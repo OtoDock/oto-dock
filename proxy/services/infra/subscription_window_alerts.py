@@ -23,7 +23,9 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import psycopg
 
 from services.engines import subscription_windows as sw
 from storage.billing import subscription_status, subscription_store
@@ -96,7 +98,7 @@ async def _opted_out(owner: str) -> bool:
     try:
         from storage.prefs import user_ui_prefs_store
         prefs = await asyncio.to_thread(user_ui_prefs_store.get_prefs, owner)
-    except Exception:
+    except psycopg.Error:
         return False
     return prefs.get(PREF_KEY) is False
 
@@ -174,17 +176,17 @@ def _owner_when(owner: str, instant: datetime) -> str:
     try:
         from core.session.session_state import get_user_tz
         tz_name = get_user_tz(owner) or ""
-    except Exception:
+    except ImportError:
         tz_name = ""
     if not tz_name:
         try:
             import config as app_config
             tz_name = app_config.get_platform_timezone() or ""
-        except Exception:
+        except ImportError:
             tz_name = ""
     try:
         zone = ZoneInfo(tz_name) if tz_name else timezone.utc
-    except Exception:
+    except (ZoneInfoNotFoundError, ValueError, OSError):
         zone = timezone.utc
     local = instant.astimezone(zone)
     stamp = local.strftime("%a %H:%M")
@@ -193,8 +195,8 @@ def _owner_when(owner: str, instant: datetime) -> str:
 
 async def _notify(sub: dict, *, scoped_label: str, window_label: str, threshold: int,
                   severity: str, pct: float, resets_at: datetime, others: int) -> None:
-    from services.notifications import notification_manager
     from core.session.session_manager import account_label_for
+    from services.notifications import notification_manager
     product = account_label_for(sub.get("layer", ""), "AI engine")
     label = sub.get("label") or product
     email = sub.get("oauth_email") or ""

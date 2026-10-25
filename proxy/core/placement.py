@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from typing import cast
 
 from core import host_os
 
@@ -65,7 +66,7 @@ def is_local(target: str | None) -> bool:
 def is_offline_sentinel(target: str | None) -> bool:
     """The resolver's hard-fail answer: the intended machine is unreachable
     and no fallback is allowed; the session must not start anywhere."""
-    return bool(target) and target.startswith(OFFLINE_PREFIX)
+    return bool(target) and cast("str", target).startswith(OFFLINE_PREFIX)
 
 
 def offline_sentinel(machine_id: str) -> str:
@@ -74,7 +75,7 @@ def offline_sentinel(machine_id: str) -> str:
 
 def offline_machine_of(target: str | None) -> str:
     """The machine a sentinel names; ``""`` for any other value."""
-    return target[len(OFFLINE_PREFIX):] if is_offline_sentinel(target) else ""
+    return cast("str", target)[len(OFFLINE_PREFIX):] if is_offline_sentinel(target) else ""
 
 
 def machine_of(target: str | None) -> str:
@@ -109,7 +110,37 @@ PAIRING_SCOPES = (PAIRING_ADMIN, PAIRING_USER)
 
 def machine_is_admin_paired(machine: dict | None) -> bool:
     """An admin-paired row (platform infrastructure); a missing row is not."""
-    return bool(machine) and (machine.get("pairing_scope") or "") == PAIRING_ADMIN
+    return bool(machine) and (cast("dict", machine).get("pairing_scope") or "") == PAIRING_ADMIN
+
+
+class PlacementRefused(RuntimeError):
+    """A session refused by the placement guard (``may_run_on``); the message
+    is the sentence the person sees."""
+
+
+#: The guard's sentence when no caller named the place more precisely.
+REFUSED_SENTENCE = ("This chat is on a machine you can't use. Pick one of your own places "
+                    "from the Runs on menu.")
+
+
+def may_run_on(machine: dict | None, *, run_sub: str | None, run_can_manage: bool,
+               user_paired_allowed: bool) -> bool:
+    """The placement guard: whether a session of this person may run on the
+    machine row ``machine`` (the caller passes ``None`` for no row: a
+    deleted machine, never the sandbox, which is always allowed and never
+    asked). A person's own paired machine, only theirs and only while the
+    platform allows personal machines; an admin machine for a run with no
+    person (a task, a call, a meeting) or a person at the owner tier there
+    (``run_can_manage``, the caller's ``roles.can_manage``): the machine has
+    no sandbox, so a role below it never runs there. Every spawn on a
+    machine passes it (``remote_session_start.placement_refuses``), and the
+    config builder asks it first (``config_builder._placement_refusal``)."""
+    if not machine:
+        return False
+    if machine_is_admin_paired(machine):
+        return not run_sub or run_can_manage
+    return (bool(run_sub) and user_paired_allowed
+            and (machine.get("registered_by") or "") == run_sub)
 
 
 # --- the site a document names ----------------------------------------------
@@ -136,7 +167,7 @@ def parse_device_grants(raw) -> set:
 _WINDOWS_DRIVE_RE = re.compile(r"^([a-zA-Z]):[\\/]")
 # The per-user install root's name on each family: what an agents root
 # shaped ``<root>/agents`` is recognised by when no home was reported.
-_STATE_DIRNAMES = frozenset(host_os.of(f).dirname for f in host_os.FAMILIES)
+_STATE_DIRNAMES = frozenset(cast("host_os.HostOS", host_os.of(f)).dirname for f in host_os.FAMILIES)
 
 
 @dataclass(frozen=True)
@@ -237,7 +268,7 @@ class PlacementCapabilities:
         with the family's dirname: ``.oto-dock``, ``OtoDock`` on Windows);
         with no home reported, the parent of an agents root shaped
         ``<root>/agents``; else ``""``."""
-        dirname = host_os.of(self.os_family).dirname
+        dirname = cast("host_os.HostOS", host_os.of(self.os_family)).dirname
         if self.home_dir:
             return self.home_dir.replace("\\", "/").rstrip("/") + "/" + dirname
         agents = (self.agents_dir or "").replace("\\", "/").rstrip("/")
@@ -258,7 +289,7 @@ class PlacementCapabilities:
         under the posix name whatever the family. A root already under a
         listed one is not repeated; Windows folds case."""
         fold = self.os_family == host_os.WINDOWS
-        dirname = host_os.of(self.os_family).dirname
+        dirname = cast("host_os.HostOS", host_os.of(self.os_family)).dirname
         homes = [h.replace("\\", "/").rstrip("/")
                  for h in (self.home_dir, self.unresolved_home_dir) if h]
         roots: list[str] = []
@@ -325,5 +356,5 @@ def from_machine(kind: str, machine: dict | None) -> PlacementCapabilities:
             unresolved_home_dir=str(caps.get("home_dir_unresolved") or ""),
             unresolved_otodock_dir=str(caps.get("otodock_dir_unresolved") or ""),
         )
-    except Exception:
+    except (ValueError, TypeError):
         return PlacementCapabilities(kind=kind, label=label)

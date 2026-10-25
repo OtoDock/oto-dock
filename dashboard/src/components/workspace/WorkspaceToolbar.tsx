@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { usePortalMenu } from '../../hooks/usePortalMenu'
 import type { WorkspaceView } from '../../hooks/useWorkspaceState'
 import { canPickFolder, FOLDER_PICKER_ATTRS } from '../../lib/droppedItems'
+import { MENU_ITEM, POPOVER } from '../ui/classes'
 
 interface NewFileOption {
   ext: string
@@ -11,14 +12,15 @@ interface NewFileOption {
   color: string
 }
 
+// The file letters as in lib/fileTypes.ts: documents primary, text and config secondary.
 const NEW_FILE_OPTIONS: NewFileOption[] = [
-  { ext: '.md',   label: 'Markdown',    icon: 'M',  color: 'text-blue-500' },
-  { ext: '.txt',  label: 'Text File',   icon: 'T',  color: 'text-gray-500' },
-  { ext: '.json', label: 'JSON',        icon: '{}', color: 'text-yellow-600' },
-  { ext: '.yaml', label: 'YAML',        icon: 'Y',  color: 'text-purple-500' },
-  { ext: '.docx', label: 'Word Doc',    icon: 'W',  color: 'text-blue-600' },
-  { ext: '.xlsx', label: 'Spreadsheet', icon: 'X',  color: 'text-green-600' },
-  { ext: '.pptx', label: 'Presentation',icon: 'S',  color: 'text-orange-500' },
+  { ext: '.md',   label: 'Markdown',    icon: 'M',  color: 'text-primary' },
+  { ext: '.txt',  label: 'Text File',   icon: 'T',  color: 'text-secondary' },
+  { ext: '.json', label: 'JSON',        icon: '{}', color: 'text-secondary' },
+  { ext: '.yaml', label: 'YAML',        icon: 'Y',  color: 'text-secondary' },
+  { ext: '.docx', label: 'Word Doc',    icon: 'W',  color: 'text-primary' },
+  { ext: '.xlsx', label: 'Spreadsheet', icon: 'X',  color: 'text-primary' },
+  { ext: '.pptx', label: 'Presentation',icon: 'S',  color: 'text-primary' },
 ]
 
 interface Props {
@@ -68,7 +70,7 @@ export default function WorkspaceToolbar({
   searchOpen = false,
   onToggleSearch,
 }: Props) {
-  // The New File and Upload dropdowns are portaled to `document.body`
+  // The New File and Upload dropdowns are portaled to the portal root (the body)
   // (instead of inline-absolute under the button) because the toolbar uses
   // `overflow-x: auto`, which per CSS spec computes `overflow-y` to `auto` as
   // well — so an absolute-positioned child would get clipped by the
@@ -76,7 +78,7 @@ export default function WorkspaceToolbar({
   // the viewport on both axes; keyboard-usable (`usePortalMenu`).
   const {
     open: newFileOpen, buttonRef: newFileButtonRef, panelRef: newFileMenuRef, style: newFileStyle,
-    toggle: toggleNewFileMenu, close: closeNewFileMenu, onKeyDown: onNewFileMenuKey,
+    portalRoot, toggle: toggleNewFileMenu, close: closeNewFileMenu, onKeyDown: onNewFileMenuKey,
   } = usePortalMenu()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
@@ -96,8 +98,8 @@ export default function WorkspaceToolbar({
     toggleUploadMenu()
   }
 
-  const btnBase =
-    'flex items-center gap-1 px-2 py-1 text-xs rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-p-text hover:bg-p-surface-hover transition-colors shrink-0'
+  const btnShape = 'flex items-center gap-1 px-2 py-1 text-xs rounded-control border transition-colors shrink-0'
+  const btnBase = `${btnShape} border-default bg-surface-card text-primary hover:bg-surface-hover`
 
   return (
     <div className="flex items-center gap-1.5 px-3 py-2 overflow-x-auto">
@@ -172,7 +174,7 @@ export default function WorkspaceToolbar({
       )}
 
       {targetDisplay && (
-        <span className="hidden sm:inline text-[11px] text-p-text-light truncate min-w-0 flex-1">
+        <span className="hidden sm:inline text-2xs text-tertiary truncate min-w-0 flex-1">
           {targetDisplay}
         </span>
       )}
@@ -194,13 +196,13 @@ export default function WorkspaceToolbar({
           <svg
             width={14} height={14} viewBox="0 0 24 24" fill="none"
             stroke="currentColor" strokeWidth={2}
-            className={transferActive ? 'animate-pulse text-brand' : ''}
+            className={transferActive ? 'animate-pulse text-link' : ''}
           >
             {/* cloud with up/down arrows — upload + sync */}
             <path strokeLinecap="round" strokeLinejoin="round" d="M20 17.6A4.5 4.5 0 0 0 17.5 9h-1.1A6 6 0 1 0 5 15.7" />
             <path strokeLinecap="round" strokeLinejoin="round" d="M9.5 14.5 12 12l2.5 2.5M12 12v9" />
           </svg>
-          <span className="absolute -top-1.5 -right-1.5 inline-flex items-center justify-center min-w-[16px] h-4 px-1 rounded-full bg-brand text-white text-[10px] font-semibold pointer-events-none">
+          <span className="absolute -top-1.5 -right-1.5 inline-flex items-center justify-center min-w-[16px] h-4 px-1 rounded-full bg-action text-action-fg text-3xs font-semibold pointer-events-none">
             {transferCount > 99 ? '99+' : transferCount}
           </span>
         </button>
@@ -223,7 +225,7 @@ export default function WorkspaceToolbar({
             <path strokeLinecap="round" strokeLinejoin="round" d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
             <path strokeLinecap="round" strokeLinejoin="round" d="M10 11v6M14 11v6" />
           </svg>
-          <span className="absolute -top-1.5 -right-1.5 inline-flex items-center justify-center min-w-[16px] h-4 px-1 rounded-full bg-brand text-white text-[10px] font-semibold pointer-events-none">
+          <span className="absolute -top-1.5 -right-1.5 inline-flex items-center justify-center min-w-[16px] h-4 px-1 rounded-full bg-action text-action-fg text-3xs font-semibold pointer-events-none">
             {recoverCount > 99 ? '99+' : recoverCount}
           </span>
         </button>
@@ -232,7 +234,7 @@ export default function WorkspaceToolbar({
       {onToggleSearch && (
         <button
           onClick={onToggleSearch}
-          className={`${btnBase} mr-1 ${searchOpen ? 'bg-brand-surface text-brand border-brand/40' : ''}`}
+          className={`${searchOpen ? `${btnShape} border-action bg-action-subtle text-link` : btnBase} mr-1`}
           title={searchOpen ? 'Close search' : 'Search this section'}
           aria-label={searchOpen ? 'Close search' : 'Search this section'}
         >
@@ -244,15 +246,15 @@ export default function WorkspaceToolbar({
       )}
 
       {/* Tree / Grid toggle */}
-      <div className="shrink-0 flex items-center rounded-lg border border-p-border-light overflow-hidden">
+      <div className="shrink-0 flex items-center rounded-control border border-default overflow-hidden">
         <button
           onClick={() => onChangeView('grid')}
           title="Grid view"
           aria-label="Grid view"
           className={`p-1 ${
             view === 'grid'
-              ? 'bg-brand-surface text-brand'
-              : 'bg-white dark:bg-p-surface text-p-text-secondary hover:bg-p-surface-hover'
+              ? 'bg-action-subtle text-link'
+              : 'bg-surface-card text-secondary hover:bg-surface-hover'
           }`}
         >
           <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
@@ -268,8 +270,8 @@ export default function WorkspaceToolbar({
           aria-label="List view"
           className={`p-1 ${
             view === 'tree'
-              ? 'bg-brand-surface text-brand'
-              : 'bg-white dark:bg-p-surface text-p-text-secondary hover:bg-p-surface-hover'
+              ? 'bg-action-subtle text-link'
+              : 'bg-surface-card text-secondary hover:bg-surface-hover'
           }`}
         >
           <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
@@ -285,7 +287,7 @@ export default function WorkspaceToolbar({
           aria-label="New file"
           onKeyDown={onNewFileMenuKey}
           style={newFileStyle}
-          className="min-w-[160px] bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg py-1"
+          className={`min-w-[160px] py-1 ${POPOVER}`}
         >
           {NEW_FILE_OPTIONS.map((opt) => (
             <button
@@ -293,19 +295,19 @@ export default function WorkspaceToolbar({
               type="button"
               role="menuitem"
               onClick={() => {
-                closeNewFileMenu(false)
+                closeNewFileMenu()
                 onNewFile(opt.ext)
               }}
-              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-p-text hover:bg-p-surface-hover focus:bg-p-surface-hover focus:outline-none"
+              className={`${MENU_ITEM} focus-visible:bg-surface-hover focus-visible:text-primary focus:outline-none`}
             >
-              <span className={`w-4 h-4 flex items-center justify-center text-[9px] font-bold ${opt.color}`}>
+              <span className={`w-4 h-4 flex items-center justify-center text-3xs font-bold ${opt.color}`}>
                 {opt.icon}
               </span>
               <span>{opt.label}</span>
             </button>
           ))}
         </div>,
-        document.body,
+        portalRoot,
       )}
       {uploadOpen && createPortal(
         <div
@@ -314,7 +316,7 @@ export default function WorkspaceToolbar({
           aria-label="Upload"
           onKeyDown={onUploadMenuKey}
           style={uploadStyle}
-          className="min-w-[140px] bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg py-1"
+          className={`min-w-[140px] py-1 ${POPOVER}`}
         >
           {([
             ['Files', fileInputRef],
@@ -328,13 +330,13 @@ export default function WorkspaceToolbar({
                 closeUploadMenu()
                 ref.current?.click()
               }}
-              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-p-text hover:bg-p-surface-hover focus:bg-p-surface-hover focus:outline-none"
+              className={`${MENU_ITEM} focus-visible:bg-surface-hover focus-visible:text-primary focus:outline-none`}
             >
               {label}
             </button>
           ))}
         </div>,
-        document.body,
+        portalRoot,
       )}
     </div>
   )

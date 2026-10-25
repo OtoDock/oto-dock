@@ -418,8 +418,9 @@ def test_a_release_is_copied_from_the_tree_without_following_a_swap(agent_tree, 
     """The swap-after-check class on the apps side: the walk judged the tree, then a
     file turned into a link before the copy; the copy refuses it and nothing
     from outside lands in a release, the preview slot or a render's copy."""
-    from services.apps import app_deploy, app_render
     import asyncio
+
+    from services.apps import app_deploy, app_render
     secret = tmp_path / "secret.txt"
     secret.write_text("SECRET-CONTENT")
     row = _folder_row("swap")

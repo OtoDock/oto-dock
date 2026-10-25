@@ -14,18 +14,17 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import re
 import logging
+import re
 import time
 from datetime import datetime
-
-from services.webhooks.event_normalizer import normalize_event, walk_path
 
 from auth.webhook_providers.base import (
     NormalizedEvent,
     VerifyResult,
     WebhookProvider,
 )
+from services.webhooks.event_normalizer import normalize_event, walk_path
 
 # Zoom's url_validation plainToken shape (22 url-safe characters in
 # practice); the handshake signs nothing outside it.

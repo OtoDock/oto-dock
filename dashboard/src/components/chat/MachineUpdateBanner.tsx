@@ -28,27 +28,27 @@ export default function MachineUpdateBanner({ machineId }: Props) {
     return () => clearTimeout(t)
   }, [slice?.status, machineId, dismiss])
 
-  // Re-render every second while updating so the elapsed-time hint is fresh.
-  const [, setTick] = useState(0)
+  // The clock the elapsed hint reads, advanced every second while updating.
+  const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     if (slice?.status !== 'updating') return
-    const t = setInterval(() => setTick((n) => n + 1), 1000)
+    const t = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(t)
   }, [slice?.status])
 
   if (!slice || !machineId) return null
 
   if (slice.status === 'updating') {
-    const elapsed = Math.floor((Date.now() - slice.startedAt) / 1000)
+    const elapsed = Math.max(0, Math.floor((now - slice.startedAt) / 1000))
     return (
-      <div className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-sm border border-amber-300/40 bg-amber-50/40 text-amber-900 dark:bg-amber-500/10 dark:text-amber-200">
+      <div className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-card border border-status-warning-border bg-status-warning-bg text-status-warning-fg">
         <div className="flex items-center gap-2">
-          <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+          <span className="inline-block w-2 h-2 rounded-full bg-status-warning-solid animate-pulse" />
           <span className="truncate">
-            Updating satellite{' '}
+            Updating OtoDock on{' '}
             <strong>{slice.machineName || slice.machineId.slice(0, 8)}</strong>
             {' '}({slice.fromVersion || 'old'} → {slice.toVersion}).{' '}
-            Will reconnect in ~30s. Your messages will be queued.
+            It reconnects in about 30 seconds. Your messages wait until then.
           </span>
           <span className="ml-auto tabular-nums opacity-60">{elapsed}s</span>
         </div>
@@ -58,11 +58,11 @@ export default function MachineUpdateBanner({ machineId }: Props) {
 
   if (slice.status === 'updated') {
     return (
-      <div className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-sm border border-emerald-300/40 bg-emerald-50/40 text-emerald-900 dark:bg-emerald-500/10 dark:text-emerald-200">
+      <div className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-card border border-status-success-border bg-status-success-bg text-status-success-fg">
         <div className="flex items-center gap-2">
-          <span className="inline-block w-2 h-2 rounded-full bg-emerald-500" />
+          <span className="inline-block w-2 h-2 rounded-full bg-status-success-solid" />
           <span>
-            Satellite{' '}
+            OtoDock on{' '}
             <strong>{slice.machineName || slice.machineId.slice(0, 8)}</strong>
             {' '}updated to {slice.toVersion}.
           </span>
@@ -73,25 +73,25 @@ export default function MachineUpdateBanner({ machineId }: Props) {
 
   // failed
   return (
-    <div className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-sm border border-red-300/40 bg-red-50/40 text-red-900 dark:bg-red-500/10 dark:text-red-200">
+    <div className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-card border border-status-danger-border bg-status-danger-bg text-status-danger-fg">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
-          <span className="inline-block w-2 h-2 rounded-full bg-red-500 shrink-0" />
+          <span className="inline-block w-2 h-2 rounded-full bg-status-danger-solid shrink-0" />
           <span className="truncate">
             Update of{' '}
             <strong>{slice.machineName || slice.machineId.slice(0, 8)}</strong>
             {' '}failed
-            {slice.error ? `: ${slice.error}` : ''}
-            {slice.rolledBackTo ? ` (rolled back to ${slice.rolledBackTo})` : ''}.
+            {slice.error ? `: ${slice.error}` : ''}.
+            {slice.rolledBackTo ? ` It rolled back to ${slice.rolledBackTo}.` : ''}
             {slice.autoUpdatePaused
-              ? ' Automatic updates are paused for this machine — retry from Platform → Remote Machines (Update now).'
+              ? ' Automatic updates are paused for this machine. Retry with Update now in Admin, Remote Machines.'
               : ''}
           </span>
         </div>
         <button
           type="button"
           onClick={() => dismiss(slice.machineId)}
-          className="shrink-0 px-1.5 py-0.5 rounded-sm hover:bg-red-500/20"
+          className="shrink-0 px-1.5 py-0.5 rounded-control hover:underline"
           title="Dismiss"
         >
           ×

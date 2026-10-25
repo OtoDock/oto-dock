@@ -12,15 +12,22 @@ import functools
 import logging
 import os
 import random
+import time
 import uuid
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+import psycopg
 
 from auth import roles as _roles
-from core import placement
-from core import layout
+from core import layout, placement
 from services.infra import path_confinement, safe_fs
+
+if TYPE_CHECKING:
+    from core.remote.file_sync import FileEntry, MergePlan
 
 logger = logging.getLogger("remote-layer")
 
@@ -99,6 +106,16 @@ async def _run_sync_cpu(fn, /, *args, **kwargs):
 _RECONNECT_SYNC_JITTER_S = 10.0
 _RECONNECT_SYNC_CONCURRENCY = 4
 _BACKGROUND_MANIFEST_CONCURRENCY = 1
+# A machine's reconnect walk starts no sooner than this after its previous
+# walk COMPLETED (a pass that reached every agent): a machine flapping three
+# times a minute walks twice at most, one back after an hour walks at once.
+# Longer would let a session re-adopted from grace read bytes a tombstone or
+# a platform-ahead mark says are stale. A pass a drop cut short restarts no
+# window.
+_RECONNECT_DEBOUNCE_S = 30.0
+# machine_id → when its last complete walk ended (``_monotonic``); entries
+# older than the window are dropped at the next stamp.
+_reconnect_completed_at: dict[str, float] = {}
 _gates: dict[str, tuple[asyncio.AbstractEventLoop, int, asyncio.Semaphore]] = {}
 
 
@@ -133,7 +150,7 @@ def manifest_request(cm, machine_id: str, agent_slug: str, *,
     ``report_skipped`` asks a 0.5.145 satellite to list what it could not
     read as entries with ``skipped`` and no hash (only the merge reads
     those; the caller checks the satellite's version)."""
-    msg = {"type": "request_manifest", "agent_slug": agent_slug}
+    msg: dict[str, Any] = {"type": "request_manifest", "agent_slug": agent_slug}
     if cm.satellite_supports_paged_manifest(machine_id):
         msg["page_size"] = _MANIFEST_PAGE_SIZE
     if report_skipped:
@@ -178,6 +195,26 @@ def _reconnect_jitter_s() -> float:
     return random.uniform(0.0, _RECONNECT_SYNC_JITTER_S)
 
 
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def _reconnect_hold_s(machine_id: str) -> float:
+    """What is left of ``machine_id``'s debounce window, 0 outside it."""
+    done_at = _reconnect_completed_at.get(machine_id)
+    if done_at is None:
+        return 0.0
+    return max(0.0, done_at + _RECONNECT_DEBOUNCE_S - _monotonic())
+
+
+def _note_reconnect_pass_done(machine_id: str) -> None:
+    now = _monotonic()
+    for mid, at in list(_reconnect_completed_at.items()):
+        if now - at >= _RECONNECT_DEBOUNCE_S:
+            del _reconnect_completed_at[mid]
+    _reconnect_completed_at[machine_id] = now
+
+
 @dataclass
 class _ReconnectWalk:
     sleeping: bool = True
@@ -194,8 +231,38 @@ _reconnect_walks: dict[str, _ReconnectWalk] = {}
 _idle_sync_inflight: set[tuple[str, str]] = set()
 
 
+@dataclass
+class _SyncRun:
+    """One merge past its inputs: the plan and the manifests' facts the
+    actions read, the counters, the recover bin and the one window every
+    action shares (the fields past ``satellite_user``: ``_sync_apply``'s)."""
+    machine_id: str
+    agent_slug: str
+    agent_dir: Path
+    progress_cb: Callable[[float, int], Awaitable[None]] | None
+    plan: "MergePlan"
+    local_entries: "list[FileEntry]"
+    remote_size: dict[str, int]
+    remote_stat: dict[str, dict]
+    satellite_user: str
+    local_mtime: dict[str, float] = field(init=False)
+    local_size: dict[str, int] = field(init=False)
+    recover_tmp: Path | None = None
+    to_notify: list[tuple[str, str]] = field(init=False)
+    n: dict[str, int] = field(init=False)
+    total: int = field(init=False)
+    last_tick: dict[str, float] = field(init=False)
+    partial: dict[str, float] = field(init=False)
+    window: asyncio.Semaphore = field(init=False)
 
-class RemoteWorkspaceSyncMixin:
+
+if TYPE_CHECKING:
+    from core.remote.remote_host import RemoteLayerHost as _Host
+else:
+    _Host = object
+
+
+class RemoteWorkspaceSyncMixin(_Host):
     # --- Workspace sync ---
 
     async def resolve_machine_sync_identity(
@@ -224,8 +291,8 @@ class RemoteWorkspaceSyncMixin:
         pull side, so a user machine only ever syncs back its role-allowed folders.
         """
         import asyncio as _asyncio
-        from storage import remote_store as _rs
-        from storage import database as _db
+
+        from storage import database as _db, remote_store as _rs
 
         machine = await _asyncio.to_thread(_rs.get_remote_machine, machine_id)
         if not machine:
@@ -284,8 +351,10 @@ class RemoteWorkspaceSyncMixin:
         its owner (with the owner's per-agent role); an admin-paired machine syncs
         admin-shared. The per-(machine, agent) lock inside ``_initial_workspace_sync``
         serializes each agent against a concurrent session warmup. One walk per
-        machine (a second kick coalesces into it), a jitter before the walk,
-        the reconnect gate around each agent's merge. Best-effort.
+        machine (a second kick coalesces into it), a jitter before the walk
+        (or the rest of the machine's debounce window, ``_RECONNECT_DEBOUNCE_S``,
+        after its previous complete walk, whichever is longer), the reconnect
+        gate around each agent's merge. Best-effort.
         """
         from storage.files import sync_state_store
 
@@ -301,23 +370,30 @@ class RemoteWorkspaceSyncMixin:
             )
             if not agents:
                 return
-            await asyncio.sleep(_reconnect_jitter_s())
+            await asyncio.sleep(max(_reconnect_jitter_s(), _reconnect_hold_s(machine_id)))
             walk.sleeping = False
             while True:
-                await self._reconnect_pass(machine_id, agents)
+                if await self._reconnect_pass(machine_id, agents):
+                    _note_reconnect_pass_done(machine_id)
                 if not walk.rerun:
                     return
+                # The pass a kick earned waits for the window too; kicks
+                # meanwhile coalesce into it.
                 walk.rerun = False
+                walk.sleeping = True
+                await asyncio.sleep(_reconnect_hold_s(machine_id))
+                walk.sleeping = False
         finally:
             _reconnect_walks.pop(machine_id, None)
 
-    async def _reconnect_pass(self, machine_id: str, agents) -> None:
+    async def _reconnect_pass(self, machine_id: str, agents) -> bool:
         """One pass over a machine's tracked agents; stops when the machine
-        is no longer connected (its next re-authentication kicks a new walk)."""
+        is no longer connected (its next re-authentication kicks a new walk).
+        True when it reached every agent."""
         synced = 0
         for agent_slug in sorted(agents):
             if not self._cm.is_connected(machine_id):
-                return
+                return False
             ident = await self.resolve_machine_sync_identity(machine_id, agent_slug)
             if ident is None:
                 continue  # machine unpaired / vanished
@@ -339,6 +415,7 @@ class RemoteWorkspaceSyncMixin:
                 "Reconnect workspace sync for %s: caught up %d agent(s)",
                 machine_id[:8], synced,
             )
+        return True
 
     async def run_idle_fingerprint_sweep(self) -> None:
         """Periodic backstop: for each CONNECTED-IDLE (machine, agent) whose
@@ -353,6 +430,7 @@ class RemoteWorkspaceSyncMixin:
         a session warmup / reconnect-sync). Best-effort; called from the 60s registry
         sweep in ``app.py``."""
         import asyncio as _asyncio
+
         from services.remote import workspace_fanout
         from storage.files import sync_state_store
 
@@ -365,7 +443,7 @@ class RemoteWorkspaceSyncMixin:
                 tracked = await _asyncio.to_thread(
                     sync_state_store.agents_for_machine, machine_id,
                 )
-            except Exception:
+            except psycopg.Error:
                 continue
             for slug, fp in list(conn.agent_fingerprints.items()):
                 if slug not in tracked:
@@ -381,7 +459,7 @@ class RemoteWorkspaceSyncMixin:
                 task = _asyncio.create_task(
                     self._idle_fingerprint_sync_one(machine_id, slug, fp)
                 )
-                task.add_done_callback(lambda t, key=key: _idle_sync_inflight.discard(key))
+                task.add_done_callback(lambda t, key=key: _idle_sync_inflight.discard(key))  # type: ignore[misc]  # mypy infers no type for a lambda with a default argument
                 self._deferred_sync_tasks.add(task)
                 task.add_done_callback(self._deferred_sync_tasks.discard)
 
@@ -417,7 +495,7 @@ class RemoteWorkspaceSyncMixin:
     ) -> None:
         """Background runner for large conflict-free PULLS deferred off the warmup
         path (Part 2, Option A). Mirrors the foreground pull branch of
-        ``_initial_workspace_sync._apply`` MINUS capture/notify (deferred pulls are
+        ``_sync_pull`` MINUS capture/notify (deferred pulls are
         ``capture_side is None`` by construction): per file, under the global
         per-(agent, rel_path) lock, stream the satellite's bytes to the platform
         agent dir, then advance base/file_author + drop any tombstone, and refresh
@@ -426,15 +504,22 @@ class RemoteWorkspaceSyncMixin:
         warmup / reconnect-sync. Does NOT hold the per-(machine, agent) warmup lock,
         so a back-to-back session's warmup isn't blocked behind it."""
         import asyncio as _asyncio
+
         import config as _cfg
         from core.remote import file_sync, remote_file_flow
         from services.notifications import notification_manager
         from services.path_policy_v2 import PathRef
-        from storage.files import file_author_store
-        from storage.files import file_tombstones_store
-        from storage.files import sync_state_store
+        from storage.files import (
+            file_author_store,
+            file_tombstones_store,
+            sync_state_store,
+        )
 
-        agent_dir = _cfg.AGENTS_DIR / agent_slug
+        try:
+            agent_dir = _cfg.get_agent_dir(agent_slug)
+        except ValueError:
+            logger.warning("deferred pulls skipped: %r names no agent folder", agent_slug)
+            return
         pulled = 0
         for action in actions:
             rp = action.rel_path
@@ -535,16 +620,14 @@ class RemoteWorkspaceSyncMixin:
         Best-effort: any error is caught by the caller and the session proceeds.
         """
         import asyncio as _asyncio
-        import config as _cfg
-        from core.remote import file_sync, remote_file_flow
-        from services.path_policy_v2 import PathRef
-        from services.notifications import notification_manager
-        from storage.files import sync_state_store
-        from storage.files import file_tombstones_store
-        from storage.files import file_author_store
-        from storage.files import recover_bin_store
 
-        agent_dir = _cfg.AGENTS_DIR / agent_slug
+        import config as _cfg
+
+        try:
+            agent_dir = _cfg.get_agent_dir(agent_slug)
+        except ValueError:
+            logger.warning("workspace sync skipped: %r names no agent folder", agent_slug)
+            return
         if not agent_dir.exists():
             return
 
@@ -558,496 +641,15 @@ class RemoteWorkspaceSyncMixin:
         # double-apply and race the base.
         cpu_gate = _background_manifest_gate() if background else contextlib.nullcontext()
         async with self._cm.get_sync_lock(machine_id, agent_slug):
-            async with cpu_gate:
-                local_entries = await _run_sync_cpu(
-                    file_sync.compute_manifest,
-                    agent_dir,
-                    target_username=target_username, target_role=target_role,
-                    exclude_user_dirs=exclude_users,
-                    # Cap the plan at what THIS machine accepts: pre-0.5.103
-                    # satellites hard-reject >100MB, so bigger files must never
-                    # enter their merge plan (doomed pushes / permanent churn).
-                    max_file_size=self._cm.effective_sync_cap(machine_id),
-                    # Marker-confirmed build-dir exclusions — ONLY for machines
-                    # whose satellite ACKed the table (0.5.110+): both walks
-                    # must apply the same rules or the diff churns.
-                    ignore_rules=self._cm.effective_ignore_rules(machine_id),
-                )
-            # What the manifest can be trusted with is the asked connection's
-            # (a satellite updating mid-merge answers on a new one: a check
-            # after the reply would judge this manifest by that version).
-            report_skipped = self._cm.satellite_supports_skipped_manifest(machine_id)
-            absence_unknown = self._cm.satellite_absence_unreliable(machine_id)
-            restore_holds = self._cm.satellite_restores_holds(machine_id)
-            try:
-                ack = await self._cm.send_command(
-                    machine_id,
-                    manifest_request(self._cm, machine_id, agent_slug,
-                                     report_skipped=report_skipped),
-                    timeout=30.0,
-                )
-            except Exception as e:
-                logger.warning(
-                    "request_manifest failed for %s: %s — skipping initial sync",
-                    agent_slug, e,
-                )
+            run = await self._sync_inputs(
+                machine_id, agent_slug, agent_dir, exclude_users, cpu_gate,
+                target_username=target_username, target_role=target_role,
+                session_username=session_username,
+                session_knowledge_rw=session_knowledge_rw, progress_cb=progress_cb,
+            )
+            if run is None:
                 return
-            remote_entries = ack.get("files", []) or []
-            if not report_skipped:
-                # Only an asked satellite may answer an entry without a hash.
-                remote_entries = [e for e in remote_entries
-                                  if not (isinstance(e, dict) and e.get("skipped"))]
-            remote_size = {
-                e.get("path", ""): int(e.get("size", 0) or 0)
-                for e in remote_entries
-            }
-
-            # Merge inputs: per-machine base, live tombstones, clock offset, and a
-            # lazy platform-author resolver for cross-user conflict detection.
-            base = await _asyncio.to_thread(
-                sync_state_store.load_for_machine_agent, machine_id, agent_slug,
-            )
-            tombstones = await _asyncio.to_thread(
-                file_tombstones_store.load_for_agent, agent_slug,
-            )
-            holds = await _asyncio.to_thread(
-                file_tombstones_store.load_holds_for_agent, agent_slug,
-            )
-            clock_offset = self._cm.get_clock_offset(machine_id)
-            satellite_user = target_username or ""  # the satellite-side writer (slug)
-
-            def _author_of(p: str):
-                return file_author_store.get(agent_slug, p)
-
-            # config/ is push-only by default, but an OWNER-tier session
-            # (manager/admin with a real username) curates config/ on its remote
-            # machine — let those edits sync BACK, matching the live-path
-            # can_write_back rule (config/ is STATIC, not regenerated per session,
-            # so there is nothing to clobber). An empty set drops config/ from
-            # push-only; .claude/.codex stay push-only (segments).
-            #
-            # The write-back identity is TWO-SOURCED: on a user-paired machine
-            # it is the machine owner (target_username — sessions there are the
-            # owner's); on an ADMIN-SHARED machine target_username is None BY
-            # DESIGN (it's the isolation filter, not a person), so the identity
-            # is the session's authenticated human (session_username). An
-            # orphaned-owner machine (target_username == "") stays fail-closed —
-            # no substitution.
-            _cwb_username = (
-                target_username if target_username is not None else session_username
-            )
-            push_only_dirs = (
-                set()
-                if (_roles.can_manage(target_role) and _cwb_username)
-                else set(file_sync.DEFAULT_PUSH_ONLY_PREFIXES)
-            )
-            # Knowledge-library mirrors: read-only attachments are
-            # platform-authoritative on every machine (push-only + scrubbed
-            # everywhere — the projector owns mirror content); writable
-            # attachments participate in the normal merge, with their
-            # (source, subdir) pairs feeding can_write_back's segment-wise
-            # subtree rule. Prefixes are PER LIBRARY subtree — the trailing
-            # slash keeps the prefix match segment-safe (an RO library
-            # ``marketing`` never covers ``marketing-extra``).
-            from storage.knowledge import db_knowledge_libraries
-            _attachments = await _asyncio.to_thread(
-                db_knowledge_libraries.attachments_for_consumer, agent_slug,
-            )
-            _lib_ro = {
-                (f"{layout.KNOWLEDGE}/shared/{a['source_agent']}/{a['subdir']}/"
-                 if a["subdir"] else f"{layout.KNOWLEDGE}/shared/{a['source_agent']}/")
-                for a in _attachments if not a["writable"]
-            }
-            writable_libraries = frozenset(
-                (a["source_agent"], a["subdir"] or "")
-                for a in _attachments if a["writable"]
-            )
-            push_only_dirs |= _lib_ro
-            async with cpu_gate:
-                plan = await _run_sync_cpu(
-                    file_sync.diff_manifests,
-                    local_entries, remote_entries,
-                    base=base, tombstones=tombstones, clock_offset=clock_offset,
-                    author_of=_author_of, satellite_user=satellite_user,
-                    push_only_dirs=push_only_dirs,
-                    target_username=target_username, target_role=target_role,
-                    session_username=session_username,
-                    exclude_user_dirs=exclude_users,
-                    writable_libraries=writable_libraries,
-                    scrub_dirs=_lib_ro,
-                    knowledge_rw=session_knowledge_rw,
-                    absence_unknown=absence_unknown,
-                    holds=holds,
-                    restore_holds=restore_holds,
-                )
-
-            # Sync-delta telemetry (alert-only, never blocks or filters the
-            # sync): a huge planned pull of NEW satellite files usually means
-            # a build tree the sync-ignore table doesn't cover yet.
-            try:
-                from core.remote import sync_delta_alerts
-                _new_pulls = [a for a in plan.actions
-                              if a.op == "pull" and a.rel_path not in base]
-                if _new_pulls:
-                    _subs: dict[str, int] = {}
-                    _nbytes = 0
-                    for a in _new_pulls:
-                        _subs[sync_delta_alerts._top_subtree(a.rel_path)] = (
-                            _subs.get(
-                                sync_delta_alerts._top_subtree(a.rel_path), 0) + 1)
-                        _nbytes += remote_size.get(a.rel_path, 0)
-                    await sync_delta_alerts.maybe_alert(
-                        machine_id, agent_slug, source="reconcile",
-                        new_files=len(_new_pulls), new_bytes=_nbytes,
-                        subtree_counts=_subs)
-            except Exception:
-                logger.debug("sync-delta telemetry failed", exc_info=True)
-
-            if not plan.actions and not plan.to_scrub:
-                logger.debug("Initial workspace sync for %s: in-sync", agent_slug)
-                return
-
-            # Defer large, conflict-free PULLS to a background
-            # task so the CLI starts without waiting for satellite-side bulk content
-            # (e.g. a big media file the satellite holds). Pulls never touch the
-            # agent's disk → safe to defer. Everything else — ALL pushes, deletes,
-            # scrubs, noops, conflict-capture pulls, and small pulls — stays
-            # foreground (awaited before start_session).
-            foreground_actions, deferred_pulls = _partition_deferred_pulls(
-                plan.actions, remote_size,
-            )
-
-            local_mtime = {e.path: e.mtime for e in local_entries}
-            local_size = {e.path: e.size for e in local_entries}
-            # Created EAGERLY (not lazily on first capture): the windowed
-            # apply below runs actions concurrently, and a lazy nonlocal
-            # create could double-mkdtemp and leak the loser.
-            import tempfile as _tempfile
-            from pathlib import Path as _Path
-            recover_tmp = _Path(_tempfile.mkdtemp(prefix="oto-recover-"))
-            to_notify: list[tuple[str, str]] = []
-            n = {"push": 0, "pull": 0, "delete": 0, "scrub": 0, "capture": 0,
-                 "done": 0}
-
-            # W2 (sync-performance): throttled progress ticks → progress_cb
-            # (the warmup wires it to the dashboard install bar; background
-            # sweeps pass None). Always fire the FINAL tick so the bar lands
-            # on 100% even under throttle.
-            import time as _time_mod
-            _total = len(foreground_actions)
-            _last_tick = {"t": 0.0}
-            # The share of each push still on its way: a large file moves
-            # the row by its bytes, not only when it lands.
-            partial: dict[str, float] = {}
-
-            async def _progress_tick(final: bool = False) -> None:
-                if progress_cb is None or _total == 0:
-                    return
-                now = _time_mod.monotonic()
-                if not final and now - _last_tick["t"] < 0.5:
-                    return
-                _last_tick["t"] = now
-                try:
-                    done = n["done"] + (0.0 if final else sum(partial.values()))
-                    await progress_cb(done, _total)
-                except Exception:
-                    logger.debug("sync progress_cb failed", exc_info=True)
-
-            async def _pull_satellite_bytes(rp: str) -> bytes | None:
-                """Pull the satellite's current copy of ``rp`` → bytes, or None on a
-                pull/read failure."""
-                dest = recover_tmp / uuid.uuid4().hex
-                ok = await self._cm.pull_file_to_path(
-                    machine_id, PathRef("agent_tree", rp), dest, agent_slug=agent_slug,
-                )
-                if not ok:
-                    return None
-                try:
-                    return dest.read_bytes()
-                except OSError:
-                    return None
-                finally:
-                    with contextlib.suppress(OSError):
-                        dest.unlink()
-
-            async def _capture_loser(action) -> None:
-                """Copy the LOSING side's current bytes to the recover-bin (a
-                cross-user conflict). Best-effort — the op proceeds regardless."""
-                if action.capture_side == "satellite":
-                    data = await _pull_satellite_bytes(action.rel_path)
-                elif action.capture_side == "platform":
-                    data = await _asyncio.to_thread(_platform_bytes, agent_dir, action.rel_path)
-                else:
-                    return
-                if data is None:
-                    return
-                entry = await _asyncio.to_thread(
-                    recover_bin_store.capture, agent_slug, action.rel_path,
-                    data, action.capture_reason,
-                )
-                if entry is not None:
-                    n["capture"] += 1
-                    if action.notify_user:
-                        to_notify.append((action.notify_user, entry["original_name"]))
-
-            async def _apply(action) -> None:
-                rp = action.rel_path
-                # Only a pull ADDS/UPDATES a file on the PLATFORM tree, so only a
-                # pull refreshes an open dashboard (set in the pull branch below).
-                pulled_to_platform = False
-                # Serialize each file against the live write-back path + other
-                # warmups on the SAME file (cross-machine) via the global lock.
-                lock = await remote_file_flow._acquire_global_path_lock(agent_slug, rp)
-                async with lock:
-                    if action.op == "push":
-                        if action.capture_side:
-                            await _capture_loser(action)
-                        # Pass the PATH — push_file streams from disk (memory
-                        # O(chunk) even at 1GB; a vanished file returns False
-                        # into the existing failure path). It runs while the
-                        # file moves (the connection's credit paces it), and
-                        # its byte progress drives the row and keeps the
-                        # session starting. The transfer gate (innermost,
-                        # see its lock-order invariant) bounds the machine's
-                        # concurrent LARGE pushes; sub-threshold files
-                        # bypass it so a
-                        # tiny-file warmup storm never queues behind a big
-                        # fan-out. The push is pinned to the platform hash
-                        # the merge planned on (the base it records): bytes
-                        # changed since the manifest fail the push instead,
-                        # and the failure drops the cached hash of the path.
-                        from core.remote import transfer_gate
-
-                        async def _bytes(sent: int, total: int, _rp=rp) -> None:
-                            partial[_rp] = sent / max(total, 1)
-                            await _progress_tick()
-
-                        async with transfer_gate.slot(
-                            machine_id, agent_slug, rp,
-                            local_size.get(rp, 0),
-                        ):
-                            ok = await self._cm.push_file(
-                                machine_id, PathRef("agent_tree", rp),
-                                agent_dir / rp,
-                                agent_slug=agent_slug, progress_cb=_bytes,
-                                content_hash=action.base_hash or None,
-                            )
-                        if not ok:
-                            # A push pinned to a stale cached hash fails at
-                            # every sync until the next merge hashes it again.
-                            file_sync.forget_hash(agent_dir / rp)
-                            logger.warning("Push failed during initial sync: %s", rp)
-                            return
-                        # The machine holds the platform copy: no read there
-                        # may take it for a missed push (lane D's marker).
-                        remote_file_flow.clear_platform_ahead(machine_id, agent_slug, rp)
-                        n["push"] += 1
-                        if action.base_hash:
-                            await _asyncio.to_thread(
-                                sync_state_store.record_one, machine_id, agent_slug,
-                                rp, action.base_hash, local_mtime.get(rp, 0.0),
-                            )
-                        if action.drop_tombstone:
-                            await _asyncio.to_thread(file_tombstones_store.drop, agent_slug, rp)
-
-                    elif action.op == "pull":
-                        if action.capture_side:
-                            await _capture_loser(action)
-                        # The named path, never resolved: the pull opens it
-                        # by components and refuses a link at any one.
-                        if not file_sync.is_canonical_rel_path(rp):
-                            logger.warning("initial-sync pull traversal blocked: %s", rp)
-                            return
-                        dest = path_confinement.join_under(agent_dir, rp)
-                        ok = await self._cm.pull_file_to_path(
-                            machine_id, PathRef("agent_tree", rp), dest,
-                            agent_slug=agent_slug,
-                        )
-                        if not ok:
-                            logger.warning("Pull failed during initial sync: %s", rp)
-                            return
-                        n["pull"] += 1
-                        pulled_to_platform = True
-                        if action.keep_mtime is not None:
-                            await _asyncio.to_thread(
-                                _keep_mtime, agent_slug, rp, action.keep_mtime)
-                        if action.base_hash:
-                            try:
-                                base_mtime = dest.stat().st_mtime
-                            except OSError:
-                                base_mtime = 0.0
-                            await _asyncio.to_thread(
-                                sync_state_store.record_one, machine_id, agent_slug,
-                                rp, action.base_hash, base_mtime,
-                            )
-                            # The platform now holds the satellite user's bytes.
-                            if satellite_user:
-                                await _asyncio.to_thread(
-                                    file_author_store.record, agent_slug, rp, satellite_user,
-                                )
-                        if action.drop_tombstone:
-                            await _asyncio.to_thread(file_tombstones_store.drop, agent_slug, rp)
-
-                    elif action.op == "delete_satellite":
-                        # Capture the satellite's only copy BEFORE deleting. A pull
-                        # failure means we do NOT delete (never cause unrecoverable
-                        # loss from a transient blip) — the tombstone persists and
-                        # we retry next sync.
-                        data = await _pull_satellite_bytes(rp)
-                        if data is None:
-                            logger.warning(
-                                "delete-sync: pull failed for %s/%s — NOT deleting",
-                                agent_slug, rp,
-                            )
-                            return
-                        entry = await _asyncio.to_thread(
-                            recover_bin_store.capture, agent_slug, rp, data, "deleted",
-                        )
-                        if entry is not None:
-                            n["capture"] += 1
-                        try:
-                            await self._cm.send_fire_and_forget(
-                                machine_id,
-                                {"type": "file_push", "agent_slug": agent_slug,
-                                 "action": "delete", "path": rp},
-                            )
-                            n["delete"] += 1
-                        except Exception:
-                            logger.exception("delete-sync failed for %s (backup kept)", rp)
-                        if action.clear_base:
-                            await _asyncio.to_thread(
-                                sync_state_store.clear_one, machine_id, agent_slug, rp,
-                            )
-
-                    elif action.op == "delete_platform":
-                        # The satellite DELETED a file it had converged on, out-of-turn,
-                        # with its tree still alive (delete-attribution). Capture
-                        # the platform bytes to the recover-bin (7-day undo) FIRST, then
-                        # delete the platform copy, tombstone it (so OTHER idle satellites
-                        # drop it too), clear base+author, and fan the delete out. Under
-                        # the global per-(agent, path) lock already held here.
-                        if action.capture_side:
-                            await _capture_loser(action)
-                        if not file_sync.is_canonical_rel_path(rp):
-                            logger.warning("delete_platform traversal blocked: %s", rp)
-                            return
-                        # The name is removed beneath the agent's folder: a
-                        # link at it goes (its target stays). A missing parent
-                        # means the file is gone already. A link above it or a
-                        # directory at it refuses, and a refused delete claims
-                        # nothing: no tombstone, the base and the author kept,
-                        # no fan-out, no dashboard refresh.
-                        try:
-                            await _asyncio.to_thread(
-                                file_sync.apply_incoming_file, agent_dir, rp, "delete",
-                            )
-                        except FileNotFoundError:
-                            pass
-                        except OSError as e:
-                            logger.warning("delete_platform refused for %s: %s", rp, e)
-                            return
-                        n["delete"] += 1
-                        import time as _t
-                        await _asyncio.to_thread(
-                            file_tombstones_store.record, agent_slug, rp,
-                            _t.time(), origin="satellite-idle-delete",
-                        )
-                        if action.clear_base:
-                            await _asyncio.to_thread(
-                                sync_state_store.clear_one, machine_id, agent_slug, rp,
-                            )
-                        await _asyncio.to_thread(
-                            file_author_store.clear, agent_slug, rp,
-                        )
-                        from services.remote import workspace_fanout as _wf
-                        await _wf.fan_out_delete(
-                            agent_slug, rp, exclude_machine_id=machine_id,
-                        )
-                        pulled_to_platform = True  # platform tree changed → dashboard refresh
-
-                    elif action.op == "noop":
-                        if action.base_hash:
-                            await _asyncio.to_thread(
-                                sync_state_store.record_one, machine_id, agent_slug,
-                                rp, action.base_hash, local_mtime.get(rp, 0.0),
-                            )
-                        if action.clear_base:
-                            await _asyncio.to_thread(
-                                sync_state_store.clear_one, machine_id, agent_slug, rp,
-                            )
-                        if action.drop_tombstone:
-                            await _asyncio.to_thread(file_tombstones_store.drop, agent_slug, rp)
-
-                if pulled_to_platform:
-                    # A pull (satellite file landed) OR a delete_platform (satellite
-                    # out-of-turn delete propagated) just changed the platform tree →
-                    # refresh any open dashboard workspace view,
-                    # best-effort, outside the lock (it doesn't need it). push
-                    # (platform→satellite) + delete_satellite (platform already
-                    # lacks the file) don't change the platform tree, so they
-                    # don't notify the dashboard.
-                    await notification_manager.broadcast_file_updated(
-                        agent_slug, rp, source="disk",
-                    )
-
-            # W1 (sync-performance): WINDOWED PIPELINING. The satellite applies
-            # frames serially on its event loop either way — but awaiting each
-            # per-file ack before SENDING the next serialized the WIRE, so a
-            # 1,500-file first sync cost RTT × N (the 25-minute first-turn
-            # report). A bounded window keeps the wire full while preserving
-            # every correctness property: per-path ordering rides the global
-            # path lock INSIDE _apply, failures still log-and-continue (same
-            # as the old loop), and counters/lists only mutate on the loop
-            # thread. Big chunked pushes may interleave with small files —
-            # the writer lanes already order control frames ahead.
-            _window = _asyncio.Semaphore(8)
-
-            async def _apply_windowed(action) -> None:
-                async with _window:
-                    try:
-                        await _apply(action)
-                    except Exception:
-                        logger.exception(
-                            "initial-sync action failed for %s/%s",
-                            agent_slug, action.rel_path,
-                        )
-                    finally:
-                        # The push's share leaves as its file counts done, so
-                        # the row never steps back.
-                        partial.pop(action.rel_path, None)
-                        n["done"] += 1
-                        await _progress_tick()
-
-            await _asyncio.gather(
-                *(_apply_windowed(a) for a in foreground_actions)
-            )
-            await _progress_tick(final=True)
-
-            # Isolation scrubs (another user's data / agent-scope creds that leaked
-            # onto the satellite) — delete there, never captured, never base-tracked.
-            for rp in plan.to_scrub:
-                try:
-                    await self._cm.send_fire_and_forget(
-                        machine_id,
-                        {"type": "file_push", "agent_slug": agent_slug,
-                         "action": "delete", "path": rp},
-                    )
-                    n["scrub"] += 1
-                except Exception:
-                    logger.exception("isolation scrub delete failed for %s", rp)
-
-            if recover_tmp is not None:
-                import shutil as _shutil
-                _shutil.rmtree(recover_tmp, ignore_errors=True)
-
-            logger.info(
-                "Initial workspace sync for %s: pushed=%d pulled=%d deleted=%d "
-                "scrubbed=%d captured=%d",
-                agent_slug, n["push"], n["pull"], n["delete"], n["scrub"], n["capture"],
-            )
-
-            if to_notify:
-                await self._notify_conflict_losers(agent_slug, to_notify)
+            deferred_pulls = await self._sync_apply(run)
 
         # Kick the deferred large pulls in the background now that the
         # per-(machine, agent) sync lock is released (so a back-to-back warmup
@@ -1060,11 +662,688 @@ class RemoteWorkspaceSyncMixin:
             )
             task = _asyncio.create_task(
                 self._run_deferred_pulls(
-                    machine_id, agent_slug, deferred_pulls, satellite_user,
+                    machine_id, agent_slug, deferred_pulls, run.satellite_user,
                 )
             )
             self._deferred_sync_tasks.add(task)
             task.add_done_callback(self._deferred_sync_tasks.discard)
+
+    async def _sync_inputs(
+        self, machine_id: str, agent_slug: str, agent_dir: Path, exclude_users: bool,
+        cpu_gate: contextlib.AbstractAsyncContextManager, *,
+        target_username: str | None, target_role: str, session_username: str,
+        session_knowledge_rw: bool,
+        progress_cb: Callable[[float, int], Awaitable[None]] | None,
+    ) -> _SyncRun | None:
+        """The merge's inputs, under the sync lock: both manifests, the base,
+        the tombstones and holds, the plan with its stale-hold pass; None when
+        the satellite's manifest did not come or the trees are in sync."""
+        import asyncio as _asyncio
+
+        from core.remote import file_sync, remote_file_flow
+        from storage.files import (
+            file_author_store,
+            file_tombstones_store,
+            sync_state_store,
+        )
+
+        async with cpu_gate:
+            local_entries = await _run_sync_cpu(
+                file_sync.compute_manifest,
+                agent_dir,
+                target_username=target_username, target_role=target_role,
+                exclude_user_dirs=exclude_users,
+                # Cap the plan at what THIS machine accepts: pre-0.5.103
+                # satellites hard-reject >100MB, so bigger files must never
+                # enter their merge plan (doomed pushes / permanent churn).
+                max_file_size=self._cm.effective_sync_cap(machine_id),
+                # Marker-confirmed build-dir exclusions — ONLY for machines
+                # whose satellite ACKed the table (0.5.110+): both walks
+                # must apply the same rules or the diff churns.
+                ignore_rules=self._cm.effective_ignore_rules(machine_id),
+            )
+        # What the manifest can be trusted with is the asked connection's
+        # (a satellite updating mid-merge answers on a new one: a check
+        # after the reply would judge this manifest by that version).
+        report_skipped = self._cm.satellite_supports_skipped_manifest(machine_id)
+        absence_unknown = self._cm.satellite_absence_unreliable(machine_id)
+        restore_holds = self._cm.satellite_restores_holds(machine_id)
+        try:
+            ack = await self._cm.send_command(
+                machine_id,
+                manifest_request(self._cm, machine_id, agent_slug,
+                                 report_skipped=report_skipped),
+                timeout=30.0,
+            )
+        except RuntimeError as e:
+            logger.warning(
+                "request_manifest failed for %s: %s — skipping initial sync",
+                agent_slug, e,
+            )
+            return None
+        remote_entries = ack.get("files", []) or []
+        if not report_skipped:
+            # Only an asked satellite may answer an entry without a hash.
+            remote_entries = [e for e in remote_entries
+                              if not (isinstance(e, dict) and e.get("skipped"))]
+        remote_size = {
+            e.get("path", ""): int(e.get("size", 0) or 0)
+            for e in remote_entries
+        }
+        # What a push may expect to replace on the machine: the
+        # manifest's own stat of the file (its mtime travels as seconds,
+        # the satellite allows the rounding), "live" for one it did not
+        # list.
+        remote_stat = {
+            e.get("path", ""): {"size": int(e.get("size", 0) or 0),
+                                "mtime_ns": int(round(float(e.get("mtime", 0) or 0) * 1e9))}
+            for e in remote_entries if e.get("hash")
+        }
+
+        # Merge inputs: per-machine base, live tombstones, clock offset, and a
+        # lazy platform-author resolver for cross-user conflict detection.
+        base = await _asyncio.to_thread(
+            sync_state_store.load_for_machine_agent, machine_id, agent_slug,
+        )
+        tombstones = await _asyncio.to_thread(
+            file_tombstones_store.load_for_agent, agent_slug,
+        )
+        holds = await _asyncio.to_thread(
+            file_tombstones_store.load_holds_for_agent, agent_slug,
+        )
+        clock_offset = self._cm.get_clock_offset(machine_id)
+        satellite_user = target_username or ""  # the satellite-side writer (slug)
+
+        def _author_of(p: str):
+            return file_author_store.get(agent_slug, p)
+
+        # config/ is push-only by default, but an OWNER-tier session
+        # (manager/admin with a real username) curates config/ on its remote
+        # machine — let those edits sync BACK, matching the live-path
+        # can_write_back rule (config/ is STATIC, not regenerated per session,
+        # so there is nothing to clobber). An empty set drops config/ from
+        # push-only; .claude/.codex stay push-only (segments).
+        #
+        # The write-back identity is TWO-SOURCED: on a user-paired machine
+        # it is the machine owner (target_username — sessions there are the
+        # owner's); on an ADMIN-SHARED machine target_username is None BY
+        # DESIGN (it's the isolation filter, not a person), so the identity
+        # is the session's authenticated human (session_username). An
+        # orphaned-owner machine (target_username == "") stays fail-closed —
+        # no substitution.
+        _cwb_username = (
+            target_username if target_username is not None else session_username
+        )
+        push_only_dirs = (
+            set()
+            if (_roles.can_manage(target_role) and _cwb_username)
+            else set(file_sync.DEFAULT_PUSH_ONLY_PREFIXES)
+        )
+        # Knowledge-library mirrors: read-only attachments are
+        # platform-authoritative on every machine (push-only + scrubbed
+        # everywhere — the projector owns mirror content); writable
+        # attachments participate in the normal merge, with their
+        # (source, subdir) pairs feeding can_write_back's segment-wise
+        # subtree rule. Prefixes are PER LIBRARY subtree — the trailing
+        # slash keeps the prefix match segment-safe (an RO library
+        # ``marketing`` never covers ``marketing-extra``).
+        from storage.knowledge import db_knowledge_libraries
+        _attachments = await _asyncio.to_thread(
+            db_knowledge_libraries.attachments_for_consumer, agent_slug,
+        )
+        _lib_ro = {
+            (f"{layout.KNOWLEDGE}/shared/{a['source_agent']}/{a['subdir']}/"
+             if a["subdir"] else f"{layout.KNOWLEDGE}/shared/{a['source_agent']}/")
+            for a in _attachments if not a["writable"]
+        }
+        writable_libraries = frozenset(
+            (a["source_agent"], a["subdir"] or "")
+            for a in _attachments if a["writable"]
+        )
+        push_only_dirs |= _lib_ro
+        async with cpu_gate:
+            plan = await _run_sync_cpu(
+                file_sync.diff_manifests,
+                local_entries, remote_entries,
+                base=base, tombstones=tombstones, clock_offset=clock_offset,
+                author_of=_author_of, satellite_user=satellite_user,
+                push_only_dirs=push_only_dirs,
+                target_username=target_username, target_role=target_role,
+                session_username=session_username,
+                exclude_user_dirs=exclude_users,
+                writable_libraries=writable_libraries,
+                scrub_dirs=_lib_ro,
+                knowledge_rw=session_knowledge_rw,
+                absence_unknown=absence_unknown,
+                holds=holds,
+                restore_holds=restore_holds,
+            )
+
+        # A pull that settles a save the machine refused as stale in the
+        # machine's favour keeps the save in the recover bin first,
+        # whatever the merge's own rule says for the path (a person's own
+        # file, a same-user divergence): the save was explicit.
+        for action in plan.actions:
+            if (action.op == "pull" and not action.capture_side
+                    and remote_file_flow.stale_hold(machine_id, agent_slug, action.rel_path)):
+                action.capture_side = "platform"
+                action.capture_reason = "conflict"
+                action.notify_user = action.notify_user or _author_of(action.rel_path)
+
+        # Sync-delta telemetry (alert-only, never blocks or filters the
+        # sync): a huge planned pull of NEW satellite files usually means
+        # a build tree the sync-ignore table doesn't cover yet.
+        try:
+            from core.remote import sync_delta_alerts
+            _new_pulls = [a for a in plan.actions
+                          if a.op == "pull" and a.rel_path not in base]
+            if _new_pulls:
+                _subs: dict[str, int] = {}
+                _nbytes = 0
+                for a in _new_pulls:
+                    _subs[sync_delta_alerts._top_subtree(a.rel_path)] = (
+                        _subs.get(
+                            sync_delta_alerts._top_subtree(a.rel_path), 0) + 1)
+                    _nbytes += remote_size.get(a.rel_path, 0)
+                await sync_delta_alerts.maybe_alert(
+                    machine_id, agent_slug, source="reconcile",
+                    new_files=len(_new_pulls), new_bytes=_nbytes,
+                    subtree_counts=_subs)
+        except ImportError:
+            logger.debug("sync-delta telemetry failed", exc_info=True)
+
+        if not plan.actions and not plan.to_scrub:
+            logger.debug("Initial workspace sync for %s: in-sync", agent_slug)
+            return None
+
+        return _SyncRun(
+            machine_id=machine_id, agent_slug=agent_slug, agent_dir=agent_dir,
+            progress_cb=progress_cb, plan=plan, local_entries=local_entries,
+            remote_size=remote_size, remote_stat=remote_stat,
+            satellite_user=satellite_user,
+        )
+
+    async def _sync_apply(self, run: _SyncRun) -> list:
+        """The plan's foreground actions through the window, the scrubs, the
+        recover bin's cleanup and the losers' notices; the deferred pulls,
+        for the caller to kick once the sync lock is released."""
+        import asyncio as _asyncio
+
+        # Defer large, conflict-free PULLS to a background
+        # task so the CLI starts without waiting for satellite-side bulk content
+        # (e.g. a big media file the satellite holds). Pulls never touch the
+        # agent's disk → safe to defer. Everything else — ALL pushes, deletes,
+        # scrubs, noops, conflict-capture pulls, and small pulls — stays
+        # foreground (awaited before start_session).
+        foreground_actions, deferred_pulls = _partition_deferred_pulls(
+            run.plan.actions, run.remote_size,
+        )
+
+        run.local_mtime = {e.path: e.mtime for e in run.local_entries}
+        run.local_size = {e.path: e.size for e in run.local_entries}
+        # Created EAGERLY (not lazily on first capture): the windowed
+        # apply below runs actions concurrently, and a lazy nonlocal
+        # create could double-mkdtemp and leak the loser.
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+        run.recover_tmp = _Path(_tempfile.mkdtemp(prefix="oto-recover-"))
+        run.to_notify = []
+        run.n = {"push": 0, "pull": 0, "delete": 0, "scrub": 0, "capture": 0,
+                 "stale": 0, "done": 0}
+
+        # W2 (sync-performance): throttled progress ticks → progress_cb
+        # (the warmup wires it to the dashboard install bar; background
+        # sweeps pass None). Always fire the FINAL tick so the bar lands
+        # on 100% even under throttle.
+        run.total = len(foreground_actions)
+        run.last_tick = {"t": 0.0}
+        # The share of each push still on its way: a large file moves
+        # the row by its bytes, not only when it lands.
+        run.partial = {}
+
+        # W1 (sync-performance): WINDOWED PIPELINING. The satellite applies
+        # frames serially on its event loop either way — but awaiting each
+        # per-file ack before SENDING the next serialized the WIRE, so a
+        # 1,500-file first sync cost RTT × N (the 25-minute first-turn
+        # report). A bounded window keeps the wire full while preserving
+        # every correctness property: per-path ordering rides the global
+        # path lock INSIDE _apply, failures still log-and-continue (same
+        # as the old loop), and counters/lists only mutate on the loop
+        # thread. Big chunked pushes may interleave with small files —
+        # the writer lanes already order control frames ahead.
+        run.window = _asyncio.Semaphore(8)
+
+        await _asyncio.gather(
+            *(self._sync_apply_windowed(run, a) for a in foreground_actions)
+        )
+        await self._sync_progress_tick(run, final=True)
+
+        # Isolation scrubs (another user's data / agent-scope creds that leaked
+        # onto the satellite) — delete there, never captured, never base-tracked.
+        for rp in run.plan.to_scrub:
+            try:
+                await self._cm.send_fire_and_forget(
+                    run.machine_id,
+                    {"type": "file_push", "agent_slug": run.agent_slug,
+                     "action": "delete", "path": rp},
+                )
+                run.n["scrub"] += 1
+            except Exception:
+                logger.exception("isolation scrub delete failed for %s", rp)
+
+        if run.recover_tmp is not None:
+            import shutil as _shutil
+            _shutil.rmtree(run.recover_tmp, ignore_errors=True)
+
+        logger.info(
+            "Initial workspace sync for %s: pushed=%d pulled=%d deleted=%d "
+            "scrubbed=%d captured=%d stale=%d",
+            run.agent_slug, run.n["push"], run.n["pull"], run.n["delete"],
+            run.n["scrub"], run.n["capture"], run.n["stale"],
+        )
+
+        if run.to_notify:
+            await self._notify_conflict_losers(run.agent_slug, run.to_notify)
+        return deferred_pulls
+
+    async def _sync_progress_tick(self, run: _SyncRun, final: bool = False) -> None:
+        """A throttled tick to the run's progress_cb; a final tick always fires."""
+        import time as _time_mod
+
+        if run.progress_cb is None or run.total == 0:
+            return
+        now = _time_mod.monotonic()
+        if not final and now - run.last_tick["t"] < 0.5:
+            return
+        run.last_tick["t"] = now
+        try:
+            done = run.n["done"] + (0.0 if final else sum(run.partial.values()))
+            await run.progress_cb(done, run.total)
+        except Exception:  # noqa: BLE001  # a caller's progress callback must not fail the sync
+            logger.debug("sync progress_cb failed", exc_info=True)
+
+    async def _sync_pull_bytes(self, run: _SyncRun, rp: str) -> bytes | None:
+        """Pull the satellite's current copy of ``rp`` → bytes, or None on a
+        pull/read failure."""
+        from services.path_policy_v2 import PathRef
+
+        # _sync_apply makes the run's recovery dir before any action runs.
+        dest = cast("Path", run.recover_tmp) / uuid.uuid4().hex
+        ok = await self._cm.pull_file_to_path(
+            run.machine_id, PathRef("agent_tree", rp), dest, agent_slug=run.agent_slug,
+        )
+        if not ok:
+            return None
+        try:
+            return dest.read_bytes()
+        except OSError:
+            return None
+        finally:
+            with contextlib.suppress(OSError):
+                dest.unlink()
+
+    async def _sync_capture_loser(
+        self, run: _SyncRun, action,
+    ) -> tuple[dict, tuple | None] | None:
+        """Copy the LOSING side's current bytes to the recover-bin (a
+        cross-user conflict). Best-effort — the op proceeds regardless.
+        Returns the entry and the notice it queued, for a push the
+        machine then refuses to undo (``_uncapture``)."""
+        import asyncio as _asyncio
+
+        from storage.files import recover_bin_store
+
+        if action.capture_side == "satellite":
+            data = await self._sync_pull_bytes(run, action.rel_path)
+        elif action.capture_side == "platform":
+            data = await _asyncio.to_thread(_platform_bytes, run.agent_dir, action.rel_path)
+        else:
+            return None
+        if data is None:
+            return None
+        entry = await _asyncio.to_thread(
+            recover_bin_store.capture, run.agent_slug, action.rel_path,
+            data, action.capture_reason,
+        )
+        if entry is None:
+            return None
+        run.n["capture"] += 1
+        notice = None
+        if action.notify_user:
+            notice = (action.notify_user, entry["original_name"])
+            run.to_notify.append(notice)
+        return entry, notice
+
+    async def _sync_uncapture(self, run: _SyncRun, captured) -> None:
+        """The push the capture preceded did not replace the machine's
+        copy (a stale answer): nothing was lost, the entry goes and
+        its owner is not told their version was replaced."""
+        import asyncio as _asyncio
+
+        from storage.files import recover_bin_store
+
+        if captured is None:
+            return
+        entry, notice = captured
+        await _asyncio.to_thread(recover_bin_store.delete, entry["entry_id"])
+        run.n["capture"] -= 1
+        if notice is not None and notice in run.to_notify:
+            run.to_notify.remove(notice)
+
+    async def _sync_hold_stale(self, run: _SyncRun, rp: str, stale: dict) -> None:
+        """Mark the platform copy ahead of a machine that refused its push as stale."""
+        import asyncio as _asyncio
+
+        from core.remote import remote_file_flow
+
+        # The machine is changing the file: the platform copy is
+        # marked ahead there with the machine's stat as the
+        # baseline, so a read serves the platform copy and the next
+        # merge compares both.
+        try:
+            pst = await _asyncio.to_thread((run.agent_dir / rp).lstat)
+        except OSError:
+            return
+        remote_file_flow.note_platform_ahead(
+            run.machine_id, run.agent_slug, rp, pst.st_size, pst.st_mtime_ns,
+            machine=remote_file_flow.stale_machine_stat(stale), stale=True,
+        )
+        logger.info(
+            "Push of %s held: the file %s on the machine; the next merge "
+            "compares both copies", rp,
+            "changed since the manifest" if stale.get("reason") == "changed"
+            else "is being written",
+        )
+
+    async def _sync_apply_action(self, run: _SyncRun, action) -> None:
+        """One action under the global path lock; the dashboard refresh after it
+        only when the op changed the platform tree."""
+        from core.remote import remote_file_flow
+        from services.notifications import notification_manager
+
+        rp = action.rel_path
+        # Only a pull ADDS/UPDATES a file on the PLATFORM tree, so only a
+        # pull refreshes an open dashboard (set in the pull branch below).
+        pulled_to_platform = False
+        # Serialize each file against the live write-back path + other
+        # warmups on the SAME file (cross-machine) via the global lock.
+        lock = await remote_file_flow._acquire_global_path_lock(run.agent_slug, rp)
+        async with lock:
+            if action.op == "push":
+                pulled_to_platform = await self._sync_push(run, action, rp)
+            elif action.op == "pull":
+                pulled_to_platform = await self._sync_pull(run, action, rp)
+            elif action.op == "delete_satellite":
+                pulled_to_platform = await self._sync_delete_satellite(run, action, rp)
+            elif action.op == "delete_platform":
+                pulled_to_platform = await self._sync_delete_platform(run, action, rp)
+            elif action.op == "noop":
+                pulled_to_platform = await self._sync_noop(run, action, rp)
+
+        if pulled_to_platform:
+            # A pull (satellite file landed) OR a delete_platform (satellite
+            # out-of-turn delete propagated) just changed the platform tree →
+            # refresh any open dashboard workspace view,
+            # best-effort, outside the lock (it doesn't need it). push
+            # (platform→satellite) + delete_satellite (platform already
+            # lacks the file) don't change the platform tree, so they
+            # don't notify the dashboard.
+            await notification_manager.broadcast_file_updated(
+                run.agent_slug, rp, source="disk",
+            )
+
+    async def _sync_push(self, run: _SyncRun, action, rp: str) -> bool:
+        """The push op; False: a push never changes the platform tree."""
+        import asyncio as _asyncio
+
+        from core.remote import file_sync, remote_file_flow
+        from services.path_policy_v2 import PathRef
+        from storage.files import file_tombstones_store, sync_state_store
+
+        captured = None
+        if action.capture_side:
+            captured = await self._sync_capture_loser(run, action)
+        # Pass the PATH — push_file streams from disk (memory
+        # O(chunk) even at 1GB; a vanished file returns False
+        # into the existing failure path). It runs while the
+        # file moves (the connection's credit paces it), and
+        # its byte progress drives the row and keeps the
+        # session starting. The transfer gate (innermost,
+        # see its lock-order invariant) bounds the machine's
+        # concurrent LARGE pushes; sub-threshold files
+        # bypass it so a
+        # tiny-file warmup storm never queues behind a big
+        # fan-out. The push is pinned to the platform hash
+        # the merge planned on (the base it records): bytes
+        # changed since the manifest fail the push instead,
+        # and the failure drops the cached hash of the path.
+        from core.remote import transfer_gate
+
+        async def _bytes(sent: int, total: int, _rp=rp) -> None:
+            run.partial[_rp] = sent / max(total, 1)
+            await self._sync_progress_tick(run)
+
+        stale: dict = {}
+        async with transfer_gate.slot(
+            run.machine_id, run.agent_slug, rp,
+            run.local_size.get(rp, 0),
+        ):
+            ok = await self._cm.push_file(
+                run.machine_id, PathRef("agent_tree", rp),
+                run.agent_dir / rp,
+                agent_slug=run.agent_slug, progress_cb=_bytes,
+                content_hash=action.base_hash or None,
+                expect=run.remote_stat.get(rp, "live"), stale_out=stale,
+            )
+        if not ok and stale:
+            # Nothing replaced, the hash kept: the platform
+            # copy is as the manifest saw it, the machine's
+            # too (so the capture before the push undoes).
+            run.n["stale"] += 1
+            await self._sync_uncapture(run, captured)
+            await self._sync_hold_stale(run, rp, stale)
+            return False
+        if not ok:
+            # A push pinned to a stale cached hash fails at
+            # every sync until the next merge hashes it again.
+            file_sync.forget_hash(run.agent_dir / rp)
+            logger.warning("Push failed during initial sync: %s", rp)
+            return False
+        # The machine holds the platform copy: no read there
+        # may take it for a missed push (lane D's marker).
+        remote_file_flow.clear_platform_ahead(run.machine_id, run.agent_slug, rp)
+        run.n["push"] += 1
+        if action.base_hash:
+            await _asyncio.to_thread(
+                sync_state_store.record_one, run.machine_id, run.agent_slug,
+                rp, action.base_hash, run.local_mtime.get(rp, 0.0),
+            )
+        if action.drop_tombstone:
+            await _asyncio.to_thread(file_tombstones_store.drop, run.agent_slug, rp)
+        return False
+
+    async def _sync_pull(self, run: _SyncRun, action, rp: str) -> bool:
+        """The pull op; True once the satellite's bytes landed on the platform."""
+        import asyncio as _asyncio
+
+        from core.remote import file_sync, remote_file_flow
+        from services.path_policy_v2 import PathRef
+        from storage.files import (
+            file_author_store,
+            file_tombstones_store,
+            sync_state_store,
+        )
+
+        if action.capture_side:
+            await self._sync_capture_loser(run, action)
+        # The named path, never resolved: the pull opens it
+        # by components and refuses a link at any one.
+        if not file_sync.is_canonical_rel_path(rp):
+            logger.warning("initial-sync pull traversal blocked: %s", rp)
+            return False
+        dest = path_confinement.join_under(run.agent_dir, rp)
+        ok = await self._cm.pull_file_to_path(
+            run.machine_id, PathRef("agent_tree", rp), dest,
+            agent_slug=run.agent_slug,
+        )
+        if not ok:
+            logger.warning("Pull failed during initial sync: %s", rp)
+            return False
+        run.n["pull"] += 1
+        pulled_to_platform = True
+        # The machine's copy is the platform's now: no mark
+        # of an older platform copy ahead there stands.
+        remote_file_flow.clear_platform_ahead(run.machine_id, run.agent_slug, rp)
+        if action.keep_mtime is not None:
+            await _asyncio.to_thread(
+                _keep_mtime, run.agent_slug, rp, action.keep_mtime)
+        if action.base_hash:
+            try:
+                base_mtime = dest.stat().st_mtime
+            except OSError:
+                base_mtime = 0.0
+            await _asyncio.to_thread(
+                sync_state_store.record_one, run.machine_id, run.agent_slug,
+                rp, action.base_hash, base_mtime,
+            )
+            # The platform now holds the satellite user's bytes.
+            if run.satellite_user:
+                await _asyncio.to_thread(
+                    file_author_store.record, run.agent_slug, rp, run.satellite_user,
+                )
+        if action.drop_tombstone:
+            await _asyncio.to_thread(file_tombstones_store.drop, run.agent_slug, rp)
+        return pulled_to_platform
+
+    async def _sync_delete_satellite(self, run: _SyncRun, action, rp: str) -> bool:
+        """The delete_satellite op; False: the platform tree is unchanged."""
+        import asyncio as _asyncio
+
+        from storage.files import recover_bin_store, sync_state_store
+
+        # Capture the satellite's only copy BEFORE deleting. A pull
+        # failure means we do NOT delete (never cause unrecoverable
+        # loss from a transient blip) — the tombstone persists and
+        # we retry next sync.
+        data = await self._sync_pull_bytes(run, rp)
+        if data is None:
+            logger.warning(
+                "delete-sync: pull failed for %s/%s — NOT deleting",
+                run.agent_slug, rp,
+            )
+            return False
+        entry = await _asyncio.to_thread(
+            recover_bin_store.capture, run.agent_slug, rp, data, "deleted",
+        )
+        if entry is not None:
+            run.n["capture"] += 1
+        try:
+            await self._cm.send_fire_and_forget(
+                run.machine_id,
+                {"type": "file_push", "agent_slug": run.agent_slug,
+                 "action": "delete", "path": rp},
+            )
+            run.n["delete"] += 1
+        except Exception:
+            logger.exception("delete-sync failed for %s (backup kept)", rp)
+        if action.clear_base:
+            await _asyncio.to_thread(
+                sync_state_store.clear_one, run.machine_id, run.agent_slug, rp,
+            )
+        return False
+
+    async def _sync_delete_platform(self, run: _SyncRun, action, rp: str) -> bool:
+        """The delete_platform op; True once the platform copy is gone."""
+        import asyncio as _asyncio
+
+        from core.remote import file_sync
+        from storage.files import (
+            file_author_store,
+            file_tombstones_store,
+            sync_state_store,
+        )
+
+        # The satellite DELETED a file it had converged on, out-of-turn,
+        # with its tree still alive (delete-attribution). Capture
+        # the platform bytes to the recover-bin (7-day undo) FIRST, then
+        # delete the platform copy, tombstone it (so OTHER idle satellites
+        # drop it too), clear base+author, and fan the delete out. Under
+        # the global per-(agent, path) lock already held here.
+        if action.capture_side:
+            await self._sync_capture_loser(run, action)
+        if not file_sync.is_canonical_rel_path(rp):
+            logger.warning("delete_platform traversal blocked: %s", rp)
+            return False
+        # The name is removed beneath the agent's folder: a
+        # link at it goes (its target stays). A missing parent
+        # means the file is gone already. A link above it or a
+        # directory at it refuses, and a refused delete claims
+        # nothing: no tombstone, the base and the author kept,
+        # no fan-out, no dashboard refresh.
+        try:
+            await _asyncio.to_thread(
+                file_sync.apply_incoming_file, run.agent_dir, rp, "delete",
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning("delete_platform refused for %s: %s", rp, e)
+            return False
+        run.n["delete"] += 1
+        import time as _t
+        await _asyncio.to_thread(
+            file_tombstones_store.record, run.agent_slug, rp,
+            _t.time(), origin="satellite-idle-delete",
+        )
+        if action.clear_base:
+            await _asyncio.to_thread(
+                sync_state_store.clear_one, run.machine_id, run.agent_slug, rp,
+            )
+        await _asyncio.to_thread(
+            file_author_store.clear, run.agent_slug, rp,
+        )
+        from services.remote import workspace_fanout as _wf
+        await _wf.fan_out_delete(
+            run.agent_slug, rp, exclude_machine_id=run.machine_id,
+        )
+        pulled_to_platform = True  # platform tree changed → dashboard refresh
+        return pulled_to_platform
+
+    async def _sync_noop(self, run: _SyncRun, action, rp: str) -> bool:
+        """The noop op: the base and tombstone bookkeeping only; False."""
+        import asyncio as _asyncio
+
+        from storage.files import file_tombstones_store, sync_state_store
+
+        if action.base_hash:
+            await _asyncio.to_thread(
+                sync_state_store.record_one, run.machine_id, run.agent_slug,
+                rp, action.base_hash, run.local_mtime.get(rp, 0.0),
+            )
+        if action.clear_base:
+            await _asyncio.to_thread(
+                sync_state_store.clear_one, run.machine_id, run.agent_slug, rp,
+            )
+        if action.drop_tombstone:
+            await _asyncio.to_thread(file_tombstones_store.drop, run.agent_slug, rp)
+        return False
+
+    async def _sync_apply_windowed(self, run: _SyncRun, action) -> None:
+        """One action inside the run's window; a failure logs, the tick counts it."""
+        async with run.window:
+            try:
+                await self._sync_apply_action(run, action)
+            except Exception:
+                logger.exception(
+                    "initial-sync action failed for %s/%s",
+                    run.agent_slug, action.rel_path,
+                )
+            finally:
+                # The push's share leaves as its file counts done, so
+                # the row never steps back.
+                run.partial.pop(action.rel_path, None)
+                run.n["done"] += 1
+                await self._sync_progress_tick(run)
 
     async def _notify_conflict_losers(
         self, agent_slug: str, to_notify: list[tuple[str, str]],
@@ -1074,6 +1353,7 @@ class RemoteWorkspaceSyncMixin:
         The notification deep-links to the Recover button (no download)."""
         import asyncio as _asyncio
         from collections import defaultdict
+
         from services.notifications import notification_manager
         from storage import database
 

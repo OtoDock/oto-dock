@@ -10,10 +10,11 @@ import sys
 import pytest
 
 from tests._paths import PROXY_DIR
+
 if str(PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(PROXY_DIR))
 
-from services.mcp import mcp_manifest_parse as mp  # noqa: E402
+from services.mcp import mcp_manifest_parse as mp
 
 _BASE = {
     "name": "maps-grounding",

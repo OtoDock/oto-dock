@@ -16,7 +16,7 @@ export default function ClipboardIndicator({ clipboard, onPasteHere, onClear }: 
   const count = clipboard.paths.length
   const verb = clipboard.mode === 'cut' ? 'cut' : 'copied'
   return (
-    <div className="shrink-0 flex items-center gap-1 px-2 py-0.5 text-[11px] rounded-full bg-brand/10 text-brand border border-brand/30">
+    <div className="shrink-0 flex items-center gap-1 px-2 py-0.5 text-2xs rounded-full bg-action-subtle text-link">
       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
         <rect x="8" y="4" width="8" height="3" rx="1" />
         <path strokeLinecap="round" strokeLinejoin="round" d="M5 7h2v13a1 1 0 001 1h8a1 1 0 001-1V7h2" />
@@ -28,7 +28,7 @@ export default function ClipboardIndicator({ clipboard, onPasteHere, onClear }: 
         <button
           onClick={onPasteHere}
           title="Paste here"
-          className="ml-1 px-1.5 py-px rounded-sm bg-brand/20 hover:bg-brand/30 text-[10px]"
+          className="ml-1 px-1.5 py-px rounded-sm bg-action text-action-fg hover:bg-action-hover text-3xs"
         >
           Paste here
         </button>
@@ -37,7 +37,7 @@ export default function ClipboardIndicator({ clipboard, onPasteHere, onClear }: 
         onClick={onClear}
         title="Clear clipboard"
         aria-label="Clear clipboard"
-        className="ml-0.5 w-4 h-4 flex items-center justify-center rounded-full hover:bg-brand/20"
+        className="ml-0.5 w-4 h-4 flex items-center justify-center rounded-full hover:bg-action-subtle-hover"
       >
         <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />

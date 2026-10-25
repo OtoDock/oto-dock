@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from core.session import interactive_session as I  # noqa: E402
+from core.session import interactive_session as I
 
 # InteractiveSession binds the running loop in __init__ (same as test_dual_control).
 pytestmark = pytest.mark.asyncio
@@ -119,6 +119,15 @@ async def test_takeover_target_is_not_the_controller():
     s = _mk()
     assert s.may_drive(OWNER) is True    # nothing to take
     assert s.may_drive(OTHER) is False   # take-over path
+
+
+async def test_the_sole_driver_is_the_one_person_who_may_drive():
+    """Only the sole driver's socket holds the prompt slot, so a pushed
+    document's token is minted for them: the owner, and nobody when anyone
+    may drive (no owner recorded, a task chat)."""
+    assert _mk().sole_driver == OWNER
+    assert _mk(user_sub="").sole_driver == ""
+    assert _mk("task-run-42").sole_driver == ""
 
 
 async def test_author_sub_for_resolves_the_controller():

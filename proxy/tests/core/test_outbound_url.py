@@ -20,9 +20,13 @@ BLOCKED = [
     "198.18.0.1", "240.0.0.1", "0.0.0.0", "224.0.0.1",
     "::1", "::", "fe80::1", "fc00::1", "fec0::1", "ff02::1",
     "::ffff:127.0.0.1", "::ffff:10.0.0.1",
+    # A NAT64 address is judged by the IPv4 inside it.
+    "64:ff9b::7f00:1", "64:ff9b::a00:1", "64:ff9b::a9fe:a9fe",
     "nope", "",
 ]
-PUBLIC = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700::1111", "2001:4860:4860::8888"]
+PUBLIC = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700::1111", "2001:4860:4860::8888",
+          # a DNS64 resolver's answer for an IPv4-only name (8.8.8.8, 140.82.121.4)
+          "64:ff9b::808:808", "64:ff9b::8c52:7904"]
 
 
 @pytest.mark.parametrize("ip", BLOCKED)
@@ -100,6 +104,7 @@ def test_the_push_endpoint_guard_refuses_what_requests_reads_differently(monkeyp
 
 def test_a_web_push_follows_no_redirect(monkeypatch):
     import asyncio
+
     import config
     sent = {}
 

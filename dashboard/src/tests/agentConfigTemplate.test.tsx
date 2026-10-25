@@ -29,24 +29,29 @@ const h = vi.hoisted(() => ({
   user: { role: 'admin', sub: 'u1', agent_roles: {} as Record<string, string> },
 }))
 
+const updateAgent = vi.hoisted(() => ({ mutate: vi.fn(), mutateAsync: () => Promise.resolve({}) }))
 vi.mock('@/api/agents', () => ({
   useAgentInfo: () => ({ data: h.agentInfo, isLoading: false }),
-  useUpdateAgent: () => ({ mutate: vi.fn(), isPending: false }),
-  useDeleteAgent: () => ({ mutate: vi.fn(), isPending: false }),
+  // One function for every render, as TanStack's own: the page's save
+  // effects list it.
+  useUpdateAgent: () => ({ mutate: updateAgent.mutate, mutateAsync: updateAgent.mutateAsync, isPending: false }),
+  useDeleteAgent: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false }),
   useDelegationTargets: () => ({ data: undefined }),
-  useSetDelegationTargets: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetDelegationTargets: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
   useExecutionLayers: () => ({ data: undefined }),
   useSetDefaultForNewUsers: () => ({ mutate: vi.fn() }),
   useAgentUsers: () => ({ data: [] }),
   AgentUpdateError: class AgentUpdateError extends Error {},
   useKnowledgeAttachments: () => ({ data: undefined }),
   useKnowledgeLibraries: () => ({ data: undefined }),
-  useSetKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
-  useAttachKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
-  useDetachKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
+  useAttachKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
+  useDetachKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
   useAgentFiles: () => ({ data: undefined }),
 }))
-vi.mock('@/api/remoteMachines', () => ({ useRemoteMachines: () => ({ data: [] }) }))
+vi.mock('@/api/remoteMachines', async (orig) => ({
+  ...(await orig<typeof import('@/api/remoteMachines')>()), useRemoteMachines: () => ({ data: [] }),
+}))
 vi.mock('@/api/departments', () => ({ useDepartments: () => ({ data: [] }) }))
 vi.mock('@/api/memory', () => ({
   useAgentMemorySettings: () => ({
@@ -56,8 +61,8 @@ vi.mock('@/api/memory', () => ({
       master: { user_memory_enabled: true, agent_memory_enabled: true },
     },
   }),
-  useSetAgentMemoryToggle: () => ({ mutate: vi.fn() }),
-  useClearAgentMemory: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetAgentMemoryToggle: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})) }),
+  useClearAgentMemory: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
 }))
 vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: h.user }),
@@ -126,7 +131,7 @@ describe('AgentConfig — the template update banner', () => {
     renderConfig()
     const banner = screen.getByTestId('template-update-banner')
     expect(banner.textContent).toContain('Version 3.0.0')
-    expect(banner.textContent).toContain('installed: 2.0.0')
+    expect(banner.textContent).toContain('and you have 2.0.0')
     expect((screen.getByRole('button', { name: 'Update' }) as HTMLButtonElement).disabled).toBe(false)
     expect(screen.getByTestId('template-row').textContent).toContain('version 2.0.0')
   })

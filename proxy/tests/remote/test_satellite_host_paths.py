@@ -20,17 +20,19 @@ async def _pass_async(*a, **kw):
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 _REPO_ROOT = _PROXY_DIR.parent
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from auth.path_policy import SecurityContext  # noqa: E402
-from core.remote import remote_file_flow as rff # noqa: E402
-from satellite.sessions.session_manager import _validate_satellite_host_path  # noqa: E402
+from auth.path_policy import SecurityContext
 from core import placement
-
+from core.remote import remote_file_flow as rff
+from satellite.sessions.session_manager import (
+    _validate_satellite_host_path,
+)
 
 # ---------------------------------------------------------------------------
 # Satellite-side defensive validation
@@ -235,7 +237,7 @@ class TestPushBackHostPath:
         assert ref.value == "/home/alice/Desktop/foo.png"
         # Streaming refactor (1.4.0): push_file receives the cache PATH.
         from pathlib import Path as _P
-        assert _P(call.args[2]).read_bytes() == b"new-bytes"
+        assert _P(call.args[2]).read_bytes() == b"new-bytes"  # noqa: ASYNC240  # a test's own temporary files
 
     @pytest.mark.asyncio
     async def test_missing_sidecar_returns_false(self, tmp_path):
@@ -297,6 +299,7 @@ class TestResolvePathHookSatelliteHost:
     def client(self, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from api.hooks import hooks as hooks_mod, paths
 
         app = FastAPI()
@@ -621,6 +624,7 @@ class TestFileWrittenHookDispatch:
     def client(self, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from api.hooks import hooks as hooks_mod, lifecycle
 
         app = FastAPI()
@@ -732,6 +736,7 @@ class TestFileWrittenHookDispatch:
         a workspace preview) learns of a file-tools write: a disk change,
         whatever the push to the machine answered."""
         from unittest.mock import AsyncMock
+
         from services.notifications import notification_manager
         bc = AsyncMock()
         monkeypatch.setattr(notification_manager, "broadcast_file_updated", bc)
@@ -740,7 +745,7 @@ class TestFileWrittenHookDispatch:
         )
         monkeypatch.setattr("core.remote.remote_file_flow.is_host_cache_path", lambda p: False)
         monkeypatch.setattr("core.remote.remote_file_flow.push_back", AsyncMock(return_value=False))
-        post = lambda path: client.post("/v1/hooks/file-written", json={  # noqa: E731
+        post = lambda path: client.post("/v1/hooks/file-written", json={
             "session_id": "s1", "path": path,
         }, headers={"Authorization": "Bearer test"})
 
@@ -767,6 +772,7 @@ class TestFileWrittenHookDispatch:
         import hashlib
         from collections import OrderedDict
         from unittest.mock import AsyncMock
+
         import config
         from api.hooks import preview
         from api.media.wopi import encode_file_id
@@ -784,7 +790,7 @@ class TestFileWrittenHookDispatch:
             "api.hooks.lifecycle.get_session_security", lambda sid: _make_remote_ctx(),
         )
         monkeypatch.setattr("core.remote.remote_file_flow.is_remote_session", lambda sid: False)
-        post = lambda: client.post("/v1/hooks/file-written", json={  # noqa: E731
+        post = lambda: client.post("/v1/hooks/file-written", json={
             "session_id": "s1", "path": "my-agent/workspace/r.docx",
         }, headers={"Authorization": "Bearer test"})
         post()
@@ -795,6 +801,7 @@ class TestFileWrittenHookDispatch:
 
     def test_a_host_cache_write_announces_nothing(self, client, monkeypatch):
         from unittest.mock import AsyncMock
+
         from services.notifications import notification_manager
         bc = AsyncMock()
         monkeypatch.setattr(notification_manager, "broadcast_file_updated", bc)
@@ -874,8 +881,9 @@ class TestFileWrittenHookDispatch:
         post passes the canonical gate after the fold and the satellite push
         goes out with the canonical rel. This is the path the old mocked test
         never exercised."""
-        import config
         from unittest.mock import MagicMock
+
+        import config
 
         monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
         monkeypatch.setattr("auth.path_policy._AGENTS_DIR", tmp_path.resolve())
@@ -904,12 +912,12 @@ class TestFileWrittenHookDispatch:
 
         pushed: dict = {}
 
-        async def fake_push_file(machine_id, ref, content, *, agent_slug=""):
+        async def fake_push_file(machine_id, ref, content, *, agent_slug="", **kw):
             from pathlib import Path
             pushed["machine_id"] = machine_id
             pushed["rel"] = ref.value
             # A path push_file streams from (push_back's open descriptor).
-            pushed["content"] = Path(content).read_bytes()
+            pushed["content"] = Path(content).read_bytes()  # noqa: ASYNC240  # a test's own temporary files
             return True
 
         mock_cm = MagicMock()
@@ -958,6 +966,7 @@ class TestResolvePathWriteRbac:
     def client(self, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from api.hooks import hooks as hooks_mod, paths
 
         app = FastAPI()
@@ -1023,6 +1032,7 @@ class TestClassifyGateHostCache:
 
     def test_own_session_cache_path_serves(self, tmp_path, monkeypatch):
         import asyncio
+
         from api.hooks import paths
         sid = self._setup(tmp_path, monkeypatch)
         cache = rff.host_cache_session_root(sid) / "abcd1234"
@@ -1035,6 +1045,7 @@ class TestClassifyGateHostCache:
 
     def test_other_sessions_cache_denied(self, tmp_path, monkeypatch):
         import asyncio
+
         from api.hooks import paths
         sid = self._setup(tmp_path, monkeypatch)
         other = rff.host_cache_session_root("sess-OTHER") / "abcd1234"
@@ -1061,8 +1072,9 @@ class TestClassifyHeldPath:
     the resolution carries the reason the routes show."""
 
     def _setup(self, tmp_path, monkeypatch, role="viewer", sid="sess-held"):
-        import config
         from types import SimpleNamespace
+
+        import config
         monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
         from core.session import session_state
         monkeypatch.setitem(session_state._session_security, sid, SecurityContext(
@@ -1081,6 +1093,7 @@ class TestClassifyHeldPath:
 
     def test_the_platform_copy_is_served(self, tmp_path, monkeypatch):
         import asyncio
+
         from api.hooks import paths
         sid = self._setup(tmp_path, monkeypatch)
         f = tmp_path / "pa" / "knowledge" / "notes.md"
@@ -1092,6 +1105,7 @@ class TestClassifyHeldPath:
 
     def test_none_with_the_reason_when_the_platform_lacks_it(self, tmp_path, monkeypatch):
         import asyncio
+
         from api.hooks import paths
         sid = self._setup(tmp_path, monkeypatch)
         (tmp_path / "pa").mkdir()
@@ -1111,6 +1125,7 @@ class TestPullThroughMirrorFallback:
     def test_failed_satellite_pull_serves_platform_mirror(self, tmp_path, monkeypatch):
         import asyncio
         from types import SimpleNamespace
+
         import config
         monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
 
@@ -1149,6 +1164,7 @@ class TestPullThroughMirrorFallback:
     def test_failed_pull_no_mirror_still_none(self, tmp_path, monkeypatch):
         import asyncio
         from types import SimpleNamespace
+
         import config
         monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
         (tmp_path / "pa").mkdir()
@@ -1185,13 +1201,14 @@ class TestHostCachePreviewEditMint:
     """A host-cache doc (Desktop/Downloads pulled through THIS session's
     cache) mints an EDIT token for the turn's person when they are the
     session's own person with a write-capable role — PutFile then pushes back
-    to the real file. Anyone else views: a teammate's turn, a run with no
-    person, another session's cache, a viewer."""
+    to the real file. Anyone else views: a teammate's turn, another
+    session's cache, a viewer. A run with no person mints nothing."""
 
     @pytest.fixture
     def client(self, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from api.hooks import hooks as hooks_mod, preview
 
         app = FastAPI()
@@ -1267,7 +1284,7 @@ class TestHostCachePreviewEditMint:
         }, headers={"Authorization": "Bearer test"})
         assert r.status_code == 200, r.text
         assert "tok" not in r.text
-        return minted["permissions"]
+        return minted.get("permissions")
 
     def test_the_token_never_rides_the_url(self, client, monkeypatch, tmp_path, temp_db):
         """F57: the live event carries the token beside a tokenless URL and
@@ -1276,11 +1293,11 @@ class TestHostCachePreviewEditMint:
         pushed = []
 
         class _Q:
-            async def put(self, item):
+            def put_nowait(self, item):
                 pushed.append(item)
 
         monkeypatch.setattr(preview, "get_permission_queue", lambda sid: _Q())
-        self._mint(client, monkeypatch, tmp_path, role="editor")
+        self._mint(client, monkeypatch, tmp_path, role="editor", person="sub-u")
         evt = pushed[-1]
         assert evt["access_token"] == "tok" and evt["access_token_ttl"] == 3600
         assert "access_token" not in evt["wopi_url"]
@@ -1295,13 +1312,13 @@ class TestHostCachePreviewEditMint:
     ):
         assert self._mint(client, monkeypatch, tmp_path, role="manager", person="sub-v") == "view"
 
-    def test_a_run_with_no_person_views(self, client, monkeypatch, tmp_path, temp_db):
-        # The token reaches whoever opens the chat (an agent-scope run's
-        # chat opens to every user of the agent).
-        assert self._mint(client, monkeypatch, tmp_path, role="manager") == "view"
+    def test_a_run_with_no_person_mints_nothing(self, client, monkeypatch, tmp_path, temp_db):
+        # Whoever opens the chat (an agent-scope run's chat opens to every
+        # user of the agent) mints their own at the pane.
+        assert self._mint(client, monkeypatch, tmp_path, role="manager") is None
 
     def test_viewer_stays_view(self, client, monkeypatch, tmp_path, temp_db):
-        assert self._mint(client, monkeypatch, tmp_path, role="viewer") == "view"
+        assert self._mint(client, monkeypatch, tmp_path, role="viewer", person="sub-u") == "view"
 
     def test_other_sessions_cache_stays_view(
         self, client, monkeypatch, tmp_path, temp_db,
@@ -1311,13 +1328,14 @@ class TestHostCachePreviewEditMint:
         # rels → view-only even for a manager.
         assert self._mint(
             client, monkeypatch, tmp_path, role="manager",
-            cache_session="sess-OTHER", req_session="sess-1",
+            cache_session="sess-OTHER", req_session="sess-1", person="sub-u",
         ) == "view"
 
     def test_download_token_is_minted_off_the_loop(
         self, client, monkeypatch, tmp_path, temp_db,
     ):
         import asyncio
+
         from storage import database as task_store
         real = task_store.create_media_token
 
@@ -1355,6 +1373,7 @@ class TestResolvePathDisplayPathCarveOut:
     def client(self, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from api.hooks import hooks as hooks_mod, paths
 
         app = FastAPI()

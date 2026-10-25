@@ -44,13 +44,3 @@ def test_auto_pick_and_stt_language_param():
     assert stt_language_param(None) == "multi"
     assert stt_language_param("el-GR") == "el-GR"
 
-
-def test_pcm16_to_wav_wraps_the_samples():
-    import io
-    import wave
-    from audio.streaming.lang import pcm16_to_wav
-    pcm = b"\x01\x00" * 800
-    data = pcm16_to_wav(pcm, 8000)
-    with wave.open(io.BytesIO(data), "rb") as w:
-        assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, 8000)
-        assert w.readframes(800) == pcm

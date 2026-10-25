@@ -10,6 +10,9 @@ import type {
   Integration,
 } from '../../api/credentials'
 import type { AccountsOps } from './types'
+import { useDialogs } from '../ui/dialogs'
+import Button from '../ui/Button'
+import { Input } from '../ui/Field'
 
 interface Props {
   integration: Integration
@@ -19,6 +22,7 @@ interface Props {
 }
 
 export function PlainCredsAccountForm({ integration, account, ops, onDone }: Props) {
+  const dialogs = useDialogs()
   const [values, setValues] = useState<Record<string, string>>({})
   const [accountLabel, setAccountLabel] = useState(
     account?.account_label || '',
@@ -52,11 +56,11 @@ export function PlainCredsAccountForm({ integration, account, ops, onDone }: Pro
 
   const handleRemove = async () => {
     if (!account) return
-    if (
-      !confirm(
-        `Remove ${account.display_email || account.account_label} from ${integration.display_name}?`,
-      )
-    )
+    if (!(await dialogs.confirm({
+      title: `Remove ${account.display_email || account.account_label} from ${integration.display_name}?`,
+      confirmLabel: 'Remove',
+      tone: 'danger',
+    })))
       return
     try {
       await ops.deleteIntegration.mutateAsync({
@@ -74,25 +78,24 @@ export function PlainCredsAccountForm({ integration, account, ops, onDone }: Pro
     <div className="space-y-3">
       {requireLabel && (
         <div>
-          <label className="block text-sm text-p-text-secondary mb-1">
+          <label className="block text-sm text-secondary mb-1">
             Account label
           </label>
-          <input
+          <Input
             type="text"
             placeholder="e.g. Work, Personal"
             value={accountLabel}
             onChange={(e) => setAccountLabel(e.target.value)}
-            className="w-full px-3 py-2 border border-p-border-light rounded-lg text-sm bg-white dark:bg-gray-900 focus:outline-hidden focus:ring-1 focus:ring-brand text-p-text placeholder:text-p-text-light"
           />
-          <div className="text-xs text-p-text-light mt-1">
-            Choose a friendly name to tell accounts apart (defaults to the
-            email/username you enter below).
+          <div className="text-xs text-tertiary mt-1">
+            Choose a friendly name to tell accounts apart. Left empty, it is
+            the email or username you enter below.
           </div>
         </div>
       )}
 
       {account?.missing_required?.length ? (
-        <div className="text-xs text-amber-700 dark:text-amber-400">
+        <div className="text-xs text-status-warning-fg">
           This account needs {account.missing_required.join(', ')} before
           its agents can use it.
         </div>
@@ -100,48 +103,45 @@ export function PlainCredsAccountForm({ integration, account, ops, onDone }: Pro
 
       {fields.map((field: CredentialField) => (
         <div key={field.key}>
-          <label className="block text-sm text-p-text-secondary mb-1">
+          <label className="block text-sm text-secondary mb-1">
             {field.label}
             {field.required === false && (
-              <span className="text-p-text-light ml-1">(optional)</span>
+              <span className="text-tertiary">, optional</span>
             )}
           </label>
-          <input
+          <Input
             type={field.input_type === 'password' ? 'password' : 'text'}
             placeholder={
               account?.configured_keys.includes(field.key)
-                ? '(configured)'
+                ? 'Configured'
                 : ''
             }
             value={values[field.key] || ''}
             onChange={(e) =>
               setValues((prev) => ({ ...prev, [field.key]: e.target.value }))
             }
-            className="w-full px-3 py-2 border border-p-border-light rounded-lg text-sm bg-white dark:bg-gray-900 focus:outline-hidden focus:ring-1 focus:ring-brand text-p-text placeholder:text-p-text-light"
           />
         </div>
       ))}
 
       <div className="flex gap-2">
-        <button
+        <Button variant="primary" size="md"
           onClick={handleSave}
           disabled={ops.setIntegration.isPending}
-          className="px-4 py-2 bg-brand hover:bg-brand-hover text-white rounded-lg text-sm disabled:opacity-50"
         >
           {ops.setIntegration.isPending ? 'Saving...' : account ? 'Save' : 'Add account'}
-        </button>
+        </Button>
         {account && (
-          <button
+          <Button variant="danger" size="md"
             onClick={handleRemove}
             disabled={ops.deleteIntegration.isPending}
-            className="px-4 py-2 border border-p-accent-red text-p-accent-red rounded-lg text-sm hover:bg-red-50 dark:hover:bg-red-900/20"
           >
             {ops.deleteIntegration.isPending ? 'Removing...' : 'Remove'}
-          </button>
+          </Button>
         )}
       </div>
 
-      {error && <div className="text-sm text-p-accent-red">{error}</div>}
+      {error && <div className="text-sm text-status-danger-fg">{error}</div>}
     </div>
   )
 }

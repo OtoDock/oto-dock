@@ -7,13 +7,21 @@ import {
   AgentMcpsNotVisibleError,
 } from '../../api/mcps'
 import CommunityMcpsBrowser from '../../components/CommunityMcpsBrowser'
-import McpCategoryFilter, { matchesMcpCategory, type McpCategoryFilterValue } from '../../components/McpCategoryFilter'
+import McpCategoryFilter from '../../components/McpCategoryFilter'
 import McpIcon from '../../components/McpIcon'
 import { ServiceAccountBindingDropdown } from '../../components/ServiceAccountBindingDropdown'
 import { useAuth } from '../../contexts/AuthContext'
 import { useAgentInfo } from '../../api/agents'
 import { ROLE, canManageAgent } from '../../lib/permissions'
+import { toastError } from '../../lib/http/apiJson'
 import { availableScopes, modeOfAgent } from '../../lib/visibility'
+import { matchesMcpCategory, type McpCategoryFilterValue } from '../../lib/mcp/categories'
+import Button from '../../components/ui/Button'
+import { Input } from '../../components/ui/Field'
+import InfoTip from '../../components/ui/InfoTip'
+import { BADGE_BASE, BADGE_TONE, CARD } from '../../components/ui/classes'
+import { SaveState } from '../../components/ui/SettingsControls'
+import { useSaveState } from '../../hooks/useSaveState'
 
 export default function AgentMcps() {
   const { name } = useParams<{ name: string }>()
@@ -26,13 +34,17 @@ export default function AgentMcps() {
   const { data: skills } = useAgentSkills(name!, canManage)
   const { data: info } = useAgentInfo(name!)
   const setMcps = useSetAgentMcps()
+  const { stateOf, run } = useSaveState()
   // A service-scope subscription runs in the agent's agent scope; a
   // Personal-only agent has none, so its binding row offers no subscriptions.
   const agentScopeAvailable = !!info && availableScopes(modeOfAgent(info)).includes('agent')
 
   // `selected` mirrors the in-flight enabled set the manager is editing.
   const [selected, setSelected] = useState<Set<string>>(new Set())
-  const [saved, setSaved] = useState(false)
+  // Bumped when the last queued save settles: the toggles then show the
+  // server's set (after a failure too), which the sync below skips while a
+  // save runs.
+  const [settled, setSettled] = useState(0)
   const [showBrowse, setShowBrowse] = useState(false)
   const [query, setQuery] = useState('')
   const [categoryFilter, setCategoryFilter] = useState<McpCategoryFilterValue>('all')
@@ -52,24 +64,24 @@ export default function AgentMcps() {
     if (mcpData && !busyRef.current && !queuedRef.current) {
       setSelected(new Set(mcpData.mcps.filter(m => m.enabled).map(m => m.name)))
     }
-  }, [mcpData])
+  }, [mcpData, settled])
 
   if (!canManage) {
     return (
-      <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-xl px-4 py-3 text-xs text-amber-800 dark:text-amber-200">
+      <div className="bg-status-warning-bg border border-status-warning-border rounded-card px-4 py-3 text-xs text-status-warning-fg">
         <strong>Read-only.</strong> MCP assignments and service-account bindings
         are owner-only.{' '}
         {agentRole === ROLE.EDITOR
-          ? 'As an editor you can collaborate on the agent\'s shared workspace; agent behavior is curated by an owner.'
+          ? 'As an editor you can work on the agent\'s shared workspace. An owner sets how the agent behaves.'
           : agentRole === ROLE.CONTRIBUTOR
-            ? 'As a contributor you can add files to the agent\'s shared workspace; agent behavior is curated by an owner.'
-            : 'As a viewer you can chat with the agent; only owners see and change its MCPs.'}
+            ? 'As a contributor you can add files to the agent\'s shared workspace. An owner sets how the agent behaves.'
+            : 'As a viewer you can chat with the agent. Only owners see and change its MCPs.'}
       </div>
     )
   }
 
   if (isLoading || !mcpData) {
-    return <div className="text-sm text-p-text-light">Loading...</div>
+    return <div className="text-sm text-tertiary">Loading...</div>
   }
 
   // Autosave per toggle (platform convention — the Save button lived at the
@@ -78,29 +90,23 @@ export default function AgentMcps() {
   const saveSet = (next: Set<string>) => {
     if (busyRef.current) { queuedRef.current = next; return }
     busyRef.current = true
-    setMcps.mutate(
-      { agent: name!, mcps: Array.from(next) },
-      {
-        onSuccess: () => {
-          setSaved(true)
-          setTimeout(() => setSaved(false), 2000)
-        },
-        onError: err => {
-          if (err instanceof AgentMcpsNotVisibleError) {
-            setStaleNames(err.notVisible)
-            setTimeout(() => setStaleNames(null), 5000)
-          }
-          // Resync the toggles to the server's truth on any failure.
-          refetch()
-        },
-        onSettled: () => {
-          busyRef.current = false
-          const queued = queuedRef.current
-          queuedRef.current = null
-          if (queued) saveSet(queued)
-        },
+    void run('mcps', () => setMcps.mutateAsync({ agent: name!, mcps: Array.from(next) }), {
+      onFail: (err) => {
+        if (err instanceof AgentMcpsNotVisibleError) {
+          setStaleNames(err.notVisible)
+          setTimeout(() => setStaleNames(null), 5000)
+        } else {
+          toastError('The MCPs were not saved')(err)
+        }
+        void refetch()
       },
-    )
+    }).finally(() => {
+      busyRef.current = false
+      const queued = queuedRef.current
+      queuedRef.current = null
+      if (queued) saveSet(queued)
+      else setSettled((n) => n + 1)
+    })
   }
 
   const handleToggle = (mcpName: string) => {
@@ -135,48 +141,45 @@ export default function AgentMcps() {
       <div className="mb-8">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center mb-4">
           <div className="flex items-center gap-3">
-            <h2 className="text-base font-bold text-p-text">MCP Assignments</h2>
-            {saved && <span className="text-xs text-green-600">Saved</span>}
+            <h2 className="text-base font-bold text-primary">MCP Assignments</h2>
+            <SaveState state={stateOf('mcps')} />
           </div>
           <div className="flex items-center gap-2 sm:ml-auto sm:flex-1 sm:max-w-md">
             <div className="relative flex-1 min-w-0">
-              <svg className="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-p-text-light pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg className="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-tertiary pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z" />
               </svg>
-              <input
+              <Input
                 type="text"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search MCPs…"
-                className="w-full pl-8 pr-7 py-1.5 text-sm rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
+                className="pl-8 pr-7"
               />
               {query && (
                 <button
                   onClick={() => setQuery('')}
                   aria-label="Clear search"
-                  className="absolute right-2 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded-sm text-p-text-light hover:text-p-text hover:bg-p-surface-hover"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded-sm text-tertiary hover:text-primary hover:bg-surface-hover"
                 >
                   ×
                 </button>
               )}
             </div>
             <McpCategoryFilter value={categoryFilter} onChange={setCategoryFilter} counts={categoryCounts} />
-            <button
-              onClick={() => setShowBrowse(true)}
-              className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text hover:bg-p-surface-hover transition-colors"
-            >
+            <Button onClick={() => setShowBrowse(true)} className="shrink-0">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
               </svg>
               Browse<span className="hidden sm:inline"> Community</span>
-            </button>
+            </Button>
           </div>
         </div>
 
         {staleNames && staleNames.length > 0 && (
-          <div className="mb-3 px-3 py-2 rounded-lg border border-amber-300 bg-amber-50 dark:border-amber-900/50 dark:bg-amber-900/20 text-xs text-amber-800 dark:text-amber-300">
-            These MCPs are no longer available for this agent (admin revoked
-            access): <strong>{staleNames.join(', ')}</strong>. The list has been
+          <div className="mb-3 px-3 py-2 rounded-card border border-status-warning-border bg-status-warning-bg text-xs text-status-warning-fg">
+            These MCPs are no longer available for this agent because an admin
+            revoked access: <strong>{staleNames.join(', ')}</strong>. The list has been
             refreshed.
           </div>
         )}
@@ -185,44 +188,38 @@ export default function AgentMcps() {
           {filteredMcps.map(mcp => (
             <div
               key={mcp.name}
-              className="px-3 py-2.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface hover:bg-p-surface-hover/50 transition-colors"
+              className={`${CARD} px-3 py-2.5 hover:bg-surface-hover transition-colors`}
             >
-              <label className="flex items-center gap-3 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={selected.has(mcp.name)}
-                  onChange={() => handleToggle(mcp.name)}
-                  className="w-4 h-4 rounded-sm border-gray-300 text-brand focus:ring-brand accent-brand"
-                />
-                <McpIcon size="sm" name={mcp.name} label={mcp.label} category={mcp.category} author={mcp.author} hasIcon={mcp.icon} />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center flex-wrap gap-1">
-                    <span className="text-sm text-p-text">{mcp.label}</span>
-                    {mcp.authorized_by === 'admin' && (
-                      <span
-                        className="text-[10px] px-1.5 py-0.5 rounded-sm bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
-                        title="Made available by admin via an instance assignment. You can still enable or disable it for this agent."
-                      >
-                        via admin
-                      </span>
-                    )}
-                    {(skillCounts.get(mcp.name) ?? 0) > 0 && (
-                      <Link
-                        to={`/agents/${name}/skills`}
-                        className="text-[10px] px-1.5 py-0.5 rounded-sm bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 dark:hover:bg-purple-900/50 transition-colors"
-                        title="This MCP bundles skills — manage them on the Skills tab"
-                      >
-                        provides {skillCounts.get(mcp.name)} skill{skillCounts.get(mcp.name) === 1 ? '' : 's'} →
-                      </Link>
-                    )}
-                  </div>
-                  {mcp.description && (
-                    <p className="text-xs text-p-text-light mt-0.5 line-clamp-2">
-                      {mcp.description}
-                    </p>
-                  )}
-                </div>
-              </label>
+              <div className="flex items-center flex-wrap gap-1">
+                <label className="flex items-center gap-3 min-w-0 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(mcp.name)}
+                    onChange={() => handleToggle(mcp.name)}
+                    className="w-4 h-4 shrink-0 rounded-sm accent-action"
+                  />
+                  <McpIcon size="sm" name={mcp.name} label={mcp.label} category={mcp.category} author={mcp.author} hasIcon={mcp.icon} />
+                  <span className="text-sm text-primary">{mcp.label}</span>
+                </label>
+                {mcp.description && <InfoTip label={mcp.label}>{mcp.description}</InfoTip>}
+                {mcp.authorized_by === 'admin' && (
+                  <span
+                    className={`${BADGE_BASE} ${BADGE_TONE.info}`}
+                    title="Made available by admin via an instance assignment. You can still enable or disable it for this agent."
+                  >
+                    Via admin
+                  </span>
+                )}
+                {(skillCounts.get(mcp.name) ?? 0) > 0 && (
+                  <Link
+                    to={`/agents/${name}/skills`}
+                    className={`${BADGE_BASE} ${BADGE_TONE.agent} hover:underline`}
+                    title="This MCP bundles skills. Manage them on the Skills tab."
+                  >
+                    provides {skillCounts.get(mcp.name)} skill{skillCounts.get(mcp.name) === 1 ? '' : 's'} →
+                  </Link>
+                )}
+              </div>
               {/* Service-account binding dropdown — only for MCPs whose
                   manifest declares one (probing every row painted a 400 in
                   the console per non-capable MCP; the dropdown still
@@ -239,7 +236,7 @@ export default function AgentMcps() {
           ))}
         </div>
         {filteredMcps.length === 0 && (
-          <p className="text-sm text-p-text-light py-4">No MCPs match your search.</p>
+          <p className="text-sm text-tertiary py-4">No MCPs match your search.</p>
         )}
       </div>
 

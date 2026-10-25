@@ -9,20 +9,21 @@ Two-pass gate:
   Pass 2 (existing):    mode-based logic (default/acceptEdits/plan/dontAsk)
 """
 
+import contextlib
 import posixpath
 import re
 from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 
 import config
+from auth import roles
+from core import layout
 from core.events import tool_roles
 from core.placement import PlacementCapabilities
+
 # str-typed readers: a duck-typed / mocked context must never look external
 # (a truthy stand-in attribute would otherwise become a host path).
 from core.session.external_identity import external_home_of, is_external_ctx
-from auth import roles
-from core import layout
-
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -124,6 +125,13 @@ class SecurityContext:
     external_ephemeral: bool = False
     external_verified: bool = False  # the daemon's PIN gate passed
     external_claim: str = ""
+    # The SSH hosts the agent's ssh-hosts instances name, as ``(host, user)``
+    # pairs (``path_shell_hosts.attached_host``): the opening the command gate
+    # gives a manager or editor on the local sandbox. Filled by the permission
+    # hook for one call from the live instances, never stored with meaning (a
+    # stored context holds ``()``; compare=False keeps a reloaded one equal).
+    # ``None``: the hook could not read them, and the call is refused so.
+    ssh_hosts: tuple | None = field(default=(), compare=False)
 
     @property
     def is_external(self) -> bool:
@@ -231,13 +239,21 @@ def _path_under(resolved: Path, parent: Path) -> bool:
 
 
 def _resolve_path(raw: str) -> Path:
-    """Resolve a raw path to absolute, following symlinks and normalizing '..'."""
+    """Resolve a raw path to absolute, following symlinks and normalizing '..'.
+    A ``~name`` of an account this machine lacks stays the literal name, as
+    the shell leaves it (``Path.expanduser`` raises on it), and a path no
+    file can have (a NUL in it: ``realpath`` raises) stays the lexical one,
+    which nothing can open."""
     p = Path(raw)
     if str(p).startswith("~"):
-        p = p.expanduser()
+        with contextlib.suppress(RuntimeError):
+            p = p.expanduser()
     if not p.is_absolute():
         p = _AGENTS_DIR / p
-    return p.resolve()
+    try:
+        return p.resolve()
+    except ValueError:
+        return Path(posixpath.normpath(str(p)))
 
 
 def _translate_sandbox_path(raw_path: str, ctx: SecurityContext) -> str:
@@ -339,7 +355,11 @@ def _check_path_arg(
 ) -> PathDecision:
     """Role-check one tool path argument across its resolution candidates.
     Allows when any candidate passes; a denial reports the cwd-anchored
-    interpretation (the one the tool actually accesses)."""
+    interpretation (the one the tool actually accesses). Another account's
+    home (``~name``) is refused with the reason a machine's resolver gives."""
+    from services.path_policy_v2 import is_other_user_tilde
+    if is_other_user_tilde(raw_path):
+        return PathDecision(False, "cannot resolve another OS user's home directory")
     first: PathDecision | None = None
     for cand in _resolve_candidates(raw_path, ctx):
         decision = (
@@ -519,7 +539,7 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
         return PathDecision(
             False,
             "Read denied: OAuth credentials are protected. "
-            "Manage accounts via Settings → Integrations.",
+            "Manage accounts in User Settings, Integrations.",
         )
 
     # The agent's OWN CLI config (.claude/*.json, .codex/config.toml|
@@ -693,6 +713,110 @@ def _external_read_denial(resolved: Path, ctx: SecurityContext) -> PathDecision 
     return None
 
 
+def _external_write_verdict(resolved: Path, ctx: SecurityContext) -> PathDecision | None:
+    """The external-caller write rules, the shared agent memory and another
+    caller's tree refused first. ``None`` = no external rule decides."""
+    if is_external_ctx(ctx):
+        denied = _external_read_denial(resolved, ctx)
+        if denied is not None:
+            return PathDecision(False, denied.reason.replace("Read denied", "Write denied"))
+        if external_home_of(ctx):
+            home = Path(ctx.external_home).resolve()
+            if _path_under(resolved, home):
+                if resolved != home:
+                    for sub in _EXTERNAL_WRITABLE_SUBDIRS:
+                        if _path_under(resolved, home / sub):
+                            return _ALLOW
+                return PathDecision(
+                    False,
+                    "Write denied: the root of the caller folder is reserved; "
+                    "only its workspace/ and context/ subfolders are writable "
+                    "on this line.",
+                )
+    return None
+
+
+def _mirror_verdict(resolved: Path, ctx: SecurityContext, agent_dir: Path) -> bool | None:
+    """Knowledge-library mirrors (knowledge/shared/<source>/…) sit
+    inside knowledge but are decided by the covering attachment's
+    writable flag, not the session's knowledge tier alone — a
+    read-only mirror gets a clean policy denial here instead of
+    the kernel's bare EROFS. The shared/ root itself is
+    projector-owned: never hand-writable. Libraries are per
+    SUBTREE — matching is segment-wise (a library ``marketing``
+    never authorizes ``marketing-extra``); a path under the slug
+    but outside every attached subtree is denied.
+    ``None`` = not a mirror-namespace path."""
+    shared_root = (agent_dir / layout.KNOWLEDGE / "shared").resolve()
+    if not _path_under(resolved, shared_root):
+        return None
+    try:
+        rel_parts = resolved.relative_to(shared_root).parts
+    except ValueError:
+        return False
+    if not rel_parts:
+        return False
+    src, sub_parts = rel_parts[0], list(rel_parts[1:])
+    for entry in (ctx.knowledge_libraries or ()):
+        e_src, e_subdir, e_writable = entry[0], entry[1], bool(entry[2])
+        if e_src != src or not e_writable:
+            continue
+        prefix = e_subdir.split("/") if e_subdir else []
+        if sub_parts[: len(prefix)] == prefix:
+            return True
+    return False
+
+
+def _check_agent_write(resolved: Path, ctx: SecurityContext, agent_name: str) -> bool:
+    """Write access for a single agent dir based on role."""
+    agent_dir = (_AGENTS_DIR / agent_name).resolve()
+
+    # Agent-scoped context (no username): workspace/ for the workspace
+    # tier, and — ONLY for manager-provenance task fires
+    # (ctx.knowledge_rw) — the knowledge tree, under the same
+    # per-attachment mirror rule as the owner tier (attachment writable
+    # AND provenance, both required). /config stays denied
+    # (human-manager-only), memory/ was denied earlier (_is_memory_file
+    # precedes this branch).
+    if not ctx.username:
+        if _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve()):
+            # The sandbox's own rule for this mount (read-only below the
+            # workspace tier): service sessions run as a manager, while
+            # a viewer's own task on a Shared-only agent and an external
+            # caller (always a viewer, phone_identity.
+            # EXTERNAL_ROUTE_ROLE) keep their role here.
+            return roles.can_write_workspace(ctx.role)
+        if ctx.knowledge_rw:
+            mirror = _mirror_verdict(resolved, ctx, agent_dir)
+            if mirror is not None:
+                return mirror
+            return _path_under(resolved, (agent_dir / layout.KNOWLEDGE).resolve())
+        return False
+
+    # Viewer — and any role the table does not know — only own user dir +
+    # plans (no workspace, no config, no knowledge). Closed, never open.
+    if not roles.can_write_workspace(ctx.role):
+        return False
+
+    # Editor / contributor: workspace/ is writable (collaborative);
+    # config/ and knowledge/ stay owner-only (they shape agent BEHAVIOR,
+    # not workspace state).
+    if not roles.can_manage(ctx.role):
+        return _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve())
+
+    # Manager / admin (owner tier): workspace/ + config/ + knowledge/
+    if _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve()):
+        return True
+    if _path_under(resolved, (agent_dir / layout.CONFIG).resolve()):
+        return True
+    mirror = _mirror_verdict(resolved, ctx, agent_dir)
+    if mirror is not None:
+        return mirror
+    if _path_under(resolved, (agent_dir / layout.KNOWLEDGE).resolve()):
+        return True
+    return False
+
+
 def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     """Validate a write operation against the security context."""
     # Memory dirs are agent-writable ONLY through the memory tool (the
@@ -711,7 +835,7 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
         return PathDecision(
             False,
             "Write denied: OAuth credentials are protected. "
-            "Manage accounts via Settings → Integrations.",
+            "Manage accounts in User Settings, Integrations.",
         )
 
     # The agent's own CLI config, and the hook scripts and settings the
@@ -741,23 +865,9 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
 
     # External sessions: only their own caller tree under externals/, and
     # only its known subdirs (the root is reserved, like a user dir's root).
-    if is_external_ctx(ctx):
-        denied = _external_read_denial(resolved, ctx)
-        if denied is not None:
-            return PathDecision(False, denied.reason.replace("Read denied", "Write denied"))
-        if external_home_of(ctx):
-            home = Path(ctx.external_home).resolve()
-            if _path_under(resolved, home):
-                if resolved != home:
-                    for sub in _EXTERNAL_WRITABLE_SUBDIRS:
-                        if _path_under(resolved, home / sub):
-                            return _ALLOW
-                return PathDecision(
-                    False,
-                    "Write denied: the root of the caller folder is reserved; "
-                    "only its workspace/ and context/ subfolders are writable "
-                    "on this line.",
-                )
+    decision = _external_write_verdict(resolved, ctx)
+    if decision is not None:
+        return decision
 
     # The sandbox's private /tmp on a local target (HOME, the CLI's runtime
     # tree, scratch files): admitted read + write. Ordered AFTER the memory /
@@ -787,87 +897,8 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
                 "(or context/ for personal context documents).",
             )
 
-    # Helper: check write access for a single agent dir based on role
-    def _check_agent_write(agent_name: str) -> bool:
-        agent_dir = (_AGENTS_DIR / agent_name).resolve()
-
-        def _mirror_verdict() -> bool | None:
-            """Knowledge-library mirrors (knowledge/shared/<source>/…) sit
-            inside knowledge but are decided by the covering attachment's
-            writable flag, not the session's knowledge tier alone — a
-            read-only mirror gets a clean policy denial here instead of
-            the kernel's bare EROFS. The shared/ root itself is
-            projector-owned: never hand-writable. Libraries are per
-            SUBTREE — matching is segment-wise (a library ``marketing``
-            never authorizes ``marketing-extra``); a path under the slug
-            but outside every attached subtree is denied.
-            ``None`` = not a mirror-namespace path."""
-            shared_root = (agent_dir / layout.KNOWLEDGE / "shared").resolve()
-            if not _path_under(resolved, shared_root):
-                return None
-            try:
-                rel_parts = resolved.relative_to(shared_root).parts
-            except ValueError:
-                return False
-            if not rel_parts:
-                return False
-            src, sub_parts = rel_parts[0], list(rel_parts[1:])
-            for entry in (ctx.knowledge_libraries or ()):
-                e_src, e_subdir, e_writable = entry[0], entry[1], bool(entry[2])
-                if e_src != src or not e_writable:
-                    continue
-                prefix = e_subdir.split("/") if e_subdir else []
-                if sub_parts[: len(prefix)] == prefix:
-                    return True
-            return False
-
-        # Agent-scoped context (no username): workspace/ for the workspace
-        # tier, and — ONLY for manager-provenance task fires
-        # (ctx.knowledge_rw) — the knowledge tree, under the same
-        # per-attachment mirror rule as the owner tier (attachment writable
-        # AND provenance, both required). /config stays denied
-        # (human-manager-only), memory/ was denied earlier (_is_memory_file
-        # precedes this branch).
-        if not ctx.username:
-            if _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve()):
-                # The sandbox's own rule for this mount (read-only below the
-                # workspace tier): service sessions run as a manager, while
-                # a viewer's own task on a Shared-only agent and an external
-                # caller (always a viewer, phone_identity.
-                # EXTERNAL_ROUTE_ROLE) keep their role here.
-                return roles.can_write_workspace(ctx.role)
-            if ctx.knowledge_rw:
-                mirror = _mirror_verdict()
-                if mirror is not None:
-                    return mirror
-                return _path_under(resolved, (agent_dir / layout.KNOWLEDGE).resolve())
-            return False
-
-        # Viewer — and any role the table does not know — only own user dir +
-        # plans (no workspace, no config, no knowledge). Closed, never open.
-        if not roles.can_write_workspace(ctx.role):
-            return False
-
-        # Editor / contributor: workspace/ is writable (collaborative);
-        # config/ and knowledge/ stay owner-only (they shape agent BEHAVIOR,
-        # not workspace state).
-        if not roles.can_manage(ctx.role):
-            return _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve())
-
-        # Manager / admin (owner tier): workspace/ + config/ + knowledge/
-        if _path_under(resolved, (agent_dir / layout.WORKSPACE).resolve()):
-            return True
-        if _path_under(resolved, (agent_dir / layout.CONFIG).resolve()):
-            return True
-        mirror = _mirror_verdict()
-        if mirror is not None:
-            return mirror
-        if _path_under(resolved, (agent_dir / layout.KNOWLEDGE).resolve()):
-            return True
-        return False
-
     # Current agent
-    if _check_agent_write(ctx.agent):
+    if _check_agent_write(resolved, ctx, ctx.agent):
         return _ALLOW
 
     if ctx.role == roles.VIEWER:
@@ -982,9 +1013,15 @@ def _unknown_tool_dangerous_scan(tool_input: dict) -> "PathDecision":
     for value in tool_input.values():
         if not isinstance(value, str) or not value:
             continue
+        if _NUL in value:
+            return PathDecision(False, f"Denied (dangerous command): {_NUL_REASON}")
         for pattern, reason in _DANGEROUS_PATTERNS:
             if pattern.search(value):
                 return PathDecision(False, f"Denied (dangerous command): {reason}")
+        # The same catastrophes written through shell quoting (``$'/'``).
+        seen = _catastrophe_seen(value, words=True)
+        if seen is not None:
+            return PathDecision(False, f"Denied (dangerous command): {seen}")
         for pattern, reason in _POWERSHELL_DANGEROUS_PATTERNS:
             if pattern.search(value):
                 return PathDecision(False, f"Denied (dangerous command): {reason}")
@@ -1020,7 +1057,7 @@ def _protected_tool_path_denial(
             return PathDecision(
                 False,
                 f"{verb} denied: OAuth credentials are protected. "
-                "Manage accounts via Settings → Integrations.",
+                "Manage accounts in User Settings, Integrations.",
             )
         if path_roles.is_protected_agent_config_path(cand, writing=writing):
             return PathDecision(False, f"{verb} denied: agent CLI config files are protected.")
@@ -1232,14 +1269,17 @@ def check_tool_access(
 # this file readable; re-export the symbols the dispatcher above + external
 # callers reference. (Imported at the bottom so the sibling modules can import
 # this module's core symbols without a cycle.)
-from auth.path_shell import (  # noqa: E402,F401
+from auth.path_prompt import (  # noqa: F401
+    _build_execution_environment_section,
+    build_permission_context as build_permission_context,
+)
+from auth.path_shell import (
     _DANGEROUS_PATTERNS,
+    _NUL,
+    _NUL_REASON,
     _POWERSHELL_DANGEROUS_PATTERNS,
+    _catastrophe_seen,
     _check_bash,
     _check_powershell,
     _check_webfetch,
-)
-from auth.path_prompt import (  # noqa: E402,F401
-    _build_execution_environment_section,
-    build_permission_context,
 )

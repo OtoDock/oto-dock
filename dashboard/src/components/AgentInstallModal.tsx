@@ -13,7 +13,7 @@
  *   silently up to 3 times.
  */
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { useCreateAgent } from '../api/agents'
@@ -29,10 +29,18 @@ import {
 import {
   CommunityAgentRegistryEntry,
   type PreviewApp,
+  taskPinNotes,
+  TASK_PINS_HEADING,
   useInstallCommunityAgent,
   useInstallPreview,
 } from '../api/communityAgents'
 import { DetailsToggle, ManifestBlocks, ManifestSummary } from './apps/AppApprovalCard'
+import { errorText, refusalProblems } from '../lib/http/apiJson'
+import { isRecord } from '../lib/json/guards'
+import Dialog from './ui/Dialog'
+import Button from './ui/Button'
+import { Input, Select } from './ui/Field'
+import { DIALOG_PANEL } from './ui/classes'
 
 interface Props {
   open: boolean
@@ -62,9 +70,13 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
   const [slugEdited, setSlugEdited] = useState(false)
   const [adminOnly, setAdminOnly] = useState(false)
   // Visibility mode for a freshly-created agent. Default = Personal + shared.
-  // Easily changed afterward in the agent's Configuration tab.
+  // Easily changed afterward in the agent's Configuration section.
   const [visibilityMode, setVisibilityMode] = useState<VisibilityMode>('personal_shared')
   const [error, setError] = useState('')
+  const [problems, setProblems] = useState<string[]>([])
+  // An install whose tasks lost their model choice holds the dialog on what
+  // it did, so the notes are read before the agent's page opens.
+  const [installed, setInstalled] = useState<{ slug: string; notes: string[] } | null>(null)
   // The consent (COMMUNITY-AGENTS-REGISTRY.md "Consent"): approve the
   // template's apps and checks at install — for every member's copy when
   // an admin installs, for the shared apps and one's own copy otherwise.
@@ -73,22 +85,29 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
   const [approveAll, setApproveAll] = useState(true)
   const [openDetails, setOpenDetails] = useState<Record<string, boolean>>({})
 
-  useEffect(() => {
-    if (!open) return
-    if (mode === 'install' && template) {
-      setDisplayName(template.display_name)
-      setSlug(template.slug)
-    } else {
-      setDisplayName('')
-      setSlug('')
+  // The dialog opening, or its template changing while open, starts the
+  // form over (in render, on the transition).
+  const [openedFor, setOpenedFor] = useState({ open, mode, template })
+  if (openedFor.open !== open || openedFor.mode !== mode || openedFor.template !== template) {
+    setOpenedFor({ open, mode, template })
+    if (open) {
+      if (mode === 'install' && template) {
+        setDisplayName(template.display_name)
+        setSlug(template.slug)
+      } else {
+        setDisplayName('')
+        setSlug('')
+      }
+      setSlugEdited(false)
+      setAdminOnly(false)
+      setVisibilityMode('personal_shared')
+      setApproveAll(true)
+      setOpenDetails({})
+      setError('')
+      setProblems([])
+      setInstalled(null)
     }
-    setSlugEdited(false)
-    setAdminOnly(false)
-    setVisibilityMode('personal_shared')
-    setApproveAll(true)
-    setOpenDetails({})
-    setError('')
-  }, [open, mode, template])
+  }
 
   // Cascade preview (install mode only).
   const preview = useInstallPreview(
@@ -109,8 +128,14 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
   const blockedMcps =
     mode === 'install' ? (preview.data?.required_mcps.filter(m => m.blocked) ?? []) : []
 
+  const openAgent = (agentSlug: string) => {
+    onClose()
+    navigate(`/agents/${agentSlug}/config`)
+  }
+
   const handleSubmit = async () => {
     setError('')
+    setProblems([])
     const cleanSlug = slug.trim()
     const cleanName = displayName.trim()
     if (!cleanName) {
@@ -118,11 +143,11 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
       return
     }
     if (!cleanSlug) {
-      setError('Slug is required')
+      setError('ID is required')
       return
     }
     if (!/^[a-z][a-z0-9-]{1,38}[a-z0-9]$/.test(cleanSlug)) {
-      setError('Slug must be lowercase alphanumeric with hyphens (3-40 chars)')
+      setError('The ID must be 3 to 40 lowercase letters, digits or hyphens.')
       return
     }
 
@@ -158,59 +183,93 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
           display_name: cleanName,
           ...consent,
         })
-        onClose()
-        navigate(`/agents/${result.agent_slug}/config`)
+        const notes = taskPinNotes(result)
+        if (notes.length > 0) {
+          setInstalled({ slug: result.agent_slug, notes })
+          return
+        }
+        openAgent(result.agent_slug)
         return
-      } catch (err: any) {
-        if (err.status === 409 && err.body?.detail?.suggested_slug) {
-          attemptSlug = err.body.detail.suggested_slug
+      } catch (err) {
+        // The install refusal carries the status and the parsed body
+        // (api/communityAgents.ts `useInstallCommunityAgent`).
+        const failure = isRecord(err) ? err : {}
+        const detail = isRecord(failure.body) && isRecord(failure.body.detail) ? failure.body.detail : {}
+        if (failure.status === 409 && typeof detail.suggested_slug === 'string' && detail.suggested_slug) {
+          attemptSlug = detail.suggested_slug
           setSlug(attemptSlug)
           continue
         }
-        setError(err.body?.detail?.message || err.message || 'Install failed')
+        setProblems(refusalProblems(err))
+        setError((typeof detail.message === 'string' && detail.message) || errorText(err) || 'Install failed')
         return
       }
     }
-    setError(`Couldn't find a free slug — try editing the slug manually.`)
+    setError(`Couldn't find a free ID. Try editing the ID yourself.`)
   }
 
   if (!open) return null
 
   const title = mode === 'install' ? 'Install community agent' : 'Create new agent'
 
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs"
-      onClick={onClose}
-    >
-      <div
-        className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light shadow-xl p-6 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto"
-        onClick={e => e.stopPropagation()}
+  if (installed) {
+    return (
+      <Dialog
+        onClose={onClose}
+        aria-labelledby="agent-install-title"
+        panelClassName={`${DIALOG_PANEL} p-6 max-w-lg max-h-[90vh] overflow-y-auto`}
       >
-        <h3 className="text-sm font-semibold text-p-text mb-4">{title}</h3>
+        <h3 id="agent-install-title" className="text-sm font-semibold text-primary mb-3">Agent installed</h3>
+        <div className="text-xs mb-4" data-testid="install-pins-dropped">
+          <div className="font-medium text-primary mb-1">{TASK_PINS_HEADING}</div>
+          <ul className="list-disc pl-5 space-y-0.5 text-secondary">
+            {installed.notes.map((n, i) => <li key={i}>{n}</li>)}
+          </ul>
+        </div>
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" size="md" onClick={onClose}>
+            Close
+          </Button>
+          <Button variant="primary" size="md" onClick={() => openAgent(installed.slug)}>
+            Open the agent
+          </Button>
+        </div>
+      </Dialog>
+    )
+  }
+
+  return (
+    <Dialog
+      onClose={onClose}
+      busy={installing}
+      aria-labelledby="agent-install-title"
+      panelClassName={`${DIALOG_PANEL} p-6 max-w-lg max-h-[90vh] overflow-y-auto`}
+    >
+        <h3 id="agent-install-title" className="text-sm font-semibold text-primary mb-4">{title}</h3>
 
         {/* Install-mode banner */}
         {mode === 'install' && template && (
-          <div className="mb-4 rounded-lg border border-p-border-light bg-p-bg p-3 flex items-start gap-3">
+          <div className="mb-4 rounded-card border border-subtle p-3 flex items-start gap-3">
             <div
-              className="w-10 h-10 rounded-lg shrink-0 flex items-center justify-center text-white font-semibold"
+              // eslint-disable-next-line otodock/no-raw-palette -- white initial on the template's own colour
+              className="w-10 h-10 rounded-card shrink-0 flex items-center justify-center text-white font-semibold"
               style={{ background: template.color }}
             >
               {template.display_name.charAt(0)}
             </div>
             <div className="min-w-0">
-              <div className="text-sm font-medium text-p-text">
-                {template.display_name} <span className="text-xs text-p-text-secondary">v{template.version}</span>
+              <div className="text-sm font-medium text-primary">
+                {template.display_name} <span className="text-xs text-secondary">v{template.version}</span>
               </div>
-              <div className="text-xs text-p-text-secondary">by {template.author}</div>
-              <div className="text-xs text-p-text-secondary mt-1 line-clamp-2">{template.description}</div>
+              <div className="text-xs text-secondary">by {template.author}</div>
+              <div className="text-xs text-secondary mt-1 line-clamp-2">{template.description}</div>
             </div>
           </div>
         )}
 
         {/* Form */}
-        <label className="block text-xs font-medium text-p-text-secondary mb-1">Display name</label>
-        <input
+        <label className="block text-xs font-medium text-secondary mb-1">Display name</label>
+        <Input
           type="text"
           value={displayName}
           onChange={e => {
@@ -220,12 +279,12 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
             }
           }}
           placeholder="e.g. Sales Assistant"
-          className="w-full px-3 py-2 rounded-lg border border-p-border-light bg-white dark:bg-p-bg text-sm text-p-text placeholder:text-p-text-light focus:outline-hidden focus:ring-2 focus:ring-brand/40 mb-3"
+          className="mb-3"
           autoFocus
         />
 
-        <label className="block text-xs font-medium text-p-text-secondary mb-1">Slug</label>
-        <input
+        <label className="block text-xs font-medium text-secondary mb-1">ID</label>
+        <Input
           type="text"
           value={slug}
           onChange={e => {
@@ -233,18 +292,17 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
             setSlugEdited(true)
           }}
           placeholder="e.g. sales-assistant"
-          className="w-full px-3 py-2 rounded-lg border border-p-border-light bg-white dark:bg-p-bg text-sm text-p-text font-mono placeholder:text-p-text-light focus:outline-hidden focus:ring-2 focus:ring-brand/40 mb-3"
+          className="font-mono mb-3"
         />
 
         {/* Create-mode options */}
         {mode === 'create' && (
           <div className="flex flex-col gap-3 mb-4">
             <div>
-              <label className="block text-xs font-medium text-p-text-secondary mb-1">Visibility &amp; workspace</label>
-              <select
+              <label className="block text-xs font-medium text-secondary mb-1">Visibility and workspace</label>
+              <Select
                 value={visibilityMode}
                 onChange={e => setVisibilityMode(e.target.value as VisibilityMode)}
-                className="w-full px-3 py-2 rounded-lg border border-p-border-light bg-white dark:bg-p-bg text-sm text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/40"
               >
                 {MODE_GROUPS.map(group => (
                   <optgroup key={group.label} label={group.label}>
@@ -253,8 +311,8 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
                     ))}
                   </optgroup>
                 ))}
-              </select>
-              <p className="text-xs text-p-text-light mt-1">{MODE_OPTION_HINT[visibilityMode]}</p>
+              </Select>
+              <p className="text-xs text-tertiary mt-1">{MODE_OPTION_HINT[visibilityMode]}</p>
             </div>
             {isAdmin(user) && (
               <label className="flex items-center gap-2 cursor-pointer">
@@ -262,9 +320,9 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
                   type="checkbox"
                   checked={adminOnly}
                   onChange={e => setAdminOnly(e.target.checked)}
-                  className="rounded-sm border-p-border-light text-brand focus:ring-brand/40"
+                  className="accent-action"
                 />
-                <span className="text-sm text-p-text-secondary">Admin only</span>
+                <span className="text-sm text-secondary">Admin only</span>
               </label>
             )}
           </div>
@@ -272,16 +330,16 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
 
         {/* Install-mode cascade preview */}
         {mode === 'install' && template && (
-          <div className="mb-4 rounded-lg border border-p-border-light bg-p-bg p-3">
-            <div className="text-xs font-medium text-p-text mb-2">Required MCPs</div>
+          <div className="mb-4 rounded-card border border-subtle p-3">
+            <div className="text-xs font-medium text-primary mb-2">Required MCPs</div>
             {preview.isLoading && (
-              <div className="text-xs text-p-text-secondary">Checking platform state…</div>
+              <div className="text-xs text-secondary">Checking platform state…</div>
             )}
             {preview.data && (
               <>
                 {!preview.data.slug_available && preview.data.suggested_slug && (
-                  <div className="mb-2 text-xs text-amber-600 dark:text-amber-400">
-                    Slug taken — server will use <code className="font-mono">{preview.data.suggested_slug}</code>.
+                  <div className="mb-2 text-xs text-status-warning-fg">
+                    That ID is taken. OtoDock will use <code className="font-mono">{preview.data.suggested_slug}</code>.
                   </div>
                 )}
                 <ul className="space-y-1 max-h-48 overflow-y-auto">
@@ -289,19 +347,19 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
                     <li key={m.name} className="text-xs flex items-start gap-2">
                       <span className={
                         !m.needs_request
-                          ? 'text-green-600 dark:text-green-400'
+                          ? 'text-status-success-fg'
                           : m.blocked
-                            ? 'text-red-600 dark:text-red-400'
-                            : 'text-amber-600 dark:text-amber-400'
+                            ? 'text-status-danger-fg'
+                            : 'text-status-warning-fg'
                       }>
                         {!m.needs_request ? '✓' : m.blocked ? '✗' : '⏳'}
                       </span>
                       <span className="font-mono">{m.name}</span>
-                      <span className="text-p-text-secondary truncate">— {m.reason}</span>
+                      <span className="text-secondary truncate">· {m.reason}</span>
                     </li>
                   ))}
                 </ul>
-                <div className="mt-2 text-xs text-p-text-secondary">
+                <div className="mt-2 text-xs text-secondary">
                   {preview.data.required_mcps.filter(m => !m.needs_request).length} ready,{' '}
                   {preview.data.required_mcps.filter(m => m.needs_request && !m.blocked).length} need admin approval,{' '}
                   {preview.data.required_mcps.filter(m => m.blocked).length} blocked
@@ -310,11 +368,11 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
                   )}
                 </div>
                 {blockedMcps.length > 0 && (
-                  <div className="mt-2 text-xs text-red-600 dark:text-red-400">
+                  <div className="mt-2 text-xs text-status-danger-fg">
                     {blockedMcps.length === 1
-                      ? `${blockedMcps[0].name}: ${blockedMcps[0].reason || 'not installed and not in any catalog'}`
-                      : `${blockedMcps.length} required MCPs are blocked (not installed and in no catalog, or explicit-mode without an instance)`}
-                    {' '}— this template can't be installed on this platform.
+                      ? `${blockedMcps[0].name}: ${blockedMcps[0].reason || 'not installed and not in the community list'}.`
+                      : `${blockedMcps.length} required MCPs are blocked. Each is not installed and not in the community list, or has no instance.`}
+                    {' '}This template can't be installed here.
                   </div>
                 )}
               </>
@@ -324,29 +382,29 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
 
         {/* The apps and checks the template ships, and the consent */}
         {mode === 'install' && hasConsentItems && (
-          <div className="mb-4 rounded-lg border border-p-border-light bg-p-bg p-3 text-xs" data-testid="install-consent">
+          <div className="mb-4 rounded-card border border-subtle p-3 text-xs" data-testid="install-consent">
             {previewApps.length > 0 && (
-              <div className="font-medium text-p-text mb-2">
+              <div className="font-medium text-primary mb-2">
                 {previewApps.length === 1 ? 'An app it brings' : `${previewApps.length} apps it brings`}
               </div>
             )}
             {previewApps.map(a => (
               <div key={a.slug} className="mb-3" data-testid={`consent-app-${a.slug}`}>
                 <div className="flex flex-wrap items-baseline gap-x-1.5">
-                  <span className="font-medium text-p-text">{a.title}</span>
-                  <span className="text-p-text-secondary">
+                  <span className="font-medium text-primary">{a.title}</span>
+                  <span className="text-secondary">
                     {a.visibility === 'user' ? 'one copy for each member' : 'shared by the agent'}
                     {a.owner_approval ? ' · each member approves their own copy' : ''}
                   </span>
                 </div>
                 <ManifestSummary app={a.row} />
                 {a.blueprint_tasks.length > 0 && (
-                  <details className="mt-1 text-p-text-secondary">
+                  <details className="mt-1 text-secondary">
                     <summary className="cursor-pointer">The tasks its buttons run</summary>
                     <ul className="mt-1 space-y-1 pl-3">
                       {a.blueprint_tasks.map(t => (
                         <li key={t.slug}>
-                          <span className="font-medium text-p-text">{t.description || t.slug}</span>
+                          <span className="font-medium text-primary">{t.description || t.slug}</span>
                           <span className="block break-words">“{t.prompt.slice(0, 300)}{t.prompt.length > 300 ? '…' : ''}”</span>
                         </li>
                       ))}
@@ -354,7 +412,7 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
                   </details>
                 )}
                 {(a.blueprint_triggers?.length ?? 0) > 0 && (
-                  <p className="mt-1 text-p-text-secondary" data-testid={`consent-app-triggers-${a.slug}`}>
+                  <p className="mt-1 text-secondary" data-testid={`consent-app-triggers-${a.slug}`}>
                     Comes with {a.blueprint_triggers!.length === 1 ? 'a trigger' : `${a.blueprint_triggers!.length} triggers`}
                     {a.visibility === 'user' ? ' of each member’s own' : ''}: {a.blueprint_triggers!.map(t => t.description || t.slug).join(', ')}
                   </p>
@@ -370,16 +428,16 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
             ))}
             {previewChecks.length > 0 && (
               <div className="mb-2">
-                <div className="font-medium text-p-text mb-1">
+                <div className="font-medium text-primary mb-1">
                   {previewChecks.length === 1 ? 'A check it brings' : `${previewChecks.length} checks it brings`}
                 </div>
-                <ul className="space-y-1 text-p-text-secondary">
+                <ul className="space-y-1 text-secondary">
                   {previewChecks.map(c => (
                     <li key={c.name} data-testid={`consent-check-${c.name}`}>
-                      <span className="font-mono text-[11px] text-p-text">{c.name}</span>
-                      {c.mandatory ? <span> (mandatory)</span> : null}
+                      <span className="font-mono text-2xs text-primary">{c.name}</span>
+                      {c.mandatory ? <span>, mandatory</span> : null}
                       {c.description ? <span>: {c.description}</span> : null}
-                      {c.words ? <span> — {c.words}</span> : null}
+                      {c.words ? <span> · {c.words}</span> : null}
                     </li>
                   ))}
                 </ul>
@@ -390,47 +448,51 @@ export default function AgentInstallModal({ open, mode, template, onClose }: Pro
                 type="checkbox"
                 checked={approveAll}
                 onChange={e => setApproveAll(e.target.checked)}
-                className="mt-0.5 rounded-sm border-p-border-light text-brand focus:ring-brand/40"
+                className="mt-0.5 accent-action"
                 data-testid="consent-checkbox"
               />
-              <span className="text-p-text">
+              <span className="text-primary">
                 {consentScope === 'everyone'
                   ? 'Approve its apps and checks for everyone who gets a copy'
-                  : 'Approve its apps and checks (the shared ones and your own copy; members approve theirs)'}
+                  : 'Approve its apps and checks: the shared ones and your own copy. Members approve theirs.'}
               </span>
             </label>
-            <p className="mt-1 text-p-text-light">
+            <p className="mt-1 text-tertiary">
               {approveAll
-                ? 'Unticked, each app waits for approval on its card and each check is offered, not mandatory.'
-                : 'Each app will wait for approval on its card; each check will be offered, not mandatory.'}
+                ? 'Unticked, each app waits for approval on its card. Each check is offered, not mandatory.'
+                : 'Each app will wait for approval on its card. Each check will be offered, not mandatory.'}
             </p>
           </div>
         )}
 
-        {/* Error */}
-        {error && <p className="text-xs text-red-500 mb-3">{error}</p>}
+        {/* Error: a refused template lists its problems apart. */}
+        {problems.length > 0 ? (
+          <div className="text-xs text-status-danger-fg mb-3" data-testid="install-problems">
+            <p className="mb-1">This template cannot be installed:</p>
+            <ul className="list-disc pl-5 space-y-0.5">
+              {problems.map((p, i) => <li key={i}>{p}</li>)}
+            </ul>
+          </div>
+        ) : error && <p className="text-xs text-status-danger-fg mb-3">{error}</p>}
 
         {/* Actions */}
         <div className="flex justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 rounded-lg text-sm font-medium text-p-text-secondary bg-p-surface hover:bg-p-surface-hover transition-colors"
-          >
+          <Button size="md" onClick={onClose}>
             Cancel
-          </button>
-          <button
+          </Button>
+          <Button
+            variant="primary"
+            size="md"
             onClick={handleSubmit}
             disabled={installing || blockedMcps.length > 0}
-            className="px-4 py-2 rounded-lg text-sm font-medium text-white bg-brand hover:bg-brand-hover transition-colors disabled:opacity-50"
           >
             {installing
               ? mode === 'install' ? 'Installing…' : 'Creating…'
               : mode === 'install'
                 ? approveAll && hasConsentItems ? 'Install and approve' : 'Install agent'
                 : 'Create'}
-          </button>
+          </Button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }

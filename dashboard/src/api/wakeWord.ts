@@ -5,7 +5,7 @@
 // the routing table.
 
 import { useQuery } from '@tanstack/react-query'
-import { apiFetch } from './auth'
+import { withMessage, apiJson } from '../lib/http/apiJson'
 
 export interface WakeAgent {
   slug: string
@@ -28,9 +28,7 @@ export function useWakeKeywords(enabled: boolean) {
   return useQuery({
     queryKey: ['wake-keywords'],
     queryFn: async (): Promise<WakeKeywords> => {
-      const res = await apiFetch('/v1/users/me/wake-keywords')
-      if (!res.ok) throw new Error('Failed to fetch wake keywords')
-      return res.json()
+      return apiJson<WakeKeywords>('/v1/users/me/wake-keywords').catch(withMessage('Failed to fetch wake keywords'))
     },
     enabled,
     // Renames/new agents re-encode automatically; the listener rebuilds the

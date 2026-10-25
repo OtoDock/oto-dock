@@ -19,9 +19,9 @@ import asyncio
 import logging
 import time
 
+from auth import roles
 from services.infra import storage_quota
 from storage.pg import get_conn
-from auth import roles
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +109,8 @@ async def _measure(scope: "storage_quota.QuotaScope") -> tuple[int, int]:
     if scope.scope_type == "user" and scope.owner_sub:
         # A chunked upload in flight is the user's disk too; it lives in the
         # staging area, outside the bucket's directories, until it completes.
-        from api.media import uploads
-        total_b += await asyncio.to_thread(uploads.staged_bytes_for, scope.owner_sub)
+        from services.media import upload_staging
+        total_b += await asyncio.to_thread(upload_staging.staged_bytes_for, scope.owner_sub)
     return (total_b, total_i)
 
 

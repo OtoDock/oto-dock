@@ -154,3 +154,8 @@ manager may set a daily cap per agent; a reached cap is a visible
 attached or mandatory.
 
 `check_app` (the display MCP) lints an app; it is not a check.
+
+For an app's server code the checks MCP ships the example
+`app-server-review`, a judge that reads the changed server files on each
+turn that writes them. Its document is in the app-authoring skill under
+"Guard what the server does". A manager adds it as an agent check.

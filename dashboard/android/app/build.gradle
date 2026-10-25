@@ -1,0 +1,157 @@
+apply plugin: 'com.android.application'
+
+// App version comes from the repo's VERSIONS.md (OTODOCK_VERSION=X.Y.Z) — the
+// platform's single source of truth, same line scripts/versions.sh and
+// proxy/config.py parse. versionName carries the full value, a -dev suffix
+// included. versionCode derives from the numeric triple and the build digit
+// below, so Play and sideload upgrades stay monotonic across releases and one
+// release can be uploaded again.
+def otodockVersionsFile = rootProject.file('../../VERSIONS.md')
+def otodockVersionLine = otodockVersionsFile.exists()
+        ? otodockVersionsFile.readLines().find { it.startsWith('OTODOCK_VERSION=') }
+        : null
+def otodockVersionMatch = otodockVersionLine != null
+        ? (otodockVersionLine =~ /OTODOCK_VERSION=(\d+)\.(\d+)\.(\d+)/)
+        : null
+if (otodockVersionMatch == null || !otodockVersionMatch.find()) {
+    throw new GradleException(
+        "OTODOCK_VERSION=X.Y.Z not found in ${otodockVersionsFile} — the app version tracks VERSIONS.md")
+}
+def otodockVersionName = otodockVersionLine.split('=', 2)[1].trim()
+// A build digit (OTODOCK_ANDROID_BUILD, 0..99, default 0) lets one release be
+// uploaded to Play again after a packaging fix; codes only grow, and 1.9.0
+// build 0 (1090000) is above every earlier code (10801).
+def otodockBuildDigitValue = (project.findProperty('OTODOCK_ANDROID_BUILD')
+        ?: System.getenv('OTODOCK_ANDROID_BUILD') ?: '0').toString().trim()
+if (!otodockBuildDigitValue.isInteger() || otodockBuildDigitValue.toInteger() < 0
+        || otodockBuildDigitValue.toInteger() > 99) {
+    throw new GradleException("OTODOCK_ANDROID_BUILD must be 0 to 99, got '${otodockBuildDigitValue}'")
+}
+def otodockBuildDigit = otodockBuildDigitValue.toInteger()
+def otodockVersionCode = (otodockVersionMatch.group(1).toInteger() * 10000 +
+        otodockVersionMatch.group(2).toInteger() * 100 +
+        otodockVersionMatch.group(3).toInteger()) * 100 + otodockBuildDigit
+
+// Release signing: the keystore and its passwords live outside every repo, in
+// Gradle properties (~/.gradle/gradle.properties) or the environment. The keystore
+// path must be absolute (Gradle does not expand ~). Debug builds never need them.
+def otodockSigningValue = { String name ->
+    def value = project.findProperty(name) ?: System.getenv(name)
+    return value ? value.toString() : null
+}
+def otodockReleaseSigning = [
+        storeFile    : otodockSigningValue('OTODOCK_ANDROID_KEYSTORE'),
+        storePassword: otodockSigningValue('OTODOCK_ANDROID_STORE_PASSWORD'),
+        keyAlias     : otodockSigningValue('OTODOCK_ANDROID_KEY_ALIAS'),
+        keyPassword  : otodockSigningValue('OTODOCK_ANDROID_KEY_PASSWORD'),
+]
+def otodockReleaseSigningReady = otodockReleaseSigning.values().every { it != null }
+
+android {
+    namespace = "com.otodock"
+    compileSdk = rootProject.ext.compileSdkVersion
+    defaultConfig {
+        applicationId "com.otodock"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode otodockVersionCode
+        versionName otodockVersionName
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            // *.br / *.gz: the dashboard build's precompressed siblings, served by the
+            // proxy over HTTP; the app loads the dashboard from the server, never from here.
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~:!*.br:!*.gz'
+        }
+    }
+    signingConfigs {
+        release {
+            // Set only when every value exists: file(null) fails at configuration
+            // time, which would break every debug build.
+            if (otodockReleaseSigningReady) {
+                storeFile file(otodockReleaseSigning.storeFile)
+                storePassword otodockReleaseSigning.storePassword
+                keyAlias otodockReleaseSigning.keyAlias
+                keyPassword otodockReleaseSigning.keyPassword
+            }
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            // A debuggable build lets USB/adb tooling inspect the WebView and its
+            // session cookie; the release build never is.
+            debuggable false
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+// Only the release packaging tasks need the signing values (compile, lint and
+// test tasks of the release variant do not).
+def otodockReleasePackagingTasks = ['assembleRelease', 'bundleRelease', 'packageRelease',
+                                    'packageReleaseBundle', 'signReleaseBundle',
+                                    'installRelease'] as Set
+gradle.taskGraph.whenReady { graph ->
+    if (!otodockReleaseSigningReady && graph.allTasks.any {
+        it.project == project && otodockReleasePackagingTasks.contains(it.name)
+    }) {
+        throw new GradleException(
+            "Release signing is not configured: set OTODOCK_ANDROID_KEYSTORE, " +
+            "OTODOCK_ANDROID_STORE_PASSWORD, OTODOCK_ANDROID_KEY_ALIAS and " +
+            "OTODOCK_ANDROID_KEY_PASSWORD in ~/.gradle/gradle.properties or the " +
+            "environment (see the Android app page of the docs site).")
+    }
+}
+
+// A store bundle without the official Firebase file would ship an app with no
+// push: the google-services plugin below is applied only when the file has text.
+def otodockStoreTasks = ['bundleRelease', 'signReleaseBundle', 'packageReleaseBundle'] as Set
+def otodockFirebaseFile = file('google-services.json')
+def otodockFirebaseConfigured = otodockFirebaseFile.exists() && !otodockFirebaseFile.text.trim().isEmpty()
+gradle.taskGraph.whenReady { graph ->
+    if (!otodockFirebaseConfigured && graph.allTasks.any {
+        it.project == project && otodockStoreTasks.contains(it.name)
+    }) {
+        throw new GradleException(
+            "A store bundle needs app/google-services.json (push). Copy the official " +
+            "one in first (see the Android app page of the docs site).")
+    }
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    // WebViewCompat.addWebMessageListener: the origin-scoped dashboard channel.
+    implementation "androidx.webkit:webkit:$androidxWebkitVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+
+    // Firebase Cloud Messaging for push notifications
+    implementation platform('com.google.firebase:firebase-bom:34.11.0')
+    implementation 'com.google.firebase:firebase-messaging'
+}
+
+apply from: 'capacitor.build.gradle'
+
+try {
+    def servicesJSON = file('google-services.json')
+    if (servicesJSON.text) {
+        apply plugin: 'com.google.gms.google-services'
+    }
+} catch(Exception e) {
+    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}

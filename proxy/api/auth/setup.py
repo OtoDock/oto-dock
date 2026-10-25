@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import cast
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -9,9 +10,9 @@ from psycopg.errors import LockNotAvailable
 from pydantic import BaseModel
 
 import config as app_config
-from storage import database as task_store
 from auth.password import HashBusy, check_password_strength_async, hash_password_async
-from auth.providers import create_session_jwt, apply_session_cookie
+from auth.providers import apply_session_cookie, create_session_jwt
+from storage import database as task_store
 
 logger = logging.getLogger("otodock")
 router = APIRouter()
@@ -53,9 +54,9 @@ async def setup_first_user(req: SetupRequest):
 
     try:
         pw_hash = await hash_password_async(req.password)
-    except HashBusy:
+    except HashBusy as exc:
         raise HTTPException(status_code=503, detail="Busy. Try again in a few seconds.",
-                            headers={"Retry-After": "5"})
+                            headers={"Retry-After": "5"}) from exc
 
     # The strength check and the hash ran for hundreds of milliseconds after
     # the first count: the store counts again and inserts in one locked
@@ -63,9 +64,9 @@ async def setup_first_user(req: SetupRequest):
     # meanwhile (a first SSO login) ends the setup.
     try:
         sub = await asyncio.to_thread(task_store.create_first_owner, email, display_name, pw_hash)
-    except LockNotAvailable:
+    except LockNotAvailable as exc:
         raise HTTPException(status_code=503, detail="Busy. Try again in a few seconds.",
-                            headers={"Retry-After": "5"})
+                            headers={"Retry-After": "5"}) from exc
     if sub is None:
         raise HTTPException(status_code=403, detail=_SETUP_DONE)
 
@@ -121,7 +122,8 @@ async def setup_first_user(req: SetupRequest):
     def _user_and_hours() -> tuple[dict | None, int]:
         return task_store.get_user(sub), app_config.get_jwt_expiry_hours()
 
-    user, hours = await asyncio.to_thread(_user_and_hours)
+    # The owner row this route created and read above (an owner is never deleted).
+    user, hours = cast("tuple[dict, int]", await asyncio.to_thread(_user_and_hours))
 
     # Build response
     user_data = {
@@ -157,5 +159,5 @@ async def setup_first_user(req: SetupRequest):
         "dashboard_url_captured": dashboard_url_captured,
     })
     apply_session_cookie(response, token, expiry_hours=hours)
-    logger.info(f"Setup wizard: created owner admin {email}")
+    logger.info("Setup wizard: created owner admin %s", email)
     return response

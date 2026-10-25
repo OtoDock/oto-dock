@@ -9,8 +9,9 @@ import json
 
 import pytest  # noqa: F401  (temp_db / monkeypatch fixtures)
 
+import ws.dashboard  # noqa: F401  (resolves the dashboard↔dashboard_chat cycle)
 from core.events import turn_ending
-from core.events.common_events import CommonEvent, DONE, ERROR, TEXT
+from core.events.common_events import DONE, ERROR, TEXT, CommonEvent
 from storage import database as task_store
 from tests.fixtures.ws_dashboard_harness import (
     ANY,
@@ -24,8 +25,7 @@ from tests.fixtures.ws_dashboard_harness import (
     stub_dashboard_seams,
     warm_new_chat,
 )
-
-import ws.dashboard  # noqa: F401  (resolves the dashboard↔dashboard_chat cycle)
+from ws import wire_events as wire
 
 
 def _error_event(reason: str, detail: str = "boom", **extra) -> CommonEvent:
@@ -243,6 +243,67 @@ def test_the_context_after_an_ending_says_the_turn_ended_and_skips_a_repeat(
             assert "ended early (exited)" in prompts[1] and "User said: start" in prompts[1]
             assert "half an answer" in prompts[1]
     run_ws_scenario(scenario2)
+
+
+def test_a_second_resume_still_carries_the_prompt_that_started_the_work(temp_db, monkeypatch):
+    """The card's Resume sends one sentence (``wire.RESUME_TEXT``). After a
+    second ending the next Resume repeats it, and the re-injected context
+    still names the prompt that started the work and both partial replies:
+    the builder passes over the earlier Resume row."""
+    layer = FakeExecutionLayer()
+    prompts: list[str] = []
+
+    def turn(sid, prompt):
+        prompts.append(prompt)
+        if len(prompts) <= 2:
+            return [CommonEvent(type=TEXT, data={"content": f"part {len(prompts)}"}),
+                    _error_event(turn_ending.EXITED, "exit 137: killed", exit_code=137)]
+        return [CommonEvent(type=TEXT, data={"content": "ok"}), CommonEvent(type=DONE, data={})]
+    layer.turn_events = turn
+    stub_dashboard_seams(monkeypatch, layer)
+    slug = make_test_agent()
+    set_username("user-admin", "admin")
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, _sid = await warm_new_chat(ws, layer, slug)
+            ws.client_send({"type": "chat", "text": "start", "chat_id": chat_id})
+            await _until(ws, "done")
+            ws.client_send({"type": "chat", "text": wire.RESUME_TEXT, "chat_id": chat_id})
+            await _until(ws, "done")
+            assert "User said: start" in prompts[1] and "part 1" in prompts[1]
+            ws.client_send({"type": "chat", "text": wire.RESUME_TEXT, "chat_id": chat_id})
+            await _until(ws, "done")
+            assert "ended early (exited)" in prompts[2] and "User said: start" in prompts[2]
+            assert "part 1" in prompts[2] and "part 2" in prompts[2]
+            assert prompts[2].rstrip().endswith(wire.RESUME_TEXT)
+    run_ws_scenario(scenario)
+
+
+def test_after_a_restart_the_next_turn_repeats_nothing_of_the_cut_one(temp_db, monkeypatch):
+    """A reply the restart cut is in the engine's own record (its transcript,
+    or the chat rows Direct LLM reads back): the next message goes alone,
+    with no copy of the cut turn and no note about it."""
+    layer, slug, prompts = _prompts_setup(monkeypatch, [
+        CommonEvent(type=TEXT, data={"content": "half an answer"}),
+        _error_event(turn_ending.RESTARTED, ""),
+    ])
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, _sid = await warm_new_chat(ws, layer, slug)
+            ws.client_send({"type": "chat", "text": "start", "chat_id": chat_id})
+            await _until(ws, "done")
+            assert [b["reason"] for b in _turn_ended_rows(chat_id)] == ["restarted"]
+            chat = task_store.get_chat(chat_id)
+            assert chat["last_turn_aborted"] is True and chat["last_abort_graceful"] is True
+            ws.client_send({"type": "chat", "text": "go on", "chat_id": chat_id})
+            await _until(ws, "done")
+            assert prompts[1].rstrip().endswith("go on")
+            assert "ended early" not in prompts[1] and "half an answer" not in prompts[1]
+    run_ws_scenario(scenario)
 
 
 def test_a_send_that_takes_waiting_messages_names_the_turn_that_ended(temp_db, monkeypatch):

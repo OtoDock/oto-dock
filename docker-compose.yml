@@ -6,6 +6,7 @@
 #      the repo documents every knob — only the password is required):
 #          POSTGRES_PASSWORD=<long random string>
 #          DASHBOARD_PUBLIC_URL=https://otodock.example.com  # URL users browse to
+#          COLLABORA_SSL_TERMINATION=true                    # with an https URL (the document editor)
 #          TZ=Europe/Athens                                  # container timezone
 #      The proxy auto-generates its remaining secrets (PROXY_API_KEY /
 #      JWT_SECRET / VAPID_*) into that same file on first boot, via the
@@ -49,7 +50,7 @@ x-logging: &default-logging
 services:
   # --- PostgreSQL ---
   otodock-postgres:
-    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea}
+    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36}
     restart: unless-stopped
     logging: *default-logging
     environment:
@@ -128,7 +129,7 @@ services:
 
   # --- The platform proxy (dashboard baked in) ---
   otodock-proxy:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.8.1}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.9.0}
     restart: unless-stopped
     logging: *default-logging
     # Graceful-stop budget: uvicorn's connection drain (up to 10s) + the 30s
@@ -185,8 +186,8 @@ services:
       # re-bind the server inside the container while the port mapping, image
       # healthcheck and sibling services all still target 8400.
       PROXY_PORT: "8400"
-      # Public URL of the dashboard. Drives document-preview wiring (COLLABORA_URL,
-      # service-root, frame-ancestors all auto-derive from this) and the session
+      # Public URL of the dashboard. Drives document-preview wiring (COLLABORA_URL
+      # and service-root derive from this, the relay sends its host to Collabora) and the session
       # cookie's Secure flag (https → Secure). Set this in config.env to your real
       # public URL (e.g. https://otodock.example.com); the localhost default works
       # for a same-host test.
@@ -266,8 +267,8 @@ services:
     # pasta creates a tap via /dev/net/tun, which Docker does not expose by
     # default. The host node is world-rw (10:200), so the non-root proxy can use
     # it once the device is mapped in — no extra capability needed (pasta gets
-    # CAP_NET_ADMIN over its OWN userns/netns). Without this the proxy boots but
-    # every agent spawn fails ("Failed to open tun socket in namespace"). See
+    # CAP_NET_ADMIN over its OWN userns/netns). Without this the proxy refuses
+    # to start: its boot check runs the sandbox and names the device. See
     # docs/architecture/SANDBOX.md.
     devices:
       - /dev/net/tun
@@ -304,7 +305,7 @@ services:
   # the upgrade case where the volume already holds root-owned agent trees;
   # idempotent + non-fatal (a fresh volume is empty so it's effectively no-op).
   otodock-agents-init:
-    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.8.1}
+    image: ghcr.io/otodock/otodock-proxy:${OTODOCK_VERSION:-1.9.0}
     user: "0:0"
     # This one-shot only chowns volumes — it needs NO network. Without this,
     # Compose creates a `<project>_default` bridge just for it, and on a host
@@ -313,7 +314,32 @@ services:
     # it off every bridge so no default network is ever created. (Also pin the
     # daemon's default-address-pools — see DOCKER-DEPLOYMENT.md host prereq.)
     network_mode: "none"
-    command: ["sh","-lc","chown -R 1000:1000 /opt/otodock/agents /opt/otodock/mcps/community /opt/otodock/mcps/skills /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/sessions /opt/otodock/recover-bin 2>/dev/null; chown 1000:1000 /opt/otodock/config.env 2>/dev/null; chmod 0755 /opt/otodock/agents; chmod 0700 /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/recover-bin 2>/dev/null; true"]
+    # It also writes Collabora's WOPI proof key, once (an existing key is
+    # kept: removing the otodock-collabora-proof volume makes a new one), for
+    # Collabora's user (1001) alone: Collabora signs every WOPI call with it
+    # and the proxy refuses an unsigned one. Beside it, on every run, the
+    # script that closes Collabora's welcome dialog (collabora's mounts say
+    # why), so a Collabora bump that changes it lands at the next up. Every
+    # shell `$` is written `$$`: compose fills variables in this text.
+    command:
+      - sh
+      - -lc
+      - |
+        chown -R 1000:1000 /opt/otodock/agents /opt/otodock/mcps/community /opt/otodock/mcps/skills /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/sessions /opt/otodock/recover-bin 2>/dev/null
+        chown 1000:1000 /opt/otodock/config.env 2>/dev/null
+        chmod 0755 /opt/otodock/agents
+        chmod 0700 /opt/otodock/mcps/custom/ssh-hosts/keys /opt/otodock/recover-bin 2>/dev/null
+        k=/opt/otodock/collabora-proof/proof_key
+        [ -s $$k ] || { umask 077; openssl genpkey -quiet -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out $$k.new && mv $$k.new $$k; }
+        chown 1001:1001 $$k 2>/dev/null
+        chmod 0400 $$k 2>/dev/null
+        w=/opt/otodock/collabora-proof/welcome.js
+        cat > $$w.new <<'EOF' && chmod 0444 $$w.new && mv -fT $$w.new $$w
+        window.parent.postMessage('{"MessageId":"welcome-translate","strings":{}}', window.origin)
+        window.parent.postMessage('{"MessageId":"welcome-close"}', window.origin)
+        EOF
+        chown 1001:1001 $$w 2>/dev/null
+        true
     volumes:
       - otodock-agents:/opt/otodock/agents
       - otodock-mcps:/opt/otodock/mcps/community
@@ -321,6 +347,7 @@ services:
       - otodock-ssh-keys:/opt/otodock/mcps/custom/ssh-hosts/keys
       - otodock-sessions:/opt/otodock/sessions
       - otodock-recover-bin:/opt/otodock/recover-bin
+      - otodock-collabora-proof:/opt/otodock/collabora-proof
       - ${OTODOCK_ENV_FILE:-./.env}:/opt/otodock/config.env
     restart: "no"
 
@@ -337,7 +364,7 @@ services:
   # on the next start. Idempotent, injection-safe. Postgres image (ships psql):
   # no Dockerfile change. Runs before the proxy connects.
   otodock-db-init:
-    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea}
+    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36}
     restart: "no"
     logging: *default-logging
     # Data-plane only: the TCP gate and the app-role proof reach
@@ -518,7 +545,7 @@ services:
   # The proxy does NOT drive this container's lifecycle in T2 (it's a sibling
   # the operator owns) — startup_docker_mcps skips it. Shares the agents volume.
   file-tools:
-    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.8.1}
+    image: ghcr.io/otodock/otodock-file-tools:${OTODOCK_VERSION:-1.9.0}
     restart: unless-stopped
     logging: *default-logging
     # Bound so a runaway document parse OOM-restarts this container instead of
@@ -552,37 +579,60 @@ services:
   # Reached internally by the proxy at http://collabora:9980; its WOPI callbacks
   # reach the proxy at http://otodock-proxy:8400 (WOPI_BASE_URL on file-tools).
   collabora:
-    image: collabora/code:25.04.10.3.1@sha256:a51dd5d1741dea5d19f49d9997de2c321bf582076015ec4015941f3f00a5f4c0
+    image: collabora/code:26.04.5.1.1@sha256:bb8f3c9c5c9016045f25fccb5f0649be94469ebc7c7cc379f3576e470cccf33d
     restart: unless-stopped
     logging: *default-logging
     # Bound so a runaway document degrades (Collabora sheds its LRU doc)
     # instead of pressuring the host; matches the T1 catalog deploy.
     mem_limit: 2g
     environment:
-      # Document preview auto-configures from the ONE setting you already provide.
-      # Collabora generates the in-browser editor URL (discovery `urlsrc`) AND
-      # enforces a strict WS-origin check from its `server_name` + `ssl.termination`
-      # — NOT from request/X-Forwarded headers — so they must equal the dashboard's
-      # public origin. The entrypoint below derives them from DASHBOARD_PUBLIC_URL:
-      # server_name + frame_ancestors = its host:port, ssl.termination = (scheme is
-      # https). So just set DASHBOARD_PUBLIC_URL to the URL users actually browse to
-      # (in config.env) and preview works — no Collabora-specific knobs.
+      # The image has no shell: its own entrypoint (coolwsd --use-env-vars)
+      # reads these. Collabora's public address needs no setting: the proxy
+      # sends the dashboard's host (DASHBOARD_PUBLIC_URL) on every request it
+      # forwards, and Collabora builds the editor's address, the
+      # frame-ancestors list and its socket origin check from it. The one
+      # thing it cannot learn that way is whether TLS ends in front of it:
+      # COLLABORA_SSL_TERMINATION, true for an https DASHBOARD_PUBLIC_URL
+      # (install.sh, upgrade.sh, the setup wizard and the proxy at its start
+      # write it into .env, scripts/compose.sh exports it; the default suits
+      # http).
       # NOTE: this is sub-path mode (the proxy forwards /collabora/* to here). For a
       # separate Collabora FQDN, run your own reverse proxy and set COLLABORA_URL.
+      # Copy mode (mount_jail_tree=false): a container without CAP_SYS_ADMIN
+      # cannot bind-mount the document jails, so Collabora copies them.
       # Background save is off: a save runs in the document's own process, as
       # a forked save on 25.04.10.3.1 hung past its timeout and lost the edit.
       # An edit is saved 10 s after the last keystroke (the stock 30), beside
       # the saves the dashboard asks for: the agent reads the stored file.
-      - DASHBOARD_PUBLIC_URL=${DASHBOARD_PUBLIC_URL:-http://localhost:${PROXY_PORT:-8400}}
       - aliasgroup1=http://otodock-proxy:8400
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        host="$${DASHBOARD_PUBLIC_URL#*://}"; host="$${host%%/*}";
-        case "$$DASHBOARD_PUBLIC_URL" in https://*) t=true ;; *) t=false ;; esac;
-        export extra_params="--o:ssl.enable=false --o:ssl.termination=$$t --o:net.frame_ancestors=$$host --o:server_name=$$host --o:net.service_root=/collabora --o:net.proxy_prefix=true --o:per_document.idle_timeout_secs=7200 --o:per_document.background_autosave=false --o:per_document.background_manualsave=false --o:per_document.idlesave_duration_secs=10 --o:logging.level_startup=warning";
-        exec /start-collabora-online.sh
+      - "extra_params=--o:ssl.enable=false --o:ssl.termination=${COLLABORA_SSL_TERMINATION:-false} --o:net.service_root=/collabora --o:mount_jail_tree=false --o:per_document.idle_timeout_secs=7200 --o:per_document.background_autosave=false --o:per_document.background_manualsave=false --o:per_document.idlesave_duration_secs=10 --o:logging.level_startup=warning"
+    volumes:
+      # The WOPI proof key otodock-agents-init writes, as a single file of
+      # its volume (a volume subpath: Docker Engine 26 or later).
+      - type: volume
+        source: otodock-collabora-proof
+        target: /etc/coolwsd/proof_key
+        read_only: true
+        volume:
+          subpath: proof_key
+      # Collabora's free edition shows an "Explore the new" welcome once per
+      # browser, and no setting turns it off short of its home mode, which
+      # caps the server at 20 connections and 10 open documents. The editor
+      # loads that welcome in a hidden frame from this script: the one
+      # otodock-agents-init writes closes it before it shows (the editor
+      # then records its version as seen), after the message the vendor's
+      # own script sends first, which stops the editor's retry of a frame
+      # that never showed. The path and the two messages were read off
+      # collabora/code 26.04.5.1.1: a Collabora bump re-checks them. A file
+      # of the key's volume, never a compose config: Compose 2.26 to 2.3x
+      # copy a config into the created container, which mounts the key
+      # before the one-shot has written it, and the first start fails.
+      - type: volume
+        source: otodock-collabora-proof
+        target: /usr/share/coolwsd/browser/dist/welcome/welcome.js
+        read_only: true
+        volume:
+          subpath: welcome.js
     cap_add:
       - MKNOD
     # Internal-only, same as file-tools: Collabora reaches only the proxy (its
@@ -590,7 +640,10 @@ services:
     # forward.
     networks: [otodock-internal]
     depends_on:
-      - otodock-proxy
+      otodock-agents-init:
+        condition: service_completed_successfully
+      otodock-proxy:
+        condition: service_started
 
 networks:
   otodock:
@@ -651,3 +704,8 @@ volumes:
     name: otodock-sessions
   otodock-recover-bin:
     name: otodock-recover-bin
+  # Collabora's WOPI proof key and its welcome script (otodock-agents-init
+  # writes both). Not in a backup: a restore gets a new key, which the proxy
+  # reads from Collabora.
+  otodock-collabora-proof:
+    name: otodock-collabora-proof

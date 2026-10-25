@@ -35,7 +35,7 @@ def test_the_contract_module_is_a_leaf():
     loaded = _modules_after("core.execution_layer")
     ours = {m for m in loaded if m.startswith(("core.", "services.", "storage.", "config"))}
     assert ours == {"core.events", "core.events.common_events", "core.execution_layer",
-                    "core.host_os", "core.placement"}, ours
+                    "core.host_os", "core.permission_modes", "core.placement"}, ours
 
 
 def test_the_subscription_services_do_not_import_the_registry():

@@ -215,6 +215,24 @@ def init_chats(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_chat_input_queue_chat ON chat_input_queue (chat_id, id)"
     )
 
+    # The turn a chat has in flight, written by its pump at the turn's start
+    # and deleted at its end (``storage/chat/open_turns.py``): a row the boot
+    # finds is a turn the last process never finished. ``engine_open`` says
+    # an engine turn runs (its result has not arrived); ``early_ranges`` (a
+    # JSON list of ``[after, upto]``) names the rows that engine turn saved
+    # before its end, committed with those rows (a replay deletes them).
+    # Created at every boot (IF NOT EXISTS), nothing to migrate.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_open_turns (
+            chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+            turn_token TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            started_at TEXT NOT NULL,
+            engine_open BOOLEAN NOT NULL DEFAULT TRUE,
+            early_ranges TEXT NOT NULL DEFAULT '[]'
+        )
+    """)
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chat_plans (
             id SERIAL PRIMARY KEY,
@@ -294,3 +312,49 @@ def init_meetings(conn) -> None:
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_meeting_turns_meeting ON meeting_turns(meeting_id)")
+
+
+def init_reply_reports(conn) -> None:
+    """A person's report of an agent's reply, for the install's admins
+    (the ``report`` notification source): who, when, the chat and its
+    reply's first row, the agent, the reason, the note, the reply's text as
+    the server stored it, and when the admins were told (``notified_at``:
+    the notice gap runs from a person's last notified report). One per
+    person and reply. The chat's deletion takes its reports (the content
+    lives with the chat); a message row can go alone (a turn replayed after a
+    restart writes its rows again), so the message id carries no FK. An
+    admin may dismiss a report to the page's history (``dismissed_at``,
+    ``dismissed_by``) and restore it; nothing is deleted. Whole-table CREATE
+    in init (new-table pattern), with the two dismiss columns added after
+    for a database that made the table before them."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reply_reports (
+            id            SERIAL PRIMARY KEY,
+            reporter_sub  TEXT NOT NULL,
+            chat_id       TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+            message_id    INTEGER NOT NULL,
+            agent         TEXT NOT NULL DEFAULT '',
+            reason        TEXT NOT NULL,
+            note          TEXT NOT NULL DEFAULT '',
+            reply_text    TEXT NOT NULL DEFAULT '',
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+            notified_at   TIMESTAMPTZ,
+            dismissed_at  TIMESTAMPTZ,
+            dismissed_by  TEXT NOT NULL DEFAULT '',
+            UNIQUE (reporter_sub, message_id)
+        )
+    """)
+    # A database that made the table before an admin could dismiss a report:
+    # every existing report stays open.
+    conn.execute("ALTER TABLE reply_reports ADD COLUMN IF NOT EXISTS dismissed_at TIMESTAMPTZ")
+    conn.execute(
+        "ALTER TABLE reply_reports ADD COLUMN IF NOT EXISTS dismissed_by TEXT NOT NULL DEFAULT ''"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reply_reports_reporter "
+        "ON reply_reports (reporter_sub, created_at)"
+    )
+    # A chat's deletion cascades here: without it every delete scans the table.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reply_reports_chat ON reply_reports (chat_id)"
+    )

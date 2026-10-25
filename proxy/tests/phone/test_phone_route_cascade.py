@@ -14,9 +14,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from storage.phone import phone_route_store
-
 from auth.providers import UserContext, get_current_user
+from storage.phone import phone_route_store
 
 
 class _State:

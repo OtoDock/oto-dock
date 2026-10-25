@@ -3,8 +3,8 @@ permission-queue artifact item to its dashboard WS frame, shared by the -p pump
 and the interactive drainer."""
 
 from core.events.artifact_events import (
-    artifact_event_from_perm_item,
     ARTIFACT_EVENT_TYPES,
+    artifact_event_from_perm_item,
 )
 
 
@@ -62,11 +62,13 @@ def test_document_preview():
         "type": "document_preview", "wopi_url": "w", "filename": "f.docx",
         "file_id": "fid", "download_url": "/d",
         "snapshot_id": "abc123", "generation": 1700000000000, "version": 3,
-        "access_token": "", "access_token_ttl": 0,
+        "access_token": "", "access_token_ttl": 0, "token_person": "",
     }
-    # The live frame carries the WOPI token beside the URL (F57).
-    live = artifact_event_from_perm_item({**item, "access_token": "t", "access_token_ttl": 9})
-    assert live["access_token"] == "t" and live["access_token_ttl"] == 9
+    # The live frame carries the WOPI token beside the URL (F57), with the
+    # person it was minted for.
+    live = artifact_event_from_perm_item({**item, "access_token": "t", "access_token_ttl": 9,
+                                          "token_person": "u"})
+    assert (live["access_token"], live["access_token_ttl"], live["token_person"]) == ("t", 9, "u")
     # Pre-snapshot pushes (no chat, copy failure) default to empty identity.
     out = artifact_event_from_perm_item(
         {"event_type": "document_preview", "wopi_url": "w", "filename": "f",

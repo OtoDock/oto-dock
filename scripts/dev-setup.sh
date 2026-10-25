@@ -55,9 +55,9 @@ SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 # ── pinned versions — read straight from VERSIONS.md (single source of truth) ─
 # shellcheck source=versions.sh
 source "$PLATFORM_ROOT/scripts/versions.sh"
-PYTHON_VERSION="$(otodock_version_get PYTHON_VERSION)"; PYTHON_VERSION="${PYTHON_VERSION:-3.13.16}"
-NODE_VERSION="$(otodock_version_get NODE_VERSION)";   NODE_VERSION="${NODE_VERSION:-24.21.0}"
-NODE_MAJOR="${NODE_VERSION%%.*}"                               # 24
+PYTHON_VERSION="$(otodock_version_get PYTHON_VERSION)"; PYTHON_VERSION="${PYTHON_VERSION:-3.13.17}"
+NODE_VERSION="$(otodock_version_get NODE_VERSION)";   NODE_VERSION="${NODE_VERSION:-26.12.1}"
+NODE_MAJOR="${NODE_VERSION%%.*}"                               # 26
 UV_VERSION="$(otodock_version_get UV_VERSION)";       export UV_VERSION   # honored by install-baseline-tools.sh
 PNPM_VERSION="$(otodock_version_get PNPM_VERSION)";   export PNPM_VERSION
 
@@ -87,13 +87,25 @@ refuse_running_units() {
 # (the sandbox mounts /usr, not $HOME, so a version-manager node in ~/ is
 # invisible to agents).
 install_node() {
-    local cur=""
-    command -v node >/dev/null 2>&1 && cur="$(node -v 2>/dev/null | sed 's/^v//;s/\..*//')"
+    local cur="" found=""
+    # A node first on PATH outside /usr stops the run before apt changes
+    # anything, whatever its major: the installed one would stay hidden
+    # behind it.
+    if command -v node >/dev/null 2>&1; then
+        found="$(readlink -f "$(command -v node)")"
+        case "$found" in
+            /usr/*) cur="$(node -v 2>/dev/null | sed 's/^v//;s/\..*//')" ;;
+            *) die "node at ${found} is not under /usr — sandboxed MCPs won't see it. Remove the version-manager node from PATH and re-run." ;;
+        esac
+    fi
     if [ "$cur" = "$NODE_MAJOR" ]; then
         ok "Node ${NODE_MAJOR}.x present ($(node -v))"
         return
     fi
     info "Installing Node ${NODE_MAJOR}.x via NodeSource (found: ${cur:-none})..."
+    # One NodeSource source: setup_NN.x writes its own, and the baseline
+    # installer's nodesource.list for an older major would stay beside it.
+    $SUDO rm -f /etc/apt/sources.list.d/nodesource.list
     curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | $SUDO -E bash -
     $SUDO apt-get install -y nodejs
     case "$(readlink -f "$(command -v node)")" in
@@ -121,6 +133,17 @@ install_baseline() {
 install_docker() {
     if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
         ok "Docker + Compose present ($(docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1))"
+        # The document editor's key is mounted as one file of a volume (a
+        # subpath): Docker Engine 26 (API 1.45) and Docker Compose 2.26 or later.
+        local api cv
+        api="$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null || $SUDO docker version --format '{{.Server.APIVersion}}' 2>/dev/null || true)"
+        cv="$(docker compose version --short 2>/dev/null || true)"
+        if ! awk -v v="$api" 'BEGIN { n = split(v, a, "."); exit !(n >= 2 && (a[1] + 0 > 1 || (a[1] + 0 == 1 && a[2] + 0 >= 45))) }'; then
+            die "Docker Engine 26 or later is needed (API ${api:-unknown}): the document editor's key is mounted as one file of a volume. Update Docker, then re-run"
+        fi
+        if ! awk -v v="${cv#v}" 'BEGIN { n = split(v, a, "."); exit !(n >= 2 && (a[1] + 0 > 2 || (a[1] + 0 == 2 && a[2] + 0 >= 26))) }'; then
+            die "Docker Compose 2.26 or later is needed (${cv:-unknown}): an older Compose mounts the document editor's key wrong. Update Docker, then re-run"
+        fi
         return
     fi
     info "Installing Docker Engine + Compose (get.docker.com)..."
@@ -171,7 +194,7 @@ setup_proxy() {
 start_postgres() {
     [ -f "$PLATFORM_ROOT/config.env" ] || die "config.env missing — proxy/setup.sh should have created it"
     local DC="docker"; docker info >/dev/null 2>&1 || DC="sudo docker"
-    info "Starting Postgres (${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea}) in Docker..."
+    info "Starting Postgres (${POSTGRES_IMAGE:-postgres:16.15-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36}) in Docker..."
     $DC compose --env-file "$PLATFORM_ROOT/config.env" -f "$PLATFORM_ROOT/docker-compose.t1.yml" up -d postgres
     ok "Postgres up on 127.0.0.1:5432 (container otodock-postgres)"
 }

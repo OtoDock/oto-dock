@@ -36,9 +36,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-import jwt
-
-import config
+from auth import tokens
 from core.credentials.mcp_gateway import CliCredential, GatewayCredential
 
 logger = logging.getLogger("otodock")
@@ -51,14 +49,14 @@ logger = logging.getLogger("otodock")
 MCP_CRED_TOKEN_TTL_S = 30 * 60
 
 # session_id -> mcp_name -> SecretBundle.  IN-MEMORY ONLY (see module docstring).
-_store: dict[str, dict[str, "SecretBundle"]] = {}
+_store: dict[str, dict[str, SecretBundle]] = {}
 
 # session_id -> relpath -> SessionFile. Per-SESSION secret FILES (not per-MCP
 # env) — SSH private keys today, credentials_dir token files next. A remote
 # session's satellite fetches these once at start via a session-files
 # capability token, materializes them 0600 under its per-session secrets dir,
 # and wipes them at session close. Same in-memory-only rule as ``_store``.
-_file_store: dict[str, dict[str, "SessionFile"]] = {}
+_file_store: dict[str, dict[str, SessionFile]] = {}
 
 
 @dataclass
@@ -87,7 +85,7 @@ class SessionFile:
 # ---------------------------------------------------------------------------
 
 
-def provision(session_id: str, secrets: dict[str, "SecretBundle"]) -> None:
+def provision(session_id: str, secrets: dict[str, SecretBundle]) -> None:
     """Install (replace) the secret bundles for a session.
 
     Called at MCP materialization and re-called on every (re)warmup, so the
@@ -101,18 +99,18 @@ def provision(session_id: str, secrets: dict[str, "SecretBundle"]) -> None:
         _store.pop(session_id, None)
 
 
-def get(session_id: str, mcp: str) -> "SecretBundle | None":
+def get(session_id: str, mcp: str) -> SecretBundle | None:
     """Direct in-process lookup of one MCP's bundle. The Direct-LLM in-proc spawn
     path uses this instead of the HTTP endpoint; the endpoint uses it too."""
     return _store.get(session_id, {}).get(mcp)
 
 
-def bundles_of(session_id: str) -> dict[str, "SecretBundle"]:
+def bundles_of(session_id: str) -> dict[str, SecretBundle]:
     """Every bundle a session holds, by MCP key (a copy)."""
     return dict(_store.get(session_id, {}))
 
 
-def cli_credential(session_id: str, host: str) -> "CliCredential | None":
+def cli_credential(session_id: str, host: str) -> CliCredential | None:
     """The command-line credential a session holds for ``host`` (the git
     helper's and the command wrappers' lookup), or None."""
     want = (host or "").strip().lower()
@@ -136,7 +134,7 @@ def purge_session(session_id: str) -> None:
 
 
 def provision_session_files(
-    session_id: str, files: dict[str, "SessionFile"],
+    session_id: str, files: dict[str, SessionFile],
 ) -> None:
     """Install (replace) the per-session secret FILES for a session.
 
@@ -149,7 +147,7 @@ def provision_session_files(
         _file_store.pop(session_id, None)
 
 
-def get_session_files(session_id: str) -> dict[str, "SessionFile"] | None:
+def get_session_files(session_id: str) -> dict[str, SessionFile] | None:
     """The session's secret files, or None when none were provisioned."""
     return _file_store.get(session_id)
 
@@ -169,7 +167,7 @@ def mint_token(session_id: str, mcp: str) -> str:
         "mcp": mcp,
         "exp": datetime.now(timezone.utc) + timedelta(seconds=MCP_CRED_TOKEN_TTL_S),
     }
-    return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
+    return tokens.mint(tokens.MCP_CREDENTIALS, payload)
 
 
 def verify_token(token: str) -> tuple[str, str] | None:
@@ -178,12 +176,9 @@ def verify_token(token: str) -> tuple[str, str] | None:
     Rejects anything that is not a ``mcp_cred`` token — in particular the session
     JWT (``type == "session"``) and the master key (not a JWT at all) both fail
     here, so the endpoint cannot be driven by a credential the agent already
-    holds. Signature + expiry are enforced by ``jwt.decode``."""
-    try:
-        payload = jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
-    except (jwt.InvalidTokenError, jwt.ExpiredSignatureError):
-        return None
-    if payload.get("type") != "mcp_cred":
+    holds: they are other kinds (``auth/tokens.py``)."""
+    payload = tokens.verify(token, tokens.MCP_CREDENTIALS)
+    if payload is None:
         return None
     sid = payload.get("sid") or ""
     mcp = payload.get("mcp") or ""
@@ -203,15 +198,12 @@ def mint_files_token(session_id: str) -> str:
         "sid": session_id,
         "exp": datetime.now(timezone.utc) + timedelta(seconds=MCP_CRED_TOKEN_TTL_S),
     }
-    return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
+    return tokens.mint(tokens.SESSION_FILES, payload)
 
 
 def verify_files_token(token: str) -> str | None:
     """Validate a session-files capability token → session_id (or None)."""
-    try:
-        payload = jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
-    except (jwt.InvalidTokenError, jwt.ExpiredSignatureError):
-        return None
-    if payload.get("type") != "session_files":
+    payload = tokens.verify(token, tokens.SESSION_FILES)
+    if payload is None:
         return None
     return payload.get("sid") or None

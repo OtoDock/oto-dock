@@ -1,12 +1,13 @@
 /**
  * useFindBar — AgentChat's find-bar state: the open flag, the raw input and
  * its 200 ms debounced query, the `?q=` deep link (captured here, deferred
- * until chat_history loads via `pendingFindQuery`, consumed by the stream's
+ * until chat_history loads via `pendingFindQueryRef`, consumed by the stream's
  * onChatHistoryLoaded), the Ctrl/Cmd+F intercept and `closeFindBar`. Called
  * where the page declared the find-bar state, so the hook order is unchanged.
  */
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { useSearchParams } from 'react-router-dom'
+import { blockedByModal } from '../../../lib/ui/modalLayers'
 
 export function useFindBar({ searchParams, setSearchParams }: {
   searchParams: URLSearchParams
@@ -16,7 +17,7 @@ export function useFindBar({ searchParams, setSearchParams }: {
   const [findBarOpen, setFindBarOpen] = useState(false)
   const [findInput, setFindInput] = useState('')   // raw input (debounced before passing to context)
   const [findQuery, setFindQuery] = useState('')    // debounced query for SearchProvider
-  const pendingFindQuery = useRef<string | null>(null)  // deferred until chat_history loads
+  const pendingFindQueryRef = useRef<string | null>(null)  // deferred until chat_history loads
 
   // --- Find bar: URL param integration + Ctrl+F + debounce ---
 
@@ -25,7 +26,7 @@ export function useFindBar({ searchParams, setSearchParams }: {
   useEffect(() => {
     const q = searchParams.get('q')
     if (q) {
-      pendingFindQuery.current = q
+      pendingFindQueryRef.current = q
       // Remove ?q from URL without re-navigation
       setSearchParams({}, { replace: true })
     }
@@ -40,6 +41,7 @@ export function useFindBar({ searchParams, setSearchParams }: {
   // Ctrl+F / Cmd+F intercept
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (blockedByModal(e)) return
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
         e.preventDefault()
         setFindBarOpen(true)
@@ -57,6 +59,6 @@ export function useFindBar({ searchParams, setSearchParams }: {
 
   return {
     findBarOpen, setFindBarOpen, findInput, setFindInput, findQuery, setFindQuery,
-    pendingFindQuery, closeFindBar,
+    pendingFindQueryRef, closeFindBar,
   }
 }

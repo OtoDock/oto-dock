@@ -6,6 +6,8 @@ prefixes the agent's display name, unless the title already names the agent
 (display name or slug) — end-of-turn titles are built with ``agent_label`` and
 must never come out double-labelled."""
 
+import psycopg
+
 from services.notifications import notification_manager as nm
 
 
@@ -62,7 +64,7 @@ def test_push_title_survives_store_errors(monkeypatch):
     from storage.agents import agent_store
 
     def boom(_slug):
-        raise RuntimeError("db down")
+        raise psycopg.OperationalError("db down")
 
     monkeypatch.setattr(agent_store, "get_agent", boom)
     assert nm.push_title("Task done", "alpha") == "alpha · Task done"

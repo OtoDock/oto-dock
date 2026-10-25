@@ -15,17 +15,17 @@ tests (``meeting_orchestrator.build_meeting_agent_config`` /
 import asyncio
 import json
 import logging
+from typing import cast
 
 import config
+from auth.path_policy import SecurityContext, build_permission_context
+from core.execution_layer import AgentConfig
+from core.session import session_kind
+from services.engines import subscription_pool
+from services.mcp import dynamic_context, mcp_registry
 from storage import database as task_store
 from storage.agents import agent_store
-from services.mcp import mcp_registry
-from services.mcp import dynamic_context
-from services.engines import subscription_pool
-from core.execution_layer import AgentConfig
-from auth.path_policy import SecurityContext, build_permission_context
-from core.execution_layer import DEFAULT_EXECUTION_PATH
-from core.session import session_kind
+from storage.agents.schema import DEFAULT_EXECUTION_PATH
 
 logger = logging.getLogger("otodock")
 
@@ -75,18 +75,35 @@ async def build_meeting_agent_config(
     # mount + owns session_scope / config_visible / available_scopes for the
     # prompt + sandbox decouple.
     from core.config.task_config_builder import resolve_task_identity
-    from core.session.visibility import resolve_visibility
-    identity = resolve_task_identity(agent_name, scope, created_by)
+    from core.session.visibility import SCOPE_AGENT, is_shared_only, resolve_visibility
+
+    def _participant_reads():
+        # Every read of the participant's identity, one worker-thread job: the
+        # identity and visibility, the delegation targets (user scope: the
+        # creator's own agents), the agent row.
+        identity = resolve_task_identity(agent_name, scope, created_by)
+        vis = resolve_visibility(
+            agent_name,
+            username=identity.username or "",
+            user_role=identity.role or "",
+            user_sub=identity.creds_user_sub or "",
+            scope_override=identity.scope,
+        )
+        shared_only = is_shared_only(agent_name)
+        db_targets = agent_store.get_delegation_targets(agent_name)
+        if identity.scope == "user" and identity.creds_user_sub:
+            user_agents = set(task_store.get_user_agents(identity.creds_user_sub))
+            targets = [t for t in db_targets if t in user_agents]
+        else:
+            targets = db_targets
+        return (identity, vis, shared_only, targets,
+                agent_store.is_admin_only(agent_name), agent_store.get_agent(agent_name))
+
+    (identity, vis, _shared_only, resolved_targets,
+     is_admin_only, agent_info) = await asyncio.to_thread(_participant_reads)
     task_username = identity.username           # REAL creator (attribution); "" for agent scope
     task_role = identity.role
     user_sub_for_creds = identity.creds_user_sub  # None for agent scope
-    vis = resolve_visibility(
-        agent_name,
-        username=task_username or "",
-        user_role=task_role or "",
-        user_sub=user_sub_for_creds or "",
-        scope_override=identity.scope,
-    )
     # A participant that would run as the agent below the editor tier is
     # refused here, before any seat (every engine's start refuses it too): a
     # Shared-only participant its creator holds below editor, and an
@@ -95,8 +112,6 @@ async def build_meeting_agent_config(
     from auth import roles as _roles
     from auth.providers import acting_role_of
     from core.sandbox.session_config_dir import refuse_agent_state_below_editor
-    from core.session.visibility import SCOPE_AGENT, is_shared_only
-    _shared_only = is_shared_only(agent_name)
     refuse_agent_state_below_editor(vis.mount_scope, task_role or "", shared_only=_shared_only)
     if scope == SCOPE_AGENT and created_by:
         from storage.pg import run_db
@@ -108,19 +123,9 @@ async def build_meeting_agent_config(
         if creator_role is not None and not _roles.can_edit(creator_role):
             refuse_agent_state_below_editor(SCOPE_AGENT, creator_role, shared_only=_shared_only)
 
-    db_targets = agent_store.get_delegation_targets(agent_name)
-    if identity.scope == "user" and user_sub_for_creds:
-        user_agents = set(task_store.get_user_agents(user_sub_for_creds))
-        resolved_targets = [t for t in db_targets if t in user_agents]
-    else:
-        resolved_targets = db_targets
-
     # Per-session ctx for ${session.*} resolution in MCP agent_env declarations
-    session_task_owner = user_sub_for_creds if identity.scope == "user" else ""
+    session_task_owner = cast("str", user_sub_for_creds) if identity.scope == "user" else ""  # a user-scope identity carries its creator
     session_task_username = task_username if (session_task_owner and task_username) else ""
-
-    is_admin_only = agent_store.is_admin_only(agent_name)
-    agent_info = agent_store.get_agent(agent_name)
 
     # Resolve the execution target + placement facts BEFORE the MCP config /
     # prompt below, so device-local MCPs (computer / browser / app control)
@@ -131,9 +136,10 @@ async def build_meeting_agent_config(
     # AgentConfig.execution_target agree; placement_of expects the RESOLVED
     # target (the raw DB default mislabeled user-override targets).
     from core import placement as _placement
+    from services.remote import remote_status
     from storage import remote_store as _remote_store
     resolved_target = (await asyncio.to_thread(
-        _remote_store.resolve_execution_target,
+        remote_status.resolve_execution_target,
         agent_name, user_sub_for_creds, task_role,
     ))[0]
     target = await asyncio.to_thread(
@@ -183,6 +189,17 @@ async def build_meeting_agent_config(
         )
     )
 
+    # The session token names the meeting's person (the creator of a
+    # user-scope meeting; nobody for an agent-scope one and for a Shared-only
+    # participant), as the task builder's does: credential_env carries it to
+    # the process, the daemon and a Codex config's stdio MCPs, where the
+    # layer's own token would name nobody. Its iat is the session's floor.
+    from auth.session_token import mint_session_env
+    credential_env = credential_env if credential_env is not None else {}
+    token_minted_at = mint_session_env(
+        credential_env, session_id, agent_name, user_sub_for_creds or "", external="",
+    )
+
     # A Codex config gets the credential environment written in; the
     # bash-only git entries stay out of the file.
     mcp_config = await asyncio.to_thread(
@@ -213,8 +230,8 @@ async def build_meeting_agent_config(
     # resolve ${account.*}, ${credential.*}, ${user.*} tokens for the
     # right scope. Agent-scope meetings fall back to service accounts.
     # Async — builder blocks invoke remote MCP tools.
-    assigned_mcp_names = [m.name for m in (mcp_registry.get_agent_mcps(
-        agent_name, placement=target,
+    assigned_mcp_names = [m.name for m in (await asyncio.to_thread(
+        mcp_registry.get_agent_mcps, agent_name, placement=target,
     ) or [])]
     dynamic_contexts = await dynamic_context.get_dynamic_contexts(
         agent_name, assigned_mcp_names,
@@ -237,7 +254,10 @@ async def build_meeting_agent_config(
         nouser_reads=not user_sub_for_creds,
     )
 
-    agent_prompt = config.build_agent_prompt(
+    # In a worker thread (the files, the memory and the tree walk), as the
+    # chat and task builders do.
+    agent_prompt = await asyncio.to_thread(
+        config.build_agent_prompt,
         agent_name,
         username=vis.mount_username,
         role=task_role,
@@ -256,9 +276,9 @@ async def build_meeting_agent_config(
     )
     agent_prompt += _MEETING_AGENT_SUFFIX
 
-    # Resolve model and effort from agent's configured defaults
-    resolved_model = config.get_cli_model(agent_name)
-    resolved_effort = config.get_cli_effort(agent_name)
+    # Resolve model and effort from agent's configured defaults (store reads)
+    resolved_model, resolved_effort = await asyncio.to_thread(
+        lambda: (config.get_cli_model(agent_name), config.get_cli_effort(agent_name)))
 
     # PROXY_TASK_OWNER/USERNAME/SCOPE flow to MCPs via manifest agent_env
     # declarations using ${session.*} tokens (resolved at config-build time
@@ -281,8 +301,8 @@ async def build_meeting_agent_config(
         # The pool refused the spawn (its subscription cap, or a user-scope
         # block): the orchestrator fails the meeting with the reason.
         raise
-    except Exception as e:
-        logger.warning(f"Subscription pool error for meeting agent {agent_name}: {e}")
+    except Exception as e:  # noqa: BLE001  # a pool error leaves the meeting agent on its own engine login
+        logger.warning("Subscription pool error for meeting agent %s: %s", agent_name, e)
 
     # Prepare the persistent config dir — .codex/ for Codex, .claude/ otherwise.
     # Single source of truth so the builders can't drift (a Codex meeting agent
@@ -304,13 +324,14 @@ async def build_meeting_agent_config(
         user_sub=created_by or "",
         system_prompt=agent_prompt,
         mcp_config_path=str(mcp_config) if mcp_config else "",
-        credential_env=credential_env or {},
+        credential_env=credential_env,
         mcp_secret_bundles=secret_bundles or {},
         permission_mode="auto",
         client_type=session_kind.MEETING.name,
         model=resolved_model,
         effort=resolved_effort,
         resume=False,
+        token_minted_at=token_minted_at,
         extra_env=extra_env,
         security_context=task_security,
         subscription_id=subscription_id,
@@ -339,13 +360,13 @@ def build_turn_prompt(meeting: dict, agent_slug: str, transcript: list[dict],
         "restate"  — agent's previous turn ran tools but relayed no findings
     """
     topic = meeting["topic"]
-    participants = json.loads(meeting["participants"])
+    participants = _roster(meeting)
     meeting_id = meeting["id"]
 
     agent_has_spoken = any(e["agent"] == agent_slug for e in transcript)
 
     # Transcript since agent's last turn
-    relevant = []
+    relevant: list[dict] = []
     if agent_has_spoken:
         for entry in reversed(transcript):
             if entry["agent"] == agent_slug:
@@ -441,6 +462,62 @@ def build_turn_prompt(meeting: dict, agent_slug: str, transcript: list[dict],
         footer = "Please respond."
 
     return header + transcript_section + footer
+
+
+def _roster(meeting: dict) -> list[str]:
+    """The agents still in the meeting: the row's live list, which a leave
+    and a removal through the route shorten, else the convened roster."""
+    for key in ("active_participants", "participants"):
+        try:
+            names = json.loads(meeting.get(key) or "")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(names, list):
+            return [n for n in names if isinstance(n, str)]
+    return []
+
+
+# The host chat's note keeps the moderator's words, the topic and the
+# participant list to these many characters: one bounded line, the shape the
+# interactive prelude matchers strip (``transcript_tailer._TIME_PRELUDE_RE``).
+PARENT_NOTE_SUMMARY_CHARS = 1500
+PARENT_NOTE_TOPIC_CHARS = 200
+PARENT_NOTE_NAMES_CHARS = 400
+
+
+def _one_line(text: str, limit: int) -> str:
+    words = " ".join((text or "").split())
+    return words if len(words) <= limit else words[:limit].rstrip() + "…"
+
+
+def parent_note(meeting: dict, *, turns: int, names: list[str], last_words: str,
+                summary: bool, ended_at: str) -> str:
+    """The note a concluded meeting leaves for its host chat's next turn: the
+    host session never saw the meeting (its participants ran their own
+    sessions), so it learns the outcome here. ``summary``: the moderator
+    ended the meeting, so its last turn is the meeting's summary."""
+    words = _one_line(last_words, PARENT_NOTE_SUMMARY_CHARS)
+    label = "Summary" if summary else "The moderator's last turn"
+    said = f"{label}: {words}" if words else "The moderator wrote no closing words."
+    topic = _one_line(str(meeting.get("topic") or ""), PARENT_NOTE_TOPIC_CHARS)
+    who = _one_line(", ".join(names), PARENT_NOTE_NAMES_CHARS)
+    return (f'[Meeting "{topic}" ({meeting.get("id", "")}) ended '
+            f"{ended_at} UTC after {turns} turns, with {who}. {said} "
+            "The person sees the whole meeting in this chat; you have only this note.]")
+
+
+def departure_entry(agent_slug: str, display_name: str) -> dict:
+    """The transcript line an agent's departure leaves: every later prompt
+    shows it, so the moderator stops addressing an agent that is gone. It
+    queues nobody."""
+    return {
+        "agent": "system",
+        "content": (f"{display_name or agent_slug} (`{agent_slug}`) is no longer in the "
+                    "meeting; do not address them."),
+        "thinking": "",
+        "tools": [],
+        "role": "system",
+    }
 
 
 # ---------------------------------------------------------------------------

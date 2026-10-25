@@ -34,8 +34,9 @@ import logging
 import os
 import re
 import signal
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 # Stdlib-only (no proxy ``config`` import) so this module is vendored verbatim
 # into the satellite via scripts/sync-satellite-code.sh — one shared transport
@@ -105,6 +106,10 @@ class AppServerClient:
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
+        # The server-request dispatches in flight: the loop holds a task only
+        # weakly, so each is kept here until it is done.
+        self._server_request_tasks: set[asyncio.Task] = set()
         self._sr_handler: ServerRequestHandler | None = None
 
         # One warning banner per daemon for inner-sandbox failures on stderr
@@ -112,7 +117,7 @@ class AppServerClient:
         self._sandbox_stderr_warned = False
 
         # Notifications (method, params) for the session to drain per turn.
-        self.notif_queue: "asyncio.Queue[tuple[str, dict]]" = asyncio.Queue()
+        self.notif_queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
         # Outstanding server-request ids we owe an answer for — lets the
         # session drop a pending answer if the daemon self-resolves it (the
         # `serverRequest/resolved` race).
@@ -144,7 +149,7 @@ class AppServerClient:
             raise RuntimeError(f"{self._label}: already started")
 
         cmd = [*self._sandbox_cmd_prefix, self._codex_bin, "app-server"]
-        logger.info(f"{self._label}: spawning {' '.join(cmd[:4])}... (cwd={self._cwd})")
+        logger.info("%s: spawning %s... (cwd=%s)", self._label, ' '.join(cmd[:4]), self._cwd)
 
         # 200 MB stdout buffer — matches the CLI/Codex subprocess. Default 64 KB
         # readline raises LimitOverrunError on large MCP-result lines and kills
@@ -164,19 +169,20 @@ class AppServerClient:
                 limit=limit,
             )
         self._started = True
-        logger.info(f"{self._label}: daemon pid={self.proc.pid}")
+        logger.info("%s: daemon pid=%s", self._label, self.proc.pid)
 
         self._reader_task = asyncio.create_task(
             self._reader_loop(), name=f"{self._label}-reader",
         )
-        asyncio.create_task(
+        self._stderr_task = asyncio.create_task(
             self._drain_stderr(), name=f"{self._label}-stderr",
         )
 
         result = await self.request("initialize", init_params)
         logger.info(
-            f"{self._label}: initialized "
-            f"(codexHome={result.get('codexHome')}, os={result.get('platformOs')})"
+            "%s: initialized "
+            "(codexHome=%s, os=%s)",
+            self._label, result.get('codexHome'), result.get('platformOs')
         )
         return result
 
@@ -219,9 +225,9 @@ class AppServerClient:
             if timeout is None:
                 return await fut
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             self._pending.pop(mid, None)
-            raise AppServerError(f"{self._label}: {method} timed out after {timeout}s")
+            raise AppServerError(f"{self._label}: {method} timed out after {timeout}s") from exc
         finally:
             self._pending.pop(mid, None)
 
@@ -244,8 +250,8 @@ class AppServerClient:
             await self._write({"jsonrpc": "2.0", "id": req_id, "result": result})
         except AppServerError as e:
             logger.warning(
-                f"{self._label}: answer to server-request {req_id} not "
-                f"delivered — daemon gone ({e})"
+                "%s: answer to server-request %s not "
+                "delivered — daemon gone (%s)", self._label, req_id, e
             )
 
     async def respond_error(self, req_id: Any, code: int, message: str) -> None:
@@ -257,8 +263,8 @@ class AppServerClient:
                                "error": {"code": code, "message": message}})
         except AppServerError as e:
             logger.warning(
-                f"{self._label}: error answer to server-request {req_id} not "
-                f"delivered — daemon gone ({e})"
+                "%s: error answer to server-request %s not "
+                "delivered — daemon gone (%s)", self._label, req_id, e
             )
 
     def is_server_request_open(self, req_id: Any) -> bool:
@@ -300,15 +306,15 @@ class AppServerClient:
                 except json.JSONDecodeError:
                     # app-server keeps stderr separate, so non-JSON on stdout is
                     # rare; skip rather than crash the reader.
-                    logger.debug(f"{self._label}: non-JSON stdout: {stripped[:200]!r}")
+                    logger.debug("%s: non-JSON stdout: %r", self._label, stripped[:200])
                     continue
                 if not isinstance(msg, dict):
                     continue
                 self._dispatch(msg)
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"{self._label}: reader loop error: {e}")
+        except Exception as e:  # noqa: BLE001  # the reader's last line: the finally fails pending requests
+            logger.warning("%s: reader loop error: %s", self._label, e)
         finally:
             # Daemon died — fail pending requests + signal end-of-stream so a
             # turn consumer unblocks.
@@ -336,23 +342,25 @@ class AppServerClient:
             # Server→client request — dispatch in its own task so a slow
             # approval never blocks the reader or the turn stream.
             self._open_server_requests.add(mid)
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._dispatch_server_request(method, mid, msg.get("params") or {}),
                 name=f"{self._label}-sr",
             )
+            self._server_request_tasks.add(task)
+            task.add_done_callback(self._server_request_tasks.discard)
         elif method is not None:
             # Notification — route to the per-turn queue.
             self.notif_queue.put_nowait((method, msg.get("params") or {}))
 
     async def _dispatch_server_request(self, method: str, req_id: Any, params: dict) -> None:
         if self._sr_handler is None:
-            logger.warning(f"{self._label}: no handler for server-request {method}; declining")
+            logger.warning("%s: no handler for server-request %s; declining", self._label, method)
             await self.respond_error(req_id, -32601, "no handler registered")
             return
         try:
             result = await self._sr_handler(method, params)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"{self._label}: server-request {method} handler error: {e}")
+        except Exception as e:  # noqa: BLE001  # a server request is always answered, whatever the handler raised
+            logger.warning("%s: server-request %s handler error: %s", self._label, method, e)
             if self.is_server_request_open(req_id):
                 await self.respond_error(req_id, -32603, f"handler error: {e}")
             return
@@ -393,11 +401,11 @@ class AppServerClient:
                     )
                     self._sandbox_stderr_warned = True
                     logger.warning(
-                        f"{self._label}[stderr][sandbox]: {text}{hint}"
+                        "%s[stderr][sandbox]: %s%s", self._label, text, hint
                     )
                 else:
-                    logger.info(f"{self._label}[stderr]: {text[:400]}")
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    logger.info("%s[stderr]: %s", self._label, text[:400])
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001  # the stderr drain must never end the client, cancelled or not
             pass
 
     async def _kill_proc(self) -> None:
@@ -504,8 +512,8 @@ class McpWarmResult:
 
 
 async def wait_for_mcp_startup(
-    client: "AppServerClient",
-    expected: "list[str] | set[str] | tuple[str, ...]",
+    client: AppServerClient,
+    expected: list[str] | set[str] | tuple[str, ...],
     *,
     cap_s: float,
     poll_s: float = 0.5,

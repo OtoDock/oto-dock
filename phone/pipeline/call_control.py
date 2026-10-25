@@ -13,6 +13,7 @@ drain. The text markers stay the fallback for models that never call tools.
 import asyncio
 import contextlib
 import logging
+import time
 
 from config_manager import transfer_target_for
 from telephony.transfer import loggable_label
@@ -87,8 +88,8 @@ class CallControlMixin:
         current = getattr(self.llm, "current_turn", None)
         if turn is not None and current is not None and turn != current:
             logger.info(
-                f"[{self.conn.peer_addr}] call control {action} for turn {turn} "
-                f"refused (current {current})"
+                "[%s] call control %s for turn %s "
+                "refused (current %s)", self.conn.peer_addr, action, turn, current
             )
             self._answer_call_control(request_id, False, STALE_TURN)
             return
@@ -98,7 +99,7 @@ class CallControlMixin:
                 self._answer_call_control(request_id, False, ALREADY_PENDING)
                 return
             self._record_call_control(action, turn, {"reason": str(data.get("reason") or "")})
-            logger.info(f"[{self.conn.peer_addr}] call control: end requested (turn {turn})")
+            logger.info("[%s] call control: end requested (turn %s)", self.conn.peer_addr, turn)
             self._answer_call_control(request_id, True, END_ACCEPTED)
         elif action == ACTION_TRANSFER:
             if state._control_action in (ACTION_END, ACTION_TRANSFER):
@@ -124,8 +125,9 @@ class CallControlMixin:
             state._transfer_target = dict(target)
             self._record_call_control(action, turn, {"target": wanted})
             logger.info(
-                f"[{self.conn.peer_addr}] call control: transfer to "
-                f"{loggable_label(str(target.get('label') or ''))} requested (turn {turn})"
+                "[%s] call control: transfer to "
+                "%s requested (turn %s)",
+                self.conn.peer_addr, loggable_label(str(target.get('label') or '')), turn
             )
             self._answer_call_control(
                 request_id, True,
@@ -141,14 +143,21 @@ class CallControlMixin:
                 self._answer_call_control(request_id, False, ALREADY_PENDING)
                 return
             self._record_call_control(action, turn, {"question": str(data.get("question") or "")})
-            logger.info(f"[{self.conn.peer_addr}] call control: question relayed (turn {turn})")
+            logger.info("[%s] call control: question relayed (turn %s)", self.conn.peer_addr, turn)
             self._answer_call_control(request_id, True, ASK_ACCEPTED)
         else:
             self._answer_call_control(request_id, False, f"Unknown call action {action!r}.")
             return
-        # Between turns (the frame beat the stream's end, or the turn was
-        # cancelled): the completion point is the next TTS drain.
-        if action in (ACTION_END, ACTION_TRANSFER) and not self._turn_busy():
+        if action not in (ACTION_END, ACTION_TRANSFER):
+            return
+        if self._turn_busy():
+            # The turn's token loop acts on the acceptance at once (it is
+            # parked on the engine's next token otherwise); an ask never
+            # wakes it, the agent's one short sentence must get through.
+            self.state._control_wake.set()
+        else:
+            # Between turns (the frame beat the stream's end, or the turn
+            # was cancelled): the completion point is the next TTS drain.
             self._schedule_control_between_turns()
 
     def _ask_back_available(self) -> bool:
@@ -164,6 +173,7 @@ class CallControlMixin:
         self.state._control_args = dict(args)
         self.state._control_cut = False
         self.state._control_boundary_seen = False
+        self.state._control_accepted_at = time.monotonic()
 
     def _clear_call_control(self, reason: str, *, keep_transfer: bool = False) -> None:
         """Drop a pending action (a barge-in, a farewell the caller resumed,
@@ -175,12 +185,14 @@ class CallControlMixin:
             return
         if keep_transfer and state._control_action == ACTION_TRANSFER:
             return
-        logger.info(f"[{self.conn.peer_addr}] call control: {state._control_action} dropped ({reason})")
+        logger.info("[%s] call control: %s dropped (%s)", self.conn.peer_addr, state._control_action, reason)
         state._control_action = ""
         state._control_turn = None
         state._control_args = {}
         state._control_cut = False
         state._control_boundary_seen = False
+        state._control_accepted_at = 0.0
+        state._control_wake.clear()
         state._transfer_target = None
 
     def _control_pending_end(self) -> bool:
@@ -222,7 +234,7 @@ class CallControlMixin:
         await asyncio.sleep(0.5)
         self.conn.send_hangup()
         state._running = False
-        logger.info(f"[{self.conn.peer_addr}] Call complete — hanging up")
+        logger.info("[%s] Call complete — hanging up", self.conn.peer_addr)
         return True
 
     async def _do_transfer(self, target: dict) -> bool:
@@ -283,9 +295,10 @@ class CallControlMixin:
             task.cancel()
             if self.conn.is_closed:
                 logger.warning(
-                    f"[{self.conn.peer_addr}] Transfer to {loggable_label(label)}: no answer in "
-                    f"{TRANSFER_SETTLE_S:.0f}s and the line closed under it — "
-                    f"outcome unknown, recorded as transferred"
+                    "[%s] Transfer to %s: no answer in "
+                    "%.0fs and the line closed under it — "
+                    "outcome unknown, recorded as transferred",
+                    self.conn.peer_addr, loggable_label(label), TRANSFER_SETTLE_S
                 )
                 self._transfer_done(label)
                 return True
@@ -305,14 +318,15 @@ class CallControlMixin:
     def _transfer_done(self, label: str) -> None:
         self.state._transferred_to = label
         self.state._running = False
-        logger.info(f"[{self.conn.peer_addr}] Caller transferred to {loggable_label(label)}")
+        logger.info("[%s] Caller transferred to %s", self.conn.peer_addr, loggable_label(label))
 
     def _transfer_failed(self, reason: str) -> None:
         state = self.state
         label = state._transfer_label
         state.call_outcome = state._transfer_previous_outcome
         logger.warning(
-            f"[{self.conn.peer_addr}] Transfer to {loggable_label(label)} failed: {reason}")
+            "[%s] Transfer to %s failed: %s",
+            self.conn.peer_addr, loggable_label(label), reason)
         state._call_complete = False
         self._clear_call_control("transfer failed")
         state._control_note = f"[The transfer to {label} failed; the caller is still with you.]"

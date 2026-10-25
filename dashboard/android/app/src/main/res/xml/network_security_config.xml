@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext (plain HTTP) is permitted at the OS layer so the app can connect to a
+  self-hosted server on a local network that has no TLS certificate (e.g. a LAN box
+  at http://192.168.x.x or http://[fd00::5]). The app itself only ever loads http://
+  for private / loopback / link-local addresses, IPv4 and IPv6 — see
+  NativeBridgePolicy.serverUrl + cleartextHost; any public host is always forced to
+  HTTPS. Android's network-security-config can't match IP ranges, so the OS permit is
+  broad and the app gate is the real control.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

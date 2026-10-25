@@ -266,7 +266,7 @@ Write-Host "=== uv (Python version manager) ===" -ForegroundColor Yellow
 # PINNED to an exact version (uv is 0.x + fast-moving). Keep in sync with
 # VERSIONS.md (UV_VERSION). The Astral installer takes the version in the URL path.
 # An installed uv older than the pin is upgraded; a newer one is left alone.
-$UvVersion = if ($env:UV_VERSION) { $env:UV_VERSION } else { '0.12.23' }
+$UvVersion = if ($env:UV_VERSION) { $env:UV_VERSION } else { '0.13.5' }
 $uvHave = Get-ToolVersion 'uv'
 if ($uvHave -and ([version]$uvHave -ge [version]$UvVersion)) {
     Write-Host "[baseline] uv $uvHave present (pin $UvVersion)" -ForegroundColor Green
@@ -353,13 +353,15 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
     # one is left alone. The version check is a local --version, so the slow
     # `npm install -g` registry round trip runs only when something moves.
     # PINNED — keep PnpmVersion in sync with VERSIONS.md (PNPM_VERSION).
-    $PnpmVersion = if ($env:PNPM_VERSION) { $env:PNPM_VERSION } else { '11.28.2' }
+    # --allow-scripts: pnpm 12's install step puts its native binary at the
+    # bin path; npm 12 skips it by default and leaves a shim that needs Node.
+    $PnpmVersion = if ($env:PNPM_VERSION) { $env:PNPM_VERSION } else { '12.15.0' }
     $pnpmHave = Get-ToolVersion 'pnpm'
     if ($pnpmHave -and ([version]$pnpmHave -ge [version]$PnpmVersion)) {
         Write-Host "[baseline]   pnpm $pnpmHave present (pin $PnpmVersion)" -ForegroundColor Green
     } else {
         Write-Host "[baseline] pnpm $PnpmVersion..."
-        if (Invoke-Native -Name 'pnpm' -Cmd { npm install -g "pnpm@$PnpmVersion" }) {
+        if (Invoke-Native -Name 'pnpm' -Cmd { npm install -g --allow-scripts=pnpm "pnpm@$PnpmVersion" }) {
             Write-Host "[baseline]   pnpm OK" -ForegroundColor Green
             Test-ResolvedCli -Label 'pnpm' -Bin 'pnpm' -Want $PnpmVersion
         } elseif ($pnpmHave) {
@@ -374,7 +376,7 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
     # VERIFIED CLI (in-app auto-update disabled), so a mismatched install is
     # UPGRADED to the pin, not skipped.
     $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.296' }
-    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.162.1' }
+    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.163.0' }
 
     function Install-PinnedCli {
         # Install OR upgrade an npm-global CLI to the EXACT pinned version.

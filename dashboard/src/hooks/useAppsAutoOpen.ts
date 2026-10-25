@@ -25,11 +25,15 @@ export function useAppsAutoOpen(
   pinnedApps: readonly unknown[] | undefined,
   setAppsOpen: (open: boolean) => void,
   keepOnChatEntryRef?: MutableRefObject<boolean>,
+  /** A `?wake=1` arrival on a chat URL: the keep is armed before the
+   * close below reads it (the param is stripped in the same commit). */
+  wakeEntry = false,
 ): void {
   const prevLocRef = useRef<{ agent?: string; chat?: string }>({})
   const pendingHomeOpenRef = useRef(false)
   const pendingChatOpenRef = useRef(false)
   useEffect(() => {
+    if (wakeEntry && keepOnChatEntryRef) keepOnChatEntryRef.current = true
     const prev = prevLocRef.current
     prevLocRef.current = { agent: agentName, chat: urlChatId }
     if (!agentName) return
@@ -59,9 +63,7 @@ export function useAppsAutoOpen(
       pendingHomeOpenRef.current = false
       if (pinnedApps.length) setAppsOpen(true)
     }
-    // setAppsOpen is a useState setter (stable); listing it keeps the linter
-    // honest without re-running the effect. keepOnChatEntryRef is a ref —
-    // deliberately NOT a dep: it is read at close time only.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentName, urlChatId, pinnedApps, setAppsOpen])
+    // The re-run after the wake param is stripped takes no branch: the chat
+    // is the one the previous run recorded.
+  }, [agentName, urlChatId, pinnedApps, setAppsOpen, keepOnChatEntryRef, wakeEntry])
 }

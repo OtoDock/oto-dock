@@ -17,7 +17,11 @@ from core.events.bg_command_state import (
     peek_bg_command_registry,
 )
 from core.layers.cli import session as cli_session
-from core.layers.cli.session import PersistentSession, _persistent_sessions, _reap_idle_pass
+from core.layers.cli.session import (
+    PersistentSession,
+    _persistent_sessions,
+    _reap_idle_pass,
+)
 from core.layers.codex import session as codex_session
 from core.remote.remote_reaper import _idle_session_has_pending_work
 from core.session import background_leash

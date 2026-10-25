@@ -1,0 +1,133 @@
+<p class="muted">Controls that save on change. A toggle, a select or a field that saves when it loses focus has no Save button, so it says what happened right after its label. Saving… shows once a save runs past 300 ms, so a fast one never flickers. Saved shows for two seconds, and a newer save takes its place. A failed save shows the reason beside the control and puts a toggle or a select back. A field keeps what was typed. This page fakes the saves, and every third one fails, so the failure shows too.</p>
+
+<div class="card">
+  <div class="setting">
+    <div class="setting-text">
+      <label class="setting-label" for="reminder">Send a reminder the day before</label><span class="save-state" role="status"></span>
+      <p class="setting-help">Customers get a message at the time below.</p>
+    </div>
+    <input id="reminder" type="checkbox" checked aria-describedby="reminder-fail">
+  </div>
+  <p class="save-fail" id="reminder-fail" hidden></p>
+
+  <div class="setting">
+    <div class="setting-text">
+      <label class="setting-label" for="reminder-time">Reminder time</label><span class="save-state" role="status"></span>
+    </div>
+    <select id="reminder-time" aria-describedby="reminder-time-fail">
+      <option>09:00</option>
+      <option selected>12:00</option>
+      <option>18:00</option>
+    </select>
+  </div>
+  <p class="save-fail" id="reminder-time-fail" hidden></p>
+
+  <div class="setting">
+    <div class="setting-text">
+      <label class="setting-label" for="shop-name">Name on the messages</label><span class="save-state" role="status"></span>
+    </div>
+    <input id="shop-name" value="Corner Bakery" aria-describedby="shop-name-fail">
+  </div>
+  <p class="save-fail" id="shop-name-fail" hidden></p>
+</div>
+
+<style>
+.setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--p-border-light); }
+.setting:last-of-type { border-bottom: 0; }
+.setting-text { min-width: 0; }
+.setting-label { color: var(--p-text); font: 500 var(--p-font-size-sm)/var(--p-line-height-sm) var(--p-font); }
+.setting-help { margin: 2px 0 0; color: var(--p-text-light); font-size: var(--p-font-size-xs); }
+.setting select, .setting #shop-name { width: auto; max-width: 12em; }
+.save-state { display: inline-flex; align-items: center; gap: 4px; color: var(--p-text-secondary); font: 500 var(--p-font-size-xs)/var(--p-line-height-xs) var(--p-font); }
+.save-state:not(:empty) { margin-left: 8px; }
+.save-state.done { color: var(--p-status-success-fg); }
+.save-state svg { width: 12px; height: 12px; }
+.save-fail { margin: 0 0 8px; color: var(--p-status-danger-fg); font-size: var(--p-font-size-xs); }
+</style>
+
+<script>
+(function () {
+  // Stands in for the app's own call. Every third save fails.
+  var count = 0
+  function fakeSave() {
+    count += 1
+    var fails = count % 3 === 0
+    return new Promise(function (resolve, reject) {
+      setTimeout(function () {
+        if (fails) reject(new Error('That change did not go through. Try again.'))
+        else resolve()
+      }, 600)
+    })
+  }
+
+  // One indication on the page: a newer save takes the place of an older one.
+  // Each save takes a number, so a save that lands late never touches the
+  // indication or the failure line of a newer one.
+  var current = null
+  var timer = 0
+  var latest = 0
+  function show(state, text, done) {
+    if (current && current !== state) { current.textContent = ''; current.classList.remove('done') }
+    current = state
+    state.textContent = ''
+    state.classList.toggle('done', !!done)
+    if (done) {
+      var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+      svg.setAttribute('viewBox', '0 0 24 24')
+      svg.setAttribute('fill', 'none')
+      svg.setAttribute('stroke', 'currentColor')
+      svg.setAttribute('stroke-width', '2.5')
+      svg.setAttribute('aria-hidden', 'true')
+      var path = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+      path.setAttribute('d', 'M5 13l4 4L19 7')
+      svg.appendChild(path)
+      state.appendChild(svg)
+    }
+    state.appendChild(document.createTextNode(text))
+  }
+
+  function saveOnChange(control, read, putBack) {
+    var row = control.closest('.setting')
+    var state = row.querySelector('.save-state')
+    var fail = document.getElementById(control.getAttribute('aria-describedby'))
+    // `sent` is the value last sent, `kept` the value last saved: a change
+    // back to what is on its way sends nothing, and a failure puts back what
+    // was saved, never a value that was refused.
+    var sent = read()
+    var kept = sent
+    var mine = 0
+    control.addEventListener('change', function () {
+      var value = read()
+      if (value === sent) return
+      sent = value
+      var run = ++latest
+      var own = ++mine
+      fail.hidden = true
+      clearTimeout(timer)
+      if (current) show(current, '', false)
+      timer = setTimeout(function () { if (latest === run) show(state, 'Saving…', false) }, 300)
+      fakeSave().then(function () {
+        kept = value
+        if (latest !== run) return
+        clearTimeout(timer)
+        show(state, 'Saved', true)
+        timer = setTimeout(function () { if (latest === run) show(state, '', false) }, 2000)
+      }, function (e) {
+        if (latest === run) { clearTimeout(timer); show(state, '', false) }
+        if (own !== mine) return
+        if (putBack) { putBack(kept); sent = kept }
+        fail.textContent = e.message
+        fail.hidden = false
+      })
+    })
+  }
+
+  var reminder = document.getElementById('reminder')
+  saveOnChange(reminder, function () { return reminder.checked }, function (v) { reminder.checked = v })
+  var time = document.getElementById('reminder-time')
+  saveOnChange(time, function () { return time.value }, function (v) { time.value = v })
+  // A field saves when it loses focus, and keeps what was typed on a failure.
+  var name = document.getElementById('shop-name')
+  saveOnChange(name, function () { return name.value }, null)
+})()
+</script>

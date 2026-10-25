@@ -9,7 +9,8 @@ import config
 from auth.session_token import SESSION_JWT_SENTINEL_BEARER
 from core.credentials.mcp_gateway import entry_url
 from core.remote.remote_mcp_rewrite import (
-    _rewrite_mcp_json_for_remote, _rewrite_mcp_toml_for_remote,
+    _rewrite_mcp_json_for_remote,
+    _rewrite_mcp_toml_for_remote,
 )
 from services.mcp.mcp_registry import _servers_to_toml
 
@@ -94,6 +95,43 @@ def test_toml_on_a_machine_that_runs_the_gateway():
     assert f'url = "http://127.0.0.1:{SAT}/mcp/file-tools/mcp/?session_id={SID}"' in out
     assert out.count(f'"Authorization" = "Bearer {JWT}"') == 4
     assert "xoxb-real" not in out and "AIza-1" not in out and f"127.0.0.1:{config.PORT}" not in out
+
+
+def _narrowed_facts(gateway_mode: bool):
+    facts = _facts(gateway_mode)
+    facts["vendor"] = {**facts["vendor"], "tunneled": True, "value": ""}
+    return facts
+
+
+def test_a_narrowed_vendor_entry_goes_through_the_tunnel_on_every_machine():
+    for gateway_mode in (True, False):
+        out = _rewrite_mcp_json_for_remote(
+            {"mcpServers": _servers()}, SAT, session_id=SID, proxy_api_key=JWT,
+            gateway=_narrowed_facts(gateway_mode), gateway_mode=gateway_mode,
+        )["mcpServers"]
+        assert out["vendor"]["url"] == f"http://127.0.0.1:{SAT}/mcp/vendor/mcp?session_id={SID}"
+        assert out["vendor"]["headers"]["Authorization"] == f"Bearer {JWT}"
+        assert "xoxb-real" not in str(out["vendor"])
+        toml = _servers_to_toml({k: {**v, "type": "streamable-http"} for k, v in _servers().items()})
+        out = _rewrite_mcp_toml_for_remote(
+            toml, SAT, session_id=SID, proxy_api_key=JWT, gateway=_narrowed_facts(gateway_mode),
+            gateway_mode=gateway_mode,
+        )
+        vendor_section = out.split("[mcp_servers.vendor]")[1].split("[mcp_servers.maps]")[0]
+        assert f'url = "http://127.0.0.1:{SAT}/mcp/vendor/mcp?session_id={SID}"' in vendor_section
+        assert f'"Authorization" = "Bearer {JWT}"' in vendor_section and "xoxb-real" not in vendor_section
+
+
+def test_a_narrowed_credential_keeps_no_value_for_an_older_machine(monkeypatch):
+    import asyncio
+
+    from core.credentials import mcp_broker
+    from core.credentials.mcp_gateway import GatewayCredential
+    from core.remote.remote_start_payload import _gateway_facts
+    cred = GatewayCredential(upstream="https://mcp.example.com", path="/mcp", allowlist_key="k",
+                             value="xoxb-real", reach={"repositories": [], "read_only": True})
+    facts = asyncio.run(_gateway_facts({"vendor": mcp_broker.SecretBundle(gateway=cred)}, False))
+    assert facts["vendor"]["tunneled"] is True and facts["vendor"]["value"] == ""
 
 
 def test_toml_below_the_gateway_version_keeps_the_inline_shape():

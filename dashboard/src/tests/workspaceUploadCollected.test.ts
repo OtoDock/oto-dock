@@ -81,7 +81,7 @@ describe('uploadCollected', () => {
       `${DIR}/notes.txt`, `${DIR}/rent_1/r.md`,
     ])
     expect(toasts).toEqual([{
-      title: 'Uploaded', body: 'Uploaded 4 files. 1 folder left out (.git).', severity: 'success',
+      title: 'Uploaded', body: 'Uploaded 4 files. 1 folder left out: .git.', severity: 'success',
     }])
     expect(refresh).toHaveBeenCalled()
   })
@@ -104,7 +104,7 @@ describe('uploadCollected', () => {
     })
     expect(rows().some((r) => isBatchRunning(r))).toBe(false)
     expect(toasts).toEqual([{
-      title: 'Upload cancelled', body: 'Uploaded 1 of 3 files; the rest were not sent.', severity: 'info',
+      title: 'Upload cancelled', body: 'Uploaded 1 of 3 files. The rest were not sent.', severity: 'info',
     }])
   })
 
@@ -172,6 +172,6 @@ describe('uploadCollected', () => {
     expect(uploadMock).not.toHaveBeenCalled()
     expect(reserveMock).not.toHaveBeenCalled()
     expect(toasts.map((t) => t.title)).toEqual(['Not uploaded', 'Nothing uploaded'])
-    expect(toasts[1].body).toBe('2 folders left out (.git, node_modules).')
+    expect(toasts[1].body).toBe('2 folders left out: .git, node_modules.')
   })
 })

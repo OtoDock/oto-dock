@@ -16,6 +16,8 @@ path changes the mode through the layer, and the plan-review tail's
 import asyncio
 import uuid
 
+import pytest
+
 from tests.fixtures.ws_dashboard_harness import (
     ANY,
     FakeExecutionLayer,
@@ -66,7 +68,7 @@ class TestPlanReviewMidStream:
     answer resolves the pump's active permission."""
 
     def _scenario(self, temp_db, monkeypatch, action: str):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
         from core.session.session_state import get_permission_queue
 
         layer = FakeExecutionLayer()
@@ -114,12 +116,11 @@ class TestPlanReviewMidStream:
 
                 ws.client_send({"type": "plan_review_response", "request_id": request_id,
                                 "action": action, "filename": PLAN_FILE})
-                # The plan-review tail's mode_changed frame carries NO chat tag
-                # in the streaming loop (pinned: a tagged one would be dropped
-                # by a tab viewing another chat).
-                mode = {"reject": "default", "implement_accept_edits": "acceptEdits",
-                        "implement_default": "default"}[action]
-                await ws.expect({"type": "mode_changed", "mode": mode})
+                # The answer's mode frame names its chat (a tab viewing
+                # another chat ignores it).
+                mode = {"reject": "ask", "implement_auto": "autoReview",
+                        "implement_ask": "ask"}[action]
+                await ws.expect({"type": "mode_changed", "mode": mode, "chat_id": chat_id})
                 await asyncio.sleep(0.2)
                 answered.set()
 
@@ -149,38 +150,32 @@ class TestPlanReviewMidStream:
     def test_reject_restores_the_pre_plan_mode(self, temp_db, monkeypatch):
         layer, seen = self._scenario(temp_db, monkeypatch, "reject")
         chat = temp_db.get_chat(seen["chat_id"])
-        assert chat["permission_mode"] == "default"
+        assert chat["permission_mode"] == "ask"
         plans = temp_db.get_chat_plans(seen["chat_id"])
         assert [(p["filename"], p["status"]) for p in plans] == [(PLAN_FILE, "rejected")]
         assert layer.control_requests == []
         assert layer.mode_changes == []
 
-    def test_implement_with_accepted_edits_queues_the_control_request(self, temp_db, monkeypatch):
-        layer, seen = self._scenario(temp_db, monkeypatch, "implement_accept_edits")
+    @pytest.mark.parametrize("action,mode", [("implement_auto", "autoReview"), ("implement_ask", "ask")])
+    def test_implement_queues_the_control_request(self, temp_db, monkeypatch, action, mode):
+        # Both answers tell the engine its mode after the turn (the CLI's
+        # own word for Auto is its classifier mode).
+        layer, seen = self._scenario(temp_db, monkeypatch, action)
         chat = temp_db.get_chat(seen["chat_id"])
-        assert chat["permission_mode"] == "acceptEdits"
+        assert chat["permission_mode"] == mode
         plans = temp_db.get_chat_plans(seen["chat_id"])
         assert [(p["filename"], p["status"]) for p in plans] == [(PLAN_FILE, "implemented")]
-        # The mode reaches the engine as a control request flushed after the turn.
-        assert (seen["sid"], "set_permission_mode", {"mode": "acceptEdits"}) in layer.control_requests
-
-    def test_implement_in_default_mode_queues_no_control_request(self, temp_db, monkeypatch):
-        # The pinned asymmetry: the streaming loop's implement_default writes
-        # the row and the frame but tells the engine nothing (the between-turns
-        # path goes through _handle_mode_change and does).
-        layer, seen = self._scenario(temp_db, monkeypatch, "implement_default")
-        chat = temp_db.get_chat(seen["chat_id"])
-        assert chat["permission_mode"] == "default"
-        assert layer.control_requests == []
+        assert (seen["sid"], "set_permission_mode", {"mode": mode}) in layer.control_requests
         assert layer.mode_changes == []
 
 
 class TestPlanReviewBetweenTurns:
-    """The review card outlived its turn (the CLI blocked, the turn ended):
-    the answer arrives between turns and the dispatcher resolves it."""
+    """The review card outlived its turn (a Codex plan, or the CLI blocked
+    and the turn ended): the answer arrives between turns and acts while the
+    plan row is pending. An implement starts the implement turn itself."""
 
-    def _scenario(self, temp_db, monkeypatch, action: str):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+    def _scenario(self, temp_db, monkeypatch, action: str, *, answered_before: bool = False):
+        from core.events.common_events import DONE, TEXT, CommonEvent
         from core.session.session_state import get_permission_queue
 
         layer = FakeExecutionLayer()
@@ -196,7 +191,16 @@ class TestPlanReviewBetweenTurns:
                 get_permission_queue(sid).put_nowait(_plan_review_item(request_id))
                 await asyncio.sleep(0.05)
                 yield CommonEvent(type=DONE, data={})
-            layer.turn_events = lambda sid, prompt: review_turn(sid)
+
+            async def implement_turn(sid):
+                yield CommonEvent(type=TEXT, data={"content": "implementing"})
+                yield CommonEvent(type=DONE, data={})
+
+            def script(sid, prompt):
+                if prompt.startswith("Please implement"):
+                    return implement_turn(sid)
+                return review_turn(sid)
+            layer.turn_events = script
 
             async with dashboard_connection(session_cookie()) as ws:
                 await drain_startup(ws)
@@ -214,43 +218,117 @@ class TestPlanReviewBetweenTurns:
                     "filename": PLAN_FILE, "chat_id": chat_id,
                 })
                 await _turn_end(ws, chat_id)
+                if answered_before:
+                    # Another tab answered it: the row is no longer pending.
+                    await asyncio.to_thread(temp_db.update_chat_plan_status,
+                                            chat_id, PLAN_FILE, "rejected")
 
                 ws.client_send({"type": "plan_review_response", "request_id": request_id,
                                 "action": action, "filename": PLAN_FILE})
-                mode = {"reject": "default", "implement_accept_edits": "acceptEdits",
-                        "implement_default": "default"}[action]
-                await ws.expect({"type": "mode_changed", "mode": mode})
+                seen["frames"] = []
+                if answered_before:
+                    await sync_dispatch(ws)
+                    ws.client_send({"type": "close"})
+                    ws.no_more_frames()
+                    return
+                # The card closes on every viewer through the chat's
+                # broadcast, which lands beside the answer's own frames.
+                frames = []
+                last = "turn_complete" if action != "reject" else "mode_changed"
+                while not frames or frames[-1]["type"] != last:
+                    frames.append(await ws.next_frame())
+                if not any(f["type"] == "permission_resolved" for f in frames):
+                    frames.append(await ws.next_frame())
+                seen["frames"] = frames
                 await sync_dispatch(ws)
                 ws.client_send({"type": "close"})
             ws.no_more_frames()
         run_ws_scenario(scenario)
         return layer, seen
 
+    @staticmethod
+    def _answer_frames(seen: dict, action: str) -> list:
+        chat_id = seen["chat_id"]
+        resolved = [f for f in seen["frames"] if f["type"] == "permission_resolved"]
+        assert [(f["action"], f["chat_id"]) for f in resolved] == [(action, chat_id)]
+        return [f for f in seen["frames"] if f["type"] != "permission_resolved"]
+
     def test_reject_between_turns(self, temp_db, monkeypatch):
         layer, seen = self._scenario(temp_db, monkeypatch, "reject")
+        assert self._answer_frames(seen, "reject") == [
+            {"type": "mode_changed", "mode": "ask", "chat_id": seen["chat_id"]}]
         chat = temp_db.get_chat(seen["chat_id"])
-        assert chat["permission_mode"] == "default"
+        assert chat["permission_mode"] == "ask"
         plans = temp_db.get_chat_plans(seen["chat_id"])
         assert [(p["filename"], p["status"]) for p in plans] == [(PLAN_FILE, "rejected")]
-        assert layer.mode_changes == []
+        # Back to the mode Plan was entered from, the engine too.
+        assert layer.mode_changes == [(seen["sid"], "ask")]
 
-    def test_implement_with_accepted_edits_changes_the_mode_through_the_layer(self, temp_db, monkeypatch):
-        layer, seen = self._scenario(temp_db, monkeypatch, "implement_accept_edits")
-        chat = temp_db.get_chat(seen["chat_id"])
-        assert chat["permission_mode"] == "acceptEdits"
-        assert layer.mode_changes == [(seen["sid"], "acceptEdits")]
+    # ``implement_accept_edits``: the answer of a tab opened before 1.9.
+    @pytest.mark.parametrize("action,answer,mode", [
+        ("implement_auto", "implement_auto", "autoReview"),
+        ("implement_accept_edits", "implement_auto", "autoReview"),
+        ("implement_ask", "implement_ask", "ask"),
+    ])
+    def test_implement_changes_the_mode_and_starts_the_implement_turn(
+            self, temp_db, monkeypatch, action, answer, mode):
+        layer, seen = self._scenario(temp_db, monkeypatch, action)
+        chat_id = seen["chat_id"]
+        frames = self._answer_frames(seen, answer)
+        assert [f["type"] for f in frames] == [
+            "mode_changed", "chat_status", "live_state", "text", "done", "plan_status",
+            "chat_status", "turn_complete"]
+        assert frames[0] == {"type": "mode_changed", "mode": mode, "chat_id": chat_id}
+        assert frames[3] == {"type": "text", "content": "implementing", "chat_id": chat_id}
+        assert frames[5] == {"type": "plan_status", "filename": PLAN_FILE, "status": "implemented"}
+        chat = temp_db.get_chat(chat_id)
+        assert chat["permission_mode"] == mode
+        assert layer.mode_changes == [(seen["sid"], mode)]
         assert layer.control_requests == []
 
-    def test_implement_in_default_mode_changes_the_mode_through_the_layer(self, temp_db, monkeypatch):
-        layer, seen = self._scenario(temp_db, monkeypatch, "implement_default")
-        chat = temp_db.get_chat(seen["chat_id"])
-        assert chat["permission_mode"] == "default"
-        assert layer.mode_changes == [(seen["sid"], "default")]
+    def test_an_answer_to_a_plan_no_longer_pending_changes_nothing(self, temp_db, monkeypatch):
+        """The row is what a reload, a second tab and a restart read: an answer
+        for a plan already implemented or rejected is dropped."""
+        layer, seen = self._scenario(temp_db, monkeypatch, "implement_auto", answered_before=True)
+        assert seen["frames"] == []
+        assert temp_db.get_chat(seen["chat_id"])["permission_mode"] == "autoReview"
+        assert layer.mode_changes == []
+
+
+class TestImplementPlanMode:
+    @pytest.mark.parametrize("path,picked,runs", [
+        ("direct-llm", "autoReview", "ask"),          # Direct LLM offers no Auto
+        ("claude-code-cli", "acceptEdits", "autoReview"),
+    ])
+    def test_the_picked_mode_is_entered_as_the_chats_engine_offers_it(
+            self, temp_db, monkeypatch, path, picked, runs):
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        seen: dict = {}
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                chat_id, _sid = await warm_new_chat(ws, layer, slug)
+                await asyncio.to_thread(temp_db.update_chat, chat_id, execution_path=path)
+                ws.client_send({"type": "implement_plan", "plan_path": "plans/p.md", "mode": picked})
+                while True:
+                    frame = await ws.next_frame()
+                    if frame["type"] == "warmup_ready":
+                        seen["ready"] = frame
+                        break
+                seen["chat_id"] = chat_id
+                ws.client_send({"type": "close"})
+        run_ws_scenario(scenario)
+        assert seen["ready"]["mode"] == runs
+        assert temp_db.get_chat(seen["chat_id"])["permission_mode"] == runs
 
 
 class TestCancelAllQueuedMidStream:
     def test_clears_the_pump_queue_with_a_tagged_frame(self, temp_db, monkeypatch):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
 
         layer = FakeExecutionLayer()
         stub_dashboard_seams(monkeypatch, layer)

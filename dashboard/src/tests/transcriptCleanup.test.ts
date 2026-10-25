@@ -49,6 +49,22 @@ describe('stripInjectedPreludes on a task run', () => {
   })
 })
 
+describe('stripInjectedPreludes on a concluded meeting note', () => {
+  const note =
+    '[Meeting "q3 [margins]" (mtg-0123456789ab) ended 2026-10-16 01:00 UTC after 3 turns, with Head, Alpha. ' +
+    'Summary: keep 12 %. ] then The person sees the whole meeting in this chat; you have only this note.]'
+
+  it('strips the note behind the time stamp, multi-line or single-lined', () => {
+    expect(stripInjectedPreludes(`${STAMP}\n\n${note}\n\nwhat did they decide?`)).toBe('what did they decide?')
+    expect(stripInjectedPreludes(`${STAMP} ${note} what did they decide?`)).toBe('what did they decide?')
+  })
+
+  it('leaves a quote of its tail mid-message alone', () => {
+    const text = 'say "you have only this note.]" back'
+    expect(stripInjectedPreludes(text)).toBe(text)
+  })
+})
+
 describe('cleanUserMessageText', () => {
   it('hides a pure slash-command record', () => {
     const row = '<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>'

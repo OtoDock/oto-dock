@@ -218,7 +218,7 @@ class AmiTransfer:
         })
         if "Success" not in str(response.get("Response", "")):
             raise TransferError(f"Redirect refused: {response.get('Message', 'unknown')}")
-        logger.info(f"AMI Redirect to {loggable_label(label)}@{REDIRECT_CONTEXT} accepted")
+        logger.info("AMI Redirect to %s@%s accepted", loggable_label(label), REDIRECT_CONTEXT)
 
 
 class TwilioTransfer:
@@ -279,5 +279,7 @@ class TwilioTransfer:
         ))
         await self._rest_client().update_call(self._call_sid, twiml)
         logger.info(
-            f"Twilio call {self._call_sid[-8:]} redirected to a <Dial> to "
-            f"{loggable_label(label)}{' from the route' if self._caller_id else ' (no callerId)'}")
+            "Twilio call %s redirected to a <Dial> to "
+            "%s%s",
+            self._call_sid[-8:], loggable_label(label),
+            ' from the route' if self._caller_id else ' (no callerId)')

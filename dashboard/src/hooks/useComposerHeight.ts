@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useLayoutEffect } from 'react'
 import type { FocusEvent as ReactFocusEvent, RefObject } from 'react'
 
 /** Rows the composer grows to while it holds the focus, and shrinks to when
@@ -55,7 +55,7 @@ export function useComposerHeight(
 ) {
   const expandedRef = useRef(false)
   const optsRef = useRef(opts)
-  optsRef.current = opts
+  useLayoutEffect(() => { optsRef.current = opts })
   const pressRef = useRef<Press | null>(null)
   const pendingRef = useRef<'shrink' | 'grow' | null>(null)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)

@@ -10,7 +10,13 @@ Run: python -m pytest satellite/tests/test_engines.py -v
 import pytest
 
 from satellite import engines
-from satellite.engines import BY_BINARY, BY_CREDENTIAL_KIND, BY_PIN_KEY, ENGINES, engine_for
+from satellite.engines import (
+    BY_BINARY,
+    BY_CREDENTIAL_KIND,
+    BY_PIN_KEY,
+    ENGINES,
+    engine_for,
+)
 
 
 def test_the_wire_ids_are_the_two_engines_every_released_satellite_ran():

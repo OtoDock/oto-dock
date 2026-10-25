@@ -13,12 +13,43 @@ remote_execution.py.
 import asyncio
 import json
 import logging
+from typing import TYPE_CHECKING
 
 from core import layout
 from core.execution_layer import AgentConfig, RemoteStartContext, RemoteStartPlan
+from core.permission_modes import LEGACY_MODES, cli_mode
 from core.sandbox import session_config_dir as _scd
 
 logger = logging.getLogger("remote-layer")
+
+#: The first satellite that speaks the 1.9 permission modes: Ask and Auto by
+#: their own words, Auto on the engine's own review, Codex without the
+#: retired approval policy. An older one is sent the words before 1.9.
+REVIEW_MODES_SATELLITE_VERSION = "0.5.156"
+_OLD_WORDS = {new: old for old, new in LEGACY_MODES.items()}
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    out: list[int] = []
+    for part in (v or "").split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out)
+
+
+def speaks_review_modes(cm, machine_id: str) -> bool:
+    """Whether the machine's satellite speaks the 1.9 permission modes."""
+    return _version_tuple(cm.satellite_version(machine_id)) >= _version_tuple(
+        REVIEW_MODES_SATELLITE_VERSION)
+
+
+def wire_mode(cm, machine_id: str, mode: str) -> str:
+    """The mode word for the machine's satellite: the current word, or the
+    word before 1.9 for a satellite that does not speak the new ones (it
+    then runs today's Ask and today's Accept Edits)."""
+    if speaks_review_modes(cm, machine_id):
+        return mode
+    return _OLD_WORDS.get(mode, mode)
 
 
 # --- Hook script cache ---------------------------------------------------
@@ -39,6 +70,7 @@ def _load_hook_scripts() -> dict[str, str]:
     if _HOOK_SCRIPTS_CACHE is not None:
         return _HOOK_SCRIPTS_CACHE
     from pathlib import Path
+
     import config as app_config
     # Canonical proxy hooks dir (config.HOOKS_DIR == BASE_DIR/"hooks"). Do NOT
     # recompute from __file__ here — this module lives at core/remote/, so a
@@ -73,8 +105,8 @@ async def _gateway_facts(bundles: dict, gateway_mode: bool) -> dict[str, dict]:
         if cred is None:
             continue
         f = {"upstream": cred.upstream, "path": cred.path, "header": cred.header,
-             "proxy_local": bool(cred.proxy_local), "value": ""}
-        if not cred.proxy_local and not gateway_mode:
+             "proxy_local": bool(cred.proxy_local), "tunneled": cred.forwarded_here, "value": ""}
+        if not cred.forwarded_here and not gateway_mode:
             res = await asyncio.to_thread(mcp_gateway.resolve_credential, cred)
             if isinstance(res, mcp_gateway.Refusal):
                 logger.warning("gateway: %s keeps no credential on this machine: %s", key, res.reason)
@@ -84,7 +116,13 @@ async def _gateway_facts(bundles: dict, gateway_mode: bool) -> dict[str, dict]:
     return facts
 
 
-class RemoteStartPayloadMixin:
+if TYPE_CHECKING:
+    from core.remote.remote_host import RemoteLayerHost as _Host
+else:
+    _Host = object
+
+
+class RemoteStartPayloadMixin(_Host):
     # --- Payload builders ---
 
     async def _build_start_payload(
@@ -124,6 +162,7 @@ class RemoteStartPayloadMixin:
         # equivalent for the payload env the satellite will inherit into
         # the spawned CLI/Codex process.
         from auth.session_token import create_session_token
+
         # PROXY_URL points at the satellite's local tunnel server
         # on 127.0.0.1, NOT a public platform endpoint. Subprocess hooks +
         # MCP HTTP traffic ride the existing WS tunnel back to the platform.
@@ -182,6 +221,10 @@ class RemoteStartPayloadMixin:
         # through the shell.
         env["OTO_HOOKS_DIR"] = f"/{cwd_relative}/{engine.capabilities.runtime.config_dir_name}"
         env["OTO_HOOK_PY"] = "python3"
+        # The shell's command-line token, over the final session token. Every
+        # satellite overlays this env on the CLI's, so a 1.8 one passes it on.
+        from auth.session_token import attach_cli_token
+        attach_cli_token(env)
 
         # Common payload fields. Hook scripts travel with every start_session
         # so satellites never need to have them pre-deployed — they live only
@@ -199,7 +242,11 @@ class RemoteStartPayloadMixin:
         # is the single source of truth).
         payload = {
             "system_prompt": config.system_prompt,
-            "permission_mode": config.permission_mode,
+            "permission_mode": wire_mode(self._cm, config.execution_target, config.permission_mode),
+            # Claude Code's own word for the mode (a 0.5.156 satellite spawns
+            # by it: the CLI's auto mode for Auto, never for the unattended
+            # word an older reading of ``auto`` could confuse it with).
+            "cli_permission_mode": cli_mode(config.permission_mode),
             "client_type": config.client_type,
             "model": config.model,
             "effort": config.effort,
@@ -228,11 +275,14 @@ class RemoteStartPayloadMixin:
         # refuse — auto-update brings it up at its next reconnect.
         if not self._cm.satellite_supports_hook_parity(config.execution_target):
             logger.warning(
-                f"Remote {execution_path} {config.client_type or 'session'} "
-                f"{session_id[:8]}: {self._cm.satellite_name(config.execution_target)} "
-                f"runs satellite {self._cm.satellite_version(config.execution_target) or 'unknown'} "
+                "Remote %s %s "
+                "%s: %s "
+                "runs satellite %s "
                 "(< 0.5.121) — no Stop hook and no Codex question bridge on "
-                "this machine until it updates at its next reconnect"
+                "this machine until it updates at its next reconnect",
+                execution_path, config.client_type or 'session', session_id[:8],
+                self._cm.satellite_name(config.execution_target),
+                self._cm.satellite_version(config.execution_target) or 'unknown'
             )
 
         # Credential broker: the stdio servers that have a secret bundle

@@ -4,6 +4,8 @@ import { safeHref } from '../../../lib/safeUrl'
 import { ensureMediaDownloadName } from '../../../lib/fileTypes'
 import { useCoarsePointer } from '../../../hooks/useCoarsePointer'
 import { callNative } from '../../../lib/nativeBridge'
+import { isRecord } from '../../../lib/json/guards'
+import { OVER_MEDIA, STAGE_FRAME, STAGE_TEXT, VIDEO_BAR, VIDEO_BUFFERED, VIDEO_SPINNER, VIDEO_THUMB, VIDEO_TRACK, VIDEO_VOLUME } from './stage'
 
 interface Props {
   /** Final playable URL: a web URL or /v1/media/{token}. */
@@ -91,7 +93,13 @@ function toEmbedUrl(src: string): string | null {
 }
 
 const PIP_SUPPORTED =
-  typeof document !== 'undefined' && !!(document as any).pictureInPictureEnabled
+  typeof document !== 'undefined' && !!document.pictureInPictureEnabled
+
+// `screen.orientation` and its `lock` are missing from some engines (an
+// older Safari, a desktop browser): every call below is optional.
+function screenOrientation(): ScreenOrientation | undefined {
+  return screen.orientation
+}
 
 /**
  * Follow the PHYSICAL device orientation during web video fullscreen.
@@ -120,7 +128,7 @@ function startOrientationFollow(initial: 'landscape' | 'portrait'): () => void {
     if (now - pendingSince < 500) return // debounce a transient tilt
     pendingSince = 0
     current = held
-    try { (screen.orientation as any).lock(held).catch(() => {}) } catch { /* unsupported */ }
+    try { screenOrientation()?.lock?.(held).catch(() => {}) } catch { /* unsupported */ }
   }
   window.addEventListener('devicemotion', onMotion)
   return () => window.removeEventListener('devicemotion', onMotion)
@@ -142,8 +150,8 @@ export default function VideoPlayer({
   const [cur, setCur] = useState(0)
   const [dur, setDur] = useState(0)
   const [buffered, setBuffered] = useState(0)
-  const [volume, setVolume] = useState(1)
-  const [muted, setMuted] = useState(false)
+  const [volume, setVolume] = useState(() => loadVolume().volume)
+  const [muted, setMuted] = useState(() => loadVolume().muted)
   const [fs, setFs] = useState(false)
   const [ratio, setRatio] = useState('16 / 9')
   const [error, setError] = useState(false)
@@ -151,14 +159,11 @@ export default function VideoPlayer({
   const [showControls, setShowControls] = useState(true)
   const [seekFlash, setSeekFlash] = useState<'fwd' | 'back' | null>(null)
 
-  // Restore remembered volume/mute once the element exists.
+  // The element follows the remembered values once it exists.
   useEffect(() => {
-    const { volume: v, muted: m } = loadVolume()
-    setVolume(v)
-    setMuted(m)
     const el = videoRef.current
-    if (el) { el.volume = v; el.muted = m }
-  }, [])
+    if (el) { el.volume = volume; el.muted = muted }
+  }, [volume, muted])
 
   const applyVolume = useCallback((v: number, m: boolean) => {
     const el = videoRef.current
@@ -169,21 +174,21 @@ export default function VideoPlayer({
   }, [])
 
   // --- auto-hide controls (YouTube-style) ---
-  const clearHide = () => {
+  const clearHide = useCallback(() => {
     if (hideTimer.current) { window.clearTimeout(hideTimer.current); hideTimer.current = null }
-  }
+  }, [])
   const scheduleHide = useCallback(() => {
     clearHide()
     hideTimer.current = window.setTimeout(() => {
       const v = videoRef.current
       if (v && !v.paused && !overControls.current) setShowControls(false)
     }, 2500)
-  }, [])
+  }, [clearHide])
   const wake = useCallback(() => {
     setShowControls(true)
     scheduleHide()
   }, [scheduleHide])
-  useEffect(() => () => clearHide(), [])
+  useEffect(() => () => clearHide(), [clearHide])
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current
@@ -232,8 +237,8 @@ export default function VideoPlayer({
     const v = videoRef.current
     if (!v) return
     try {
-      if ((document as any).pictureInPictureElement) await (document as any).exitPictureInPicture()
-      else await (v as any).requestPictureInPicture()
+      if (document.pictureInPictureElement) await document.exitPictureInPicture()
+      else await v.requestPictureInPicture()
     } catch {
       /* user gesture / not allowed — ignore */
     }
@@ -253,7 +258,7 @@ export default function VideoPlayer({
   // portrait while staying fullscreen. All guards no-op on desktop / plain web.
   useEffect(() => {
     if (!fs) return
-    const w = window as any
+    const w: Window & { __otodockVideoFullscreenActive?: boolean; __otodockVideoFullscreenClose?: () => void } = window
     const v = videoRef.current
     // videoWidth is 0 until metadata loads — never treat that as "wide" (it
     // used to rotate PORTRAIT videos to landscape when fullscreen came fast).
@@ -263,8 +268,8 @@ export default function VideoPlayer({
     w.__otodockVideoFullscreenActive = true       // MainActivity.handleBackAction checks this
     w.__otodockVideoFullscreenClose = close
     let stopFollow: (() => void) | null = null
-    if (!native && coarse && (screen.orientation as any)?.lock) {
-      if (landscape) { try { (screen.orientation as any).lock('landscape').catch?.(() => {}) } catch { /* unsupported */ } }
+    if (!native && coarse && screenOrientation()?.lock) {
+      if (landscape) { try { screenOrientation()?.lock?.('landscape').catch?.(() => {}) } catch { /* unsupported */ } }
       stopFollow = startOrientationFollow(landscape ? 'landscape' : 'portrait')
     }
     let pushed = false
@@ -279,20 +284,27 @@ export default function VideoPlayer({
         w.__otodockVideoFullscreenActive = false
         w.__otodockVideoFullscreenClose = undefined
       }
-      try { (screen.orientation as any)?.unlock?.() } catch { /* ignore */ }
+      try { screenOrientation()?.unlock?.() } catch { /* ignore */ }
       // Remove our dummy entry only if we exited via the FS API (not popstate,
       // which already consumed it) — mirrors ImageLightbox's guard.
-      if (pushed && (history.state as any)?.otoVideoFs) { try { history.back() } catch { /* ignore */ } }
+      const state: unknown = history.state
+      if (pushed && isRecord(state) && state.otoVideoFs) { try { history.back() } catch { /* ignore */ } }
     }
   }, [fs, coarse])
 
   // Re-arm auto-hide whenever play-state or fullscreen changes — fixes the
   // control bar staying visible after exiting fullscreen (it only re-hid on the
   // next tap/mouse-move before).
+  // A pause shows the controls at once (in render, on the transition).
+  const [wasPlaying, setWasPlaying] = useState(playing)
+  if (wasPlaying !== playing) {
+    setWasPlaying(playing)
+    if (!playing) setShowControls(true)
+  }
   useEffect(() => {
-    if (!playing) { clearHide(); setShowControls(true); return }
+    if (!playing) { clearHide(); return }
     scheduleHide()
-  }, [playing, fs])
+  }, [playing, fs, clearHide, scheduleHide])
 
   const onTime = () => {
     const v = videoRef.current
@@ -378,8 +390,8 @@ export default function VideoPlayer({
   if (embedUrl) {
     return (
       <div className="my-2 max-w-2xl">
-        {title && <div className="mb-1 text-sm font-medium text-p-text">{title}</div>}
-        <div className="relative overflow-hidden rounded-xl bg-black" style={{ aspectRatio: '16 / 9' }}>
+        {title && <div className="mb-1 text-sm font-medium text-primary">{title}</div>}
+        <div className={`relative overflow-hidden rounded-card ${STAGE_FRAME}`} style={{ aspectRatio: '16 / 9' }}>
           {/* The app-wide Referrer-Policy is same-origin, which sends NO Referer
               to youtube.com — YouTube rejects referrer-less embeds with player
               error 153. Override for this iframe only. */}
@@ -392,22 +404,22 @@ export default function VideoPlayer({
             referrerPolicy="strict-origin-when-cross-origin"
           />
         </div>
-        {caption && <div className="mt-1 text-xs text-p-text-secondary">{caption}</div>}
+        {caption && <div className="mt-1 text-xs text-secondary">{caption}</div>}
       </div>
     )
   }
 
   if (error) {
     return (
-      <div className="my-2 max-w-md rounded-xl border border-p-border-light bg-p-surface/50 p-4 text-sm text-p-text-secondary">
+      <div className="my-2 max-w-md rounded-card bg-surface-sunken p-4 text-sm text-secondary">
         {offline
           ? 'This video is on the remote machine, which is offline. Reconnect it and try again.'
           : "Can't play this video in your browser."}{' '}
-        <button onClick={retry} className="text-p-accent-red underline">Retry</button>
+        <button onClick={retry} className="text-link underline hover:text-link-hover">Retry</button>
         {!offline && canDownload && downloadHref && (
           <>
             {' · '}
-            <a href={safeHref(downloadHref)} download={dlName} className="text-p-accent-red underline">Download</a>
+            <a href={safeHref(downloadHref)} download={dlName} className="text-link underline hover:text-link-hover">Download</a>
           </>
         )}
       </div>
@@ -421,13 +433,13 @@ export default function VideoPlayer({
 
   return (
     <div className="my-2 max-w-2xl">
-      {title && <div className="mb-1 text-sm font-medium text-p-text">{title}</div>}
+      {title && <div className="mb-1 text-sm font-medium text-primary">{title}</div>}
       <div
         ref={wrapRef}
         tabIndex={0}
         onKeyDown={onKeyDown}
         onMouseMove={() => { if (!coarse) wake() }}
-        className={`relative overflow-hidden rounded-xl bg-black outline-hidden ${
+        className={`relative overflow-hidden rounded-card ${STAGE_FRAME} outline-hidden ${
           fs && !controlsVisible ? 'cursor-none' : ''
         }`}
         style={{ aspectRatio: fs ? undefined : ratio }}
@@ -438,7 +450,7 @@ export default function VideoPlayer({
           poster={poster || undefined}
           playsInline
           preload="metadata"
-          className="h-full w-full bg-black"
+          className={`h-full w-full ${STAGE_FRAME}`}
           style={fs ? { objectFit: 'contain', height: '100%', width: '100%' } : undefined}
           onClick={onSurfaceClick}
           onPlay={() => { setPlaying(true); setEnded(false); wake() }}
@@ -461,11 +473,11 @@ export default function VideoPlayer({
         {/* Double-tap seek flash (mobile) */}
         {seekFlash && (
           <div
-            className={`pointer-events-none absolute inset-y-0 flex w-1/3 items-center justify-center text-white ${
+            className={`pointer-events-none absolute inset-y-0 flex w-1/3 items-center justify-center ${STAGE_TEXT} ${
               seekFlash === 'back' ? 'left-0' : 'right-0'
             }`}
           >
-            <span className="rounded-full bg-black/50 px-3 py-1 text-sm">
+            <span className={`rounded-full ${OVER_MEDIA} px-3 py-1 text-sm`}>
               {seekFlash === 'back' ? '−10s' : '+10s'}
             </span>
           </div>
@@ -474,7 +486,7 @@ export default function VideoPlayer({
         {/* Buffering spinner */}
         {loading && (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-            <span className="h-12 w-12 animate-spin rounded-full border-4 border-white/30 border-t-white" />
+            <span className={`h-12 w-12 animate-spin rounded-full border-4 ${VIDEO_SPINNER}`} />
           </div>
         )}
 
@@ -485,7 +497,7 @@ export default function VideoPlayer({
             <button
               onClick={(e) => { e.stopPropagation(); togglePlay() }}
               aria-label={ended ? 'Replay' : playing ? 'Pause' : 'Play'}
-              className="pointer-events-auto flex h-16 w-16 items-center justify-center rounded-full bg-black/55 text-white backdrop-blur-xs transition hover:bg-black/70"
+              className={`pointer-events-auto flex h-16 w-16 items-center justify-center rounded-full ${OVER_MEDIA} transition`}
             >
               {ended
                 ? <svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor"><path d="M12 5V1L7 6l5 5V7a6 6 0 11-6 6H4a8 8 0 108-8z" /></svg>
@@ -500,15 +512,15 @@ export default function VideoPlayer({
         <div
           onMouseEnter={() => { overControls.current = true }}
           onMouseLeave={() => { overControls.current = false }}
-          className={`absolute inset-x-0 bottom-0 flex flex-col gap-2 bg-linear-to-t from-black/75 to-transparent px-3 pb-2.5 pt-8 text-white transition-opacity duration-200 ${
+          className={`absolute inset-x-0 bottom-0 flex flex-col gap-2 ${VIDEO_BAR} px-3 pb-2.5 pt-8 transition-opacity duration-200 ${
             controlsVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
           }`}
         >
           {/* Scrubber */}
           <div className="relative flex items-center">
-            <div className="absolute left-0 right-0 h-1 rounded-sm bg-white/25" />
+            <div className={`absolute left-0 right-0 h-1 rounded-sm ${VIDEO_TRACK}`} />
             <div
-              className="absolute left-0 h-1 rounded-sm bg-white/40"
+              className={`absolute left-0 h-1 rounded-sm ${VIDEO_BUFFERED}`}
               style={{ width: dur ? `${(buffered / dur) * 100}%` : '0%' }}
             />
             <input
@@ -519,7 +531,7 @@ export default function VideoPlayer({
               value={cur}
               onChange={onSeek}
               aria-label="Seek"
-              className="relative z-10 h-1 w-full cursor-pointer appearance-none bg-transparent accent-p-accent-red [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white"
+              className={`relative z-10 h-1 w-full cursor-pointer appearance-none bg-transparent accent-action [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full ${VIDEO_THUMB}`}
             />
           </div>
           <div className="flex items-center gap-3.5 text-sm">
@@ -538,7 +550,7 @@ export default function VideoPlayer({
               <input
                 type="range" min={0} max={1} step={0.05} value={muted ? 0 : volume}
                 onChange={onVolumeInput} aria-label="Volume"
-                className={`h-1 cursor-pointer appearance-none rounded-sm bg-white/30 accent-white [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white ${
+                className={`h-1 cursor-pointer appearance-none rounded-sm ${VIDEO_VOLUME} [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full ${VIDEO_THUMB} ${
                   coarse ? 'block w-12' : 'hidden w-16 sm:block'
                 }`}
               />
@@ -561,7 +573,7 @@ export default function VideoPlayer({
           </div>
         </div>
       </div>
-      {caption && <div className="mt-1 text-xs text-p-text-secondary">{caption}</div>}
+      {caption && <div className="mt-1 text-xs text-secondary">{caption}</div>}
     </div>
   )
 }

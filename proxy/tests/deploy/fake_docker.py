@@ -23,10 +23,14 @@ The fake reads its world from the environment:
 * ``FAKE_DU_K``: what ``du -sk`` inside the image answers, when set.
 * ``FAKE_VOLUMES``: a JSON map of volume name to the host directory that
   stands in for it in a one-off ``docker run -v name:path``.
+* ``FAKE_API_VERSION`` and ``FAKE_COMPOSE_VERSION``: what ``docker version``
+  and ``docker compose version --short`` answer (1.51 and 2.35.1).
 
 ``exec`` and ``run`` run the command the script asked for, with every path
 under a mount rewritten to the host path standing in for it, so the tree
-programs the scripts stream in run for real against test directories.
+programs the scripts stream in run for real against test directories;
+``exec -e K=V`` sets the variable for that command. ``inspect -f`` answers
+a label with ``index .Config.Labels "<key>"``.
 """
 
 from __future__ import annotations
@@ -113,12 +117,28 @@ def run_cmd(cmd, mounts):
     return subprocess.call(real)
 
 
+if args[:1] == ["version"]:
+    print(os.environ.get("FAKE_API_VERSION", "1.51"))
+    sys.exit(0)
+if args[:2] == ["compose", "version"] and "--short" in args:
+    print(os.environ.get("FAKE_COMPOSE_VERSION", "2.35.1"))
+    sys.exit(0)
 if args[:1] == ["ps"]:
     ps(args[1:])
     sys.exit(0)
 if args[:1] == ["exec"]:
-    rest = [a for a in args[1:] if a != "-i"]
+    rest, env = [], {}
+    it = iter(args[1:])
+    for a in it:
+        if a == "-i":
+            continue
+        if a == "-e":
+            k, _, v = next(it).partition("=")
+            env[k] = v
+            continue
+        rest.append(a)
     c = by_id.get(rest[0], {})
+    os.environ.update(env)
     sys.exit(run_cmd(rest[1:], c.get("mounts", {})))
 if args[:1] == ["inspect"]:
     fmt = args[args.index("-f") + 1] if "-f" in args else ""
@@ -130,6 +150,9 @@ if args[:1] == ["inspect"]:
         print(f"{c['id']} {status}")
     elif ".State.Status" in fmt:
         print(status)
+    elif ".Config.Labels" in fmt:
+        m = re.search(r'index \.Config\.Labels "([^"]+)"', fmt)
+        print(c["labels"].get(m.group(1), "") if m else "")
     elif ".Image" in fmt:
         print(c.get("image", "fakeimage"))
     elif ".Mounts" in fmt:

@@ -73,8 +73,10 @@ async def create_llm_backend(
 
     ws_ok = await client.connect()
     logger.info(
-        f"Created ProxyClient ({route.llm_mode} mode) for agent='{route.agent}' "
-        f"({'connected' if ws_ok else 'the proxy is unreachable'}, "
-        f"trigger_payload={'yes' if audiosocket_uuid else 'no'})"
+        "Created ProxyClient (%s mode) for agent='%s' "
+        "(%s, "
+        "trigger_payload=%s)",
+        route.llm_mode, route.agent, 'connected' if ws_ok else 'the proxy is unreachable',
+        'yes' if audiosocket_uuid else 'no'
     )
     return client

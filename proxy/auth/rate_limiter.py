@@ -28,9 +28,8 @@ import time
 from collections import Counter
 from datetime import datetime
 
-import jwt
-
 import config
+from auth import tokens
 from storage import database as db
 from storage.pg import run_db
 
@@ -317,10 +316,10 @@ _DEVICE_PURPOSE = "trusted_device"
 
 def mint_device_token(sub: str) -> str:
     now = int(time.time())
-    return jwt.encode({
+    return tokens.mint(tokens.TRUSTED_DEVICE, {
         "purpose": _DEVICE_PURPOSE, "sub": sub, "jti": secrets.token_urlsafe(16),
         "iat": now, "exp": now + DEVICE_TOKEN_DAYS * 86400,
-    }, config.JWT_SECRET, algorithm="HS256")
+    })
 
 
 def device_token_claims(token: str) -> dict | None:
@@ -328,11 +327,8 @@ def device_token_claims(token: str) -> dict | None:
     another token type)."""
     if not token:
         return None
-    try:
-        claims = jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
-    except jwt.InvalidTokenError:
-        return None
-    if claims.get("purpose") != _DEVICE_PURPOSE or not claims.get("sub") or not claims.get("jti"):
+    claims = tokens.verify(token, tokens.TRUSTED_DEVICE)
+    if claims is None or not claims.get("sub") or not claims.get("jti"):
         return None
     return claims
 

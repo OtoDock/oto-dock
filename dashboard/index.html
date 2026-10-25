@@ -3,14 +3,78 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1" />
-    <!-- Fonts (Comfortaa + JetBrains Mono) are self-hosted via @fontsource
-         imports in src/index.css — no CDN requests, air-gap safe. xterm falls
-         back to a system mono stack if the mono font fails; it renders
-         box-drawing via its own glyphs regardless. -->
+    <!-- The fonts (Manrope, Comfortaa, JetBrains Mono) are self-hosted through
+         @fontsource imports in src/index.css: no CDN request, safe on an
+         air-gapped install. xterm falls back to a system mono stack if the mono
+         font fails; it draws box-drawing glyphs itself. -->
     <link rel="icon" type="image/png" href="/assets/favicon.png" />
     <title>OtoDock Dashboard</title>
+    <meta name="theme-color" content="#faf9f9" />
+    <!-- The boot screen: the field the app's system splash fades onto, the
+         page colour on the web, the mark centred where the splash draws its
+         icon (the app pushes the bar heights as two variables, since the
+         viewport sits between the bars). boot.js sets data-boot before the
+         first paint; a page without it shows nothing. The colours are the
+         design tokens' values, held by a test. -->
+    <style>
+      #boot { display: none; }
+      html[data-boot] #boot {
+        display: block; position: fixed; inset: 0; z-index: 1000; overflow: hidden;
+        background: var(--boot-bg);
+        --boot-cy: calc(50% + (var(--oto-bar-bottom, 0px) - var(--oto-bar-top, 0px)) / 2);
+        --boot-mark: 96px;
+      }
+      html[data-boot="app"] { --boot-bg: linear-gradient(#1d4f80, #174067); --boot-ink: #ffffff; --boot-light: #fdf6e3; }
+      html[data-boot="app"] #boot { --boot-mark: 127px; }
+      html[data-boot="web"] { --boot-bg: #faf9f9; --boot-ink: #1d4f80; --boot-light: #fdf6e3; }
+      html[data-boot="web"].dark { --boot-bg: #0d1117; --boot-ink: #ffffff; --boot-light: #fdf6e3; }
+      #boot .boot-mark {
+        position: absolute; left: 50%; top: var(--boot-cy);
+        width: calc(var(--boot-mark) * 96 / 88); height: calc(var(--boot-mark) * 96 / 88);
+        transform: translate(-50%, -50%);
+      }
+      #boot .boot-word {
+        position: absolute; left: 50%; top: calc(var(--boot-cy) + var(--boot-mark) * 0.7);
+        width: calc(var(--boot-mark) * 1.167); transform: translateX(-50%);
+      }
+      html[data-boot="web"] #boot .boot-word { display: none; }
+      #boot .boot-ink { fill: var(--boot-ink); }
+      #boot .boot-glow stop { stop-color: var(--boot-light); }
+      /* A rim of light runs once around the mark's edge (the orbit, masked to
+         the outline's stroke) and rests at the upper left, a glass reflection.
+         The light is a candle white (amber.100): warm against the blue field
+         and the ink page, a glint on the blue mark of the light page. */
+      #boot .boot-orbit {
+        transform-origin: 48px 56px; transform: rotate(315deg); opacity: 0;
+        animation: boot-orbit 1100ms cubic-bezier(0.2, 0, 0, 1) both paused;
+      }
+      html.boot-shown #boot .boot-orbit { animation-play-state: running; }
+      @keyframes boot-orbit {
+        0% { transform: rotate(315deg); opacity: 0; }
+        15% { opacity: 1; }
+        60% { opacity: 1; }
+        100% { transform: rotate(675deg); opacity: 0.4; }
+      }
+      #boot.is-done { opacity: 0; pointer-events: none; transition: opacity 200ms cubic-bezier(0.3, 0, 1, 1); }
+      @media (prefers-reduced-motion: reduce) {
+        #boot .boot-orbit { animation: none; transform: rotate(315deg); opacity: 0.4; }
+        #boot.is-done { transition: none; }
+      }
+    </style>
+    <script src="/boot.js"></script>
   </head>
   <body>
+    <div id="boot" aria-hidden="true">
+      <svg class="boot-mark" viewBox="0 0 96 96">
+        <defs>
+          <mask id="boot-rim" maskUnits="userSpaceOnUse" x="0" y="0" width="96" height="96"><path d="M 46.5 12.77 A 5 5 0 1 1 49.5 12.77 L 49.5 20.031 A 36 36 0 0 1 81.941 44 L 88 44 A 4 4 0 0 1 92 48 L 92 60 A 4 4 0 0 1 88 64 L 83.1 64 A 36 36 0 0 1 12.9 64 L 8 64 A 4 4 0 0 1 4 60 L 4 48 A 4 4 0 0 1 8 44 L 14.059 44 A 36 36 0 0 1 46.5 20.031 Z" fill="none" stroke="#fff" stroke-width="3.2" stroke-linejoin="round" /></mask>
+          <radialGradient id="boot-glow" class="boot-glow"><stop offset="0" stop-opacity="1" /><stop offset="1" stop-opacity="0" /></radialGradient>
+        </defs>
+        <path class="boot-ink" fill-rule="evenodd" d="M 46.5 12.77 A 5 5 0 1 1 49.5 12.77 L 49.5 20.031 A 36 36 0 0 1 81.941 44 L 88 44 A 4 4 0 0 1 92 48 L 92 60 A 4 4 0 0 1 88 64 L 83.1 64 A 36 36 0 0 1 12.9 64 L 8 64 A 4 4 0 0 1 4 60 L 4 48 A 4 4 0 0 1 8 44 L 14.059 44 A 36 36 0 0 1 46.5 20.031 Z M 28 38 L 68 38 A 10 10 0 0 1 78 48 L 78 54 A 10 10 0 0 1 68 64 L 54 64 A 2 2 0 0 0 52 66 A 2 2 0 0 1 50 68 L 28 68 A 10 10 0 0 1 18 58 L 18 48 A 10 10 0 0 1 28 38 Z M 32.4 44.98 L 32.6 42 L 35.4 42 L 35.6 44.98 A 7.2 7.2 0 0 1 37.832 45.905 L 40.081 43.939 L 42.061 45.919 L 40.095 48.168 A 7.2 7.2 0 0 1 41.02 50.4 L 44 50.6 L 44 53.4 L 41.02 53.6 A 7.2 7.2 0 0 1 40.095 55.832 L 42.061 58.081 L 40.081 60.061 L 37.832 58.095 A 7.2 7.2 0 0 1 35.6 59.02 L 35.4 62 L 32.6 62 L 32.4 59.02 A 7.2 7.2 0 0 1 30.168 58.095 L 27.919 60.061 L 25.939 58.081 L 27.905 55.832 A 7.2 7.2 0 0 1 26.98 53.6 L 24 53.4 L 24 50.6 L 26.98 50.4 A 7.2 7.2 0 0 1 27.905 48.168 L 25.939 45.919 L 27.919 43.939 L 30.168 45.905 A 7.2 7.2 0 0 1 32.4 44.98 Z M 30.4 52 A 3.6 3.6 0 1 0 37.6 52 A 3.6 3.6 0 1 0 30.4 52 Z M 57 52 A 5 5 0 1 1 67 52 A 5 5 0 1 1 57 52 Z" />
+        <g mask="url(#boot-rim)"><g class="boot-orbit"><circle cx="48" cy="22" r="30" fill="url(#boot-glow)" /></g></g>
+      </svg>
+      <svg class="boot-word" viewBox="108 44 275 49"><path class="boot-ink" d="M 133.09 92.61 Q 127.75 92.61 123.32 90.82 Q 118.89 89.03 115.71 85.78 Q 112.52 82.53 110.76 78.07 Q 109 73.61 109 68.27 Q 109 62.93 110.76 58.5 Q 112.52 54.07 115.71 50.83 Q 118.89 47.58 123.32 45.79 Q 127.75 44 133.09 44 Q 138.43 44 142.83 45.79 Q 147.23 47.58 150.45 50.83 Q 153.66 54.07 155.42 58.5 Q 157.18 62.93 157.18 68.27 Q 157.18 73.61 155.42 78.07 Q 153.66 82.53 150.45 85.78 Q 147.23 89.03 142.83 90.82 Q 138.43 92.61 133.09 92.61 Z M 133.09 86.9 Q 137.04 86.9 140.34 85.48 Q 143.65 84.05 146.08 81.53 Q 148.5 79.01 149.81 75.62 Q 151.11 72.22 151.11 68.27 Q 151.11 64.33 149.81 60.93 Q 148.5 57.53 146.08 55.01 Q 143.65 52.5 140.34 51.1 Q 137.04 49.7 133.09 49.7 Q 129.15 49.7 125.84 51.1 Q 122.53 52.5 120.14 55.01 Q 117.74 57.53 116.4 60.93 Q 115.07 64.33 115.07 68.27 Q 115.07 72.22 116.4 75.62 Q 117.74 79.01 120.14 81.53 Q 122.53 84.05 125.84 85.48 Q 129.15 86.9 133.09 86.9 Z M 178.54 92 Q 175.51 92 173.08 90.45 Q 170.65 88.91 169.26 86.24 Q 167.86 83.57 167.86 80.23 L 167.86 51.28 Q 167.86 49.95 168.71 49.1 Q 169.56 48.25 170.9 48.25 Q 172.23 48.25 173.08 49.1 Q 173.93 49.95 173.93 51.28 L 173.93 80.23 Q 173.93 82.65 175.27 84.29 Q 176.6 85.93 178.54 85.93 L 180.61 85.93 Q 181.7 85.93 182.46 86.78 Q 183.21 87.63 183.21 88.97 Q 183.21 90.3 182.21 91.15 Q 181.21 92 179.63 92 L 178.54 92 Z M 165.07 65.24 Q 163.8 65.24 163.01 64.51 Q 162.22 63.78 162.22 62.69 Q 162.22 61.48 163.01 60.75 Q 163.8 60.02 165.07 60.02 L 179.09 60.02 Q 180.36 60.02 181.15 60.75 Q 181.94 61.48 181.94 62.69 Q 181.94 63.78 181.15 64.51 Q 180.36 65.24 179.09 65.24 L 165.07 65.24 Z M 205.85 92.24 Q 200.93 92.24 197.17 90.09 Q 193.41 87.93 191.26 84.14 Q 189.1 80.35 189.1 75.43 Q 189.1 70.46 191.26 66.66 Q 193.41 62.87 197.17 60.72 Q 200.93 58.56 205.85 58.56 Q 210.7 58.56 214.47 60.72 Q 218.23 62.87 220.38 66.66 Q 222.54 70.46 222.54 75.43 Q 222.54 80.35 220.41 84.14 Q 218.29 87.93 214.53 90.09 Q 210.76 92.24 205.85 92.24 Z M 205.85 86.78 Q 209.01 86.78 211.43 85.32 Q 213.86 83.87 215.23 81.32 Q 216.59 78.77 216.59 75.43 Q 216.59 72.1 215.23 69.52 Q 213.86 66.94 211.43 65.48 Q 209.01 64.03 205.85 64.03 Q 202.69 64.03 200.27 65.48 Q 197.84 66.94 196.44 69.52 Q 195.05 72.1 195.05 75.43 Q 195.05 78.77 196.44 81.32 Q 197.84 83.87 200.27 85.32 Q 202.69 86.78 205.85 86.78 Z M 235.52 92 Q 234.19 92 233.28 91.09 Q 232.37 90.18 232.37 88.84 L 232.37 47.76 Q 232.37 46.37 233.28 45.49 Q 234.19 44.61 235.52 44.61 L 246.51 44.61 Q 251.73 44.61 256 46.34 Q 260.28 48.07 263.44 51.25 Q 266.59 54.44 268.29 58.75 Q 269.99 63.05 269.99 68.27 Q 269.99 73.49 268.29 77.83 Q 266.59 82.17 263.44 85.36 Q 260.28 88.54 256 90.27 Q 251.73 92 246.51 92 L 235.52 92 Z M 238.68 86.42 L 246.51 86.42 Q 251.6 86.42 255.52 84.08 Q 259.43 81.74 261.68 77.65 Q 263.92 73.55 263.92 68.27 Q 263.92 62.93 261.68 58.87 Q 259.43 54.8 255.52 52.5 Q 251.6 50.19 246.51 50.19 L 238.68 50.19 L 238.68 86.42 Z M 294.32 92.24 Q 289.41 92.24 285.65 90.09 Q 281.88 87.93 279.73 84.14 Q 277.58 80.35 277.58 75.43 Q 277.58 70.46 279.73 66.66 Q 281.88 62.87 285.65 60.72 Q 289.41 58.56 294.32 58.56 Q 299.18 58.56 302.94 60.72 Q 306.7 62.87 308.86 66.66 Q 311.01 70.46 311.01 75.43 Q 311.01 80.35 308.89 84.14 Q 306.76 87.93 303 90.09 Q 299.24 92.24 294.32 92.24 Z M 294.32 86.78 Q 297.48 86.78 299.91 85.32 Q 302.34 83.87 303.7 81.32 Q 305.07 78.77 305.07 75.43 Q 305.07 72.1 303.7 69.52 Q 302.34 66.94 299.91 65.48 Q 297.48 64.03 294.32 64.03 Q 291.17 64.03 288.74 65.48 Q 286.31 66.94 284.92 69.52 Q 283.52 72.1 283.52 75.43 Q 283.52 78.77 284.92 81.32 Q 286.31 83.87 288.74 85.32 Q 291.17 86.78 294.32 86.78 Z M 335.29 92.24 Q 330.43 92.24 326.64 90.03 Q 322.85 87.81 320.69 84.02 Q 318.54 80.23 318.54 75.43 Q 318.54 70.52 320.66 66.7 Q 322.79 62.87 326.49 60.72 Q 330.19 58.56 334.98 58.56 Q 338.56 58.56 341.54 59.93 Q 344.51 61.29 346.88 64.03 Q 347.73 65 347.48 66.03 Q 347.24 67.06 346.15 67.85 Q 345.3 68.46 344.27 68.24 Q 343.24 68.03 342.39 67.18 Q 339.41 64.03 334.98 64.03 Q 331.89 64.03 329.52 65.45 Q 327.15 66.88 325.82 69.43 Q 324.48 71.97 324.48 75.43 Q 324.48 78.71 325.85 81.26 Q 327.21 83.81 329.64 85.29 Q 332.07 86.78 335.29 86.78 Q 337.41 86.78 339.02 86.27 Q 340.63 85.75 341.96 84.66 Q 342.93 83.87 343.96 83.78 Q 344.99 83.69 345.78 84.35 Q 346.82 85.2 346.94 86.27 Q 347.06 87.33 346.21 88.18 Q 341.84 92.24 335.29 92.24 Z M 362.53 79.86 L 358.77 75.74 L 377.4 59.11 Q 378.31 58.26 379.43 58.32 Q 380.55 58.38 381.34 59.29 Q 382.19 60.2 382.13 61.29 Q 382.07 62.39 381.16 63.24 L 362.53 79.86 Z M 359.68 92 Q 358.35 92 357.53 91.18 Q 356.71 90.36 356.71 89.03 L 356.71 47.58 Q 356.71 46.25 357.53 45.43 Q 358.35 44.61 359.68 44.61 Q 361.02 44.61 361.83 45.43 Q 362.65 46.25 362.65 47.58 L 362.65 89.03 Q 362.65 90.36 361.83 91.18 Q 361.02 92 359.68 92 Z M 381.34 91.7 Q 380.37 92.49 379.19 92.39 Q 378.01 92.3 377.22 91.33 L 364.9 76.1 L 369.15 72.1 L 381.77 87.63 Q 382.56 88.6 382.47 89.72 Q 382.38 90.85 381.34 91.7 Z" /></svg>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

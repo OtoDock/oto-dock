@@ -29,11 +29,12 @@ import uuid
 from urllib.parse import urlparse
 
 import httpx
-from PIL import Image
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+from PIL import Image
 
+from _tool_args import ToolArgs
 from _url_guard import validate_outbound_url
 
 # ---------------------------------------------------------------------------
@@ -102,11 +103,12 @@ logger = logging.getLogger("image-search")
 # ---------------------------------------------------------------------------
 
 server = Server("image-search")
+TOOL_ARGS = ToolArgs()
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="find_images",
             description=(
@@ -153,6 +155,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["query"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
         ),
         Tool(
             name="search_by_image",
@@ -194,6 +197,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["image_path"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
         ),
         Tool(
             name="save_image",
@@ -228,12 +232,16 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["url"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
         ),
-    ]
+    ])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     try:
         if name == "find_images":
             result = await _tool_find_images(arguments)
@@ -492,7 +500,7 @@ async def _create_temp_url(abs_path: str) -> tuple[str | None, str | None]:
             if resp.status_code == 200:
                 return resp.json().get("url"), None
             return None, f"proxy returned {resp.status_code}: {resp.text[:300]}"
-    except Exception as e:
+    except (httpx.HTTPError, ValueError, AttributeError) as e:
         return None, f"failed to mint temp URL: {e}"
 
 
@@ -537,7 +545,7 @@ async def _preflight_temp_url(url: str) -> str | None:
                     )
                 return f"Temp image URL redirects to {location[:120]} (HTTP {resp.status_code})."
             return f"Temp image URL returned HTTP {resp.status_code}."
-    except Exception as e:
+    except (httpx.HTTPError, httpx.InvalidURL) as e:
         return f"Temp image URL pre-flight failed: {e}"
 
 
@@ -561,7 +569,7 @@ async def _tool_search_by_image(args: dict) -> dict:
     abs_path, err = _resolve_image_path(image_path)
     if err:
         return {"error": err}
-    if not os.path.isfile(abs_path):
+    if not await asyncio.to_thread(os.path.isfile, abs_path):
         return {"error": f"file not found: {image_path}"}
 
     # Mint the temp URL via the platform.
@@ -592,7 +600,7 @@ async def _tool_search_by_image(args: dict) -> dict:
                     )
                 }
             data = resp.json()
-    except Exception as e:
+    except (httpx.HTTPError, ValueError) as e:
         return {"error": f"SerpAPI request failed: {e}"}
 
     if data.get("error"):
@@ -655,7 +663,7 @@ def _normalize_serpapi_lens(data: dict, mode: str, count: int) -> list[dict]:
 def _domain_of(url: str) -> str:
     try:
         return urlparse(url).netloc or url
-    except Exception:
+    except ValueError:
         return url
 
 
@@ -769,7 +777,7 @@ async def _tool_save_image(args: dict) -> dict:
                         return {"error": f"URL returned HTTP {head.status_code} on HEAD"}
                 finally:
                     await head.aclose()
-        except Exception:
+        except Exception:  # noqa: BLE001  # the HEAD probe is optional, the GET below decides
             # Treat HEAD failures as "unknown" — proceed to GET with guards.
             pass
 
@@ -805,7 +813,7 @@ async def _tool_save_image(args: dict) -> dict:
                 got_ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
                 if got_ctype and not got_ctype.startswith("image/"):
                     return {"error": f"URL is not an image (Content-Type: {got_ctype})"}
-                with open(tmp_path, "wb") as f:
+                with open(tmp_path, "wb") as f:  # noqa: ASYNC230  # a streamed download written one network chunk at a time
                     async for chunk in resp.aiter_bytes(SAVE_CHUNK_SIZE):
                         total += len(chunk)
                         if total > MAX_SAVE_BYTES:
@@ -824,7 +832,7 @@ async def _tool_save_image(args: dict) -> dict:
             finally:
                 await resp.aclose()
         os.replace(tmp_path, save_path)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the download's error text
         return {"error": f"download/write failed: {e}"}
 
     # Extract dimensions + final mime via PIL.
@@ -835,7 +843,7 @@ async def _tool_save_image(args: dict) -> dict:
             width, height = img.size
             if not final_mime.startswith("image/") and img.format:
                 final_mime = f"image/{img.format.lower()}"
-    except Exception:
+    except Exception:  # noqa: BLE001  # Pillow on the tool's image raises anything from a decoder
         pass  # non-fatal — file is saved either way
 
     return {

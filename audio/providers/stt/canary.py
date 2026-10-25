@@ -36,7 +36,7 @@ class NvidiaCanarySTT(STTProvider):
         raise NotImplementedError(_HINT)
 
     @classmethod
-    def from_row(cls, row: dict, resolver: CredentialResolver) -> "NvidiaCanarySTT":
+    def from_row(cls, row: dict, resolver: CredentialResolver) -> NvidiaCanarySTT:
         return cls()
 
     # Concrete (unreachable — __init__ raises) implementations of the ABC surface

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useLayoutEffect } from 'react'
 import { onIframeSwipe } from '../lib/iframeGestures'
 
 interface SwipeOptions {
@@ -16,6 +16,11 @@ interface SwipeOptions {
   excludeTags?: string[]
   /** CSS classes to exclude — swipes starting inside elements with these classes are ignored */
   excludeClasses?: string[]
+  /** Ignore a touch that starts this close (px) to either side of the screen,
+   *  where Android's own back gesture begins (default: 0) */
+  edgeDeadZone?: number
+  /** Ignore swipes forwarded out of app and artifact frames (default: false) */
+  ignoreIframeSwipes?: boolean
 }
 
 const DEFAULT_EXCLUDE_TAGS = ['PRE', 'CODE', 'TABLE', 'THEAD', 'TBODY', 'TR', 'TD', 'TH']
@@ -39,11 +44,13 @@ export function useSwipeGesture(
     mobileOnly = true,
     excludeTags = DEFAULT_EXCLUDE_TAGS,
     excludeClasses = DEFAULT_EXCLUDE_CLASSES,
+    edgeDeadZone = 0,
+    ignoreIframeSwipes = false,
   } = options
 
   // Store callbacks in refs to avoid re-attaching listeners
   const callbacksRef = useRef({ onSwipeLeft, onSwipeRight })
-  callbacksRef.current = { onSwipeLeft, onSwipeRight }
+  useLayoutEffect(() => { callbacksRef.current = { onSwipeLeft, onSwipeRight } })
 
   useEffect(() => {
     const el = ref.current
@@ -96,8 +103,10 @@ export function useSwipeGesture(
       if (e.touches.length > 1) return // ignore multi-touch
       if (isExcluded(e.target)) return
       if (isInteractiveElement(e.target)) return
+      const x = e.touches[0].clientX
+      if (edgeDeadZone > 0 && (x < edgeDeadZone || x > window.innerWidth - edgeDeadZone)) return
 
-      startX = e.touches[0].clientX
+      startX = x
       startY = e.touches[0].clientY
       startTime = Date.now()
       tracking = true
@@ -150,7 +159,7 @@ export function useSwipeGesture(
     // — the containment check gives them the same routing a direct touch
     // would get by bubbling. The frame's runtime already applied the same
     // thresholds; only the mobile gate re-applies here.
-    const offIframe = onIframeSwipe(({ el: frame, dir }) => {
+    const offIframe = ignoreIframeSwipes ? () => {} : onIframeSwipe(({ el: frame, dir }) => {
       if (!isMobile()) return
       if (!el.contains(frame)) return
       if (dir === 'right') callbacksRef.current.onSwipeRight?.()
@@ -163,5 +172,5 @@ export function useSwipeGesture(
       el.removeEventListener('touchcancel', onTouchCancel)
       offIframe()
     }
-  }, [ref, minDistance, minVelocity, directionRatio, mobileOnly, excludeTags, excludeClasses])
+  }, [ref, minDistance, minVelocity, directionRatio, mobileOnly, excludeTags, excludeClasses, edgeDeadZone, ignoreIframeSwipes])
 }

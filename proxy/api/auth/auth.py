@@ -10,12 +10,14 @@ share a path+method)."""
 
 # Section route modules — imported for their ``@router`` registrations (this is
 # what attaches every endpoint to the shared router).
-from api.auth import _router
-from api.auth import identity as _identity
-from api.auth import admin_users as _admin_users
-from api.auth import platform as _platform
-from api.auth import webauthn as _webauthn
-from api.auth import csp as _csp
+from api.auth import (
+    _router,
+    admin_users as _admin_users,
+    csp as _csp,
+    identity as _identity,
+    platform as _platform,
+    webauthn as _webauthn,
+)
 
 # The shared router app.py mounts as ``auth.router`` (all section routes attached).
 router = _router.router

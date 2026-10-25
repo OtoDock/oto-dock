@@ -665,7 +665,7 @@ def windows_schedule_oneshot(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
             capture_output=True, timeout=60, check=False, text=True,
         )
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
         return False, f"powershell spawn failed: {e}"
     if r.returncode != 0:
         return False, (
@@ -817,7 +817,7 @@ def ensure_windows_install_artifacts() -> None:
                     "install-heal: task action update failed rc=%s err=%r",
                     rc.returncode, (rc.stderr or "").strip(),
                 )
-    except Exception:
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         logger.debug("install-heal: task check skipped", exc_info=True)
 
     # 2. Silent launcher script.
@@ -829,7 +829,7 @@ def ensure_windows_install_artifacts() -> None:
         if current.replace("\r\n", "\n") != _START_TRAY_VBS.replace("\r\n", "\n"):
             vbs.write_text(_START_TRAY_VBS, encoding="ascii", newline="")
             logger.info("install-heal: start-tray.vbs (re)written")
-    except Exception:
+    except OSError:
         logger.debug("install-heal: vbs write skipped", exc_info=True)
 
     # 3. Start-Menu shortcut — create if missing (pre-0.5.4 installs never
@@ -878,7 +878,7 @@ def ensure_windows_install_artifacts() -> None:
                     "install-heal: shortcut check failed rc=%s err=%r",
                     rc.returncode, (rc.stderr or "").strip(),
                 )
-    except Exception:
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         logger.debug("install-heal: shortcut skipped", exc_info=True)
 
 
@@ -889,13 +889,14 @@ _DEFAULT_CONFIG_PATH = otodock_dir() / "satellite.conf"
 # this on any change to the satellite<->proxy contract; a purely additive frame
 # an older proxy can safely ignore needs a bump only when the proxy must gate
 # behaviour on it (e.g. satellite_supports_pty). Per-change history is in git.
-SATELLITE_VERSION = "0.5.147"
+SATELLITE_VERSION = "0.5.158"
+SHARED_LOOP_WATCHDOG_HASH = "3627e437d8e1d3c373c2a4f96a9f0cfe3978be4050850e56e71764f3358d2dc4"
 SHARED_LAYOUT_HASH = "2addd8b41902ccd73df4135667a276d215d83e635cc5d94587f764ba58d38ad9"
-SHARED_TERMINAL_QUERIES_HASH = "5738e35e3d21559f82f40563b763cc8b4d591c07262fa6868b97687ebc66a5df"
-SHARED_STDIO_INTERCEPTOR_HASH = "249f4153f709bdad0dc0e9754fba2ccc1716dacf542214941bc7626a0a50f3fa"
-SHARED_CODEX_APPROVALS_HASH = "aef49a7d1f92a09459848f6e3bd802ddec1c13deb44f3b4904e0c1e064502ea7"
-SHARED_APP_SERVER_CLIENT_HASH = "36ccdaed5e23751c81e26df5f3ac9c15d9bf310ed471ac27579ddcbd0cff719d"
-SHARED_MCP_INSTALLER_HASH = "88482714414a7eeb98db4eeaaf64217bd4bcfa40fcb6dba2527d279acbb2bc82"
+SHARED_TERMINAL_QUERIES_HASH = "3cbc0e533e4aef2d4a532f7e97117bb30a1cdc4bfcf73bad82aee1385e95e0ac"
+SHARED_STDIO_INTERCEPTOR_HASH = "da22d95ff38fefe4c69c488e9355c71c01acc9614b0be8aa1df796ce6d0480d4"
+SHARED_CODEX_APPROVALS_HASH = "e95b161d721361ea9cfbd5aaa60848b86af83bde400bf900cbb09dc3cdfff80a"
+SHARED_APP_SERVER_CLIENT_HASH = "d141cda0ed263bd6ab815d0346295dd87aefc21bfc4f6dff1409be91fd91d831"
+SHARED_MCP_INSTALLER_HASH = "f060f8d1e0742c0ef3cad1e167150f7f9b95370ffdd863d11a688149b2f95721"
 
 
 def _default_cli_bins() -> dict[str, str]:

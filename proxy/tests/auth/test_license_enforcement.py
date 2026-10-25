@@ -8,14 +8,14 @@ the cost-based `usage_service` ones.
 
 import base64
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-import config
 import auth.license as L
+import config
 
 
 def _b64u(b: bytes) -> str:

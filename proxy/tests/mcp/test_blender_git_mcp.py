@@ -4,7 +4,7 @@ our own bridge).
 
 DB-free (mirrors test_browser_mcp.py). Covers:
   1. the new `git+` source type in the SHARED installer's parse_source,
-  2. the Blender manifest parsing with companion_app + BOTH high-risk exec tools,
+  2. the Blender manifest parsing with companion_app and BOTH exec tools,
   3. the device gate + auto-approve helpers treating it as an `app` capability,
   4. resolve_server_config emitting the `python -m blmcp` stdio entry — and in
      particular that the bare module name `blmcp` is NOT mangled into a path.
@@ -12,11 +12,10 @@ DB-free (mirrors test_browser_mcp.py). Covers:
 
 import pytest
 
-from services.mcp import mcp_registry as reg
-from services.mcp import mcp_installer as inst
-
-from tests._paths import REPO_ROOT as _ROOT
 from core import placement
+from services.mcp import mcp_installer as inst, mcp_registry as reg
+from tests._paths import REPO_ROOT as _ROOT
+
 _MANIFEST = _ROOT / "mcps" / "community" / "blender" / "manifest.json"
 if not _MANIFEST.is_file():
     # community/* MCPs ship from the separate community-mcps repo and are
@@ -96,12 +95,18 @@ def test_manifest_companion_app(manifest):
     assert all(v.startswith("blender>=") for v in ca.plugin.supported_host_versions)
 
 
-def test_manifest_high_risk_tools(manifest):
-    # BOTH arbitrary-Python tools the official server exposes must be gated so
-    # they still prompt even when the machine grants "app".
-    assert manifest.device_high_risk_tools == [
-        "execute_blender_code", "execute_blender_code_for_cli",
-    ]
+def test_the_code_tools_take_the_manifests_tier(manifest):
+    # The two arbitrary-Python tools follow the chat's mode like the server's
+    # other tools (no permissions block: the sensitive fallback); a catalog
+    # entry that still lists them under the retired device_high_risk_tools
+    # key pins nothing.
+    from services.mcp import mcp_permissions
+    reg._manifests[manifest.name] = manifest
+    try:
+        for tool in ("execute_blender_code", "execute_blender_code_for_cli", "get_scene_info"):
+            assert mcp_permissions.resolve_tool_tier("blender", tool) == "sensitive"
+    finally:
+        reg._manifests.pop(manifest.name, None)
 
 
 def test_manifest_declares_git_system_requirement(manifest):
@@ -139,13 +144,10 @@ def test_gate_excluded_when_known_headless(manifest):
     assert "no interactive display" in (_reason(manifest, r=True, d=False, g={"app"}) or "")
 
 
-def test_capability_and_high_risk_helpers(manifest):
+def test_capability_helper(manifest):
     reg._manifests[manifest.name] = manifest
     try:
         assert reg.device_capability_for_server("blender") == "app"
-        assert reg.is_high_risk_device_tool("blender", "execute_blender_code") is True
-        assert reg.is_high_risk_device_tool("blender", "execute_blender_code_for_cli") is True
-        assert reg.is_high_risk_device_tool("blender", "get_scene_info") is False
     finally:
         reg._manifests.pop(manifest.name, None)
 

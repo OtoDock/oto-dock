@@ -39,8 +39,8 @@ export async function ensureNativeMicPermission(): Promise<void> {
   } catch (e) {
     const name = (e as { name?: string })?.name
     if (name === 'NotAllowedError' || name === 'SecurityError') {
-      throw new Error('Microphone permission denied. Enable it in Settings → Apps → OtoDock → Permissions.')
+      throw new Error("Microphone access was denied. Allow it in your phone's Settings, Apps, OtoDock, Permissions.", { cause: e })
     }
-    throw new Error('Could not access the microphone on this device.')
+    throw new Error('Could not access the microphone on this device.', { cause: e })
   }
 }

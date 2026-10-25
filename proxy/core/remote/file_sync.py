@@ -17,10 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import config
-from services.infra import safe_fs
-from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
 from auth import roles
 from core import layout
+from services.infra import safe_fs
+from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
 
 logger = logging.getLogger("otodock.file-sync")
 
@@ -112,7 +112,8 @@ SATELLITE_OWNED_SUBPATHS: tuple[tuple[str, ...], ...] = (
 # otherwise hash every manifest only to skip in the diff), temp dirs, caches,
 # shell snapshots, backups. They churn constantly (``.codex/.tmp`` alone can hold
 # thousands of files), so they are PRUNED during the walk — never manifested,
-# never synced. Real config + ``skills/`` (curated content) still sync. This set
+# never synced. Under an engine home only a person's own folders sync
+# (``_ENGINE_HOME_SYNCED_CHILDREN``). This set
 # MUST stay identical to ``satellite/file_sync.py`` or the two manifests disagree
 # and the diff churns.
 _CLI_RUNTIME_CHILD_DIRS = frozenset({
@@ -142,6 +143,54 @@ def _is_cli_runtime_child(parent_name: str, child_name: str) -> bool:
     """True for a runtime-cruft dir that is an immediate child of an engine
     config dir (``INCLUDE_DOTTED_DIRS``)."""
     return parent_name in INCLUDE_DOTTED_DIRS and child_name in _CLI_RUNTIME_CHILD_DIRS
+
+
+# Under an ENGINE HOME (the ``.claude``/``.codex`` directly under a scope
+# root: ``workspace/.claude``, ``users/<u>/.codex``) only the folders a
+# person authors sync: the skills, and the CLI's user-level commands,
+# agents, output styles and prompts (the home is the CLI's config dir, so
+# it reads them under its user setting source). Every other child there is
+# the CLI's own: runtime dirs the denylist above names and the ones it does
+# not (``state``, ``thread-writer-locks``, the ``bin`` wrappers) and direct
+# files rewritten per session or per turn (``history.jsonl``,
+# ``installation_id``, ``.claude.json``, the model catalog cache). Listed
+# by one side only, they were scrubbed at every merge and recreated at the
+# next session. A ``.claude``/``.codex`` nested deeper (a repository's
+# checked-in project config) keeps the general rules. The satellite's twin
+# is identical (the engine twins test under ``tests/remote/``).
+_ENGINE_HOME_SYNCED_CHILDREN = {
+    ".claude": frozenset({"skills", "commands", "agents", "output-styles"}),
+    ".codex": frozenset({"prompts", "skills"}),
+}
+
+
+def _engine_home_children(rel_dir: str) -> frozenset[str] | None:
+    """The synced children of ``rel_dir`` when it is an engine home
+    (``workspace/.claude``, ``workspace/.codex``, ``users/<u>/.claude``,
+    ``users/<u>/.codex``, agent-relative with forward slashes), else None."""
+    parts = rel_dir.split("/")
+    if len(parts) == 2 and parts[0] == layout.WORKSPACE:
+        return _ENGINE_HOME_SYNCED_CHILDREN.get(parts[1])
+    if len(parts) == 3 and parts[0] == layout.USERS:
+        return _ENGINE_HOME_SYNCED_CHILDREN.get(parts[2])
+    return None
+
+
+def _is_engine_home(rel_dir: str) -> bool:
+    return _engine_home_children(rel_dir) is not None
+
+
+def is_unsynced_engine_home_path(rel_path: str) -> bool:
+    """True for a path under an engine home the allowlist leaves to the host:
+    a direct file there, or anything under a child other than its
+    ``_ENGINE_HOME_SYNCED_CHILDREN`` (the child itself included)."""
+    parts = rel_path.replace("\\", "/").split("/")
+    for i in (2, 3):
+        if len(parts) > i:
+            allowed = _engine_home_children("/".join(parts[:i]))
+            if allowed is not None:
+                return parts[i] not in allowed
+    return False
 
 
 # The marker of the platform's own in-flight hook-file writes
@@ -375,6 +424,9 @@ class _IgnoreMatcher:
                  "veto_files", "veto_globs")
 
     def __init__(self, rules: dict):
+        file_m: set[str]
+        signed_m: set[str]
+        dir_m: set[str]
         file_m, signed_m, dir_m = set(), set(), set()
         for m in rules.get("in_dir_markers") or []:
             if "file" in m:
@@ -579,7 +631,7 @@ def compute_manifest(
             ``satellite_supports_sync_ignore_rules``); the two walks must
             apply the SAME rules or the diff misattributes deletes.
     """
-    entries = []
+    entries: list[FileEntry] = []
     if not agent_dir.exists():
         return entries
     size_cap = max_file_size or MAX_FILE_SIZE
@@ -616,6 +668,12 @@ def compute_manifest(
             and (not d.startswith(".") or d in INCLUDE_DOTTED_DIRS)
             and not _is_cli_runtime_child(_root_name, d)
         ]
+        synced_children = _engine_home_children(rel_root.as_posix())
+        if synced_children is not None:
+            # Only the person's own folders sync under an engine home (the
+            # allowlist above).
+            dirs[:] = [d for d in dirs if d in synced_children]
+            files[:] = []
         if exclude_user_dirs and root == str(agent_dir) and layout.USERS in dirs:
             dirs.remove(layout.USERS)
         # The platform-only trees (external callers' trees, app release
@@ -1246,7 +1304,7 @@ def diff_manifests(
     tombstones = tombstones or {}
     holds = holds or {}
     if author_of is None:
-        author_of = lambda _p: None  # noqa: E731
+        author_of = lambda _p: None
 
     if exclude_user_dirs:
         # Drop users/ from EVERY input (manifests + carried state) so the
@@ -1258,6 +1316,15 @@ def diff_manifests(
         tombstones = {k: v for k, v in tombstones.items()
                       if not layout.is_personal(k)}
         holds = {k: v for k, v in holds.items() if not layout.is_personal(k)}
+    # The engine-home paths the allowlist leaves to each host are nobody's
+    # to sync: a satellite below 0.5.150 still lists them, and read as
+    # satellite-only extras under a push-only segment they would be scrubbed
+    # (its CLI's own files, its command wrappers) at every merge.
+    local = [e for e in local if not is_unsynced_engine_home_path(e.path)]
+    remote = [r for r in remote if not is_unsynced_engine_home_path(str(r.get("path", "")))]
+    base = {k: v for k, v in base.items() if not is_unsynced_engine_home_path(k)}
+    tombstones = {k: v for k, v in tombstones.items() if not is_unsynced_engine_home_path(k)}
+    holds = {k: v for k, v in holds.items() if not is_unsynced_engine_home_path(k)}
     unknown_files = {str(r.get("path", "")) for r in remote
                      if r.get("skipped") and not r.get("dir")}
     unknown_dirs = tuple(
@@ -1389,7 +1456,7 @@ def prepare_outgoing_files(
     with no link followed (a link, at the leaf or on the way, is skipped:
     symlinks don't round-trip).
     """
-    messages = []
+    messages: list[dict] = []
     agent_dir = Path(agent_dir)
     with safe_fs.open_root(agent_dir.parent, agent_dir.name) as rootfd:
       for rel_path in paths:

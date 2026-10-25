@@ -8,13 +8,13 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from storage import database as task_store
-from services.notifications import notification_manager
 from auth.providers import (
     UserContext,
     get_current_user,
     require_auth,
 )
+from services.notifications import notification_manager
+from storage import database as task_store
 
 logger = logging.getLogger("otodock.internal-api")
 router = APIRouter()
@@ -57,7 +57,7 @@ async def internal_fire_task(
         trigger_type=trigger_type,
         trigger_source="standalone-scheduler",
     )
-    logger.info(f"Internal fire-task: task={task_id}, run={run_id}")
+    logger.info("Internal fire-task: task=%s, run=%s", task_id, run_id)
     return {"run_id": run_id, "task_id": task_id}
 
 
@@ -83,5 +83,5 @@ async def internal_fire_notification(
 
     # Reuse the existing scheduled notification fire path
     await notification_manager._fire_scheduled_notification(notification_id)
-    logger.info(f"Internal fire-notification: {notification_id}")
+    logger.info("Internal fire-notification: %s", notification_id)
     return {"status": "fired", "notification_id": notification_id}

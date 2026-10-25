@@ -6,11 +6,12 @@
  * acknowledgement a user-mode inbound route needs to save without a PIN.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import * as authApi from '@/api/auth'
 import PhoneServersTab from '@/pages/admin/PhoneServersTab'
+import { answerDialog, findAlertDialog, renderWithDialogs } from './dialogsHarness'
 
 const fetchSpy = vi.spyOn(authApi, 'apiFetch')
 
@@ -63,7 +64,7 @@ function mockApi(routes: unknown[], opts: {
 
 function renderTab() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}><PhoneServersTab /></QueryClientProvider>)
+  return renderWithDialogs(<QueryClientProvider client={qc}><PhoneServersTab /></QueryClientProvider>)
 }
 
 async function openEdit() {
@@ -81,13 +82,24 @@ function routePut() {
   return fetchSpy.mock.calls.find(([p, i]) => p === '/v1/admin/phone/routes/r1' && i?.method === 'PUT')
 }
 
+/** No dialog on screen says this (the routes table's own marker may). */
+function noDialogSays(text: string) {
+  for (const d of screen.queryAllByRole('alertdialog')) expect(d.textContent).not.toContain(text)
+}
+
+/** The no-PIN confirm: it names the tied user; answer it. */
+async function answerNoPin(button: 'Save without a PIN' | 'Cancel') {
+  const ask = await findAlertDialog('Save without a PIN?')
+  expect(ask.textContent).toMatch(/act as Alice, with all their tools and credentials\./)
+  await act(async () => { await answerDialog(button, 'Save without a PIN?') })
+}
+
 function pinCard() {
   return screen.getByText('Require a PIN').closest('div')!.parentElement!
 }
 
 describe('route identity', () => {
-  beforeEach(() => { vi.stubGlobal('alert', vi.fn()); vi.stubGlobal('confirm', vi.fn(() => true)) })
-  afterEach(() => { fetchSpy.mockReset(); vi.unstubAllGlobals() })
+  afterEach(() => { fetchSpy.mockReset() })
 
   it('defaults to per-caller with the remember control and the tool preview', async () => {
     mockApi([makeRoute({ role: 'manager' })])   // a legacy column value: never shown
@@ -97,11 +109,12 @@ describe('route identity', () => {
     expect(cell).not.toHaveTextContent('manager')
     await openEdit()
     const group = screen.getByRole('radiogroup', { name: 'Caller identity' })
-    expect((within(group).getByLabelText(/Per caller/) as HTMLInputElement).checked).toBe(true)
+    expect((within(group).getByRole('radio', { name: /Per caller/ }) as HTMLInputElement).checked).toBe(true)
     // Callers are always viewers: no role control anywhere in the form.
     expect(screen.queryByLabelText('Role on the agent')).not.toBeInTheDocument()
     expect(screen.queryByText(/Editor|Manager —/)).not.toBeInTheDocument()
-    expect(screen.getByText(/Callers read the agent's shared files as viewers/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'About Per caller, recommended' }), { detail: 0 })
+    expect(screen.getByRole('tooltip')).toHaveTextContent(/Callers read the agent's shared files as viewers/)
     expect(screen.getByText('Remember callers')).toBeInTheDocument()
     expect(screen.queryByLabelText('Platform user')).not.toBeInTheDocument()
     // The preview names what reaches the line and what never does.
@@ -116,7 +129,7 @@ describe('route identity', () => {
     mockApi([makeRoute()])
     renderTab()
     await openEdit()
-    fireEvent.click(screen.getByLabelText(/A platform user/))
+    fireEvent.click(screen.getByRole('radio', { name: /A platform user/ }))
     const picker = await pickerWithAlice()
     expect(screen.getByText(/anyone who dials this number acts as that user/)).toBeInTheDocument()
     expect(screen.queryByText('Remember callers')).not.toBeInTheDocument()
@@ -126,6 +139,8 @@ describe('route identity', () => {
     expect(screen.getByText('Save').closest('button')).not.toBeDisabled()
     // Saving without a PIN asks first and sends the acknowledgement.
     fireEvent.click(screen.getByText('Save'))
+    expect(routePut()).toBeUndefined()
+    await answerNoPin('Save without a PIN')
     await waitFor(() => {
       const put = routePut()
       expect(put).toBeTruthy()
@@ -136,8 +151,6 @@ describe('route identity', () => {
       expect(body).not.toHaveProperty('warnings')
       expect(body).not.toHaveProperty('pin')
     })
-    expect(vi.mocked(confirm)).toHaveBeenCalledTimes(1)
-    expect(vi.mocked(confirm)).toHaveBeenCalledWith(expect.stringMatching(/act as Alice, with all their tools and credentials\. Save without a PIN\?/))
   })
 
   it('offers exactly two identities — per caller and a platform user', async () => {
@@ -169,22 +182,19 @@ describe('route identity', () => {
     await openEdit()
     await pickerWithAlice()
     fireEvent.click(screen.getByText('Save'))
-    await waitFor(() => {
-      expect(vi.mocked(alert)).toHaveBeenCalledWith(expect.stringContaining(ADMIN_NOTE))
-    })
-    expect(vi.mocked(confirm)).toHaveBeenCalledTimes(1)
-    expect(vi.mocked(confirm)).toHaveBeenCalledWith(expect.stringContaining('act as Alice'))
-    expect(vi.mocked(alert)).not.toHaveBeenCalledWith(expect.stringContaining('no PIN'))
+    await answerNoPin('Save without a PIN')
+    const notes = await findAlertDialog('Route saved. Please note:')
+    expect(notes.textContent).toContain(ADMIN_NOTE)
+    noDialogSays('no PIN')
   })
 
   it('Cancel on the confirm sends nothing and keeps the modal open', async () => {
-    vi.stubGlobal('confirm', vi.fn(() => false))
     mockApi([makeRoute({ identity_mode: 'user', identity_user_sub: 'u-alice', warnings: [NO_PIN_NOTE] })])
     renderTab()
     await openEdit()
     await pickerWithAlice()
     fireEvent.click(screen.getByText('Save'))
-    expect(vi.mocked(confirm)).toHaveBeenCalledTimes(1)
+    await answerNoPin('Cancel')
     expect(routePut()).toBeUndefined()
     expect(screen.getByText('Save')).toBeInTheDocument()
     expect(screen.getByLabelText('Platform user')).toBeInTheDocument()
@@ -207,8 +217,7 @@ describe('route identity', () => {
       expect(body).not.toHaveProperty('acknowledge_no_pin')
     })
     expect(fetchSpy.mock.calls.some(([p]) => String(p).startsWith('/v1/admin/phone/routes/r1/pin'))).toBe(false)
-    expect(vi.mocked(confirm)).not.toHaveBeenCalled()
-    expect(vi.mocked(alert)).not.toHaveBeenCalledWith(expect.stringContaining('no PIN'))
+    expect(screen.queryByRole('alertdialog')).toBeNull()
   })
 
   it('turning the PIN off on a user-mode route asks, flags the removal, and does not repeat the note', async () => {
@@ -220,13 +229,13 @@ describe('route identity', () => {
     fireEvent.click(pinCard().querySelector('[role="switch"]')!)
     expect(screen.getByText('The PIN will be removed when you save.')).toBeInTheDocument()
     fireEvent.click(screen.getByText('Save'))
+    await answerNoPin('Save without a PIN')
     await waitFor(() => {
       expect(fetchSpy.mock.calls.some(
         ([p, i]) => p === '/v1/admin/phone/routes/r1/pin?acknowledge_no_pin=true' && i?.method === 'DELETE')).toBe(true)
     })
-    expect(vi.mocked(confirm)).toHaveBeenCalledTimes(1)
     expect(JSON.parse(String(routePut()![1]!.body)).acknowledge_no_pin).toBe(true)
-    expect(vi.mocked(alert)).not.toHaveBeenCalledWith(expect.stringContaining('no PIN'))
+    noDialogSays('no PIN')
   })
 
   it('a caller-mode save never asks', async () => {
@@ -235,7 +244,7 @@ describe('route identity', () => {
     await openEdit()
     fireEvent.click(screen.getByText('Save'))
     await waitFor(() => { expect(routePut()).toBeTruthy() })
-    expect(vi.mocked(confirm)).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alertdialog')).toBeNull()
     expect(JSON.parse(String(routePut()![1]!.body))).not.toHaveProperty('acknowledge_no_pin')
   })
 })

@@ -10,15 +10,14 @@ policy as MCP tool args.
 import sys
 from unittest.mock import patch
 
-
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
-from auth.path_policy import SecurityContext, check_tool_access  # noqa: E402
-from services.path_policy_v2 import check_target_still_valid  # noqa: E402
+from auth.path_policy import SecurityContext, check_tool_access
 from core import placement
-
+from services.path_policy_v2 import check_target_still_valid
 
 # ---------------------------------------------------------------------------
 # Test fixtures

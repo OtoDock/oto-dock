@@ -90,7 +90,7 @@ class DuplexManager:
             return
 
         async def _fail(reason: str) -> None:
-            logger.warning(f"duplex_open {duplex_id[:8]} refused: {reason}")
+            logger.warning("duplex_open %s refused: %s", duplex_id[:8], reason)
             with contextlib.suppress(Exception):
                 await mgmt_ws.send(json.dumps({
                     "type": "duplex_open_failed",
@@ -114,7 +114,7 @@ class DuplexManager:
                 max_size=10 * 1024 * 1024,
                 close_timeout=5,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the open is refused with the dial-back's error, whatever it was
             await _fail(f"dial-back failed: {e}")
             return
 
@@ -126,8 +126,7 @@ class DuplexManager:
         try:
             session = DuplexSession(conn, self._cfg, session_cfg)
         except Exception as e:
-            logger.error(f"duplex {duplex_id[:8]}: session build failed: {e}",
-                         exc_info=True)
+            logger.exception("duplex %s: session build failed: %s", duplex_id[:8], e)
             await conn.close()
             await _fail(f"session build failed: {e}")
             return
@@ -142,4 +141,4 @@ class DuplexManager:
             with contextlib.suppress(Exception):
                 await conn.close()
             self._sessions.pop(duplex_id, None)
-            logger.info(f"duplex {duplex_id[:8]}: session ended")
+            logger.info("duplex %s: session ended", duplex_id[:8])

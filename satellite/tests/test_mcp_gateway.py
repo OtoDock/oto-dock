@@ -117,8 +117,9 @@ async def test_wait_for_sees_a_push_in_flight():
         await asyncio.sleep(0.1)
         t.push({"session_id": "s", "token_hash": "h", "mcp": "m", "header": "A", "value": "v",
                 "expires_in": 60, "upstream": "https://x.example/mcp"})
-    asyncio.create_task(_late())
+    pusher = asyncio.create_task(_late())
     tok = await t.wait_for("h", "m", 2.0)
+    await pusher
     assert tok is not None
     assert await t.wait_for("h", "nope", 0.3) is None
 

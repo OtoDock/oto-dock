@@ -8,13 +8,13 @@ import pytest
 
 from core.remote.file_sync import (
     FileEntry,
+    _hash_file,
+    apply_incoming_file,
+    can_write_back,
     compute_manifest,
     diff_manifests,
     prepare_outgoing_files,
-    apply_incoming_file,
     should_sync_to_target,
-    can_write_back,
-    _hash_file,
 )
 
 
@@ -112,8 +112,9 @@ class TestComputeManifest:
         cl, cx = base / ".claude", base / ".codex"
         for d in (cl, cx):
             d.mkdir(parents=True)
-        # .codex/models_cache.json is real synced config — KEEP. .claude
-        # settings.json + mcp-config.json are HOST-LOCAL now (never synced).
+        # .codex/models_cache.json is Codex's own catalog cache, rewritten
+        # every turn: a direct file under the engine home, never synced.
+        # .claude settings.json + mcp-config.json are HOST-LOCAL (never synced).
         (cl / "settings.json").write_text("{}")
         (cl / "mcp-config.json").write_text("{}")
         (cl / "auth.json").write_text("{}")
@@ -154,7 +155,7 @@ class TestComputeManifest:
         assert "users/alice/.claude/mcp-config.json" not in paths
         assert "users/alice/.claude/auth.json" not in paths
         assert "users/alice/.claude/.credentials.json" not in paths
-        assert "users/alice/.codex/models_cache.json" in paths
+        assert "users/alice/.codex/models_cache.json" not in paths
         for leaked in (
             "users/alice/.claude/projects/f", "users/alice/.claude/tasks/f",
             "users/alice/.claude/backups/f",
@@ -171,6 +172,49 @@ class TestComputeManifest:
             assert leaked not in paths, f"cruft leaked: {leaked}"
         # Materialized skills DO sync — remote sessions depend on it.
         assert "users/alice/.claude/skills/voiceover/SKILL.md" in paths
+
+    def test_only_the_persons_folders_sync_under_an_engine_home(self, agent_dir):
+        """The engine homes (``workspace/.claude``, ``users/<u>/.codex``) hold
+        the CLIs' own files the denylists never named: listed by one side
+        only, they were scrubbed at every merge and recreated at the next
+        session. Only what a person authors syncs there (Claude's skills,
+        commands, agents and output styles; Codex's prompts and skills); a
+        ``.claude`` nested deeper (a repository's project config) keeps the
+        general rules."""
+        from core.remote.file_sync import is_unsynced_engine_home_path
+        for rel in ("users/alice/.claude/history.jsonl", "users/alice/.claude/.claude.json",
+                    "users/alice/.claude/bin/gh", "users/alice/.claude/skills/x/SKILL.md",
+                    "users/alice/.claude/skills/x/.oto-skill.json",
+                    "users/alice/.claude/commands/deploy.md", "users/alice/.claude/agents/rev.md",
+                    "users/alice/.claude/output-styles/terse.md", "users/alice/.claude/prompts/p.md",
+                    "workspace/.codex/installation_id", "workspace/.codex/state/s.json",
+                    "workspace/.codex/thread-writer-locks/t.lock", "workspace/.codex/models_cache.json",
+                    "workspace/.codex/skills/y/SKILL.md", "workspace/.codex/prompts/q.md",
+                    "workspace/.codex/commands/c.md", "workspace/.codex/.last-cleanup",
+                    "workspace/repo/.claude/commands/deploy.md", "workspace/repo/.codex/notes.md",
+                    "users/alice/notes.md"):
+            p = agent_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("x")
+        paths = {e.path for e in compute_manifest(agent_dir, target_role="manager")}
+        assert {p for p in paths if "/.claude/" in p or "/.codex/" in p} == {
+            "users/alice/.claude/skills/x/SKILL.md", "users/alice/.claude/skills/x/.oto-skill.json",
+            "users/alice/.claude/commands/deploy.md", "users/alice/.claude/agents/rev.md",
+            "users/alice/.claude/output-styles/terse.md",
+            "workspace/.codex/skills/y/SKILL.md", "workspace/.codex/prompts/q.md",
+            "workspace/repo/.claude/commands/deploy.md", "workspace/repo/.codex/notes.md",
+        }
+        assert "users/alice/notes.md" in paths
+        for rel in ("users/alice/.claude/history.jsonl", "users/alice/.claude/bin/gh",
+                    "users/alice/.claude/bin", "users/alice/.claude/prompts/p.md",
+                    "workspace/.codex/state/s.json", "workspace/.codex/commands/c.md",
+                    "workspace/.codex/models_cache.json", "workspace/.codex/state"):
+            assert is_unsynced_engine_home_path(rel), rel
+        for rel in ("users/alice/.claude/skills", "users/alice/.claude/skills/x/SKILL.md",
+                    "users/alice/.claude/commands/deploy.md", "workspace/.codex/prompts/q.md",
+                    "workspace/.codex/skills/y/SKILL.md", "workspace/repo/.claude/commands/deploy.md",
+                    "users/alice/notes.md", "workspace/.claude", "users/alice/.codex"):
+            assert not is_unsynced_engine_home_path(rel), rel
 
     def test_satellite_authored_skills_never_write_back(self):
         """A compromised satellite writing into .claude/skills/ must never
@@ -290,6 +334,26 @@ class TestDiffManifests:
         a = _act(diff_manifests([], remote, target_role="manager"), "workspace/data.txt")
         assert a and a.op == "pull"
 
+    def test_an_older_satellites_engine_home_files_get_no_action(self):
+        """A satellite below 0.5.150 still lists the CLIs' own files under an
+        engine home; the platform walk lists none. Read as satellite-only
+        extras under a push-only segment they would be scrubbed at every
+        merge (the command wrappers of a live session among them): a path
+        the allowlist leaves to each host gets no action from either side,
+        whatever the base, a tombstone or a hold says about it."""
+        remote = [_r("workspace/.claude/history.jsonl", "sha256:1"),
+                  _r("workspace/.claude/bin/gh", "sha256:2"),
+                  _r("users/alice/.codex/installation_id", "sha256:3"),
+                  _r("users/alice/.claude/commands/deploy.md", "sha256:4")]
+        local = [FileEntry("users/alice/.claude/commands/deploy.md", "sha256:4", 10, 1.0)]
+        plan = diff_manifests(
+            local, remote, target_role="manager", target_username="alice",
+            base={"workspace/.claude/bin/gh": ("sha256:9", 1.0)},
+            tombstones={"users/alice/.codex/installation_id": 5.0},
+            holds={"workspace/.claude/history.jsonl": 5.0},
+        )
+        assert plan.actions == [] and plan.to_scrub == []
+
     def test_exclude_user_dirs_ignores_users_paths_both_sides(self):
         """Shared-only agents: users/ paths are invisible to the merge — a
         stray satellite-side copy is neither pulled nor scrubbed, and a
@@ -330,18 +394,21 @@ class TestDiffManifests:
         assert _act(plan, "workspace/x.txt") is None and not plan.to_scrub
 
     def test_push_only_subtrees_scrubbed_not_pulled(self):
-        # .claude/.codex/config on the satellite without a platform copy are
-        # platform-authoritative extras → to_scrub (never pulled/captured).
+        # A satellite-only skill under .claude/.codex, and config/ on the
+        # satellite without a platform copy, are platform-authoritative
+        # extras → to_scrub (never pulled/captured). The CLIs' own files
+        # directly under an engine home are nobody's to sync (left alone).
         remote = [
-            _r("users/alice/.claude/settings.json", "sha256:a"),
-            _r("users/alice/.codex/config.toml", "sha256:b"),
+            _r("users/alice/.claude/skills/evil/SKILL.md", "sha256:a"),
+            _r("users/alice/.codex/skills/evil/SKILL.md", "sha256:b"),
+            _r("users/alice/.claude/settings.json", "sha256:d"),
             _r("config/prompt.md", "sha256:c"),
         ]
         plan = diff_manifests([], remote, target_role="manager", target_username="alice")
         assert not plan.actions
         assert set(plan.to_scrub) == {
-            "users/alice/.claude/settings.json",
-            "users/alice/.codex/config.toml",
+            "users/alice/.claude/skills/evil/SKILL.md",
+            "users/alice/.codex/skills/evil/SKILL.md",
             "config/prompt.md",
         }
 
@@ -384,8 +451,8 @@ class TestDiffManifests:
         plan = diff_manifests([], [_r("config/extra.md", "sha256:abc")])
         assert not plan.to_scrub and not plan.actions
         # The platform-regenerated SEGMENTS still scrub even admin-shared.
-        plan = diff_manifests([], [_r("users/alice/.claude/settings.json", "sha256:a")])
-        assert plan.to_scrub == ["users/alice/.claude/settings.json"]
+        plan = diff_manifests([], [_r("users/alice/.claude/skills/x/SKILL.md", "sha256:a")])
+        assert plan.to_scrub == ["users/alice/.claude/skills/x/SKILL.md"]
 
     def test_owner_config_pulls_back_when_push_only_dropped(self):
         # sync-a: an owner-tier session passes push_only_dirs=set() so config/ is
@@ -408,14 +475,14 @@ class TestDiffManifests:
         # push_only_dirs=set() drops `config/` ONLY; the `.claude`/`.codex`/
         # `.credentials` segments stay platform-authoritative even for an owner.
         remote = [
-            _r("users/alice/.claude/settings.json", "sha256:a"),
+            _r("users/alice/.claude/skills/x/SKILL.md", "sha256:a"),
             _r("config/notes.md", "sha256:c"),
         ]
         plan = diff_manifests(
             [], remote, push_only_dirs=set(),
             target_role="manager", target_username="alice",
         )
-        assert "users/alice/.claude/settings.json" in plan.to_scrub  # segment still push-only
+        assert "users/alice/.claude/skills/x/SKILL.md" in plan.to_scrub  # segment still push-only
         assert "config/notes.md" not in plan.to_scrub                 # config/ now adoptable
         a = _act(plan, "config/notes.md")
         assert a and a.op == "pull"
@@ -896,6 +963,7 @@ class TestManifestCapAndHashCache:
         self, tmp_path, monkeypatch,
     ):
         import os as _os
+
         from core.remote import file_sync as fs
 
         d = self._tree(tmp_path)

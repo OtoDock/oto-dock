@@ -19,7 +19,9 @@ import pytest
 
 from core.execution_layer import AgentConfig
 from core.layers.codex.helpers import (
-    LOCAL_ENDPOINT_KEY_ENV, LOCAL_ENDPOINT_STREAM_IDLE_TIMEOUT_MS, LOCAL_PROVIDER_TOOL_NOTE,
+    LOCAL_ENDPOINT_KEY_ENV,
+    LOCAL_ENDPOINT_STREAM_IDLE_TIMEOUT_MS,
+    LOCAL_PROVIDER_TOOL_NOTE,
 )
 from core.layers.codex.local_model_catalog import LOCAL_MODEL_ROWS_ENV
 from core.remote.remote_execution import RemoteExecutionLayer
@@ -215,7 +217,8 @@ class TestLocalEndpointPayload:
 
 def test_satellite_supports_local_model_provider_gate():
     from core.remote.satellite_connection import (
-        SatelliteConnection, SatelliteConnectionManager,
+        SatelliteConnection,
+        SatelliteConnectionManager,
     )
     cm = SatelliteConnectionManager()
     for mid, ver in (

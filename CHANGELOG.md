@@ -13,6 +13,95 @@ migration, a changed default, is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-10-25
+
+### Upgrade notes
+- **Accept Edits is now Auto, and Default is now Ask.** Ask works as Default did. In Auto the engine reviews all but
+  ordinary work. New chats start in Auto or your last pick for the agent, and `otodock` on a paired computer in Auto.
+- **Paired computers get OtoDock 0.5.158 and Codex 0.163.0 at reconnect.** Until then, moved chats keep only a summary.
+  A Windows one on Python 3.10 loses its tray icon and its Pause. Install Python 3.11 or later and pair it again.
+- **Editors never run a chat on an admin machine.** Their message moves it to the OtoDock platform or their computer.
+- **Blender's code tool no longer asks on every call.** It runs unasked where a computer's App connectors grant is on.
+- **Automatic language detection is on** for dictation set to Automatic and for routes made since 1.8.0. Older routes
+  need it turned on in Setup, Phone. While it decides, for up to 20 seconds, each dictation or call runs one or two
+  extra speech streams. Your provider bills them.
+- **Upgraded installs keep a 60 or 180 second dictation limit.** The extra streams count toward it. New ones get 300.
+- **Chats idle for 180 days lose their working files on paired computers too,** and continue from their history. To keep
+  the files, turn this off before upgrading in Setup, System Settings, Storage and Retention.
+- **Outside services need public DNS answers.** Private or fake ones stop the catalogs, push notifications, usage
+  checks, Microsoft sign-in and Twilio. Set `HTTPS_PROXY` in `.env`, or `config.env` from source, to a proxy that looks
+  names up itself.
+- **Four new optional settings** in `config.env.example`: `HTTPS_PROXY`, `NO_PROXY`, `COLLABORA_SSL_TERMINATION` and
+  `WOPI_ACCEPT_UNSIGNED`. The last keeps your own Collabora working until it has its key. Delete
+  `COLLABORA_FRAME_ANCESTORS`: nothing reads it now.
+- **The document editor moves to Collabora 26.04,** which needs Docker Engine 26 and Compose 2.26 or later. `upgrade.sh`
+  checks both and stops before any change. By hand, follow the [upgrading guide][1.9.0-upgrading], and on https set
+  `COLLABORA_SSL_TERMINATION=true` in `.env` first.
+- **A `docker-compose.override.yml` that pins an older Collabora,** or replaces its `entrypoint` or `extra_params`,
+  breaks the editor. Remove those lines first.
+- **Node 26 and pnpm 12** come with the upgrade. Compiled Node modules in an agent's project need `npm rebuild` once.
+- **OtoDock refuses to start when its agents' sandbox cannot run.** It needs `/dev/net/tun`, which Docker installs have
+  unless you changed the proxy's `devices` or `security_opt` lines. On a native install, run `sudo modprobe tun` and
+  list `tun` in a file under `/etc/modules-load.d/`.
+- **A Meeting Rooms limit of 0 now turns meetings off.** It used to mean four. Clear the field to keep four.
+- **Apps built on OtoDock's styles take the new look.** If one looks wrong, ask the agent that built it.
+- **Going back to 1.8 signs everyone out,** and two-factor is asked again.
+
+### Added
+- **The Android app** comes to Google Play after this release. Notifications and alarms reach your phone, and agents can
+  ask where you are once you allow it.
+- **Choose where a chat runs:** the OtoDock platform or your paired computers, and for admins an admin machine. The icon
+  beside the model shows it. Move a chat later, or ask the agent to.
+- **Tasks and delegated work on your paired computers.** When that computer is offline, the run goes where the agent
+  usually runs and says so.
+- **Plans on Codex.** A Codex plan ends with buttons to implement it in Auto or Ask, edit it or reject it.
+- **GitHub Apps.** Use your admin's GitHub App, or OtoDock's with hosted sign-in. A manager picks what the agent's own
+  GitHub account reaches, or makes it read only. Each person picks for their own chats. Needs GitHub MCP 2.1.0.
+- **An admin command line for the day nobody can sign in.** `otodock-admin.sh` resets a password, turns off a lost
+  authenticator and prints support information. On Docker, put your release's copy from GitHub in the install folder.
+- **Report a reply.** A flag under each agent reply sends it to Admin, Reports, never to OtoDock.
+
+### Changed
+- **A new look.** A new logo, font and dark theme, with clearer colours and plainer words. Settings share one layout,
+  with long explanations behind a small info button. A setting that saves at once shows Saved beside it.
+- **Tools follow their own labels.** One marked as only reading runs without asking, as does a tool a computer's owner
+  granted. Ask asks for the others. Auto runs one whose changes can be undone and reviews the rest. Six OtoDock tools,
+  like changing a department, ask in every mode.
+- **Shared chats on your own computer.** On a Shared only agent, a member can move a shared chat to their computer.
+  Others can only read it there. The agent's accounts are never copied to it.
+- **Language detection follows the speech.** Where the speech service scores its words, the clearer words decide, so an
+  accent no longer switches the language. List only the languages your callers speak, under Setup, Phone.
+- **SSH hosts follow the agent's roles.** On the server, its managers and editors can use the hosts an admin added.
+- **Apps your agents build match OtoDock's look,** or your client's brand when you ask.
+- **Every engine shows its progress.** Codex sums up its thinking, and the chat says Working while nothing new shows.
+- **Dialogs work with the keyboard,** and every refused or failed action says why.
+- **If an upgrade fails before the new release starts,** `upgrade.sh` puts the old release back and says what failed.
+
+### Fixed
+- **Resume.** When a reply ends early, Resume asks the agent to carry on instead of sending your message again.
+- **Chats.** A reply no longer splits around background work or a meeting's start. A question answered in one tab closes
+  in the others. A long reply survives a restart, and a chat survives a slow or dropped computer.
+- **Phone calls and dictation.** Calls catch Greek words they used to miss. Long dictation keeps every word, and a slow
+  connection says so. A call ends with a short goodbye.
+- **Also fixed:** a save never overwrites a file a paired computer is still writing. It goes to the Recover bin. A
+  crashed tool container shows as stopped. The terminal no longer repeats autocorrected text.
+
+### Security
+- **A person's Codex task, meeting or call acts as that person.** It used to act as the agent.
+- **Agents cannot wipe the root or a home folder,** however it is written. rsync to other computers works again.
+- **The bundled editor opens a document only for the person signed in.** A link from its log opens nothing.
+- **Calls to outside services go only to the address OtoDock checked,** even if DNS changes.
+- **MCP servers can no longer fetch your GitHub token.** Only git and gh in the agent's shell can.
+- **A Codex chat's first command runs inside Codex's own sandbox again.** From 1.7.1 to 1.8.1 only OtoDock's held it.
+- **A sign-in link or token made for one purpose is refused elsewhere.** Older ones work until they expire.
+- **Tasks and triggers that run as the agent reach only its shared files.** One that wrote a person's files must run as
+  that person. One that changed the agent's settings needs a creator who manages it.
+- **Direct LLM chats offer only the tools the person may use.**
+- **A failing app shows its visitors a short error,** never its code.
+- **The libraries behind images, certificates and web requests are updated** to close published vulnerabilities.
+
+[1.9.0-upgrading]: https://docs.otodock.io/administration/upgrading#notes-for-1-9-0
+
 ## [1.8.1] - 2026-10-14
 
 ### Upgrade notes
@@ -24,196 +113,181 @@ migration, a changed default, is called out explicitly under its version.
 
 ## [1.8.0] - 2026-10-13
 
+
+
 ### Upgrade notes
-- **Claude Code 2.1.296, Codex 0.162.1, satellite 0.5.147.** Paired machines update at
-  reconnect, which ends their running turns. Haiku 4.5 pins move to Haiku 5.5 at boot, and
-  a Codex terminal's worktrees land in your own folder.
-- **Cartesia speech defaults to `sonic-3.6`,** a retired id follows it, both providers
-  voice every language, your picks and voices stay.
-- **Accounts connect from the address in `DASHBOARD_PUBLIC_URL`.** A connect started
-  elsewhere is refused with the address to use: set that key.
-- **Catalog MCP updates wait seven days after a release** (Update applies at once), config
-  defaults apply until you save a value, git MCPs at a pinned commit update weekly, the
-  Docker tool filter works, PyPI takes extras.
-- **An older server refuses a database a newer release migrated**
-  (`OTODOCK_ALLOW_NEWER_DATABASE` overrides), a yes/no setting written 1, yes or on counts
-  as on, another word stops the start, and backups now hold the tree.
-- **Proxy log lines name `otodock`,** not `claude-proxy`, and `MAX_PARALLEL_SPAWNS` 0 on a
-  delegation MCP allows no workers: clear it for four.
+
+- **Claude Code 2.1.296, Codex 0.162.1 and OtoDock 0.5.147 on paired machines.** Paired
+  machines update when they reconnect. Turns running on them end. Agents pinned to Haiku
+  4.5 move to Haiku 5.5 at boot.
+- **Cartesia speech uses the sonic-3.6 model.** A retired model id moves to it. Both
+  speech providers now voice every language. Your voice picks stay.
+- **Connecting an account needs `DASHBOARD_PUBLIC_URL`.** Set it to the address people
+  use for the dashboard. A connect started from another address is refused and tells you
+  the address to use.
+- **Catalog MCP updates wait seven days after a release.** The Update button still
+  applies at once. An MCP's default settings apply until you save your own value.
+- **An older server refuses a database a newer release already upgraded.**
+  `OTODOCK_ALLOW_NEWER_DATABASE` overrides that. A yes or no setting in the config
+  accepts 1, yes or on. Any other word stops the start.
+- **Log lines from the server are named `otodock`,** no longer `claude-proxy`.
+  `MAX_PARALLEL_SPAWNS` set to 0 on a delegation MCP now allows no workers. Clear it to
+  get the default of four.
 
 ### Added
-- **Calls end and transfer by tool:** `end_call`, `transfer_call` to colleagues and, on
-  another agent's call, `ask_initiating_agent`. The default call prompts say so, a prompt
-  you never edited takes the new text, and the AMI block keeps `call`.
-- **Calls can follow the caller's language.** A route option identifies it on the first
-  words and switches the voice, the route form keeps rare fields under Advanced and can
-  pin one voice, and dictation gains an Automatic language.
-- **A call placed from your chat runs inside it.** On a route tied to you the person's
-  words arrive as messages, the agent speaks back, then the chat resumes.
-- **Pictures and files an MCP returns reach the chat,** saved in your workspace and shown
-  with the result's text. MCP results show their text on Claude again.
+
+- **An agent can end a call or transfer it to a colleague.** On a call another agent
+  started, it can also ask that agent. The default call prompts mention the new tools. A
+  prompt you never edited takes the new text.
+- **Calls can follow the caller's language.** A route can identify it from the first
+  words and switch the voice. Rare route fields sit under Advanced. A route can pin one
+  voice. Dictation gains an Automatic language.
+- **A call placed from your chat runs inside it.** On a route tied to you, the person's
+  words arrive as messages and the agent speaks back. The chat resumes when the call
+  ends.
+- **Pictures and files an MCP returns reach the chat.** They are saved in your workspace
+  and shown with the result. MCP results show their text on Claude again.
 - **Back up and restore the whole install by script.** One dated folder holds the
-  database, env, agents, SSH keys and accounts, restore refuses a newer one, and the
-  installer checks the free disk before it pulls images.
-- **Admins see the version and new releases:** a daily check (off with
-  `OTODOCK_RELEASE_CHECK`) names a newer release, and a dialog shows what is new.
-- **Folders upload whole,** dropped or picked, in the workspace and the chat.
-- **An outbound call can ask for a PIN.** On a route tied to you the person who answers
-  enters it before the agent speaks, and wrong codes end the call. A switch saves a call's
-  outgoing audio (WAV, ten kept), never the caller's.
-- **Claude Haiku 5.5** on Claude Code and Direct LLM: 1M context, adaptive thinking, a
-  twentieth of Sonnet's price up to 100K-token prompts, five times that above. GPT-5.6
-  Terra and GPT-6 Luna get a 1.05M window on Direct LLM, and prompts past 272K tokens cost
-  OpenAI's long-context rate on both engines.
+  database, the settings, the agents, the SSH keys and the accounts. A restore refuses a
+  newer backup. The installer checks the free disk before it pulls images.
+- **Admins see the version and new releases.** A daily check names a newer release. A
+  dialog shows what is new after an update. `OTODOCK_RELEASE_CHECK` turns the check off.
+- **Folders upload whole,** dropped or picked, in the workspace and in the chat.
+- **An outbound call can ask for a PIN.** The person who answers enters it before the
+  agent speaks. Wrong codes end the call. A switch saves a call's outgoing audio, ten
+  files kept, never the caller's voice.
+- **Claude Haiku 5.5** on Claude Code and Direct LLM. A 1M context and adaptive thinking
+  at a twentieth of Sonnet's price. GPT-5.6 Terra and GPT-6 Luna get a 1.05M window on
+  Direct LLM. Prompts past 272K tokens cost OpenAI's long-context rate.
 
 ### Fixed
-- **Paired machines sync safely again.** Windows machines send files back (broken since
-  1.7.1) and files the bug dropped return once the machine updates, a file a machine
-  cannot read never counts as deleted, and agents made there validate when written.
-- **Calls repeat nothing and lose nothing.** A first call keeps its start, a transfer
-  survives the hangup, Greek dictation shows at once, an unserved call hears an apology,
-  the log says who hung up, and a call on a Codex agent with MCP credentials starts.
-- **Messages you send are kept, in order.** Sends typed while a chat gets ready go out
-  after its first message, and voice, phone and meeting turns wait.
-- **Delegated workers report when done.** A run waits for its background work, a stuck
-  permission ends in ten minutes, and a Stop ends the run at once, reported as stopped.
-- **Checks that cannot decide refuse.** A task run or call lists no phone chats, a
-  delegation trusts only its token, a password change ends cached checks.
-- **The dashboard is steadier.** Fields keep their size on phones, the map shows only what
-  you may see, a document saves at once and reloads after idling, a waiting permission
-  card pings you, and the file browser shows synced and uploaded files.
-- **Sessions follow what you set up.** Claude and Codex read each repository's instruction
-  file, a retired model runs on its successor, task runs see the time.
-- **Also fixed:** the recover bin survives an upgrade on its own volume, a cut-off
-  satellite update no longer reads rolled back, Sonnet 5.5 cache reads cost $0.10, a paste
-  from Word, Excel or LibreOffice keeps its text, and a sandbox probe the host never
-  answers no longer hangs the start.
+
+- **Paired machines sync safely again.** Windows machines send files back, broken since
+  1.7.1. Files the bug dropped return once the machine updates. A file a machine cannot
+  read never counts as deleted.
+- **Calls repeat nothing and lose nothing.** A first call keeps its start. A transfer
+  survives the hangup. Greek dictation shows at once. An unserved call hears an apology.
+  The log says who hung up.
+- **Messages you send are kept, in order.** Messages typed while a chat gets ready go
+  out after its first message. Voice, phone and meeting turns wait their turn.
+- **Delegated workers report when done.** A run waits for its background work. A stuck
+  permission ends in ten minutes. A Stop ends the run at once and reports it as stopped.
+- **The dashboard is steadier.** Fields keep their size on phones. The map shows only
+  what you may see. A document saves at once and reloads after idling. A waiting
+  permission card pings you. The file browser shows synced and uploaded files.
+- **Sessions follow what you set up.** Claude and Codex read each repository's
+  instruction file. A retired model runs on its successor. Task runs see the time.
+- **Also fixed:** a paste from Word, Excel or LibreOffice keeps its text. Sonnet 5.5
+  cache reads cost $0.10. The recover bin survives an upgrade.
 
 ### Security
-- **GitHub tokens leave the agent's environment** ([GHSA-9m79-q4pv-8hfj][1.8.0-ghsa],
-  thanks to @jourasharsy). git and gh fetch the account's token per command, and a
-  disconnected account stops on paired machines too.
-- **A session cannot change what judges its tools:** its hook files are read-only in the
-  sandbox, the floor refuses `rm -rf / x` on every engine and mode, a `/sys` write asks
-  instead over `ssh` and on a full-access machine, the pool account's claude.ai connectors
-  no longer load, and a permission hook that cannot run denies the call.
+
+- **GitHub tokens leave the agent's environment.** `git` and `gh` fetch the account's
+  token per command. A disconnected account stops working on paired machines too.
+  [GHSA-9m79-q4pv-8hfj][1.8.0-ghsa], thanks to @jourasharsy.
+- **A file from a paired machine lands only where the person may write.** A document
+  opened from a person's own machine is edited by that person only.
+  [GHSA-6vfw-92r2-jw83][1.8.0-ghsa-files].
+- **An agent cannot change the rules that judge its tools.** The command `rm -rf /` is
+  refused on every engine and in every mode. A permission check that cannot run denies
+  the call.
+- **Release images carry a signed provenance and an SBOM.** Each image is booted before
+  its tag is written. `gh attestation verify` checks them. SECURITY.md explains how.
+- **Sign-ins are single-use.** A 2FA code works once, across restarts. A double sign-in
+  opens one session. An account connect finishes in the browser where it started.
+- **Web requests the server makes go to the address it checked.** Webhooks, app traffic,
+  event lookups and push messages resolve a host once and only to public addresses.
+- **Document tokens are narrower.** A token opens only its own document. The editor
+  refuses a sign-in that was signed out everywhere or is due a new password.
 - **The file tools take cairosvg 2.9.1** (CVE-2026-107378).
-- **Showing, sending, saving or editing a file keeps to the session's role and person.**
-- **Release images carry a signed provenance and an SBOM**, and each is booted before its
-  tag is written. `gh attestation verify` checks them (SECURITY.md).
-- **Sign-ins are single-use:** a 2FA code is good once, restarts too, a double sign-in
-  opens one session, and an account connect finishes in its own browser.
-- **Outbound calls reach the address they checked.** App egress, webhooks, event lookups
-  and Web Push resolve a host once, public only, an egress proxy kept.
-- **Document tokens are narrower.** A token opens only its own push's document, and the
-  editor refuses a sign-in signed out everywhere or due a new password.
 
 [1.8.0-ghsa]: https://github.com/OtoDock/oto-dock/security/advisories/GHSA-9m79-q4pv-8hfj
+[1.8.0-ghsa-files]: https://github.com/OtoDock/oto-dock/security/advisories/GHSA-6vfw-92r2-jw83
 
 ## [1.7.1] — 2026-10-07
 
+
+
+### Upgrade notes
+
+- **Enter adds a new line in the chat box.** Shift+Enter, Ctrl+Enter or the Send button
+  sends the message. On a phone or tablet the Send button sends.
+- **App shares made before 1.7.1 wait in "Shared with you".** Accept them once more.
+- **Paired machines update their OtoDock software during the upgrade.** Turns running on
+  them end. The document editor's container is recreated once.
+- **A new `JWT_SECRET` under 32 characters is refused.** One already in use only warns.
+  `CREDENTIAL_ENCRYPTION_KEY` now works on Docker installs too. Old secrets still open.
+- **Behind a reverse proxy, a banner tells you the `TRUSTED_PROXY` value to set.** The
+  installer tells you too.
+
 ### Added
-- **Share an app with a person, an agent or a department** at a role you pick;
-  "Shared with you" in the notifications panel replaces the Agents page strip
-  (earlier app shares wait there to be accepted, one migration). An agent an app
-  is placed in can call what it offers, and an app can keep each viewer's data.
-- **Documents open in a pane beside the chat**, one tab per document the agent
-  delivers with every version delivered in that chat (Live first) and a card per
-  delivery; it opens itself when a turn delivers one, floating on a phone.
-- **Hosted MCP servers sign in with OAuth.** The install registers itself with
-  the vendor (Forget undoes it) or uses an admin's own app when the server takes
-  one; the token is added in transit and never written into a session's files.
-- Admins accept an MCP's move to a new catalog source on the MCP Servers page; a
-  source that changed quietly is flagged, and settings, credentials and
-  assignments stay. An MCP-authoring skill checks a package (editors and up).
-- A worker's result files land in the delegating agent's workspace, a result or
-  wake-up that stops to ask you in a chat nobody watches notifies you, and
-  admins list and delete removed people's archives (kept 180 days by default).
+
+- **Share an app with a person, an agent or a department.** You pick their role. They
+  accept it from "Shared with you" in the notifications panel. Agents can use the apps
+  placed in them.
+- **Documents open in a pane beside the chat.** One tab per document. Every version the
+  agent delivered in that chat is there. The pane opens by itself when a turn delivers a
+  document.
+- **MCP servers hosted by a vendor sign in with OAuth.** You sign in once in the
+  dashboard. The token is added on the way to the vendor. It is never written to a
+  session's files.
+- **An MCP can move to a new catalog source.** Admins accept the move on the MCP Servers
+  page. Settings, credentials and assignments are kept.
+- **A delegated worker hands files back** to the workspace of the agent that asked. If
+  the worker stops to ask a question in a chat nobody is watching, you get a
+  notification.
 
 ### Changed
-- **Enter adds a line in the chat box.** Shift+Enter, Ctrl+Enter or Send sends, and
-  on a phone or tablet Send does, now also during a turn. A paste never sends, the
-  box no longer zooms an iPhone, and it shrinks to four lines when you leave it.
-- **Claude Code 2.1.289, Codex 0.160.0, satellite 0.5.138** in the images and on
-  paired machines at reconnect (npm 12 too); a satellite update ends that
-  machine's running turns. Headless Claude stops a background command at 30 min.
-- **Sonnet 5.5 and GPT-6.1 Sol replace Sonnet 5 and GPT-6 Sol**, and pinned ones
-  move at boot. Anthropic chat titles use Sonnet 5.5, about twice Haiku's cost.
-- Prompts wait up to a day (3 on the direct engine, paired machines too), tool calls
-  outlast a 2-minute restart, workers switch model, limited accounts wait for reset.
-- Idle terminals end on time (one waiting for you stays a day), the session cap
-  closes only what it must, and no burst, refresh or long history stalls a chat.
-- SSH tools reach editors and up only, and a Shared-only agent takes editors and
-  managers only (assignments kept and marked; the switch names who loses one).
-- Apps shared with you: Remove for me removes a share you accepted, placed apps
-  carry a teal border, a server app's unpin reads Stop app, Admin → Shares lists
-  every share, revoked or declined ones go in 30 days.
-- Webhooks accept up to 25 MB from GitHub and API-key senders (2 MB otherwise),
-  refusals show on the subscription, and vendor API calls refuse private hosts.
-- The Local Browser reaches local services on its site list, its run-code tool
-  follows the chat's mode, and its saved token serves allowed unattended runs.
-- A hung MCP install rolls back, Python tools prefer prebuilt packages, a reinstall
-  keeps saved data, and a remote task or meeting removes no MCP it leaves out.
-- A copy stops at 100,000 entries or 4 GB (configurable) and never takes a whole
-  top folder; moved tasks, triggers and notifications show where they came from.
-- A banner and the installer name the `TRUSTED_PROXY` an untrusted proxy needs.
+
+- **Claude Code 2.1.289, Codex 0.160.0 and OtoDock 0.5.138 on paired machines.** Paired
+  machines update when they reconnect. A background command in a scheduled task stops
+  after 30 minutes.
+- **Sonnet 5.5 and GPT-6.1 Sol replace Sonnet 5 and GPT-6 Sol.** Agents pinned to the
+  old ones move over at boot. Chat titles on Anthropic use Sonnet 5.5.
+- When an agent asks you a question, it waits up to a day for your answer. A server
+  restart under two minutes does not break a running tool call.
+- Chats stay fast with a long history, many open tabs or a burst of messages.
+- SSH tools need the editor role or above. Existing assignments are kept and marked.
+- Shared apps: you can remove a share you accepted. Placed apps have a teal border.
+  Admins see every share on the Shares page.
+- Webhooks from GitHub and API-key senders may be up to 25 MB.
+- The Local Browser can open local services you add to its site list. An MCP install
+  that hangs is rolled back.
 
 ### Fixed
-- Saving a document from the chat keeps the edit when Collabora's background save
-  hangs (the upgrade recreates the container) or editing ends on a phone, a save
-  after another write asks first, and a phone's Fullscreen keeps the cursor.
-- **Documents on a remote machine.** The pane shows the stored file after the
-  agent's write even while another device has it open, a write that could not
-  reach the machine is not undone by the next read, and your edits are saved
-  10 s after the last keystroke, on minimize, hide and send, saved as you.
-- **Messages typed while the agent works wait in the chat** (one new table):
-  every tab and a teammate on a shared chat see them, they go out in order after
-  a chat switch, a closed tab, a restart or a machine's reconnect, and a failed
-  or stopped turn hands them back. A chat still answering opens in one paint.
-- **A turn that cannot finish ends with a card that says why** (a decline, the
-  usage limit, an engine error or exit, 10 minutes of silence with no tool
-  running, a lost machine), with Send again where it can help; check-backs, job
-  reviews and delegated results are their own turn, ending at the answer.
-- **Remote machines on a slow uplink or a blip.** Large files no longer drop the
-  connection, transfers pass 30 s, and turns and sent messages outlast a blip.
-- Meetings refuse an agent you hold below editor, keep a removed agent out and
-  end when the moderator leaves; bottom-level agents know their department.
-- After a restart a paired machine's chat keeps its session (idle Codex too),
-  tools and mode, sessions closed offline stay closed, results stored meanwhile
-  go to the person who asked, and the satellite survives a memory kill.
-- The Android app opens servers with an underscore, IPv6 or international name, no
-  longer reloads during sign-in, and can pick a zip to install.
-- A refused chat says why once, a demoted manager's accounts are not lent, first
-  boot gives the owner automations of accounts deleted before 1.7, and smaller
-  fixes cover HTML conversion, IPv6 sandboxes, big uploads, restore and backups.
+
+- **Documents keep your edits.** A save is no longer lost when the editor's background
+  save hangs. Closing the editor on a phone keeps the save too. A document on a remote
+  machine is saved 10 seconds after your last keystroke.
+- **Messages typed while the agent works wait in the chat.** Every tab and teammate sees
+  them. They go out in order after a switch, a restart or a reconnect.
+- **A turn that cannot finish ends with a card that says why.** A decline, the usage
+  limit, an engine error, 10 minutes of silence or a lost machine. Where it helps, a
+  Send again button is there.
+- **Paired machines on a slow or flaky connection** keep large transfers and running
+  turns. After a server restart, a paired machine's chat keeps its session.
+- The Android app opens servers with an underscore, IPv6 or an international name. It
+  stays put during sign-in.
+- Smaller fixes cover meetings, refused chats, HTML conversion, big uploads, restore and
+  backups.
 
 ### Security
-- SSO verifies the ID token and refuses an unverified email already in use;
-  sign-in starts are capped per network address (60 in 5 minutes, reloads not
-  counted), and a success no longer clears that address's other failures.
-- A session token works only while its session runs and never for admin pages.
-  Signing out ends one sign-in; a password change, a lowered role or an admin's
-  sign-out everywhere ends them all and their push devices. Idle tabs re-check.
-- `CREDENTIAL_ENCRYPTION_KEY` works on Docker installs (old secrets still open),
-  a new `JWT_SECRET` under 32 characters is refused (one in use warns), tokens
-  leave page URLs and logs, and the server log is private.
-- Webhook, caller and visitor input is treated as data in prompts, MCP prompts
-  carry no credentials, meeting agents see only their own thinking, and Claude
-  Code plugins, Claude Mods and claude.ai Artifact tools stay out of sessions.
-- Writes from another site are refused even when signed in, disallowed scripts
-  are reported, anonymous calls to member-only pages get 401 before their body
-  is read, and an untrusted proxy's headers bypass no webhook or app limit.
-- New phone PINs take 6 digits (older ones still work), lockouts survive a
-  restart, plain http to the proxy or the phone service is refused online, and
-  a call's conversation is read-only on the dashboard, for managers too.
-- App hooks pause after failed signatures, an app's local step runs only its
-  approved script, conversions load no linked pictures, a sandbox mounts only
-  folders it checked, and plain-http machines get no update or uninstall.
-- A pushed document's editor token reaches only the person whose turn delivered it,
-  a file sent to another agent never writes through a planted link, and the
-  background-output read rule admits only the session's own output.
-- PyJWT 2.15.1, urllib3 2.8.0, multidict 6.9.1, Capacitor 8.5.2 and pnpm 11.28.2
-  fix advisories, as do Python 3.13.16, Node 24.21.0 and Postgres 16.15 (data kept).
+
+- **A file sent to another agent can no longer write outside that agent's workspace
+  through a planted link.** [GHSA-jfp5-m3vx-9272][1.7.1-ghsa], thanks to @zaara2004.
+- Single sign-on checks the identity token. It refuses an unverified email that another
+  account already uses. Sign-in attempts are limited per address.
+- A sign-in ends when the password changes or the role is lowered. Tokens no longer
+  appear in page URLs or logs.
+- Text that arrives from webhooks, phone callers and visitors is handed to the agent as
+  data, never as instructions.
+- A page on another website cannot make changes in your OtoDock while you are signed in.
+- New phone PINs have 6 digits. Lockouts survive a restart. Plain http from the internet
+  to the proxy or the phone service is refused.
+- PyJWT 2.15.1, urllib3 2.8.0, multidict 6.9.1, Capacitor 8.5.2 and pnpm 11.28.2 fix
+  advisories. So do Python 3.13.16, Node 24.21.0 and Postgres 16.15.
+
+[1.7.1-ghsa]: https://github.com/OtoDock/oto-dock/security/advisories/GHSA-jfp5-m3vx-9272
 
 ## [1.7.0] — 2026-09-29
 
@@ -1056,7 +1130,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.8.1...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/OtoDock/oto-dock/compare/v1.8.1...v1.9.0
 [1.8.1]: https://github.com/OtoDock/oto-dock/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/OtoDock/oto-dock/compare/v1.7.1...v1.8.0
 [1.7.1]: https://github.com/OtoDock/oto-dock/compare/v1.7.0...v1.7.1

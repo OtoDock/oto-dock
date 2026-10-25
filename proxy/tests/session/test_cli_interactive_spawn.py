@@ -218,3 +218,16 @@ async def test_start_session_interactive_routes_to_register(monkeypatch, tmp_pat
     assert "--model" in argv and "claude-opus-5" in argv
     assert "--session-id" in argv
     assert captured["env"].get("TERM") == "xterm-256color"
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+def test_the_shell_gets_a_command_line_token_mirroring_its_session_token(interactive):
+    """Headless and the TUI alike: ``OTO_CLI_TOKEN`` names the same session,
+    person and life as the final ``PROXY_API_KEY`` the hooks present."""
+    from auth.session_token import create_session_token, validate_cli_token
+    s = _mk(interactive)
+    s.credential_env = {"PROXY_API_KEY": create_session_token(s.session_id, "agent", "user-x")}
+    _cmd, env, _cwd = s.build_spawn_command()
+    cli = validate_cli_token(env["OTO_CLI_TOKEN"])
+    assert cli["sid"] == s.session_id and cli["user_sub"] == "user-x"
+    assert env["OTO_CLI_TOKEN"] != env["PROXY_API_KEY"]

@@ -39,7 +39,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import cast
 
 
 def self_hash() -> str:
@@ -162,11 +163,19 @@ def approval_to_tool(
                 "reason": params.get("reason") or "",
                 "approval_id": params.get("approvalId") or "",
             }
+        # The command as the model wrote it (the PreToolUse hook saw that
+        # text): the platform matches it with the person's Allow on the
+        # hook's card for the same call, so a sandbox crossing is not asked
+        # twice.
+        raw = params.get("command")
+        if isinstance(raw, list):  # legacy execCommandApproval = Array<string>
+            raw = " ".join(str(c) for c in raw)
+        raw = _unwrap_bash_lc(raw or "")
         # Windows-shell invocations (powershell/pwsh/cmd /c) route to the platform
         # PowerShell checker; everything else is a POSIX/bash command.
         if _is_windows_shell_wrapper(cmd):
-            return "PowerShell", {"command": cmd, "cwd": cwd}
-        return "Bash", {"command": cmd, "cwd": cwd}
+            return "PowerShell", {"command": cmd, "cwd": cwd, "_codex_command": raw}
+        return "Bash", {"command": cmd, "cwd": cwd, "_codex_command": raw}
 
     if method in _PATCH_APPROVALS:
         paths: list[str] = []
@@ -231,78 +240,50 @@ def build_response(method: str, params: dict, allow: bool) -> dict:
 # ─────────────────────────────────────────────────────────────────────────
 
 
-# The approval policy that makes Codex ask for EVERY shell command its own
-# trusted list does not cover and for every patch (``AskForApproval::
-# UnlessTrusted``). Accepted on the app-server's ``thread/start``,
-# ``thread/resume`` and ``turn/start`` (its integration tests send it at
-# 0.153.4 and 0.154.0) but retired from config files and the CLI flag in
-# 0.149 — so a session that sends it must be ready for a rejection and fall
-# back (``untrusted_fallback``); the bump checklist probes it.
-UNTRUSTED_POLICY = "untrusted"
-UNTRUSTED_FALLBACK = "on-request"
-
-#: The platform modes in which nothing asks a person. An attended chat runs
-#: them under ``never``: the bridge never fires and its PreToolUse hook judges
-#: every call (HOOKS.md "Attended Codex chats").
-NO_PROMPT_MODES = frozenset({"dontAsk", "auto"})
+#: The platform mode that runs on Codex's own reviewer (``autoReview``, the
+#: platform's Auto): the reviewer judges what crosses the sandbox. A copy of
+#: the platform's word: this module is stdlib-only (vendored to the satellite).
+AUTO_REVIEW_MODE = "autoReview"
+#: ``approvalsReviewer``: Codex's own reviewer for Auto, the bridge (a person
+#: through the platform) for every other mode.
+REVIEWER_AUTO = "auto_review"
+REVIEWER_USER = "user"
 
 
 def approval_for_sandbox(sandbox_mode: str) -> str:
-    """The ``approvalPolicy`` of a session nobody answers through the bridge
-    (an unattended app-server session, the interactive TUI), from the
-    resolved ``SandboxMode``.
+    """The ``approvalPolicy`` a resolved ``SandboxMode`` asks for.
 
-    ``danger-full-access`` → ``"never"``: nothing asks, the PreToolUse hook is
-    the gate. ``read-only`` and ``workspace-write`` → ``"on-request"``, so a
-    sandbox escape, an MCP call and Codex's own dangerous-command heuristics
-    fire an approval we route through ``decide_tool_permission``.
+    ``danger-full-access`` → ``"never"``: nothing leaves a sandbox, so nothing
+    asks; the PreToolUse hook judges every call. ``read-only`` and
+    ``workspace-write`` → ``"on-request"``, so a sandbox escape, an MCP call
+    and Codex's own dangerous-command heuristics fire an approval request.
     """
     return "never" if sandbox_mode == "danger-full-access" else "on-request"
 
 
-def approval_policy(permission_mode: str, sandbox_mode: str, *, attended: bool) -> str:
-    """The ``approvalPolicy`` of an app-server session.
-
-    Attended (a dashboard chat — a person answers the bridge): the platform
-    MODE decides, not the sandbox. ``dontAsk`` / ``auto`` → ``"never"``: the
-    bridge never fires and the hook judges every call. Every other mode →
-    ``"untrusted"``: every shell command Codex's trusted list does not cover
-    and every patch become an approval request, so the bridge decides each one
-    exactly as Claude's PreToolUse hook is decided — the read tier runs, edits
-    run in acceptEdits and ask in default, destructive commands ask in both.
-    A machine paired with full access runs default and acceptEdits under
-    ``danger-full-access`` and still asks. An empty ``permission_mode`` (a
-    proxy that ships none) reads the sandbox as before: ``never`` under
-    ``danger-full-access``.
-
-    Unattended: ``approval_for_sandbox``.
-    """
-    if not attended:
-        return approval_for_sandbox(sandbox_mode)
-    if permission_mode:
-        return "never" if permission_mode in NO_PROMPT_MODES else UNTRUSTED_POLICY
-    return "never" if sandbox_mode == "danger-full-access" else UNTRUSTED_POLICY
+def approval_policy(permission_mode: str, sandbox_mode: str) -> str:
+    """The ``approvalPolicy`` of an app-server session: ``on-request`` in Auto
+    (its sandbox crossings go to Codex's reviewer), else what the sandbox asks
+    for (``approval_for_sandbox``). The PreToolUse hook judges every call in
+    every mode; the bridge takes the requests that cross the sandbox."""
+    if permission_mode == AUTO_REVIEW_MODE:
+        return "on-request"
+    return approval_for_sandbox(sandbox_mode)
 
 
-def is_untrusted_policy_rejection(error: Exception | str) -> bool:
-    """Did the app-server refuse a request because of the ``untrusted``
-    approval policy? (The fallback trigger — a future Codex may retire the
-    wire value as it retired the config key.)"""
-    text = str(error).lower()
-    return "untrusted" in text or "unlesstrusted" in text or "approvalpolicy" in text
+def approvals_reviewer(permission_mode: str) -> str:
+    """The ``approvalsReviewer`` for a platform mode: Codex's own reviewer in
+    Auto, the bridge otherwise."""
+    return REVIEWER_AUTO if permission_mode == AUTO_REVIEW_MODE else REVIEWER_USER
 
 
-def untrusted_fallback(sandbox_mode: str) -> str:
-    """The policy an attended chat runs once the daemon refused ``untrusted``.
-
-    ``on-request`` (a sandbox escape, an MCP call and Codex's own heuristics
-    still reach the bridge), except under ``danger-full-access`` (a machine
-    paired with full access, default or acceptEdits), where no command leaves
-    a sandbox and ``on-request`` would let every one run with no judge:
-    ``never`` there, so the PreToolUse hook judges every call with the
-    session's stored mode and raises the person's cards itself.
-    """
-    return "never" if sandbox_mode == "danger-full-access" else UNTRUSTED_FALLBACK
+def tui_reviewer_flags(permission_mode: str) -> list[str]:
+    """The Codex terminal's reviewer switch for a platform mode: Auto starts
+    it with Codex's own reviewer (its ``-a on-request`` requests go to it);
+    every other mode keeps the terminal's own prompt."""
+    if permission_mode != AUTO_REVIEW_MODE:
+        return []
+    return ["-c", f'approvals_reviewer="{REVIEWER_AUTO}"']
 
 
 def build_sandbox_policy(sandbox_mode: str, writable_root: str = "") -> dict:
@@ -360,7 +341,9 @@ async def _handle_mcp_elicitation(params: dict, decide: DecideFn, log) -> dict:
     server = params.get("serverName") or ""
     tool = _parse_elicitation_tool(params.get("message") or "")
     mcp_tool = f"mcp__{server}__{tool}" if tool else f"mcp__{server}__"
-    tool_input = meta.get("tool_params") if isinstance(meta.get("tool_params"), dict) else {}
+    # The kind is "mcp_tool_call" only for a dict meta (above).
+    tool_params = cast("dict", meta).get("tool_params")
+    tool_input = tool_params if isinstance(tool_params, dict) else {}
     decision = await decide(mcp_tool, tool_input)
     allow = (decision or {}).get("decision") == "allow"
     if log:
@@ -368,7 +351,7 @@ async def _handle_mcp_elicitation(params: dict, decide: DecideFn, log) -> dict:
     return {"action": "accept" if allow else "decline", "content": None, "_meta": None}
 
 
-async def _handle_request_user_input(params: dict, ask: "AskFn | None", log) -> dict:
+async def _handle_request_user_input(params: dict, ask: AskFn | None, log) -> dict:
     """Answer ``item/tool/requestUserInput`` (the AskUserQuestion analogue).
 
     Codex holds the turn OPEN on this server→client request (core waits
@@ -384,7 +367,7 @@ async def _handle_request_user_input(params: dict, ask: "AskFn | None", log) -> 
         return {"answers": {}}
     try:
         answers = await ask(questions)
-    except Exception as e:  # noqa: BLE001 — never hang the turn on a surface failure
+    except Exception as e:  # noqa: BLE001  # never hang the turn on a surface failure
         if log:
             log(f"codex request_user_input surface failed ({e}); declining")
         return {"answers": {}}
@@ -411,7 +394,7 @@ def _non_approval_response(method: str, params: dict) -> dict:
 def make_server_request_handler(
     decide: DecideFn,
     *,
-    ask_question: "AskFn | None" = None,
+    ask_question: AskFn | None = None,
     get_item_paths: Callable[[], dict] | None = None,
     log: Callable[[str], None] | None = None,
 ):

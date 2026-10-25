@@ -179,10 +179,19 @@ def test_pty_neutrality_windows_cmd_shim(monkeypatch, tmp_path):
 
 # --- reconcile: verify-first ------------------------------------------------
 
+DID_NOT_RUN = object()   # a probe the machine could not run (no memory, a kill)
+
+
 def _wire_probe(monkeypatch, versions: dict):
-    monkeypatch.setattr(
-        cli_versions, "_probe_version_at", lambda p: versions.get(p, ""),
-    )
+    """``versions``: path → the version its probe prints; ``DID_NOT_RUN``
+    for a probe that gives no verdict; an unlisted path is "absent"."""
+    def _probe(p):
+        v = versions.get(p, "")
+        if v is DID_NOT_RUN:
+            return cli_versions._Probe("", False)
+        return cli_versions._Probe(v, True)
+
+    monkeypatch.setattr(cli_versions, "_probe_version_at", _probe)
 
 
 def test_reconcile_verify_first_heals_stale_config_no_install(
@@ -291,6 +300,104 @@ def test_reconcile_fastpath_reprobes_recorded_paths(tmp_path, monkeypatch):
     versions[old] = "9.9.9"
     cli_versions.reconcile_cli_versions(pins)
     assert cli_versions._verified["claude"]["path"] == fresh
+
+
+def test_a_probe_that_did_not_run_installs_nothing(tmp_path, monkeypatch, caplog):
+    """The 2026-10-10 stall: ``claude --version`` failed for lack of memory,
+    the reconcile read it as "absent" and ran ``npm install`` mid-crisis.
+    A probe with no verdict keeps the recorded binary, installs nothing and
+    leaves the pass unrecorded so the next reconnect tries again."""
+    pinned = _mk(tmp_path / "usrbin")
+    monkeypatch.setenv("PATH", str(tmp_path / "usrbin"))
+    monkeypatch.setattr(cli_versions, "_npm_global_bin_dirs", lambda: [])
+    installs = []
+    monkeypatch.setattr(
+        cli_versions, "_npm_install",
+        lambda pkg, v: installs.append((pkg, v)) or True,
+    )
+    pins = {"claude_code": "2.1.220"}
+    cli_versions.set_pins(pins, {})
+    cli_versions._verified["claude"] = {"path": pinned, "version": "2.1.220"}
+    _wire_probe(monkeypatch, {pinned: DID_NOT_RUN})
+    with caplog.at_level(logging.WARNING, logger="satellite"):
+        cli_versions.reconcile_cli_versions(pins)
+
+    assert installs == []
+    assert cli_versions._verified["claude"]["path"] == pinned
+    assert cli_versions._last_reconciled == {}
+    assert any("did not run" in r.message and pinned in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("outcome", [
+    "timeout", "enomem", "exit-137", "signal", "ntstatus-crash", "win-commit-limit",
+])
+def test_the_probe_tells_a_verdict_from_a_run_that_did_not_finish(monkeypatch, outcome):
+    import errno
+    import subprocess
+    from types import SimpleNamespace
+
+    def _run(cmd, **kwargs):
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(cmd, 15)
+        if outcome == "enomem":
+            raise OSError(errno.ENOMEM, "Cannot allocate memory")
+        if outcome == "win-commit-limit":
+            # Windows: CreateProcess failing on the commitment limit maps to
+            # EINVAL; only the winerror names the moment.
+            exc = OSError(errno.EINVAL, "The paging file is too small for this operation")
+            exc.winerror = 1455
+            raise exc
+        if outcome == "exit-137":
+            return SimpleNamespace(returncode=137, stdout="", stderr="")
+        if outcome == "ntstatus-crash":
+            return SimpleNamespace(returncode=0xC0000005, stdout="", stderr="")
+        return SimpleNamespace(returncode=-9, stdout="", stderr="")
+
+    monkeypatch.setattr(cli_versions.subprocess, "run", _run)
+    assert cli_versions._probe_version_at("/x/claude") == cli_versions._Probe("", False)
+
+
+@pytest.mark.parametrize("outcome, version", [
+    ("enoent", ""), ("eacces", ""), ("stub-exit-1", ""), ("ok", "2.1.220"),
+])
+def test_the_probe_keeps_its_verdict_for_a_binary_that_answered(monkeypatch, outcome, version):
+    """A missing or unrunnable binary and a stub that prints no version
+    (an npm 12 install without scripts) still install: the self-heal."""
+    import errno
+    from types import SimpleNamespace
+
+    def _run(cmd, **kwargs):
+        if outcome == "enoent":
+            raise FileNotFoundError(errno.ENOENT, "No such file")
+        if outcome == "eacces":
+            raise PermissionError(errno.EACCES, "Permission denied")
+        if outcome == "stub-exit-1":
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="2.1.220 (Claude Code)", stderr="")
+
+    monkeypatch.setattr(cli_versions.subprocess, "run", _run)
+    assert cli_versions._probe_version_at("/x/claude") == cli_versions._Probe(version, True)
+
+
+def test_fastpath_treats_a_probe_that_did_not_run_as_no_drift(tmp_path, monkeypatch):
+    old = _mk(tmp_path / "usrbin")
+    monkeypatch.setenv("PATH", str(tmp_path / "usrbin"))
+    monkeypatch.setattr(cli_versions, "_npm_global_bin_dirs", lambda: [])
+    versions = {old: "2.1.220"}
+    _wire_probe(monkeypatch, versions)
+    installs = []
+    monkeypatch.setattr(
+        cli_versions, "_npm_install", lambda pkg, v: installs.append((pkg, v)) or True,
+    )
+    pins = {"claude_code": "2.1.220"}
+    cli_versions.set_pins(pins, {})
+    cli_versions.reconcile_cli_versions(pins)
+    assert cli_versions._last_reconciled == pins
+
+    versions[old] = DID_NOT_RUN
+    cli_versions.reconcile_cli_versions(pins)
+    assert installs == []
+    assert cli_versions._verified["claude"]["path"] == old
 
 
 def test_reconcile_failure_warns_with_candidates(tmp_path, monkeypatch, caplog):

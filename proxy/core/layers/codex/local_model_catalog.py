@@ -8,7 +8,7 @@ entry has ``supports_search_tool``; an unknown slug gets the built-in fallback
 local model receives every MCP server as a ``namespace`` tool on every request
 (T1 capture 2026-09-07: 25 tools, 98 functions, 200 KB; the desktop: 47k-113k
 prompt tokens a turn). ``model_catalog_json = "<abs path>"`` in config.toml
-(0.149.1 through 0.162.1 alike) replaces the bundled catalog with the file's
+(0.149.1 through 0.163.0 alike) replaces the bundled catalog with the file's
 entries (longest slug-prefix match); with an entry for the session's model
 Codex sends its built-ins, ``tool_search`` (searched client-side in Codex) and
 ``web_search`` — 12 tools, 35 KB — and Ollama 0.34+ returns the model's
@@ -25,7 +25,7 @@ EMPTY instructions for an entry without a template, and the legacy top-level
 the fallback sends (T1 capture on 0.149.1: 20,751 chars; since 0.162 the text
 rides as the request's first input item instead of its top-level
 ``instructions`` field; the file is identical from rust-v0.149.1 to
-rust-v0.162.1). Refresh it on every Codex bump against the
+rust-v0.163.0). Refresh it on every Codex bump against the
 file at the new tag (VERSIONS.md "To bump a CLI version"; attribution in
 ``codex_base_instructions.NOTICE``).
 
@@ -53,8 +53,10 @@ from __future__ import annotations
 import functools
 import json
 import logging
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
+
+import psycopg
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +89,7 @@ def catalog_provider_supported(provider: str) -> bool:
 
 def local_model_catalog_entry(model: str, context_window: int = 0) -> dict:
     """The ``ModelInfo`` for ``model``: Codex's fallback entry
-    (``model_info_from_slug``, same shape from 0.149.1 to the pinned 0.162.1) with ``supports_search_tool``
+    (``model_info_from_slug``, same shape from 0.149.1 to the pinned 0.163.0) with ``supports_search_tool``
     on, ``tool_mode`` direct, the model LISTED (an unavailable requested model
     is replaced by the first listed one when the app-server allows a provider
     fallback — an unlisted catalog would resolve to no model at all) and the
@@ -187,7 +189,7 @@ def local_model_rows_json(provider: str) -> str:
         for m in subscription_store.list_models(layer="codex-cli"):
             if (m.get("provider") or "") == (provider or "") and m.get("model_id"):
                 rows.append([m["model_id"], int(m.get("context_window") or 0)])
-    except Exception as e:  # fail-soft: the session's model alone, fallback window
+    except (ImportError, psycopg.Error) as e:  # fail-soft: the session's model alone, fallback window
         logger.debug("codex local model rows lookup failed for %s: %s", provider, e)
     return json.dumps(rows)
 

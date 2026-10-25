@@ -8,7 +8,11 @@ from __future__ import annotations
 import subprocess
 
 from core.sandbox.sandbox import SandboxBuilder
-from tests.execution.test_sandbox import _make_config, _needs_netns, tmp_agents  # noqa: F401
+from tests.execution.test_sandbox import (  # noqa: F401
+    _make_config,
+    _needs_netns,
+    tmp_agents,
+)
 
 _CLAUDE = ".claude"
 _CODEX = ".codex"
@@ -24,7 +28,7 @@ def _hooks_in(d, wrappers=True):
 
 
 def _ro_binds(cmd):
-    return {b: c for a, b, c in zip(cmd, cmd[1:], cmd[2:]) if a == "--ro-bind"}
+    return {b: c for a, b, c in zip(cmd, cmd[1:], cmd[2:], strict=False) if a == "--ro-bind"}
 
 
 def test_a_users_hook_files_are_bound_read_only_over_its_rw_dir(tmp_agents):  # noqa: F811

@@ -1,0 +1,520 @@
+{
+ "chat": {
+  "cache_read": 0,
+  "cache_write": 0,
+  "codex_thread_id": null,
+  "context_max": 0,
+  "context_used": 0,
+  "engine_cost_session_id": "",
+  "engine_cost_total": 0.0,
+  "last_abort_graceful": false,
+  "last_response_at": false,
+  "last_turn_aborted": false,
+  "output_tokens": 0,
+  "permission_mode": "ask",
+  "thread_goal": null,
+  "title_generated": false,
+  "total_cost": 0.0
+ },
+ "events": [
+  [
+   "done",
+   {}
+  ]
+ ],
+ "rows": [],
+ "seams": {
+  "ephemeral": [
+   [
+    [
+     "user-admin"
+    ],
+    {
+     "body": "Allow Bash?",
+     "chat_id": "chat-pc-hooks-unwatched",
+     "mid_turn": true,
+     "title": "a1 needs your input"
+    }
+   ],
+   [
+    [
+     "user-admin"
+    ],
+    {
+     "body": "Delete the keypair file?",
+     "chat_id": "chat-pc-hooks-unwatched",
+     "mid_turn": true,
+     "title": "a1 needs your input"
+    }
+   ]
+  ],
+  "kept": [],
+  "reconciles": [],
+  "relocated": [],
+  "replays": [],
+  "rests": [],
+  "status": [],
+  "titles": [],
+  "tool_starts": []
+ },
+ "trace": [
+  {
+   "blocks": [],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "permission_prompt",
+     "request_id": "req-perm-0001",
+     "tool_input": {
+      "command": "rm -r build"
+     },
+     "tool_name": "Bash"
+    },
+    "session_id": "sid-pc-hooks-unwatched",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-perm-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-perm-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "req-perm-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [],
+    "workflows_forwarded": []
+   },
+   "step": "perm:permission_prompt"
+  },
+  {
+   "blocks": [],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "permission_prompt",
+     "request_id": "req-perm-0001",
+     "tool_input": {
+      "command": "rm -r build"
+     },
+     "tool_name": "Bash"
+    },
+    "session_id": "sid-pc-hooks-unwatched",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-perm-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-perm-0001",
+    "permission_buffer": [
+     "req-question-0001"
+    ],
+    "pinged": [
+     "req-perm-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [],
+    "workflows_forwarded": []
+   },
+   "step": "perm:question_prompt"
+  },
+  {
+   "blocks": [],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks-unwatched",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [],
+    "workflows_forwarded": []
+   },
+   "step": "perm:prompt_retired"
+  },
+  {
+   "blocks": [],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks-unwatched",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-perm-0003"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [],
+    "workflows_forwarded": []
+   },
+   "step": "perm:permission_prompt"
+  },
+  {
+   "blocks": [],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks-unwatched",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-perm-0003"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [],
+    "workflows_forwarded": []
+   },
+   "step": "event:done"
+  }
+ ]
+}

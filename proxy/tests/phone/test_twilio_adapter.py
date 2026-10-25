@@ -13,8 +13,7 @@ import logging
 import httpx
 import pytest
 
-from services.phone.phone_adapters import PhoneAdapterError
-from services.phone.phone_adapters import twilio as twilio_mod
+from services.phone.phone_adapters import PhoneAdapterError, twilio as twilio_mod
 from services.phone.phone_adapters.twilio import (
     TwilioAdapter,
     normalize_did,

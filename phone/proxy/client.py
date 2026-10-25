@@ -134,12 +134,12 @@ class ProxyClient:
             )
             self._ws_connected = True
             self._recv_task = asyncio.create_task(self._recv_loop())
-            logger.info(f"WebSocket connected to proxy at {config.PROXY_WS_HOST_PORT}")
+            logger.info("WebSocket connected to proxy at %s", config.PROXY_WS_HOST_PORT)
             return True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the call learns the proxy is unreachable whatever the connect raised
             self._ws_connected = False
             self.proxy_lost = True
-            logger.warning(f"WebSocket connection failed, the call cannot be served: {e}")
+            logger.warning("WebSocket connection failed, the call cannot be served: %s", e)
             return False
 
     async def _recv_loop(self) -> None:
@@ -167,13 +167,14 @@ class ProxyClient:
                     self._turn_queue.put_nowait(msg)
                 else:
                     logger.debug(
-                        f"Dropping stale frame turn={turn} "
-                        f"(current={self._current_turn}): {msg.get('type')}"
+                        "Dropping stale frame turn=%s "
+                        "(current=%s): %s",
+                        turn, self._current_turn, msg.get('type')
                     )
         except websockets.ConnectionClosed as e:
-            logger.warning(f"WS connection closed: {e}")
-        except Exception as e:
-            logger.error(f"WS receive loop error: {e}")
+            logger.warning("WS connection closed: %s", e)
+        except Exception as e:  # noqa: BLE001  # the receive loop's last line: the call sees the proxy lost
+            logger.error("WS receive loop error: %s", e)
         finally:
             self._ws_connected = False
             closed = {"type": "_closed"}
@@ -187,8 +188,8 @@ class ProxyClient:
                 if handler is not None:
                     try:
                         handler()
-                    except Exception as e:
-                        logger.error(f"proxy lost handler error: {e}")
+                    except Exception as e:  # noqa: BLE001  # the proxy-lost handler is the call's callback, the loop ends anyway
+                        logger.error("proxy lost handler error: %s", e)
 
     def _dispatch_call_control(self, msg: dict) -> None:
         handler = self.on_call_control
@@ -199,8 +200,8 @@ class ProxyClient:
             return
         try:
             handler(msg)
-        except Exception as e:
-            logger.error(f"call control handler error: {e}")
+        except Exception as e:  # noqa: BLE001  # a call-control handler is the call's callback, the socket goes on
+            logger.error("call control handler error: %s", e)
 
     async def send_call_control_result(self, request_id: str, ok: bool, message: str) -> None:
         """Answer one ``call_control`` frame (the tool's result text)."""
@@ -211,8 +212,8 @@ class ProxyClient:
                 "type": "call_control_result",
                 "data": {"request_id": request_id, "ok": bool(ok), "message": message},
             }))
-        except Exception as e:
-            logger.warning(f"WS call control result send failed: {e}")
+        except Exception as e:  # noqa: BLE001  # the proxy socket's send raises by its state and transport
+            logger.warning("WS call control result send failed: %s", e)
 
     def discard_turn(self) -> None:
         """Stop reading the open turn: the line closes as the farewell drains
@@ -265,18 +266,19 @@ class ProxyClient:
             if msg.get("type") == "warmup_ready":
                 self.session_id = msg["data"]["session_id"]
                 logger.info(
-                    f"WS warmup ready: {self.session_id} "
-                    f"(mode={msg['data'].get('llm_mode', self.llm_mode)})"
+                    "WS warmup ready: %s "
+                    "(mode=%s)",
+                    self.session_id, msg['data'].get('llm_mode', self.llm_mode)
                 )
                 return self.session_id
             elif msg.get("type") == "error":
-                logger.warning(f"WS warmup error: {msg['data'].get('message')}")
+                logger.warning("WS warmup error: %s", msg['data'].get('message'))
                 return None
             else:
-                logger.warning(f"WS warmup unexpected response: {msg}")
+                logger.warning("WS warmup unexpected response: %s", msg)
                 return None
-        except Exception as e:
-            logger.warning(f"WS warmup failed: {e}")
+        except Exception as e:  # noqa: BLE001  # a failed warmup reads as none, the first turn warms the session
+            logger.warning("WS warmup failed: %s", e)
             return None
 
     def set_session_id(self, session_id: str) -> None:
@@ -286,7 +288,7 @@ class ProxyClient:
             "role": "assistant",
             "content": f"[//]: # (session:{session_id})",
         })
-        logger.info(f"Session ID injected: {session_id}")
+        logger.info("Session ID injected: %s", session_id)
 
     def mark_spoken(self, char_count: int) -> None:
         """Track how many chars of the last response were played via TTS."""
@@ -313,8 +315,8 @@ class ProxyClient:
             frame["resume"] = True
         try:
             await self._ws.send(json.dumps(frame))
-        except Exception as e:
-            logger.warning(f"WS system note failed: {e}")
+        except Exception as e:  # noqa: BLE001  # the proxy socket's send raises by its state and transport
+            logger.warning("WS system note failed: %s", e)
             return False
         return True
 
@@ -359,10 +361,10 @@ class ProxyClient:
             if system:
                 frame["system"] = True
             await self._ws.send(json.dumps(frame))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the proxy socket's send raises by its state and transport
             # The socket is broken: the receive loop ends it for the
             # pipeline; this turn says nothing.
-            logger.error(f"WS send failed: {e}")
+            logger.error("WS send failed: %s", e)
             self.proxy_lost = True
             return
 
@@ -393,8 +395,9 @@ class ProxyClient:
                 # only on completion, interactive row feeds land post-hoc —
                 # so tool_end is the only boundary they ever send; without it
                 # the pre-tool sentence sits unfinalized in the TTS context
-                # until the turn ends. Repeats are safe: an empty text buffer
-                # makes the signal a no-op downstream.
+                # until the turn ends. Repeats are safe: an empty buffer with
+                # nothing sent since the last flush makes the signal a no-op
+                # downstream.
                 yield TOOL_USE_SIGNAL
             elif msg_type == "session":
                 self.session_id = msg.get("data", {}).get("session_id")
@@ -403,7 +406,7 @@ class ProxyClient:
                 break
             elif msg_type == "error":
                 error_msg = msg.get("data", {}).get("message", "Unknown error")
-                logger.error(f"WS chat error: {error_msg}")
+                logger.error("WS chat error: %s", error_msg)
                 self.turn_in_flight = False
                 yield "Sorry, I encountered an error."
                 break
@@ -415,8 +418,8 @@ class ProxyClient:
 
         assistant_text = "".join(full_response)
         logger.info(
-            f"WS response: {len(assistant_text)} chars, turn={turn}, "
-            f"session={self.session_id}"
+            "WS response: %s chars, turn=%s, "
+            "session=%s", len(assistant_text), turn, self.session_id
         )
 
     @property
@@ -454,8 +457,8 @@ class ProxyClient:
             await self._ws.send(json.dumps({
                 "type": "abort", "turn": self._current_turn,
             }))
-        except Exception as e:
-            logger.warning(f"WS abort send failed: {e}")
+        except Exception as e:  # noqa: BLE001  # the proxy socket's send raises by its state and transport
+            logger.warning("WS abort send failed: %s", e)
 
     async def close_session(self) -> bool:
         """Close the persistent session on the proxy (call on hangup)."""
@@ -463,10 +466,10 @@ class ProxyClient:
             return False
         try:
             await self._ws.send(json.dumps({"type": "close"}))
-            logger.info(f"WS close sent: session={self.session_id}")
+            logger.info("WS close sent: session=%s", self.session_id)
             return True
-        except Exception as e:
-            logger.warning(f"WS close failed: {e}")
+        except Exception as e:  # noqa: BLE001  # the proxy socket's send raises by its state and transport
+            logger.warning("WS close failed: %s", e)
             return False
 
     async def close(self) -> None:
@@ -505,8 +508,8 @@ async def report_call(payload: dict) -> None:
                 headers={"Authorization": f"Bearer {config.PROXY_API_KEY}"},
                 json=payload,
             )
-    except Exception as e:
-        logger.warning(f"Call report failed: {e}")
+    except Exception as e:  # noqa: BLE001  # call reports are best effort, the call's teardown must not see them
+        logger.warning("Call report failed: %s", e)
 
 
 async def report_transfer_outcome(call_uuid: str, outcome: str) -> None:
@@ -524,8 +527,8 @@ async def report_transfer_outcome(call_uuid: str, outcome: str) -> None:
                 headers={"Authorization": f"Bearer {config.PROXY_API_KEY}"},
                 json={"call_uuid": call_uuid, "outcome": outcome},
             )
-    except Exception as e:
-        logger.warning(f"Transfer outcome report failed: {e}")
+    except Exception as e:  # noqa: BLE001  # call reports are best effort, the call's teardown must not see them
+        logger.warning("Transfer outcome report failed: %s", e)
 
 
 async def fetch_pin_failures(window_s: int) -> list[dict] | None:
@@ -547,9 +550,30 @@ async def fetch_pin_failures(window_s: int) -> list[dict] | None:
             resp.raise_for_status()
             calls = resp.json().get("calls")
             return calls if isinstance(calls, list) else None
-    except Exception as e:
-        logger.warning(f"PIN failure history unavailable: {e}")
+    except Exception as e:  # noqa: BLE001  # the PIN history is best effort, a dead proxy must not stop the call
+        logger.warning("PIN failure history unavailable: %s", e)
         return None
+
+
+async def report_relisten_usage(*, agent: str, provider: str, seconds: float, session_id: str = "") -> None:
+    """Report one call's second-listen seconds (the STT provider's batch
+    endpoint, on top of the stream) to the proxy for the usage page. Best
+    effort, as ``report_turn_classifier_usage``."""
+    if seconds <= 0:
+        return
+    try:
+        async with httpx.AsyncClient(
+            base_url=config.PROXY_URL,
+            timeout=httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0),
+        ) as http:
+            await http.post(
+                "/v1/phone/usage/relisten",
+                headers={"Authorization": f"Bearer {config.PROXY_API_KEY}"},
+                json={"agent": agent, "provider": provider, "seconds": round(float(seconds), 2),
+                      "session_id": session_id or ""},
+            )
+    except Exception as e:  # noqa: BLE001  # usage reports are best effort, the call's teardown must not see them
+        logger.warning("Second-listen usage report failed: %s", e)
 
 
 async def report_turn_classifier_usage(
@@ -585,5 +609,5 @@ async def report_turn_classifier_usage(
                     "session_id": session_id or "",
                 },
             )
-    except Exception as e:
-        logger.warning(f"Turn-classifier usage report failed: {e}")
+    except Exception as e:  # noqa: BLE001  # usage reports are best effort, the call's teardown must not see them
+        logger.warning("Turn-classifier usage report failed: %s", e)

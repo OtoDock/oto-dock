@@ -91,7 +91,7 @@ def test_audience_filters_by_the_session_role_when_told(temp_db, tmp_path):
     are not told (every existing caller)."""
     m = _tiered_manifest(tmp_path)
     with patch.object(mcp_registry, "get_agent_mcps", return_value=[m]):
-        ids = lambda role: [s[0] for s in mcp_registry.get_skills_for_agent("pa", context="", user_role=role)]  # noqa: E731
+        ids = lambda role: [s[0] for s in mcp_registry.get_skills_for_agent("pa", context="", user_role=role)]
         assert ids(None) == ["everyone-skill", "mcp-authoring", "owner-skill"]
         assert ids("viewer") == ["everyone-skill"]
         assert ids("contributor") == ["everyone-skill"]
@@ -108,7 +108,7 @@ def test_materialization_keys_the_audience_on_the_person(temp_db, tmp_path):
     with patch.object(mcp_registry, "get_agent_mcps_all_placements", return_value=[m]), \
             patch.object(mcp_registry, "_role_of_username",
                          side_effect=lambda u, a: roles_by_name.get(u)):
-        ids = lambda **kw: [s[0] for s in mcp_registry.get_on_demand_skills_for_materialization("pa", **kw)]  # noqa: E731
+        ids = lambda **kw: [s[0] for s in mcp_registry.get_on_demand_skills_for_materialization("pa", **kw)]
         assert ids() == ["everyone-skill", "mcp-authoring"]
         assert ids(username="edna") == ["everyone-skill", "mcp-authoring"]
         assert ids(username="vince") == ["everyone-skill"]
@@ -226,8 +226,9 @@ def test_every_shipped_skill_file_is_confined():
     """Every skills[].file the platform ships passes the rule and resolves
     inside its own folder (the rule is a tightening, never a regression)."""
     import json
-    from tests._paths import PROXY_DIR
+
     from services.mcp.mcp_manifest_parse import resolve_skill_file, skill_file_error
+    from tests._paths import PROXY_DIR
     mcps = PROXY_DIR.parent / "mcps"
     seen = 0
     for manifest in sorted(mcps.glob("*/*/manifest.json")):

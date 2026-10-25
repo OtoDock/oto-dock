@@ -75,7 +75,7 @@ class GroqTurnClassifier(TurnClassifier):
         self._in_tokens = 0
         self._out_tokens = 0
         hosted = self._base_url != self.DEFAULT_BASE_URL
-        logger.info(f"Groq turn classifier initialized (model={model}, hosted={hosted})")
+        logger.info("Groq turn classifier initialized (model=%s, hosted=%s)", model, hosted)
 
     @property
     def model(self) -> str:
@@ -132,8 +132,8 @@ class GroqTurnClassifier(TurnClassifier):
             is_complete = not answer.startswith("inc")
             log_transcript(logger, f"Groq '{answer}' for", text[:80])
             return is_complete
-        except Exception as e:
-            logger.warning(f"Groq classifier error: {e}")
+        except (httpx.HTTPError, ValueError, LookupError, TypeError, AttributeError) as e:
+            logger.warning("Groq classifier error: %s", e)
             return True  # fail-open
 
     async def classify_continuation(
@@ -197,8 +197,8 @@ class GroqTurnClassifier(TurnClassifier):
                 f"original={original[:50]!r} follow_up={follow_up[:50]!r}",
             )
             return is_continuation
-        except Exception as e:
-            logger.warning(f"Groq continuation classifier error: {e}")
+        except (httpx.HTTPError, ValueError, LookupError, TypeError, AttributeError) as e:
+            logger.warning("Groq continuation classifier error: %s", e)
             return False  # fail-open: treat as new request (safer)
 
     async def close(self) -> None:

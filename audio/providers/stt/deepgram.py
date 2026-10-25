@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import unicodedata
 
 from deepgram import (
     DeepgramClient,
@@ -22,7 +23,8 @@ from deepgram import (
 from audio.capabilities import STTCapabilities
 from audio.providers.credential_resolver import CredentialResolver
 from audio.providers.model_succession import DEFAULT_MODELS
-from audio.providers.stt.base import LanguageGuess, STTProvider, TranscriptResult, Word
+from audio.providers.stt.base import Heard, STTProvider, TranscriptResult, Word
+from audio.providers.stt.relisten import RELISTEN_FINISH_WAIT_S, Relisten, TurnRelisten
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +88,8 @@ _DG_REGIONAL = {
 def _to_deepgram_lang(tag: str) -> str:
     """BCP-47 tag → Deepgram language code: keep the regional variants Deepgram
     supports, else strip to the base subtag. Empty or ``auto`` → ``multi``
-    (the code-switching stream: ten languages, Greek not among them)."""
+    (the code-switching stream: ten languages, Greek not among them; the
+    dictation relay's fallback when the local identifier is unavailable)."""
     if not tag or tag == "auto":
         return "multi"
     if tag in _DG_REGIONAL or "-" not in tag:
@@ -94,15 +97,9 @@ def _to_deepgram_lang(tag: str) -> str:
     return tag.split("-", 1)[0]
 
 
-# The languages the code-switching stream (``language=multi``) transcribes
-# (the vendor's documented set): Greek is not among them, so the dictation
-# relay identifies a Greek speaker through the prerecorded endpoint and
-# reopens the stream in Greek.
-_MULTI_LANGUAGES = frozenset({"en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"})
-
-# The languages Deepgram's identification can name (its documented set); a
-# streaming model transcribes each of them once the stream is opened in it.
-_IDENTIFIABLE = frozenset({
+# The languages a nova-3 stream can be opened in (the vendor's documented
+# set); asked when the language rule opens a candidate stream.
+_STREAMABLE = frozenset({
     "bg", "ca", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hi", "hu",
     "id", "it", "ja", "ko", "lt", "lv", "ms", "nl", "no", "pl", "pt", "ro", "ru",
     "sk", "sv", "th", "tr", "uk", "vi", "zh",
@@ -115,7 +112,10 @@ _WORD_STRIP = ".,;:!?·»«\"'()[]{}"
 
 
 def _norm_word(word: str) -> str:
-    return word.strip(_WORD_STRIP).casefold()
+    # An interim and its final can differ by an accent alone (the Greek
+    # tonos lands on the final): the same word for the prefix rule.
+    bare = unicodedata.normalize("NFD", word.strip(_WORD_STRIP).casefold())
+    return "".join(c for c in bare if unicodedata.category(c) != "Mn")
 
 
 def _norm_words(text: str) -> list[str]:
@@ -135,10 +135,37 @@ def _result_words(alt) -> list[Word]:
         try:
             text = getattr(w, "punctuated_word", None) or w.word
             if _norm_word(text):
-                out.append(Word(word=text, start=float(w.start), end=float(w.end)))
+                confidence = getattr(w, "confidence", None)
+                out.append(Word(word=text, start=float(w.start), end=float(w.end),
+                                confidence=float(confidence) if confidence is not None else None))
         except (AttributeError, TypeError, ValueError):
             return []
     return out
+
+
+def _evidence(alt, time_base: float) -> tuple[int, float, tuple[tuple[float, float, float], ...]]:
+    """A live result's word count, mean word confidence (the result's own
+    confidence when its words carry none; 0 for an empty result) and each
+    timed word's ``(start, end, confidence)`` on the provider's clock."""
+    confidences: list[float] = []
+    marks: list[tuple[float, float, float]] = []
+    for w in (getattr(alt, "words", None) or []):
+        try:
+            confidence = float(w.confidence)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        confidences.append(confidence)
+        with contextlib.suppress(AttributeError, TypeError, ValueError):
+            marks.append((time_base + float(w.start), time_base + float(w.end), confidence))
+    if confidences:
+        return len(confidences), sum(confidences) / len(confidences), tuple(marks) if len(marks) == len(confidences) else ()
+    count = len((getattr(alt, "transcript", "") or "").split())
+    if not count:
+        return 0, 0.0, ()
+    try:
+        return count, float(getattr(alt, "confidence", 0.0) or 0.0), ()
+    except (TypeError, ValueError):
+        return count, 0.0, ()
 
 
 class DeepgramSTT(STTProvider):
@@ -150,6 +177,7 @@ class DeepgramSTT(STTProvider):
         supports_endpointing=True,
         supports_word_timestamps=True,
         is_local=False,
+        reports_confidence=True,
     )
 
     def __init__(
@@ -170,8 +198,6 @@ class DeepgramSTT(STTProvider):
         self._channels = channels
         self._vad_silence_offset_ms = vad_silence_offset_ms
         self._connection = None
-        # The connections a restart replaced, closing off the caller's path.
-        self._closing: set[asyncio.Task] = set()
         self._transcript_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._is_open = False
         self._connection_gen: int = 0  # generation counter to guard _on_close race
@@ -195,11 +221,26 @@ class DeepgramSTT(STTProvider):
         # as 8 kHz → permanent garbage transcripts (live duplex bug, audit F5).
         self._active_rate = sample_rate
         self._send_skips = 0  # closed-connection sends since last open (one WARNING per incident)
+        # Every connection's result times start at zero: the audio clock at
+        # the connection's start puts its results on the provider's clock.
+        self._time_base = 0.0
+        # Dictation's second listen (``relisten.py``): the audio this
+        # connection accepted, the windows held for a re-listen, the words
+        # the interims showed per window (by time), and what the last
+        # display sent showed of the held windows.
+        self._relisten: Relisten | None = None
+        # A call's second listen (``relisten.TurnRelisten``): the audio this
+        # connection accepted and the live finals of the turn.
+        self._turn_relisten: TurnRelisten | None = None
+        self._finish_wait = RELISTEN_FINISH_WAIT_S
+        self._seen: list[Word] = []
+        self._held_shown = ""
+        self._last_display_sent = ""
 
     # ── Factory / metadata ─────────────────────────────────────────
 
     @classmethod
-    def from_row(cls, row: dict, resolver: CredentialResolver) -> "DeepgramSTT":
+    def from_row(cls, row: dict, resolver: CredentialResolver) -> DeepgramSTT:
         advanced = row.get("advanced") or {}
         return cls(
             api_key=resolver(row.get("credential_key", "")),
@@ -237,6 +278,55 @@ class DeepgramSTT(STTProvider):
     @property
     def endpointing_ms(self) -> int:
         return self._endpointing_ms
+
+    def enable_dictation_mode(self) -> None:
+        super().enable_dictation_mode()
+        if self._relisten is None:
+            self._relisten = Relisten(transcribe=self._relisten_transcribe, release=self._release_final,
+                                      norm=_norm_word, rate=self._active_rate,
+                                      stream_seconds=self._budget_stream_seconds, spent=self._budget_spent)
+
+    def enable_turn_relisten(self) -> None:
+        if self._turn_relisten is None and not self.dictation_mode:
+            self._turn_relisten = TurnRelisten(transcribe=self._relisten_transcribe, norm=_norm_word,
+                                               rate=self._active_rate, stream_seconds=self._budget_stream_seconds,
+                                               spent=self._budget_spent)
+
+    async def complete_turn(self, text: str, bound: float) -> str:
+        if self._turn_relisten is None:
+            return text
+        return await self._turn_relisten.complete(text, bound)
+
+    def turn_taken(self) -> None:
+        if self._turn_relisten is not None:
+            self._turn_relisten.take()
+
+    async def release_wordless_turn(self, timeout: float) -> bool:
+        if self._turn_relisten is None or not self._turn_relisten.wordless:
+            return False
+        text = await self._turn_relisten.wait_wordless(timeout)
+        if not text:
+            return False
+        self._log_transcript("Deepgram call re-listen final", text)
+        self._release_final(text)
+        return True
+
+    def _budget_stream_seconds(self) -> float:
+        return self.dictation_seconds() if self.dictation_seconds is not None else self.audio_offered_s
+
+    def _budget_spent(self) -> float:
+        return self.dictation_relistened() if self.dictation_relistened is not None else self.relisten_seconds
+
+    async def _relisten_transcribe(self, audio: bytes) -> TranscriptResult:
+        return await self.transcribe_file(audio, language=getattr(self, "_label", None))
+
+    @property
+    def relisten_seconds(self) -> float:
+        dictation = self._relisten.seconds if self._relisten is not None else 0.0
+        return dictation + (self._turn_relisten.seconds if self._turn_relisten is not None else 0.0)
+
+    def bound_finish(self, seconds: float) -> None:
+        self._finish_wait = max(0.0, min(RELISTEN_FINISH_WAIT_S, seconds))
 
     # ── Batch / prerecorded transcription ──────────────────────────
 
@@ -292,7 +382,7 @@ class DeepgramSTT(STTProvider):
                     getattr(warn, "message", None) or warn,
                 )
         except (AttributeError, IndexError, TypeError) as e:
-            logger.warning(f"Deepgram prerecorded parse error: {e}")
+            logger.warning("Deepgram prerecorded parse error: %s", e)
 
         self._log_transcript("Deepgram file", text)
         return TranscriptResult(
@@ -300,59 +390,8 @@ class DeepgramSTT(STTProvider):
             language_confidence=confidence,
         )
 
-    async def identify_language(self, audio_wav: bytes) -> LanguageGuess | None:
-        """One utterance through the prerecorded endpoint with
-        ``detect_language`` (Deepgram identifies on pre-recorded audio only;
-        its code-switching stream covers ten languages without Greek)."""
-        result = await self.transcribe_file(audio_wav, language=None)
-        lang = (result.language or "").split("-", 1)[0].lower()
-        if not lang:
-            return None
-        return LanguageGuess(language=lang, confidence=result.language_confidence, text=result.text)
-
     def streams_language(self, language: str) -> bool:
-        return (language or "").split("-", 1)[0].lower() in _IDENTIFIABLE
-
-    @property
-    def multi_languages(self) -> frozenset[str]:
-        return _MULTI_LANGUAGES
-
-    async def restart(self, language: str) -> bool:
-        """Reopen the stream in ``language`` with the stored rate, interims
-        and endpointing (the language lock mid-call). The new stream opens
-        BEFORE the old one closes: the vendor's close handshake takes about
-        half a second, nothing of the old stream is wanted (its callbacks
-        are bound to their generation and ignored once ``start`` bumps it),
-        and the audio the lock replays should reach the new stream at once."""
-        old, self._connection = self._connection, None
-        try:
-            await self.start(
-                language=language, sample_rate=self._active_rate,
-                interim_results=self._interim_results,
-                endpointing_ms=self._endpointing_override,
-            )
-        except Exception as e:
-            logger.warning(f"Deepgram STT restart in {language} failed: {e}")
-            self._is_open = False
-            self._finish_quietly(old)
-            return False
-        self._finish_quietly(old)
-        logger.info(f"Deepgram STT restarted in {language}")
-        return True
-
-    def _finish_quietly(self, connection) -> None:
-        """A replaced connection's close handshake, off the caller's path;
-        its outcome is nobody's (the task is held until it ends)."""
-        if connection is None:
-            return
-
-        async def _finish() -> None:
-            with contextlib.suppress(Exception):
-                await connection.finish()
-
-        task = asyncio.create_task(_finish())
-        self._closing.add(task)
-        task.add_done_callback(self._closing.discard)
+        return (language or "").split("-", 1)[0].lower() in _STREAMABLE
 
     # ── Streaming surface ──────────────────────────────────────────
 
@@ -377,6 +416,7 @@ class DeepgramSTT(STTProvider):
         """
         rate = sample_rate or self._sample_rate
         language = _to_deepgram_lang(language)
+        self._label = language
         self._active_rate = rate
         self._send_skips = 0
         self._latest_interim = ""
@@ -388,6 +428,16 @@ class DeepgramSTT(STTProvider):
         self._interim_results = interim_results
         self._endpointing_override = endpointing_ms
         self._transcript_queue = asyncio.Queue()
+        self._seen = []
+        self._held_shown = ""
+        self._last_display_sent = ""
+        self._finish_wait = RELISTEN_FINISH_WAIT_S
+        if self._relisten is not None:
+            self._relisten.reset(rate)
+            self._relisten.label = language
+        if self._turn_relisten is not None:
+            self._turn_relisten.reset(rate)
+            self._turn_relisten.label = language
         self._transcript_ready.clear()
         self._connection_gen += 1
         gen = self._connection_gen
@@ -398,8 +448,7 @@ class DeepgramSTT(STTProvider):
         # replaced socket's dying gasp (net0001 after a mid-call reconnect)
         # must not surface as a pipeline "STT fatal" for the LIVE connection,
         # and a late result of the old stream must not land in the new queue
-        # (a dictation restart replays audio the old stream was still
-        # transcribing).
+        # (the reconnect in ``ensure_alive``).
         self._connection.on(
             LiveTranscriptionEvents.Transcript,
             lambda _conn, result, _gen=gen, **kw: self._on_transcript(_conn, result, _gen=_gen, **kw),
@@ -430,16 +479,26 @@ class DeepgramSTT(STTProvider):
         started = await self._connection.start(options)
         if not started:
             raise RuntimeError("Failed to start Deepgram connection")
+        # The connection's time zero is the first byte it receives: the
+        # frames offered while it connected were skipped, not sent.
+        self._time_base = self.audio_offered_s
         self._is_open = True
         logger.info("Deepgram STT connection opened")
 
     async def send_audio(self, audio_bytes: bytes) -> None:
         """Send raw PCM audio to Deepgram for transcription."""
+        if self._connection_gen:
+            self._count_offered(len(audio_bytes), self._active_rate, self._channels)
         if self._connection and self._is_open:
             try:
-                await self._connection.send(audio_bytes)
-            except Exception as e:
-                logger.error(f"Deepgram send error: {e}")
+                accepted = await self._connection.send(audio_bytes)
+            except Exception as e:  # noqa: BLE001  # the Deepgram SDK raises whatever its socket does
+                logger.error("Deepgram send error: %s", e)
+            else:
+                if accepted is True:
+                    for second in (self._relisten, self._turn_relisten):
+                        if second is not None and second.keeps_audio:
+                            second.ring.append(audio_bytes)
         elif not self._is_open and self._connection:
             # One WARNING per death incident, not one per 20 ms frame (a dead
             # 35 s call tail used to log 1,700+ of these). The guard task owns
@@ -470,8 +529,8 @@ class DeepgramSTT(STTProvider):
             await self._connection.keep_alive()
             self._last_keepalive = now
             logger.debug("Deepgram KeepAlive sent")
-        except Exception as e:
-            logger.warning(f"Deepgram KeepAlive error: {e}")
+        except Exception as e:  # noqa: BLE001  # the Deepgram SDK raises whatever its socket does
+            logger.warning("Deepgram KeepAlive error: %s", e)
 
     def clear_queue(self) -> None:
         """Discard all pending transcripts (e.g., after TTS echo)."""
@@ -483,6 +542,10 @@ class DeepgramSTT(STTProvider):
             except asyncio.QueueEmpty:
                 break
         self._transcript_ready.clear()
+        if self._relisten is not None:
+            self._relisten.cancel()
+        if self._turn_relisten is not None:
+            self._turn_relisten.take()
         # A discarded utterance's live partial must go with it — a stale
         # interim that never finalizes reads as permanent speech "evidence"
         # to the barge-in pause monitor (audit A5, 2026-08-24).
@@ -490,7 +553,7 @@ class DeepgramSTT(STTProvider):
         self._latest_interim_words = []
         self._promoted_edge = None
         if discarded:
-            logger.info(f"STT queue cleared ({discarded} items discarded)")
+            logger.info("STT queue cleared (%s items discarded)", discarded)
 
     def drain_transcript(self) -> str | None:
         """Return any transcripts available so far WITHOUT closing the connection.
@@ -523,15 +586,36 @@ class DeepgramSTT(STTProvider):
         retracting words it will re-confirm) would visibly truncate the
         composer; real rewordings still pass."""
         txt = self._latest_interim
-        if not txt or txt == self._last_interim_sent:
-            return None
-        if self.dictation_mode and self._last_interim_sent:
+        fresh = bool(txt) and txt != self._last_interim_sent
+        if fresh and self.dictation_mode and self._last_interim_sent:
             new, old = _norm_words(txt), _norm_words(self._last_interim_sent)
             if len(new) < len(old) and old[: len(new)] == new:
-                return None
-        self._last_interim_sent = txt
-        self._last_interim_sent_words = list(self._latest_interim_words)
-        return txt
+                fresh = False
+        if fresh:
+            self._last_interim_sent = txt
+            self._last_interim_sent_words = list(self._latest_interim_words)
+        held = self._relisten.held_text() if self._relisten is not None else ""
+        if not held and not self._held_shown:
+            if fresh:
+                self._last_display_sent = txt
+                return txt
+            return None
+        # A window held for a re-listen stays on screen ahead of the live
+        # partial (its words, and the words shown for its gap) until it is
+        # released as a final; a release sends the display again.
+        self._held_shown = held
+        display = " ".join(p for p in (held, self._last_interim_sent) if p)
+        if not display or display == self._last_display_sent:
+            return None
+        self._last_display_sent = display
+        return display
+
+    @property
+    def display_interim(self) -> str:
+        """The live partial as the composer shows it: the held windows'
+        text ahead of it."""
+        held = self._relisten.held_text() if self._relisten is not None else ""
+        return " ".join(p for p in (held, self._latest_interim) if p)
 
     async def wait_for_transcript(self, timeout: float = 1.0) -> str | None:
         """Wait up to `timeout` seconds for the next is_final transcript.
@@ -554,8 +638,8 @@ class DeepgramSTT(STTProvider):
         if self._connection and self._is_open:
             try:
                 await self._connection.finalize()
-            except Exception as e:
-                logger.warning(f"Deepgram finalize error: {e}")
+            except Exception as e:  # noqa: BLE001  # the Deepgram SDK raises whatever its socket does
+                logger.warning("Deepgram finalize error: %s", e)
 
     @property
     def latest_interim(self) -> str:
@@ -577,13 +661,20 @@ class DeepgramSTT(STTProvider):
 
         Returns the final transcript text, or None if nothing was recognized.
         """
+        # The bound counts from here: the vendor's own finish takes part of it.
+        deadline = time.monotonic() + self._finish_wait
+        self._finish_wait = RELISTEN_FINISH_WAIT_S
         if self._connection and self._is_open:
             try:
                 await self._connection.finish()
-            except Exception as e:
-                logger.error(f"Deepgram finish error: {e}")
+            except Exception as e:  # noqa: BLE001  # the Deepgram SDK raises whatever its socket does
+                logger.error("Deepgram finish error: %s", e)
 
         self._is_open = False
+        if self._relisten is not None:
+            # The windows held for a re-listen go out first, in order (a
+            # re-listen still out at the bound goes with its shown words).
+            await self._relisten.settle(max(0.0, deadline - time.monotonic()))
 
         # Collect all queued transcripts
         parts = []
@@ -598,7 +689,8 @@ class DeepgramSTT(STTProvider):
         if self.dictation_mode:
             # A tail the user saw but Deepgram never finalized (stop hit
             # mid-window) must still commit — the client's stop() waits
-            # ≤1.8s for exactly this trailing final. The stream is over, so
+            # for exactly this trailing final (10 s, more on a slow uplink).
+            # The stream is over, so
             # nothing can re-deliver it: the whole shown text goes.
             leftover, _ = self._shown_interim()
             if leftover:
@@ -613,6 +705,12 @@ class DeepgramSTT(STTProvider):
     async def close(self) -> None:
         """Close the connection without waiting for final transcript."""
         self._is_open = False
+        if self._relisten is not None:
+            # The vendor's last results arrive during its finish: they are
+            # released as they are, never listened to again.
+            self._relisten.close()
+        if self._turn_relisten is not None:
+            self._turn_relisten.close()
         if self._connection:
             with contextlib.suppress(Exception):
                 await self._connection.finish()
@@ -685,12 +783,12 @@ class DeepgramSTT(STTProvider):
                 endpointing_ms=self._endpointing_override,
             )
             logger.info(
-                "Deepgram STT reconnected mid-call"
-                + (f" ({skipped} frames dropped while dead)" if skipped else "")
+                "Deepgram STT reconnected mid-call%s",
+                f" ({skipped} frames dropped while dead)" if skipped else "",
             )
             return True
-        except Exception as e:
-            logger.warning(f"Deepgram STT reconnect failed: {e}")
+        except Exception as e:  # noqa: BLE001  # the Deepgram SDK raises whatever its socket does
+            logger.warning("Deepgram STT reconnect failed: %s", e)
             return False
 
     @property
@@ -769,25 +867,71 @@ class DeepgramSTT(STTProvider):
             transcript = " ".join(w.word for w in words)
         return transcript, words
 
-    async def _commit(self, label: str, text: str, *, partial_final: str | None = None) -> None:
+    async def _commit(self, label: str, text: str, *, partial_final: str | None = None,
+                      window: tuple[float, float] | None = None, words: list[Word] | None = None) -> None:
         self._log_transcript(label, text)
-        await self._transcript_queue.put(text)
-        self._transcript_ready.set()
+        if self._relisten is not None and window is not None:
+            self._hold_window(window, text, words or [])
+        else:
+            await self._transcript_queue.put(text)
+            self._transcript_ready.set()
         if partial_final:
             self._emit_partial_final(partial_final)
+
+    def _release_final(self, text: str) -> None:
+        self._transcript_queue.put_nowait(text)
+        self._transcript_ready.set()
+
+    def _hold_window(self, window: tuple[float, float], text: str, words: list[Word]) -> None:
+        """A dictation final through the re-listen's FIFO (``relisten.py``):
+        released at once unless a stretch of its window no committed word
+        covers may hold speech (never for untimed words, the ``multi``
+        stream, or a stream the gate keeps out)."""
+        start, end = window
+        shown = [w for w in self._seen if start - 0.25 <= w.start < end]
+        gate = self.relisten_gate
+        timed = (bool(words) or not text) and all(w.end > w.start for w in words)
+        enabled = getattr(self, "_label", "") != "multi" and timed and (gate is None or gate())
+        self._relisten.window(start=start, end=end, text=text, words=words, shown=shown, enabled=enabled)
+
+    def _note_turn_window(self, start: float, end: float, text: str, words: list[Word]) -> None:
+        """A call's live final for its turn's second listen (never the
+        ``multi`` stream, never one the gate keeps out)."""
+        if self._turn_relisten is None:
+            return
+        gate = self.relisten_gate
+        enabled = getattr(self, "_label", "") != "multi" and (gate is None or gate())
+        self._turn_relisten.window(start=start, end=end, text=text, words=words, enabled=enabled)
+
+    def _note_seen(self, words: list[Word]) -> None:
+        """An interim's timed words replace the words seen over the time they
+        cover (a word by its middle: a re-timed word is the same word); what
+        an earlier interim showed before them stays."""
+        if not words:
+            return
+        lo, hi = words[0].start - 0.05, words[-1].end
+        kept = [w for w in self._seen if not lo <= (w.start + w.end) / 2 < hi]
+        self._seen = sorted([*kept, *words], key=lambda w: w.start)
 
     async def _on_transcript(self, _conn, result, _gen: int | None = None, **kwargs) -> None:
         """Handle transcript events from Deepgram."""
         if _gen is not None and _gen != self._connection_gen:
-            logger.debug(f"Deepgram transcript on stale gen={_gen} (current={self._connection_gen}) — ignoring")
+            logger.debug("Deepgram transcript on stale gen=%s (current=%s) — ignoring", _gen, self._connection_gen)
             return
         try:
             alt = result.channel.alternatives[0]
             transcript = alt.transcript
             is_final = result.is_final
-            words = _result_words(alt) if self.dictation_mode else []
-            final_end = (float(getattr(result, "start", 0.0) or 0.0)
-                         + float(getattr(result, "duration", 0.0) or 0.0))
+            words = _result_words(alt) if self.dictation_mode or self._turn_relisten is not None else []
+            result_start = float(getattr(result, "start", 0.0) or 0.0)
+            final_end = result_start + float(getattr(result, "duration", 0.0) or 0.0)
+            count, confidence, marks = _evidence(alt, self._time_base)
+            heard = Heard(start=self._time_base + result_start, end=self._time_base + final_end,
+                          words=count, confidence=confidence, final=bool(is_final), marks=marks)
+            if is_final:
+                self._heard_final(heard)
+            else:
+                self._heard_interim(heard)
             if self._promoted_edge:
                 transcript, words = self._strip_promoted_edge(transcript, words)
                 if is_final:
@@ -802,18 +946,30 @@ class DeepgramSTT(STTProvider):
                     # re-delivers them, and leaving them painted avoids a
                     # blink); the words its audio consumed are gone for good
                     # unless committed here — done when they extend the final
-                    # (normalized word-prefix match; a rewording wins as-is).
+                    # (normalized word-prefix match), and for a reworded
+                    # final, for the painted words after its own last word:
+                    # the rewording covers only the head it transcribed, the
+                    # window past that head never comes again.
                     shown, shown_words = self._shown_interim()
                     consumed, rest = self._split_shown(shown, shown_words, final_end)
                     fin = _norm_words(transcript)
                     seen = [_norm_word(w.word) for w in consumed]
+                    timed = bool(shown_words) and len(shown_words) == len(_norm_words(shown))
+                    extra: list[Word] = []
+                    shape = "short"
                     if len(seen) > len(fin) and seen[: len(fin)] == fin:
                         extra = consumed[len(fin):]
+                    elif timed and words:
+                        covered = words[-1].end
+                        extra = [w for w in consumed if w.start >= covered]
+                        shape = "reworded short"
+                    if extra:
                         committed = transcript + " " + " ".join(w.word for w in extra)
                         self._note_promoted_edge(extra, final_end)
                         logger.info(
-                            "Deepgram short final — %d shown word(s) committed with it, "
-                            "%d left for the next window", len(extra), len(rest),
+                            "Deepgram %s final (%s) — %d shown word(s) committed with it, "
+                            "%d left for the next window", shape, getattr(self, "_label", ""),
+                            len(extra), len(rest),
                         )
                     self._set_interim(" ".join(w.word for w in rest), rest)
                 else:
@@ -823,15 +979,29 @@ class DeepgramSTT(STTProvider):
                     # repeated words of every call). Cleared before the
                     # commit, whose push starts the duplex sweep.
                     self._latest_interim, self._latest_interim_words = "", []
-                await self._commit("Deepgram final", committed, partial_final=transcript)
+                if self.dictation_mode:
+                    await self._commit("Deepgram final", committed, partial_final=transcript,
+                                       window=(result_start, final_end), words=[*words, *extra])
+                    self._seen = [w for w in self._seen if w.start >= final_end]
+                else:
+                    self._note_turn_window(result_start, final_end, committed, words)
+                    await self._commit("Deepgram final", committed, partial_final=transcript)
             elif transcript and not is_final:
                 self._last_result_at = time.monotonic()
                 self._latest_interim, self._latest_interim_words = transcript, words
-                logger.debug(f"Deepgram interim: \"{transcript}\"")
+                if self.dictation_mode:
+                    self._note_seen(words)
+                logger.debug("Deepgram interim: \"%s\"", transcript)
             elif is_final and not transcript:
                 shown, shown_words = self._shown_interim() if self.dictation_mode else ("", [])
                 if not shown:
                     logger.debug("Deepgram final: (empty)")
+                    self._note_turn_window(result_start, final_end, "", [])
+                    if self._relisten is not None:
+                        # A window answered empty with nothing shown: it may
+                        # still hold speech the second listen recovers.
+                        self._hold_window((result_start, final_end), "", [])
+                        self._seen = [w for w in self._seen if w.start >= final_end]
                     return
                 # An empty final orphans the painted interim: the base the
                 # composer commits onto never advances, and the next window's
@@ -846,21 +1016,26 @@ class DeepgramSTT(STTProvider):
                     self._note_promoted_edge(consumed, final_end)
                     self._set_interim(" ".join(w.word for w in rest), rest)
                     await self._commit("Deepgram empty final — committing shown interim",
-                                       " ".join(w.word for w in consumed))
+                                       " ".join(w.word for w in consumed),
+                                       window=(result_start, final_end), words=consumed)
                 else:
                     logger.debug("Deepgram final: (empty, shown interim all past its end)")
+                    if self._relisten is not None:
+                        self._hold_window((result_start, final_end), "", [])
+                self._seen = [w for w in self._seen if w.start >= final_end]
         except (IndexError, AttributeError) as e:
-            logger.warning(f"Failed to parse Deepgram result: {e}")
+            logger.warning("Failed to parse Deepgram result: %s", e)
 
     async def _on_error(self, _conn, error, _gen: int = 0, **kwargs) -> None:
         """Handle errors from Deepgram (generation-guarded like _on_close)."""
         if _gen != self._connection_gen:
             logger.info(
-                f"Deepgram error on stale gen={_gen} "
-                f"(current={self._connection_gen}) — ignoring: {str(error)[:120]}"
+                "Deepgram error on stale gen=%s "
+                "(current=%s) — ignoring: %s",
+                _gen, self._connection_gen, str(error)[:120]
             )
             return
-        logger.error(f"Deepgram error: {error}")
+        logger.error("Deepgram error: %s", error)
         self._fatal_error = f"Deepgram speech-to-text error: {str(error)[:200]}"
 
     def pop_fatal_error(self) -> str | None:
@@ -879,6 +1054,6 @@ class DeepgramSTT(STTProvider):
             logger.info("Deepgram connection closed (current gen)")
         else:
             logger.info(
-                f"Deepgram connection closed (stale gen={_gen}, "
-                f"current={self._connection_gen}) — ignoring"
+                "Deepgram connection closed (stale gen=%s, "
+                "current=%s) — ignoring", _gen, self._connection_gen
             )

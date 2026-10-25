@@ -11,6 +11,18 @@
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
 import { apiFetch } from '../api/auth'
+import { currentMode } from '../lib/engines/modes'
+
+/** Persisted prefs from an earlier version, brought to the current one: the
+ *  remembered permission modes in the current words. */
+export function migratePrefs(persisted: unknown, version: number): AgentPrefsState {
+  const state = (persisted ?? {}) as AgentPrefsState
+  if (version < 1 && state.lastMode) {
+    state.lastMode = Object.fromEntries(
+      Object.entries(state.lastMode).map(([agent, mode]) => [agent, currentMode(mode)]))
+  }
+  return state
+}
 
 interface AgentPrefsState {
   lastModel: Record<string, string>      // agent slug → model
@@ -42,7 +54,7 @@ export const useAgentPrefsStore = create<AgentPrefsState>()(
         set((s) => ({ lastModel: { ...s.lastModel, [agent]: model } })),
 
       setLastMode: (agent, mode) =>
-        set((s) => ({ lastMode: { ...s.lastMode, [agent]: mode } })),
+        set((s) => ({ lastMode: { ...s.lastMode, [agent]: currentMode(mode) } })),
 
       setLastInteractive: (agent, mode) => {
         set((s) => ({ lastInteractive: { ...s.lastInteractive, [agent]: mode } }))
@@ -59,6 +71,10 @@ export const useAgentPrefsStore = create<AgentPrefsState>()(
     {
       name: 'oto-dock-agent-prefs',
       storage: createJSONStorage(() => localStorage),
+      // 1: the permission modes of 1.9 (a remembered Default reads as Ask,
+      // Accept Edits as Auto).
+      version: 1,
+      migrate: (persisted, version) => migratePrefs(persisted, version),
     },
   ),
 )

@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
@@ -32,10 +33,10 @@ from auth.path_policy import (
     _check_write_path,
     check_tool_access,
 )
+from core import placement
 from core.sandbox.sandbox import claude_runtime_root
 from services import path_roles
 from services.path_policy_v2 import PathPolicyContext, _is_session_runtime_path
-from core import placement
 
 _AGENTS = config.AGENTS_DIR.resolve()
 SID = "76fe15d2-9b5b-495c-9c6c-42e6626f88f6"

@@ -2,9 +2,12 @@
 """PreToolUse hook: calls the proxy to decide whether to allow or deny a tool use.
 
 The proxy decides based on session mode and client type:
-  - "auto" mode: always allow (phone, tasks)
-  - "default" mode + dashboard: block until user approves/denies in dashboard UI
-  - "plan" mode: always deny (read-only planning)
+  - the unattended "auto" mode: allow (phone, tasks), the floor still refuses
+  - "ask" + dashboard: block until the person approves/denies in the dashboard
+  - "autoReview" (Auto): its allow set runs; the rest is the engine's own
+    reviewer's ("defer": this script prints nothing and the engine decides)
+  - "plan" mode, every client: read-only tools, the read tier of the shell and
+    plan-file writes run; every other tool is denied (read-only planning)
   - AskUserQuestion: always deny (question shown to user, they reply in next message)
 
 Environment variables (set by core/sandbox/env_builder.py in the CLI's subprocess env):
@@ -35,9 +38,11 @@ _AUTH_LADDER = (2.0, 4.0, 8.0)
 # A decision that waits on a person is streamed with whitespace keepalives
 # every 30 s, so a few intervals of silence mean the stream is gone.
 _SOCKET_TIMEOUT_S = 150
-# The permission_mode values Codex reports for a turn whose approval requests
-# reach the platform's bridge ("default" for untrusted / on-request /
-# granular; "bypassPermissions" means never, where no request comes).
+# The permission_mode values Codex reports for a turn under an asking
+# approval policy ("default"; "bypassPermissions" means never). A satellite
+# before 1.9 runs its attended Codex chats on the retired "untrusted"
+# policy with OTO_HOOK_BRIDGED set: every command reaches its bridge, so
+# the gate stands aside on such a turn. Nothing else sets the switch.
 _BRIDGE_ASKS = frozenset({"default", "acceptEdits", "plan"})
 
 
@@ -105,7 +110,7 @@ def _log_failure():
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} pid={os.getpid()}\n")
             traceback.print_exc(file=fh)
-    except Exception:
+    except Exception:  # noqa: BLE001  # the crash breadcrumb must not stop the fail-closed deny after it
         pass
 
 
@@ -117,11 +122,11 @@ def main():
     except (OSError, ValueError):
         inp = {}
 
-    # An attended Codex app-server chat (OTO_HOOK_BRIDGED): Codex's approval
-    # requests carry the person's cards, so the gate stands aside on a turn
-    # Codex says will raise them, and judges every other one (Don't Ask and
-    # auto run under never: "bypassPermissions"). An unknown or missing value
-    # is judged: a turn with no judge is the failure to avoid.
+    # An attended Codex chat on a satellite before 1.9 (OTO_HOOK_BRIDGED):
+    # its approval requests carry the person's cards, so the gate stands
+    # aside on a turn Codex says will raise them, and judges every other one
+    # (Don't Ask and auto run under never: "bypassPermissions"). An unknown
+    # or missing value is judged: a turn with no judge is the failure to avoid.
     if os.environ.get("OTO_HOOK_BRIDGED") and inp.get("permission_mode") in _BRIDGE_ASKS:
         return
 
@@ -167,12 +172,22 @@ def main():
         reason = result.get("reason", "")
         updated_input = result.get("updated_input")
 
-    # "defer" = the platform has NO OPINION (interactive residual tier):
-    # emit nothing, so the CLI's own permission engine — the live Shift+Tab
-    # mode the human actually chose — governs the call. Distinct from
-    # "allow", which is a hard override that would SUPPRESS the CLI's own
-    # prompt. Denies, asks and allows still emit below.
+    # "defer" = the platform has NO OPINION (a terminal's residual tier,
+    # Auto's review set): emit no decision, so the engine's own permission
+    # engine governs the call (the live Shift+Tab mode the human chose, the
+    # CLI's classifier in its auto mode, Codex's reviewer). Distinct from
+    # "allow", which is a hard override that skips the engine's own check.
+    # A satellite path rewrite still rides it as a bare updatedInput (Claude
+    # Code applies it and judges the corrected call; Codex takes none).
+    # Denies, asks and allows still emit below.
     if decision == "defer":
+        if isinstance(updated_input, dict) and not os.environ.get("OTO_HOOK_DENY_ONLY"):
+            output = {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                             "updatedInput": updated_input}}
+            note = _path_note(tool_input, updated_input)
+            if note:
+                output["hookSpecificOutput"]["additionalContext"] = note
+            print(json.dumps(output))
         return
 
     # Codex's PreToolUse hook supports a DENY decision but REJECTS
@@ -212,7 +227,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except Exception:  # noqa: BLE001  # the gate answers deny on any crash, a traceback lets the tool run
         # A hook crash enforces nothing on its own: both CLIs read a non-zero
         # exit as a non-blocking error and run the tool, and Claude Code's
         # onFailure block (the platform's settings, 2.1.295+) cannot see an

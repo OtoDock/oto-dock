@@ -32,15 +32,15 @@ function dup(over: Partial<DuplexControlProps> = {}): DuplexControlProps {
 describe('VoiceControl duplex', () => {
   it('renders no phone button without the capability', () => {
     render(<VoiceControl {...baseProps} />)
-    expect(screen.queryByTitle(/full duplex/i)).toBeNull()
+    expect(screen.queryByTitle(/start a live conversation/i)).toBeNull()
     render(<VoiceControl {...baseProps} duplex={dup({ available: false })} />)
-    expect(screen.queryByTitle(/full duplex/i)).toBeNull()
+    expect(screen.queryByTitle(/start a live conversation/i)).toBeNull()
   })
 
   it('phone button starts and ends the session', () => {
     const d = dup()
     render(<VoiceControl {...baseProps} duplex={d} />)
-    fireEvent.click(screen.getByTitle(/full duplex/i))
+    fireEvent.click(screen.getByTitle(/start a live conversation/i))
     expect(d.onToggle).toHaveBeenCalledTimes(1)
 
     const active = dup({ active: true, phase: 'listening' })

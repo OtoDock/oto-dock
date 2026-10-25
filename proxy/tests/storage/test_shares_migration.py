@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import uuid
 
-from storage import database as task_store
-from storage import pg
-from storage import schema as pg_schema
+from storage import database as task_store, pg, schema as pg_schema
 from storage.pg import get_conn
 from storage.sharing import share_store
 

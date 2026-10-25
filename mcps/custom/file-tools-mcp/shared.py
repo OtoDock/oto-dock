@@ -1,19 +1,22 @@
 """Shared utilities for the file-tools MCP server.
 
-Config, path mapping, LibreOffice lock, preview push helpers.
+Config, path mapping, LibreOffice runs, preview push helpers.
 """
 
 import asyncio
 import base64
 import contextlib
-import hashlib
-import tempfile
 import contextvars
+import hashlib
 import json
 import logging
 import os
 import re
+import signal
+import tempfile
+import time
 import unicodedata
+import weakref
 from pathlib import Path
 
 import httpx
@@ -142,9 +145,9 @@ async def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | No
     event loop for all of them.
     """
     session_id, auth = _current_session()
-    logger.info(f"_resolve_via_proxy: path={path}, session_id={session_id[:12] if session_id else '(empty)'}, PROXY_URL={PROXY_URL}")
+    logger.info("_resolve_via_proxy: path=%s, session_id=%s, PROXY_URL=%s", path, session_id[:12] if session_id else '(empty)', PROXY_URL)
     if not session_id or not PROXY_URL or not auth:
-        logger.warning(f"_resolve_via_proxy: skipping — session_id={'empty' if not session_id else 'set'}, PROXY_URL={'empty' if not PROXY_URL else 'set'}, auth={'empty' if not auth else 'set'}")
+        logger.warning("_resolve_via_proxy: skipping — session_id=%s, PROXY_URL=%s, auth=%s", 'empty' if not session_id else 'set', 'empty' if not PROXY_URL else 'set', 'empty' if not auth else 'set')
         return None, "", "file-tools is not session-bound (missing session_id/PROXY_URL/auth)"
     try:
         async with httpx.AsyncClient(timeout=HOOK_TIMEOUT) as client:
@@ -166,11 +169,11 @@ async def _resolve_via_proxy(path: str, writing: bool = False) -> tuple[str | No
         detail = ""
         try:
             detail = str(resp.json().get("detail", "")).strip()
-        except Exception:
+        except (ValueError, AttributeError):
             detail = (resp.text or "")[:200].strip()
         return None, "", f"proxy resolve-path {resp.status_code}: {detail or '(no detail)'}"
-    except Exception as e:
-        logger.debug(f"resolve-path failed for '{path}': {e}")
+    except (httpx.HTTPError, ValueError, AttributeError) as e:
+        logger.debug("resolve-path failed for '%s': %s", path, e)
         return None, "", f"resolve-path request failed: {e}"
 
 
@@ -263,7 +266,7 @@ async def _resolve_path(path: str, writing: bool = False) -> str:
     elif agents_rel:
         rel = agents_rel.lstrip("/")
         allowed = _session_subtree(agent)
-        resolved = str(Path(MOUNT_AGENTS_DIR + "/" + rel).resolve())
+        resolved = str(await asyncio.to_thread(Path(MOUNT_AGENTS_DIR + "/" + rel).resolve))
         # The separator matters: a bare prefix test admits a sibling such as
         # /agents/proj-a-evil/x.
         if allowed and (resolved == allowed or resolved.startswith(allowed + "/")):
@@ -482,7 +485,7 @@ _RESOLVE_ERR_PREFIX = "__RESOLVE_ERROR__:"
 async def _resolve_or_mark(path_value: str, *, writing: bool = False) -> str:
     try:
         return await _resolve_path(path_value, writing=writing)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  # a path that cannot be resolved becomes a marked error for the batch
         return _RESOLVE_ERR_PREFIX + (str(exc) or exc.__class__.__name__)
 
 
@@ -510,10 +513,22 @@ _WRITE_OP_ADVICE = (
 
 
 # ---------------------------------------------------------------------------
-# LibreOffice lock (serialize concurrent headless calls)
+# LibreOffice runs: one profile per slot, the slots by memory
 # ---------------------------------------------------------------------------
+#
+# Two LibreOffice processes on one user profile cannot run at once (the
+# second exits with no output), so each conversion slot has a profile of its
+# own and a conversion waits for a free slot. The slots follow the parse
+# workers' permits: two on a container of 3 GiB or more or with no memory
+# limit, one on a smaller one, where a second soffice beside the warm
+# background model and a parse worker would pass the container's memory. A
+# conversion writes only into the output directory its caller made for it,
+# so two conversions of one file run side by side.
 
-_libreoffice_lock = asyncio.Lock()
+_LO_TIMEOUT_S = 120
+# How long a conversion waits for a free slot: past two whole runs, a slot
+# that never comes back is an error the caller sees, never a hang.
+_LO_SLOT_WAIT_S = 300
 
 # The profile the headless conversions run under: formulas are never
 # recalculated on load, links are never updated, macros never run, and a
@@ -536,10 +551,33 @@ _LO_REGISTRY = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
-def _libreoffice_profile() -> str:
-    """The user-installation directory the conversions run under, its
+def _lo_slot_count() -> int:
+    from isolation import parse_permits
+
+    return parse_permits()
+
+
+_lo_free: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Queue]" = weakref.WeakKeyDictionary()
+# The runs in flight: a run outlives a caller that stopped waiting.
+_lo_runs: set[asyncio.Task] = set()
+
+
+def _lo_free_slots() -> asyncio.Queue:
+    """This loop's free slot numbers (one queue per event loop)."""
+    loop = asyncio.get_running_loop()
+    free = _lo_free.get(loop)
+    if free is None:
+        free = _lo_free[loop] = asyncio.Queue()
+        for slot in range(_lo_slot_count()):
+            free.put_nowait(slot)
+    return free
+
+
+def _libreoffice_profile(slot: int) -> str:
+    """The user-installation directory of one slot's conversions, its
     registry seeded with the pins above (written once, rewritten on drift)."""
-    user = os.path.join(_LO_PROFILE_DIR, "user")
+    profile = os.path.join(_LO_PROFILE_DIR, f"slot-{slot}")
+    user = os.path.join(profile, "user")
     os.makedirs(user, exist_ok=True)
     xcu = os.path.join(user, "registrymodifications.xcu")
     try:
@@ -549,42 +587,97 @@ def _libreoffice_profile() -> str:
     if current != _LO_REGISTRY:
         with open(xcu, "w", encoding="utf-8") as fh:
             fh.write(_LO_REGISTRY)
-    return _LO_PROFILE_DIR
+    return profile
 
 
-async def _libreoffice_convert(
-    input_path: str, output_format: str, output_dir: str | None = None
-) -> str:
+async def _libreoffice_convert(input_path: str, output_format: str, output_dir: str) -> str:
     """Convert a file with LibreOffice headless. Returns output path. The
     caller passes an ``output_dir`` outside the agent tree (a temp directory)
     and lands the result through ``safe_open_write``: LibreOffice writes by
-    name and must never write into the tree itself."""
-    if output_dir is None:
-        output_dir = str(Path(input_path).parent)
-    async with _libreoffice_lock:
-        # Under the lock: a drift rewrite never lands while a run reads it.
-        profile = await asyncio.to_thread(_libreoffice_profile)
+    name and must never write into the tree itself.
+
+    The run is a task of its own: a caller that stops waiting (the client
+    went away) ends it, and the run still ends its processes and waits for
+    them before it frees its slot."""
+    run = asyncio.ensure_future(_libreoffice_run(input_path, output_format, output_dir))
+    _lo_runs.add(run)
+    run.add_done_callback(_lo_runs.discard)
+    try:
+        await asyncio.shield(run)
+    except asyncio.CancelledError:
+        run.cancel()
+        raise
+    stem = Path(input_path).stem
+    out = Path(output_dir) / f"{stem}.{output_format}"
+    if not out.exists():
+        raise RuntimeError(f"Conversion produced no output file at {out}")
+    return str(out)
+
+
+async def _libreoffice_run(input_path: str, output_format: str, output_dir: str) -> None:
+    free = _lo_free_slots()
+    try:
+        slot = await asyncio.wait_for(free.get(), _LO_SLOT_WAIT_S)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"LibreOffice is busy: no conversion slot came free within {_LO_SLOT_WAIT_S}s"
+        ) from exc
+    proc = None
+    try:
+        # The slot is held: a drift rewrite never lands while a run reads it.
+        profile = await asyncio.to_thread(_libreoffice_profile, slot)
+        # Its own process group: the wrapper starts oosplash and soffice.bin,
+        # and ending the run ends all three.
         proc = await asyncio.create_subprocess_exec(
             "libreoffice", f"-env:UserInstallation=file://{profile}",
             "--headless", "--norestore", "--convert-to",
             output_format, "--outdir", output_dir, input_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=120
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=_LO_TIMEOUT_S
             )
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise RuntimeError("LibreOffice conversion timed out (120s)")
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"LibreOffice conversion timed out ({_LO_TIMEOUT_S}s)") from exc
         if proc.returncode != 0:
             raise RuntimeError(f"LibreOffice error: {stderr.decode()[:500]}")
-    stem = Path(input_path).stem
-    out = Path(output_dir) / f"{stem}.{output_format}"
-    if not out.exists():
-        raise RuntimeError(f"Conversion produced no output file at {out}")
-    return str(out)
+    finally:
+        # Ending the group and freeing the slot is one task of its own: a
+        # cancel that arrives while a lingering group is ended (the person
+        # stops a conversion that just timed out) leaves it running, and the
+        # slot still comes back once the group is gone.
+        cleanup = asyncio.ensure_future(_end_and_free(proc, free, slot))
+        _lo_runs.add(cleanup)
+        cleanup.add_done_callback(_lo_runs.discard)
+        await asyncio.shield(cleanup)
+
+
+async def _end_and_free(proc, free: asyncio.Queue, slot: int) -> None:
+    try:
+        if proc is not None and proc.returncode is None:
+            await _end_process_group(proc)
+    finally:
+        free.put_nowait(slot)
+
+
+async def _end_process_group(proc) -> None:
+    """End a run's whole process group and wait, five seconds at most, until
+    none of it is left, so the next run on the slot's profile never meets a
+    dying instance. The grandchildren are reaped by the image's init."""
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    await proc.wait()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(proc.pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        await asyncio.sleep(0.05)
+    logger.warning("LibreOffice run %s: its processes outlived the 5 s wait", proc.pid)
 
 
 # ---------------------------------------------------------------------------
@@ -616,8 +709,8 @@ async def _notify_file_written(file_path: str) -> bool:
             )
             if resp.status_code == 200:
                 return bool(resp.json().get("ok"))
-    except Exception as exc:
-        logger.warning(f"file-written notify failed (non-fatal): {exc}")
+    except (httpx.HTTPError, ValueError, AttributeError) as exc:
+        logger.warning("file-written notify failed (non-fatal): %s", exc)
     return False
 
 
@@ -648,8 +741,8 @@ async def _push_preview(file_path: str, filename: str | None = None):
                 },
                 headers={"Authorization": auth},
             )
-    except Exception as exc:
-        logger.warning(f"Preview push failed (non-fatal): {exc}")
+    except httpx.HTTPError as exc:
+        logger.warning("Preview push failed (non-fatal): %s", exc)
 
 
 # Dashboard previews never need print resolution — a multi-MB base64 body
@@ -676,7 +769,7 @@ async def _push_image_preview(
             buf = io.BytesIO()
             img.convert("RGB").save(buf, format="JPEG", quality=85)
             image_bytes, mime = buf.getvalue(), "image/jpeg"
-        except Exception:
+        except Exception:  # noqa: BLE001  # Pillow on the tool's image raises anything from a decoder
             pass  # best-effort — an oversized preview beats none
     b64 = base64.b64encode(image_bytes).decode()
     # Posts a 1-item gallery — the unified /v1/hooks/images endpoint renders
@@ -695,5 +788,5 @@ async def _push_image_preview(
                 },
                 headers={"Authorization": auth},
             )
-    except Exception as exc:
-        logger.warning(f"Image preview push failed (non-fatal): {exc}")
+    except httpx.HTTPError as exc:
+        logger.warning("Image preview push failed (non-fatal): %s", exc)

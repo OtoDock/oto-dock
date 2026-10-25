@@ -79,6 +79,7 @@ def test_a_template_tarball_takes_regular_files_only():
     # hardlink, its target in the archive or not) is skipped, never a
     # KeyError; the template's files come out.
     import shutil
+
     from services.community.community_agents_catalog import _extract_template_subfolder
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:

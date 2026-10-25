@@ -1,7 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
+import { useRef, useState } from 'react'
 import { useSpeechSession } from '@/hooks/useSpeechSession'
+import { useDictationDraft } from '@/hooks/useDictationDraft'
 import type { STTSession } from '@/audio/types'
+import { DICTATION_FINISHING } from '@/audio/backends/dictationWords'
 
 // ─── useSpeechSession (lifecycle; backend faked at the resolver) ─────────────
 
@@ -13,36 +16,62 @@ vi.mock('@/api/userAudio', () => ({
 }))
 vi.mock('@/audio/backends/platformStt', () => ({
   platformStt: { kind: 'platform', isAvailable: () => false, create: () => { throw new Error('unused') } },
+  STOP_FINAL_WAIT_MS: 10000,
+  STOP_BACKLOG_MAX_MS: 20000,
 }))
 
 interface FakeSession {
   session: STTSession
-  emit: { partial: (t: string) => void; final: (t: string) => void; end: () => void }
+  emit: {
+    partial: (t: string) => void; final: (t: string) => void; replace: (t: string) => void; end: () => void
+    error: (m: string) => void; notice: (t: string | null) => void
+  }
   resolveStart: () => void
   stopSpy: ReturnType<typeof vi.fn>
+  resolveStop: () => void
+  finishing: () => void
 }
+
+// A test sets this before the session is created: its stop() then waits
+// for resolveStop (the server's last final still on its way).
+let deferStop = false
+
+// A start after a stop waits for that stop (a few microtasks for a fake
+// whose stop resolves at once).
+const settle = () => act(async () => { for (let i = 0; i < 10; i++) await Promise.resolve() })
 
 let fakes: FakeSession[] = []
 
 function makeFakeSession(): FakeSession {
   const h = {
-    partial: (_: string) => {}, final: (_: string) => {}, error: (_: Error) => {}, end: () => {},
+    partial: (_: string) => {}, final: (_: string) => {}, replace: (_: string) => {}, error: (_: Error) => {}, end: () => {},
+    notice: (_: string | null) => {}, finishing: () => {},
   }
   let resolveStart = () => {}
-  const stopSpy = vi.fn(async () => {})
+  let resolveStop = () => {}
+  const deferred = deferStop
+  const stopSpy = vi.fn(() => deferred ? new Promise<void>((res) => { resolveStop = res }) : Promise.resolve())
   const session: STTSession = {
     start: () => new Promise<void>((res) => { resolveStart = res }),
     stop: stopSpy,
     onPartial: (f) => { h.partial = f },
     onFinal: (f) => { h.final = f },
+    onReplace: (f) => { h.replace = f },
     onError: (f) => { h.error = f },
     onEnd: (f) => { h.end = f },
+    onNotice: (f) => { h.notice = f },
+    onFinishing: (f) => { h.finishing = f },
   }
   const fake: FakeSession = {
     session,
-    emit: { partial: (t) => h.partial(t), final: (t) => h.final(t), end: () => h.end() },
+    emit: {
+      partial: (t) => h.partial(t), final: (t) => h.final(t), replace: (t) => h.replace(t), end: () => h.end(),
+      error: (m) => h.error(new Error(m)), notice: (t) => h.notice(t),
+    },
     resolveStart: () => resolveStart(),
     stopSpy,
+    resolveStop: () => resolveStop(),
+    finishing: () => h.finishing(),
   }
   fakes.push(fake)
   return fake
@@ -55,10 +84,200 @@ vi.mock('@/audio/resolver', () => ({
 describe('useSpeechSession', () => {
   beforeEach(() => {
     fakes = []
+    deferStop = false
     vi.useFakeTimers()
   })
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it('a replace from the engine rewrites the session\'s words, and a discarded session drops a late one', async () => {
+    const onFinal = vi.fn()
+    const onReplace = vi.fn()
+    const onCommit = vi.fn()
+    const { result } = renderHook(() => useSpeechSession({ onFinal, onReplace, onCommit }))
+    act(() => { void result.current.start() })
+    act(() => { fakes[0].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { fakes[0].emit.final('yes sir'); fakes[0].emit.replace('Ναι κύριε') })
+    expect(onReplace).toHaveBeenCalledWith('Ναι κύριε')
+    act(() => { fakes[0].emit.end() })
+    expect(onCommit).toHaveBeenCalledWith('Ναι κύριε')  // the commit carries the replaced words
+
+    act(() => { void result.current.start() })
+    act(() => { fakes[1].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { result.current.stop(true) })            // Send took the text
+    act(() => { fakes[1].emit.replace('late words') })
+    expect(onReplace).toHaveBeenCalledTimes(1)
+  })
+
+  it('a slow link\'s notice reaches the composer from the current session only, and clears at the stop', async () => {
+    const onNotice = vi.fn()
+    const { result } = renderHook(() => useSpeechSession({ onNotice }))
+    act(() => { void result.current.start() })
+    act(() => { fakes[0].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { fakes[0].emit.notice('The connection is slow.') })
+    expect(onNotice).toHaveBeenLastCalledWith('The connection is slow.')
+    act(() => { result.current.stop() })
+    expect(onNotice).toHaveBeenLastCalledWith(DICTATION_FINISHING)   // its last words on the way
+    await settle()
+    expect(onNotice).toHaveBeenLastCalledWith(null)
+    act(() => { fakes[0].emit.notice('late') })          // a stopped session says nothing more
+    expect(onNotice).not.toHaveBeenCalledWith('late')
+  })
+
+  it('a stopped session\'s late error never lands over the next recording', async () => {
+    const onError = vi.fn()
+    const { result } = renderHook(() => useSpeechSession({ onError }))
+    act(() => { void result.current.start() })
+    act(() => { fakes[0].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { result.current.stop() })
+    act(() => { void result.current.start() })
+    await settle()
+    act(() => { fakes[1].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { fakes[0].emit.error('The connection was lost.') })
+    expect(onError).not.toHaveBeenCalled()
+    expect(result.current.status).toBe('recording')
+    act(() => { fakes[1].emit.error('The connection was lost.') })
+    expect(onError).toHaveBeenCalledWith('The connection was lost.')
+  })
+
+  it('a tap right after a stop waits for the stopped dictation\'s last words: one copy in the box', async () => {
+    deferStop = true
+    const { result } = renderHook(() => {
+      const [text, setTextState] = useState('')
+      const valueRef = useRef('')
+      const keyRef = useRef<string | undefined>('chat-a')
+      const setText = (t: string) => { valueRef.current = t; setTextState(t) }
+      const draft = useDictationDraft({ valueRef, draftKeyRef: keyRef, setText, onStart: () => {}, afterChange: () => {} })
+      const speech = useSpeechSession({
+        onInterim: draft.showInterim, onFinal: draft.appendTranscript,
+        onReplace: draft.replaceTranscript, onActive: draft.onMicActive,
+      })
+      return { text, speech }
+    })
+    act(() => { void result.current.speech.start() })
+    act(() => { fakes[0].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { fakes[0].emit.partial('ένα δύο τρία') })
+    expect(result.current.text).toBe('ένα δύο τρία')
+    act(() => { result.current.speech.stop() })            // the server still owes the last final
+    act(() => { void result.current.speech.start() })      // and the person taps at once
+    expect(result.current.speech.status).toBe('connecting')
+    expect(fakes.length).toBe(1)                            // no new attempt yet: no snapshot taken
+    act(() => { fakes[0].emit.final('ένα δύο τρία') })     // the last words land
+    act(() => { fakes[0].resolveStop() })
+    await settle()
+    expect(fakes.length).toBe(2)
+    act(() => { fakes[1].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { fakes[1].emit.final('τέσσερα') })
+    expect(result.current.text).toBe('ένα δύο τρία τέσσερα')
+  })
+
+  it('a tap after a stop on a slow uplink still waits past ten seconds for the last words', async () => {
+    deferStop = true
+    const { result } = renderHook(() => {
+      const [text, setTextState] = useState('')
+      const valueRef = useRef('')
+      const keyRef = useRef<string | undefined>('chat-a')
+      const setText = (t: string) => { valueRef.current = t; setTextState(t) }
+      const draft = useDictationDraft({ valueRef, draftKeyRef: keyRef, setText, onStart: () => {}, afterChange: () => {} })
+      const speech = useSpeechSession({
+        onInterim: draft.showInterim, onFinal: draft.appendTranscript,
+        onReplace: draft.replaceTranscript, onActive: draft.onMicActive,
+      })
+      return { text, speech }
+    })
+    act(() => { void result.current.speech.start() })
+    act(() => { fakes[0].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { fakes[0].emit.partial('ένα δύο τρία') })
+    act(() => { result.current.speech.stop() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(12_000) })   // past the plain bound
+    act(() => { void result.current.speech.start() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+    expect(result.current.speech.status).toBe('connecting')
+    expect(fakes.length).toBe(1)                            // still waiting: no snapshot yet
+    act(() => { fakes[0].emit.final('ένα δύο τρία') })     // the backlog's last words, 15 s in
+    act(() => { fakes[0].resolveStop() })
+    await settle()
+    expect(fakes.length).toBe(2)
+    act(() => { fakes[1].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { fakes[1].emit.final('τέσσερα') })
+    expect(result.current.text).toBe('ένα δύο τρία τέσσερα')
+  })
+
+  it('a plain stop says it is finishing until its last words land, the composer free at once', async () => {
+    deferStop = true
+    const onNotice = vi.fn()
+    const onActive = vi.fn()
+    const { result } = renderHook(() => useSpeechSession({ onNotice, onActive }))
+    act(() => { void result.current.start() })
+    act(() => { fakes[0].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { result.current.stop() })
+    expect(result.current.status).toBe('finishing')
+    expect(onNotice).toHaveBeenLastCalledWith(DICTATION_FINISHING)
+    expect(onActive).toHaveBeenLastCalledWith(false)        // edits are the person's again at once
+    act(() => { result.current.stop() })                    // a focus while it finishes: nothing to stop
+    expect(result.current.status).toBe('finishing')
+    act(() => { fakes[0].resolveStop() })
+    await settle()
+    expect(result.current.status).toBe('idle')
+    expect(onNotice).toHaveBeenLastCalledWith(null)
+  })
+
+  it('the finishing state ends at the bound when the last words never come', async () => {
+    deferStop = true
+    const onNotice = vi.fn()
+    const { result } = renderHook(() => useSpeechSession({ onNotice }))
+    act(() => { void result.current.start() })
+    act(() => { fakes[0].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { result.current.stop() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(29_000) })
+    expect(result.current.status).toBe('finishing')
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_100) })
+    expect(result.current.status).toBe('idle')
+    expect(onNotice).toHaveBeenLastCalledWith(null)
+  })
+
+  it('a tap while the last words are on the way starts the next dictation, which waits for them', async () => {
+    deferStop = true
+    const onNotice = vi.fn()
+    const { result } = renderHook(() => useSpeechSession({ onNotice }))
+    act(() => { void result.current.start() })
+    act(() => { fakes[0].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { result.current.stop() })
+    act(() => { result.current.toggle() })
+    expect(result.current.status).toBe('connecting')
+    act(() => { fakes[0].resolveStop() })
+    await settle()
+    expect(fakes.length).toBe(2)
+    expect(onNotice).toHaveBeenLastCalledWith(null)        // the finishing note gives way
+    act(() => { fakes[1].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    expect(result.current.status).toBe('recording')
+  })
+
+  it('a session the server ends leaves recording for finishing until its words land', async () => {
+    const onError = vi.fn()
+    const { result } = renderHook(() => useSpeechSession({ onError }))
+    act(() => { void result.current.start() })
+    act(() => { fakes[0].resolveStart() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(600) })
+    act(() => { fakes[0].finishing() })
+    expect(result.current.status).toBe('finishing')
+    act(() => { fakes[0].emit.error('Dictation reached its time limit and stopped.') })
+    expect(result.current.status).toBe('idle')
+    expect(onError).toHaveBeenCalledWith('Dictation reached its time limit and stopped.')
   })
 
   it('a timed-out start leaves NO zombie — late finals are dropped, the session is stopped', async () => {
@@ -139,6 +358,7 @@ describe('useSpeechSession', () => {
     expect(result.current.status).toBe('connecting')
     act(() => { fakes[0].emit.end() })
     expect(result.current.status).toBe('connecting') // NOT knocked back to idle
+    await settle()                                     // A's stop resolved: B is created
     // B completes and is fully functional.
     act(() => { fakes[1].resolveStart() })
     await act(async () => { await vi.advanceTimersByTimeAsync(600) })

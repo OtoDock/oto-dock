@@ -7,11 +7,14 @@ formatting, transitions, connectors, hyperlinks, and slide management.
 
 import copy
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from equations import latex_to_png
 from isolation import run_parse
 from shared import (
+    _WRITE_OP_ADVICE,
     HELP_POINTER,
     _checked_resolved,
     _dropped_note,
@@ -21,10 +24,9 @@ from shared import (
     _push_preview,
     _resolve_path,
     _to_agents_relative,
-    _WRITE_OP_ADVICE,
+    cleanup_partials,
     help_text,
     logger,
-    cleanup_partials,
     safe_open_write,
     split_help_ops,
 )
@@ -34,82 +36,8 @@ _SHAPE = "shape_name (its name or its whole text) or shape_index"
 _RUN_KEYS = "font_size? (pt), bold?, italic?, underline?, color? (hex), font_name?"
 _BOX = "left?, top?, width?, height? (inches)"
 
-# What {"op": "help"} answers; one entry per operation the dispatcher in
-# _write_pptx_core knows (a test holds the two together).
-_HELP_GROUPS = (
-    ("SLIDES", (
-        ("add_slide", "layout? (title | title_and_content | section_header | two_content "
-                      "| comparison | title_only | blank, default blank)"),
-        ("delete_slide", f"{_SLIDE}"),
-        ("duplicate_slide", f"{_SLIDE} (the copy is added last)"),
-        ("move_slide", "from_index, to_index (0-based, -1 = last)"),
-        ("set_slide_dimensions", "width? (13.333), height? (7.5) in inches"),
-        ("set_core_properties", "title?, author?, subject?, keywords?, comments?"),
-    )),
-    ("TEXT", (
-        ("set_text", f"{_SLIDE}, placeholder? (title | body | its index, default title), "
-                     f"text with {_RUN_KEYS}, or runs: [{{text, {_RUN_KEYS}}}]"),
-        ("add_textbox", f"{_SLIDE}, text with {_RUN_KEYS}, or runs; {_BOX}, alignment? "
-                        "(left | center | right | justify), word_wrap? (true), auto_size?, "
-                        "margin? (inches)"),
-        ("add_bullet_points", f"{_SLIDE}, items: [text or {{text, level? (0-8)}}], "
-                              f"font_size?; target: {_SHAPE}, or placeholder? (body by default)"),
-        ("format_text", f"{_SLIDE}, find (text on the slide), {_RUN_KEYS}"),
-    )),
-    ("SHAPES", (
-        ("add_shape", f"{_SLIDE}, shape_type (rectangle, rounded_rectangle, oval, triangle, "
-                      "diamond, arrow_right / arrow_left / arrow_up / arrow_down, star, star_4, "
-                      "star_6, chevron, pentagon, hexagon, cloud, heart, lightning, plus, "
-                      "flowchart_process / flowchart_decision / flowchart_data / "
-                      f"flowchart_terminator, callout_1, callout_2), {_BOX}, text?, "
-                      "text_alignment?, font_size?, bold?, font_color?, font_name?, "
-                      "fill_color?, no_fill?, line_color?, line_width? (pt), rotation? (degrees)"),
-        ("set_shape_format", f"{_SLIDE}, {_SHAPE}, fill_color?, no_fill?, line_color?, "
-                             f"line_width?, rotation?, {_BOX}: resizes and moves a shape"),
-        ("remove_shape", f"{_SLIDE}, {_SHAPE}"),
-        ("add_group_shape", f"{_SLIDE}, name?"),
-        ("add_freeform", f"{_SLIDE}, points: [[x, y] or {{x, y}}, ...] (inches, 2 or more), "
-                         "close? (true), fill_color?, line_color?"),
-        ("add_connector", f"{_SLIDE}, start_x, start_y, end_x, end_y (inches), line_color?, "
-                          "line_width?, arrow_start?, arrow_end?"),
-    )),
-    ("TABLES", (
-        ("add_table", f"{_SLIDE}, headers, rows, {_BOX}"),
-        ("format_table_cell", f"{_SLIDE}, table_index? (0), row, col, end_row? / end_col? "
-                              f"(a range), fill_color?, alignment?, vertical_alignment? (top | "
-                              f"middle | bottom), {_RUN_KEYS}, merge_to? {{row, col}}"),
-    )),
-    ("CHARTS", (
-        ("add_chart", f"{_SLIDE}, chart_type (column_clustered, column_stacked, "
-                      "bar_clustered, bar_stacked, line, line_markers, pie, pie_exploded, "
-                      "doughnut, scatter, scatter_lines, area, area_stacked, radar), "
-                      "categories, series: [{name, values, color? (hex)}] (scatter: "
-                      "[{name, x, y}]), colors? (per slice, pie and doughnut), title?, "
-                      f"has_legend?, {_BOX}"),
-        ("update_chart_data", f"{_SLIDE}, chart_index? (0), categories, series: "
-                              "[{name, values}]"),
-    )),
-    ("IMAGES / EQUATIONS", (
-        ("add_image", f"{_SLIDE}, image_path, left?, top?, width?, height? (one of the two "
-                      "keeps the aspect ratio)"),
-        ("add_equation", f"{_SLIDE}, latex, left?, top?, height? (0.8), width? (inches): a "
-                         "high-resolution picture; amsmath subset"),
-    )),
-    ("VISUAL", (
-        ("set_background", f"{_SLIDE}, color (hex), or gradient: [{{color, position? "
-                           "(0-1)}}, ...] and angle? (270); also as set_background_color"),
-        ("set_transition", f"{_SLIDE}, transition (fade | push | wipe | split | reveal | "
-                           "cover | dissolve), duration? (ms, the effect's speed), "
-                           "advance_after? (ms: advance by itself)"),
-    )),
-    ("NOTES / LINKS / NUMBERS", (
-        ("set_speaker_notes", f"{_SLIDE}, text, append?"),
-        ("add_hyperlink", f"{_SLIDE}, {_SHAPE}, url, text? (a linked run in the shape's "
-                          "text; without it the whole shape links), color?"),
-        ("set_slide_number", "enabled: false removes the slide-number placeholders "
-                             "from the layouts"),
-    )),
-)
+# An old spelling still accepted, answered for its operation.
+_ALIASES = {"set_background_color": "set_background"}
 _HELP_NOTES = ("UNITS: positions and sizes are INCHES (a 16:9 slide is 13.333 x 7.5), "
                "font sizes and line widths POINTS. Style charts and shapes in the deck's "
                "palette.")
@@ -280,7 +208,7 @@ def read_pptx(path: str) -> str:
             meta.append(f"Author: {props.author}")
         if meta:
             result.append("**Properties**: " + " | ".join(meta))
-    except Exception:
+    except Exception:  # noqa: BLE001  # python-pptx on a user's deck raises anything from its parser
         pass
 
     result.append("")
@@ -295,7 +223,7 @@ def read_pptx(path: str) -> str:
                 notes = slide.notes_slide.notes_text_frame.text.strip()
                 if notes:
                     result.append(f"  Notes: {notes}")
-        except Exception:
+        except Exception:  # noqa: BLE001  # python-pptx on a user's deck raises anything from its parser
             pass
 
         # Shape inventory
@@ -335,8 +263,7 @@ async def handle_write_pptx(args: dict) -> str:
     presentation) runs in a bounded worker child."""
     ops, dropped = _normalize_operations(args.get("operations"))
     help_ops, ops = split_help_ops(ops)
-    answer = help_text("write_pptx", _HELP_GROUPS, _HELP_NOTES, help_ops,
-                       {"set_background_color": "set_background"})
+    answer = help_text("write_pptx", _HELP_GROUPS, _HELP_NOTES, help_ops, _ALIASES)
     if help_ops and not ops:
         # A question never creates or previews a presentation.
         return answer + _dropped_note(dropped)
@@ -355,25 +282,888 @@ async def handle_write_pptx(args: dict) -> str:
     return msg + ("\n\n" + answer if answer else "")
 
 
+@dataclass
+class _PptxJob:
+    """What one write_pptx call's operations share (the core reads the same
+    errors list after the loop)."""
+    prs: Any
+    errors: list[str]
+    align_map: dict
+
+
+_LAYOUT_MAP = {
+    "title": 0, "title_and_content": 1, "section_header": 2,
+    "two_content": 3, "comparison": 4, "title_only": 5,
+    "blank": 6, "content": 1, "image": 6,
+}
+
+
+# ---------------------------------------------------------------------------
+# Write — slides
+# ---------------------------------------------------------------------------
+
+
+def _op_add_slide(job: _PptxJob, idx: int, op: dict) -> None:
+    layout_name = op.get("layout", "blank")
+    li = _LAYOUT_MAP.get(layout_name, 6)
+    li = min(li, len(job.prs.slide_layouts) - 1)
+    job.prs.slides.add_slide(job.prs.slide_layouts[li])
+
+
+def _op_delete_slide(job: _PptxJob, idx: int, op: dict) -> None:
+    _si = op.get("slide_index")
+    if _si is None:
+        _si = op.get("slide")
+    si = int(_si if _si is not None else -1)
+    n = len(job.prs.slides)
+    if si < 0:
+        si = n + si
+    if 0 <= si < n:
+        rId = job.prs.slides._sldIdLst[si].rId
+        job.prs.part.drop_rel(rId)
+        del job.prs.slides._sldIdLst[si]
+
+
+def _op_duplicate_slide(job: _PptxJob, idx: int, op: dict) -> None:
+    _si = op.get("slide_index")
+    if _si is None:
+        _si = op.get("slide")
+    si = int(_si if _si is not None else -1)
+    if si < 0:
+        si = len(job.prs.slides) + si
+    if si >= len(job.prs.slides):
+        job.errors.append(f"Op #{idx} duplicate_slide: index {si} out of range")
+        return
+    src = job.prs.slides[si]
+    layout = src.slide_layout
+    new_slide = job.prs.slides.add_slide(layout)
+    # Copy all shapes from source to new slide
+    for shape in src.shapes:
+        el = copy.deepcopy(shape._element)
+        new_slide.shapes._spTree.append(el)
+    # Copy notes
+    try:
+        if src.has_notes_slide:
+            notes_text = src.notes_slide.notes_text_frame.text
+            if notes_text:
+                new_slide.notes_slide.notes_text_frame.text = notes_text
+    except Exception:  # noqa: BLE001  # python-pptx on a user's deck raises anything from its parser
+        pass
+
+
+def _op_move_slide(job: _PptxJob, idx: int, op: dict) -> None:
+    sld_lst = job.prs.slides._sldIdLst
+    n = len(sld_lst)
+    from_idx, to_idx = (
+        i + n if i < 0 else i
+        for i in (int(op.get("from_index", 0)), int(op.get("to_index", 0))))
+    if not (0 <= from_idx < n and 0 <= to_idx < n):
+        job.errors.append(f"Op #{idx} move_slide: index out of range "
+                      f"(have {n} slides, use 0-{n - 1} or -1 for last)")
+        return
+    el = sld_lst[from_idx]
+    sld_lst.remove(el)
+    sld_lst.insert(to_idx, el)
+
+
+def _op_set_slide_dimensions(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.util import Inches
+
+    job.prs.slide_width = Inches(float(op.get("width", 13.333)))
+    job.prs.slide_height = Inches(float(op.get("height", 7.5)))
+
+
+# ---------------------------------------------------------------------------
+# Write — text & placeholders
+# ---------------------------------------------------------------------------
+
+
+def _op_set_text(job: _PptxJob, idx: int, op: dict) -> None:
+    slide = _get_slide(job.prs, op)
+    placeholder = str(op.get("placeholder", "title"))
+    ph_idx = int(placeholder) if placeholder.isdigit() else (0 if placeholder == "title" else 1)
+
+    for shape in slide.placeholders:
+        if shape.placeholder_format.idx == ph_idx:
+            # Support runs array for mixed formatting
+            runs_data = op.get("runs")
+            if runs_data and isinstance(runs_data, list):
+                shape.text = ""
+                tf = shape.text_frame
+                p = tf.paragraphs[0]
+                for rd in runs_data:
+                    run = p.add_run()
+                    run.text = rd.get("text", "")
+                    _apply_run_format(run, rd)
+            else:
+                shape.text = op.get("text", "")
+                if shape.text_frame.paragraphs:
+                    para = shape.text_frame.paragraphs[0]
+                    run = para.runs[0] if para.runs else para.add_run()
+                    if not para.runs:
+                        run.text = op.get("text", "")
+                    _apply_run_format(run, op)
+            break
+
+
+def _op_add_textbox(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.util import Inches
+
+    slide = _get_slide(job.prs, op)
+    left = Inches(float(op.get("left", 1)))
+    top = Inches(float(op.get("top", 1)))
+    width = Inches(float(op.get("width", 6)))
+    height = Inches(float(op.get("height", 1)))
+    txBox = slide.shapes.add_textbox(left, top, width, height)
+    tf = txBox.text_frame
+    tf.word_wrap = op.get("word_wrap", True)
+    if op.get("auto_size"):
+        from pptx.enum.text import MSO_AUTO_SIZE
+        tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    if op.get("margin") is not None:
+        m = Inches(float(op["margin"]))
+        tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = m
+
+    runs_data = op.get("runs")
+    p = tf.paragraphs[0]
+    if runs_data and isinstance(runs_data, list):
+        for rd in runs_data:
+            run = p.add_run()
+            run.text = rd.get("text", "")
+            _apply_run_format(run, rd)
+    else:
+        run = p.add_run()
+        run.text = op.get("text", "")
+        _apply_run_format(run, op)
+
+    alignment = op.get("alignment")
+    if alignment and alignment in job.align_map:
+        p.alignment = job.align_map[alignment]
+
+
+def _op_add_bullet_points(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.util import Pt
+
+    slide = _get_slide(job.prs, op)
+    # Find target text frame
+    shape_name = op.get("shape_name")
+    shape_idx = op.get("shape_index")
+    ph_raw = op.get("placeholder")
+    tf = None
+    if shape_name:
+        # Match by shape.name then by text content
+        for s in slide.shapes:
+            if s.has_text_frame and (s.name == shape_name or s.text_frame.text == shape_name):
+                tf = s.text_frame
+                break
+    elif shape_idx is not None:
+        shapes = list(slide.shapes)
+        si = int(shape_idx)
+        if 0 <= si < len(shapes) and shapes[si].has_text_frame:
+            tf = shapes[si].text_frame
+    elif ph_raw is not None:
+        # Accept named placeholders or numeric index
+        ph_names = {"title": 0, "body": 1, "subtitle": 1, "content": 1}
+        ph_idx = ph_names.get(str(ph_raw).lower(), None)
+        if ph_idx is None:
+            try:
+                ph_idx = int(ph_raw)
+            except (ValueError, TypeError):
+                job.errors.append(f"Op #{idx} add_bullet_points: unknown placeholder '{ph_raw}'")
+                return
+        for s in slide.placeholders:
+            if s.placeholder_format.idx == ph_idx:
+                tf = s.text_frame
+                break
+    else:
+        # Default: body placeholder (idx 1)
+        for s in slide.placeholders:
+            if s.placeholder_format.idx == 1:
+                tf = s.text_frame
+                break
+
+    if not tf:
+        job.errors.append(f"Op #{idx} add_bullet_points: no text frame found")
+        return
+
+    items = op.get("items", [])
+    for item in items:
+        if isinstance(item, dict):
+            text = item.get("text", "")
+            level = int(item.get("level", 0))
+        else:
+            text = str(item)
+            level = 0
+        p = tf.add_paragraph()
+        p.text = text
+        p.level = min(level, 8)
+        if op.get("font_size"):
+            for run in p.runs:
+                run.font.size = Pt(int(op["font_size"]))
+
+
+def _op_format_text(job: _PptxJob, idx: int, op: dict) -> None:
+    slide = _get_slide(job.prs, op)
+    find_text = op.get("find", "")
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        for para in shape.text_frame.paragraphs:
+            for run in para.runs:
+                if find_text in run.text:
+                    _apply_run_format(run, op)
+
+
+# ---------------------------------------------------------------------------
+# Write — shapes
+# ---------------------------------------------------------------------------
+
+
+def _op_add_shape(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.enum.text import PP_ALIGN
+    from pptx.util import Inches, Pt
+
+    slide = _get_slide(job.prs, op)
+    shape_type_name = op.get("shape_type", "rectangle")
+    shape_map = _get_shape_map()
+    mso_shape = shape_map.get(shape_type_name)
+    if not mso_shape:
+        job.errors.append(f"Op #{idx} add_shape: unknown shape_type '{shape_type_name}'. Available: {', '.join(shape_map.keys())}")
+        return
+
+    left = Inches(float(op.get("left", 1)))
+    top = Inches(float(op.get("top", 1)))
+    width = Inches(float(op.get("width", 2)))
+    height = Inches(float(op.get("height", 1)))
+
+    shape = slide.shapes.add_shape(mso_shape, left, top, width, height)
+
+    # Text
+    if op.get("text"):
+        shape.text = op["text"]
+        if shape.text_frame.paragraphs:
+            for para in shape.text_frame.paragraphs:
+                para.alignment = job.align_map.get(op.get("text_alignment", "center"), PP_ALIGN.CENTER)
+                for run in para.runs:
+                    _apply_run_format(run, {
+                        "font_size": op.get("font_size"),
+                        "bold": op.get("bold"),
+                        "color": op.get("font_color") or op.get("text_color"),
+                        "font_name": op.get("font_name"),
+                    })
+        shape.text_frame.word_wrap = True
+
+    # Fill
+    fill_color = op.get("fill_color") or op.get("fill")
+    if fill_color:
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = _parse_rgb(fill_color)
+    elif op.get("no_fill"):
+        shape.fill.background()
+
+    # Line
+    line_color = op.get("line_color")
+    if line_color:
+        shape.line.color.rgb = _parse_rgb(line_color)
+    if op.get("line_width"):
+        shape.line.width = Pt(float(op["line_width"]))
+
+    # Rotation
+    if op.get("rotation"):
+        shape.rotation = float(op["rotation"])
+
+
+def _op_set_shape_format(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.util import Inches, Pt
+
+    slide = _get_slide(job.prs, op)
+    shape = _find_shape(slide, op)
+
+    fill_color = op.get("fill_color") or op.get("fill")
+    if fill_color:
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = _parse_rgb(fill_color)
+    if op.get("no_fill"):
+        shape.fill.background()
+    if op.get("line_color"):
+        shape.line.color.rgb = _parse_rgb(op["line_color"])
+    if op.get("line_width"):
+        shape.line.width = Pt(float(op["line_width"]))
+    if op.get("rotation") is not None:
+        shape.rotation = float(op["rotation"])
+    # Resize and reposition
+    if op.get("width") is not None:
+        shape.width = Inches(float(op["width"]))
+    if op.get("height") is not None:
+        shape.height = Inches(float(op["height"]))
+    if op.get("left") is not None:
+        shape.left = Inches(float(op["left"]))
+    if op.get("top") is not None:
+        shape.top = Inches(float(op["top"]))
+
+
+def _op_remove_shape(job: _PptxJob, idx: int, op: dict) -> None:
+    slide = _get_slide(job.prs, op)
+    shape = _find_shape(slide, op)
+    sp = shape._element
+    sp.getparent().remove(sp)
+
+
+def _op_add_group_shape(job: _PptxJob, idx: int, op: dict) -> None:
+    slide = _get_slide(job.prs, op)
+    group = slide.shapes.add_group_shape()
+    if op.get("name"):
+        group.name = op["name"]
+
+
+def _op_add_freeform(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.util import Inches
+
+    slide = _get_slide(job.prs, op)
+    points = op.get("points", [])
+    if len(points) < 2:
+        job.errors.append(f"Op #{idx} add_freeform: need at least 2 points")
+        return
+    # Accept both [x, y] arrays and {"x": ..., "y": ...} dicts
+    def _pt(p):
+        if isinstance(p, (list, tuple)):
+            return float(p[0]), float(p[1])
+        return float(p.get("x", 0)), float(p.get("y", 0))
+    sx, sy = _pt(points[0])
+    builder = slide.shapes.build_freeform(Inches(sx), Inches(sy))
+    for pt in points[1:]:
+        px, py = _pt(pt)
+        builder.add_line_segment(Inches(px), Inches(py))
+    if op.get("close", True):
+        builder.add_line_segment(Inches(sx), Inches(sy))
+    shape = builder.convert_to_shape()
+    fill = op.get("fill_color")
+    if fill:
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = _parse_rgb(fill)
+    if op.get("line_color"):
+        shape.line.color.rgb = _parse_rgb(op["line_color"])
+
+
+# ---------------------------------------------------------------------------
+# Write — connectors
+# ---------------------------------------------------------------------------
+
+
+def _op_add_connector(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.oxml import parse_xml
+    from pptx.util import Inches, Pt
+
+    slide = _get_slide(job.prs, op)
+    from pptx.enum.shapes import MSO_CONNECTOR_TYPE
+    start_x = Inches(float(op.get("start_x", 1)))
+    start_y = Inches(float(op.get("start_y", 1)))
+    end_x = Inches(float(op.get("end_x", 5)))
+    end_y = Inches(float(op.get("end_y", 1)))
+
+    connector = slide.shapes.add_connector(
+        MSO_CONNECTOR_TYPE.STRAIGHT, start_x, start_y, end_x, end_y
+    )
+    if op.get("line_color"):
+        connector.line.color.rgb = _parse_rgb(op["line_color"])
+    if op.get("line_width"):
+        connector.line.width = Pt(float(op["line_width"]))
+
+    # Arrow heads via XML
+    if op.get("arrow_end") or op.get("arrow_start"):
+        ln = connector.line._ln
+        if op.get("arrow_end"):
+            tail = parse_xml(f'<a:tailEnd xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" type="arrow"/>')
+            ln.append(tail)
+        if op.get("arrow_start"):
+            head = parse_xml(f'<a:headEnd xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" type="arrow"/>')
+            ln.append(head)
+
+
+# ---------------------------------------------------------------------------
+# Write — images
+# ---------------------------------------------------------------------------
+
+
+def _op_add_image(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.util import Inches
+
+    slide = _get_slide(job.prs, op)
+    img_path = _checked_resolved(op.get("image_path", ""))
+    left = Inches(float(op.get("left", 1)))
+    top = Inches(float(op.get("top", 1)))
+    width = Inches(float(op["width"])) if op.get("width") else None
+    height = Inches(float(op["height"])) if op.get("height") else None
+    slide.shapes.add_picture(img_path, left, top, width=width, height=height)
+
+
+def _op_add_equation(job: _PptxJob, idx: int, op: dict) -> None:
+    # LaTeX equation as a 4×-oversampled PNG picture (pptx has no
+    # reliable native-math write path — python-pptx renders
+    # appended OMML as nothing).
+    import tempfile
+
+    from pptx.util import Inches
+
+    slide = _get_slide(job.prs, op)
+    latex = op.get("latex") or op.get("equation") or ""
+    left = Inches(float(op.get("left", 1)))
+    top = Inches(float(op.get("top", 2)))
+    height_in = float(op.get("height", 0.8))
+    width = Inches(float(op["width"])) if op.get("width") else None
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp.close()
+    try:
+        latex_to_png(latex, tmp.name, display=True,
+                     height_px=int(height_in * 96))
+        slide.shapes.add_picture(
+            tmp.name, left, top, width=width,
+            height=None if width else Inches(height_in),
+        )
+    finally:
+        os.unlink(tmp.name)
+
+
+# ---------------------------------------------------------------------------
+# Write — tables
+# ---------------------------------------------------------------------------
+
+
+def _op_add_table(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.util import Inches
+
+    slide = _get_slide(job.prs, op)
+    headers = op.get("headers", [])
+    rows = op.get("rows", [])
+    cols = len(headers)
+    total_rows = 1 + len(rows)
+    left = Inches(float(op.get("left", 1)))
+    top = Inches(float(op.get("top", 3)))
+    width = Inches(float(op.get("width", 8)))
+    height = Inches(float(op.get("height", 2)))
+    table_shape = slide.shapes.add_table(total_rows, cols, left, top, width, height)
+    table = table_shape.table
+    for ci, h in enumerate(headers):
+        table.cell(0, ci).text = str(h)
+    for ri, row in enumerate(rows):
+        for ci, val in enumerate(row):
+            if ci < cols:
+                table.cell(ri + 1, ci).text = str(val)
+
+
+def _op_format_table_cell(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.enum.text import MSO_ANCHOR
+
+    slide = _get_slide(job.prs, op)
+    ti = int(op.get("table_index", 0))
+    tables = [s for s in slide.shapes if s.has_table]
+    if ti >= len(tables):
+        job.errors.append(f"Op #{idx} format_table_cell: table_index {ti} out of range")
+        return
+    table = tables[ti].table
+    row = int(op.get("row", 0))
+    col = int(op.get("col", 0))
+
+    # Support range
+    end_row = int(op.get("end_row", row))
+    end_col = int(op.get("end_col", col))
+
+    for r in range(row, end_row + 1):
+        for c in range(col, end_col + 1):
+            if r >= len(table.rows) or c >= len(table.columns):
+                continue
+            cell = table.cell(r, c)
+            # Fill
+            fill_color = op.get("fill_color") or op.get("fill")
+            if fill_color:
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = _parse_rgb(fill_color)
+            # Text formatting
+            for para in cell.text_frame.paragraphs:
+                if op.get("alignment") and op["alignment"] in job.align_map:
+                    para.alignment = job.align_map[op["alignment"]]
+                for run in para.runs:
+                    _apply_run_format(run, op)
+            # Vertical alignment
+            if op.get("vertical_alignment"):
+                va_map = {"top": MSO_ANCHOR.TOP, "middle": MSO_ANCHOR.MIDDLE, "bottom": MSO_ANCHOR.BOTTOM}
+                va = va_map.get(op["vertical_alignment"])
+                if va:
+                    cell.vertical_anchor = va
+
+    # Merge
+    merge_to = op.get("merge_to")
+    if merge_to:
+        mr, mc = int(merge_to.get("row", row)), int(merge_to.get("col", col))
+        table.cell(row, col).merge(table.cell(mr, mc))
+
+
+# ---------------------------------------------------------------------------
+# Write — charts
+# ---------------------------------------------------------------------------
+
+
+def _op_add_chart(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.chart.data import CategoryChartData, XyChartData
+    from pptx.util import Inches
+
+    slide = _get_slide(job.prs, op)
+    chart_type_name = op.get("chart_type", "column_clustered")
+    ct_map = _get_chart_type_map()
+    xl_ct = ct_map.get(chart_type_name)
+    if not xl_ct:
+        job.errors.append(f"Op #{idx} add_chart: unknown chart_type '{chart_type_name}'. "
+                      f"Available: {', '.join(ct_map)}")
+        return
+
+    categories = op.get("categories", [])
+    series_list = op.get("series", [])
+
+    left = Inches(float(op.get("left", 1)))
+    top = Inches(float(op.get("top", 2)))
+    width = Inches(float(op.get("width", 8)))
+    height = Inches(float(op.get("height", 4.5)))
+
+    # Scatter/XY charts use XyChartData
+    if chart_type_name.startswith("scatter"):
+        chart_data = XyChartData()
+        for s in series_list:
+            xy_series = chart_data.add_series(s.get("name", "Series"))
+            x_vals = s.get("x", s.get("values", []))
+            y_vals = s.get("y", [])
+            for xi, yi in zip(x_vals, y_vals, strict=False):
+                xy_series.add_data_point(xi, yi)
+    else:
+        chart_data = CategoryChartData()
+        chart_data.categories = categories
+        for s in series_list:
+            chart_data.add_series(s.get("name", "Series"), s.get("values", []))
+
+    chart_frame = slide.shapes.add_chart(xl_ct, left, top, width, height, chart_data)
+    chart = chart_frame.chart
+
+    if op.get("title"):
+        chart.has_title = True
+        chart.chart_title.text_frame.text = op["title"]
+    if op.get("has_legend") is not None:
+        chart.has_legend = op["has_legend"]
+
+    # Colors: per-series "color" (hex); pie/doughnut take an
+    # op-level "colors" array applied per slice. Without these,
+    # decks keep Office default steel-blue amid custom-styled
+    # slides.
+    try:
+        if chart_type_name in ("pie", "pie_exploded", "doughnut"):
+            slice_colors = op.get("colors") or (
+                series_list[0].get("colors") if series_list else []) or []
+            if slice_colors:
+                for point, col in zip(chart.series[0].points, slice_colors, strict=False):
+                    point.format.fill.solid()
+                    point.format.fill.fore_color.rgb = _parse_rgb(col)
+        else:
+            for s_def, s_obj in zip(series_list, chart.series, strict=False):
+                col = s_def.get("color")
+                if not col:
+                    continue
+                rgb = _parse_rgb(col)
+                if chart_type_name.startswith(("line", "scatter", "radar")):
+                    s_obj.format.line.color.rgb = rgb
+                    try:
+                        s_obj.marker.format.fill.solid()
+                        s_obj.marker.format.fill.fore_color.rgb = rgb
+                    except Exception:  # noqa: BLE001  # python-pptx on a user's deck raises anything from its parser
+                        pass  # marker styling is best-effort
+                else:
+                    s_obj.format.fill.solid()
+                    s_obj.format.fill.fore_color.rgb = rgb
+    except Exception as exc:  # noqa: BLE001  # python-pptx on a user's deck raises anything from its parser
+        job.errors.append(f"Op #{idx} add_chart: color styling failed: {exc}")
+
+
+def _op_update_chart_data(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.chart.data import CategoryChartData
+
+    slide = _get_slide(job.prs, op)
+    # Find chart shape
+    ci = int(op.get("chart_index", 0))
+    charts = [s for s in slide.shapes if s.has_chart]
+    if ci >= len(charts):
+        job.errors.append(f"Op #{idx} update_chart_data: chart_index {ci} out of range")
+        return
+    chart = charts[ci].chart
+    chart_data = CategoryChartData()
+    chart_data.categories = op.get("categories", [])
+    for s in op.get("series", []):
+        chart_data.add_series(s.get("name", "Series"), s.get("values", []))
+    chart.replace_data(chart_data)
+
+
+# ---------------------------------------------------------------------------
+# Write — background & transitions
+# ---------------------------------------------------------------------------
+
+
+def _op_set_background(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.oxml import parse_xml
+    from pptx.oxml.ns import qn
+
+    slide = _get_slide(job.prs, op)
+    bg = slide.background
+    gradient = op.get("gradient")
+    if gradient and isinstance(gradient, list) and len(gradient) >= 2:
+        # Build gradient XML directly (python-pptx gradient API is limited)
+        ns_a = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        stops_xml = ""
+        for i, g in enumerate(gradient):
+            color = _parse_rgb(g.get("color", "FFFFFF"))
+            pos = float(g.get("position", i / (len(gradient) - 1)))
+            pos_pct = int(pos * 100000)
+            stops_xml += (
+                f'<a:gs pos="{pos_pct}" xmlns:a="{ns_a}">'
+                f'<a:srgbClr val="{color}"/>'
+                f'</a:gs>'
+            )
+        angle = int(float(op.get("angle", 270)) * 60000)  # EMU degrees
+        grad_xml = (
+            f'<a:gradFill xmlns:a="{ns_a}">'
+            f'<a:gsLst>{stops_xml}</a:gsLst>'
+            f'<a:lin ang="{angle}" scaled="1"/>'
+            f'</a:gradFill>'
+        )
+        bg_pr = bg._element  # p:bg element
+        # Clear existing fill
+        bgPr = bg_pr.find(qn("p:bgPr"))
+        if bgPr is None:
+            bgPr = parse_xml(
+                f'<p:bgPr xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">'
+                f'<a:noFill xmlns:a="{ns_a}"/>'
+                f'<a:effectLst xmlns:a="{ns_a}"/>'
+                f'</p:bgPr>'
+            )
+            bg_pr.append(bgPr)
+        # Remove old fill children
+        for child in list(bgPr):
+            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if tag in ("solidFill", "gradFill", "noFill", "pattFill"):
+                bgPr.remove(child)
+        bgPr.insert(0, parse_xml(grad_xml))
+    else:
+        fill = bg.fill
+        fill.solid()
+        c = op.get("color", "FFFFFF")
+        fill.fore_color.rgb = _parse_rgb(c)
+
+
+def _op_set_transition(job: _PptxJob, idx: int, op: dict) -> None:
+    from pptx.oxml import parse_xml
+    from pptx.oxml.ns import qn
+
+    slide = _get_slide(job.prs, op)
+    # Accept multiple key names: transition/effect/name
+    transition = op.get("transition") or op.get("effect") or op.get("name") or "fade"
+    # If transition is a dict (LLM sends {"type": "fade", "duration": 1000}), extract
+    if isinstance(transition, dict):
+        duration = int(transition.get("duration", op.get("duration", 1000)))
+        advance_after = transition.get("advance_after", op.get("advance_after"))
+        transition = transition.get("type") or transition.get("name") or transition.get("effect") or "fade"
+    else:
+        duration = int(op.get("duration", 1000))
+        advance_after = op.get("advance_after")
+
+    # XML-based transition
+    trans_map = {
+        "fade": "fade", "push": "push", "wipe": "wipe",
+        "split": "split", "reveal": "reveal", "cover": "cover",
+        "dissolve": "dissolve",
+    }
+    trans_tag = trans_map.get(transition, "fade")
+    ns = "http://schemas.openxmlformats.org/presentationml/2006/main"
+
+    # Remove existing transition
+    existing = slide._element.findall(qn("p:transition"))
+    for e in existing:
+        slide._element.remove(e)
+
+    # duration is the effect's speed; only advance_after advances
+    # the slide by itself (advTm).
+    speed = "fast" if duration <= 500 else "med" if duration <= 1000 else "slow"
+    trans_el = parse_xml(
+        f'<p:transition xmlns:p="{ns}" spd="{speed}">'
+        f'<p:{trans_tag}/>'
+        f'</p:transition>'
+    )
+    if advance_after:
+        trans_el.set("advTm", str(advance_after))
+        trans_el.set("advClick", "0")
+
+    slide._element.append(trans_el)
+
+
+# ---------------------------------------------------------------------------
+# Write — speaker notes
+# ---------------------------------------------------------------------------
+
+
+def _op_set_speaker_notes(job: _PptxJob, idx: int, op: dict) -> None:
+    slide = _get_slide(job.prs, op)
+    text = op.get("text", "")
+    notes_slide = slide.notes_slide
+    tf = notes_slide.notes_text_frame
+    if op.get("append") and tf.text.strip():
+        tf.text = tf.text + "\n" + text
+    else:
+        tf.text = text
+
+
+# ---------------------------------------------------------------------------
+# Write — hyperlinks
+# ---------------------------------------------------------------------------
+
+
+def _op_add_hyperlink(job: _PptxJob, idx: int, op: dict) -> None:
+    slide = _get_slide(job.prs, op)
+    url = op.get("url", "")
+    shape = _find_shape(slide, op)
+    if shape.has_text_frame:
+        # Add hyperlink on a run
+        text = op.get("text")
+        if text:
+            p = shape.text_frame.paragraphs[-1]
+            run = p.add_run()
+            run.text = text
+            run.hyperlink.address = url
+            run.font.color.rgb = _parse_rgb(op.get("color", "0563C1"))
+            run.font.underline = True
+        else:
+            # Hyperlink on whole shape
+            shape.click_action.hyperlink.address = url
+    else:
+        shape.click_action.hyperlink.address = url
+
+
+# ---------------------------------------------------------------------------
+# Write — slide numbers & properties
+# ---------------------------------------------------------------------------
+
+
+def _op_set_slide_number(job: _PptxJob, idx: int, op: dict) -> None:
+    # Enable slide numbers by adding placeholder to slide master
+    enabled = op.get("enabled", True)
+    for slide_master in job.prs.slide_masters:
+        for layout in slide_master.slide_layouts:
+            for ph in layout.placeholders:
+                if ph.placeholder_format.idx == 12:  # Slide number
+                    if not enabled:
+                        ph._element.getparent().remove(ph._element)
+                    break
+
+
+def _op_set_core_properties(job: _PptxJob, idx: int, op: dict) -> None:
+    props = job.prs.core_properties
+    if op.get("title"):
+        props.title = op["title"]
+    if op.get("author"):
+        props.author = op["author"]
+    if op.get("subject"):
+        props.subject = op["subject"]
+    if op.get("keywords"):
+        props.keywords = op["keywords"]
+    if op.get("comments"):
+        props.comments = op["comments"]
+
+
+# What {"op": "help"} answers and what the core dispatches to: per group, per
+# operation, its handler and its keys. _HELP_GROUPS (the help text's input)
+# and _HANDLERS are derived from it, so neither can miss an operation.
+_OPS = (
+    ("SLIDES", (
+        ("add_slide", _op_add_slide, "layout? (title | title_and_content | section_header | two_content "
+                                     "| comparison | title_only | blank, default blank)"),
+        ("delete_slide", _op_delete_slide, f"{_SLIDE}"),
+        ("duplicate_slide", _op_duplicate_slide, f"{_SLIDE} (the copy is added last)"),
+        ("move_slide", _op_move_slide, "from_index, to_index (0-based, -1 = last)"),
+        ("set_slide_dimensions", _op_set_slide_dimensions, "width? (13.333), height? (7.5) in inches"),
+        ("set_core_properties", _op_set_core_properties, "title?, author?, subject?, keywords?, comments?"),
+    )),
+    ("TEXT", (
+        ("set_text", _op_set_text, f"{_SLIDE}, placeholder? (title | body | its index, default title), "
+                                   f"text with {_RUN_KEYS}, or runs: [{{text, {_RUN_KEYS}}}]"),
+        ("add_textbox", _op_add_textbox, f"{_SLIDE}, text with {_RUN_KEYS}, or runs; {_BOX}, alignment? "
+                                         "(left | center | right | justify), word_wrap? (true), auto_size?, "
+                                         "margin? (inches)"),
+        ("add_bullet_points", _op_add_bullet_points, f"{_SLIDE}, items: [text or {{text, level? (0-8)}}], "
+                                                     f"font_size?; target: {_SHAPE}, or placeholder? (body by default)"),
+        ("format_text", _op_format_text, f"{_SLIDE}, find (text on the slide), {_RUN_KEYS}"),
+    )),
+    ("SHAPES", (
+        ("add_shape", _op_add_shape, f"{_SLIDE}, shape_type (rectangle, rounded_rectangle, oval, triangle, "
+                                     "diamond, arrow_right / arrow_left / arrow_up / arrow_down, star, star_4, "
+                                     "star_6, chevron, pentagon, hexagon, cloud, heart, lightning, plus, "
+                                     "flowchart_process / flowchart_decision / flowchart_data / "
+                                     f"flowchart_terminator, callout_1, callout_2), {_BOX}, text?, "
+                                     "text_alignment?, font_size?, bold?, font_color?, font_name?, "
+                                     "fill_color?, no_fill?, line_color?, line_width? (pt), rotation? (degrees)"),
+        ("set_shape_format", _op_set_shape_format, f"{_SLIDE}, {_SHAPE}, fill_color?, no_fill?, line_color?, "
+                                                   f"line_width?, rotation?, {_BOX}: resizes and moves a shape"),
+        ("remove_shape", _op_remove_shape, f"{_SLIDE}, {_SHAPE}"),
+        ("add_group_shape", _op_add_group_shape, f"{_SLIDE}, name?"),
+        ("add_freeform", _op_add_freeform, f"{_SLIDE}, points: [[x, y] or {{x, y}}, ...] (inches, 2 or more), "
+                                           "close? (true), fill_color?, line_color?"),
+        ("add_connector", _op_add_connector, f"{_SLIDE}, start_x, start_y, end_x, end_y (inches), line_color?, "
+                                             "line_width?, arrow_start?, arrow_end?"),
+    )),
+    ("TABLES", (
+        ("add_table", _op_add_table, f"{_SLIDE}, headers, rows, {_BOX}"),
+        ("format_table_cell", _op_format_table_cell, f"{_SLIDE}, table_index? (0), row, col, end_row? / end_col? "
+                                                     f"(a range), fill_color?, alignment?, vertical_alignment? (top | "
+                                                     f"middle | bottom), {_RUN_KEYS}, merge_to? {{row, col}}"),
+    )),
+    ("CHARTS", (
+        ("add_chart", _op_add_chart, f"{_SLIDE}, chart_type (column_clustered, column_stacked, "
+                                     "bar_clustered, bar_stacked, line, line_markers, pie, pie_exploded, "
+                                     "doughnut, scatter, scatter_lines, area, area_stacked, radar), "
+                                     "categories, series: [{name, values, color? (hex)}] (scatter: "
+                                     "[{name, x, y}]), colors? (per slice, pie and doughnut), title?, "
+                                     f"has_legend?, {_BOX}"),
+        ("update_chart_data", _op_update_chart_data, f"{_SLIDE}, chart_index? (0), categories, series: "
+                                                     "[{name, values}]"),
+    )),
+    ("IMAGES / EQUATIONS", (
+        ("add_image", _op_add_image, f"{_SLIDE}, image_path, left?, top?, width?, height? (one of the two "
+                                     "keeps the aspect ratio)"),
+        ("add_equation", _op_add_equation, f"{_SLIDE}, latex, left?, top?, height? (0.8), width? (inches): a "
+                                           "high-resolution picture; amsmath subset"),
+    )),
+    ("VISUAL", (
+        ("set_background", _op_set_background, f"{_SLIDE}, color (hex), or gradient: [{{color, position? "
+                                               "(0-1)}}, ...] and angle? (270); also as set_background_color"),
+        ("set_transition", _op_set_transition, f"{_SLIDE}, transition (fade | push | wipe | split | reveal | "
+                                               "cover | dissolve), duration? (ms, the effect's speed), "
+                                               "advance_after? (ms: advance by itself)"),
+    )),
+    ("NOTES / LINKS / NUMBERS", (
+        ("set_speaker_notes", _op_set_speaker_notes, f"{_SLIDE}, text, append?"),
+        ("add_hyperlink", _op_add_hyperlink, f"{_SLIDE}, {_SHAPE}, url, text? (a linked run in the shape's "
+                                             "text; without it the whole shape links), color?"),
+        ("set_slide_number", _op_set_slide_number, "enabled: false removes the slide-number placeholders "
+                                                   "from the layouts"),
+    )),
+)
+
+_HELP_GROUPS = tuple((group, tuple((name, keys) for name, _, keys in ops)) for group, ops in _OPS)
+_HANDLERS = {name: handler for _, ops in _OPS for name, handler, _ in ops}
+_HANDLERS.update({alias: _HANDLERS[name] for alias, name in _ALIASES.items()})
+
+
 def _write_pptx_core(path: str, ops: list, dropped: int, create_new: bool) -> str:
     """Worker core: op application + atomic save + result message."""
     from pptx import Presentation
-    from pptx.chart.data import CategoryChartData, XyChartData
-    from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
-    from pptx.oxml import parse_xml
-    from pptx.oxml.ns import qn
-    from pptx.util import Inches, Pt
+    from pptx.enum.text import PP_ALIGN
 
     if Path(path).exists() and not create_new:
         prs = Presentation(path)
     else:
         prs = Presentation()
-
-    layout_map = {
-        "title": 0, "title_and_content": 1, "section_header": 2,
-        "two_content": 3, "comparison": 4, "title_only": 5,
-        "blank": 6, "content": 1, "image": 6,
-    }
 
     align_map = {
         "left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER,
@@ -381,720 +1171,18 @@ def _write_pptx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
     }
 
     errors = []
+    job = _PptxJob(prs, errors, align_map)
 
     for idx, op in enumerate(ops):
         ot = _op_type(op)
         try:
-            # =============================================================
-            # SLIDES
-            # =============================================================
-
-            if ot == "add_slide":
-                layout_name = op.get("layout", "blank")
-                li = layout_map.get(layout_name, 6)
-                li = min(li, len(prs.slide_layouts) - 1)
-                prs.slides.add_slide(prs.slide_layouts[li])
-
-            elif ot == "delete_slide":
-                _si = op.get("slide_index")
-                if _si is None:
-                    _si = op.get("slide")
-                si = int(_si if _si is not None else -1)
-                n = len(prs.slides)
-                if si < 0:
-                    si = n + si
-                if 0 <= si < n:
-                    rId = prs.slides._sldIdLst[si].rId
-                    prs.part.drop_rel(rId)
-                    del prs.slides._sldIdLst[si]
-
-            elif ot == "duplicate_slide":
-                _si = op.get("slide_index")
-                if _si is None:
-                    _si = op.get("slide")
-                si = int(_si if _si is not None else -1)
-                if si < 0:
-                    si = len(prs.slides) + si
-                if si >= len(prs.slides):
-                    errors.append(f"Op #{idx} duplicate_slide: index {si} out of range")
-                    continue
-                src = prs.slides[si]
-                layout = src.slide_layout
-                new_slide = prs.slides.add_slide(layout)
-                # Copy all shapes from source to new slide
-                for shape in src.shapes:
-                    el = copy.deepcopy(shape._element)
-                    new_slide.shapes._spTree.append(el)
-                # Copy notes
-                try:
-                    if src.has_notes_slide:
-                        notes_text = src.notes_slide.notes_text_frame.text
-                        if notes_text:
-                            new_slide.notes_slide.notes_text_frame.text = notes_text
-                except Exception:
-                    pass
-
-            elif ot == "move_slide":
-                sld_lst = prs.slides._sldIdLst
-                n = len(sld_lst)
-                from_idx, to_idx = (
-                    i + n if i < 0 else i
-                    for i in (int(op.get("from_index", 0)), int(op.get("to_index", 0))))
-                if not (0 <= from_idx < n and 0 <= to_idx < n):
-                    errors.append(f"Op #{idx} move_slide: index out of range "
-                                  f"(have {n} slides, use 0-{n - 1} or -1 for last)")
-                    continue
-                el = sld_lst[from_idx]
-                sld_lst.remove(el)
-                sld_lst.insert(to_idx, el)
-
-            elif ot == "set_slide_dimensions":
-                prs.slide_width = Inches(float(op.get("width", 13.333)))
-                prs.slide_height = Inches(float(op.get("height", 7.5)))
-
-            # =============================================================
-            # TEXT & PLACEHOLDERS
-            # =============================================================
-
-            elif ot == "set_text":
-                slide = _get_slide(prs, op)
-                placeholder = str(op.get("placeholder", "title"))
-                ph_idx = int(placeholder) if placeholder.isdigit() else (0 if placeholder == "title" else 1)
-
-                for shape in slide.placeholders:
-                    if shape.placeholder_format.idx == ph_idx:
-                        # Support runs array for mixed formatting
-                        runs_data = op.get("runs")
-                        if runs_data and isinstance(runs_data, list):
-                            shape.text = ""
-                            tf = shape.text_frame
-                            p = tf.paragraphs[0]
-                            for rd in runs_data:
-                                run = p.add_run()
-                                run.text = rd.get("text", "")
-                                _apply_run_format(run, rd)
-                        else:
-                            shape.text = op.get("text", "")
-                            if shape.text_frame.paragraphs:
-                                para = shape.text_frame.paragraphs[0]
-                                run = para.runs[0] if para.runs else para.add_run()
-                                if not para.runs:
-                                    run.text = op.get("text", "")
-                                _apply_run_format(run, op)
-                        break
-
-            elif ot == "add_textbox":
-                slide = _get_slide(prs, op)
-                left = Inches(float(op.get("left", 1)))
-                top = Inches(float(op.get("top", 1)))
-                width = Inches(float(op.get("width", 6)))
-                height = Inches(float(op.get("height", 1)))
-                txBox = slide.shapes.add_textbox(left, top, width, height)
-                tf = txBox.text_frame
-                tf.word_wrap = op.get("word_wrap", True)
-                if op.get("auto_size"):
-                    from pptx.enum.text import MSO_AUTO_SIZE
-                    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-                if op.get("margin") is not None:
-                    m = Inches(float(op["margin"]))
-                    tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = m
-
-                runs_data = op.get("runs")
-                p = tf.paragraphs[0]
-                if runs_data and isinstance(runs_data, list):
-                    for rd in runs_data:
-                        run = p.add_run()
-                        run.text = rd.get("text", "")
-                        _apply_run_format(run, rd)
-                else:
-                    run = p.add_run()
-                    run.text = op.get("text", "")
-                    _apply_run_format(run, op)
-
-                alignment = op.get("alignment")
-                if alignment and alignment in align_map:
-                    p.alignment = align_map[alignment]
-
-            elif ot == "add_bullet_points":
-                slide = _get_slide(prs, op)
-                # Find target text frame
-                shape_name = op.get("shape_name")
-                shape_idx = op.get("shape_index")
-                ph_raw = op.get("placeholder")
-                tf = None
-                if shape_name:
-                    # Match by shape.name then by text content
-                    for s in slide.shapes:
-                        if s.has_text_frame and (s.name == shape_name or s.text_frame.text == shape_name):
-                            tf = s.text_frame
-                            break
-                elif shape_idx is not None:
-                    shapes = list(slide.shapes)
-                    si = int(shape_idx)
-                    if 0 <= si < len(shapes) and shapes[si].has_text_frame:
-                        tf = shapes[si].text_frame
-                elif ph_raw is not None:
-                    # Accept named placeholders or numeric index
-                    ph_names = {"title": 0, "body": 1, "subtitle": 1, "content": 1}
-                    ph_idx = ph_names.get(str(ph_raw).lower(), None)
-                    if ph_idx is None:
-                        try:
-                            ph_idx = int(ph_raw)
-                        except (ValueError, TypeError):
-                            errors.append(f"Op #{idx} add_bullet_points: unknown placeholder '{ph_raw}'")
-                            continue
-                    for s in slide.placeholders:
-                        if s.placeholder_format.idx == ph_idx:
-                            tf = s.text_frame
-                            break
-                else:
-                    # Default: body placeholder (idx 1)
-                    for s in slide.placeholders:
-                        if s.placeholder_format.idx == 1:
-                            tf = s.text_frame
-                            break
-
-                if not tf:
-                    errors.append(f"Op #{idx} add_bullet_points: no text frame found")
-                    continue
-
-                items = op.get("items", [])
-                for item in items:
-                    if isinstance(item, dict):
-                        text = item.get("text", "")
-                        level = int(item.get("level", 0))
-                    else:
-                        text = str(item)
-                        level = 0
-                    p = tf.add_paragraph()
-                    p.text = text
-                    p.level = min(level, 8)
-                    if op.get("font_size"):
-                        for run in p.runs:
-                            run.font.size = Pt(int(op["font_size"]))
-
-            elif ot == "format_text":
-                slide = _get_slide(prs, op)
-                find_text = op.get("find", "")
-                for shape in slide.shapes:
-                    if not shape.has_text_frame:
-                        continue
-                    for para in shape.text_frame.paragraphs:
-                        for run in para.runs:
-                            if find_text in run.text:
-                                _apply_run_format(run, op)
-
-            # =============================================================
-            # SHAPES
-            # =============================================================
-
-            elif ot == "add_shape":
-                slide = _get_slide(prs, op)
-                shape_type_name = op.get("shape_type", "rectangle")
-                shape_map = _get_shape_map()
-                mso_shape = shape_map.get(shape_type_name)
-                if not mso_shape:
-                    errors.append(f"Op #{idx} add_shape: unknown shape_type '{shape_type_name}'. Available: {', '.join(shape_map.keys())}")
-                    continue
-
-                left = Inches(float(op.get("left", 1)))
-                top = Inches(float(op.get("top", 1)))
-                width = Inches(float(op.get("width", 2)))
-                height = Inches(float(op.get("height", 1)))
-
-                shape = slide.shapes.add_shape(mso_shape, left, top, width, height)
-
-                # Text
-                if op.get("text"):
-                    shape.text = op["text"]
-                    if shape.text_frame.paragraphs:
-                        for para in shape.text_frame.paragraphs:
-                            para.alignment = align_map.get(op.get("text_alignment", "center"), PP_ALIGN.CENTER)
-                            for run in para.runs:
-                                _apply_run_format(run, {
-                                    "font_size": op.get("font_size"),
-                                    "bold": op.get("bold"),
-                                    "color": op.get("font_color") or op.get("text_color"),
-                                    "font_name": op.get("font_name"),
-                                })
-                    shape.text_frame.word_wrap = True
-
-                # Fill
-                fill_color = op.get("fill_color") or op.get("fill")
-                if fill_color:
-                    shape.fill.solid()
-                    shape.fill.fore_color.rgb = _parse_rgb(fill_color)
-                elif op.get("no_fill"):
-                    shape.fill.background()
-
-                # Line
-                line_color = op.get("line_color")
-                if line_color:
-                    shape.line.color.rgb = _parse_rgb(line_color)
-                if op.get("line_width"):
-                    shape.line.width = Pt(float(op["line_width"]))
-
-                # Rotation
-                if op.get("rotation"):
-                    shape.rotation = float(op["rotation"])
-
-            elif ot == "set_shape_format":
-                slide = _get_slide(prs, op)
-                shape = _find_shape(slide, op)
-
-                fill_color = op.get("fill_color") or op.get("fill")
-                if fill_color:
-                    shape.fill.solid()
-                    shape.fill.fore_color.rgb = _parse_rgb(fill_color)
-                if op.get("no_fill"):
-                    shape.fill.background()
-                if op.get("line_color"):
-                    shape.line.color.rgb = _parse_rgb(op["line_color"])
-                if op.get("line_width"):
-                    shape.line.width = Pt(float(op["line_width"]))
-                if op.get("rotation") is not None:
-                    shape.rotation = float(op["rotation"])
-                # Resize and reposition
-                if op.get("width") is not None:
-                    shape.width = Inches(float(op["width"]))
-                if op.get("height") is not None:
-                    shape.height = Inches(float(op["height"]))
-                if op.get("left") is not None:
-                    shape.left = Inches(float(op["left"]))
-                if op.get("top") is not None:
-                    shape.top = Inches(float(op["top"]))
-
-            elif ot == "remove_shape":
-                slide = _get_slide(prs, op)
-                shape = _find_shape(slide, op)
-                sp = shape._element
-                sp.getparent().remove(sp)
-
-            elif ot == "add_group_shape":
-                slide = _get_slide(prs, op)
-                group = slide.shapes.add_group_shape()
-                if op.get("name"):
-                    group.name = op["name"]
-
-            elif ot == "add_freeform":
-                slide = _get_slide(prs, op)
-                points = op.get("points", [])
-                if len(points) < 2:
-                    errors.append(f"Op #{idx} add_freeform: need at least 2 points")
-                    continue
-                # Accept both [x, y] arrays and {"x": ..., "y": ...} dicts
-                def _pt(p):
-                    if isinstance(p, (list, tuple)):
-                        return float(p[0]), float(p[1])
-                    return float(p.get("x", 0)), float(p.get("y", 0))
-                sx, sy = _pt(points[0])
-                builder = slide.shapes.build_freeform(Inches(sx), Inches(sy))
-                for pt in points[1:]:
-                    px, py = _pt(pt)
-                    builder.add_line_segment(Inches(px), Inches(py))
-                if op.get("close", True):
-                    builder.add_line_segment(Inches(sx), Inches(sy))
-                shape = builder.convert_to_shape()
-                fill = op.get("fill_color")
-                if fill:
-                    shape.fill.solid()
-                    shape.fill.fore_color.rgb = _parse_rgb(fill)
-                if op.get("line_color"):
-                    shape.line.color.rgb = _parse_rgb(op["line_color"])
-
-            # =============================================================
-            # CONNECTORS
-            # =============================================================
-
-            elif ot == "add_connector":
-                slide = _get_slide(prs, op)
-                from pptx.enum.shapes import MSO_CONNECTOR_TYPE
-                start_x = Inches(float(op.get("start_x", 1)))
-                start_y = Inches(float(op.get("start_y", 1)))
-                end_x = Inches(float(op.get("end_x", 5)))
-                end_y = Inches(float(op.get("end_y", 1)))
-
-                connector = slide.shapes.add_connector(
-                    MSO_CONNECTOR_TYPE.STRAIGHT, start_x, start_y, end_x, end_y
-                )
-                if op.get("line_color"):
-                    connector.line.color.rgb = _parse_rgb(op["line_color"])
-                if op.get("line_width"):
-                    connector.line.width = Pt(float(op["line_width"]))
-
-                # Arrow heads via XML
-                if op.get("arrow_end") or op.get("arrow_start"):
-                    ln = connector.line._ln
-                    if op.get("arrow_end"):
-                        tail = parse_xml(f'<a:tailEnd xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" type="arrow"/>')
-                        ln.append(tail)
-                    if op.get("arrow_start"):
-                        head = parse_xml(f'<a:headEnd xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" type="arrow"/>')
-                        ln.append(head)
-
-            # =============================================================
-            # IMAGES
-            # =============================================================
-
-            elif ot == "add_image":
-                slide = _get_slide(prs, op)
-                img_path = _checked_resolved(op.get("image_path", ""))
-                left = Inches(float(op.get("left", 1)))
-                top = Inches(float(op.get("top", 1)))
-                width = Inches(float(op["width"])) if op.get("width") else None
-                height = Inches(float(op["height"])) if op.get("height") else None
-                slide.shapes.add_picture(img_path, left, top, width=width, height=height)
-
-            elif ot == "add_equation":
-                # LaTeX equation as a 4×-oversampled PNG picture (pptx has no
-                # reliable native-math write path — python-pptx renders
-                # appended OMML as nothing).
-                import tempfile
-
-                slide = _get_slide(prs, op)
-                latex = op.get("latex") or op.get("equation") or ""
-                left = Inches(float(op.get("left", 1)))
-                top = Inches(float(op.get("top", 2)))
-                height_in = float(op.get("height", 0.8))
-                width = Inches(float(op["width"])) if op.get("width") else None
-                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                tmp.close()
-                try:
-                    latex_to_png(latex, tmp.name, display=True,
-                                 height_px=int(height_in * 96))
-                    slide.shapes.add_picture(
-                        tmp.name, left, top, width=width,
-                        height=None if width else Inches(height_in),
-                    )
-                finally:
-                    os.unlink(tmp.name)
-
-            # =============================================================
-            # TABLES
-            # =============================================================
-
-            elif ot == "add_table":
-                slide = _get_slide(prs, op)
-                headers = op.get("headers", [])
-                rows = op.get("rows", [])
-                cols = len(headers)
-                total_rows = 1 + len(rows)
-                left = Inches(float(op.get("left", 1)))
-                top = Inches(float(op.get("top", 3)))
-                width = Inches(float(op.get("width", 8)))
-                height = Inches(float(op.get("height", 2)))
-                table_shape = slide.shapes.add_table(total_rows, cols, left, top, width, height)
-                table = table_shape.table
-                for ci, h in enumerate(headers):
-                    table.cell(0, ci).text = str(h)
-                for ri, row in enumerate(rows):
-                    for ci, val in enumerate(row):
-                        if ci < cols:
-                            table.cell(ri + 1, ci).text = str(val)
-
-            elif ot == "format_table_cell":
-                slide = _get_slide(prs, op)
-                ti = int(op.get("table_index", 0))
-                tables = [s for s in slide.shapes if s.has_table]
-                if ti >= len(tables):
-                    errors.append(f"Op #{idx} format_table_cell: table_index {ti} out of range")
-                    continue
-                table = tables[ti].table
-                row = int(op.get("row", 0))
-                col = int(op.get("col", 0))
-
-                # Support range
-                end_row = int(op.get("end_row", row))
-                end_col = int(op.get("end_col", col))
-
-                for r in range(row, end_row + 1):
-                    for c in range(col, end_col + 1):
-                        if r >= len(table.rows) or c >= len(table.columns):
-                            continue
-                        cell = table.cell(r, c)
-                        # Fill
-                        fill_color = op.get("fill_color") or op.get("fill")
-                        if fill_color:
-                            cell.fill.solid()
-                            cell.fill.fore_color.rgb = _parse_rgb(fill_color)
-                        # Text formatting
-                        for para in cell.text_frame.paragraphs:
-                            if op.get("alignment") and op["alignment"] in align_map:
-                                para.alignment = align_map[op["alignment"]]
-                            for run in para.runs:
-                                _apply_run_format(run, op)
-                        # Vertical alignment
-                        if op.get("vertical_alignment"):
-                            va_map = {"top": MSO_ANCHOR.TOP, "middle": MSO_ANCHOR.MIDDLE, "bottom": MSO_ANCHOR.BOTTOM}
-                            va = va_map.get(op["vertical_alignment"])
-                            if va:
-                                cell.vertical_anchor = va
-
-                # Merge
-                merge_to = op.get("merge_to")
-                if merge_to:
-                    mr, mc = int(merge_to.get("row", row)), int(merge_to.get("col", col))
-                    table.cell(row, col).merge(table.cell(mr, mc))
-
-            # =============================================================
-            # CHARTS
-            # =============================================================
-
-            elif ot == "add_chart":
-                slide = _get_slide(prs, op)
-                chart_type_name = op.get("chart_type", "column_clustered")
-                ct_map = _get_chart_type_map()
-                xl_ct = ct_map.get(chart_type_name)
-                if not xl_ct:
-                    errors.append(f"Op #{idx} add_chart: unknown chart_type '{chart_type_name}'. "
-                                  f"Available: {', '.join(ct_map)}")
-                    continue
-
-                categories = op.get("categories", [])
-                series_list = op.get("series", [])
-
-                left = Inches(float(op.get("left", 1)))
-                top = Inches(float(op.get("top", 2)))
-                width = Inches(float(op.get("width", 8)))
-                height = Inches(float(op.get("height", 4.5)))
-
-                # Scatter/XY charts use XyChartData
-                if chart_type_name.startswith("scatter"):
-                    chart_data = XyChartData()
-                    for s in series_list:
-                        xy_series = chart_data.add_series(s.get("name", "Series"))
-                        x_vals = s.get("x", s.get("values", []))
-                        y_vals = s.get("y", [])
-                        for xi, yi in zip(x_vals, y_vals):
-                            xy_series.add_data_point(xi, yi)
-                else:
-                    chart_data = CategoryChartData()
-                    chart_data.categories = categories
-                    for s in series_list:
-                        chart_data.add_series(s.get("name", "Series"), s.get("values", []))
-
-                chart_frame = slide.shapes.add_chart(xl_ct, left, top, width, height, chart_data)
-                chart = chart_frame.chart
-
-                if op.get("title"):
-                    chart.has_title = True
-                    chart.chart_title.text_frame.text = op["title"]
-                if op.get("has_legend") is not None:
-                    chart.has_legend = op["has_legend"]
-
-                # Colors: per-series "color" (hex); pie/doughnut take an
-                # op-level "colors" array applied per slice. Without these,
-                # decks keep Office default steel-blue amid custom-styled
-                # slides.
-                try:
-                    if chart_type_name in ("pie", "pie_exploded", "doughnut"):
-                        slice_colors = op.get("colors") or (
-                            series_list[0].get("colors") if series_list else []) or []
-                        if slice_colors:
-                            for point, col in zip(chart.series[0].points, slice_colors):
-                                point.format.fill.solid()
-                                point.format.fill.fore_color.rgb = _parse_rgb(col)
-                    else:
-                        for s_def, s_obj in zip(series_list, chart.series):
-                            col = s_def.get("color")
-                            if not col:
-                                continue
-                            rgb = _parse_rgb(col)
-                            if chart_type_name.startswith(("line", "scatter", "radar")):
-                                s_obj.format.line.color.rgb = rgb
-                                try:
-                                    s_obj.marker.format.fill.solid()
-                                    s_obj.marker.format.fill.fore_color.rgb = rgb
-                                except Exception:
-                                    pass  # marker styling is best-effort
-                            else:
-                                s_obj.format.fill.solid()
-                                s_obj.format.fill.fore_color.rgb = rgb
-                except Exception as exc:
-                    errors.append(f"Op #{idx} add_chart: color styling failed: {exc}")
-
-            elif ot == "update_chart_data":
-                slide = _get_slide(prs, op)
-                # Find chart shape
-                ci = int(op.get("chart_index", 0))
-                charts = [s for s in slide.shapes if s.has_chart]
-                if ci >= len(charts):
-                    errors.append(f"Op #{idx} update_chart_data: chart_index {ci} out of range")
-                    continue
-                chart = charts[ci].chart
-                chart_data = CategoryChartData()
-                chart_data.categories = op.get("categories", [])
-                for s in op.get("series", []):
-                    chart_data.add_series(s.get("name", "Series"), s.get("values", []))
-                chart.replace_data(chart_data)
-
-            # =============================================================
-            # BACKGROUND & TRANSITIONS
-            # =============================================================
-
-            elif ot in ("set_background", "set_background_color"):
-                slide = _get_slide(prs, op)
-                bg = slide.background
-                gradient = op.get("gradient")
-                if gradient and isinstance(gradient, list) and len(gradient) >= 2:
-                    # Build gradient XML directly (python-pptx gradient API is limited)
-                    ns_a = "http://schemas.openxmlformats.org/drawingml/2006/main"
-                    stops_xml = ""
-                    for i, g in enumerate(gradient):
-                        color = _parse_rgb(g.get("color", "FFFFFF"))
-                        pos = float(g.get("position", i / (len(gradient) - 1)))
-                        pos_pct = int(pos * 100000)
-                        stops_xml += (
-                            f'<a:gs pos="{pos_pct}" xmlns:a="{ns_a}">'
-                            f'<a:srgbClr val="{color}"/>'
-                            f'</a:gs>'
-                        )
-                    angle = int(float(op.get("angle", 270)) * 60000)  # EMU degrees
-                    grad_xml = (
-                        f'<a:gradFill xmlns:a="{ns_a}">'
-                        f'<a:gsLst>{stops_xml}</a:gsLst>'
-                        f'<a:lin ang="{angle}" scaled="1"/>'
-                        f'</a:gradFill>'
-                    )
-                    bg_pr = bg._element  # p:bg element
-                    # Clear existing fill
-                    bgPr = bg_pr.find(qn("p:bgPr"))
-                    if bgPr is None:
-                        bgPr = parse_xml(
-                            f'<p:bgPr xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">'
-                            f'<a:noFill xmlns:a="{ns_a}"/>'
-                            f'<a:effectLst xmlns:a="{ns_a}"/>'
-                            f'</p:bgPr>'
-                        )
-                        bg_pr.append(bgPr)
-                    # Remove old fill children
-                    for child in list(bgPr):
-                        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-                        if tag in ("solidFill", "gradFill", "noFill", "pattFill"):
-                            bgPr.remove(child)
-                    bgPr.insert(0, parse_xml(grad_xml))
-                else:
-                    fill = bg.fill
-                    fill.solid()
-                    c = op.get("color", "FFFFFF")
-                    fill.fore_color.rgb = _parse_rgb(c)
-
-            elif ot == "set_transition":
-                slide = _get_slide(prs, op)
-                # Accept multiple key names: transition/effect/name
-                transition = op.get("transition") or op.get("effect") or op.get("name") or "fade"
-                # If transition is a dict (LLM sends {"type": "fade", "duration": 1000}), extract
-                if isinstance(transition, dict):
-                    duration = int(transition.get("duration", op.get("duration", 1000)))
-                    advance_after = transition.get("advance_after", op.get("advance_after"))
-                    transition = transition.get("type") or transition.get("name") or transition.get("effect") or "fade"
-                else:
-                    duration = int(op.get("duration", 1000))
-                    advance_after = op.get("advance_after")
-
-                # XML-based transition
-                trans_map = {
-                    "fade": "fade", "push": "push", "wipe": "wipe",
-                    "split": "split", "reveal": "reveal", "cover": "cover",
-                    "dissolve": "dissolve",
-                }
-                trans_tag = trans_map.get(transition, "fade")
-                ns = "http://schemas.openxmlformats.org/presentationml/2006/main"
-
-                # Remove existing transition
-                existing = slide._element.findall(qn("p:transition"))
-                for e in existing:
-                    slide._element.remove(e)
-
-                # duration is the effect's speed; only advance_after advances
-                # the slide by itself (advTm).
-                speed = "fast" if duration <= 500 else "med" if duration <= 1000 else "slow"
-                trans_el = parse_xml(
-                    f'<p:transition xmlns:p="{ns}" spd="{speed}">'
-                    f'<p:{trans_tag}/>'
-                    f'</p:transition>'
-                )
-                if advance_after:
-                    trans_el.set("advTm", str(advance_after))
-                    trans_el.set("advClick", "0")
-
-                slide._element.append(trans_el)
-
-            # =============================================================
-            # SPEAKER NOTES
-            # =============================================================
-
-            elif ot == "set_speaker_notes":
-                slide = _get_slide(prs, op)
-                text = op.get("text", "")
-                notes_slide = slide.notes_slide
-                tf = notes_slide.notes_text_frame
-                if op.get("append") and tf.text.strip():
-                    tf.text = tf.text + "\n" + text
-                else:
-                    tf.text = text
-
-            # =============================================================
-            # HYPERLINKS
-            # =============================================================
-
-            elif ot == "add_hyperlink":
-                slide = _get_slide(prs, op)
-                url = op.get("url", "")
-                shape = _find_shape(slide, op)
-                if shape.has_text_frame:
-                    # Add hyperlink on a run
-                    text = op.get("text")
-                    if text:
-                        p = shape.text_frame.paragraphs[-1]
-                        run = p.add_run()
-                        run.text = text
-                        run.hyperlink.address = url
-                        run.font.color.rgb = _parse_rgb(op.get("color", "0563C1"))
-                        run.font.underline = True
-                    else:
-                        # Hyperlink on whole shape
-                        shape.click_action.hyperlink.address = url
-                else:
-                    shape.click_action.hyperlink.address = url
-
-            # =============================================================
-            # SLIDE NUMBERS & PROPERTIES
-            # =============================================================
-
-            elif ot == "set_slide_number":
-                # Enable slide numbers by adding placeholder to slide master
-                enabled = op.get("enabled", True)
-                for slide_master in prs.slide_masters:
-                    for layout in slide_master.slide_layouts:
-                        for ph in layout.placeholders:
-                            if ph.placeholder_format.idx == 12:  # Slide number
-                                if not enabled:
-                                    ph._element.getparent().remove(ph._element)
-                                break
-
-            elif ot == "set_core_properties":
-                props = prs.core_properties
-                if op.get("title"):
-                    props.title = op["title"]
-                if op.get("author"):
-                    props.author = op["author"]
-                if op.get("subject"):
-                    props.subject = op["subject"]
-                if op.get("keywords"):
-                    props.keywords = op["keywords"]
-                if op.get("comments"):
-                    props.comments = op["comments"]
-
-            # =============================================================
-            # UNKNOWN
-            # =============================================================
-
+            handler = _HANDLERS.get(ot) if isinstance(ot, str) else None
+            if handler is not None:
+                handler(job, idx, op)
             else:
                 logger.warning(f"write_pptx: unknown operation '{ot}', skipping")
                 errors.append(f"Op #{idx}: unknown operation '{ot}'" + HELP_POINTER)
-
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # an op's failure becomes its error line, the other ops still run
             errors.append(f"Op #{idx} {ot}: {exc}")
             logger.warning(f"write_pptx op #{idx} '{ot}' failed: {exc}")
 

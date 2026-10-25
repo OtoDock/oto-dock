@@ -6,9 +6,13 @@ Mixin for :class:`pipeline.core.CallPipeline`; operates on ``self.state``
 
 import asyncio
 import logging
-import time
 import re
+import time
+
 import numpy as np
+from audio.providers.stt.relisten import TURN_RELISTEN_WAIT_S
+
+from background import spawn
 
 from .markers import _CALL_COMPLETE_RE, _QUESTION_RE
 
@@ -86,8 +90,8 @@ class TurnMixin:
         if not self.state._tts_ever_played:
             # Response was never played — don't add to transcript
             logger.debug(
-                f"[{self.conn.peer_addr}] Voice transcript: skipping assistant "
-                f"(never played): {content[:60]}"
+                "[%s] Voice transcript: skipping assistant "
+                "(never played): %s", self.conn.peer_addr, content[:60]
             )
             return
         entry = {
@@ -97,9 +101,11 @@ class TurnMixin:
         }
         self.state._call_transcript.append(entry)
         logger.debug(
-            f"[{self.conn.peer_addr}] Voice transcript += assistant "
-            f"({'interrupted' if self.state._utterance_cancelled else 'full'}): "
-            f"{content[:80]}"
+            "[%s] Voice transcript += assistant "
+            "(%s): "
+            "%s",
+            self.conn.peer_addr, 'interrupted' if self.state._utterance_cancelled else 'full',
+            content[:80]
         )
 
     async def _turn_classifier(self):
@@ -118,14 +124,14 @@ class TurnMixin:
                 asyncio.shield(task), timeout=TURN_CLASSIFIER_WAIT_S)
         except asyncio.TimeoutError:
             logger.info(
-                f"[{self.conn.peer_addr}] Turn classifier still loading — "
-                f"heuristic timing for this turn"
+                "[%s] Turn classifier still loading — "
+                "heuristic timing for this turn", self.conn.peer_addr
             )
             return None
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            logger.warning(f"[{self.conn.peer_addr}] Turn classifier failed to build: {e}")
+        except Exception as e:  # noqa: BLE001  # a classifier's build raises whatever its model loader does
+            logger.warning("[%s] Turn classifier failed to build: %s", self.conn.peer_addr, e)
             self.state._turn_clf_task = None
             return None
         return self._turn_clf
@@ -171,9 +177,10 @@ class TurnMixin:
                     else:
                         return self.cfg.turn_incomplete_timeout_s
                 # is_complete is None → fall through to heuristic
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # a failed classifier falls back to the heuristic timing
                 logger.warning(
-                    f"[{self.conn.peer_addr}] Classifier failed, using heuristic: {e}"
+                    "[%s] Classifier failed, using heuristic: %s",
+                    self.conn.peer_addr, e
                 )
         # No classifier available — use complete timeout as safe default
         return self.cfg.turn_complete_timeout_s
@@ -190,12 +197,12 @@ class TurnMixin:
         """
         transcript = combined
 
-        for attempt in range(5):  # safety cap
+        for _attempt in range(5):  # safety cap
             # Wait for user silence
             if not self.state._user_silent.is_set():
                 logger.info(
-                    f"[{self.conn.peer_addr}] Continuation: "
-                    f"waiting for user to finish speaking"
+                    "[%s] Continuation: "
+                    "waiting for user to finish speaking", self.conn.peer_addr
                 )
                 try:
                     await asyncio.wait_for(
@@ -218,8 +225,8 @@ class TurnMixin:
                 self.state._queued_speech.clear()
                 transcript = f"{transcript} {extra}"
                 logger.debug(
-                    f"[{self.conn.peer_addr}] Continuation batch: "
-                    f"+'{extra}' → {transcript}"
+                    "[%s] Continuation batch: "
+                    "+'%s' → %s", self.conn.peer_addr, extra, transcript
                 )
 
             # Drain late STT transcripts
@@ -228,16 +235,16 @@ class TurnMixin:
                 if late:
                     transcript = f"{transcript} {late}"
                     logger.debug(
-                        f"[{self.conn.peer_addr}] Continuation drain: "
-                        f"+'{late}' → {transcript}"
+                        "[%s] Continuation drain: "
+                        "+'%s' → %s", self.conn.peer_addr, late, transcript
                     )
 
             # Classify the combined turn
             timeout = await self._classify_turn([transcript])
             label = "complete" if timeout <= self.cfg.turn_classifier_grace_s else "incomplete"
             logger.debug(
-                f"[{self.conn.peer_addr}] Continuation re-classify: "
-                f"{label} — {transcript[:80]}"
+                "[%s] Continuation re-classify: "
+                "%s — %s", self.conn.peer_addr, label, transcript[:80]
             )
 
             if timeout <= self.cfg.turn_classifier_grace_s:
@@ -246,9 +253,9 @@ class TurnMixin:
                 # dispatch yet — loop again to gather it.
                 if not self.state._user_silent.is_set() or self.state._queued_speech:
                     logger.info(
-                        f"[{self.conn.peer_addr}] Continuation: classified "
-                        f"complete but user speaking or new speech queued "
-                        f"— continuing to gather"
+                        "[%s] Continuation: classified "
+                        "complete but user speaking or new speech queued "
+                        "— continuing to gather", self.conn.peer_addr
                     )
                     continue
                 break
@@ -275,8 +282,8 @@ class TurnMixin:
             if not has_new:
                 # No new speech after timeout — send what we have
                 logger.info(
-                    f"[{self.conn.peer_addr}] Continuation: no new speech "
-                    f"after timeout, dispatching"
+                    "[%s] Continuation: no new speech "
+                    "after timeout, dispatching", self.conn.peer_addr
                 )
                 break
 
@@ -299,9 +306,10 @@ class TurnMixin:
             return await clf.classify_continuation(
                 original, follow_up, context,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # a failed continuation check treats the speech as a new request
             logger.warning(
-                f"[{self.conn.peer_addr}] Continuation classifier failed: {e}"
+                "[%s] Continuation classifier failed: %s",
+                self.conn.peer_addr, e
             )
             return False  # fail-open: treat as new request
 
@@ -343,8 +351,9 @@ class TurnMixin:
             verdict_ms = (time.monotonic() - t_verdict) * 1000
             label = "complete" if timeout <= self.cfg.turn_classifier_grace_s else "incomplete"
             logger.info(
-                f"[{self.conn.peer_addr}] Turn looks {label} "
-                f"(verdict {verdict_ms:.0f}ms) — waiting {timeout}s"
+                "[%s] Turn looks %s "
+                "(verdict %.0fms) — waiting %ss",
+                self.conn.peer_addr, label, verdict_ms, timeout
             )
 
             await asyncio.sleep(timeout)
@@ -357,8 +366,8 @@ class TurnMixin:
         # after SPEECH_START, it can't be cancelled.
         if not self.state._user_silent.is_set():
             logger.info(
-                f"[{self.conn.peer_addr}] Turn timer: user speaking — "
-                f"waiting for silence before dispatch"
+                "[%s] Turn timer: user speaking — "
+                "waiting for silence before dispatch", self.conn.peer_addr
             )
             # Two-stage wait with a phantom short-circuit (live-hit
             # 2026-08-14: line noise held VAD in "speech" and this wait ate
@@ -371,13 +380,12 @@ class TurnMixin:
                     self.state._user_silent.wait(), timeout=2.0,
                 )
             except asyncio.TimeoutError:
-                evidence = (bool(self.stt.latest_interim)
-                            or self.stt.has_pending_finals
+                evidence = (self.stt.speech_evidence
                             or bool(self.state._queued_speech))
                 if not evidence:
                     logger.info(
-                        f"[{self.conn.peer_addr}] Turn timer: 2s of VAD "
-                        f"speech with no transcript evidence — dispatching"
+                        "[%s] Turn timer: 2s of VAD "
+                        "speech with no transcript evidence — dispatching", self.conn.peer_addr
                     )
                 else:
                     try:
@@ -386,8 +394,8 @@ class TurnMixin:
                         )
                     except asyncio.TimeoutError:
                         logger.warning(
-                            f"[{self.conn.peer_addr}] Turn timer: timed out "
-                            f"waiting for user silence (5s)"
+                            "[%s] Turn timer: timed out "
+                            "waiting for user silence (5s)", self.conn.peer_addr
                         )
                     except asyncio.CancelledError:
                         return
@@ -419,35 +427,28 @@ class TurnMixin:
                     self.state._interim_fallback_text = final
                     self.state._interim_fallback_at = time.monotonic()
                 logger.info(
-                    f"[{self.conn.peer_addr}] STT final flush ({source}): {final}"
+                    "[%s] STT final flush (%s): %s",
+                    self.conn.peer_addr, source, final
                 )
 
         if self.state._turn_segments:
-            # The first dispatch of a call that identifies the caller's
-            # language waits for the identification (bounded): when it moved
-            # the call to another language, its text is this turn's (the
-            # stream was tuned to the route's language).
-            await self._await_language_identification()
-            joined = " ".join(self.state._turn_segments)
-            identified = self._take_language_first_text()
-            if identified:
-                logger.info(
-                    f"[{self.conn.peer_addr}] Turn text from the language "
-                    f"identification ({len(identified)} chars)"
-                )
-                joined = identified
+            # A call that follows the caller's language: the first turn's
+            # take lets a lean leader win (pipeline/language.py), and every
+            # take moves the language streams on.
+            joined = await self._language_take(" ".join(self.state._turn_segments))
             count = len(self.state._turn_segments)
             self.state._turn_segments.clear()
             self.state._turn_timer = None
 
             logger.info(
-                f"[{self.conn.peer_addr}] Turn dispatching "
-                f"({count} segments): {joined}"
+                "[%s] Turn dispatching "
+                "(%s segments): %s", self.conn.peer_addr, count, joined
             )
 
             if self._turn_busy():
                 logger.info(
-                    f"[{self.conn.peer_addr}] Queuing turn (LLM busy): {joined}"
+                    "[%s] Queuing turn (LLM busy): %s",
+                    self.conn.peer_addr, joined
                 )
                 self.state._queued_speech.append(joined)
                 self._interrupt_for_queued_speech()
@@ -482,8 +483,9 @@ class TurnMixin:
             last = self.state._turn_segments[-1]
             if transcript.startswith(last) and len(transcript) > len(last):
                 logger.info(
-                    f"[{self.conn.peer_addr}] Replacing interim segment "
-                    f"with final: \"{last}\" → \"{transcript}\""
+                    "[%s] Replacing interim segment "
+                    "with final: \"%s\" → \"%s\"",
+                    self.conn.peer_addr, last, transcript
                 )
                 self.state._turn_segments[-1] = transcript
                 return True
@@ -491,8 +493,8 @@ class TurnMixin:
                 new, old = _norm_words(transcript), _norm_words(last)
                 if new and new == old[:len(new)]:
                     logger.info(
-                        f"[{self.conn.peer_addr}] Interim segment repeats the "
-                        f"last one — dropped: \"{transcript}\""
+                        "[%s] Interim segment repeats the "
+                        "last one — dropped: \"%s\"", self.conn.peer_addr, transcript
                     )
                     return False
         self.state._turn_segments.append(transcript)
@@ -538,32 +540,37 @@ class TurnMixin:
             return
         if self.state._playback_paused:
             logger.info(
-                f"[{self.conn.peer_addr}] Barge-in: confirmed transcript on "
-                f"paused playback — committing"
+                "[%s] Barge-in: confirmed transcript on "
+                "paused playback — committing", self.conn.peer_addr
             )
-            asyncio.create_task(self._cancel_tts())
+            spawn(self._cancel_tts(), name="cancel_tts", owner="call")
             # _cancel_tts owns the upstream abort (liveness-gated) — done.
             return
-        if self.state._tts_playing:
+        if self.state._tts_playing or self.state._tts_idle:
+            # Audible playback, or a segment idle after a flushed sentence
+            # while the engine works (the turn is about to go on, or to call
+            # the end tool): the queued words are handled at the stream's
+            # end, never an abort of the generation under way.
             return
         if not getattr(self.llm, "supports_abort", False):
             return
         if getattr(self.llm, "abort_erases_turn", True):
             return
         logger.info(
-            f"[{self.conn.peer_addr}] Queued speech during silent turn "
-            f"phase — aborting in-flight generation"
+            "[%s] Queued speech during silent turn "
+            "phase — aborting in-flight generation", self.conn.peer_addr
         )
 
         async def _abort() -> None:
             try:
                 await self.llm.abort_turn()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # aborting a turn that queued speech already replaced
                 logger.warning(
-                    f"[{self.conn.peer_addr}] Queued-speech abort failed: {e}"
+                    "[%s] Queued-speech abort failed: %s",
+                    self.conn.peer_addr, e
                 )
 
-        asyncio.create_task(_abort())
+        spawn(_abort(), name="abort_turn", owner="call")
 
     async def _delayed_drain_retry(self) -> None:
         """Wait for STT to deliver a finalized transcript.
@@ -578,24 +585,30 @@ class TurnMixin:
                 return
 
             transcript = await self.stt.wait_for_transcript(timeout=self.stt.transcript_wait_timeout_s)
-            elapsed_ms = (time.monotonic() - self.state._speech_end_time) * 1000
             source = "final"
             if not transcript and self.stt.latest_interim:
                 # Forced finalize's is_final didn't arrive — use the live partial
                 # instead of dropping the turn (interim_results streams it).
                 transcript, source = self.stt.latest_interim, "interim"
+            release = getattr(self.stt, "release_wordless_turn", None)
+            if not transcript and release is not None and await release(TURN_RELISTEN_WAIT_S):
+                # Every live final of the turn came back with no word: the
+                # second listen's words are the turn.
+                transcript, source = self.stt.drain_transcript(), "re-listen"
+            elapsed_ms = (time.monotonic() - self.state._speech_end_time) * 1000
 
             if transcript and self._is_interim_fallback_dup(transcript):
                 logger.info(
-                    f"[{self.conn.peer_addr}] Delayed drain: late final "
-                    f"duplicates the interim-dispatched tail — dropped: "
-                    f"{transcript}"
+                    "[%s] Delayed drain: late final "
+                    "duplicates the interim-dispatched tail — dropped: "
+                    "%s", self.conn.peer_addr, transcript
                 )
                 return
             if transcript:
                 self._append_turn_segment(transcript, source=source)
                 logger.info(
-                    f"[{self.conn.peer_addr}] Delayed drain got ({source}, {elapsed_ms:.0f}ms): {transcript}"
+                    "[%s] Delayed drain got (%s, %.0fms): %s",
+                    self.conn.peer_addr, source, elapsed_ms, transcript
                 )
                 joined = " ".join(self.state._turn_segments)
                 self._cancel_turn_timer()
@@ -613,7 +626,8 @@ class TurnMixin:
                     )
             else:
                 logger.info(
-                    f"[{self.conn.peer_addr}] Delayed drain timed out ({self.stt.transcript_wait_timeout_s}s)"
+                    "[%s] Delayed drain timed out (%ss)",
+                    self.conn.peer_addr, self.stt.transcript_wait_timeout_s
                 )
                 # If there are pending segments, create a turn timer so they
                 # don't get orphaned.  Without this, SPEECH_END cancels the
@@ -622,8 +636,9 @@ class TurnMixin:
                 if self.state._turn_segments and not (self.state._turn_timer and not self.state._turn_timer.done()):
                     joined = " ".join(self.state._turn_segments)
                     logger.info(
-                        f"[{self.conn.peer_addr}] Delayed drain: creating "
-                        f"timer for {len(self.state._turn_segments)} pending segments"
+                        "[%s] Delayed drain: creating "
+                        "timer for %s pending segments",
+                        self.conn.peer_addr, len(self.state._turn_segments)
                     )
                     self.state._turn_timer = asyncio.create_task(
                         self._turn_timeout_handler(joined)
@@ -651,15 +666,17 @@ class TurnMixin:
 
             if transcript and self._is_interim_fallback_dup(transcript):
                 logger.info(
-                    f"[{self.conn.peer_addr}] Delayed queue: late final "
-                    f"duplicates the interim-dispatched tail — dropped: "
-                    f"{transcript}"
+                    "[%s] Delayed queue: late final "
+                    "duplicates the interim-dispatched tail — dropped: "
+                    "%s", self.conn.peer_addr, transcript
                 )
                 return
             if transcript:
                 logger.info(
-                    f"[{self.conn.peer_addr}] Delayed queue got ({source}, {elapsed_ms:.0f}ms): {transcript}"
+                    "[%s] Delayed queue got (%s, %.0fms): %s",
+                    self.conn.peer_addr, source, elapsed_ms, transcript
                 )
+                self._note_turn_taken()
                 self.state._queued_speech.append(transcript)
                 # Interim fallback (audit F2) keeps the DISPATCH; only a real
                 # final may commit a paused playback or abort a generation.
@@ -667,7 +684,8 @@ class TurnMixin:
                     final_evidence=(source == "final"))
             else:
                 logger.info(
-                    f"[{self.conn.peer_addr}] Delayed queue timed out ({self.stt.transcript_wait_timeout_s}s)"
+                    "[%s] Delayed queue timed out (%ss)",
+                    self.conn.peer_addr, self.stt.transcript_wait_timeout_s
                 )
         except asyncio.CancelledError:
             return

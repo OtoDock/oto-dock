@@ -50,7 +50,7 @@ def _private_key(app_id: str) -> ed25519.Ed25519PrivateKey:
     if key is None:
         seed = HKDF(
             algorithm=hashes.SHA256(), length=32, salt=b"otodock-app-keys",
-            info=f"app-ed25519:{app_id}".encode("utf-8"),
+            info=f"app-ed25519:{app_id}".encode(),
         ).derive(config.JWT_SECRET.encode("utf-8"))
         key = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
         _keys[app_id] = key

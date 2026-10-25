@@ -20,9 +20,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from satellite.engines import BY_CREDENTIAL_KIND, ENGINES  # noqa: E402
-
-from core.session.session_manager import get_all_layers  # noqa: E402
+from core.session.session_manager import get_all_layers
+from satellite.engines import BY_CREDENTIAL_KIND, ENGINES
 
 
 def _remote_layers():

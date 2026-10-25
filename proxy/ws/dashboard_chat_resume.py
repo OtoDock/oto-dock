@@ -10,43 +10,47 @@ import asyncio
 import functools
 import json
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, cast
+
 import config
-from typing import TYPE_CHECKING
+from auth.providers import UserContext
 from core import placement
-from storage import database as task_store
-from storage.automation import run_status
-from storage.pg import run_db
 from core.events import chat_writer, input_queue, turn_ending
-from core.events.common_events import CommonEvent, ERROR
+from core.events.common_events import ERROR, CommonEvent
+from core.events.stream_pump import (
+    _active_pumps,
+    _pending_permissions,
+)
+from core.permission_modes import ASK_MODE
+from core.session import (
+    interactive_session,
+    session_kind,
+    visibility as _vis,
+    warmup_registry,
+)
+from core.session.session_manager import resolve_execution_path
 from core.session.session_state import (
     _chat_streaming_state,
     get_session_mode,
     get_user_tz,
     set_session_user_tz,
 )
-from core.session.session_manager import resolve_execution_path
-from core.events.stream_pump import (
-    _active_pumps,
-    _pending_permissions,
-)
-from core.session import session_kind, warmup_registry, interactive_session
-from core.session import visibility as _vis
-# Imported by ws/dashboard.py AFTER its helpers are defined —
-# safe intra-unit circularity (see the class assembly there).
-from ws.dashboard import (
-    STALE_TURN_SECS,
-    _CHAT_PAGE,
-    _build_chat_restore,
-    _role_and_layer,
-    chat_process_alive,
-    task_run_active_async,
-)
-from auth.providers import UserContext
+from storage import database as task_store
+from storage.automation import run_status
+from storage.pg import run_db
 from ws import wire_events as wire
+
+# ws/dashboard.py assembles the connection from the mixins at its end, so
+# its helpers are imported inside the functions that call them: this
+# module imports first too (tests/core/test_import_layers.py).
 from ws.dashboard_chat_text import grace_layer
 
 if TYPE_CHECKING:
+    from core.events.stream_pump import ChatStreamPump
+    from core.execution_layer import ExecutionLayer
     from ws.dashboard_host import DashboardHost as _Host
 else:
     _Host = object
@@ -69,7 +73,7 @@ def _cut_rows(rows: list[dict], cuts: dict[str, int | None], floors: dict[str, i
     for m in rows:
         chat = m.get("chat_id") or ""
         cut = cuts.get(chat, _NO_CUT)
-        above = cut is not _NO_CUT and cut is not None and int(m["id"]) > cut
+        above = cut is not _NO_CUT and cut is not None and int(m["id"]) > cast("int", cut)
         if above and m.get("role") != "user":
             continue
         kept.append(m)
@@ -91,14 +95,64 @@ def _encode_history(frame: dict, rows: list[dict]) -> str:
     """The history frame's text with ``rows`` as its ``messages``, one dumps
     per row (a worker thread encoding a long history yields the GIL between
     rows instead of holding it for one call)."""
-    opts = {"separators": (",", ":"), "ensure_ascii": False}
+    opts: dict[str, Any] = {"separators": (",", ":"), "ensure_ascii": False}
     head = json.dumps(frame, **opts)
     body = ",".join(json.dumps(r, **opts) for r in rows)
     return head[:-1] + ',"messages":[' + body + "]}"
 
 
+@dataclass
+class _ResumeFacts:
+    """The chat row's facts the history frame and the warmup_ready frames
+    carry."""
+
+    effective_exec_path: str
+    chat_model: str
+    perm_mode: str
+    total_cost: float
+    context_used: int
+    context_max: int
+    cache_read: int
+    cache_write: int
+    output_tokens: int
+
+
+@dataclass
+class _ResumeRows:
+    """What the reads produced for one resume: the rows and their page state,
+    the live pumps' held snapshot and the cutoff reader over it, the delta
+    decision and its floors."""
+
+    rows: list[dict]
+    has_more: bool
+    plans: list[dict]
+    restore: dict
+    held: dict[str, tuple]
+    related_pumps: list
+    active_task_pump: "ChatStreamPump | None"  # a sibling turn's live pump, else None
+    as_delta: bool
+    read_floors: dict[str, int]
+    is_task_chat: bool
+    # A live pump's cutoff against the held snapshot: the closure
+    # ``_resume_rows`` defines over ``held``; the cut reads it per pump.
+    _cut_of: Callable[[object], int | None]
+
+
 class ChatResumeMixin(_Host):
     """resume_chat: history replay, the visit path, restore and the lazy warmup"""
+
+    # The connection state this mixin assigns, declared where it assigns it:
+    # the type checker reads an attribute a mixin assigns from the mixin
+    # first. Annotations only (strings), no class attributes.
+    _history_floors: "tuple[str, dict[str, int]] | None"
+    agent_name: "str"
+    chat_id: "str | None"
+    chat_plan_filename: "str"
+    deferred_mode: "str"
+    deferred_model: "str"
+    layer: "ExecutionLayer | None"
+    promised_pump_chat: "str | None"
+    session_id: "str | None"
 
     # The live blocks each live pump held when the last resume took its cut,
     # {chat_id: (pump, blocks)}: the next attach to that pump replays the
@@ -111,9 +165,14 @@ class ChatResumeMixin(_Host):
         it; on a task chat viewed through a sibling run's pump, that pump's
         chat's queue."""
         cid = pump.chat_id if pump is not None else self.chat_id
-        q = await input_queue.loaded(cid)
-        return {"type": wire.QUEUE_SNAPSHOT, "chat_id": self.chat_id,
-                "messages": q.snapshot()}
+        q = await input_queue.loaded(cast("str", cid))
+        frame: dict = {"type": wire.QUEUE_SNAPSHOT, "chat_id": self.chat_id,
+                       "messages": q.snapshot()}
+        if cid != self.chat_id:
+            # The page files the chips under the viewed chat and names this
+            # one on a cancel.
+            frame["queue_chat_id"] = cid
+        return frame
 
     async def _send_engine_prompts(self) -> None:
         """The cards of the engine's own permission requests still waiting
@@ -135,35 +194,18 @@ class ChatResumeMixin(_Host):
         )
 
     async def _handle_resume_chat(self, msg: dict):
+        """The viewed chat's history and its session: the gate, an in-flight
+        warmup's replay, the rows, the wedged-pump reap, the history frame, then
+        the live pump's attach, the session re-attach or the lazy frame."""
+        from ws.dashboard import _role_and_layer
         self.promised_pump_chat = None  # every resume resets the previous promise
         self._resume_live = None
         self._detach_pty_viewer()  # leaving any interactive chat we were viewing
 
-        cid = msg.get("chat_id", "")
-        if not cid:
-            await self._send_error("chat_id required")
+        gated = await self._resume_gate(msg)
+        if gated is None:
             return
-
-        chat = await run_db(task_store.get_chat, cid)
-        if not chat:
-            await self._send_error("Chat not found")
-            return
-        # Imported here: the agents API package imports this module's assembly.
-        from api.agents.chats import can_access_chat
-        if not await run_db(can_access_chat, self._viewer_context(), chat):
-            await self._send_error("Access denied")
-            return
-        # A chat this user may open but not drive (a Shared-only chat below
-        # the editor tier, a task run they cannot continue): this connection
-        # watches it and is never its notification sink or its time zone.
-        refusal = await self._deny_task_continue(cid, chat, quiet=True)
-        self._view_only = bool(refusal)
-        # The sentence a chat that runs as the agent refuses this person with:
-        # the dashboard locks its mode, model and terminal pickers on it. A
-        # task chat keeps its own gate and locks nothing here.
-        drive_refusal = (refusal if _vis.is_shared_chat_owner(chat.get("user_sub"))
-                         and not session_kind.is_task_chat_id(cid) else "")
-        locked = {"drive_refusal": drive_refusal} if drive_refusal else {}
+        cid, chat, locked = gated
 
         # In-flight warmup re-attach: if a warmup is still running (fresh
         # satellite first chat, ~90s MCP install) and our WS reconnected,
@@ -173,60 +215,7 @@ class ChatResumeMixin(_Host):
         # chat_history or kick a new warmup here.
         inflight = warmup_registry.get(cid)
         if inflight is not None:
-            await warmup_registry.attach_listener(cid, self._send)
-            self._attached_warmups.add(cid)
-            self.chat_id = cid
-            self.agent_name = chat["agent"]
-            # (DB-first read): the first prompt was persisted at
-            # send-time (_persist_first_prompt), so a switch-away/back or a mid-spawn
-            # refresh must reload it from the DB — without this the bubble is blank
-            # until the turn streams (the "my prompt disappeared while it was getting
-            # ready" bug). Send chat_history FIRST so the frontend clears its
-            # switch-away discard guard (onChatHistory) before the replayed warmup_*
-            # events re-render the "Getting ready" state on top of the prompt.
-            def _inflight_job():
-                return (*task_store.get_chat_messages_page(cid, _CHAT_PAGE),
-                        _build_chat_restore(cid))
-
-            # A lane job: the first prompt was queued on this chat's lane by
-            # _persist_first_prompt — read it back behind that write.
-            inflight_msgs, inflight_has_more, inflight_restore = await chat_writer.submit(
-                cid, _inflight_job, label="inflight_history",
-            )
-            await self._send({
-                "type": wire.CHAT_HISTORY,
-                "chat_id": cid,
-                "agent": chat["agent"],  # agent of record — URL normalization
-                "messages": inflight_msgs,
-                "has_more": inflight_has_more,
-                "restore": inflight_restore,
-                "plans": [],
-                "total_cost": chat.get("total_cost") or 0,
-                "context_used": chat.get("context_used") or 0,
-                "context_max": chat.get("context_max") or 0,
-                "cache_read": chat.get("cache_read") or 0,
-                "cache_write": chat.get("cache_write") or 0,
-                "output_tokens": chat.get("output_tokens") or 0,
-                "execution_path": resolve_execution_path(self.agent_name, chat.get("execution_path", "")),
-                "execution_mode": chat.get("execution_mode", ""),
-                "model": chat.get("model", ""),
-                "mode": chat.get("permission_mode", "default"),
-                # A warmup is mid-spawn — the session is coming up; never
-                # offer cross-engine options against it.
-                "process_alive": True,
-                **locked,
-            })
-            self._history_floors = None
-            for past_ev in list(inflight.event_history):
-                await self._send(past_ev)
-            # Install events are delivered out-of-band via the per-user
-            # broadcaster + replayed on connect (see the WS setup), so there
-            # is no per-chat install attach to do here.
-            logger.info(
-                f"WS dashboard resume_chat: attached to in-flight warmup "
-                f"chat={cid}, sent {len(inflight_msgs)} msgs + replayed "
-                f"{len(inflight.event_history)} events"
-            )
+            await self._resume_inflight(cid, chat, locked, inflight)
             return
 
         self.chat_id = cid
@@ -255,6 +244,146 @@ class ChatResumeMixin(_Host):
         cache_read = chat.get("cache_read") or 0
         cache_write = chat.get("cache_write") or 0
         output_tokens = chat.get("output_tokens") or 0
+
+        r = await self._resume_rows(cid, msg)
+
+        # Restore plan filename from DB so subsequent pumps reuse it
+        if r.plans and not self.chat_plan_filename:
+            self.chat_plan_filename = r.plans[-1]["filename"]
+
+        old_session_id = chat.get("session_id")
+        perm_mode = chat.get("permission_mode") or ASK_MODE
+        f = _ResumeFacts(
+            effective_exec_path=effective_exec_path, chat_model=chat_model, perm_mode=perm_mode,
+            total_cost=total_cost, context_used=context_used, context_max=context_max,
+            cache_read=cache_read, cache_write=cache_write, output_tokens=output_tokens,
+        )
+
+        await self._reap_wedged_pump(cid, r.is_task_chat, msg)
+        pump, view_only_external, kind = await self._resume_history(cid, chat, r, locked, f)
+
+        if view_only_external:
+            # Read-only view of a live external session: history is sent, but we
+            # do NOT acquire the session slot, send warmup_ready, or promise a
+            # pump attach — leaving the phone/webhook driver's stream untouched
+            # so the call keeps playing and tears down normally.
+            logger.info(
+                "WS dashboard: chat=%s is driven by a %s session — "
+                "read-only %s after chat_view_only, "
+                "not attaching", cid, kind, 'delta' if r.as_delta else 'history'
+            )
+            return
+
+        if pump and not pump.is_done:
+            await self._resume_attach(cid, chat, pump, f)
+            return
+
+        if await self._resume_session(chat, old_session_id, f):
+            return
+
+        await self._resume_lazy(chat, old_session_id, f)
+
+    async def _resume_gate(self, msg: dict) -> tuple[str, dict, dict[str, str]] | None:
+        """The chat the resume names, loaded and allowed: ``(cid, chat, locked)``,
+        or None after the error this sent (a deleting chat gets no answer)."""
+        cid = msg.get("chat_id", "")
+        if not cid:
+            await self._send_error("chat_id required")
+            return None
+        if input_queue.deleting(cid):
+            # The chat is going (a poll's or a page's resume racing its
+            # delete): nothing is loaded and nothing is said; a resume after
+            # the row went is answered "not found" as it always was.
+            return None
+
+        chat = await run_db(task_store.get_chat, cid)
+        if not chat:
+            await self._send_error("Chat not found")
+            return None
+        # Imported here: the agents API package imports this module's assembly.
+        from core.session.visibility import can_access_chat
+        if not await run_db(can_access_chat, self._viewer_context(), chat):
+            await self._send_error("Access denied")
+            return None
+        # A chat this user may open but not drive (a Shared-only chat below
+        # the editor tier, a task run they cannot continue): this connection
+        # watches it and is never its notification sink or its time zone.
+        refusal = await self._deny_task_continue(cid, chat, quiet=True)
+        self._view_only = bool(refusal)
+        # The sentence a chat that runs as the agent refuses this person with:
+        # the dashboard locks its mode, model and terminal pickers on it. A
+        # task chat keeps its own gate and locks nothing here.
+        drive_refusal = (refusal if _vis.is_shared_chat_owner(chat.get("user_sub"))
+                         and not session_kind.is_task_chat_id(cid) else "")
+        locked = {"drive_refusal": drive_refusal} if drive_refusal else {}
+        return cid, chat, locked
+
+    async def _resume_inflight(self, cid: str, chat: dict, locked: dict[str, str],
+                               inflight: warmup_registry.InflightWarmup) -> None:
+        """A warmup still running for the chat: this socket joins it as a listener
+        and replays the persisted first prompt, then the warmup's events."""
+        from ws.dashboard import _CHAT_PAGE, _build_chat_restore
+        await warmup_registry.attach_listener(cid, self._send)
+        self._attached_warmups.add(cid)
+        self.chat_id = cid
+        self.agent_name = chat["agent"]
+        # (DB-first read): the first prompt was persisted at
+        # send-time (_persist_first_prompt), so a switch-away/back or a mid-spawn
+        # refresh must reload it from the DB — without this the bubble is blank
+        # until the turn streams (the "my prompt disappeared while it was getting
+        # ready" bug). Send chat_history FIRST so the frontend clears its
+        # switch-away discard guard (onChatHistory) before the replayed warmup_*
+        # events re-render the "Getting ready" state on top of the prompt.
+        def _inflight_job():
+            return (*task_store.get_chat_messages_page(cid, _CHAT_PAGE),
+                    _build_chat_restore(cid))
+
+        # A lane job: the first prompt was queued on this chat's lane by
+        # _persist_first_prompt — read it back behind that write.
+        inflight_msgs, inflight_has_more, inflight_restore = await chat_writer.submit(
+            cid, _inflight_job, label="inflight_history",
+        )
+        await self._send({
+            "type": wire.CHAT_HISTORY,
+            "chat_id": cid,
+            "agent": chat["agent"],  # agent of record — URL normalization
+            "messages": inflight_msgs,
+            "has_more": inflight_has_more,
+            "restore": inflight_restore,
+            "plans": [],
+            "total_cost": chat.get("total_cost") or 0,
+            "context_used": chat.get("context_used") or 0,
+            "context_max": chat.get("context_max") or 0,
+            "cache_read": chat.get("cache_read") or 0,
+            "cache_write": chat.get("cache_write") or 0,
+            "output_tokens": chat.get("output_tokens") or 0,
+            "execution_path": resolve_execution_path(self.agent_name, chat.get("execution_path", "")),
+            "execution_mode": chat.get("execution_mode", ""),
+            "model": chat.get("model", ""),
+            "mode": chat.get("permission_mode") or ASK_MODE,
+            # A warmup is mid-spawn — the session is coming up; never
+            # offer cross-engine options against it.
+            "process_alive": True,
+            **locked,
+        })
+        self._history_floors = None
+        for past_ev in list(inflight.event_history):
+            await self._send(past_ev)
+        # Install events are delivered out-of-band via the per-user
+        # broadcaster + replayed on connect (see the WS setup), so there
+        # is no per-chat install attach to do here.
+        logger.info(
+            "WS dashboard resume_chat: attached to in-flight warmup "
+            "chat=%s, sent %s msgs + replayed "
+            "%s events",
+            cid, len(inflight_msgs), len(inflight.event_history)
+        )
+
+    async def _resume_rows(self, cid: str, msg: dict) -> _ResumeRows:
+        """The rows of the view: the sibling turns, their lanes drained, the live
+        pumps' snapshot held, then the page or the delta read behind the chat's
+        lane. The awaits keep this order: the snapshot is taken after the drains
+        and before the reads."""
         # task-{runId} chats aggregate sibling-turn histories below; a scroll-back
         # cursor over a mixed-id set is incoherent, so they load FULL (no paging).
         # Every other chat loads the newest page; older turns lazy-load on scroll-up.
@@ -287,7 +416,7 @@ class ChatResumeMixin(_Host):
         # first, so the cut below never shows the rows above the blocks
         # they follow.
         for p in (_active_pumps.get(cid), *related_pumps):
-            if p is not None and not p.is_done and getattr(p, "accepts_in_flight", 0):
+            if p is not None and not p.is_done and getattr(p, "accepts_in_flight", False):
                 await chat_writer.drain(p.chat_id, timeout=2.0)
         # Each live pump's cutoff and live blocks, taken together before any
         # read (no await in between). A save landing during the reads raises
@@ -317,6 +446,27 @@ class ChatResumeMixin(_Host):
             and (msg.get("delta") or msg.get("_delta")))
         read_floors = {c: int((prev_floors or {}).get(c, 0)) if as_delta else 0
                        for c in (cid, *related_chats)}
+        rows, has_more, plans, restore = await self._resume_read(
+            cid, is_task_chat, related_chats, as_delta, read_floors,
+        )
+        # A live sibling turn: its in-flight tail is withheld below (the
+        # live_state replays it), and it is the pump this view attaches to
+        # when the primary chat has none.
+        active_task_pump = next((rp for rp in related_pumps if rp and not rp.is_done), None)
+        return _ResumeRows(
+            rows=rows, has_more=has_more, plans=plans, restore=restore, held=held,
+            related_pumps=related_pumps, active_task_pump=active_task_pump, as_delta=as_delta,
+            read_floors=read_floors, is_task_chat=is_task_chat, _cut_of=_cut_of,
+        )
+
+    async def _resume_read(self, cid: str, is_task_chat: bool, related_chats: list[str],
+                           as_delta: bool, read_floors: dict[str, int],
+                           ) -> tuple[list[dict], bool, list[dict], dict]:
+        """The rows behind the chat's lane: above the floors as a delta (the
+        siblings' lanes drained first), or the newest page (a task chat loads
+        whole) with the siblings' rows appended; the plans and the restore state
+        ride the same job."""
+        from ws.dashboard import _CHAT_PAGE, _build_chat_restore
         if as_delta:
             # A sibling's row with a lower id can commit after a higher one
             # was observed: its lane is drained before the read.
@@ -349,18 +499,14 @@ class ChatResumeMixin(_Host):
                 for extra in await run_db(
                         lambda: [task_store.get_chat_messages(c) for c in related_chats]):
                     rows.extend(extra)
-        # A live sibling turn: its in-flight tail is withheld below (the
-        # live_state replays it), and it is the pump this view attaches to
-        # when the primary chat has none.
-        active_task_pump = next((rp for rp in related_pumps if rp and not rp.is_done), None)
+        return rows, has_more, plans, restore
 
-        # Restore plan filename from DB so subsequent pumps reuse it
-        if plans and not self.chat_plan_filename:
-            self.chat_plan_filename = plans[-1]["filename"]
-
-        old_session_id = chat.get("session_id")
-        perm_mode = chat.get("permission_mode", "default")
-
+    async def _reap_wedged_pump(self, cid: str, is_task_chat: bool, msg: dict) -> None:
+        """A primary pump whose turn cannot end (its producer done, its remote
+        stream severed, its process dead, or silent past the hard ceiling) is
+        aborted before the attach, the task run it rides stamped as reaped. A
+        resync never reaps: its pump is busy, not wedged."""
+        from ws.dashboard import STALE_TURN_SECS
         # Reap a WEDGED primary pump before truncating/attaching (stuck-chat
         # recovery). A remote turn whose satellite event stream was severed (a
         # reconnect orphaned the session queue, so post-reconnect events are
@@ -407,7 +553,7 @@ class ChatResumeMixin(_Host):
                     _reason = "stream severed by a satellite reconnect"
                 elif _hard_stale:
                     _reason = (
-                        f"stalled: no stream events for {int(_idle)}s, "
+                        f"stalled: no stream events for {int(cast('float', _idle))}s, "
                         f"hard ceiling exceeded"
                     )
                 else:
@@ -416,10 +562,12 @@ class ChatResumeMixin(_Host):
                         f"process dead"
                     )
                 logger.warning(
-                    f"WS dashboard resume_chat: reaping wedged pump chat={cid} "
-                    f"session={_wedged.session_id[:8]} (producer_done="
-                    f"{_wedged.producer.done()}, severed={_severed}, "
-                    f"idle={_idle}, proc_dead={_proc_dead})"
+                    "WS dashboard resume_chat: reaping wedged pump chat=%s "
+                    "session=%s (producer_done="
+                    "%s, severed=%s, "
+                    "idle=%s, proc_dead=%s)",
+                    cid, _wedged.session_id[:8], _wedged.producer.done(), _severed, _idle,
+                    _proc_dead
                 )
                 # A running task run riding this chat: stamp WHY the platform
                 # stopped it (the runs page must distinguish this from a user
@@ -452,15 +600,22 @@ class ChatResumeMixin(_Host):
                     try:
                         await self.layer.prepare_resume(_wedged.session_id)
                     except Exception:
-                        logger.exception(f"reap prepare_resume failed for chat={cid}")
+                        logger.exception("reap prepare_resume failed for chat=%s", cid)
                     from core.concurrency import release_chat_slot
                     release_chat_slot(_wedged.session_id)
             elif _stale:
                 logger.info(
-                    f"WS dashboard resume_chat: chat={cid} stalled but process "
-                    f"alive (idle={_idle:.0f}s) — leaving the turn to recover"
+                    "WS dashboard resume_chat: chat=%s stalled but process "
+                    "alive (idle=%.0fs) — leaving the turn to recover", cid, _idle
                 )
 
+    async def _resume_history(self, cid: str, chat: dict, r: _ResumeRows, locked: dict[str, str],
+                              f: _ResumeFacts) -> tuple["ChatStreamPump | None", bool, str]:
+        """The history frame: the pump re-read after the reap, the rows above a
+        live pump's cutoff withheld, the view-only notice first on an externally
+        driven chat, the frame encoded off the loop. Answers the pump, whether
+        the view is read-only and the external kind the log names."""
+        from ws.dashboard import chat_process_alive, task_run_active_async
         # Check for active pump on primary chat or related task turn
         pump = _active_pumps.get(cid)
         # An ACTIVE external session (phone today; website/webhook later) owns
@@ -485,45 +640,45 @@ class ChatResumeMixin(_Host):
         # job pending: no row of that turn exists yet) withholds nothing.
         cuts: dict[str, int | None] = {}
         if pump and not pump.is_done and not view_only_external:
-            cuts[cid] = _cut_of(pump)
-        elif active_task_pump:
+            cuts[cid] = r._cut_of(pump)
+        elif r.active_task_pump:
             # Related turn has active pump — primary messages are complete
-            pump = active_task_pump
-        for rp in related_pumps:
+            pump = r.active_task_pump
+        for rp in r.related_pumps:
             if rp and not rp.is_done:
-                cuts[rp.chat_id] = _cut_of(rp)
-        self._resume_live = {c: (h[0], h[2]) for c, h in held.items()}
-        messages, new_floors = _cut_rows(rows, cuts, read_floors)
-        if is_task_chat:
+                cuts[rp.chat_id] = r._cut_of(rp)
+        self._resume_live = {c: (h[0], h[2]) for c, h in r.held.items()}
+        messages, new_floors = _cut_rows(r.rows, cuts, r.read_floors)
+        if r.is_task_chat:
             # The turns as they happened: a reload and a delta converge on
             # one order, whichever run a row belongs to.
             messages.sort(key=lambda m: int(m["id"]))
 
-        frame = {"type": wire.CHAT_HISTORY_DELTA if as_delta else wire.CHAT_HISTORY,
+        frame = {"type": wire.CHAT_HISTORY_DELTA if r.as_delta else wire.CHAT_HISTORY,
                  "chat_id": cid,
                  # Agent of record, from the chat row — the frontend uses it
                  # to normalize a mismatched /chat/:name/:chatId URL (a
                  # deep-link/redirect can carry the wrong slug; the route
                  # param is otherwise trusted for the UI shell).
                  "agent": chat["agent"],
-                 "has_more": has_more,
-                 "restore": restore,
+                 "has_more": r.has_more,
+                 "restore": r.restore,
                  "plans": [{"filename": p["filename"], "content": p["content"],
-                            "status": p["status"]} for p in plans],
-                 "total_cost": total_cost,
-                 "context_used": context_used,
-                 "context_max": context_max,
-                 "cache_read": cache_read,
-                 "cache_write": cache_write,
-                 "output_tokens": output_tokens,
-                 "execution_path": effective_exec_path,
+                            "status": p["status"]} for p in r.plans],
+                 "total_cost": f.total_cost,
+                 "context_used": f.context_used,
+                 "context_max": f.context_max,
+                 "cache_read": f.cache_read,
+                 "cache_write": f.cache_write,
+                 "output_tokens": f.output_tokens,
+                 "execution_path": f.effective_exec_path,
                  "execution_mode": chat.get("execution_mode", ""),
                  "model": chat.get("model", ""),
                  # The chat's stored permission mode. The frontend applies
                  # it for task-run chats (the scheduler's 'auto' posture)
                  # so the permission chip reflects the RUN's real mode,
                  # not the viewer's sticky selection.
-                 "mode": chat.get("permission_mode", "default"),
+                 "mode": chat.get("permission_mode") or ASK_MODE,
                  # Best-effort process liveness (in-memory only, no RPC) —
                  # gates the cross-engine model options client-side. An
                  # active pump also means alive (the attach below streams
@@ -542,8 +697,8 @@ class ChatResumeMixin(_Host):
         # holds these rows and paints both at once.
         if pump and not pump.is_done and not view_only_external:
             frame["live_pending"] = True
-        if as_delta:
-            frame["since_id"] = min(read_floors.values())
+        if r.as_delta:
+            frame["since_id"] = min(r.read_floors.values())
         kind = ""
         if view_only_external:
             kind = pump.source_type if pump else session_kind.of_chat(chat).source_type
@@ -558,60 +713,54 @@ class ChatResumeMixin(_Host):
         # the loop, and the thread yields between rows.
         if await self._send_text(await asyncio.to_thread(_encode_history, frame, messages)):
             self._history_floors = (cid, new_floors)
+        return pump, view_only_external, kind
 
-        if view_only_external:
-            # Read-only view of a live external session: history is sent, but we
-            # do NOT acquire the session slot, send warmup_ready, or promise a
-            # pump attach — leaving the phone/webhook driver's stream untouched
-            # so the call keeps playing and tears down normally.
-            logger.info(
-                f"WS dashboard: chat={cid} is driven by a {kind} session — "
-                f"read-only {'delta' if as_delta else 'history'} after chat_view_only, "
-                f"not attaching"
-            )
+    async def _resume_attach(self, cid: str, chat: dict, pump, f: _ResumeFacts) -> None:
+        """A live pump on the chat: the slot confirmed, warmup_ready and the queue
+        snapshot sent, the attach promised to the pump loop."""
+        # Confirm the concurrency slot (idempotent for a tracked session;
+        # the reconciler may have dropped one), using the chat's pinned
+        # target so a REMOTE session stays off the local ceiling G.
+        from core.concurrency import acquire_chat_slot
+        adm = await acquire_chat_slot(
+            pump.session_id, target=chat.get("execution_target") or placement.LOCAL,
+            execution_path=chat.get("execution_path"),
+            user_sub=None if self._view_only else self.user_sub,
+            per_user_cap=False,
+        )
+        if not adm:
+            await self._send_error(cast("str", adm.user_message))
             return
+        self.session_id = pump.session_id
+        # Refresh session's user_tz from this user's last client_info —
+        # handles the WS-reconnect case where session was originally
+        # warmed up before any client_info had arrived.
+        _user_default_tz = get_user_tz(self.user_sub)
+        if _user_default_tz and not self._view_only:
+            set_session_user_tz(self.session_id, _user_default_tz)
+        await self._send({
+            "type": wire.WARMUP_READY,
+            "session_id": self.session_id,
+            "chat_id": self.chat_id,
+            "mode": f.perm_mode,
+            "model": f.chat_model,
+            "execution_path": f.effective_exec_path,
+            **(await run_db(self._target_mismatch_fields, self.chat_id)),
+        })
+        # Resync any reload-persisted queuedMessages on the
+        # client against the pump's actual queue. Backend is the source
+        # of truth; without this a reload mid-streaming would show
+        # stale entries (we might have missed a queue_sent during the
+        # disconnect).
+        await self._send(await self._queue_snapshot(pump))
+        # live_state is sent from _stream_via_pump AFTER attach() to avoid race
+        self.promised_pump_chat = cid  # consumed by _enter_pump_loop
+        logger.info("WS dashboard: active pump found for chat=%s, will attach", self.chat_id)
 
-        if pump and not pump.is_done:
-            # Confirm the concurrency slot (idempotent for a tracked session;
-            # the reconciler may have dropped one), using the chat's pinned
-            # target so a REMOTE session stays off the local ceiling G.
-            from core.concurrency import acquire_chat_slot
-            adm = await acquire_chat_slot(
-                pump.session_id, target=chat.get("execution_target") or placement.LOCAL,
-                execution_path=chat.get("execution_path"),
-                user_sub=None if self._view_only else self.user_sub,
-                per_user_cap=False,
-            )
-            if not adm:
-                await self._send_error(adm.user_message)
-                return
-            self.session_id = pump.session_id
-            # Refresh session's user_tz from this user's last client_info —
-            # handles the WS-reconnect case where session was originally
-            # warmed up before any client_info had arrived.
-            _user_default_tz = get_user_tz(self.user_sub)
-            if _user_default_tz and not self._view_only:
-                set_session_user_tz(self.session_id, _user_default_tz)
-            await self._send({
-                "type": wire.WARMUP_READY,
-                "session_id": self.session_id,
-                "chat_id": self.chat_id,
-                "mode": perm_mode,
-                "model": chat_model,
-                "execution_path": effective_exec_path,
-                **(await run_db(self._target_mismatch_fields, self.chat_id)),
-            })
-            # Resync any reload-persisted queuedMessages on the
-            # client against the pump's actual queue. Backend is the source
-            # of truth; without this a reload mid-streaming would show
-            # stale entries (we might have missed a queue_sent during the
-            # disconnect).
-            await self._send(await self._queue_snapshot(pump))
-            # live_state is sent from _stream_via_pump AFTER attach() to avoid race
-            self.promised_pump_chat = cid  # consumed by _enter_pump_loop
-            logger.info(f"WS dashboard: active pump found for chat={self.chat_id}, will attach")
-            return
-
+    async def _resume_session(self, chat: dict, old_session_id: str | None, f: _ResumeFacts) -> bool:
+        """The chat's session still alive: a PTY session re-attached as a viewer,
+        a headless or grace-held one re-admitted. True when this answered the
+        resume (the slot refusal's error included), so no lazy frame follows."""
         # Try to reconnect to existing session
         if old_session_id:
             # Live INTERACTIVE session (PTY) — re-attach the viewer. Checked
@@ -632,9 +781,9 @@ class ChatResumeMixin(_Host):
                     "type": wire.WARMUP_READY,
                     "session_id": self.session_id,
                     "chat_id": self.chat_id,
-                    "mode": get_session_mode(old_session_id) or perm_mode,
-                    "model": chat_model,
-                    "execution_path": effective_exec_path,
+                    "mode": get_session_mode(old_session_id) or f.perm_mode,
+                    "model": f.chat_model,
+                    "execution_path": f.effective_exec_path,
                     "interactive": True,
                     # Live turn state at attach — same reconciliation as the
                     # warmup re-attach path: the chat_history sent above makes
@@ -649,7 +798,7 @@ class ChatResumeMixin(_Host):
                 await self._send(await self._queue_snapshot())
                 await self._send_engine_prompts()
                 # Client attaches the PTY viewer via pty_attach (see _dispatch).
-                return
+                return True
             # A machine in its reconnect grace is coming back: its session
             # stays the chat's (a turn sent meanwhile waits for it).
             if self.layer and (
@@ -667,21 +816,21 @@ class ChatResumeMixin(_Host):
                     per_user_cap=False,
                 )
                 if not adm:
-                    await self._send_error(adm.user_message)
-                    return
+                    await self._send_error(cast("str", adm.user_message))
+                    return True
                 self.session_id = old_session_id
                 # Refresh session's user_tz from this user's last client_info.
                 _user_default_tz = get_user_tz(self.user_sub)
                 if _user_default_tz and not self._view_only:
                     set_session_user_tz(self.session_id, _user_default_tz)
-                live_mode = get_session_mode(old_session_id) or perm_mode
+                live_mode = get_session_mode(old_session_id) or f.perm_mode
                 await self._send({
                     "type": wire.WARMUP_READY,
                     "session_id": self.session_id,
                     "chat_id": self.chat_id,
                     "mode": live_mode,
-                    "model": chat_model,
-                    "execution_path": effective_exec_path,
+                    "model": f.chat_model,
+                    "execution_path": f.effective_exec_path,
                     "interactive": False,
                     **(await run_db(self._target_mismatch_fields, self.chat_id)),
                 })
@@ -689,8 +838,12 @@ class ChatResumeMixin(_Host):
                 # clears any reload-persisted stale entries.
                 await self._send(await self._queue_snapshot())
                 await self._send_engine_prompts()
-                return
+                return True
+        return False
 
+    async def _resume_lazy(self, chat: dict, old_session_id: str | None, f: _ResumeFacts) -> None:
+        """No session: a stale permission prompt of the old one saved as rejected,
+        then warmup_ready with ``needs_warmup`` (the first message re-warms)."""
         # Session dead or doesn't exist — DON'T spawn a new process just for browsing.
         # Send warmup_ready with no session. When the user sends a message,
         # _handle_chat -> _start_new_stream will auto-resume the session on demand.
@@ -719,18 +872,18 @@ class ChatResumeMixin(_Host):
                         ),
                         label="stale_permission",
                     )
-                    logger.info(f"WS dashboard: saved stale permission as rejected for chat={self.chat_id}")
+                    logger.info("WS dashboard: saved stale permission as rejected for chat=%s", self.chat_id)
                 elif evt_type == wire.ITEM_PLAN_REVIEW:
                     # Keep plan_review pending — user can still implement after session resume
-                    logger.info(f"WS dashboard: keeping stale plan_review pending for chat={self.chat_id}")
+                    logger.info("WS dashboard: keeping stale plan_review pending for chat=%s", self.chat_id)
         self.session_id = None
         await self._send({
             "type": wire.WARMUP_READY,
             "session_id": None,
             "chat_id": self.chat_id,
-            "mode": perm_mode,
-            "model": chat_model,
-            "execution_path": effective_exec_path,
+            "mode": f.perm_mode,
+            "model": f.chat_model,
+            "execution_path": f.effective_exec_path,
             "execution_mode": chat.get("execution_mode", ""),
             "needs_warmup": True,
             **(await run_db(self._target_mismatch_fields, self.chat_id)),
@@ -742,6 +895,7 @@ class ChatResumeMixin(_Host):
         await self._send(await self._queue_snapshot())
         await self._send_engine_prompts()
         logger.info(
-            f"WS dashboard resume_chat (lazy): session dead/missing, "
-            f"chat={self.chat_id}, agent={self.agent_name} — will warmup on first message"
+            "WS dashboard resume_chat (lazy): session dead/missing, "
+            "chat=%s, agent=%s — will warmup on first message",
+            self.chat_id, self.agent_name
         )

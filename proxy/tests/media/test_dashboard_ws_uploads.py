@@ -34,23 +34,24 @@ def test_pasted_photos_are_saved_off_the_loop_in_order(tmp_path, monkeypatch):
     two at a time across every connection."""
     import asyncio
     import threading
+
     import ws.dashboard  # noqa: F401  (assembles the support mixin first)
-    from ws import dashboard_chat_support as support
+    from ws import dashboard as dash, dashboard_chat_support as support
 
     main = threading.get_ident()
     seen: list[tuple[str, bool]] = []
-    real = support._save_base64_image
+    real = dash._save_base64_image
 
     def _recording_save(data_url, *, save_dir):
         seen.append((data_url[-8:], threading.get_ident() != main))
         return real(data_url, save_dir=save_dir)
 
-    monkeypatch.setattr(support, "_save_base64_image", _recording_save)
+    monkeypatch.setattr(dash, "_save_base64_image", _recording_save)
     monkeypatch.setattr(support, "_PHOTO_WAIT_S", 5.0)
     urls = [_TINY_PNG_DATA_URL + ("=" * i) for i in range(3)]
 
     async def run():
-        return [await support._save_photo_off_loop(support._save_base64_image, u,
+        return [await support._save_photo_off_loop(dash._save_base64_image, u,
                                                    save_dir=tmp_path) for u in urls]
 
     saved = asyncio.run(run())
@@ -157,6 +158,7 @@ def test_save_base64_image_jpeg_for_large_input(tmp_path):
     import os
 
     from PIL import Image
+
     from ws.dashboard import _save_base64_image
 
     # 1500x1500 random RGB pixels — enough entropy that JPEG can't compress
@@ -183,7 +185,7 @@ def _data_url(img, fmt: str, **save) -> str:
     import io
     buf = io.BytesIO()
     img.save(buf, format=fmt, **save)
-    mime = {"JPEG": "jpeg", "PNG": "png", "GIF": "gif"}[fmt]
+    mime = {"JPEG": "jpeg", "PNG": "png", "GIF": "gif", "TIFF": "tiff"}[fmt]
     return f"data:image/{mime};base64,{_b64.b64encode(buf.getvalue()).decode('ascii')}"
 
 
@@ -197,6 +199,7 @@ def test_a_small_jpeg_stays_a_jpeg_without_metadata(tmp_path):
     saved as a JPEG, not re-encoded as a PNG; the orientation the user saw
     is applied, EXIF and the comment are gone, the colour profile is kept."""
     from PIL import Image, ImageCms
+
     from ws.dashboard import _save_base64_image
 
     img = Image.new("RGB", (400, 300), (200, 30, 30))
@@ -220,6 +223,7 @@ def test_a_small_jpeg_stays_a_jpeg_without_metadata(tmp_path):
 
 def test_a_cmyk_jpeg_is_saved_as_rgb(tmp_path):
     from PIL import Image
+
     from ws.dashboard import _save_base64_image
 
     saved = _save_base64_image(
@@ -231,6 +235,7 @@ def test_a_cmyk_jpeg_is_saved_as_rgb(tmp_path):
 @pytest.mark.parametrize("make", ["rgba", "colour_key", "palette_gif", "sixteen_bit"])
 def test_transparency_palette_and_deep_images_stay_png(tmp_path, make):
     from PIL import Image
+
     from ws.dashboard import _save_base64_image
 
     if make == "rgba":
@@ -247,8 +252,24 @@ def test_transparency_palette_and_deep_images_stay_png(tmp_path, make):
     assert _saved_image(saved).format == "PNG"
 
 
+def test_a_32_bit_grey_image_is_kept_as_a_16_bit_png(tmp_path):
+    """A scientific TIFF opens as mode I, which PNG cannot hold: it is
+    clipped to 16 bits rather than refused."""
+    from PIL import Image
+
+    from ws.dashboard import _save_base64_image
+
+    saved = _save_base64_image(
+        _data_url(Image.new("I", (64, 64), 70000), "TIFF"), save_dir=tmp_path)
+    assert saved["media_type"] == "image/png"
+    out = _saved_image(saved)
+    assert out.format == "PNG" and out.mode == "I;16"
+    assert out.getpixel((0, 0)) == 65535
+
+
 def test_an_opaque_rgb_png_becomes_a_jpeg(tmp_path):
     from PIL import Image
+
     from ws.dashboard import _save_base64_image
 
     saved = _save_base64_image(
@@ -262,6 +283,7 @@ def test_a_huge_non_jpeg_is_refused_with_a_reason(tmp_path):
     message is refused with a sentence instead of the photo silently
     vanishing."""
     from PIL import Image
+
     from ws.dashboard import _save_base64_image
     from ws.dashboard_chat_support import AttachmentsRefused
 
@@ -276,6 +298,7 @@ def test_a_converted_jpeg_keeps_no_profile_of_its_old_mode(tmp_path):
     values, so the RGB copy carries none (read as sRGB, the space the
     conversion writes) rather than one that misdescribes its pixels."""
     from PIL import Image, ImageCms
+
     from ws.dashboard import _save_base64_image
 
     profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
@@ -306,8 +329,8 @@ def _attach(images, files=(), *, direct=False):
 @pytest.fixture
 def agents_root(tmp_path, monkeypatch):
     """A private agents root, and no satellite push (no remote session)."""
-    import config
     import api.media.uploads as uploads
+    import config
     import ws.dashboard  # noqa: F401  (assembles the support mixin first)
 
     async def _no_push(*_a, **_k):
@@ -318,8 +341,9 @@ def agents_root(tmp_path, monkeypatch):
 
 
 def _saved_photo(root: Path, rel: str, data: bytes = b"") -> str:
-    from PIL import Image
     import io
+
+    from PIL import Image
     path = root / _AGENT / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     if not data:
@@ -335,6 +359,7 @@ def test_a_refused_message_keeps_none_of_the_photos_it_saved(agents_root):
     photos this message already saved; a photo re-attached by its saved
     path belongs to an earlier message and stays."""
     from PIL import Image
+
     from ws.dashboard_chat_support import AttachmentsRefused
 
     earlier = _saved_photo(agents_root, _SCOPE + "uploads/photos/img_earlier.png")
@@ -353,10 +378,10 @@ def test_a_refused_message_keeps_none_of_the_photos_it_saved(agents_root):
 def test_a_photo_that_waits_too_long_for_a_slot_refuses_the_message(agents_root, monkeypatch):
     """Both photo slots busy past the wait: the message is refused with the
     busy sentence and the photo saved before it is removed."""
-    from ws import dashboard_chat_support as support
+    from ws import dashboard as dash, dashboard_chat_support as support
 
     monkeypatch.setattr(support, "_PHOTO_WAIT_S", 0.05)
-    real = support._save_base64_image
+    real = dash._save_base64_image
     held: dict = {}
 
     def _take_both_slots():
@@ -368,7 +393,7 @@ def test_a_photo_that_waits_too_long_for_a_slot_refuses_the_message(agents_root,
         held["loop"].call_soon_threadsafe(_take_both_slots)
         return out
 
-    monkeypatch.setattr(support, "_save_base64_image", _save_then_fill_the_slots)
+    monkeypatch.setattr(dash, "_save_base64_image", _save_then_fill_the_slots)
 
     async def run():
         held["loop"] = asyncio.get_running_loop()
@@ -386,9 +411,10 @@ def test_a_send_cancelled_while_a_photo_saves_keeps_no_photo(agents_root, monkey
     the file it wrote, and holds the photo slot until the thread ends."""
     import threading
     import time
-    from ws import dashboard_chat_support as support
 
-    real = support._save_base64_image
+    from ws import dashboard as dash
+
+    real = dash._save_base64_image
     started, go, done = threading.Event(), threading.Event(), threading.Event()
 
     def _slow_save(data_url, *, save_dir):
@@ -399,11 +425,11 @@ def test_a_send_cancelled_while_a_photo_saves_keeps_no_photo(agents_root, monkey
         finally:
             done.set()
 
-    monkeypatch.setattr(support, "_save_base64_image", _slow_save)
+    monkeypatch.setattr(dash, "_save_base64_image", _slow_save)
 
     async def run():
         task = asyncio.create_task(_attach([{"data": _TINY_PNG_DATA_URL, "name": "a.png"}]))
-        while not started.is_set():
+        while not started.is_set():  # noqa: ASYNC110  # a thread sets this event: there is nothing to await
             await asyncio.sleep(0.01)
         task.cancel()
         go.set()
@@ -425,6 +451,7 @@ def test_a_reattached_photo_is_checked_and_read_in_one_job(agents_root):
     photos directory replaced by a link while the photo waits is refused,
     never followed."""
     import os
+
     from ws import dashboard_chat_support as support
 
     mine = _saved_photo(agents_root, _SCOPE + "uploads/photos/img_same.png")
@@ -556,6 +583,7 @@ def test_a_resolved_agent_root_is_compared_with_a_resolved_path(agents_root):
     """An agents root reached through a link: the scope check and the
     listed path both work from the resolved roots."""
     import os
+
     from ws.dashboard_chat_support import _scoped_files
     doc = _saved_photo(agents_root, _SCOPE + "uploads/files/n.md", data=b"n")
     via = agents_root / "via"

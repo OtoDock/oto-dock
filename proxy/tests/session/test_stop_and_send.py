@@ -26,18 +26,17 @@ import asyncio
 
 import pytest
 
+import ws.dashboard  # noqa: F401  (resolves the dashboard↔dashboard_chat cycle)
 from core.events.stream_pump import (
     ChatStreamPump,
     _active_pumps,
     _pending_permissions,
 )
 from core.session.session_state import _chat_streaming_state
-
-import ws.dashboard  # noqa: F401  (resolves the dashboard↔dashboard_chat cycle)
 from ws.dashboard_chat import (
     _STOP_AND_SEND_NOTE,
-    _queued_outgoing,
     ChatController,
+    _queued_outgoing,
 )
 
 
@@ -255,8 +254,9 @@ class TestPumpState:
         an interaction is left once for a viewer, and a system prompt is the
         chat's wake. A typed message never waits here (the chat's queue)."""
         import json
+
         from core.events import chat_writer
-        from core.events.common_events import CommonEvent, ERROR, TurnInput
+        from core.events.common_events import ERROR, CommonEvent, TurnInput
         from storage import database as task_store
         task_store.create_chat("chat-e", "user-admin", "a1")
         events: asyncio.Queue = asyncio.Queue()

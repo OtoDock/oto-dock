@@ -7,7 +7,7 @@
  * isn't rendered falls back to the independents (the map's two-part test).
  */
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen, within, fireEvent } from '@testing-library/react'
+import { render, screen, within, fireEvent, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import AgentGrid from '../pages/AgentGrid'
 
@@ -19,6 +19,8 @@ const agent = (name: string, dept = '', level = '') => ({
   mcp_names: [], schedule_count: 0, trigger_count: 0,
   has_workspace: false, department_id: dept, department_level_id: level,
 })
+
+const setDefault = vi.hoisted(() => vi.fn(() => Promise.resolve()))
 
 const mockUser = vi.hoisted(() => ({
   current: { sub: 'u1', role: 'member', agents: [], agent_roles: {}, default_agent: 'zeta' },
@@ -40,7 +42,7 @@ vi.mock('../api/agents', () => ({
     ],
     isLoading: false,
   }),
-  useSetDefaultAgent: () => ({ mutate: vi.fn() }),
+  useSetDefaultAgent: () => ({ mutate: vi.fn(), mutateAsync: setDefault }),
 }))
 
 vi.mock('../api/departments', () => ({
@@ -102,6 +104,20 @@ describe('AgentGrid departments', () => {
     expect(within(group).getByText('Senior')).toBeInTheDocument()
   })
 
+  it('the group is the raised card and its member cards sit on the page colour', () => {
+    mount()
+    const group = screen.getByText('Engineering').closest('section')!
+    expect(group.className).toContain('bg-surface-card')
+    expect(group.className).not.toContain('bg-surface-sunken')
+    const member = within(group).getByText('BOSS').closest('a')!
+    expect(member.className).toContain('bg-surface-page')
+    expect(member.className).toContain('border-subtle')
+    // An independent agent sits on the page, so it is a raised card.
+    const independent = screen.getByText('OMEGA').closest('a')!
+    expect(independent.className).toContain('bg-surface-card')
+    expect(independent.className).toContain('shadow-elevation-1')
+  })
+
   it('collapses on the header toggle and expands back', () => {
     mount()
     const toggle = screen.getByRole('button', { name: /Engineering/ })
@@ -128,5 +144,24 @@ describe('AgentGrid departments', () => {
     expect(within(fresh).getByText(/No agents yet/)).toBeInTheDocument()
     expect(within(fresh).queryAllByRole('heading', { level: 3 })).toHaveLength(0)
     expect(screen.queryByText('Secret')).not.toBeInTheDocument()
+  })
+})
+
+describe('setting the default agent', () => {
+  it('a refusal shows its reason and leaves the favorite as it was', async () => {
+    const { ApiError } = await import('../lib/http/apiJson')
+    const { onAppToast } = await import('../lib/appToasts')
+    const { personClick } = await import('./dialogsHarness')
+    setDefault.mockImplementationOnce(() => Promise.reject(
+      new ApiError(403, "You don't have access to this agent.", null, null)))
+    const seen: { title: string, body: string }[] = []
+    const stop = onAppToast((t) => seen.push(t))
+    render(<MemoryRouter><AgentGrid /></MemoryRouter>)
+    personClick(screen.getAllByTitle('Set as default agent')[0])
+    personClick(await screen.findByRole('button', { name: 'Confirm' }))
+    await waitFor(() => expect(seen).toHaveLength(1))
+    stop()
+    expect(seen[0]).toMatchObject({ title: 'The default agent was not set', body: "You don't have access to this agent." })
+    expect(mockUser.current.default_agent).toBe('zeta')
   })
 })

@@ -153,6 +153,7 @@ class TestPumpDurableMarker:
     @staticmethod
     def _mk_pump(chat_id, session_id, saved, monkeypatch):
         import asyncio as _aio
+
         from core.events import stream_pump as sp
         monkeypatch.setattr(sp.task_store, "add_chat_message",
                             lambda *a, **k: saved.append((a, k)))

@@ -34,7 +34,7 @@ class CallControlBody(BaseModel):
     question: str = ""
 
 
-def _session_id(authorization: str | None) -> str:
+def _session_id(authorization: str | None) -> dict:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
     parts = authorization.split(" ", 1)

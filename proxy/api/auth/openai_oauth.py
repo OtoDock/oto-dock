@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -26,18 +27,20 @@ import shutil
 import signal
 import time
 from pathlib import Path
+from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import get_current_user, require_human, UserContext, require_user
+import config as app_config
+from auth import rate_limiter, roles
+from auth.providers import UserContext, get_current_user, require_human, require_user
 from services.engines import subscription_pool
 from storage.billing import subscription_status, subscription_store
-import config as app_config
-import contextlib
-from auth import rate_limiter, roles
 
 logger = logging.getLogger(__name__)
+
+_UNREADABLE_LOGIN = "Could not read the ChatGPT sign-in. Start the sign-in again."
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 
@@ -153,14 +156,14 @@ async def oauth_start(
     # Spawn codex login --device-auth via node directly (the codex binary
     # is a Node.js script and systemd services have minimal PATH)
     codex_bin = getattr(app_config, "CODEX_BIN", "codex")
-    codex_resolved = os.path.realpath(codex_bin)
+    codex_resolved = os.path.realpath(codex_bin)  # noqa: ASYNC240  # resolves the Codex binary once per login
     # Resolve node from PATH — its location varies by install (bare-metal apt
     # = /usr/bin/node, the container image = /usr/local/bin/node); keep the
     # apt path as the fallback for systemd's minimal PATH.
     node_bin = shutil.which("node") or "/usr/bin/node"
     logger.info(
-        f"codex device-auth: binary={codex_bin}, resolved={codex_resolved}, "
-        f"node={node_bin}"
+        "codex device-auth: binary=%s, resolved=%s, "
+        "node=%s", codex_bin, codex_resolved, node_bin
     )
     spawn_env = {**os.environ, "BROWSER": "echo", "CODEX_HOME": str(home)}
     try:
@@ -190,7 +193,7 @@ async def oauth_start(
         while time.monotonic() < deadline:
             try:
                 line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=3,
+                    cast("asyncio.StreamReader", proc.stdout).readline(), timeout=3,
                 )
             except asyncio.TimeoutError:
                 # If we already have both values, stop reading
@@ -203,7 +206,7 @@ async def oauth_start(
             all_output.append(raw)
             # Strip ANSI codes for parsing
             clean = _ANSI_RE.sub("", raw)
-            logger.info(f"codex device-auth: {clean[:200]}")
+            logger.info("codex device-auth: %s", clean[:200])
 
             # Extract verification URL (e.g., https://auth.openai.com/codex/device)
             if not verification_url:
@@ -220,8 +223,8 @@ async def oauth_start(
 
             if verification_url and user_code:
                 break
-    except Exception as e:
-        logger.error(f"Error reading codex device-auth output: {e}")
+    except (OSError, ValueError) as e:
+        logger.error("Error reading codex device-auth output: %s", e)
 
     if _active_logins.get(login_id) is not meta:
         await _end_login(login_id, meta)
@@ -229,8 +232,9 @@ async def oauth_start(
     if not verification_url or not user_code:
         clean_output = [_ANSI_RE.sub("", l) for l in all_output]
         logger.error(
-            f"codex device-auth: missing url={bool(verification_url)} "
-            f"code={bool(user_code)}. Output: {clean_output[:10]}"
+            "codex device-auth: missing url=%s "
+            "code=%s. Output: %s",
+            bool(verification_url), bool(user_code), clean_output[:10]
         )
         await _end_login(login_id, meta)
         raise HTTPException(
@@ -239,7 +243,7 @@ async def oauth_start(
             "Make sure device code login is enabled in your ChatGPT Security Settings.",
         )
 
-    logger.info(f"OpenAI device-auth started (id={login_id[:8]}, code_received={bool(user_code)})")
+    logger.info("OpenAI device-auth started (id=%s, code_received=%s)", login_id[:8], bool(user_code))
     return {"url": verification_url, "user_code": user_code, "login_id": login_id}
 
 
@@ -403,20 +407,20 @@ async def _store_login(req: OAuthFinishRequest, meta: dict, user: UserContext) -
 
         await asyncio.to_thread(_apply_reconnect)
         sub = await asyncio.to_thread(subscription_store.get_subscription, sub_id)
-        logger.info(f"Updated existing OpenAI OAuth subscription {sub_id[:8]} with fresh tokens")
+        logger.info("Updated existing OpenAI OAuth subscription %s with fresh tokens", sub_id[:8])
         # The exchange rotated the grant OUTSIDE the rotation chokepoint —
         # push the fresh token into live bound sessions' auth.json files
         # (see the Anthropic twin in claude_oauth.py).
         await asyncio.to_thread(subscription_pool.fan_out_current_token, sub_id)
     else:
-        logger.info(f"Created new OpenAI OAuth subscription {sub['id'][:8]}")
+        logger.info("Created new OpenAI OAuth subscription %s", cast("dict", sub)['id'][:8])
 
     # A freshly (re)connected account may be the replacement that sessions
     # stuck on a delisted/removed subscription are waiting for.
     subscription_pool.schedule_rebind("openai oauth connect")
     # The account's window bars show right after the connect.
     from services.engines import subscription_windows
-    subscription_windows.schedule_poll(str(sub.get("id") or ""))
+    subscription_windows.schedule_poll(str(cast("dict", sub).get("id") or ""))
     return {"subscription": sub}
 
 
@@ -449,13 +453,14 @@ def _read_login_blob(home: Path) -> dict:
     """The finished login's ``auth.json``, or the finish's 400."""
     auth_path = Path(home) / "auth.json"
     if not auth_path.exists():
-        raise HTTPException(400, "No credentials found — login may have failed")
+        raise HTTPException(400, "The ChatGPT sign-in did not finish. Start the sign-in again.")
     try:
         auth_data = json.loads(auth_path.read_text())
     except Exception as e:
-        raise HTTPException(400, f"Failed to read credentials: {e}")
+        logger.warning("Reading the ChatGPT sign-in failed: %s", e)
+        raise HTTPException(400, _UNREADABLE_LOGIN) from e
     if not isinstance(auth_data, dict):
-        raise HTTPException(400, "Failed to read credentials: not a JSON object")
+        raise HTTPException(400, _UNREADABLE_LOGIN)
     return auth_data
 
 

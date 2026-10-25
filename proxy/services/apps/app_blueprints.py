@@ -27,11 +27,11 @@ import tempfile
 from pathlib import Path
 
 import config
+from core import layout
 from core.session.session_state import get_user_tz
 from services.apps import app_deploy, releases
 from services.infra import path_confinement, safe_fs
 from storage import database as task_store
-from core import layout
 
 logger = logging.getLogger("otodock.apps")
 
@@ -83,7 +83,7 @@ def export_bundle(row: dict) -> tuple[bytes, dict]:
     try:
         files = releases.walk_tree(source)
     except releases.ReleaseInvalid as e:
-        raise BlueprintError(str(e))
+        raise BlueprintError(str(e)) from e
     if not any(rel == "app.json" for rel, _p in files):
         raise BlueprintError("only an app with a folder (app.json) can be exported")
     doc = app_deploy.read_app_json(source)
@@ -107,8 +107,8 @@ def export_bundle(row: dict) -> tuple[bytes, dict]:
                 continue
             try:
                 data = releases.read_tree_file(source, rel, max_size=releases.MAX_RELEASE_FILE_BYTES)
-            except OSError:
-                raise BlueprintError(f"{rel} changed while it was exported; export again")
+            except OSError as exc:
+                raise BlueprintError(f"{rel} changed while it was exported; export again") from exc
             total += len(data)
             if total > releases.MAX_RELEASE_BYTES:
                 raise BlueprintError("the app is larger than 32 MB")
@@ -126,8 +126,8 @@ def _safe_rel(name: str) -> str:
         raise BlueprintError(f"the bundle holds an unsafe path {name!r}")
     try:
         rel = path_confinement.normalize_rel_path(name)
-    except path_confinement.PathOutsideRoot:
-        raise BlueprintError(f"the bundle holds an unsafe path {name!r}")
+    except path_confinement.PathOutsideRoot as exc:
+        raise BlueprintError(f"the bundle holds an unsafe path {name!r}") from exc
     parts = rel.split("/")
     if any(p.startswith(".") for p in parts) or any(p in _NEVER_PARTS for p in parts):
         raise BlueprintError(f"the bundle holds {name!r} — dotfiles, node_modules and data never travel")
@@ -148,7 +148,7 @@ def read_bundle(data: bytes) -> tuple[Path, dict]:
         try:
             tar = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
         except (tarfile.TarError, OSError, EOFError) as e:
-            raise BlueprintError(f"not a .otoapp archive: {e}")
+            raise BlueprintError(f"not a .otoapp archive: {e}") from e
         with tar:
             # Member by member, every entry counted (folders too): the whole
             # index up front was gigabytes for a small archive of empty
@@ -161,8 +161,8 @@ def read_bundle(data: bytes) -> tuple[Path, dict]:
                     rel = _safe_rel(m.name.rstrip("/"))
                     try:
                         safe_fs.mkdirs_beneath(str(tmp), rel)
-                    except OSError:
-                        raise BlueprintError(f"the bundle holds {rel!r} twice, as a file and a folder")
+                    except OSError as exc:
+                        raise BlueprintError(f"the bundle holds {rel!r} twice, as a file and a folder") from exc
                     continue
                 if not m.isfile():
                     raise BlueprintError(f"the bundle holds {m.name!r}, which is not a regular file")
@@ -180,15 +180,15 @@ def read_bundle(data: bytes) -> tuple[Path, dict]:
                 if rel == BUNDLE_NAME:
                     try:
                         blueprint = json.loads(content.decode("utf-8"))
-                    except (ValueError, UnicodeDecodeError):
-                        raise BlueprintError("blueprint.json is not valid JSON")
+                    except (ValueError, UnicodeDecodeError) as exc:
+                        raise BlueprintError("blueprint.json is not valid JSON") from exc
                     continue
                 # Every member lands beneath the extraction directory through
                 # the helpers: no link on the way is ever written through.
                 try:
                     safe_fs.atomic_write_beneath(str(tmp), rel, content, mkdirs=True, fsync=False)
-                except OSError:
-                    raise BlueprintError(f"{rel} could not be unpacked from the bundle")
+                except OSError as exc:
+                    raise BlueprintError(f"{rel} could not be unpacked from the bundle") from exc
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -231,11 +231,11 @@ def _seed_task(item: dict, agent: str, created_by: str, scope: str, app_slug: st
             community_template=template_slug, community_template_item_slug=item_slug,
         )
         return task_id
-    except psycopg.errors.UniqueViolation:
+    except psycopg.errors.UniqueViolation as exc:
         existing = task_store.find_template_task(
             agent, item_slug, created_by if scope == "user" else None)
         if not existing:
-            raise BlueprintError(f"bundle task {slug!r}: exists under another owner")
+            raise BlueprintError(f"bundle task {slug!r}: exists under another owner") from exc
         return existing["id"]
 
 
@@ -251,6 +251,7 @@ def _seed_trigger(item: dict, agent: str, created_by: str, scope: str, app_slug:
     copy. Answers ``created`` / ``exists`` / ``repointed`` / ``reattached`` /
     ``skipped: <reason>``."""
     import psycopg
+
     from services.scheduler import trigger_manager
     from storage.automation import trigger_store
     slug = str(item.get("slug") or "")
@@ -287,7 +288,7 @@ def _seed_trigger(item: dict, agent: str, created_by: str, scope: str, app_slug:
 
 def _seed_triggers(items: list[dict], agent: str, created_by: str, scope: str, app_slug: str,
                    template_slug: str, app_id: str, doc: dict) -> dict[str, str]:
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     pseudo = {"handlers": json.dumps(doc.get("handlers") or {})}
     names = list(_mf.parse_handlers(pseudo).get("on_trigger") or [])
     out: dict[str, str] = {}
@@ -334,12 +335,12 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
     try:
         files = await asyncio_to_thread(releases.walk_tree, source_dir)
     except releases.ReleaseInvalid as e:
-        raise BlueprintError(str(e))
+        raise BlueprintError(str(e)) from e
     doc = await asyncio_to_thread(app_deploy.read_app_json, source_dir)
     try:
         await asyncio_to_thread(app_deploy.require_entry_page, source_dir)
     except app_deploy.DeployError as e:
-        raise BlueprintError(str(e))
+        raise BlueprintError(str(e)) from e
     items = list(tasks or [])
     if len(items) > MAX_BUNDLE_TASKS:
         raise BlueprintError(f"at most {MAX_BUNDLE_TASKS} tasks in a bundle")
@@ -352,8 +353,8 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
     rel_dir = f"{layout.scope_workspace(username)}/apps/{slug}"
     try:
         root = path_confinement.join_under(agent_dir, rel_dir)
-    except path_confinement.PathOutsideRoot:
-        raise BlueprintError("the app folder would leave the workspace")
+    except path_confinement.PathOutsideRoot as exc:
+        raise BlueprintError("the app folder would leave the workspace") from exc
 
     def _folder_is_plain() -> None:
         # Judged before any task is seeded, so a refused write leaves no
@@ -363,8 +364,8 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
             st = safe_fs.lstat_beneath(agents_root, dest_rel)
         except FileNotFoundError:
             return
-        except safe_fs.SymlinkRefused:
-            raise BlueprintError(f"apps/{slug} sits behind a link, make it a real folder")
+        except safe_fs.SymlinkRefused as exc:
+            raise BlueprintError(f"apps/{slug} sits behind a link, make it a real folder") from exc
         if stat.S_ISLNK(st.st_mode):
             raise BlueprintError(f"apps/{slug} is a link, make it a real folder")
 
@@ -397,10 +398,10 @@ async def import_folder(agent: str, username: str, owner_sub: str | None, slug: 
                         src_root, f"{src_base}/{rel}" if src_base else rel, agents_root, f"{dest_rel}/{rel}",
                         max_size=releases.MAX_RELEASE_FILE_BYTES, mode=releases.RELEASE_FILE_MODE,
                         mkdirs=True)
-        except safe_fs.SymlinkRefused:
-            raise BlueprintError(f"apps/{slug} is a link, or sits behind one: make it a real folder")
-        except OSError:
-            raise BlueprintError(f"apps/{slug} could not be written; try again")
+        except safe_fs.SymlinkRefused as exc:
+            raise BlueprintError(f"apps/{slug} is a link, or sits behind one: make it a real folder") from exc
+        except OSError as exc:
+            raise BlueprintError(f"apps/{slug} could not be written; try again") from exc
 
     await asyncio_to_thread(_write)
     try:

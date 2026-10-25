@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { fetchAppLogs, type PinnedApp } from '../../api/apps'
 import type { AppServerState } from '../../lib/status/appServer'
+import Button from '../ui/Button'
+import { CARD } from '../ui/classes'
 
 /**
  * The server log of a folder app (APPS.md "The supervisor"): the last
@@ -19,12 +21,12 @@ interface Props {
 const STATE_WORDS: Record<AppServerState, string> = {
   up: 'running',
   starting: 'starting',
-  stopped: 'stopped (starts on the next request)',
-  backoff: 'failed — waiting before the next start',
-  quota_full: 'stopped — the storage quota is full',
-  static: 'no server (a client-only app)',
+  stopped: 'stopped, starts on the next request',
+  backoff: 'failed, waiting to start again',
+  quota_full: 'stopped',
+  static: 'no server, a client-only app',
   unapproved: 'waiting for approval',
-  secrets: 'waiting for a secret to be set (Settings in the menu)',
+  secrets: 'waiting for a secret to be set. Open Settings in the menu',
   failed: 'failed to start',
 }
 
@@ -32,47 +34,46 @@ export default function AppLogsPanel({ app, onClose }: Props) {
   const [log, setLog] = useState<string>('')
   const [server, setServer] = useState<string>('')
   const [error, setError] = useState<string>('')
-  const [loading, setLoading] = useState(false)
-
-  const load = () => {
-    setLoading(true)
+  // Each request is the app and a refresh count; the panel loads until the
+  // one it shows has settled.
+  const [refreshes, setRefreshes] = useState(0)
+  const request = `${app.id}#${refreshes}`
+  const [settled, setSettled] = useState<string | null>(null)
+  const loading = settled !== request
+  useEffect(() => {
+    let alive = true
     fetchAppLogs(app.id, 400)
-      .then((r) => { setLog(r.log); setServer(r.error ? `${r.server}: ${r.error}` : r.server); setError('') })
-      .catch((e: Error) => setError(e.message))
-      .finally(() => setLoading(false))
-  }
-  useEffect(() => { load() }, [app.id]) // eslint-disable-line react-hooks/exhaustive-deps
+      .then((r) => {
+        if (!alive) return
+        setLog(r.log); setServer(r.error ? `${r.server}: ${r.error}` : r.server); setError('')
+      })
+      .catch((e: Error) => { if (alive) setError(e.message) })
+      .finally(() => { if (alive) setSettled(request) })
+    return () => { alive = false }
+  }, [app.id, request])
 
   const state = server.split(':')[0]
   return (
-    <div className="mx-3 mt-2 rounded-xl border border-p-border-light bg-p-surface text-xs" data-testid="app-logs-panel">
-      <div className="flex items-center gap-2 border-b border-p-border-light/60 px-3 py-2">
-        <span className="font-medium text-p-text">Logs of “{app.title || app.slug}”</span>
-        <span className="text-p-text-light">
-          server {STATE_WORDS[state as AppServerState] || server || '…'}{server.includes(':') ? ` (${server.split(':').slice(1).join(':').trim()})` : ''}
+    <div className={`mx-3 mt-2 text-xs ${CARD}`} data-testid="app-logs-panel">
+      <div className="flex items-center gap-2 border-b border-subtle px-3 py-2">
+        <span className="font-medium text-primary">Logs of “{app.title || app.slug}”</span>
+        <span className="text-tertiary">
+          server {STATE_WORDS[state as AppServerState] || server || '…'}{server.includes(':') ? `: ${server.split(':').slice(1).join(':').trim()}` : ''}
         </span>
         <span className="ml-auto flex items-center gap-1.5">
-          <button
-            onClick={load}
-            disabled={loading}
-            className="rounded-md border border-p-border-light px-2 py-0.5 text-p-text-secondary transition-colors hover:bg-p-surface-hover disabled:opacity-60"
-          >
+          <Button size="xs" onClick={() => setRefreshes((n) => n + 1)} disabled={loading}>
             Refresh
-          </button>
-          <button
-            onClick={onClose}
-            aria-label="Close logs"
-            className="rounded-md border border-p-border-light px-2 py-0.5 text-p-text-secondary transition-colors hover:bg-p-surface-hover"
-          >
+          </Button>
+          <Button size="xs" onClick={onClose} aria-label="Close logs">
             ✕
-          </button>
+          </Button>
         </span>
       </div>
       {error ? (
-        <p className="px-3 py-2 text-red-500">{error}</p>
+        <p className="px-3 py-2 text-status-danger-fg">{error}</p>
       ) : (
-        <pre className="max-h-64 overflow-auto px-3 py-2 font-mono text-[10px] leading-snug text-p-text-secondary">
-          {log || (loading ? 'Loading…' : 'No log lines yet — the server has not started since the platform did.')}
+        <pre className="max-h-64 overflow-auto rounded-b-card bg-surface-sunken px-3 py-2 font-mono text-3xs leading-snug text-secondary">
+          {log || (loading ? 'Loading…' : 'No log lines yet. The app’s server has not started since OtoDock did.')}
         </pre>
       )}
     </div>

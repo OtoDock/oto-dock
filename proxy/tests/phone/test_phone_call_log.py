@@ -18,15 +18,13 @@ from fastapi.testclient import TestClient
 
 import config
 from auth.providers import UserContext, get_current_user
-from storage.phone import phone_call_log_store
-from storage.phone import phone_route_store
 from storage.pg import get_conn
+from storage.phone import phone_call_log_store, phone_route_store
 
 
 @pytest.fixture
 def client(temp_db):
-    from api.phone import phone as phone_router
-    from api.phone import phone_usage as phone_usage_router
+    from api.phone import phone as phone_router, phone_usage as phone_usage_router
 
     app = FastAPI()
     app.include_router(phone_router.router)

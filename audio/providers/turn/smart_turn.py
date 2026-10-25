@@ -119,8 +119,8 @@ def load_model(model_path: str | None = None, num_threads: int = 1) -> _SmartTur
             _models.clear()
             _models[key] = model
             logger.info(
-                f"Smart Turn model loaded in {time.monotonic() - t0:.1f}s "
-                f"(threads={key[1]})"
+                "Smart Turn model loaded in %.1fs "
+                "(threads=%s)", time.monotonic() - t0, key[1]
             )
     return model
 
@@ -139,8 +139,9 @@ class SmartTurnClassifier(TurnClassifier):
         self._audio_window_samples = int(audio_window_s * 16000)  # 16kHz
         self._model = load_model(model_path, num_threads)
         logger.info(
-            f"Smart Turn classifier initialized "
-            f"(threshold={threshold}, threads={num_threads}, window={audio_window_s}s)"
+            "Smart Turn classifier initialized "
+            "(threshold=%s, threads=%s, window=%ss)",
+            threshold, num_threads, audio_window_s
         )
 
     def _predict_sync(self, audio_16k: np.ndarray) -> tuple[bool, float]:
@@ -170,7 +171,7 @@ class SmartTurnClassifier(TurnClassifier):
         prob = float(1.0 / (1.0 + np.exp(-logit.item())))
         is_complete = prob >= self._threshold
 
-        logger.debug(f"Smart Turn: prob={prob:.3f} → {'complete' if is_complete else 'incomplete'}")
+        logger.debug("Smart Turn: prob=%.3f → %s", prob, 'complete' if is_complete else 'incomplete')
         return is_complete, prob
 
     async def classify_audio(self, audio_16k: np.ndarray) -> bool:
@@ -181,6 +182,6 @@ class SmartTurnClassifier(TurnClassifier):
                 _executor, self._predict_sync, audio_16k,
             )
             return is_complete
-        except Exception as e:
-            logger.warning(f"Smart Turn classifier error: {e}")
+        except Exception as e:  # noqa: BLE001  # onnxruntime loading or running a model raises anything
+            logger.warning("Smart Turn classifier error: %s", e)
             return True  # fail-open

@@ -24,23 +24,24 @@ import sys
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from core.session.session_state import (  # noqa: E402
-    wait_for_permission,
-    wait_for_question,
+from core.session.session_state import (
+    _permission_decisions,
+    _permission_events,
+    _permission_request_sessions,
+    _question_answers,
+    _question_events,
+    _session_permission_requests,
+    cleanup_session_permission_state,
     resolve_permission,
     resolve_question,
     resolve_session_permissions,
-    cleanup_session_permission_state,
-    _permission_events,
-    _permission_decisions,
-    _session_permission_requests,
-    _permission_request_sessions,
-    _question_events,
-    _question_answers,
+    wait_for_permission,
+    wait_for_question,
 )
 
 
@@ -300,6 +301,7 @@ class _CloseProc:
 def parked(monkeypatch):
     """A session with a fake CLI; ``kills`` records the close's kill."""
     import types
+
     from core.layers.cli import session as cli_session_mod
     from core.layers.cli.session import PersistentSession
 

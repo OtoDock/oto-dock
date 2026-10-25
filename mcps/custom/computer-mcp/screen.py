@@ -47,9 +47,9 @@ def _ensure_windows_dpi_aware() -> None:
         # process-wide SetProcessDPIAware (Vista+) if shcore is unavailable.
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except Exception:
+        except Exception:  # noqa: BLE001  # ctypes calls into win32 raise whatever the bridge does
             ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
+    except Exception:  # noqa: BLE001  # ctypes calls into win32 raise whatever the bridge does
         # Best-effort only; the DPR math still self-corrects from the
         # capture/monitor size ratio even if this fails.
         pass
@@ -169,7 +169,7 @@ def capture(display: int | None, coord_mode: str, *, save_path: str | None = Non
         try:
             img.save(save_path, format="PNG", optimize=False, compress_level=6)
             saved_path = save_path
-        except Exception:
+        except (OSError, ValueError):
             saved_path = None  # non-fatal — inline image is still returned
 
     scale = geometry.compute_scale(phys_w, phys_h, coord_mode)

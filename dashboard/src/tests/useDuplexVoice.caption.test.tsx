@@ -16,22 +16,7 @@ vi.mock('@/api/auth', () => ({
 
 import { useDuplexVoice } from '@/hooks/useDuplexVoice'
 import { installMicEnv, uninstallMicEnv } from './fakeMicEnv'
-
-class FakeWebSocket {
-  static OPEN = 1
-  static CONNECTING = 0
-  static instances: FakeWebSocket[] = []
-  readyState = FakeWebSocket.OPEN
-  binaryType = ''
-  sent: string[] = []
-  onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
-  onmessage: ((e: { data: string }) => void) | null = null
-  constructor(public url: string) { FakeWebSocket.instances.push(this) }
-  send(data: string) { this.sent.push(data) }
-  close() { /* keep teardown quiet */ }
-}
+import { FakeWebSocket } from './fakeWebSocket'
 
 describe('useDuplexVoice caption accumulation', () => {
   beforeEach(() => {
@@ -68,6 +53,25 @@ describe('useDuplexVoice caption accumulation', () => {
 
     frame(ws, { type: 'interim_final', text: 'over and out' })
     expect(hook.result.current.caption).toBe('hey, do you copy? over and out')
+  })
+
+  it('the init frame names the browser language and a replace rewrites the committed pieces', async () => {
+    const { hook, ws } = await startSession()
+    act(() => { ws.onopen?.() })
+    const init = JSON.parse(ws.sent[0]) as { type: string; language: string }
+    expect(init.type).toBe('init')
+    expect(['en', 'el', 'de', 'es', 'fr', 'it']).toContain(init.language)
+
+    frame(ws, { type: 'interim_final', text: 'yes sir' })
+    frame(ws, { type: 'interim', text: 'I am' })
+    expect(hook.result.current.caption).toBe('yes sir I am')
+    // The language switched: the new stream's words stand, the overlay restarts.
+    frame(ws, { type: 'replace', text: 'Ναι κύριε' })
+    expect(hook.result.current.caption).toBe('Ναι κύριε')
+    frame(ws, { type: 'interim', text: 'είμαι' })
+    expect(hook.result.current.caption).toBe('Ναι κύριε είμαι')
+    frame(ws, { type: 'replace', text: '' })
+    expect(hook.result.current.caption).toBe('')
   })
 
   it('dispatch clears the committed pieces (final + state frames)', async () => {

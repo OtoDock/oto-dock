@@ -1,0 +1,188 @@
+{
+ "tool_result": {
+  "event_type": "tool_result",
+  "tool_name": "Bash",
+  "tool_use_id": "",
+  "summary": "3 lines",
+  "result_content": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+  "is_error": false
+ },
+ "tool_result_error": {
+  "event_type": "tool_result",
+  "tool_name": "Read",
+  "tool_use_id": "",
+  "summary": "Error",
+  "result_content": "Error: the path is outside your allowed scope",
+  "is_error": true
+ },
+ "question": {
+  "event_type": "question",
+  "tool_name": "AskUserQuestion",
+  "tool_input": {
+   "questions": [
+    {
+     "question": "Which folder?",
+     "header": "Folder",
+     "options": [
+      {
+       "label": "workspace"
+      },
+      {
+       "label": "knowledge"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "permission_prompt": {
+  "event_type": "permission_prompt",
+  "request_id": "req-perm-0001",
+  "tool_name": "Bash",
+  "tool_input": {
+   "command": "rm -r build"
+  }
+ },
+ "permission_prompt_meeting": {
+  "event_type": "permission_prompt",
+  "request_id": "req-perm-0002",
+  "tool_name": "Write",
+  "tool_input": {
+   "file_path": "/workspace/x.md"
+  },
+  "meeting_agent": "ceo"
+ },
+ "question_prompt": {
+  "event_type": "question_prompt",
+  "request_id": "req-question-0001",
+  "tool_name": "request_user_input",
+  "tool_input": {
+   "questions": [
+    {
+     "question": "Delete the keypair file?"
+    }
+   ]
+  }
+ },
+ "plan_review_named": {
+  "event_type": "plan_review",
+  "request_id": "req-plan-0001",
+  "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+  "tool_input": {
+   "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+   "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+  }
+ },
+ "plan_review_unnamed": {
+  "event_type": "plan_review",
+  "request_id": "req-plan-0002",
+  "plan": "# Plan v2\n\n1. Create hello.txt",
+  "tool_input": {
+   "plan": "# Plan v2"
+  }
+ },
+ "prompt_retired": {
+  "event_type": "prompt_retired",
+  "request_id": "req-perm-0001"
+ },
+ "prompt_retired_gone": {
+  "event_type": "prompt_retired",
+  "request_id": "req-perm-0002",
+  "caller_gone": true
+ },
+ "mode_restored": {
+  "event_type": "mode_restored",
+  "mode": "default"
+ },
+ "images": {
+  "event_type": "images",
+  "images": [
+   {
+    "url": "",
+    "image_data": "iVBORw0KGgo=",
+    "caption": "A chart",
+    "link_url": "",
+    "attribution": ""
+   }
+  ]
+ },
+ "image_generating": {
+  "event_type": "image_generating",
+  "prompt_preview": "a red bicycle",
+  "model": "nano-banana"
+ },
+ "image_gen_failed": {
+  "event_type": "image_gen_failed"
+ },
+ "url": {
+  "event_type": "url",
+  "url": "https://example.com",
+  "title": "Example",
+  "description": ""
+ },
+ "file": {
+  "event_type": "file",
+  "filename": "report.pdf",
+  "download_url": "/v1/media/tok-file-1?download=1",
+  "description": "The report"
+ },
+ "video_url": {
+  "event_type": "video",
+  "src_kind": "url",
+  "url": "https://example.com/clip.mp4",
+  "mime": "",
+  "caption": "A clip",
+  "title": "Clip",
+  "poster": ""
+ },
+ "audio_token": {
+  "event_type": "audio",
+  "src_kind": "token",
+  "token": "tok-audio-1",
+  "media_url": "/v1/media/tok-audio-1",
+  "mime": "audio/wav",
+  "caption": "A take",
+  "title": "Take"
+ },
+ "media_processing": {
+  "event_type": "media_processing",
+  "media_kind": "video",
+  "caption": "A clip"
+ },
+ "media_failed": {
+  "event_type": "media_failed",
+  "error": "ffmpeg failed"
+ },
+ "document_preview": {
+  "event_type": "document_preview",
+  "wopi_url": "/v1/wopi/files/f1",
+  "access_token": "wopi-secret-live-only",
+  "access_token_ttl": 3600,
+  "filename": "notes.docx",
+  "file_id": "f1",
+  "download_url": "/v1/media/tok-doc-1?download=1",
+  "snapshot_id": "snap-1",
+  "generation": 3,
+  "version": 2
+ },
+ "document_preview_again": {
+  "event_type": "document_preview",
+  "wopi_url": "/v1/wopi/files/f1",
+  "access_token": "wopi-secret-live-only-2",
+  "access_token_ttl": 3600,
+  "filename": "notes.docx",
+  "file_id": "f1",
+  "download_url": "/v1/media/tok-doc-2?download=1",
+  "snapshot_id": "snap-2",
+  "generation": 4,
+  "version": 3
+ },
+ "ui": {
+  "event_type": "ui",
+  "token": "tok-ui-1",
+  "ui_url": "/v1/ui/tok-ui-1",
+  "title": "A calculator",
+  "height": 420,
+  "path": "workspace/ui/calc.html"
+ }
+}

@@ -2,7 +2,7 @@ import type { ChatMessage } from '@/api/chats'
 import type { MessageBlock } from '@/components/chat/types'
 import { eventToBlock } from './messageBlocks'
 import { REPLAYABLE_ARTIFACT_EVENT_TYPES, identityKey } from './kinds/artifact'
-import { WIRE } from '@/api/wireEvents'
+import { WIRE, type PersistedEvent } from '@/api/wireEvents'
 
 // Replay-on-open rule for interactive PiP artifact windows.
 //
@@ -49,7 +49,7 @@ export function replayableDisplayEvents(
     if (m.role !== 'event' || !REPLAYABLE_ARTIFACT_EVENT_TYPES.has(m.event_type) || !m.event_data) continue
     // A document opens in the chat's document pane, never as a window.
     if (m.event_type === WIRE.DOCUMENT_PREVIEW) continue
-    let evt: any
+    let evt: PersistedEvent
     try { evt = JSON.parse(m.event_data) } catch { continue }
     if (!evt || evt.dismissed) continue
     const block = eventToBlock(evt, m.id)

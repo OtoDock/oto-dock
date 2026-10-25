@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen } from '@testing-library/react'
 
-import { SubscriptionWindowBars, BalanceHint, formatReset } from '@/components/engines/SubscriptionWindows'
+import { SubscriptionWindowBars, BalanceHint } from '@/components/engines/SubscriptionWindows'
+import { formatReset } from '@/components/engines/SubscriptionWindows.helpers'
 
 const windows = {
   five_hour: { pct: 34.4, resets_at: '2099-01-01T14:00:00+00:00' },
@@ -25,7 +26,7 @@ describe('SubscriptionWindowBars', () => {
     const reset = screen.getByText(/^resets /)
     expect(reset.getAttribute('title')).toMatch(/\d{2}:\d{2}/)
     expect(reset.className).toContain('basis-full')
-    expect(screen.getByText('as of 3 min ago')).toBeInTheDocument()
+    expect(screen.getByText('As of 3 min ago')).toBeInTheDocument()
   })
 
   it('says so before the first sample and renders nothing when absent', () => {

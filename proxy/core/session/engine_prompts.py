@@ -20,6 +20,14 @@ on an older one the request is refused at once.
 A request reaches here from the pump (the turn's own stream, ``watch``) or
 from a between-turns reader (``note_frame``: the idle drains, the stale
 drains, a run's background wait).
+
+One request is never a card: the one Claude Code raises in its auto mode
+once its reviewer declined several actions in a row (``decision_reason_type``
+``classifier``). Every reader reaches ``note_frame`` first (the turn's
+readers before the translator), which refuses it at once with a message the
+model reads; the CLI then re-enters auto before the next turn, at most
+``REVIEW_REENTRIES`` times per session, and after that Auto answers with the
+platform's cards (``session_state.pause_review``).
 """
 from __future__ import annotations
 
@@ -40,6 +48,18 @@ UNATTENDED_WAIT_S = 600.0
 #: The first satellite version that writes an answer in the CLI's shape; an
 #: older one's remote request is refused at once.
 ANSWER_SATELLITE_VERSION = "0.5.140"
+
+#: The ``decision_reason_type`` of a request Claude Code raises after its
+#: reviewer's decline limit.
+REVIEW_DECLINE_REASON = "classifier"
+#: How many times per session the CLI re-enters auto after that limit.
+REVIEW_REENTRIES = 2
+_REVIEW_LIMIT_MESSAGE = (
+    "The reviewer declined several actions in a row. Do not retry this one now: "
+    "tell the person what you wanted to do and why, and wait for their reply."
+)
+# request id -> the message its deny carries (``answer_frame``).
+_deny_messages: dict[str, str] = {}
 
 # Why a request was refused without a person's answer (the chat line).
 _NOBODY = "nobody answered in time"
@@ -85,7 +105,8 @@ def answer_frame(request_id: str, approved: bool, tool_input: dict | None = None
         if tool_input is not None:
             decision["updatedInput"] = dict(tool_input)
     else:
-        decision = {"behavior": "deny", "message": "The request was not approved."}
+        decision = {"behavior": "deny", "message": _deny_messages.pop(
+            request_id, "The request was not approved.")}
     return {"type": "control_response",
             "response": {"subtype": "success", "request_id": request_id, "response": decision}}
 
@@ -178,10 +199,16 @@ def note_frame(session_id: str, data: dict, *, in_turn: bool = False) -> None:
     if t == "control_cancel_request":
         withdraw(str(data.get("request_id") or ""))
         return
-    if in_turn or t != "control_request":
+    if t != "control_request":
         return
     request = data.get("request") or {}
     if request.get("subtype") != "can_use_tool":
+        return
+    if request.get("decision_reason_type") == REVIEW_DECLINE_REASON:
+        _refuse_review_fallback(session_id, str(data.get("request_id") or ""),
+                                request.get("input") or {})
+        return
+    if in_turn:
         return
     rid = str(data.get("request_id") or "")
     if not rid or rid in _pending or rid in _withdrawn_early:
@@ -195,6 +222,50 @@ def note_frame(session_id: str, data: dict, *, in_turn: bool = False) -> None:
         "session_id": session_id,
     }
     spawn(_surface(session_id, surfaced), name="surface", owner="engine_prompts")
+
+
+def _refuse_review_fallback(session_id: str, rid: str, tool_input: dict) -> None:
+    """Claude Code's ask after its reviewer's decline limit: refused at once
+    with a message the model reads, never shown (the pump's card for it is
+    skipped: ``withdrawn_before_registered``), then auto re-entered."""
+    if not rid or not session_id:
+        return
+    _withdrawn_early[rid] = time.monotonic()
+    _deny_messages[rid] = _REVIEW_LIMIT_MESSAGE
+    spawn(_refuse_and_reenter(session_id, rid, dict(tool_input)),
+          name="review_limit", owner="engine_prompts")
+
+
+async def _refuse_and_reenter(session_id: str, rid: str, tool_input: dict) -> None:
+    from core.permission_modes import AUTO_REVIEW_MODE
+    from core.session.session_manager import find_layer_for_session
+    from core.session.session_state import (
+        get_session_mode,
+        note_review_reentry,
+        pause_review,
+    )
+    layer = find_layer_for_session(session_id)
+    if layer is None:
+        _deny_messages.pop(rid, None)
+        return
+    try:
+        await layer.answer_engine_prompt(session_id, rid, False, tool_input)
+        logger.info("engine prompt %s on session %s refused: the reviewer's decline limit",
+                    rid, session_id[:8])
+        if get_session_mode(session_id) != AUTO_REVIEW_MODE:
+            return
+        done = note_review_reentry(session_id)
+        if done >= REVIEW_REENTRIES:
+            pause_review(session_id)
+            logger.info("engine review paused on session %s after %d re-entries",
+                        session_id[:8], done)
+            return
+        # The engine re-enters its own review (a local session after the
+        # turn's end); a mode the person changed meanwhile stands.
+        await layer.reenter_review(session_id)
+    except Exception:
+        logger.exception("engine prompt %s on session %s: the decline-limit answer failed",
+                         rid, session_id[:8])
 
 
 async def _surface(session_id: str, data: dict) -> None:

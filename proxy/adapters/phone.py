@@ -11,7 +11,6 @@ from pathlib import Path
 
 from adapters.base import ClientAdapter
 
-
 # A phone call's direction: a route's and a call log row's ``direction``, a
 # phone session's ``call_type``. A missing direction is inbound.
 INBOUND = "inbound"

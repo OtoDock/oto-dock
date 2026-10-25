@@ -12,15 +12,16 @@ Verifies:
 - Multiple images → multiple image blocks in order.
 """
 
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import pytest
 
 from core.layers.providers.base import (
-    ProviderAdapter, ProviderStreamEvent, ProviderUsage,
+    ProviderAdapter,
+    ProviderStreamEvent,
+    ProviderUsage,
 )
 from core.layers.providers.registry import register_adapter
-
 
 _STUB_PROVIDER = "stub-vision-test"
 
@@ -184,8 +185,8 @@ async def test_run_direct_stream_keyless_cloud_provider_clean_error(direct_sessi
 async def test_run_direct_stream_keyless_ok_when_adapter_has_default(direct_session, monkeypatch):
     """Keyless LOCAL providers (ollama / openai-compatible) supply their own
     placeholder key via default_api_key — the turn must proceed."""
-    from core.layers.direct.session import run_direct_stream
     from core.layers.direct import session as S
+    from core.layers.direct.session import run_direct_stream
 
     adapter = S.get_adapter(direct_session.provider)
     monkeypatch.setattr(adapter.__class__, "default_api_key",

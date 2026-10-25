@@ -60,12 +60,20 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass, field
+from typing import Any
+
+import psycopg
 
 from core.session.history_seed import strip_seed_prefix
-from core.session.transcript_tailer import line_time, author_sub_for
+from core.session.transcript_tailer import author_sub_for, line_time
 from core.session.transcript_tool_events import (
-    TailLocks, ToolEventBuffer, attach_result, consume_sent_prompt,
-    persist_event, record_batch_usage,
+    TailLocks,
+    ToolEventBuffer,
+    attach_result,
+    consume_sent_prompt,
+    persist_event,
+    record_batch_usage,
 )
 from ws import wire_events as wire
 
@@ -79,7 +87,7 @@ def _record_rate_limits(session_id: str, snapshot: dict, timestamp) -> None:
     try:
         record_snapshot(
             session_id, snapshot, timestamp if isinstance(timestamp, str) else None)
-    except Exception:
+    except Exception:  # noqa: BLE001  # a window sample spans the pool and the store: the tail goes on
         logger.debug("rollout tailer: window record failed", exc_info=True)
 
 # session_id → number of rollout lines already processed. The rollout JSONL is
@@ -124,7 +132,7 @@ def seek_past_existing(session_id: str, chat_id: str = "") -> int:
     n = 0
     if path and os.path.isfile(path):
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            with open(path, encoding="utf-8", errors="replace") as fh:
                 n = sum(1 for _ in fh)
         except Exception:
             logger.exception("seek_past_existing failed for %s", session_id[:8])
@@ -168,7 +176,7 @@ def rollout_exists(host_codex_home: str, thread_id: str) -> bool:
 def _read_session_meta(path: str) -> dict | None:
     """Parse the first line (session_meta payload) of a rollout, or None."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             first = fh.readline()
         obj = json.loads(first)
     except (OSError, json.JSONDecodeError, ValueError):
@@ -205,7 +213,7 @@ def resolve_rollout_path(session_id: str, chat_id: str) -> str | None:
     try:
         rec = task_store.get_chat(chat_id)
         tid = (rec or {}).get("codex_thread_id", "") or ""
-    except Exception:
+    except psycopg.Error:
         tid = ""
 
     others = {p for s, p in _resolved.items() if s != session_id}
@@ -300,7 +308,8 @@ def _extract_text(content) -> str:
 # in spaces instead of a line break).
 _TIME_PRELUDE_RE = re.compile(
     r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
-    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\.)\]"
+    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\."
+    r'|Meeting "[^\n]{0,4000}? you have only this note\.)\]'
     r"(?:[ \t]*(?:\r?\n+|$)|[ \t]+)"
 )
 
@@ -336,7 +345,8 @@ def _title_from_prompt(text: str) -> str:
 # regex above demands the line end.
 _ROW_PRELUDE_RE = re.compile(
     r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
-    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\.)\]\s*"
+    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\."
+    r'|Meeting "[^\n]{0,4000}? you have only this note\.)\]\s*'
 )
 
 
@@ -381,7 +391,7 @@ def _persisted_prefix(chat_id: str) -> tuple[list[tuple[str, str]], set[str]]:
     from storage import database as task_store
     try:
         rows = task_store.get_chat_messages(chat_id, limit=_PREFIX_LIMIT)  # newest-first
-    except Exception:
+    except psycopg.Error:
         return [], set()
     out: list[tuple[str, str]] = []
     event_keys: set[str] = set()
@@ -428,7 +438,7 @@ def tail_rollout(session_id: str, chat_id: str, rollout_path: str) -> dict:
         processed = start
         new_lines: list[str] = []
         try:
-            with open(rollout_path, "r", encoding="utf-8", errors="replace") as fh:
+            with open(rollout_path, encoding="utf-8", errors="replace") as fh:
                 for idx, raw in enumerate(fh):
                     if idx < start:
                         continue
@@ -662,7 +672,8 @@ def _on_rollout_tool_output(buf: ToolEventBuffer, task_store, chat_id: str,
     attach_result(blk, output)
     if session_id:
         from core.session import session_events
-        tool_input = blk.get("tool_input") if isinstance(blk.get("tool_input"), dict) else {}
+        blk_input = blk.get("tool_input")
+        tool_input = blk_input if isinstance(blk_input, dict) else {}
         if blk.get("name") == "apply_patch":
             # The patch's files only in the record (the persisted row keeps
             # the raw input): the checks' changed set reads written paths.
@@ -674,6 +685,67 @@ def _on_rollout_tool_output(buf: ToolEventBuffer, task_store, chat_id: str,
             tool_input=tool_input, is_error=bool(blk.get("is_error")), source="tailer",
         )
     return _persist_block(task_store, chat_id, blk, known_events)
+
+
+#: The tool response items ``_rollout_tool_item`` reads (a call or its
+#: output, a tool search, a web search).
+_TOOL_ITEM_KINDS = frozenset({"function_call", "custom_tool_call", "function_call_output",
+                              "custom_tool_call_output", "tool_search_call",
+                              "tool_search_output", "web_search_call"})
+
+
+@dataclass
+class _RolloutBatch:
+    """One batch of rollout lines: what the parse loop reads and the
+    counters it fills, handed to the per-item functions and to the batch's
+    end. The context first (the session, the chat, the store, the buffer
+    the pairing waits in, the persisted prefix a first tail skips and its
+    event keys, whether usage is calibrated only)."""
+    session_id: str
+    chat_id: str
+    task_store: Any
+    buf: ToolEventBuffer
+    prefix: list
+    known_events: set | None
+    calibrate_usage: bool
+    ptr: int = 0
+    persisted: int = 0
+    message_rows: int = 0
+    # Early-title counters (interactive_session accumulates them across
+    # batches and fires the LLM title upgrade mid-turn at char/tool
+    # thresholds). Incremented ONLY at actual persist sites, after the
+    # prefix/known_events dedup guards, so re-read history never counts;
+    # question/thinking/system rows are excluded (tool rows only).
+    assistant_chars: int = 0
+    tool_rows: int = 0
+    first_user_text: str | None = None
+    # Turn-end signal for the interactive completion watcher: Codex writes one
+    # ``event_msg``/``task_complete`` per turn (with the
+    # final text in ``last_agent_message``). interactive_session gates the actual
+    # completion on min-turn-time + fire-once, so this is just the signal.
+    saw_task_complete: bool = False
+    last_agent_message: str = ""
+    # The LAST turn-relevant record in the batch — a batch can straddle a turn
+    # boundary ([task_complete, user new-prompt] in one forward), where
+    # ``turn_complete`` alone would read "idle" while a new turn is opening.
+    # Vocabulary shared with transcript_tailer: "user" (a prompt opened a
+    # turn), "tool_use" (agent output mid-turn, no completion yet),
+    # "end_turn" (task_complete), None (nothing turn-relevant).
+    last_signal: str | None = None
+    # The rollout line behind ``last_signal``: its own time (transcript_tailer).
+    last_signal_at: float | None = None
+    # request_user_input call_ids fired this batch and not yet answered. The
+    # TUI blocks on the bottom-pane picker (no further items until the
+    # function_call_output), so an id still open at batch end means the CLI
+    # is parked on the question — the batch folds to a turn close below,
+    # mirroring the Claude tailer's AskUserQuestion fold.
+    open_questions: set[str] = field(default_factory=set)
+    # compacted rollout item seen this batch (see the handler below).
+    compacted: bool = False
+    # Provider usage newly consumed this batch (single accumulator — the model
+    # rides _usage_models, keyed per turn_context). Flushed once at batch end.
+    usage_acc: dict[str, int] = field(default_factory=lambda: {
+        "input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_write": 0})
 
 
 def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
@@ -708,46 +780,10 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
     their usage was recorded pre-restart; recording the replay would
     double-count the whole session."""
     from storage import database as task_store
-    prefix = prefix or []
-    buf = _tool_events.setdefault(session_id, ToolEventBuffer())
-    ptr = 0
-    persisted = 0
-    message_rows = 0
-    # Early-title counters (interactive_session accumulates them across
-    # batches and fires the LLM title upgrade mid-turn at char/tool
-    # thresholds). Incremented ONLY at actual persist sites, after the
-    # prefix/known_events dedup guards, so re-read history never counts;
-    # question/thinking/system rows are excluded (tool rows only).
-    assistant_chars = 0
-    tool_rows = 0
-    first_user_text: str | None = None
-    # Turn-end signal for the interactive completion watcher: Codex writes one
-    # ``event_msg``/``task_complete`` per turn (with the
-    # final text in ``last_agent_message``). interactive_session gates the actual
-    # completion on min-turn-time + fire-once, so this is just the signal.
-    saw_task_complete = False
-    last_agent_message = ""
-    # The LAST turn-relevant record in the batch — a batch can straddle a turn
-    # boundary ([task_complete, user new-prompt] in one forward), where
-    # ``turn_complete`` alone would read "idle" while a new turn is opening.
-    # Vocabulary shared with transcript_tailer: "user" (a prompt opened a
-    # turn), "tool_use" (agent output mid-turn, no completion yet),
-    # "end_turn" (task_complete), None (nothing turn-relevant).
-    last_signal: str | None = None
-    # The rollout line behind ``last_signal``: its own time (transcript_tailer).
-    last_signal_at: float | None = None
-    # request_user_input call_ids fired this batch and not yet answered. The
-    # TUI blocks on the bottom-pane picker (no further items until the
-    # function_call_output), so an id still open at batch end means the CLI
-    # is parked on the question — the batch folds to a turn close below,
-    # mirroring the Claude tailer's AskUserQuestion fold.
-    open_questions: set[str] = set()
-    # compacted rollout item seen this batch (see the handler below).
-    compacted = False
-    # Provider usage newly consumed this batch (single accumulator — the model
-    # rides _usage_models, keyed per turn_context). Flushed once at batch end.
-    usage_acc = {"input_tokens": 0, "output_tokens": 0,
-                 "cache_read": 0, "cache_write": 0}
+    b = _RolloutBatch(session_id=session_id, chat_id=chat_id, task_store=task_store,
+                      buf=_tool_events.setdefault(session_id, ToolEventBuffer()),
+                      prefix=prefix or [], known_events=known_events,
+                      calibrate_usage=calibrate_usage)
     for raw in lines:
         raw = (raw or "").strip()
         if not raw:
@@ -779,63 +815,8 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
                 _usage_models[session_id] = str(payload["model"])
             continue
 
-        if otype == "event_msg" and payload.get("type") == "token_count":
-            info = payload.get("info") or {}
-            last = info.get("last_token_usage") or {}
-            total = info.get("total_token_usage") or {}
-            # Claim per event line — no id, so key on the envelope timestamp +
-            # the cumulative total (monotonic per session): unique per real
-            # event, identical on a re-delivery.
-            key = (f"usage:{obj.get('timestamp', '')}"
-                   f":{total.get('total_tokens', 0)}")
-            fresh = buf.claim(key)
-            if last and fresh and not calibrate_usage:
-                inp = int(last.get("input_tokens") or 0)
-                cached = int(last.get("cached_input_tokens") or 0)
-                cw = int(last.get("cache_write_input_tokens") or 0)
-                non_cached = max(0, inp - cached)
-                cw = min(cw, non_cached)
-                usage_acc["input_tokens"] += non_cached - cw
-                usage_acc["cache_read"] += cached
-                usage_acc["cache_write"] += cw
-                usage_acc["output_tokens"] += int(last.get("output_tokens") or 0)
-            if fresh and isinstance(payload.get("rate_limits"), dict):
-                # The account's window state rides next to the counts; the
-                # envelope timestamp dates the observation, so a replayed
-                # line never reads as a fresh one.
-                _record_rate_limits(session_id, payload["rate_limits"],
-                                    obj.get("timestamp"))
-            continue
-
-        if otype == "event_msg" and payload.get("type") in ("error", "stream_error"):
-            # CLI-reported stream/API error (its own marker — never model
-            # prose): a provider limit rests the account and fails the scope
-            # over now. Claude twin: transcript_tailer's isApiErrorMessage hook.
-            try:
-                from services.engines.subscription_pool import throttle_from_cli_error
-                throttle_from_cli_error(
-                    session_id, str(payload.get("message") or ""))
-            except Exception:
-                logger.exception(
-                    "codex tail %s: limit-detection failed", session_id[:8])
-            continue
-
-        if otype == "event_msg" and payload.get("type") == "task_complete":
-            # Per-turn completion marker — the agent finished this turn.
-            saw_task_complete = True
-            last_signal = "end_turn"
-            last_signal_at = line_time(obj)
-            lam = payload.get("last_agent_message")
-            if lam:
-                last_agent_message = lam
-            continue
-
-        if otype == "event_msg" and payload.get("type") == "turn_aborted":
-            # ESC / dashboard Stop: the turn ended by interruption — no
-            # task_complete follows. Close the turn WITHOUT the completion
-            # signal (the user stopped it themselves; no finished ping).
-            last_signal = "end_turn"
-            last_signal_at = line_time(obj)
+        if otype == "event_msg":
+            _rollout_event_msg(b, obj, payload)
             continue
 
         if otype == "compacted":
@@ -848,183 +829,268 @@ def _process_rollout_lines(session_id: str, chat_id: str, lines, *, prefix=None,
                 "subtype": wire.SUBTYPE_CONTEXT_COMPRESSED,
                 "message": "Conversation compacted",
             })
-            persisted += 1
-            compacted = True
+            b.persisted += 1
+            b.compacted = True
             continue
 
         if otype != "response_item":
             continue
         ptype = payload.get("type")
-        if ptype in ("function_call", "custom_tool_call"):
-            rows = _on_rollout_tool_call(buf, task_store, chat_id,
-                                         payload, known_events,
-                                         open_questions)
-            persisted += rows
-            # A persisted row here is a tool card (update_plan snapshot /
-            # id-less input-only) — EXCEPT the question row.
-            if payload.get("name") != "request_user_input":
-                tool_rows += rows
-            if payload.get("name") == "request_user_input":
-                # Turn-relevant: codex tool calls otherwise don't move the
-                # signal, but the question fold below keys on "tool_use"
-                # (Claude parity — its question tool_use sets the same).
-                last_signal = "tool_use"
-                last_signal_at = line_time(obj)
-            continue
-        if ptype in ("function_call_output", "custom_tool_call_output"):
-            open_questions.discard(payload.get("call_id") or "")
-            rows = _on_rollout_tool_output(
-                buf, task_store, chat_id, payload.get("call_id") or "",
-                payload.get("output"), known_events, session_id=session_id)
-            persisted += rows
-            tool_rows += rows
-            continue
-        if ptype == "tool_search_call":
-            args = payload.get("arguments") \
-                if isinstance(payload.get("arguments"), dict) else {}
-            call_id = payload.get("call_id") or payload.get("id") or ""
-            if call_id and buf.claim(call_id):
-                from core.layers.codex import tool_names
-                buf.pending[call_id] = {
-                    "type": wire.PERSISTED_TOOL, "name": tool_names.canonical(ptype), "tool_id": call_id,
-                    "summary": args.get("query", ""), "active": False,
-                    "tool_input": args,
-                }
-            continue
-        if ptype == "tool_search_output":
-            rows = _on_rollout_tool_output(
-                buf, task_store, chat_id, payload.get("call_id") or "",
-                json.dumps(payload.get("tools") or []), known_events,
-                session_id=session_id)
-            persisted += rows
-            tool_rows += rows
-            continue
-        if ptype == "web_search_call":
-            # Server-side tool — no output item pairs with it; the results ride
-            # the model's context. One completed row at the call's position.
-            wid = payload.get("call_id") or payload.get("id") or ""
-            action = payload.get("action")
-            query = (action.get("query") or "") if isinstance(action, dict) else ""
-            if wid and not buf.claim(wid):
-                continue
-            from core.layers.codex import tool_names
-            rows = _persist_block(task_store, chat_id, {
-                "type": wire.PERSISTED_TOOL, "name": tool_names.canonical(ptype), "tool_id": wid or tool_names.canonical(ptype),
-                "summary": query, "active": False,
-                "tool_input": {"query": query} if query else None,
-            }, known_events)
-            persisted += rows
-            tool_rows += rows
+        if ptype in _TOOL_ITEM_KINDS:
+            _rollout_tool_item(b, obj, payload, ptype)
             continue
         if ptype == "reasoning":
-            # Headless parity: the summary text is what streams as THINKING
-            # (raw chains arrive encrypted — nothing readable to persist then).
-            texts = [s.get("text", "") for s in payload.get("summary") or []
-                     if isinstance(s, dict)]
-            texts += [c.get("text", "") for c in payload.get("content") or []
-                      if isinstance(c, dict)
-                      and c.get("type") in ("reasoning_text", "text")]
-            content_text = "\n\n".join(t for t in texts if t and t.strip())
-            if not content_text.strip():
-                continue
-            rid = payload.get("id") or ""
-            if rid and not buf.claim(rid):
-                continue
-            persisted += _persist_block(task_store, chat_id, {
-                "type": wire.THINKING, "content": content_text,
-            }, known_events)
+            _rollout_reasoning(b, payload)
             continue
         if ptype != "message":
             continue
-        role = payload.get("role")
-        if role not in ("user", "assistant"):
-            continue  # developer (perms) + any other synthetic role
-        text = _extract_text(payload.get("content"))
-        if role == "user":
-            # Drop any restored-history digest the reseed prepended to the
-            # cold prompt — only the real prompt belongs in chat_messages.
-            text = strip_seed_prefix(text)
-        if not text.strip():
-            continue
-        if role == "user" and _is_synthetic_user(text):
-            continue  # AGENTS.md / environment-context injection
+        _rollout_message(b, obj, payload)
+    return _finish_rollout_batch(b)
 
-        if role == "user" and first_user_text is None:
-            first_user_text = text
 
-        # Turn-relevant either way — a prefix-skipped record is still the
-        # batch's latest turn state (a resume's first tail re-reads history).
-        last_signal = "user" if role == "user" else "tool_use"
-        last_signal_at = line_time(obj)
+def _rollout_event_msg(b: _RolloutBatch, obj: dict, payload: dict) -> None:
+    """An ``event_msg`` line: the usage and window sample of a
+    ``token_count``, a stream error's throttle, the turn's completion or
+    its abort; any other kind is nothing to the chat."""
+    if payload.get("type") == "token_count":
+        info = payload.get("info") or {}
+        last = info.get("last_token_usage") or {}
+        total = info.get("total_token_usage") or {}
+        # Claim per event line — no id, so key on the envelope timestamp +
+        # the cumulative total (monotonic per session): unique per real
+        # event, identical on a re-delivery.
+        key = (f"usage:{obj.get('timestamp', '')}"
+               f":{total.get('total_tokens', 0)}")
+        fresh = b.buf.claim(key)
+        if last and fresh and not b.calibrate_usage:
+            inp = int(last.get("input_tokens") or 0)
+            cached = int(last.get("cached_input_tokens") or 0)
+            cw = int(last.get("cache_write_input_tokens") or 0)
+            non_cached = max(0, inp - cached)
+            cw = min(cw, non_cached)
+            b.usage_acc["input_tokens"] += non_cached - cw
+            b.usage_acc["cache_read"] += cached
+            b.usage_acc["cache_write"] += cw
+            b.usage_acc["output_tokens"] += int(last.get("output_tokens") or 0)
+        if fresh and isinstance(payload.get("rate_limits"), dict):
+            # The account's window state rides next to the counts; the
+            # envelope timestamp dates the observation, so a replayed
+            # line never reads as a fresh one.
+            _record_rate_limits(b.session_id, payload["rate_limits"],
+                                obj.get("timestamp"))
+        return
+    if payload.get("type") in ("error", "stream_error"):
+        # CLI-reported stream/API error (its own marker — never model
+        # prose): a provider limit rests the account and fails the scope
+        # over now. Claude twin: transcript_tailer's isApiErrorMessage hook.
+        try:
+            from services.engines.subscription_pool import throttle_from_cli_error
+            throttle_from_cli_error(
+                b.session_id, str(payload.get("message") or ""))
+        except Exception:
+            logger.exception(
+                "codex tail %s: limit-detection failed", b.session_id[:8])
+        return
+    if payload.get("type") == "task_complete":
+        # Per-turn completion marker — the agent finished this turn.
+        b.saw_task_complete = True
+        b.last_signal = "end_turn"
+        b.last_signal_at = line_time(obj)
+        lam = payload.get("last_agent_message")
+        if lam:
+            b.last_agent_message = lam
+        return
+    if payload.get("type") == "turn_aborted":
+        # ESC / dashboard Stop: the turn ended by interruption — no
+        # task_complete follows. Close the turn WITHOUT the completion
+        # signal (the user stopped it themselves; no finished ping).
+        b.last_signal = "end_turn"
+        b.last_signal_at = line_time(obj)
+        return
 
-        # Prefix-merge: already persisted (resume/restart) → consume + skip.
-        if ptr < len(prefix) and _same_persisted_row(prefix[ptr], role, text):
-            ptr += 1
-            continue
 
-        # The dashboard warmup already persisted this exact prompt at
-        # send-time — skip the row, keep the turn signal/title (twin of the
-        # Claude tailer's consume; see transcript_tool_events).
-        if role == "user" and consume_sent_prompt(chat_id, text):
-            continue
+def _rollout_tool_item(b: _RolloutBatch, obj: dict, payload: dict, ptype: str) -> None:
+    """A tool ``response_item``: a call or its output paired through the
+    buffer, a tool search and its answer, a web search's one row."""
+    if ptype in ("function_call", "custom_tool_call"):
+        rows = _on_rollout_tool_call(b.buf, b.task_store, b.chat_id,
+                                     payload, b.known_events,
+                                     b.open_questions)
+        b.persisted += rows
+        # A persisted row here is a tool card (update_plan snapshot /
+        # id-less input-only) — EXCEPT the question row.
+        if payload.get("name") != "request_user_input":
+            b.tool_rows += rows
+        if payload.get("name") == "request_user_input":
+            # Turn-relevant: codex tool calls otherwise don't move the
+            # signal, but the question fold below keys on "tool_use"
+            # (Claude parity — its question tool_use sets the same).
+            b.last_signal = "tool_use"
+            b.last_signal_at = line_time(obj)
+        return
+    if ptype in ("function_call_output", "custom_tool_call_output"):
+        b.open_questions.discard(payload.get("call_id") or "")
+        rows = _on_rollout_tool_output(
+            b.buf, b.task_store, b.chat_id, payload.get("call_id") or "",
+            payload.get("output"), b.known_events, session_id=b.session_id)
+        b.persisted += rows
+        b.tool_rows += rows
+        return
+    if ptype == "tool_search_call":
+        arguments = payload.get("arguments")
+        args = arguments if isinstance(arguments, dict) else {}
+        call_id = payload.get("call_id") or payload.get("id") or ""
+        if call_id and b.buf.claim(call_id):
+            from core.layers.codex import tool_names
+            b.buf.pending[call_id] = {
+                "type": wire.PERSISTED_TOOL, "name": tool_names.canonical(ptype), "tool_id": call_id,
+                "summary": args.get("query", ""), "active": False,
+                "tool_input": args,
+            }
+        return
+    if ptype == "tool_search_output":
+        rows = _on_rollout_tool_output(
+            b.buf, b.task_store, b.chat_id, payload.get("call_id") or "",
+            json.dumps(payload.get("tools") or []), b.known_events,
+            session_id=b.session_id)
+        b.persisted += rows
+        b.tool_rows += rows
+        return
+    if ptype == "web_search_call":
+        # Server-side tool — no output item pairs with it; the results ride
+        # the model's context. One completed row at the call's position.
+        wid = payload.get("call_id") or payload.get("id") or ""
+        action = payload.get("action")
+        query = (action.get("query") or "") if isinstance(action, dict) else ""
+        if wid and not b.buf.claim(wid):
+            return
+        from core.layers.codex import tool_names
+        rows = _persist_block(b.task_store, b.chat_id, {
+            "type": wire.PERSISTED_TOOL, "name": tool_names.canonical(ptype), "tool_id": wid or tool_names.canonical(ptype),
+            "summary": query, "active": False,
+            "tool_input": {"query": query} if query else None,
+        }, b.known_events)
+        b.persisted += rows
+        b.tool_rows += rows
+        return
 
-        task_store.add_chat_message(
-            chat_id, role, text,
-            # Attribution is a property of the HUMAN turn (twin of the Claude
-            # tailer's author_sub stamp); assistant rows carry none.
-            author_sub=(author_sub_for(session_id) if role == "user" else ""),
-            sync_search=False,
-        )
-        persisted += 1
-        message_rows += 1
-        if role == "assistant":
-            assistant_chars += len(text)
 
+def _rollout_reasoning(b: _RolloutBatch, payload: dict) -> None:
+    """A ``reasoning`` item: its readable summary as one thinking row."""
+    # Headless parity: the summary text is what streams as THINKING
+    # (raw chains arrive encrypted — nothing readable to persist then).
+    texts = [s.get("text", "") for s in payload.get("summary") or []
+             if isinstance(s, dict)]
+    texts += [c.get("text", "") for c in payload.get("content") or []
+              if isinstance(c, dict)
+              and c.get("type") in ("reasoning_text", "text")]
+    content_text = "\n\n".join(t for t in texts if t and t.strip())
+    if not content_text.strip():
+        return
+    rid = payload.get("id") or ""
+    if rid and not b.buf.claim(rid):
+        return
+    b.persisted += _persist_block(b.task_store, b.chat_id, {
+        "type": wire.THINKING, "content": content_text,
+    }, b.known_events)
+
+
+def _rollout_message(b: _RolloutBatch, obj: dict, payload: dict) -> None:
+    """A ``message`` item: the role filter, the seed and synthetic strips,
+    the turn signal, the prefix merge, the sent-prompt skip, the row."""
+    role = payload.get("role")
+    if role not in ("user", "assistant"):
+        return  # developer (perms) + any other synthetic role
+    text = _extract_text(payload.get("content"))
+    if role == "user":
+        # Drop any restored-history digest the reseed prepended to the
+        # cold prompt — only the real prompt belongs in chat_messages.
+        text = strip_seed_prefix(text)
+    if not text.strip():
+        return
+    if role == "user" and _is_synthetic_user(text):
+        return  # AGENTS.md / environment-context injection
+
+    if role == "user" and b.first_user_text is None:
+        b.first_user_text = text
+
+    # Turn-relevant either way — a prefix-skipped record is still the
+    # batch's latest turn state (a resume's first tail re-reads history).
+    b.last_signal = "user" if role == "user" else "tool_use"
+    b.last_signal_at = line_time(obj)
+
+    # Prefix-merge: already persisted (resume/restart) → consume + skip.
+    if b.ptr < len(b.prefix) and _same_persisted_row(b.prefix[b.ptr], role, text):
+        b.ptr += 1
+        return
+
+    # The dashboard warmup already persisted this exact prompt at
+    # send-time — skip the row, keep the turn signal/title (twin of the
+    # Claude tailer's consume; see transcript_tool_events).
+    if role == "user" and consume_sent_prompt(b.chat_id, text):
+        return
+
+    b.task_store.add_chat_message(
+        b.chat_id, role, text,
+        # Attribution is a property of the HUMAN turn (twin of the Claude
+        # tailer's author_sub stamp); assistant rows carry none.
+        author_sub=(author_sub_for(b.session_id) if role == "user" else ""),
+        sync_search=False,
+    )
+    b.persisted += 1
+    b.message_rows += 1
+    if role == "assistant":
+        b.assistant_chars += len(text)
+
+
+def _finish_rollout_batch(b: _RolloutBatch) -> dict:
+    """The batch's end: the question fold, the search rebuild, the title
+    backfill, the usage flush, the log line and the result."""
     # Question fold: a request_user_input still unanswered at batch end means
     # the TUI is blocked on the picker — close the turn (headless parity: the
     # pump's turn would end right after the question card) so the live dot
     # clears and the "needs your input" ping can fire. Never overrides a REAL
     # later signal: "user" (new prompt) and "end_turn" (turn_aborted from ESC
     # / real completion) win — those paths must not read as question-parked.
-    question_pending = bool(open_questions) and last_signal in ("tool_use", None)
+    question_pending = bool(b.open_questions) and b.last_signal in ("tool_use", None)
     if question_pending:
-        last_signal = "end_turn"
+        b.last_signal = "end_turn"
 
     # The message rows skipped the per-row search rebuild: one per batch.
-    if message_rows and chat_id:
-        task_store.rebuild_chat_search(chat_id)
+    if b.message_rows and b.chat_id:
+        b.task_store.rebuild_chat_search(b.chat_id)
 
-    title_set = _maybe_backfill_title(session_id, chat_id, first_user_text)
+    title_set = _maybe_backfill_title(b.session_id, b.chat_id, b.first_user_text)
 
     usage_rows = 0
-    if any(usage_acc.values()) and chat_id:
+    if any(b.usage_acc.values()) and b.chat_id:
         usage_rows = record_batch_usage(
-            session_id, chat_id,
-            {_usage_models.get(session_id, ""): usage_acc}, task_store)
+            b.session_id, b.chat_id,
+            {_usage_models.get(b.session_id, ""): b.usage_acc}, b.task_store)
 
-    if persisted:
+    if b.persisted:
         logger.info(
             "interactive codex %s: persisted %d rollout message(s) to chat %s%s",
-            session_id[:8], persisted, chat_id, " (titled)" if title_set else "",
+            b.session_id[:8], b.persisted, b.chat_id, " (titled)" if title_set else "",
         )
     return {
-        "persisted": persisted,
+        "persisted": b.persisted,
         "title_set": title_set,
         # Interactive completion signal (consumed by interactive_session).
-        "turn_complete": saw_task_complete,
-        "last_message": last_agent_message,
-        "last_signal": last_signal,
-        "last_signal_at": last_signal_at,
+        "turn_complete": b.saw_task_complete,
+        "last_message": b.last_agent_message,
+        "last_signal": b.last_signal,
+        "last_signal_at": b.last_signal_at,
         # Turn parked on an unanswered request_user_input (folded to end_turn
         # above) — interactive_session rewords the ping + gates injection.
         "question_pending": question_pending,
         # A compacted rollout item landed in this batch (see handler above).
-        "compacted": compacted,
+        "compacted": b.compacted,
         # usage_records rows written for this batch (0 = no new usage events).
         "usage_rows": usage_rows,
         # Early-title counters (see the init comment above).
-        "assistant_chars": assistant_chars,
-        "tool_rows": tool_rows,
+        "assistant_chars": b.assistant_chars,
+        "tool_rows": b.tool_rows,
     }
 
 
@@ -1048,7 +1114,7 @@ def _maybe_backfill_title(session_id: str, chat_id: str, first_user_text: str | 
                     rec.get("user_sub", ""), chat_id, new_title,
                     agent=rec.get("agent") or "",
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001  # the title fan-out must not fail a title already saved
                 pass
             return True
     except Exception:

@@ -23,8 +23,7 @@ async def _outage(tmp_path, stage: str, restore: str) -> dict:
     the loop every 200 ms and on the lanes every 100 ms until an on-loop
     read succeeds after the restore."""
     import config
-    from storage import database as sdb
-    from storage import pg
+    from storage import database as sdb, pg
     from tests.loadtest import _harness as h
 
     real_url = config.DATABASE_URL
@@ -40,7 +39,7 @@ async def _outage(tmp_path, stage: str, restore: str) -> dict:
             try:
                 sdb.get_platform_setting("loadtest_probe")
                 loop_reads.append({"t": t0, "s": time.monotonic() - t0, "error": ""})
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  # the outage test records which error each read met
                 loop_reads.append({"t": t0, "s": time.monotonic() - t0, "error": type(exc).__name__})
             await asyncio.sleep(0.2)
 
@@ -49,7 +48,7 @@ async def _outage(tmp_path, stage: str, restore: str) -> dict:
             try:
                 await pg.run_db(sdb.get_platform_setting, "loadtest_probe")
                 lane_reads.append({"t": t0, "s": time.monotonic() - t0, "error": ""})
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  # the outage test records which error each read met
                 lane_reads.append({"t": t0, "s": time.monotonic() - t0, "error": type(exc).__name__})
 
         pending = set()
@@ -82,7 +81,7 @@ async def _outage(tmp_path, stage: str, restore: str) -> dict:
                 await h.read_line(relay, 10)
                 t_back = time.monotonic()
                 async with asyncio.timeout(60):
-                    while not any(r["t"] >= t_back and not r["error"] for r in loop_reads):
+                    while not any(r["t"] >= t_back and not r["error"] for r in loop_reads):  # noqa: ASYNC110  # the reader task's results list: nothing to await
                         await asyncio.sleep(0.05)
                 await asyncio.sleep(1.0)
                 stop.set()

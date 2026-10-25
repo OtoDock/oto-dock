@@ -282,7 +282,10 @@ async def test_the_proxys_own_kill_ends_the_turn_with_no_ending(_no_foreign, _no
 
 @pytest.mark.asyncio
 async def test_interrupt_marks_the_kill_as_the_proxys_own(monkeypatch):
-    from core.layers.cli.session import _persistent_sessions, interrupt_persistent_session
+    from core.layers.cli.session import (
+        _persistent_sessions,
+        interrupt_persistent_session,
+    )
     s = _session()
 
     async def fake_kill(proc, sid):

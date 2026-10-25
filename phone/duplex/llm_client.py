@@ -88,14 +88,16 @@ class DuplexLlmClient:
             if not first_text_logged and mtype == "text":
                 first_text_logged = True
                 logger.info(
-                    f"[{self._conn.peer_addr}] turn {turn}: first text frame"
+                    "[%s] turn %s: first text frame",
+                    self._conn.peer_addr, turn
                 )
             elif mtype in ("tool_start", "tool_end"):
                 logger.info(
-                    f"[{self._conn.peer_addr}] turn {turn}: {mtype} frame"
+                    "[%s] turn %s: %s frame",
+                    self._conn.peer_addr, turn, mtype
                 )
             if mtype == "_closed":
-                logger.info(f"[{self._conn.peer_addr}] socket closed mid-turn")
+                logger.info("[%s] socket closed mid-turn", self._conn.peer_addr)
                 self.turn_in_flight = False
                 break
             if mtype == "text":
@@ -121,7 +123,7 @@ class DuplexLlmClient:
             elif mtype == "error":
                 reason = msg.get("data", {}).get("message", "unknown")
                 logger.warning(
-                    f"[{self._conn.peer_addr}] turn error: {reason}"
+                    "[%s] turn error: %s", self._conn.peer_addr, reason
                 )
                 self.turn_in_flight = False
                 yield "Sorry, I hit an error handling that."

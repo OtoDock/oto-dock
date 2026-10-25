@@ -4,9 +4,8 @@ A session JWT is scoped to its session_id. Hook endpoints cross-check the
 token's sid against the request body session_id (``verify_session_match_async``)
 so a compromised MCP can't request resources for other sessions."""
 
-from fastapi import HTTPException
-
 import pytest
+from fastapi import HTTPException
 
 
 @pytest.mark.asyncio

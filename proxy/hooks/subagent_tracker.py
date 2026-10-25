@@ -19,6 +19,7 @@ inherited by subagent-lifecycle hook subprocesses):
   OTO_SESSION_ID    - session UUID for this conversation
 """
 
+import http.client
 import json
 import os
 import sys
@@ -75,7 +76,7 @@ def main():
     try:
         with urllib.request.urlopen(req, timeout=10):
             pass  # Fire and forget
-    except Exception:
+    except (OSError, http.client.HTTPException, ValueError):
         pass  # Non-blocking — never interrupt Claude
 
 

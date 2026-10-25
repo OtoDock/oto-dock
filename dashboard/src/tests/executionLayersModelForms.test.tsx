@@ -11,8 +11,8 @@ vi.mock('@/api/executionLayers', async (importOriginal) => {
   return {
     ...mod,
     useAddModel: () => ({ mutate: vi.fn(), isPending: false }),
-    useUpdateModel: () => ({ mutate: vi.fn(), isPending: false }),
-    useDeleteModel: () => ({ mutate: vi.fn(), isPending: false }),
+    useUpdateModel: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false }),
+    useDeleteModel: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false }),
   }
 })
 
@@ -51,7 +51,7 @@ function Harness() {
   )
 }
 
-const xhighBox = () => screen.queryByLabelText(/Supports xhigh effort/)
+const xhighBox = () => screen.queryByRole('checkbox', { name: /Supports xhigh effort/ })
 
 describe('ModelsByProvider — the xhigh checkbox reads the provider entry', () => {
   it('the add form shows it under the provider that declares xhigh per model only', () => {
@@ -65,9 +65,20 @@ describe('ModelsByProvider — the xhigh checkbox reads the provider entry', () 
     expect(xhighBox()).not.toBeInTheDocument()
   })
 
+  it('the add form opens under its provider header, above that provider\'s models', () => {
+    render(<Harness />)
+    fireEvent.click(screen.getAllByRole('button', { name: '+ Custom' })[0])
+    const field = screen.getByPlaceholderText(/Model ID/)
+    const model = screen.getByText('forge model')
+    expect(field.compareDocumentPosition(model) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // Escape inside it closes it.
+    fireEvent.keyDown(field, { key: 'Escape' })
+    expect(screen.queryByPlaceholderText(/Model ID/)).toBeNull()
+  })
+
   it("a row's editor follows the same declaration", () => {
     render(<Harness />)
-    const [forgeEdit, lanEdit] = screen.getAllByTitle('Edit pricing, context & tier')
+    const [forgeEdit, lanEdit] = screen.getAllByTitle('Edit pricing, context and tier')
     fireEvent.click(forgeEdit)
     expect(xhighBox()).toBeInTheDocument()
     fireEvent.click(forgeEdit)  // collapses

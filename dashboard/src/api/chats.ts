@@ -1,6 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './auth'
-import { apiJson } from '../lib/http/apiJson'
+import { apiJson, apiOk, withMessage, withFallback, ApiError } from '../lib/http/apiJson'
 import { type SourceType } from '../lib/session/kind'
 import type { ActiveRowPhase } from '../lib/status/chat'
 
@@ -58,10 +57,8 @@ export function useChats(agent?: string, pollPaused = false) {
     queryKey: ['chats', agent],
     queryFn: async () => {
       const params = agent ? `?agent=${agent}` : ''
-      const res = await apiFetch(`/v1/chats${params}`)
-      if (!res.ok) throw new Error('Failed to fetch chats')
-      const data = await res.json()
-      return data.chats as Chat[]
+      const data = await apiJson<{ chats: Chat[] }>(`/v1/chats${params}`).catch(withMessage('Failed to fetch chats'))
+      return data.chats
     },
     // Paused while an inline rename is being typed: a poll-driven reorder
     // moves the row's DOM node, which blurs the input and would silently
@@ -90,10 +87,9 @@ export function useTaskChats(agent?: string, enabled = true, pollPaused = false)
   return useQuery({
     queryKey: ['task-chats', agent],
     queryFn: async () => {
-      const res = await apiFetch(`/v1/chats?agent=${agent}&kind=tasks`)
-      if (!res.ok) throw new Error('Failed to fetch task chats')
-      const data = await res.json()
-      return data.chats as TaskChat[]
+      const data = await apiJson<{ chats: TaskChat[] }>(`/v1/chats?agent=${agent}&kind=tasks`)
+        .catch(withMessage('Failed to fetch task chats'))
+      return data.chats
     },
     enabled: !!agent && enabled,
     // Paused while an inline rename is being typed (see useChats).
@@ -172,13 +168,14 @@ export async function resolveChatPath(
   const cacheKey = `${chatId}\n${path}`
   const cached = resolvePathCache.get(cacheKey)
   if (cached) return cached
-  const res = await apiFetch(`/v1/chats/${chatId}/resolve-path`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path }),
-  })
-  if (!res.ok) throw new Error(`Failed to resolve path (HTTP ${res.status})`)
-  const data = await res.json() as { found: boolean } & Omit<ResolvedChatPath, 'previewable'> & { previewable?: boolean }
+  const data = await apiJson<{ found: boolean } & Omit<ResolvedChatPath, 'previewable'> & { previewable?: boolean }>(
+    `/v1/chats/${chatId}/resolve-path`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    },
+  ).catch(withMessage(() => 'Could not open that file'))
   if (!data.found) return null
   const resolved: ResolvedChatPath = {
     agent: data.agent,
@@ -198,10 +195,9 @@ export async function fetchOlderMessages(
   chatId: string, beforeId: number, limit = 50,
 ): Promise<{ messages: ChatMessage[]; has_more: boolean }> {
   const params = new URLSearchParams({ before_id: String(beforeId), limit: String(limit) })
-  const res = await apiFetch(`/v1/chats/${chatId}?${params}`)
-  if (!res.ok) throw new Error('Failed to fetch older messages')
-  const data = await res.json()
-  return { messages: (data.messages ?? []) as ChatMessage[], has_more: !!data.has_more }
+  const data = await apiJson<{ messages?: ChatMessage[]; has_more?: boolean }>(`/v1/chats/${chatId}?${params}`)
+    .catch(withMessage('Failed to fetch older messages'))
+  return { messages: data.messages ?? [], has_more: !!data.has_more }
 }
 
 /** Imperative fetch of the NEWEST page of a chat (+ has_more) — the rich-view
@@ -209,21 +205,17 @@ export async function fetchOlderMessages(
 export async function fetchChatPage(
   chatId: string, limit = 50,
 ): Promise<{ messages: ChatMessage[]; has_more: boolean }> {
-  const res = await apiFetch(`/v1/chats/${chatId}?limit=${limit}`)
-  if (!res.ok) throw new Error('Failed to fetch chat history')
-  const data = await res.json()
-  return { messages: (data.messages ?? []) as ChatMessage[], has_more: !!data.has_more }
+  const data = await apiJson<{ messages?: ChatMessage[]; has_more?: boolean }>(`/v1/chats/${chatId}?limit=${limit}`)
+    .catch(withMessage('Failed to fetch chat history'))
+  return { messages: data.messages ?? [], has_more: !!data.has_more }
 }
 
 export function useDeleteChat() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: async (chatId: string) => {
-      const res = await apiFetch(`/v1/chats/${chatId}`, { method: 'DELETE' })
-      if (!res.ok) {
-        const detail = await res.json().then(d => d?.detail).catch(() => '')
-        throw new Error(detail || `Failed to delete chat (HTTP ${res.status})`)
-      }
+      await apiOk(`/v1/chats/${chatId}`, { method: 'DELETE' })
+        .catch(withFallback(() => 'Could not delete the chat'))
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['chats'] })
@@ -246,16 +238,11 @@ export function useRenameChat() {
   }
   return useMutation({
     mutationFn: async ({ chatId, title }: { chatId: string; title: string }) => {
-      const res = await apiFetch(`/v1/chats/${chatId}`, {
+      return apiJson<{ title?: string }>(`/v1/chats/${chatId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title }),
-      })
-      if (!res.ok) {
-        const detail = await res.json().then(d => d?.detail).catch(() => '')
-        throw new Error(detail || `Failed to rename (HTTP ${res.status})`)
-      }
-      return res.json() as Promise<{ title?: string }>
+      }).catch(withFallback(() => 'Could not rename the chat'))
     },
     onMutate: async ({ chatId, title }) => {
       // Stop in-flight polls from resurrecting the old title mid-patch.
@@ -279,15 +266,11 @@ export function useRenameTask() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: async ({ taskId, name }: { taskId: string; name: string }) => {
-      const res = await apiFetch(`/v1/tasks/${taskId}`, {
+      await apiOk(`/v1/tasks/${taskId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
-      })
-      if (!res.ok) {
-        const detail = await res.json().then(d => d?.detail).catch(() => '')
-        throw new Error(detail || `Failed to rename (HTTP ${res.status})`)
-      }
+      }).catch(withFallback(() => 'Could not rename the task'))
     },
     onMutate: async ({ taskId, name }) => {
       await queryClient.cancelQueries({ queryKey: ['task-chats'] })
@@ -312,9 +295,8 @@ export function useAgentConversations(agent: string, sourceType?: string, offset
     queryFn: async () => {
       const params = new URLSearchParams({ offset: String(offset), limit: String(limit) })
       if (sourceType) params.set('source_type', sourceType)
-      const res = await apiFetch(`/v1/agents/${agent}/conversations?${params}`)
-      if (!res.ok) throw new Error('Failed to fetch conversations')
-      return res.json() as Promise<{ conversations: Chat[]; total: number }>
+      return apiJson<{ conversations: Chat[]; total: number }>(`/v1/agents/${agent}/conversations?${params}`)
+        .catch(withMessage('Failed to fetch conversations'))
     },
     enabled: !!agent,
   })
@@ -325,10 +307,10 @@ export function useChatDetail(chatId: string | null) {
     queryKey: ['chat-detail', chatId],
     queryFn: async () => {
       if (!chatId) return null
-      const res = await apiFetch(`/v1/chats/${chatId}/detail`)
-      if (res.status === 403) throw new ForbiddenError()
-      if (!res.ok) throw new Error('Failed to fetch chat')
-      return res.json() as Promise<Chat>
+      return apiJson<Chat>(`/v1/chats/${chatId}/detail`).catch((e: unknown) => {
+        if (e instanceof ApiError && e.status === 403) throw new ForbiddenError()
+        return withMessage('Failed to fetch chat')(e)
+      })
     },
     enabled: !!chatId,
   })

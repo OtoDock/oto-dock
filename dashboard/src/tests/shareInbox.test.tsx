@@ -56,11 +56,11 @@ describe('ShareInboxSection', () => {
     const first = render(<ShareInboxSection items={[mkItem({})]} agents={withPool}
       onAccept={onAccept} onDecline={noop} onHide={noop} onOpen={noop} />)
     const select = screen.getByLabelText('Place in') as HTMLSelectElement
-    expect(Array.from(select.options).map((o) => o.textContent)).toEqual(['Lite', 'Ops Pool (for everyone there)'])
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual(['Lite', 'Ops Pool, for everyone there'])
     expect(screen.queryByTestId('share-inbox-for-everyone')).toBeNull()
     fireEvent.change(select, { target: { value: 'pool' } })
     expect(screen.getByTestId('share-inbox-for-everyone').textContent).toContain(
-      'Ops Pool is Shared only: its chats run as the agent, so the app goes to its apps for everyone there, and Nora is told.')
+      'Ops Pool is Shared only, so its chats run as the agent. The app goes to its apps for everyone there. Nora is told.')
     fireEvent.click(screen.getByRole('button', { name: 'Add for everyone' }))
     expect(onAccept).toHaveBeenCalledWith(expect.objectContaining({ id: 's1' }), 'pool')
     first.unmount()

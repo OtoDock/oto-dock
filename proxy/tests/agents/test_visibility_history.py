@@ -11,8 +11,8 @@ from __future__ import annotations
 import pytest
 
 from core.session.visibility import chat_history_owner, is_shared_chat_owner
-from storage.agents import agent_store
 from storage import database
+from storage.agents import agent_store
 
 
 def _seed_modes():
@@ -150,7 +150,7 @@ async def test_otodock_fresh_chat_lands_in_scope_aware_history(
     # unresumable ("that chat was not found").
     _seed_modes()
     from core.session import otodock_session as osess
-    from storage import remote_store
+    from services.remote import remote_status
 
     async def fake_owner_for_machine(machine_id):
         return {"pairing_scope": "admin"}, "admin-sub", {"sub": "admin-sub"}
@@ -162,7 +162,7 @@ async def test_otodock_fresh_chat_lands_in_scope_aware_history(
     monkeypatch.setattr(osess, "_owner_role_for_agent", fake_role)
     monkeypatch.setattr(osess, "_model_for_path", lambda a, p, m: "claude-fable-5")
     monkeypatch.setattr(
-        remote_store, "resolve_execution_target", lambda a, s, r: ("m1", ""),
+        remote_status, "resolve_execution_target", lambda a, s, r: ("m1", ""),
     )
 
     class _Stop(Exception):

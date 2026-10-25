@@ -16,18 +16,21 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
-from core.layers.cli.helpers import (
-    ClaudeStreamChunk,
-    _extract_context_window,
-    _extract_turn_context,
-    _extract_tool_summary,
-    _SKIP_INLINE_TOOLS,
-)
-from core.session.session_state import get_subagent_registry
 from core.events import turn_ending
 from core.events.bg_command_state import (
-    get_bg_command_registry, shorten_label, TERMINAL_STATUSES,
+    TERMINAL_STATUSES,
+    get_bg_command_registry,
+    shorten_label,
 )
+from core.events.common_events import NOTE_MARK
+from core.layers.cli.helpers import (
+    _SKIP_INLINE_TOOLS,
+    ClaudeStreamChunk,
+    _extract_context_window,
+    _extract_tool_summary,
+    _extract_turn_context,
+)
+from core.session.session_state import get_subagent_registry
 
 if TYPE_CHECKING:
     pass
@@ -117,7 +120,8 @@ def _rejected_resets_at(info: dict) -> str:
     at = turn_ending.epoch_to_iso(info.get("resetsAt"))
     if at:
         return at
-    windows = info.get("unifiedWindows") if isinstance(info.get("unifiedWindows"), dict) else {}
+    unified = info.get("unifiedWindows")
+    windows = unified if isinstance(unified, dict) else {}
     reached = windows.get(str(info.get("rateLimitType") or ""))
     return turn_ending.epoch_to_iso(reached.get("resetsAt")) if isinstance(reached, dict) else ""
 
@@ -143,6 +147,7 @@ class ClaudeCLIEventTranslator:
         "open_tools",
         "interrupted",
         "has_emitted_text",
+        "_emitted_note",
         "_tool_inputs",
         "_tool_input_names",
         "agents_spawned",
@@ -174,6 +179,10 @@ class ClaudeCLIEventTranslator:
         # interrupt landing, not an engine error.
         self.interrupted: bool = False
         self.has_emitted_text: bool = False
+        # A narration block was re-sent as note text this turn: the text
+        # around it gets its paragraph break (every reader that joins TEXT),
+        # while has_emitted_text stays the answer's.
+        self._emitted_note: bool = False
         self._tool_inputs: dict[int, list[str]] = {}
         self._tool_input_names: dict[int, str] = {}
         self.last_turn_context: int = 0
@@ -226,6 +235,7 @@ class ClaudeCLIEventTranslator:
         self.active_tool = None
         self.open_tools.clear()
         self.has_emitted_text = False
+        self._emitted_note = False
         self._tool_inputs.clear()
         self._tool_input_names.clear()
         self.last_turn_context = 0
@@ -263,6 +273,7 @@ class ClaudeCLIEventTranslator:
             return []
         if msg_type == "assistant":
             self._note_limit_notice(data)
+            self._note_narration(data)
             return []
         if msg_type == "user":
             return self._handle_user(data)
@@ -299,8 +310,9 @@ class ClaudeCLIEventTranslator:
             failed = [s["name"] for s in mcp_servers if s.get("status") == "failed"]
             if connected or failed:
                 logger.info(
-                    f"[{self.session_id[:8]}] MCP init — "
-                    f"connected={connected}, failed={failed}"
+                    "[%s] MCP init — "
+                    "connected=%s, failed=%s",
+                    self.session_id[:8], connected, failed
                 )
             return []
 
@@ -513,7 +525,8 @@ class ClaudeCLIEventTranslator:
                 session_id=self.actual_session_id,
             )]
         logger.info(
-            f"[{self.session_id[:8]}] unhandled control_request subtype={req_subtype}"
+            "[%s] unhandled control_request subtype=%s",
+            self.session_id[:8], req_subtype
         )
         return []
 
@@ -558,7 +571,8 @@ class ClaudeCLIEventTranslator:
         """Claude Code answers a usage limit with a synthetic assistant message
         (model ``<synthetic>``, ``error: "rate_limit"``) and then an error
         result; the message's text is the notice the ending carries."""
-        message = data.get("message") if isinstance(data.get("message"), dict) else {}
+        data_message = data.get("message")
+        message = data_message if isinstance(data_message, dict) else {}
         text = "".join(
             b.get("text", "") for b in (message.get("content") or [])
             if isinstance(b, dict) and b.get("type") == "text"
@@ -567,7 +581,31 @@ class ClaudeCLIEventTranslator:
                 message.get("model") == "<synthetic>" and turn_ending.is_limit_text(text)):
             self._limit_notice = text or self._limit_notice
 
-    def _ending_chunks(self, ending: "turn_ending.TurnEnding") -> list[ClaudeStreamChunk]:
+    def _note_narration(self, data: dict) -> None:
+        """A narration block: the server's summary of the prose the model
+        wrote between tool calls, sent as a thinking block (CLI 2.1.280+
+        lists it in ``narration_block_indexes``, wrapper-level beside the
+        message). The index counts in the frame's own content, and with
+        partial messages each frame carries the one block that just ended,
+        before its ``content_block_stop``: so a frame listing 0 marks the
+        open thinking block, which its stop re-sends as a progress note. A
+        sub-agent's frames and an empty block are left as thinking."""
+        indexes = data.get("narration_block_indexes")
+        if not isinstance(indexes, list) or 0 not in indexes or data.get("parent_tool_use_id"):
+            return
+        message = data.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        block = content[0] if isinstance(content, list) and content else None
+        text = block.get("thinking") if isinstance(block, dict) and block.get("type") == "thinking" else None
+        if not isinstance(text, str) or not text.strip():
+            return
+        for entry in self.block_types.values():
+            if entry.get("type") == "thinking" and entry.get("open") and "narration" not in entry:
+                entry["narration"] = text
+                return
+        logger.debug("[%s] a narration frame with no open thinking block", self.session_id[:8])
+
+    def _ending_chunks(self, ending: turn_ending.TurnEnding) -> list[ClaudeStreamChunk]:
         """The turn's typed ending, once: an open tool block is closed first
         (its call never ran)."""
         if self.ending_emitted:
@@ -613,15 +651,25 @@ class ClaudeCLIEventTranslator:
         }
 
         if cb_type == "text":
-            if self.has_emitted_text:
+            if self.has_emitted_text or self._emitted_note:
                 chunks.append(ClaudeStreamChunk(text="\n\n", session_id=self.actual_session_id))
         elif cb_type == "thinking":
+            self.block_types[idx]["open"] = True
             chunks.append(ClaudeStreamChunk(
                 event_type="thinking",
                 event_data={"phase": "start"},
                 session_id=self.actual_session_id,
             ))
         elif cb_type == "tool_use":
+            said = self.block_types.get(idx - 1) if idx > 0 else None
+            if said is not None and said.get("type") == "text" and said.get("said"):
+                # The text right before this call in the same message is a
+                # progress note: the mark tells the pump and the page. Blocks
+                # of one message start in index order, so ``idx - 1`` is
+                # this message's; a call that opens its message follows no
+                # text of it.
+                chunks.append(ClaudeStreamChunk(text="", event_data=dict(NOTE_MARK),
+                                                session_id=self.actual_session_id))
             tool_name = cb.get("name", "")
             self.active_tool = {"name": tool_name, "tool_id": cb.get("id", "")}
             if cb.get("id"):
@@ -645,6 +693,9 @@ class ClaudeCLIEventTranslator:
             if not text:
                 return []
             self.has_emitted_text = True
+            block = self.block_types.get(event.get("index", 0))
+            if block is not None and text.strip():
+                block["said"] = True
             return [ClaudeStreamChunk(text=text, session_id=self.actual_session_id)]
 
         if delta_type == "thinking_delta":
@@ -673,6 +724,23 @@ class ClaudeCLIEventTranslator:
         chunks: list[ClaudeStreamChunk] = []
 
         if block_info.get("type") == "thinking":
+            block_info.pop("open", None)
+            narration = block_info.pop("narration", None)
+            if narration:
+                # The block was a note: its end says so (the pump and the
+                # page drop the thinking they drew) and its words follow as
+                # note text, which every reader of the agent's words reads,
+                # a paragraph apart from the text before it.
+                # has_emitted_text stays: the result's text fallback is the
+                # answer's.
+                lead = "\n\n" if self.has_emitted_text or self._emitted_note else ""
+                self._emitted_note = True
+                return [
+                    ClaudeStreamChunk(event_type="thinking", event_data={"phase": "end", "note": True},
+                                      session_id=self.actual_session_id),
+                    ClaudeStreamChunk(text=lead + narration, event_data={"note": True},
+                                      session_id=self.actual_session_id),
+                ]
             chunks.append(ClaudeStreamChunk(
                 event_type="thinking",
                 event_data={"phase": "end"},
@@ -698,8 +766,9 @@ class ClaudeCLIEventTranslator:
             # carries it back so the right widget clears on finish.
             tool_use_id = block_info.get("tool_id", "")
             logger.info(
-                f"[{self.session_id[:8]}] subagent #{self.agents_spawned} spawned: "
-                f"{desc} ({'bg' if is_bg else 'fg'})"
+                "[%s] subagent #%s spawned: "
+                "%s (%s)",
+                self.session_id[:8], self.agents_spawned, desc, 'bg' if is_bg else 'fg'
             )
             chunks.append(ClaudeStreamChunk(
                 event_type="task_spawn",
@@ -730,8 +799,9 @@ class ClaudeCLIEventTranslator:
             ))
         elif t_name == "ExitPlanMode":
             logger.info(
-                f"[{self.session_id[:8]}] ExitPlanMode "
-                f"has_plan={'plan' in t_input if t_input else False}"
+                "[%s] ExitPlanMode "
+                "has_plan=%s",
+                self.session_id[:8], 'plan' in t_input if t_input else False
             )
             chunks.append(ClaudeStreamChunk(
                 event_type="plan_mode",
@@ -920,7 +990,7 @@ class ClaudeCLIEventTranslator:
         context_max = _extract_context_window(data)
         self._warn_context_window_drift(data)
         meta: dict = {
-            "cost_usd": data.get("total_cost_usd", 0.0),
+            "cost_usd": data.get("total_cost_usd") or 0.0,
             "duration_ms": data.get("duration_ms", 0),
         }
         if self.last_turn_context > 0 and context_max > 0:
@@ -982,6 +1052,7 @@ class ClaudeCLIEventTranslator:
         self.active_tool = None
         self.open_tools.clear()
         self.has_emitted_text = False
+        self._emitted_note = False
         self._tool_inputs.clear()
         self._tool_input_names.clear()
         self._pending_task_creates.clear()
@@ -1001,6 +1072,7 @@ class ClaudeCLIEventTranslator:
         self.active_tool = None
         self.open_tools.clear()
         self.has_emitted_text = False
+        self._emitted_note = False
         self._tool_inputs.clear()
         self._tool_input_names.clear()
         self._pending_task_creates.clear()

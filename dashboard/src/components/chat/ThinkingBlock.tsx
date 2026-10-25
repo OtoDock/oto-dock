@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import SearchHighlight from './SearchHighlight'
-import { useSearch } from '../../contexts/SearchContext'
+import { useSearch } from '../../contexts/useSearch'
+
 
 interface Props {
   content: string
@@ -24,54 +25,53 @@ export default function ThinkingBlock({ content, collapsed: externalCollapsed = 
   const { query, currentMatch, getGlobalOffset } = useSearch()
 
   // Auto-collapse when external state changes (thinking phase ends)
-  useEffect(() => {
+  const [syncedCollapsed, setSyncedCollapsed] = useState(externalCollapsed)
+  if (syncedCollapsed !== externalCollapsed) {
+    setSyncedCollapsed(externalCollapsed)
     setCollapsed(externalCollapsed)
-  }, [externalCollapsed])
+  }
 
   const hasContent = content.length > 0
   const matchId = blockId ? `${blockId}-think` : ''
 
-  // If current search match is inside this block, auto-expand
-  useEffect(() => {
-    if (!query || !matchId || !hasContent || !collapsed) return
+  // The block is held open while the current search match is inside it
+  if (query && matchId && hasContent && collapsed) {
     const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const count = (content.match(new RegExp(escaped, 'gi')) || []).length
     if (count > 0) {
       const offset = getGlobalOffset(matchId)
-      if (currentMatch >= offset && currentMatch < offset + count) {
-        setCollapsed(false)
-      }
+      if (currentMatch >= offset && currentMatch < offset + count) setCollapsed(false)
     }
-  }, [query, currentMatch, matchId, hasContent, content, collapsed, getGlobalOffset])
+  }
 
   return (
-    <div className="my-1.5 rounded-lg border border-[#673a97]/20 bg-[#673a97]/5 overflow-hidden">
+    <div className="my-1.5 rounded-card border border-accent-agent-border bg-accent-agent-bg overflow-hidden">
       <button
         onClick={() => hasContent && setCollapsed(!collapsed)}
-        className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs text-p-accent-purple transition-colors ${hasContent ? 'hover:bg-[#673a97]/10 cursor-pointer' : 'cursor-default'}`}
+        className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs text-accent-agent-fg transition-colors ${hasContent ? 'hover:bg-surface-hover cursor-pointer' : 'cursor-default'}`}
       >
         {hasContent ? (
           <>
-            <span className={`transform transition-transform text-[10px] ${collapsed ? '' : 'rotate-90'}`}>
+            <span className={`transform transition-transform text-3xs ${collapsed ? '' : 'rotate-90'}`}>
               {'\u25B6'}
             </span>
             <span className="font-medium">Thinking</span>
-            <span className="text-p-accent-purple/60">({content.trim().split(/\s+/).length.toLocaleString()} words)</span>
+            <span className="text-secondary">({content.trim().split(/\s+/).length.toLocaleString()} words)</span>
           </>
         ) : done ? (
           <>
-            <span className="w-1.5 h-1.5 rounded-full bg-p-accent-purple/60" />
+            <span className="w-1.5 h-1.5 rounded-full bg-accent-agent-solid" />
             <span className="font-medium">Thought</span>
             {tokens > 0 && (
-              <span className="text-p-accent-purple/60">(~{tokens.toLocaleString()} tokens)</span>
+              <span className="text-secondary">(~{tokens.toLocaleString()} tokens)</span>
             )}
           </>
         ) : (
           <>
-            <span className="w-1.5 h-1.5 rounded-full bg-p-accent-purple/60 animate-pulse" />
+            <span className="w-1.5 h-1.5 rounded-full bg-accent-agent-solid animate-pulse" />
             <span className="font-medium animate-pulse">Thinking...</span>
             {tokens > 0 && (
-              <span className="text-p-accent-purple/60">(~{tokens.toLocaleString()} tokens)</span>
+              <span className="text-secondary">(~{tokens.toLocaleString()} tokens)</span>
             )}
           </>
         )}
@@ -79,8 +79,8 @@ export default function ThinkingBlock({ content, collapsed: externalCollapsed = 
       {/* Always render content when search is active (so SearchHighlight registers in DOM order).
           Hidden visually when collapsed via CSS — avoids late registration causing wrong match order. */}
       {hasContent && (query ? true : !collapsed) && (
-        <div className={`border-t border-[#673a97]/20 px-3 py-2 ${collapsed ? 'hidden' : ''}`}>
-          <pre className="text-xs text-[#673a97] whitespace-pre-wrap max-h-60 overflow-auto leading-relaxed">
+        <div className={`border-t border-accent-agent-border px-3 py-2 ${collapsed ? 'hidden' : ''}`}>
+          <pre className="text-xs text-accent-agent-fg whitespace-pre-wrap max-h-60 overflow-auto leading-relaxed">
             {query && matchId ? (
               <SearchHighlight text={content} matchId={matchId} order={blockOrder} />
             ) : (
@@ -90,5 +90,20 @@ export default function ThinkingBlock({ content, collapsed: externalCollapsed = 
         </div>
       )}
     </div>
+  )
+}
+
+/** A progress note: the agent's words between its steps (a Codex preamble, a
+ * Claude narration block). Plain faint prose in the steps group, no box;
+ * searchable like the thinking text. */
+export function NoteBlock({ content, blockId, blockOrder = 0 }: { content: string; blockId?: string; blockOrder?: number }) {
+  const { query } = useSearch()
+  const text = content.trim()
+  if (!text) return null
+  const matchId = blockId ? `${blockId}-note` : ''
+  return (
+    <p data-testid="progress-note" className="my-0.5 text-xs leading-relaxed text-tertiary whitespace-pre-wrap">
+      {query && matchId ? <SearchHighlight text={text} matchId={matchId} order={blockOrder} /> : text}
+    </p>
   )
 }

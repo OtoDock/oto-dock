@@ -48,8 +48,8 @@ def app_with_router(tmp_path, monkeypatch):
         return user
 
     # Stub agent_store + task_store calls inside the endpoint
-    from storage.agents import agent_store
     from storage import database as task_store
+    from storage.agents import agent_store
     monkeypatch.setattr(agent_store, "agent_exists", lambda name: name == "test-agent")
     monkeypatch.setattr(task_store, "get_username_by_sub", lambda sub: "alice" if sub == "user-test-sub" else None)
     # Skip the satellite-push side effect (no remote sessions in tests).
@@ -211,9 +211,9 @@ def app_with_internal_agent(tmp_path, monkeypatch):
     async def _stub_user():
         return user
 
-    from storage.agents import agent_store
-    from storage import database as task_store
     from core.session import visibility as _vis
+    from storage import database as task_store
+    from storage.agents import agent_store
     monkeypatch.setattr(agent_store, "agent_exists", lambda name: name == "internal-bot")
     monkeypatch.setattr(_vis, "is_shared_only", lambda name: name == "internal-bot")
     monkeypatch.setattr(task_store, "get_username_by_sub", lambda sub: "alice" if sub == "user-test-sub" else None)
@@ -494,6 +494,7 @@ def test_single_shot_writes_and_fsyncs_off_the_loop(app_with_router, monkeypatch
 def test_single_shot_refuses_below_the_free_disk_floor(app_with_router, monkeypatch):
     import shutil
     from collections import namedtuple
+
     import config
     app, _agents_dir = app_with_router
     usage = namedtuple("usage", "total used free")
@@ -597,6 +598,7 @@ def test_a_landed_upload_and_a_reserved_folder_refresh_the_open_trees(app_with_r
     without a Refresh) and a teammate's hear ``file_updated``: once per
     landed file and once per reserved folder, the uploader never excluded."""
     from unittest.mock import AsyncMock
+
     from services.notifications import notification_manager
     told = AsyncMock()
     monkeypatch.setattr(notification_manager, "broadcast_file_updated", told)
@@ -723,6 +725,7 @@ def test_a_name_the_file_system_refuses_is_a_400_never_a_500(app_with_router, mo
     """ENAMETOOLONG at the temp open, at the final rename and at a folder
     reservation answers a plain 400; no temp is left behind."""
     import errno
+
     from api.media import uploads
     app, agents_dir = app_with_router
     client = TestClient(app)
@@ -747,6 +750,7 @@ def test_a_name_the_file_system_refuses_is_a_400_never_a_500(app_with_router, mo
 
 def test_a_chunked_complete_refused_for_its_name_is_a_400(app_with_router, tmp_path, monkeypatch):
     import errno
+
     import config
     from api.media import uploads
     app, _agents_dir = app_with_router
@@ -914,6 +918,7 @@ def test_a_lone_surrogate_is_dropped_from_a_name_and_refused_in_a_path(app_with_
 ])
 def test_folder_name_rules(raw, expected):
     from fastapi import HTTPException
+
     from api.media.uploads import _folder_name
     if expected is None:
         with pytest.raises(HTTPException) as exc:

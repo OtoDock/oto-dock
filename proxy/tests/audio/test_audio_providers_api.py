@@ -152,11 +152,13 @@ def test_the_boot_walk_moves_retired_ids_and_clears_a_former_default_once(client
 
     row = _create(client, provider_type="tts", provider_name="cartesia",
                   advanced={"model_id": "sonic-2"})
-    # An elevenlabs row holding a Cartesia id, an unknown provider holding a
-    # Cartesia id: the walk keys on the row's own provider, so neither moves;
-    # an admin's explicit pick of a served id (sonic-3.5) stays.
-    other = _create(client, provider_type="tts", provider_name="elevenlabs",
-                    advanced={"model_id": "sonic-3.5"})
+    # An elevenlabs row holding a Cartesia id (written before the API checked
+    # the engine's rules, so through the store), an unknown provider holding
+    # a Cartesia id: the walk keys on the row's own provider, so neither
+    # moves; an admin's explicit pick of a served id (sonic-3.5) stays.
+    other = audio_provider_store.create_provider({
+        "provider_type": "tts", "provider_name": "elevenlabs",
+        "advanced": {"model_id": "sonic-3.5"}})
     unknown = audio_provider_store.create_provider({
         "provider_type": "tts", "provider_name": f"cartesia-{uuid.uuid4().hex[:4]}",
         "advanced": {"model_id": "sonic-3.5"}})
@@ -197,3 +199,46 @@ def test_known_providers_hides_stubs(client):
     # canary/chatterbox stay stubs (hidden); elevenlabs shipped for both types.
     known = client.get("/v1/admin/audio/known-providers").json()
     assert known == {"stt": ["deepgram", "elevenlabs"], "tts": ["cartesia", "elevenlabs"]}
+
+
+def test_the_engines_advanced_rules_answer_400_naming_the_field(client):
+    # Deepgram's rule: endpointing values are whole numbers >= 0.
+    r = client.post("/v1/admin/audio/providers", json={
+        "provider_type": "stt", "provider_name": "deepgram",
+        "advanced": {"call_endpointing_ms": -1, "chat_endpointing_ms": "soon"}})
+    assert r.status_code == 400
+    assert "call_endpointing_ms" in r.json()["detail"] and "chat_endpointing_ms" in r.json()["detail"]
+    ok = _create(client, provider_name="deepgram", advanced={"call_endpointing_ms": 300})
+    assert ok["advanced"]["call_endpointing_ms"] == 300
+    r = client.put(f"/v1/admin/audio/providers/{ok['id']}", json={"advanced": {"call_endpointing_ms": "x"}})
+    assert r.status_code == 400 and r.json()["detail"].startswith("advanced: call_endpointing_ms")
+    stored = [p for p in client.get("/v1/admin/audio/providers").json()["providers"]
+              if p["id"] == ok["id"]][0]
+    assert stored["advanced"]["call_endpointing_ms"] == 300          # the bad update wrote nothing
+    assert client.put(f"/v1/admin/audio/providers/{ok['id']}",
+                      json={"advanced": {"call_endpointing_ms": 450}}).status_code == 200
+    # ElevenLabs TTS: the model id family and the schedule bounds.
+    r = client.post("/v1/admin/audio/providers", json={
+        "provider_type": "tts", "provider_name": "elevenlabs",
+        "advanced": {"model_id": "sonic-3.5", "chunk_length_schedule": [5]}})
+    assert r.status_code == 400 and "model_id" in r.json()["detail"]
+    assert client.put("/v1/admin/audio/providers/999999", json={"advanced": {"x": 1}}).status_code == 404
+
+
+def test_a_provider_that_cannot_be_added_says_why_in_plain_words(client, monkeypatch, caplog):
+    body = {"provider_type": "stt", "provider_name": f"p-{uuid.uuid4().hex[:6]}"}
+    assert client.post("/v1/admin/audio/providers", json=body).status_code == 200
+    with caplog.at_level("WARNING"):
+        r = client.post("/v1/admin/audio/providers", json=body)
+    assert (r.status_code, r.json()["detail"]) == (400, "This provider is already added.")
+    assert "duplicate key" in caplog.text
+
+    from storage.prefs import audio_provider_store
+
+    def broken(data):
+        raise RuntimeError("connection to server lost")
+    monkeypatch.setattr(audio_provider_store, "create_provider", broken)
+    r = client.post("/v1/admin/audio/providers",
+                    json={"provider_type": "stt", "provider_name": "other"})
+    assert (r.status_code, r.json()["detail"]) == (
+        400, "Could not add the provider. The server log has the details.")

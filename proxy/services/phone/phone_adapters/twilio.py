@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from adapters.phone import is_outbound
+from services.infra import pinned_http
 
 from .base import (
     BootstrapResult,
@@ -132,16 +133,17 @@ class TwilioAdapter(PhoneServerAdapter):
         sid, token = self._credentials()
         url = f"{self.api_base}/2010-04-01/Accounts/{sid}{path}"
         try:
-            async with httpx.AsyncClient(
-                auth=(sid, token), timeout=_TIMEOUT_S,
+            # Twilio's public API host: the dial is checked.
+            async with pinned_http.checked_client(
+                url, pinned_http.public_only, auth=(sid, token), timeout=_TIMEOUT_S,
             ) as client:
                 resp = await client.request(method, url, params=params, data=data)
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
             raise PhoneAdapterError(
                 "Twilio API timed out.", status_code=504,
-            )
+            ) from exc
         except httpx.HTTPError as e:
-            raise PhoneAdapterError(f"Twilio API unreachable: {e}")
+            raise PhoneAdapterError(f"Twilio API unreachable: {e}") from e
         if resp.status_code in (401, 403):
             raise PhoneAdapterError(
                 "Twilio rejected the credentials — check the Account SID "
@@ -249,7 +251,8 @@ class TwilioAdapter(PhoneServerAdapter):
         )
         canonical = str(number.get("phone_number") or did)
         logger.info(
-            f"twilio server {self.server_id}: route {route.get('id')} → {webhook}"
+            "twilio server %s: route %s → %s",
+            self.server_id, route.get('id'), webhook
         )
         return RouteHandle(
             adapter_data={

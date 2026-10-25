@@ -400,7 +400,7 @@ async def test_a_waiting_path_source_push_goes_before_the_running_one_takes_agai
     conn.bulk_credit = _BulkCredit(cap=2048)
     long_push = asyncio.create_task(mgr.push_file(
         "m1", PathRef("agent_tree", "big.bin"), big, agent_slug="a1"))
-    while len(wire.sent) < 2:
+    while len(wire.sent) < 2:  # noqa: ASYNC110  # a fake wire's sent list: the fake has no event
         await asyncio.sleep(0.01)
     await asyncio.sleep(0.05)        # its third chunk is read and queued for credit
     write = asyncio.create_task(mgr.push_file(
@@ -427,7 +427,7 @@ async def test_a_lost_frame_aborts_the_push_at_once(monkeypatch):
     mgr, conn, wire = _manager_with_writer()
     push = asyncio.create_task(mgr.push_file(
         "m1", PathRef("agent_tree", "w.bin"), b"x" * 16, agent_slug="a1", stall_s=30))
-    while len(wire.sent) < 2:
+    while len(wire.sent) < 2:  # noqa: ASYNC110  # a fake wire's sent list: the fake has no event
         await asyncio.sleep(0.01)
     await _ack(mgr, wire.sent[1])    # the first frame's answer never comes
     assert await asyncio.wait_for(push, 2) is False
@@ -438,8 +438,79 @@ async def test_a_lost_frame_aborts_the_push_at_once(monkeypatch):
 
 async def test_a_transfer_frame_is_contact_for_the_heartbeat_monitor():
     import time
+
     from core.remote.satellite_connection import _last_contact
     conn = SatelliteConnection(machine_id="m1", ws=_Wire())
     conn.last_heartbeat = time.monotonic() - 200       # queued behind a pull
     conn.last_transfer_at = time.monotonic() - 5
     assert time.monotonic() - _last_contact(conn) < 10
+
+
+# --- the stale guard ----------------------------------------------------------
+
+
+async def _frames(wire, n: int) -> list[dict]:
+    for _ in range(1000):
+        if len(wire.sent) >= n:
+            return wire.sent[:n]
+        await asyncio.sleep(0)
+    raise AssertionError(f"{n} frames never left the writer")
+
+
+async def test_a_stale_ack_fails_the_push_and_hands_the_caller_the_machines_stat():
+    mgr, conn, wire = _manager_with_writer()
+    stale: dict = {}
+    task = asyncio.create_task(mgr.push_file(
+        "m1", PathRef("agent_tree", "w/run.log"), b"platform", agent_slug="a1",
+        expect={"size": 4, "mtime_ns": 100}, stale_out=stale,
+    ))
+    (frame,) = await _frames(wire, 1)
+    assert frame["expect"] == {"size": 4, "mtime_ns": 100}
+    await mgr.handle_message("m1", {
+        "type": "ack", "command_id": frame["command_id"], "status": "stale", "error": "",
+        "reason": "changed", "size": 9, "mtime_ns": 555,
+    })
+    assert await task is False
+    assert stale == {"reason": "changed", "size": 9, "mtime_ns": 555}
+    conn.writer_task.cancel()
+    await _settle()
+    assert conn.bulk_credit.inflight == 0
+
+
+async def test_an_ok_ack_with_the_committed_stat_records_the_machines_copy(monkeypatch):
+    """Every frame of a chunked push carries the expectation; the last ack's
+    stat is recorded as the machine's copy. A bare ack (an older satellite)
+    records nothing, and a push without an expectation sends none."""
+    from core.remote import remote_file_flow
+    monkeypatch.setattr("core.remote.file_sync.MAX_CHUNK_SIZE", 4)
+    remote_file_flow._pull_stat_records.clear()
+    mgr, conn, wire = _manager_with_writer()
+
+    async def _satellite(final: dict):
+        n = 0
+        while True:
+            await asyncio.sleep(0)
+            while n < len(wire.sent):
+                f = wire.sent[n]
+                n += 1
+                ack = {"type": "ack", "command_id": f["command_id"], "status": "ok", "error": ""}
+                if f["hash"]:
+                    ack.update(final)
+                await mgr.handle_message("m1", ack)
+
+    sat = asyncio.create_task(_satellite({"size": 10, "mtime_ns": 777}))
+    try:
+        assert await mgr.push_file("m1", PathRef("agent_tree", "w/n.md"), b"0123456789",
+                                   agent_slug="a1", expect="live")
+        assert len(wire.sent) == 3 and all(f["expect"] == "live" for f in wire.sent)
+        assert remote_file_flow._pull_stat_records[("m1", "a1", "w/n.md")] == {
+            "exists": True, "size": 10, "mtime_ns": 777}
+        sat.cancel()
+        sat = asyncio.create_task(_satellite({}))
+        assert await mgr.push_file("m1", PathRef("agent_tree", "w/o.md"), b"v", agent_slug="a1")
+        assert "expect" not in wire.sent[-1]
+        assert ("m1", "a1", "w/o.md") not in remote_file_flow._pull_stat_records
+    finally:
+        sat.cancel()
+        conn.writer_task.cancel()
+        remote_file_flow._pull_stat_records.clear()

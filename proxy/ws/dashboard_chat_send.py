@@ -10,35 +10,46 @@ import asyncio
 import functools
 import json
 import logging
+from typing import TYPE_CHECKING, Any, cast
+
 import config
-from typing import TYPE_CHECKING
 from core import placement
-from storage import database as task_store
-from storage.pg import run_db
+from core.background import spawn
 from core.events import chat_writer, input_queue
-from services.notifications import notification_manager
+from core.events.common_events import TurnInput
+from core.events.stream_pump import (
+    _active_pumps,
+    shelve_undelivered,
+)
+from core.permission_modes import ASK_MODE
+from core.session import interactive_session, visibility as _vis, warmup_registry
 from core.session.session_state import (
     get_session_mode,
 )
-from core.events.common_events import TurnInput
-from core.events.stream_pump import (
-    _active_pumps, shelve_undelivered,
-)
-from core.session import warmup_registry, visibility as _vis, interactive_session
-# Imported by ws/dashboard.py AFTER its helpers are defined —
-# safe intra-unit circularity (see the class assembly there).
-from ws.dashboard import (
-    _role_and_layer,
-)
-from ws.dashboard_chat_text import (
-    HEAL_ANSWERED, HEAL_READY, HEAL_RECONNECTING, HEAL_REFUSED, LIVE_TERMINAL_REFUSED,
-    LIVE_TERMINAL_TYPED, RECONNECTING_NOT_SENT, TurnDeferred,
-    _REVIVAL_WAIT_S, grace_layer,
-)
+from services.notifications import notification_manager
+from storage import database as task_store
+from storage.pg import run_db
 from ws import wire_events as wire
-from core.background import spawn
+
+# ws/dashboard.py assembles the connection from the mixins at its end, so
+# its helpers are imported inside the functions that call them: this
+# module imports first too (tests/core/test_import_layers.py).
+from ws.dashboard_chat_text import (
+    _REVIVAL_WAIT_S,
+    HEAL_ANSWERED,
+    HEAL_READY,
+    HEAL_RECONNECTING,
+    HEAL_REFUSED,
+    LIVE_TERMINAL_REFUSED,
+    LIVE_TERMINAL_TYPED,
+    RECONNECTING_NOT_SENT,
+    TurnDeferred,
+    grace_layer,
+)
 
 if TYPE_CHECKING:
+    from core.events.stream_pump import ChatStreamPump
+    from core.execution_layer import ExecutionLayer
     from ws.dashboard_host import DashboardHost as _Host
 else:
     _Host = object
@@ -48,6 +59,14 @@ logger = logging.getLogger("otodock")
 
 class ChatSendMixin(_Host):
     """User sends: the chat turn itself, stop-and-send, delivery into a live"""
+
+    # The connection state this mixin assigns, declared where it assigns it:
+    # the type checker reads an attribute a mixin assigns from the mixin
+    # first. Annotations only (strings), no class attributes.
+    agent_name: "str"
+    chat_id: "str | None"
+    layer: "ExecutionLayer | None"
+    session_id: "str | None"
 
     async def _pool_cap_gate(self) -> str:
         """The sender's own-pool subscription cap on this chat's engine
@@ -81,14 +100,15 @@ class ChatSendMixin(_Host):
         the slot and the subscription; the JSONL stays, so the re-warm
         resumes the conversation (one respawn and its prompt cache)."""
         logger.info(
-            f"WS dashboard _handle_chat: {why} — recycling session "
-            f"{self.session_id} for chat={self.chat_id}"
+            "WS dashboard _handle_chat: %s — recycling session "
+            "%s for chat=%s", why, self.session_id, self.chat_id
         )
         try:
-            await self.layer.close_session(self.session_id)
-        except Exception:
+            # Called on a warm session (_recycle_if_on_own_oauth's caller).
+            await cast("ExecutionLayer", self.layer).close_session(cast("str", self.session_id))
+        except Exception:  # noqa: BLE001  # closing a session that is being replaced or released
             logger.warning(
-                f"session recycle: close_session failed for {self.session_id}",
+                "session recycle: close_session failed for %s", self.session_id,
                 exc_info=True,
             )
         self.session_id = None
@@ -106,10 +126,10 @@ class ChatSendMixin(_Host):
         terminal (a PTY holds live TUI state)."""
         from services.engines import subscription_pool
         from storage.billing import subscription_store
-        pump = _active_pumps.get(self.chat_id)
+        pump = _active_pumps.get(cast("str", self.chat_id))
         if pump and not pump.is_done:
             return
-        if interactive_session.get(self.session_id) is not None:
+        if interactive_session.get(cast("str", self.session_id)) is not None:
             return
         bound = await run_db(subscription_pool.get_session_subscription, self.session_id)
         row = await run_db(subscription_store.get_subscription, bound) if bound else None
@@ -128,6 +148,7 @@ class ChatSendMixin(_Host):
         machine is still reconnecting after the wait (nothing was touched,
         the send waits); else ``HEAL_READY``. ``msg`` is the composer frame a
         live terminal would take."""
+        from ws.dashboard import _role_and_layer
         # Auto-warmup if we have agent but no session. background=False: this
         # turn needs the session synchronously (the caller reads session_id
         # right after), so wait for the spawn rather than backgrounding it.
@@ -162,17 +183,18 @@ class ChatSendMixin(_Host):
                 inflight = warmup_registry.get(self.chat_id)
                 if inflight is not None:
                     logger.info(
-                        f"WS dashboard _handle_chat: warmup in flight for "
-                        f"chat={self.chat_id} — awaiting it instead of re-warming"
+                        "WS dashboard _handle_chat: warmup in flight for "
+                        "chat=%s — awaiting it instead of re-warming", self.chat_id
                     )
                     try:
                         await asyncio.wait_for(
                             inflight.completed.wait(), timeout=_REVIVAL_WAIT_S)
                     except asyncio.TimeoutError:
                         logger.warning(
-                            f"WS dashboard _handle_chat: in-flight warmup for "
-                            f"chat={self.chat_id} still running after "
-                            f"{_REVIVAL_WAIT_S:.0f}s — falling back to auto-warm"
+                            "WS dashboard _handle_chat: in-flight warmup for "
+                            "chat=%s still running after "
+                            "%.0fs — falling back to auto-warm",
+                            self.chat_id, _REVIVAL_WAIT_S
                         )
                     live = await self._deliver_chat_to_live_interactive(msg)
                     if live:
@@ -195,13 +217,15 @@ class ChatSendMixin(_Host):
                 if not (warmed_here and holder.is_session_grace_held(self.session_id)):
                     alive = await holder.wait_session_reconnect(self.session_id)
                 if not alive and holder.is_session_grace_held(self.session_id):
-                    logger.info(f"WS dashboard _handle_chat: session {self.session_id} "
-                                f"is still reconnecting, chat={self.chat_id} — the send waits")
+                    logger.info("WS dashboard _handle_chat: session %s "
+                                "is still reconnecting, chat=%s — the send waits",
+                                self.session_id, self.chat_id)
                     return HEAL_RECONNECTING
             if not alive:
                 logger.info(
-                    f"WS dashboard _handle_chat: session {self.session_id} "
-                    f"dead/reaped, auto-warming for chat={self.chat_id}"
+                    "WS dashboard _handle_chat: session %s "
+                    "dead/reaped, auto-warming for chat=%s",
+                    self.session_id, self.chat_id
                 )
                 if self.layer:
                     await self.layer.prepare_resume(self.session_id)
@@ -255,6 +279,15 @@ class ChatSendMixin(_Host):
         await self._send({"type": wire.SYSTEM, "subtype": wire.SUBTYPE_MACHINE_RECONNECTING,
                           "message": RECONNECTING_NOT_SENT, "chat_id": cid})
 
+    async def _send_deferred_line(self, cid: str, deferred: TurnDeferred | None) -> None:
+        """The not-sent line of a turn put off by ``deferred`` (the
+        reconnecting one when the caller has no exception in hand)."""
+        if deferred is None:
+            await self._send_reconnecting_line(cid)
+            return
+        await self._send({"type": wire.SYSTEM, "subtype": deferred.subtype,
+                          "message": deferred.not_sent_text, "chat_id": cid})
+
     async def _queue_until_reconnect(self, msg: dict, q) -> None:
         """A send whose chat's machine is still reconnecting waits in the
         chat's queue, its chip saying why, and goes out at the reconnect (the
@@ -285,8 +318,8 @@ class ChatSendMixin(_Host):
         identity cannot be proven serves nobody, since a needless recycle
         costs one respawn and a skipped one lets the turn act as the
         previous sender."""
-        from services.engines import subscription_pool
         from core.session import session_state
+        from services.engines import subscription_pool
         payer = subscription_pool.get_session_payer_sub(sid)
         warmed = session_state.get_session_security(sid)
         if warmed is None or (warmed.username or "") != (self.user.get("username") or ""):
@@ -304,7 +337,7 @@ class ChatSendMixin(_Host):
                                             self.user_sub, self.user_role)
             if not limit["allowed"]:
                 return "the sender's usage limit is reached"
-        except Exception:
+        except Exception:  # noqa: BLE001  # a failed usage-limit check never blocks the message
             pass
         try:
             from core.session.session_manager import resolve_execution_path
@@ -317,7 +350,7 @@ class ChatSendMixin(_Host):
             if not cap.allowed and not (cap.on_reached == "continue" and await run_db(
                     subscription_pool.cap_continue_available, layer_path, self.user_sub)):
                 return "the sender's subscription cap is reached"
-        except Exception:
+        except Exception:  # noqa: BLE001  # a failed subscription-cap check lets the turn proceed
             logger.debug("pool cap gate failed for a queued turn", exc_info=True)
         return ""
 
@@ -334,7 +367,7 @@ class ChatSendMixin(_Host):
         sender = self.user_sub
 
         def _job() -> dict:
-            out = {"prev_author": "", "cancelled": "", "consumed": None}
+            out: dict[str, Any] = {"prev_author": "", "cancelled": "", "consumed": None}
             rec = task_store.get_chat(cid)
             if not rec:
                 return out
@@ -393,8 +426,8 @@ class ChatSendMixin(_Host):
                 await workspace_fanout.fan_out_write(
                     agent, rel, agent_dir / rel, include_idle=True,
                     transfer_kind="upload", only_machine_id=machine)
-            except Exception:
-                logger.warning(f"queued turn: attachment {rel} not pushed again", exc_info=True)
+            except Exception:  # noqa: BLE001  # one attachment's re-push: the turn runs without it
+                logger.warning("queued turn: attachment %s not pushed again", rel, exc_info=True)
 
     async def _deliver_queued(self, chat_id: str, taken: list) -> tuple[str, str]:
         """Messages this person queued in ``chat_id``, out as the chat's
@@ -421,7 +454,7 @@ class ChatSendMixin(_Host):
         chat = await run_db(task_store.get_chat, chat_id)
         if not chat:
             return input_queue.DELIVERY_GATED, "the chat is gone"
-        from api.agents.chats import can_access_chat
+        from core.session.visibility import can_access_chat
         if not await run_db(can_access_chat, self._viewer_context(), chat):
             return input_queue.DELIVERY_GATED, "the sender may no longer open the chat"
         refusal = await self._deny_task_continue(chat_id, chat, quiet=True)
@@ -465,8 +498,8 @@ class ChatSendMixin(_Host):
             waited = True
         if (shared_only and await layer.is_session_alive(sid)
                 and not self._session_serves_sender(sid)):
-            logger.info(f"queued turn: the session of chat={chat_id[:8]} serves another "
-                        f"sender, closed so the turn re-warms as its author")
+            logger.info("queued turn: the session of chat=%s serves another "
+                        "sender, closed so the turn re-warms as its author", chat_id[:8])
             await layer.close_session(sid)
         batch = TurnInput.combine([qi.item for qi in taken])
         await self._push_batch_attachments(chat.get("agent") or "", batch, sid)
@@ -477,23 +510,25 @@ class ChatSendMixin(_Host):
             pump = await self._start_new_stream(
                 prompt, target_session_id=sid, target_chat_id=chat_id, target_layer=layer,
                 images=batch.images or None, headless=True, rows_first=rows_first,
-                reconnect_waited=waited,
+                reconnect_waited=waited, typed=True,
             )
-        except TurnDeferred:
+        except TurnDeferred as deferred:
             self._restore_abort_flags(chat_id, consumed)
             for qi in taken:
-                qi.waiting = input_queue.WAITING_RECONNECT
-            return input_queue.DELIVERY_DEFERRED, "the machine is reconnecting"
+                qi.waiting = deferred.waiting
+            return input_queue.DELIVERY_DEFERRED, deferred.why
         if pump is None:
             self._restore_abort_flags(chat_id, consumed)
             return input_queue.DELIVERY_DEFERRED, "the turn could not start"
-        logger.info(f"WS dashboard: {len(taken)} queued message(s) out as the next turn, "
-                    f"chat={chat_id[:8]}, headless as {(self.user_sub or '-')[:8]}")
+        logger.info("WS dashboard: %s queued message(s) out as the next turn, "
+                    "chat=%s, headless as %s",
+                    len(taken), chat_id[:8], (self.user_sub or '-')[:8])
         self._announce_sent(chat_id, taken, rows_first)
         return input_queue.DELIVERY_SENT, ""
 
     async def _handle_chat(self, msg: dict):
 
+        from ws.dashboard import _role_and_layer
         text = msg.get("text", "")
         images = msg.get("images", [])  # [{data: "data:image/...;base64,...", name: "photo.jpg"}, ...]
         files = msg.get("files", [])    # [{path: "users/{username}/workspace/...", name: "report.pdf"}, ...]
@@ -509,6 +544,10 @@ class ChatSendMixin(_Host):
 
         if not text and not images and not files:
             await self._send_error("Empty message")
+            return
+        if input_queue.deleting(msg_chat_id or self.chat_id or ""):
+            await self._send_error("This chat was deleted.")
+            await self._send({"type": wire.DONE, "chat_id": msg_chat_id or self.chat_id or ""})
             return
 
         # Route the end-of-turn alert to the device that sent this prompt (the
@@ -547,7 +586,7 @@ class ChatSendMixin(_Host):
                 # The rule resume_chat binds by (the chat's owner decides,
                 # never the agent's current mode). Imported here: the agents
                 # API package imports this module's assembly.
-                from api.agents.chats import can_access_chat
+                from core.session.visibility import can_access_chat
                 allowed = await run_db(can_access_chat, self._viewer_context(), chat)
                 if allowed:
                     # In-flight warmup re-attach: if a warmup is still running
@@ -567,9 +606,10 @@ class ChatSendMixin(_Host):
                         self.chat_id = msg_chat_id
                         self.agent_name = chat["agent"]
                         logger.info(
-                            f"WS dashboard _handle_chat: attached to in-flight "
-                            f"warmup chat={msg_chat_id}, replayed "
-                            f"{len(inflight.event_history)} events"
+                            "WS dashboard _handle_chat: attached to in-flight "
+                            "warmup chat=%s, replayed "
+                            "%s events",
+                            msg_chat_id, len(inflight.event_history)
                         )
                         # The message itself waits in the chat's queue (below).
 
@@ -606,22 +646,24 @@ class ChatSendMixin(_Host):
                                 "type": wire.WARMUP_READY,
                                 "session_id": self.session_id,
                                 "chat_id": self.chat_id,
-                                "mode": get_session_mode(self.session_id) or chat.get("permission_mode", "default"),
+                                "mode": get_session_mode(self.session_id) or chat.get("permission_mode") or ASK_MODE,
                                 "model": chat.get("model", ""),
                                 "execution_path": chat.get("execution_path") or "",
                             })
                             logger.info(
-                                f"WS dashboard _handle_chat: recovered state from msg.chat_id, "
-                                f"attached to active pump session={self.session_id}, chat={self.chat_id}, "
-                                f"agent={self.agent_name}"
+                                "WS dashboard _handle_chat: recovered state from msg.chat_id, "
+                                "attached to active pump session=%s, chat=%s, "
+                                "agent=%s",
+                                self.session_id, self.chat_id, self.agent_name
                             )
                         else:
                             await self._send_error("Platform busy — too many active sessions.")
                             return
                     else:
                         logger.info(
-                            f"WS dashboard _handle_chat: recovered state from msg.chat_id "
-                            f"(no warmup/resume seen on this WS), chat={self.chat_id}, agent={self.agent_name}"
+                            "WS dashboard _handle_chat: recovered state from msg.chat_id "
+                            "(no warmup/resume seen on this WS), chat=%s, agent=%s",
+                            self.chat_id, self.agent_name
                         )
 
         # A chat still getting ready (its warmup, or its first turn enqueued
@@ -632,10 +674,13 @@ class ChatSendMixin(_Host):
         # of its own, so ``done`` frees its composer and the chip shows it.
         if (not server_kick and not artifact_framed and self.chat_id
                 and input_queue.getting_ready(self.chat_id)):
-            item = await self._prepare_turn_input(text, images, files)
+            queue_only = bool(msg.get("queue_only"))
+            queue_id = str(msg.get("queue_id") or "") if queue_only else ""
+            item = await self._prepare_turn_input(text, images, files, queue_id=queue_id)
             if item is not None:
-                await self._queue_for_next_turn(self.chat_id, item, msg.get("queue_id"))
-            if not msg.get("queue_only"):
+                await self._queue_for_next_turn(self.chat_id, item, msg.get("queue_id"),
+                                                name_refusal=queue_only)
+            if not queue_only:
                 await self._send({"type": wire.DONE, "chat_id": self.chat_id})
             return
 
@@ -662,8 +707,9 @@ class ChatSendMixin(_Host):
                 holder = grace_layer(self.session_id or "", self.layer)
                 reconnecting = bool(self.session_id and holder
                                     and holder.is_session_grace_held(self.session_id))
+                # A queue is loaded only for a socket on a chat (above).
                 await self._queue_for_next_turn(
-                    self.chat_id, item, queue_id,
+                    cast("str", self.chat_id), item, queue_id,
                     waiting=input_queue.WAITING_RECONNECT if reconnecting else "")
                 if await self._enter_pump_loop() is None:
                     # No turn ran on this socket (the other starter deferred,
@@ -706,7 +752,7 @@ class ChatSendMixin(_Host):
                 return
             if limit_status["warning"]:
                 await self._send({"type": wire.LIMIT_WARNING, **limit_status["periods"]})
-        except Exception:
+        except Exception:  # noqa: BLE001  # a failed usage-limit check never blocks the message
             pass  # Don't block messages if limit check fails
 
         # ── Subscription pool cap (the sender's own accounts on this chat's
@@ -716,7 +762,7 @@ class ChatSendMixin(_Host):
         cap_verdict = "ok"
         try:
             cap_verdict = await self._pool_cap_gate()
-        except Exception:
+        except Exception:  # noqa: BLE001  # a failed subscription-cap check lets the turn proceed
             logger.debug("pool cap gate failed, turn proceeds", exc_info=True)
         if cap_verdict == "blocked":
             return
@@ -770,7 +816,8 @@ class ChatSendMixin(_Host):
         #     engine's own history — injecting would duplicate it. Skipped
         #     while a history seed is pending (the digest injected at
         #     _start_new_stream already contains the aborted turn).
-        _cid = self.chat_id
+        # A ready session has its chat (the warmup minted both).
+        _cid = cast("str", self.chat_id)
         _sender = self.user_sub
         _persist_row = not server_kick and not artifact_framed
         _read_prev_author = is_agent_scoped and bool(_cid) and not server_kick
@@ -800,7 +847,7 @@ class ChatSendMixin(_Host):
                 try:
                     from services.apps.focus_context import focus_line
                     out["focus"] = focus_line(_focus_user, connection_id=_focus_conn)
-                except Exception:
+                except Exception:  # noqa: BLE001  # the focus line is optional, a failure must never hold the send
                     logger.debug("focus line unavailable for chat %s", _cid, exc_info=True)
             if _read_prev_author:
                 out["prev_author"] = task_store.get_last_user_message_author(_cid)
@@ -846,15 +893,15 @@ class ChatSendMixin(_Host):
             await self._send({"type": wire.TITLE_UPDATED, "chat_id": self.chat_id, "title": _title})
             try:
                 notification_manager.broadcast_chat_title(
-                    (chat_rec or {}).get("user_sub") or "", self.chat_id, _title,
+                    (chat_rec or {}).get("user_sub") or "", cast("str", self.chat_id), _title,
                     agent=(chat_rec or {}).get("agent") or "",
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001  # the title broadcast is best effort, the turn goes on
                 logger.debug("first-message title broadcast failed for %s",
                              self.chat_id, exc_info=True)
         if sent["cancelled"]:
             cli_text = sent["cancelled"] + "\n\n" + cli_text
-            logger.info(f"WS dashboard: injected cancelled turn context ({len(sent['cancelled'])} chars) for chat={self.chat_id}")
+            logger.info("WS dashboard: injected cancelled turn context (%s chars) for chat=%s", len(sent['cancelled']), self.chat_id)
         # Prompt-side only, like the notes around it: the stored row is the
         # raw text.
         if sent.get("focus"):
@@ -879,22 +926,23 @@ class ChatSendMixin(_Host):
             pump = await self._start_new_stream(
                 cli_text,
                 target_session_id=self.session_id,
-                target_chat_id=self.chat_id,
+                target_chat_id=cast("str", self.chat_id),
                 target_layer=self.layer,
                 images=attached_images or None,
+                typed=True,
             )
-        except TurnDeferred:
-            # The machine dropped between the heal and the start: the rows are
-            # written (the waiting messages taken with this one included), so
-            # the person is told to send them again, and the card keeps their
-            # text for a reload.
+        except TurnDeferred as deferred:
+            # The machine dropped between the heal and the start, or did not
+            # answer the resume probe: the rows are written (the waiting
+            # messages taken with this one included), so the person is told
+            # to send them again, and the card keeps their text for a reload.
             self._restore_abort_flags(_cid, sent["consumed"])
             if q is not None:
                 q.release(claim)
             if not artifact_framed:
                 shelve_undelivered(_cid, [qi.item for qi in taken] + [turn_input],
                                    reason=wire.UNDELIVERED_QUEUED)
-            await self._send_reconnecting_line(self.chat_id or "")
+            await self._send_deferred_line(self.chat_id or "", deferred)
             await self._send({"type": wire.DONE, "chat_id": self.chat_id or ""})
             return
         if q is not None:
@@ -928,7 +976,7 @@ class ChatSendMixin(_Host):
         spawn(self._fire_stop_and_send(pump, flags),
               name="fire_stop_and_send", owner="dashboard_chat_send")
 
-    async def _fire_stop_and_send(self, pump, flags: dict) -> None:
+    async def _fire_stop_and_send(self, pump: "ChatStreamPump", flags: dict) -> None:
         # Pre-flight re-checks (the ack await above yielded the loop): the
         # producer may have claimed the queue already (the interrupt would
         # land on the DRAIN turn delivering this very message), the user may
@@ -942,19 +990,20 @@ class ChatSendMixin(_Host):
         try:
             # The pump's session, never the connection's — an attach viewer
             # may hold a different session id than the streaming turn.
-            if await self.layer.interrupt_for_queued(pump.session_id):
+            # _maybe_stop_and_send spawns this only with a layer.
+            if await cast("ExecutionLayer", self.layer).interrupt_for_queued(pump.session_id):
                 flags["note"] = True
                 # The auto-deny released the hook waiters; clear the pump's
                 # permission slot too, else the drain turn's next permission
                 # buffers invisibly behind the dead card.
                 pump.clear_permission_state()
                 logger.info(
-                    f"stop-and-send: graceful interrupt fired for "
-                    f"chat={pump.chat_id[:8]}"
+                    "stop-and-send: graceful interrupt fired for "
+                    "chat=%s", pump.chat_id[:8]
                 )
             else:
                 flags["fired"] = False
-        except Exception:
+        except Exception:  # noqa: BLE001  # a failed interrupt falls back to the plain stop
             flags["fired"] = False
             logger.warning("stop-and-send: interrupt attempt failed",
                            exc_info=True)
@@ -1017,7 +1066,7 @@ class ChatSendMixin(_Host):
             "type": wire.WARMUP_READY,
             "session_id": self.session_id,
             "chat_id": self.chat_id,
-            "mode": get_session_mode(self.session_id) or chat_rec.get("permission_mode", "default"),
+            "mode": get_session_mode(self.session_id) or chat_rec.get("permission_mode") or ASK_MODE,
             "model": chat_rec.get("model", "") or config.get_cli_model(self.agent_name),
             "execution_path": chat_rec.get("execution_path", ""),
             "interactive": True,
@@ -1033,20 +1082,25 @@ class ChatSendMixin(_Host):
             event_meta["files"] = valid_files
         await self._type_into_terminal(
             isess, self.chat_id, text, cli_text, event_meta,
-            row=not msg.get("_server_kick") and not msg.get("_artifact_framed"))
+            row=not msg.get("_server_kick") and not msg.get("_artifact_framed"),
+            typed=not msg.get("_artifact_framed"))
         logger.info(
-            f"WS dashboard _handle_chat: delivered composer send to live "
-            f"interactive session={self.session_id[:8]}, chat={self.chat_id[:8]}"
+            "WS dashboard _handle_chat: delivered composer send to live "
+            "interactive session=%s, chat=%s",
+            self.session_id[:8], self.chat_id[:8]
         )
         return LIVE_TERMINAL_TYPED
 
     async def _type_into_terminal(self, isess, chat_id: str, text: str, cli_text: str,
-                                  event_meta: dict, *, row: bool = True) -> None:
+                                  event_meta: dict, *, row: bool = True,
+                                  typed: bool = True) -> None:
         """A composer message typed into the live terminal ``isess`` on
         ``chat_id``: its row (the raw text, unless the caller wrote it), the
-        time and focus preludes on what the terminal gets, the stamped bytes
-        noted so the tailer's duplicate-skip matches the journaled user line
-        byte for byte, then a bracketed paste and CR."""
+        time and focus preludes on what the terminal gets, behind them the
+        chat's notes when the message is a person's (``typed``; an app
+        interaction is not), the stamped bytes noted so the tailer's
+        duplicate-skip matches the journaled user line byte for byte, then a
+        bracketed paste and CR."""
         if row:
             # Awaited: the row must exist before note_sent_prompt below, or
             # the tailer's duplicate-skip and the row race.
@@ -1069,8 +1123,10 @@ class ChatSendMixin(_Host):
                 focus_line, self.user_sub,
                 connection_id=getattr(self, "notify_connection_id", "") or None,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001  # the focus line is optional, a failure must never hold the send
             logger.debug("focus line unavailable for chat %s", chat_id, exc_info=True)
+        if typed:
+            cli_text = await self._with_pending_notes(chat_id, cli_text)
         stamped = self._interactive_prelude(cli_text, session_id=isess.session_id,
                                             focus_line=focus)
         from core.session.transcript_tool_events import note_sent_prompt
@@ -1090,6 +1146,7 @@ class ChatSendMixin(_Host):
         style: its own framed turn when idle, queued to the boundary while a
         turn streams. Acks `{type:"artifact_ack", token, status[, reason]}`.
         """
+        from core.events import artifact_events
         from ws import artifact_interactions as _ai
         token = str(msg.get("token") or "")
 
@@ -1121,7 +1178,7 @@ class ChatSendMixin(_Host):
             pump = _active_pumps.get(chat_id)
             if pump is not None:
                 queued = pump.queue_artifact(interaction)
-            elif len(self.artifact_queue) < _ai.QUEUE_CAP:
+            elif len(self.artifact_queue) < artifact_events.QUEUE_CAP:
                 self.artifact_queue.append(interaction)
                 queued = True
             else:
@@ -1140,7 +1197,7 @@ class ChatSendMixin(_Host):
             functools.partial(
                 task_store.add_chat_message, chat_id, "event", "",
                 event_type=wire.ARTIFACT_INTERACTION,
-                event_data=_ai.event_row_json(interaction),
+                event_data=artifact_events.event_row_json(interaction),
             ),
             label="artifact_row",
         )
@@ -1159,6 +1216,7 @@ class ChatSendMixin(_Host):
         the one authority upgrade; everything else keeps the backchannel
         downgrades. Acks `{type:"app_action_ack", app_id, action_id, status
         [, reason]}`."""
+        from core.events import artifact_events
         from ws import artifact_interactions as _ai
         app_id = str(msg.get("app_id") or "")
         action_id = str(msg.get("action_id") or "")
@@ -1207,7 +1265,7 @@ class ChatSendMixin(_Host):
             pump = _active_pumps.get(chat_id)
             if pump is not None:
                 queued = pump.queue_artifact(interaction)
-            elif len(self.artifact_queue) < _ai.QUEUE_CAP:
+            elif len(self.artifact_queue) < artifact_events.QUEUE_CAP:
                 self.artifact_queue.append(interaction)
                 queued = True
             else:
@@ -1219,7 +1277,7 @@ class ChatSendMixin(_Host):
             chat_id,
             functools.partial(
                 task_store.add_chat_message, chat_id, "event", "",
-                event_type=wire.APP_ACTION, event_data=_ai.event_row_json(interaction),
+                event_type=wire.APP_ACTION, event_data=artifact_events.event_row_json(interaction),
             ),
             label="app_action_row",
         )
@@ -1242,7 +1300,7 @@ class ChatSendMixin(_Host):
             return
         _uid, _viewer = self.user_sub, self._viewer_context()
         # Imported here: the agents API package imports this module's assembly.
-        from api.agents.chats import can_access_chat
+        from core.session.visibility import can_access_chat
 
         def _read_job() -> tuple[str, str] | None:
             # Access gate (the resume gate's rule) + the read mark in ONE

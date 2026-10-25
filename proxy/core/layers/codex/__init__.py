@@ -7,9 +7,9 @@ from core.layers.codex.layer import (
 from core.layers.codex.session import (
     CodexAppServerSession,
     CodexEvent,
+    close_codex_session,
     create_codex_session,
     get_codex_session,
-    close_codex_session,
     reap_idle_codex_sessions,
 )
 

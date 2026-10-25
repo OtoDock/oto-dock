@@ -9,7 +9,6 @@ import hmac
 import ipaddress
 import logging
 import re
-import time
 from urllib.parse import parse_qs, urlparse
 
 from fastapi import Body, Depends, HTTPException, Request
@@ -17,23 +16,60 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 import config
-from auth.lan_check import auth_bucket_key, check_local_auth_allowed, client_address, get_client_ip
+from api.auth._common import build_feature_flags, user_payload
+from api.auth._router import router
+from auth import rate_limiter, session_revocation, token_holder, tokens
+from auth.lan_check import (
+    auth_bucket_key,
+    check_local_auth_allowed,
+    client_address,
+    get_client_ip,
+)
 from auth.license import check_seat_limit
-from auth.password import HashBusy, check_password_strength_async, hash_password_async, verify_password_async
-from auth.providers import ClientStatesFull, StateStoreFull, UserContext, apply_session_cookie, create_session_jwt, discard_oauth_state, get_current_user, mask_email, peek_oauth_state, require_auth, require_human, validate_oauth_state
-from auth import session_revocation, token_holder
+from auth.password import (
+    HashBusy,
+    check_password_strength_async,
+    hash_password_async,
+    verify_password_async,
+)
+from auth.providers import (
+    ClientStatesFull,
+    StateStoreFull,
+    UserContext,
+    apply_session_cookie,
+    create_session_jwt,
+    discard_oauth_state,
+    get_current_user,
+    mask_email,
+    peek_oauth_state,
+    require_auth,
+    require_human,
+    validate_oauth_state,
+)
 from auth.providers.local_provider import LocalAuthProvider
 from auth.providers.oidc_provider import OIDCAuthProvider, ensure_oidc_discovery
-from auth import rate_limiter
 from auth.rate_limiter import hit as rate_limit_hit, record_successful_login
-from auth.totp import StepTokenBusy, create_2fa_session_token, decrypt_recovery_codes, decrypt_totp_secret, encrypt_recovery_codes, encrypt_totp_secret, generate_recovery_codes, generate_totp_secret, get_totp_uri, hash_recovery_codes, release_2fa_session_token, reserve_2fa_session_token, spend_2fa_session_token, totp_step, verify_recovery_code
+from auth.totp import (
+    StepTokenBusy,
+    create_2fa_session_token,
+    decrypt_recovery_codes,
+    decrypt_totp_secret,
+    encrypt_recovery_codes,
+    encrypt_totp_secret,
+    generate_recovery_codes,
+    generate_totp_secret,
+    get_totp_uri,
+    hash_recovery_codes,
+    release_2fa_session_token,
+    reserve_2fa_session_token,
+    spend_2fa_session_token,
+    totp_step,
+    verify_recovery_code,
+)
+from core.background import spawn
 from services.agents import offboarding_sessions
 from storage import database as task_store
 from storage.pg import run_db
-
-from api.auth._common import build_feature_flags, user_payload
-from api.auth._router import router
-from core.background import spawn
 
 logger = logging.getLogger("otodock")
 
@@ -178,8 +214,8 @@ def _hash_busy() -> HTTPException:
 async def _password_matches(plain: str, hashed: str) -> bool:
     try:
         return await verify_password_async(plain, hashed)
-    except HashBusy:
-        raise _hash_busy()
+    except HashBusy as exc:
+        raise _hash_busy() from exc
 
 
 async def _new_password_hash(plain: str) -> str:
@@ -189,8 +225,8 @@ async def _new_password_hash(plain: str) -> str:
         raise HTTPException(400, msg)
     try:
         return await hash_password_async(plain)
-    except HashBusy:
-        raise _hash_busy()
+    except HashBusy as exc:
+        raise _hash_busy() from exc
 
 
 def _check_platform_configured(user_sub: str, role: str) -> bool:
@@ -233,8 +269,8 @@ def _auth_config_payload() -> dict:
     # actually enabled, so the rendered widget matches backend enforcement exactly.
     from services.infra import turnstile
     tcfg = turnstile.load_config(settings)
-    from services.billing import relay_client
     from api.auth.webauthn import passkey_rp_host, passkeys_enabled
+    from services.billing import relay_client
     mode = settings.get("passkey_login_mode", "")
     relay_offered = relay_client.relay_offered()
     return {
@@ -315,7 +351,7 @@ def _sso_start_allowed(key: str) -> None:
     ok, retry_after = rate_limiter.hit("sso_start", key)
     if not ok:
         raise HTTPException(status_code=429,
-                            detail="Too many sign-ins started; try again in a few minutes.",
+                            detail="Too many sign-ins started.",
                             headers={"Retry-After": str(retry_after)})
 
 
@@ -365,12 +401,12 @@ def _sso_login_url(client: tuple[str, bool], **kwargs) -> str | None:
         return _oidc_provider.get_login_url(client=key, client_capped=capped, **kwargs)
     except ClientStatesFull as full:
         raise HTTPException(status_code=429,
-                            detail="Too many sign-ins started from your address; try again in a few minutes.",
-                            headers={"Retry-After": str(full.retry_after)})
+                            detail="Too many sign-ins started from your address.",
+                            headers={"Retry-After": str(full.retry_after)}) from full
     except StateStoreFull as full:
         raise HTTPException(status_code=503,
-                            detail="Too many sign-ins in progress; try again in a few minutes.",
-                            headers={"Retry-After": str(full.retry_after)})
+                            detail="Too many sign-ins in progress.",
+                            headers={"Retry-After": str(full.retry_after)}) from full
 
 
 @router.get("/auth/login")
@@ -513,7 +549,7 @@ def _require_fresh_login(claims: dict, state_meta: dict, email: str) -> None:
     started = float(state_meta.get("created_at") or 0)
     if auth_time is None:
         if config.OIDC_CONFIRM_REQUIRE_AUTH_TIME:
-            logger.warning(f"OIDC confirm refused for {mask_email(email)}: no auth_time in the ID token")
+            logger.warning("OIDC confirm refused for %s: no auth_time in the ID token", mask_email(email))
             raise HTTPException(status_code=403,
                                 detail="The identity provider did not say when you logged in")
         return
@@ -525,8 +561,9 @@ def _require_fresh_login(claims: dict, state_meta: dict, email: str) -> None:
     if fresh:
         return
     ago = max(0, int((started - at) / 60)) if at else 0
-    logger.warning(f"OIDC confirm refused for {mask_email(email)}: the login was not fresh "
-                   f"(auth_time {at:.0f}, confirm started {started:.0f}, {ago} min earlier)")
+    logger.warning("OIDC confirm refused for %s: the login was not fresh "
+                   "(auth_time %.0f, confirm started %.0f, %s min earlier)",
+                   mask_email(email), at, started, ago)
     raise HTTPException(
         status_code=403,
         detail=(f"The login was not fresh: {config.OIDC_PROVIDER_NAME or 'the identity provider'} "
@@ -561,7 +598,7 @@ async def _finish_oidc_confirm(state_meta: dict, code: str) -> JSONResponse:
     if config.OIDC_CONFIRM_FRESH_LOGIN:
         _require_fresh_login(claims, state_meta, result.email)
     token = confirm.mint_confirm_token(result.sub)
-    logger.info(f"OIDC confirm: {mask_email(result.email)} provider={result.auth_provider}")
+    logger.info("OIDC confirm: %s provider=%s", mask_email(result.email), result.auth_provider)
     return JSONResponse(content={"purpose": "confirm", "confirm_token": token,
                                  "return_to": state_meta.get("return_to") or "/"})
 
@@ -613,9 +650,9 @@ async def auth_login_local(req: LocalLoginRequest, request: Request):
     try:
         result = await _local_provider.authenticate(
             {"email": req.email, "password": req.password}, device=device)
-    except HashBusy:
+    except HashBusy as exc:
         rate_limiter.release_login_attempt(bucket_key)
-        raise _hash_busy()
+        raise _hash_busy() from exc
 
     if not result.success:
         if result.error_code == "account_locked":
@@ -664,7 +701,7 @@ async def auth_login_local(req: LocalLoginRequest, request: Request):
     await record_successful_login(result.sub)
     user = await run_db(task_store.get_user, result.sub)
     response = await _login_response(user or user_row, "local")
-    logger.info(f"Local login: {mask_email(result.email)} role={result.role}")
+    logger.info("Local login: %s role=%s", mask_email(result.email), result.role)
     return response
 
 
@@ -687,8 +724,8 @@ async def auth_login_2fa(req: TwoFactorRequest, request: Request):
     # never opens two sessions.
     try:
         step = reserve_2fa_session_token(req.totp_session_token)
-    except StepTokenBusy:
-        raise HTTPException(status_code=409, detail="This sign-in is already being completed")
+    except StepTokenBusy as exc:
+        raise HTTPException(status_code=409, detail="This sign-in is already being completed") from exc
     if step is None:
         raise HTTPException(status_code=401, detail="2FA session expired. Please log in again.")
     sub = step.sub
@@ -735,7 +772,7 @@ async def auth_login_2fa(req: TwoFactorRequest, request: Request):
                         await run_db(
                             task_store.update_user_auth_fields, sub, totp_recovery_enc=new_enc
                         )
-                        logger.info(f"2FA recovery code used for {mask_email(user['email'])} ({len(remaining)} remaining)")
+                        logger.info("2FA recovery code used for %s (%s remaining)", mask_email(user['email']), len(remaining))
                 if not matched:
                     raise HTTPException(status_code=401, detail="Invalid 2FA code")
 
@@ -746,7 +783,7 @@ async def auth_login_2fa(req: TwoFactorRequest, request: Request):
         # The right code guessed nothing; the wrong ones stay counted.
         rate_limiter.release_attempt("2fa", bucket_key)
         response = await _login_response(user, "local")
-        logger.info(f"2FA verified: {mask_email(user['email'])}")
+        logger.info("2FA verified: %s", mask_email(user['email']))
         return response
     finally:
         # Every other exit (a wrong code, a refusal, an error, a cancelled
@@ -800,8 +837,9 @@ async def auth_callback(req: OAuthCallbackRequest, request: Request):
     # address by claiming it at the provider.
     if (result.email and not result.email_verified
             and await run_db(task_store.email_taken_by_other, result.email, result.sub)):
-        logger.warning(f"OIDC login refused for {mask_email(result.email)}: the email is "
-                       f"not verified by the provider and another account here uses it")
+        logger.warning("OIDC login refused for %s: the email is "
+                       "not verified by the provider and another account here uses it",
+                       mask_email(result.email))
         raise HTTPException(status_code=403, detail=(
             "Your identity provider does not confirm this email address, and another "
             "account here already uses it. Ask your administrator to verify the email "
@@ -858,7 +896,7 @@ async def auth_callback(req: OAuthCallbackRequest, request: Request):
     # it would break a second login tab still in flight in the same browser. The
     # bound states are single-use (validate_oauth_state consumed this one) and
     # the cookie self-expires via its TTL.
-    logger.info(f"OIDC login: {mask_email(result.email)} role={result.role} provider={result.auth_provider}")
+    logger.info("OIDC login: %s role=%s provider=%s", mask_email(result.email), result.role, result.auth_provider)
     return response
 
 
@@ -930,8 +968,9 @@ async def admin_sign_out_everywhere(
     if target.get("is_owner") and not u.is_owner:
         raise HTTPException(status_code=403, detail="Cannot sign out the owner")
     closed = await end_every_sign_in(sub, target.get("username") or "", "signed_out")
-    logger.info(f"Admin {mask_email(u.email)} signed {mask_email(target['email'])} out everywhere "
-                f"({closed} chat session(s) closed)")
+    logger.info("Admin %s signed %s out everywhere "
+                "(%s chat session(s) closed)",
+                mask_email(u.email), mask_email(target['email']), closed)
     return {"status": "ok", "sessions_closed": closed}
 
 
@@ -1048,7 +1087,7 @@ async def set_my_default_agent(
                 detail=f"Agent '{agent}' is not accessible to you",
             )
     await run_db(task_store.set_user_default_agent, u.sub, agent)
-    logger.info(f"User {mask_email(u.email)} set their default agent: {agent or '(none)'}")
+    logger.info("User %s set their default agent: %s", mask_email(u.email), agent or '(none)')
     return {"status": "updated", "default_agent": agent}
 
 
@@ -1078,7 +1117,7 @@ async def change_my_password(
     await asyncio.to_thread(task_store.set_user_password, u.sub, pw_hash)
     # The write moved the token epoch: no cached pass may outlive it.
     token_holder.forget(u.sub)
-    logger.info(f"User {mask_email(u.email)} changed their password")
+    logger.info("User %s changed their password", mask_email(u.email))
     # Their warm chats hold session tokens the change just invalidated:
     # close them so the next message re-warms with fresh ones.
     await offboarding_sessions.close_person_sessions(
@@ -1122,9 +1161,9 @@ async def change_my_email(
     try:
         await asyncio.to_thread(task_store.update_user_email, u.sub, req.new_email.strip().lower())
     except ValueError as e:
-        raise HTTPException(409, str(e))
+        raise HTTPException(409, str(e)) from e
 
-    logger.info(f"User {mask_email(u.email)} changed email to {mask_email(req.new_email)}")
+    logger.info("User %s changed email to %s", mask_email(u.email), mask_email(req.new_email))
     return {"status": "ok"}
 
 
@@ -1200,7 +1239,7 @@ async def totp_verify(
     await asyncio.to_thread(
         task_store.update_user_auth_fields, u.sub, totp_enabled=True,
     )
-    logger.info(f"User {mask_email(u.email)} enabled 2FA")
+    logger.info("User %s enabled 2FA", mask_email(u.email))
     return {"status": "enabled"}
 
 
@@ -1230,15 +1269,17 @@ async def totp_disable(
         task_store.update_user_auth_fields, u.sub,
         totp_secret_enc=None, totp_recovery_enc=None, totp_enabled=False,
     )
-    logger.info(f"User {mask_email(u.email)} disabled 2FA")
+    logger.info("User %s disabled 2FA", mask_email(u.email))
     return {"status": "disabled"}
 
 
 @router.post("/auth/forgot-password")
 async def forgot_password(req: ForgotPasswordRequest, request: Request):
     """Request a password reset email. Always returns 200 (no user enumeration)."""
-    from services.notifications.smtp import is_smtp_configured, send_password_reset_email
-    import jwt as pyjwt
+    from services.notifications.smtp import (
+        is_smtp_configured,
+        send_password_reset_email,
+    )
 
     # Throttle per source address AND per target email so this can't be used to bomb a
     # victim's inbox or sweep emails. Both keys are independent of user existence,
@@ -1263,11 +1304,8 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
 
     if user and user.get("auth_provider", "").startswith("local") and user.get("password_hash"):
         # Generate reset token (JWT, 1hr expiry)
-        token = pyjwt.encode(
-            {"sub": user["sub"], "purpose": "password_reset",
-             "iat": int(time.time()), "exp": int(time.time()) + 3600},
-            config.JWT_SECRET, algorithm="HS256",
-        )
+        token = tokens.mint(tokens.PASSWORD_RESET,
+                            {"sub": user["sub"], "purpose": "password_reset"}, ttl_s=3600)
         reset_url = f"{config.DASHBOARD_PUBLIC_URL}/reset-password?token={token}"
 
         # Fire-and-forget: awaiting the SMTP send here would make the response
@@ -1277,7 +1315,7 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
         async def _send_reset() -> None:
             try:
                 await asyncio.to_thread(send_password_reset_email, email, reset_url)
-            except Exception:
+            except Exception:  # noqa: BLE001  # the reset mail's spawned task: the request was already answered
                 logger.warning("Password-reset email send failed for %s",
                                mask_email(email))
         spawn(_send_reset(), name="send_reset", owner="identity")
@@ -1289,8 +1327,6 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
 @router.post("/auth/reset-password")
 async def reset_password(req: ResetPasswordRequest, request: Request):
     """Reset password using a token from the forgot-password email."""
-    import jwt as pyjwt
-
     # Per-address throttle so the reset endpoint can't be hammered (token guessing /
     # strength-check abuse). Burst-safe record-before-check.
     ok, retry_after = rate_limit_hit("reset", auth_bucket_key(request))
@@ -1302,14 +1338,11 @@ async def reset_password(req: ResetPasswordRequest, request: Request):
         )
 
     try:
-        payload = pyjwt.decode(req.token, config.JWT_SECRET, algorithms=["HS256"])
-    except pyjwt.ExpiredSignatureError:
-        raise HTTPException(400, "Reset link has expired. Please request a new one.")
-    except pyjwt.InvalidTokenError:
-        raise HTTPException(400, "Invalid reset link.")
-
-    if payload.get("purpose") != "password_reset":
-        raise HTTPException(400, "Invalid reset link.")
+        payload = tokens.decode(req.token, tokens.PASSWORD_RESET)
+    except tokens.TokenExpired as exc:
+        raise HTTPException(400, "Reset link has expired. Please request a new one.") from exc
+    except tokens.TokenInvalid as exc:
+        raise HTTPException(400, "Invalid reset link.") from exc
 
     sub = payload.get("sub", "")
     user = await asyncio.to_thread(task_store.get_user, sub)
@@ -1330,7 +1363,7 @@ async def reset_password(req: ResetPasswordRequest, request: Request):
     pw_hash = await _new_password_hash(req.new_password)
     await asyncio.to_thread(task_store.set_user_password, sub, pw_hash)
     token_holder.forget(sub)
-    logger.info(f"Password reset completed for {mask_email(user['email'])}")
+    logger.info("Password reset completed for %s", mask_email(user['email']))
     await offboarding_sessions.close_person_sessions(
         sub, user.get("username") or "", "password_changed")
     return {"status": "ok"}
@@ -1344,8 +1377,6 @@ async def accept_invite(req: AcceptInviteRequest, request: Request):
     creation). Single-use is structural: only valid while the account has no
     password, and accepting sets one — so a replayed token (or one raced by an
     admin password reset) is dead."""
-    import jwt as pyjwt
-
     # Per-address throttle, same posture as the reset endpoint (token guessing /
     # strength-check abuse). Burst-safe record-before-check.
     ok, retry_after = rate_limit_hit("invite", auth_bucket_key(request))
@@ -1357,14 +1388,11 @@ async def accept_invite(req: AcceptInviteRequest, request: Request):
         )
 
     try:
-        payload = pyjwt.decode(req.token, config.JWT_SECRET, algorithms=["HS256"])
-    except pyjwt.ExpiredSignatureError:
-        raise HTTPException(400, "This invite link has expired. Ask your admin for a new one.")
-    except pyjwt.InvalidTokenError:
-        raise HTTPException(400, "Invalid invite link.")
-
-    if payload.get("purpose") != "invite":
-        raise HTTPException(400, "Invalid invite link.")
+        payload = tokens.decode(req.token, tokens.INVITE)
+    except tokens.TokenExpired as exc:
+        raise HTTPException(400, "This invite link has expired. Ask your admin for a new one.") from exc
+    except tokens.TokenInvalid as exc:
+        raise HTTPException(400, "Invalid invite link.") from exc
 
     user = await asyncio.to_thread(task_store.get_user, payload.get("sub", ""))
     if not user or not (user.get("auth_provider") or "").startswith("local"):
@@ -1376,5 +1404,5 @@ async def accept_invite(req: AcceptInviteRequest, request: Request):
     pw_hash = await _new_password_hash(req.new_password)
     await asyncio.to_thread(task_store.set_user_password, user["sub"], pw_hash)
     token_holder.forget(user["sub"])
-    logger.info(f"Invite accepted for {mask_email(user['email'])}")
+    logger.info("Invite accepted for %s", mask_email(user['email']))
     return {"status": "ok", "email": user["email"]}

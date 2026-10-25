@@ -9,12 +9,20 @@ tests there) and are imported lazily.
 """
 
 import logging
+from typing import TYPE_CHECKING
+
 from core import placement
 
 logger = logging.getLogger("otodock.satellite")
 
 
-class SatelliteAdminAlertsMixin:
+if TYPE_CHECKING:
+    from core.remote.satellite_host import SatelliteManagerHost as _Host
+else:
+    _Host = object
+
+
+class SatelliteAdminAlertsMixin(_Host):
     async def _evaluate_admin_machine_alerts(self) -> None:
         """Fire admin offline/online notifications based on SUSTAINED state.
 
@@ -47,13 +55,13 @@ class SatelliteAdminAlertsMixin:
         # These stay in satellite_connection (monkeypatched / read by tests
         # there) — import live each call so the patches take effect.
         from core.remote.satellite_connection import (
+            _OFFLINE_ALERT_GRACE_S,
             _notify_admins_machine_state_change,
             _seconds_since_iso,
-            _OFFLINE_ALERT_GRACE_S,
         )
+        from services.remote import remote_status
         from storage import remote_store
         from storage.pg import run_db
-        from services.remote import remote_status
 
         machines = await run_db(remote_store.get_all_remote_machines)
         for m in machines:

@@ -18,7 +18,6 @@ from fastapi import HTTPException
 from api.auth import claude_oauth as claude_api
 from api.auth.claude_oauth import OAuthExchangeRequest
 
-
 _ACCOUNT_A = {"email_address": "a@example.com", "uuid": "uuid-a"}
 _ACCOUNT_B = {"email_address": "b@example.com", "uuid": "uuid-b"}
 
@@ -239,7 +238,8 @@ def test_exchange_stores_grant_expiry():
 def _update(user_role, owner_sub="user-1", **body):
     from api.admin import execution_layers as el
     from api.admin.execution_layers import (
-        UpdateSubscriptionRequest, user_update_subscription,
+        UpdateSubscriptionRequest,
+        user_update_subscription,
     )
     store = MagicMock()
     store.get_subscription.return_value = {"id": "s1", "owner_sub": owner_sub}

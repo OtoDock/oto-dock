@@ -34,10 +34,14 @@ from __future__ import annotations
 import logging
 import math
 import unicodedata
+from typing import TYPE_CHECKING
 
 from config import BASE_DIR
-from storage.agents import agent_store
 from storage import database as task_store
+from storage.agents import agent_store
+
+if TYPE_CHECKING:
+    from sentencepiece import SentencePieceProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +70,11 @@ PLATFORM_PHRASES = (
 _HEY = "HEY "
 
 # (sentencepiece processor, frozenset of tokens.txt symbols); loaded once.
-_encoder: tuple[object, frozenset[str]] | None = None
+_encoder: tuple[SentencePieceProcessor, frozenset[str]] | None = None
 _encoder_failed = False
 
 
-def _load_encoder() -> tuple[object, frozenset[str]] | None:
+def _load_encoder() -> tuple[SentencePieceProcessor, frozenset[str]] | None:
     """Load bpe.model + tokens.txt once; None (logged) when unavailable so a
     broken install degrades to wake-word-off instead of 500ing settings."""
     global _encoder, _encoder_failed

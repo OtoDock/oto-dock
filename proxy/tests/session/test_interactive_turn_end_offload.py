@@ -35,7 +35,7 @@ async def test_turn_end_stamps_are_one_ordered_off_loop_job(loop_db_guard, monke
         sess._turn_end_effects()
 
     deadline = time.monotonic() + 3
-    while len(calls) < 2 and time.monotonic() < deadline:
+    while len(calls) < 2 and time.monotonic() < deadline:  # noqa: ASYNC110  # the recorded calls list: the offloaded work has no event
         await asyncio.sleep(0.02)
     assert [c[0] for c in calls] == ["update_chat", "mark_chat_read"]
     assert all(c[1] != threading.get_ident() for c in calls)

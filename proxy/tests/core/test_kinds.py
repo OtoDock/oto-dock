@@ -282,6 +282,21 @@ def test_the_app_mirror():
 
 
 # ---------------------------------------------------------------------------
+# the OAuth-app credential kinds
+# ---------------------------------------------------------------------------
+
+def test_the_oauth_app_mirror():
+    from storage.identity import oauth_app_kinds as kinds
+    text = _mirror("oauthApp.ts")
+    assert set(_ts_const_strings(text, "OAUTH_APP_KIND")) == set(kinds.KINDS)
+    assert set(_ts_const_strings(text, "MCP_TOKEN")) == set(kinds.MCP_TOKENS)
+    assert _ts_const_strings(text, "INSTALLATION_TARGET_KIND") == [kinds.INSTALLATION_TARGET_KIND]
+    assert _ts_const_strings(text, "REGISTRATION_MODE_APP") == [kinds.REGISTRATION_MODE_APP]
+    assert _ts_const_strings(text, "INPUT_MULTILINE_SECRET") == [kinds.INPUT_MULTILINE_SECRET]
+    assert kinds.installation_standing({}, 1) == kinds.APP_CHANGED
+
+
+# ---------------------------------------------------------------------------
 # the MCP runtime
 # ---------------------------------------------------------------------------
 

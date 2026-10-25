@@ -35,7 +35,7 @@ def _why(e: Exception) -> str:
 
 
 @functools.lru_cache(maxsize=512)
-def compile(pattern: str):  # noqa: A001 — the re-style name
+def compile(pattern: str):
     try:
         return re2.compile(pattern, options=_OPTIONS)
     except re2.error as e:

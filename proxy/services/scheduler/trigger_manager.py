@@ -21,13 +21,11 @@ import re
 import time
 from typing import TYPE_CHECKING
 
-from storage.automation import trigger_store
-from storage import database as task_store
-from storage import db_apps
-from storage.automation import notification_store
+from core.session import visibility as _vis
 from services.infra import external_data
 from services.scheduler import task_kinds
-from core.session import visibility as _vis
+from storage import database as task_store, db_apps
+from storage.automation import notification_store, trigger_store
 
 if TYPE_CHECKING:
     from auth.webhook_providers.base import NormalizedEvent
@@ -257,7 +255,7 @@ def _validate_app_linkage(
     debounce (a debounced fire is dropped, and a wake must not be)."""
     if not app_id:
         return
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     row = task_store.get_app(app_id)
     if not row:
         raise TriggerValidationError("app not found")
@@ -549,8 +547,8 @@ def register_trigger(
         handler=(handler or None) if app_id else None,
     )
     logger.info(
-        f"Trigger created: id={row['id'][:8]} scope={scope} agent={agent} "
-        f"slug={slug} by={created_by[:12]}"
+        "Trigger created: id=%s scope=%s agent=%s "
+        "slug=%s by=%s", row['id'][:8], scope, agent, slug, created_by[:12]
     )
     return row
 
@@ -753,7 +751,7 @@ def _substitute_placeholders(template: str | None, context: dict, *,
         context = {}
 
     def _walk(key: str):
-        cursor = context
+        cursor: object = context
         for seg in key.split("."):
             if not isinstance(cursor, dict):
                 return None
@@ -936,7 +934,7 @@ async def fire_trigger(
                 actions.append("task")
         except Exception as e:
             errors.append(f"task: {e}")
-            logger.exception(f"Trigger {trigger_id[:8]} task fire failed")
+            logger.exception("Trigger %s task fire failed", trigger_id[:8])
             # A fire that failed did not run the event: another
             # subscription's delivery of it may still run it.
             if vendor_event is not None and event_id:
@@ -952,7 +950,7 @@ async def fire_trigger(
             actions.append("duplicate" if duplicate else "app")
         except Exception as e:
             errors.append(f"app: {e}")
-            logger.exception(f"Trigger {trigger_id[:8]} app fire failed")
+            logger.exception("Trigger %s app fire failed", trigger_id[:8])
 
     # 3. Notification
     delivery_count = 0
@@ -965,15 +963,15 @@ async def fire_trigger(
                 actions.append("notify")
         except Exception as e:
             errors.append(f"notify: {e}")
-            logger.exception(f"Trigger {trigger_id[:8]} notify fire failed")
+            logger.exception("Trigger %s notify fire failed", trigger_id[:8])
 
     # 4. Stats
     err_text = "; ".join(errors) if errors else None
     await asyncio.to_thread(trigger_store.record_fire, trigger_id, error=err_text)
     try:
-        from api.apps import catalog
+        from services.apps import catalog
         catalog.trigger_fired(trigger_row, err_text)
-    except Exception:
+    except Exception:  # noqa: BLE001  # the catalog delta is best effort, the broadcast already went out
         logger.debug("catalog trigger_fires delta failed", exc_info=True)
 
     status = "ok" if not errors else ("partial" if actions else "failed")

@@ -237,7 +237,7 @@ class TwilioCallAPI:
         form = {k: v for k, v in (await request.post()).items()
                 if isinstance(v, str)}
         if not validate_webhook_signature(request, form, server_cfg):
-            logger.warning(f"twilio inbound: bad signature (server {server_id})")
+            logger.warning("twilio inbound: bad signature (server %s)", server_id)
             return web.json_response({"error": "bad signature"}, status=403)
         # AFTER the signature check: the limiter budget is shared and
         # fixed-window, so unsigned garbage consuming it first would let an
@@ -251,15 +251,15 @@ class TwilioCallAPI:
         if call_sid and self._recent_call_sids.seen(call_sid):
             # Replayed signed POST (signatures carry no timestamp) — one
             # TwiML answer per CallSid.
-            logger.warning(f"twilio inbound: replayed CallSid {call_sid[-8:]}")
+            logger.warning("twilio inbound: replayed CallSid %s", call_sid[-8:])
             return _twiml(_TWIML_REJECT)
 
         to = form.get("To", "")
         route = self.cfg.resolve_inbound_route_by_did(server_id, to)
         if route is None:
             logger.warning(
-                f"twilio inbound: no route for {normalize_did(to)!r} "
-                f"on server {server_id} — rejecting"
+                "twilio inbound: no route for %r "
+                "on server %s — rejecting", normalize_did(to), server_id
             )
             return _twiml(_TWIML_REJECT)
         if self._active_count() >= self.cfg.max_live_calls:
@@ -299,8 +299,8 @@ class TwilioCallAPI:
         }
         self._pending.put(token, (route, caller_info))
         logger.info(
-            f"twilio inbound: call {call_sid[-8:]} → route {route.id} "
-            f"(agent={route.agent})"
+            "twilio inbound: call %s → route %s "
+            "(agent=%s)", call_sid[-8:], route.id, route.agent
         )
         return _twiml(build_stream_twiml(
             server_cfg["public_base_url"], server_id, token,
@@ -312,7 +312,7 @@ class TwilioCallAPI:
         server_id = request.match_info["server_id"]
         server_cfg = self.cfg.twilio_server(server_id)
         if not server_cfg or not validate_upgrade_signature(request, server_cfg):
-            logger.warning(f"twilio media: bad upgrade signature (server {server_id})")
+            logger.warning("twilio media: bad upgrade signature (server %s)", server_id)
             return web.json_response({"error": "bad signature"}, status=403)
 
         ws = web.WebSocketResponse()
@@ -320,14 +320,14 @@ class TwilioCallAPI:
         try:
             start = await read_stream_start(ws)
         except TwilioMediaError as e:
-            logger.warning(f"twilio media: handshake failed: {e}")
+            logger.warning("twilio media: handshake failed: %s", e)
             await ws.close()
             return ws
 
         fmt = start.get("mediaFormat") or {}
         if fmt and ("mulaw" not in str(fmt.get("encoding", "mulaw"))
                     or int(fmt.get("sampleRate") or 8000) != 8000):
-            logger.error(f"twilio media: unexpected mediaFormat {fmt} — closing")
+            logger.error("twilio media: unexpected mediaFormat %s — closing", fmt)
             await ws.close()
             return ws
 
@@ -346,8 +346,8 @@ class TwilioCallAPI:
             if (outbound_call.status != CallStatus.DIALING
                     or self._claimed_uuids.seen(token)):
                 logger.warning(
-                    f"twilio media: refusing outbound attach "
-                    f"(status={outbound_call.status.value})"
+                    "twilio media: refusing outbound attach "
+                    "(status=%s)", outbound_call.status.value
                 )
                 await ws.close()
                 return ws
@@ -392,7 +392,7 @@ class TwilioCallAPI:
         form = {k: v for k, v in (await request.post()).items()
                 if isinstance(v, str)}
         if not validate_webhook_signature(request, form, server_cfg):
-            logger.warning(f"twilio status: bad signature (server {server_id})")
+            logger.warning("twilio status: bad signature (server %s)", server_id)
             return web.json_response({"error": "bad signature"}, status=403)
         # Limiter AFTER the signature check — see inbound() for the rationale.
         if not self._limiter.allow():
@@ -406,7 +406,7 @@ class TwilioCallAPI:
         # anything after the pipeline attached is the pipeline's to finalize.
         if call is not None and call.status == CallStatus.DIALING:
             if call_status in ("busy", "no-answer", "failed", "canceled"):
-                logger.info(f"twilio status: {call.call_id} → {call_status}")
+                logger.info("twilio status: %s → %s", call.call_id, call_status)
                 self.call_manager.update_status(
                     call.call_id, CallStatus.FAILED, error=call_status,
                 )
@@ -414,7 +414,7 @@ class TwilioCallAPI:
             elif call_status == "completed":
                 # Answered-and-ended before the media WS ever connected.
                 logger.info(
-                    f"twilio status: {call.call_id} completed before media"
+                    "twilio status: %s completed before media", call.call_id
                 )
                 self.call_manager.update_status(
                     call.call_id, CallStatus.FAILED,
@@ -438,7 +438,7 @@ class TwilioCallAPI:
         form = {k: v for k, v in (await request.post()).items()
                 if isinstance(v, str)}
         if not validate_webhook_signature(request, form, server_cfg):
-            logger.warning(f"twilio transfer: bad signature (server {server_id})")
+            logger.warning("twilio transfer: bad signature (server %s)", server_id)
             return web.json_response({"error": "bad signature"}, status=403)
         # Limiter AFTER the signature check — see inbound() for the rationale.
         if not self._limiter.allow():
@@ -450,14 +450,16 @@ class TwilioCallAPI:
         entry = pending_dials.by_call_sid(call_sid)
         if entry is None:
             logger.warning(
-                f"twilio transfer: the Dial of an unknown call {call_sid[-8:]} ended "
-                f"({dial_status or 'no status'})")
+                "twilio transfer: the Dial of an unknown call %s ended "
+                "(%s)", call_sid[-8:], dial_status or 'no status')
             return _twiml(_TWIML_HANGUP)
         entry.outcome = CALLER_GONE if caller_gone else (dial_status or "failed")
         logger.info(
-            f"twilio transfer {call_sid[-8:]} to {loggable_label(entry.label)}: "
-            f"{dial_status or 'no status'}, call {form.get('CallStatus', '') or 'unknown'} "
-            f"(dial {form.get('DialCallSid', '')[-8:]})")
+            "twilio transfer %s to %s: "
+            "%s, call %s "
+            "(dial %s)",
+            call_sid[-8:], loggable_label(entry.label), dial_status or 'no status',
+            form.get('CallStatus', '') or 'unknown', form.get('DialCallSid', '')[-8:])
         if entry.failed:
             asyncio.get_running_loop().create_task(
                 report_transfer_outcome(entry.report_uuid, "transfer_failed"))
@@ -480,8 +482,8 @@ def _transfer_caller_id(route, caller_info: dict, is_outbound: bool) -> str:
         return typed
     if typed:
         logger.warning(
-            f"twilio transfer: the route's number {typed!r} is not E.164; the Dial "
-            f"presents no callerId")
+            "twilio transfer: the route's number %r is not E.164; the Dial "
+            "presents no callerId", typed)
     return ""
 
 

@@ -8,16 +8,16 @@ One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 
 import asyncio
 import logging
-from core.events import tool_roles
 from dataclasses import dataclass
 
 from fastapi import APIRouter
 
-from storage import database as task_store
+from core.events import tool_roles
 from core.session.session_state import (
     get_meeting_session_info,
     mark_meeting_turn_routed,
 )
+from storage import database as task_store
 
 logger = logging.getLogger("otodock")
 router = APIRouter()
@@ -45,7 +45,7 @@ class HookRoute:
     is_meeting: bool = False
     is_moderator: bool = False
     # The meeting routing tool this turn already passed ("" = none): the
-    # turn-end backstop in ``permission._decide_tool_permission`` denies what follows.
+    # turn-end backstop (``permission._ToolCall.meeting_backstop``) denies what follows.
     routed_tool: str = ""
 
 
@@ -163,8 +163,9 @@ def _meeting_turn_end_backstop(
     info = get_meeting_session_info(session_id) or {}
     reason = _meeting_turn_over_reason(route, int(info.get("turn_text_chars", 0)))
     logger.info(
-        f"Hook denied (meeting turn over after {route.routed_tool}): "
-        f"session={session_id[:8]}, agent={route.meeting_agent}, tool={tool_name}"
+        "Hook denied (meeting turn over after %s): "
+        "session=%s, agent=%s, tool=%s",
+        route.routed_tool, session_id[:8], route.meeting_agent, tool_name
     )
     return {"decision": "deny", "reason": reason}
 

@@ -21,16 +21,17 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import config
+from api.apps import app_proxy
 from app import app
 from auth.providers import UserContext, get_current_user
 from auth.session_token import create_session_token
-from tests.conftest import live_session_token
-from api.apps import app_proxy
 from services.apps import app_supervisor, app_tokens, releases
 from storage import database as task_store
+from tests.conftest import live_session_token
 
 client = TestClient(app)
 
@@ -242,9 +243,9 @@ def test_api_paths_bodies_and_redirects_are_bounded(agent_tree, upstream, monkey
     # encoded forms reach the server as written and the check refuses them.)
     for bad in ("_health", "_handler/x", "/_handler/x", "//_handler/x", "%2e%2e/x", "a%2fb", "a%5cb"):
         assert client.get(f"/v1/apps/{row['id']}/api/{bad}", headers=_bearer(tok)).status_code == 404, bad
-    with pytest.raises(Exception):
+    with pytest.raises(HTTPException):
         app_proxy.check_app_path("a/../b")
-    with pytest.raises(Exception):
+    with pytest.raises(HTTPException):
         app_proxy.check_app_path("/_handler/x", "//_handler/x")
     monkeypatch.setattr(app_proxy, "MAX_BODY_BYTES", 16)
     r = client.post(f"/v1/apps/{row['id']}/api/big", content=b"x" * 17, headers=_bearer(tok))
@@ -256,6 +257,24 @@ def test_api_paths_bodies_and_redirects_are_bounded(agent_tree, upstream, monkey
                       follow_redirects=False).status_code == 502
     r = client.get(f"/v1/apps/{row['id']}/api/redir-ok", headers=_bearer(tok), follow_redirects=False)
     assert r.status_code == 302 and r.headers["location"] == f"/v1/apps/{row['id']}/api/ok"
+
+
+def test_a_cancelled_post_is_a_quiet_refusal(caplog):
+    """A browser that leaves mid-POST (a page closed during a state save)
+    disconnects inside the body read: a 400 nobody reads, no traceback."""
+    import logging
+
+    from starlette.requests import Request
+
+    async def _receive():
+        return {"type": "http.disconnect"}
+
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": []}, _receive)
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(app_proxy._read_body(request))
+    assert exc.value.status_code == 400
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
 def test_api_tokens_of_other_apps_expired_claims_and_launch_tokens(agent_tree, upstream):
@@ -643,7 +662,7 @@ def test_the_preview_launch_token_never_writes_the_live_app(agent_tree, upstream
     reaches the preview's own server, and never writes the live state
     document, pushes to the live frames or notifies the members."""
     from api.apps import apps as apps_api
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     shared = _folder_row("team", "", None)
     actions_json, err = _mf.validate_actions(
         [{"id": "n", "label": "N", "type": "platform", "method": "notifications.create"}], AGENT, shared=True)
@@ -675,11 +694,47 @@ def test_the_preview_launch_token_never_writes_the_live_app(agent_tree, upstream
                         headers=_bearer(live.token)).status_code == 200
 
 
+def test_a_servers_platform_call_without_args_is_refused_not_dropped(agent_tree, upstream, monkeypatch):
+    """A server that puts the fields at the top level, or sends a notification
+    with no title, gets a 400 its `r.ok` sees. A page's own call keeps the
+    200 `{ok: false}` contract."""
+    from services.apps import manifest as _mf
+    shared = _folder_row("team", "", None)
+    actions_json, err = _mf.validate_actions(
+        [{"id": "n", "label": "N", "type": "platform", "method": "notifications.create"}], AGENT, shared=True)
+    assert actions_json is not None, err
+    shared = task_store.upsert_app(AGENT, "", None, "team", actions_json=actions_json)
+    task_store.approve_app_actions(shared["id"], task_store.manifest_sig(shared), "alice-sub")
+    shared = task_store.get_app(shared["id"])
+    upstream.app_id = shared["id"]
+    live = _install(shared, upstream.server_port)
+    sent: list = []
+
+    async def fake_fire(title, body, **kw):
+        sent.append(title)
+        return [{"id": "x"}]
+
+    monkeypatch.setattr("services.notifications.notification_manager.fire_notification", fake_fire)
+    hdr = _bearer(live.token)
+    r = client.post(f"/v1/apps/{shared['id']}/platform/notifications.create",
+                    json={"title": "A visitor chose a house", "body": "b", "severity": "info"}, headers=hdr)
+    assert r.status_code == 400 and "args" in r.json()["detail"], r.text
+    r = client.post(f"/v1/apps/{shared['id']}/platform/notifications.create",
+                    json={"args": {"body": "no title"}}, headers=hdr)
+    assert r.status_code == 400 and "title" in r.text, r.text
+    assert sent == []
+    r = client.post(f"/v1/apps/{shared['id']}/platform/notifications.create",
+                    json={"args": {"title": "A visitor chose a house", "body": "b"}}, headers=hdr)
+    assert r.status_code == 200 and r.json()["result"]["to"] == "members", r.text
+    assert sent == ["A visitor chose a house"]
+
+
 def test_the_agent_caller_judges_the_tokens_holder(agent_tree, upstream):
     """A session token whose person is gone, or was minted before
     their last password change, reaches no app; a living person's token and
     a no-user token do."""
     from datetime import datetime, timedelta, timezone
+
     from storage.pg import get_conn
     shared = _folder_row("team", "", None)
     upstream.app_id = shared["id"]
@@ -701,9 +756,8 @@ def owner_standing(agent_tree, upstream):
     """pm, a contributor, owns an approved personal folder app declaring the
     ``sessions`` feed and ``viewer.me``, served by a fake live instance; the
     apps' offboarding subscriber is registered for the test."""
-    from api.apps import manifest as _mf
     from services.agents import offboarding
-    from services.apps import app_lifecycle
+    from services.apps import app_lifecycle, manifest as _mf
     from storage.agents import agent_store
     agent_store.create_agent(AGENT, AGENT)
     _person("pm-sub", "pm", agent_role="contributor")
@@ -740,8 +794,9 @@ def test_apps_owner_standing(owner_standing, monkeypatch):
     every surface answers as for a missing app, its server stops at the
     removal, nothing is deleted, and a re-attach brings it back; an admin
     still sees the row."""
-    from api.apps import apps as apps_api
     from starlette.websockets import WebSocketDisconnect
+
+    from api.apps import apps as apps_api
     row, inst = owner_standing
     _as(PM)
     claim = _viewer_token(row["id"])
@@ -1132,6 +1187,7 @@ def test_a_placed_session_reaches_the_exports_and_nothing_else(agent_tree, ws_up
     agent's session, with or without a person, and a placed session's token
     never keeps alive a socket the home agent's own session opened."""
     from starlette.websockets import WebSocketDisconnect
+
     from api.apps import apps as apps_api
     row = _exporting_row()
     _install(row, ws_upstream)

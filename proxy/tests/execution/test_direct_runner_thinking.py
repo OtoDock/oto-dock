@@ -7,18 +7,22 @@ Verifies:
   non-reasoning event closes with ``end`` — before the text that follows;
 - a reasoning-only API call still closes its block (on ``stop``);
 - a provider error after reasoning closes the block before the error event;
-- thinking text never lands in the assistant message history.
+- thinking text never lands in the assistant message history;
+- the note mark: the text right before a tool call in the same model call
+  is a progress note, said by an empty note text before the tool's start.
 """
 
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import pytest
 
 from core.layers.providers.base import (
-    ProviderAdapter, ProviderError, ProviderStreamEvent, ProviderUsage,
+    ProviderAdapter,
+    ProviderError,
+    ProviderStreamEvent,
+    ProviderUsage,
 )
 from core.layers.providers.registry import register_adapter
-
 
 _STUB_PROVIDER = "stub-thinking-test"
 
@@ -144,3 +148,73 @@ async def test_no_thinking_no_bracket(direct_session):
     ]
     events = await _collect(direct_session)
     assert not any(e["type"] == "thinking" for e in events)
+
+
+# --- the note mark: the text right before a tool call in one model call ----
+
+async def _call_frames(session, script):
+    """The frames of ONE model call (one assistant message)."""
+    from core.layers.direct.session import _DirectCall, _DirectUsage, _stream_call
+    _ADAPTER.script = script
+    return [f async for f in _stream_call(session, _ADAPTER, "k", _DirectCall(), _DirectUsage())]
+
+
+def _tool(tool_id):
+    return [ProviderStreamEvent(type="tool_start", tool_id=tool_id, tool_name="Glob"),
+            ProviderStreamEvent(type="tool_input_delta", tool_input_json='{"pattern": "*"}'),
+            ProviderStreamEvent(type="tool_stop", tool_id=tool_id, tool_name="Glob",
+                                tool_input_json='{"pattern": "*"}')]
+
+
+@pytest.mark.asyncio
+async def test_the_text_before_a_tool_call_in_its_call_is_marked_a_note(direct_session):
+    from core.events.common_events import NOTE_MARK
+    frames = await _call_frames(direct_session, [
+        ProviderStreamEvent(type="text_delta", text="I'll look "),
+        ProviderStreamEvent(type="text_delta", text="at the folder."),
+        *_tool("t1"), *_tool("t2"),
+        ProviderStreamEvent(type="stop", stop_reason="tool_use"),
+    ])
+    shaped = [(f["type"], f["data"]) for f in frames]
+    assert shaped == [
+        ("text", {"content": "I'll look "}), ("text", {"content": "at the folder."}),
+        ("text", NOTE_MARK), ("tool_start", {"name": "Glob", "tool_use_id": "t1"}),
+        ("tool_start", {"name": "Glob", "tool_use_id": "t2"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_text_that_ends_a_call_reasoning_between_and_an_error_get_no_mark(direct_session):
+    from core.events.common_events import is_note_mark
+
+    def marks(frames):
+        return [f for f in frames if f["type"] == "text" and is_note_mark(f["data"])]
+
+    # The answer ends its call; the next call (the next message) opens with a tool.
+    first = await _call_frames(direct_session, [ProviderStreamEvent(type="text_delta", text="Done."),
+                                                ProviderStreamEvent(type="stop", stop_reason="end_turn")])
+    second = await _call_frames(direct_session, [*_tool("t1"),
+                                                 ProviderStreamEvent(type="stop", stop_reason="tool_use")])
+    assert marks(first) == marks(second) == []
+    between = await _call_frames(direct_session, [ProviderStreamEvent(type="text_delta", text="Hm."),
+                                                  ProviderStreamEvent(type="thinking_delta", text="…"),
+                                                  *_tool("t2")])
+    assert marks(between) == []
+    errored = await _call_frames(direct_session, [ProviderStreamEvent(type="text_delta", text="Let me"),
+                                                  ProviderStreamEvent(type="error", text="overloaded")])
+    assert marks(errored) == [] and errored[-1]["type"] == "error"
+    blank = await _call_frames(direct_session, [ProviderStreamEvent(type="text_delta", text="\n"), *_tool("t3")])
+    assert marks(blank) == []  # whitespace is not words
+    # A server tool's result (web search) between the words and the next call.
+    searched = await _call_frames(direct_session, [
+        ProviderStreamEvent(type="text_delta", text="Found it."),
+        ProviderStreamEvent(type="tool_result", tool_id="ws1", text="3 results"), *_tool("t4")])
+    assert marks(searched) == []
+
+
+def test_the_mark_translates_to_the_note_mark_event_and_an_empty_text_to_nothing():
+    from core.events.common_events import NOTE_MARK, TEXT
+    from core.layers.direct.layer import direct_event_to_common
+    ev = direct_event_to_common({"type": "text", "data": dict(NOTE_MARK)})
+    assert ev is not None and (ev.type, ev.data) == (TEXT, NOTE_MARK)
+    assert direct_event_to_common({"type": "text", "data": {"content": ""}}) is None

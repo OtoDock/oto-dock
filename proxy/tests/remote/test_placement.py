@@ -137,6 +137,7 @@ def test_os_family_reads_the_report_first_then_the_path_shape():
 
 _ROW = {
     "id": "m-1", "name": "Alice MBP", "allow_full_fs": True, "device_grants": '["computer"]',
+    "pairing_scope": "admin",
     "capabilities": json.dumps({
         "os": "darwin", "home_dir": "/Users/alice", "agents_dir": "/Users/alice/.oto-dock/agents",
         "os_user": "alice", "claude_runtime_root": "/tmp/claude-501",
@@ -194,6 +195,35 @@ def test_placement_of_resolves_the_kind_and_reads_once(monkeypatch):
     monkeypatch.setattr(remote_store, "get_remote_machine", lambda mid: None)
     deleted = remote_store.placement_of("m-9", None, "pa")
     assert deleted.admin_paired and deleted.machine_id == "" and deleted.site == placement.SITE_LOCAL
+
+
+def test_a_personal_machine_is_user_remote_whatever_pinned_the_chat(monkeypatch):
+    # A chat moved to its person's own machine (no default override for the
+    # agent) is still a personal placement: the kind follows the row.
+    from storage import remote_store
+    monkeypatch.setattr(remote_store, "get_remote_machine",
+                        lambda mid: dict(_ROW, id=mid, pairing_scope="user", registered_by="u-1"))
+    monkeypatch.setattr(remote_store, "get_user_remote_target", lambda sub, agent: None)
+    assert remote_store.placement_of("m-1", "u-1", "pa").user_paired
+    assert remote_store.placement_of("m-1", None, "pa").user_paired
+
+
+def test_may_run_on_is_the_placement_guard():
+    admin = {"pairing_scope": "admin", "registered_by": "a"}
+    mine = {"pairing_scope": "user", "registered_by": "u-1"}
+    assert placement.may_run_on(admin, run_sub=None, run_can_manage=False, user_paired_allowed=True)
+    assert placement.may_run_on(admin, run_sub="u-1", run_can_manage=True, user_paired_allowed=True)
+    assert not placement.may_run_on(admin, run_sub="u-1", run_can_manage=False,
+                                    user_paired_allowed=True)
+    assert placement.may_run_on(mine, run_sub="u-1", run_can_manage=False, user_paired_allowed=True)
+    assert not placement.may_run_on(mine, run_sub="u-2", run_can_manage=True,
+                                    user_paired_allowed=True)
+    assert not placement.may_run_on(mine, run_sub=None, run_can_manage=True,
+                                    user_paired_allowed=True)
+    assert not placement.may_run_on(mine, run_sub="u-1", run_can_manage=True,
+                                    user_paired_allowed=False)
+    assert not placement.may_run_on(None, run_sub="u-1", run_can_manage=True,
+                                    user_paired_allowed=True)
 
 
 def test_the_browser_settings_read_takes_the_placement(monkeypatch):

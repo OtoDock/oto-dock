@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import BlockRenderer from './ChatBlockRenderer'
-import { useSearch } from '../../contexts/SearchContext'
+
 import type { MessageBlock } from './types'
-import type { ActivityRun } from '../../lib/activityGroups'
+import { isNote, type ActivityRun } from '../../lib/activityGroups'
 import type { BgCommandPair } from '../../lib/messageBlocks'
+import { useSearch } from '../../contexts/useSearch'
 
 interface Props {
   run: ActivityRun
@@ -34,7 +35,10 @@ function spanIndices(run: ActivityRun): number[] {
  *
  * The chip is a single muted line on the chat background (no card border):
  * finished runs show "N steps" (+ amber "M failed"), thinking-only runs show
- * "Thought", live runs pulse with "Working · {current action}".
+ * "Thought", live runs pulse with "Working · {the agent's newest words}"
+ * (`headline`: the running step's title only when the span has no note).
+ * The span's latest progress note reads as one faint line under the
+ * collapsed chip, unless the running line already shows it.
  */
 export default function ActivityGroup({
   run,
@@ -65,6 +69,7 @@ export default function ActivityGroup({
         agentName={agentName}
         onPermissionRespond={onPermissionRespond}
         bgPair={bgPairs.get(i)}
+        noteAside={isNote(blocks[i])}  // a span holds only the notes drawn as asides
       />
     )
   }
@@ -77,20 +82,20 @@ export default function ActivityGroup({
         type="button"
         data-testid="activity-chip"
         onClick={() => setExpanded(v => !v)}
-        className="flex w-fit max-w-full items-center gap-1.5 py-0.5 text-xs text-p-text-light hover:text-p-text-secondary transition-colors cursor-pointer"
+        className="flex w-fit max-w-full items-center gap-1.5 py-0.5 text-xs text-tertiary hover:text-secondary transition-colors cursor-pointer"
       >
         <span
-          className={`shrink-0 text-[9px] transform transition-transform ${expanded ? 'rotate-90' : ''}`}
+          className={`shrink-0 text-3xs transform transition-transform ${expanded ? 'rotate-90' : ''}`}
           aria-hidden
         >
           {'▶'}
         </span>
         {run.running ? (
           <>
-            <span className="w-1.5 h-1.5 rounded-full bg-brand animate-pulse shrink-0" />
+            <span className="w-1.5 h-1.5 rounded-full bg-action animate-pulse shrink-0" />
             <span className="font-medium animate-pulse shrink-0">Working</span>
-            {run.currentLabel && (
-              <span className="truncate min-w-0">{'·'} {run.currentLabel}</span>
+            {run.headline && (
+              <span className="truncate min-w-0" title={run.headline}>{'·'} {run.headline}</span>
             )}
             {run.toolCount > 0 && (
               <span className="shrink-0">{'·'} {steps}</span>
@@ -103,33 +108,40 @@ export default function ActivityGroup({
             </svg>
             <span className="font-medium shrink-0">{steps}</span>
             {run.failedCount > 0 && (
-              <span className="text-p-accent-yellow shrink-0">{'·'} {run.failedCount} failed</span>
+              <span className="text-status-warning-fg shrink-0">{'·'} {run.failedCount} failed</span>
             )}
           </>
         ) : (
           <>
-            <span className="w-1.5 h-1.5 rounded-full bg-p-accent-purple/60 shrink-0" />
+            <span className="w-1.5 h-1.5 rounded-full bg-accent-agent-solid shrink-0" />
             <span className="font-medium">Thought</span>
           </>
         )}
       </button>
+      {!expanded && run.latestNote && !(run.running && run.headline === run.latestNote) && (
+        <p data-testid="activity-note" title={run.latestNote}
+          className="pl-[18px] text-xs text-tertiary truncate">
+          {run.latestNote}
+        </p>
+      )}
       {expanded && (
         <div
           data-testid="activity-group-expanded"
-          className="mt-1 border-l-2 border-p-border-light/70 pl-3 space-y-3"
+          className="mt-1 border-l-2 border-subtle pl-3 space-y-3"
         >
           {spanIndices(run).map(i => (hiddenToolIdx.has(i) ? null : renderSpanBlock(i)))}
         </div>
       )}
-      {/* While a FindBar query is active, keep the run's thinking blocks
-          MOUNTED but hidden (ThinkingBlock's own hidden-while-query pattern):
-          among collapsible renderers only ThinkingBlock registers search
-          matches, and late registration would scramble global match order.
-          The group stays visually collapsed — no layout shift per keystroke. */}
-      {!expanded && !!query && run.thinkingCount > 0 && (
+      {/* While a FindBar query is active, keep the run's thinking blocks and
+          notes MOUNTED but hidden (ThinkingBlock's own hidden-while-query
+          pattern): among collapsible renderers only those register search
+          matches (the faint note line above registers none), and late
+          registration would scramble global match order. The group stays
+          visually collapsed — no layout shift per keystroke. */}
+      {!expanded && !!query && (run.thinkingCount > 0 || run.noteCount > 0) && (
         <div className="hidden" data-testid="activity-group-search-mount">
           {spanIndices(run).map(i =>
-            blocks[i].type === 'thinking' ? renderSpanBlock(i) : null)}
+            blocks[i].type === 'thinking' || isNote(blocks[i]) ? renderSpanBlock(i) : null)}
         </div>
       )}
     </div>

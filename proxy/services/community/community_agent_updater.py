@@ -29,14 +29,17 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
+import httpx
 from fastapi import HTTPException
 
 import config
+from auth import roles
+from core import layout
 from services.apps import app_deploy
-from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
-from storage.agents import agent_store, template_sig
-from storage.agents.community_agent_template_store import (
+from services.community import template_sig
+from services.community.community_agent_template_store import (
     AppItem,
     CommunityAgentTemplate,
     TemplateValidationError,
@@ -45,8 +48,8 @@ from storage.agents.community_agent_template_store import (
     substitute_template_vars,
     template_to_persistable_dict,
 )
-from auth import roles
-from core import layout
+from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
+from storage.agents import agent_store
 
 logger = logging.getLogger("otodock.community-agent-updater")
 
@@ -79,7 +82,7 @@ def detect(agent_row: dict | None, entry: dict | None) -> dict:
     installed = str((agent_row or {}).get("community_template_version") or "")
     catalog = str((entry or {}).get("version") or "") if entry else ""
     provenance = str((agent_row or {}).get("community_template") or "")
-    compat = bool(entry) and community_catalog.platform_version_ok(entry.get("platform_min_version"))
+    compat = bool(entry) and community_catalog.platform_version_ok(cast("dict", entry).get("platform_min_version"))
     return {
         "installed_version": installed,
         "catalog_version": catalog,
@@ -127,7 +130,10 @@ async def _fetch_new(agent_row: dict) -> tuple[CommunityAgentTemplate, Path, dic
     try:
         registry = await community_agents_catalog.fetch_registry()
     except Exception as exc:
-        raise HTTPException(502, f"Could not load community-agents catalog: {exc}")
+        logger.warning("update plan of %s: could not load the community agents: %s",
+                       agent_row.get("slug"), exc)
+        raise HTTPException(502, community_catalog.load_refusal(
+            "community agents", community_agents_catalog.REGISTRY_RAW_URL, exc)) from exc
     entry = next((e for e in registry.get("agents", []) if e.get("slug") == provenance), None)
     if not entry:
         raise HTTPException(404, f"the template '{provenance}' is no longer in the catalog")
@@ -142,7 +148,9 @@ async def _fetch_new(agent_row: dict) -> tuple[CommunityAgentTemplate, Path, dic
             raise TemplateValidationError(f"version {template.version!r} is not a release number")
     except TemplateValidationError as exc:
         shutil.rmtree(extracted.parent, ignore_errors=True)
-        raise HTTPException(400, f"Invalid catalog template: {exc}")
+        raise HTTPException(400, detail={
+            "error": "invalid_template", "message": f"Invalid catalog template: {exc}",
+            "problems": exc.problems}) from exc
     return template, extracted, entry
 
 
@@ -174,7 +182,7 @@ def consent_lines(template: CommunityAgentTemplate, old: CommunityAgentTemplate 
         })
     checks = []
     for c in template.checks:
-        prev = old_checks.get(c.name)
+        prev_check = old_checks.get(c.name)
         entry = {"name": c.name, "description": str(c.doc.get("description") or ""),
                  "sections": [s for s in ("schema", "script", "handler", "judge") if c.doc.get(s)],
                  "applies": list(c.doc.get("applies") or []), "script": c.script_name or "",
@@ -184,7 +192,7 @@ def consent_lines(template: CommunityAgentTemplate, old: CommunityAgentTemplate 
             "name": c.name, "description": entry["description"], "mandatory": c.mandatory,
             "applies": entry["applies"], "script": entry["script"], "sig": c.sig,
             "words": template_app_seeder.check_words(entry),
-            "change": "new" if prev is None else ("changed" if prev.sig != c.sig else "same"),
+            "change": "new" if prev_check is None else ("changed" if prev_check.sig != c.sig else "same"),
         })
     return {"apps": apps, "checks": checks}
 
@@ -208,7 +216,8 @@ class _Run:
     loop: asyncio.AbstractEventLoop | None = None
     report: dict = dataclasses.field(default_factory=lambda: {
         "replaced": [], "added": [], "kept": [], "unchanged": 0,
-        "pending_apps": [], "offered_checks": [], "members": {}, "mcps": {}, "ignored_fields": []})
+        "pending_apps": [], "offered_checks": [], "members": {}, "mcps": {}, "ignored_fields": [],
+        "task_pins_dropped": []})
 
     @property
     def beside(self) -> Path:
@@ -416,18 +425,6 @@ def _layer_items(run: _Run) -> None:
     members = _members(run.agent)
     tslug = run.new.slug
 
-    def _task_fields(item) -> dict:
-        return {
-            "prompt": item.prompt, "name": item.description or item.slug,
-            "schedule": item.cron if item.schedule_kind == "cron" else None,
-            "interval_seconds": item.interval_seconds if item.schedule_kind == "interval" else None,
-            "run_at": item.run_at if item.schedule_kind == "run_at" else None,
-        }
-
-    def _row_matches(row: dict, item) -> bool:
-        want = _task_fields(item)
-        return all(str(row.get(k) or "") == str(v or "") for k, v in want.items())
-
     for item in run.new.tasks:
         what = f"the task '{item.slug}'"
         rows: list[dict] = []
@@ -454,21 +451,13 @@ def _layer_items(run: _Run) -> None:
             continue
         prev = old_tasks.get(item.slug)
         for r in rows:
-            if _row_matches(r, item):
-                run.same()
-            elif prev is not None and _row_matches(r, prev):
-                if run.apply:
-                    db_tasks.update_dynamic_task(r["id"], _task_fields(item))
-                    inst.schedule_task_row(r["id"])
-                run.replaced(what if item.scope == "agent" else f"{what} of {r.get('created_by') or 'a member'}")
-            else:
-                run.report["kept"].append({"what": what, "reason": "edited locally", "path": "", "new_path": ""})
+            _merge_task_row(run, r, item, prev, what)
 
-    for item in run.new.triggers:
-        what = f"the trigger '{item.slug}'"
-        key = f"{item.slug}__task"
+    for trig in run.new.triggers:
+        what = f"the trigger '{trig.slug}'"
+        key = f"{trig.slug}__task"
         rows = []
-        if item.scope == "agent":
+        if trig.scope == "agent":
             r = db_tasks.find_template_task(run.agent, key)
             rows = [r] if r else []
         else:
@@ -477,26 +466,26 @@ def _layer_items(run: _Run) -> None:
                 if r:
                     rows.append(r)
         if not rows:
-            if item.slug in old_trigs:
+            if trig.slug in old_trigs:
                 run.removed(what)
                 continue
             if run.apply:
-                if item.scope == "agent":
-                    inst._seed_trigger_with_paired_task(item, run.agent, run.by_sub, tslug)
+                if trig.scope == "agent":
+                    inst._seed_trigger_with_paired_task(trig, run.agent, run.by_sub, tslug)
                 else:
                     for m in members:
-                        inst._seed_triggers_for_user(run.agent, dataclasses.replace(run.new, triggers=[item]),
+                        inst._seed_triggers_for_user(run.agent, dataclasses.replace(run.new, triggers=[trig]),
                                                      m["sub"], m["agent_role"])
             run.added(what)
             continue
-        prev = old_trigs.get(item.slug)
+        prev_trig = old_trigs.get(trig.slug)
         for r in rows:
-            if str(r.get("prompt") or "") == item.prompt:
+            if str(r.get("prompt") or "") == trig.prompt:
                 run.same()
-            elif prev is not None and str(r.get("prompt") or "") == prev.prompt:
+            elif prev_trig is not None and str(r.get("prompt") or "") == prev_trig.prompt:
                 if run.apply:
-                    db_tasks.update_dynamic_task(r["id"], {"prompt": item.prompt,
-                                                           "name": f"[trigger] {item.description or item.slug}"})
+                    db_tasks.update_dynamic_task(r["id"], {"prompt": trig.prompt,
+                                                           "name": f"[trigger] {trig.description or trig.slug}"})
                 run.replaced(what)
             else:
                 run.report["kept"].append({"what": what, "reason": "edited locally", "path": "", "new_path": ""})
@@ -509,32 +498,32 @@ def _layer_items(run: _Run) -> None:
             "run_at": item.run_at if item.schedule_kind == "run_at" else None,
         }
 
-    for item in run.new.notifications:
-        what = f"the notification '{item.slug}'"
-        ids = ([f"notif-{tslug}-{item.slug}-{run.agent}"] if item.scope == "agent"
-               else [f"notif-{tslug}-{item.slug}-{run.agent}-{m['sub']}" for m in members])
+    for notif in run.new.notifications:
+        what = f"the notification '{notif.slug}'"
+        ids = ([f"notif-{tslug}-{notif.slug}-{run.agent}"] if notif.scope == "agent"
+               else [f"notif-{tslug}-{notif.slug}-{run.agent}-{m['sub']}" for m in members])
         rows = [r for r in (notification_store.get_notification(i) for i in ids) if r]
         if not rows:
-            if item.slug in old_notifs:
+            if notif.slug in old_notifs:
                 run.removed(what)
                 continue
             if run.apply:
-                if item.scope == "agent":
-                    inst._seed_notifications(run.agent, dataclasses.replace(run.new, notifications=[item]), None)
+                if notif.scope == "agent":
+                    inst._seed_notifications(run.agent, dataclasses.replace(run.new, notifications=[notif]), None)
                 else:
                     for m in members:
-                        inst._seed_notifs_for_user(run.agent, dataclasses.replace(run.new, notifications=[item]),
+                        inst._seed_notifs_for_user(run.agent, dataclasses.replace(run.new, notifications=[notif]),
                                                    m["sub"], m["agent_role"])
             run.added(what)
             continue
-        prev = old_notifs.get(item.slug)
-        want = _notif_fields(item)
+        prev_notif = old_notifs.get(notif.slug)
+        want = _notif_fields(notif)
         for r in rows:
-            def _eq(fields: dict) -> bool:
+            def _eq(fields: dict, r: dict = r) -> bool:
                 return all(str(r.get(k) or "") == str(v or "") for k, v in fields.items())
             if _eq(want):
                 run.same()
-            elif prev is not None and _eq(_notif_fields(prev)):
+            elif prev_notif is not None and _eq(_notif_fields(prev_notif)):
                 if run.apply:
                     notification_store.update_notification(r["id"], dict(
                         want, notification_type="recurring" if (want["schedule"] or want["interval_seconds"])
@@ -543,6 +532,59 @@ def _layer_items(run: _Run) -> None:
                 run.replaced(what)
             else:
                 run.report["kept"].append({"what": what, "reason": "edited locally", "path": "", "new_path": ""})
+
+
+def _task_groups(item) -> tuple[dict, dict, dict]:
+    """A template task's row fields in the three groups an update judges
+    apart: the text and the clock, the model and the engine, the mode."""
+    return (
+        {
+            "prompt": item.prompt, "name": item.description or item.slug,
+            "schedule": item.cron if item.schedule_kind == "cron" else None,
+            "interval_seconds": item.interval_seconds if item.schedule_kind == "interval" else None,
+            "run_at": item.run_at if item.schedule_kind == "run_at" else None,
+        },
+        {"override_model": item.override_model or "", "override_execution_path": item.layer or ""},
+        {"notification_mode": item.notification_mode},
+    )
+
+
+def _field_value(key: str, value) -> str:
+    text = str(value or "")
+    # The boot walk rewrites a retired pin to its successor: not an edit.
+    return config.live_model_id(text) if key == "override_model" else text
+
+
+def _row_holds(row: dict, fields: dict) -> bool:
+    return all(_field_value(k, row.get(k)) == _field_value(k, v) for k, v in fields.items())
+
+
+def _merge_task_row(run: _Run, row: dict, item, prev, what: str) -> None:
+    """One seeded task row against the new version, group by group: a
+    group the row still holds as the installed version wrote it takes the
+    new one, a group a person changed is kept (a member's own notification
+    mode never stops the next prompt from arriving)."""
+    from services.community import community_agent_installer as inst
+    from storage.automation import db_tasks
+    changes: dict = {}
+    kept = False
+    old_groups = _task_groups(prev) if prev is not None else (None, None, None)
+    for new, old in zip(_task_groups(item), old_groups, strict=True):
+        if _row_holds(row, new):
+            continue
+        if old is not None and _row_holds(row, old):
+            changes.update(new)
+        else:
+            kept = True
+    if changes:
+        if run.apply:
+            db_tasks.update_dynamic_task(row["id"], changes)
+            inst.schedule_task_row(row["id"])
+        run.replaced(what if item.scope == "agent" else f"{what} of {row.get('created_by') or 'a member'}")
+    if kept:
+        run.report["kept"].append({"what": what, "reason": "edited locally", "path": "", "new_path": ""})
+    if not changes and not kept:
+        run.same()
 
 
 def _layer_dashboards(run: _Run) -> None:
@@ -611,7 +653,7 @@ def _tree_unchanged(folder: Path, old: AppItem | None, template_doc: dict) -> bo
         return False
     try:
         tree = template_sig.tree_sha(folder, [rel for rel, _path in releases.walk_tree(folder)])
-    except Exception:
+    except (releases.ReleaseInvalid, OSError):
         return False
     if tree != old.tree_sha:
         return False
@@ -668,7 +710,7 @@ def _pause_stale_triggers(run: _Run, item: AppItem, app_id: str, doc: dict) -> N
     """After a copy took the new version: a seeded trigger whose handler
     the new manifest no longer declares is paused with the reason (an
     update never deletes); the report's notes say so."""
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     from storage.automation import trigger_store
     names = set(_mf.parse_handlers({"handlers": json.dumps(doc.get("handlers") or {})}).get("on_trigger") or [])
     for t in trigger_store.list_triggers_for_app(app_id):
@@ -771,7 +813,7 @@ async def _layer_apps(run: _Run, new_data: dict) -> None:
                             run.agent, username, owner_sub, item.slug, item.dir,
                             template_slug=run.new.slug, tasks=list(item.blueprint.get("tasks") or []),
                             cold=True, approve_as=by, template_ref=ref, triggers=trig_items)
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001  # an app's deploy spans the store and the pipeline, it is reported kept
                         run.report["kept"].append({"what": what, "reason": f"the new version failed to deploy: {e}",
                                                    "path": "", "new_path": ""})
                         continue
@@ -1010,10 +1052,13 @@ async def plan(agent_slug: str, by_sub: str, by_role: str) -> dict:
         raise HTTPException(404, "no such agent")
     template, extracted, _entry = await _fetch_new(row)
     try:
+        from services.community import community_agent_installer as inst
+        template, pin_notes = await asyncio.to_thread(inst.resolve_task_pins, agent_slug, template)
         old_data = await asyncio.to_thread(agent_store.get_community_template_data, agent_slug) or {}
         run = _Run(agent=agent_slug, agent_dir=config.get_agent_dir(agent_slug), new=template,
                    old=_load_old(old_data), old_data=old_data, baseline=old_data.get("baseline") or {},
                    apply=False, by_sub=by_sub, by_role=by_role, loop=asyncio.get_running_loop())
+        run.report["task_pins_dropped"] = pin_notes
         new_data = template_to_persistable_dict(template, agent_slug=agent_slug)
         new_data["consent"] = old_data.get("consent") or {"apps": {}, "checks": {}}
         report = await _run_layers(run, new_data)
@@ -1078,16 +1123,22 @@ async def apply(agent_slug: str, by_sub: str, by_role: str, *, from_version: str
 
 async def _apply_now(agent_slug: str, template: CommunityAgentTemplate, by_sub: str, by_role: str, *,
                      app_consent: dict[str, str] | None, check_consent: dict[str, str] | None) -> dict:
-    from services.community import template_app_seeder as seeder
+    from services.community import (
+        community_agent_installer as inst,
+        template_app_seeder as seeder,
+    )
+    # The new version's task pins as this agent runs them, before the run
+    # compares and the record keeps them.
+    template, pin_notes = await asyncio.to_thread(inst.resolve_task_pins, agent_slug, template)
     old_data = await asyncio.to_thread(agent_store.get_community_template_data, agent_slug) or {}
     run = _Run(agent=agent_slug, agent_dir=config.get_agent_dir(agent_slug), new=template,
                old=_load_old(old_data), old_data=old_data, baseline=old_data.get("baseline") or {},
                apply=True, by_sub=by_sub, by_role=by_role, loop=asyncio.get_running_loop())
+    run.report["task_pins_dropped"] = pin_notes
     # The new record, with the presser's consent for the new version's
     # apps and checks over the old consent (an unchanged app keeps its
     # entry: the same signature, the same person).
     new_data = template_to_persistable_dict(template, agent_slug=agent_slug)
-    from services.community import community_agent_installer as inst
     inst.stamp_core_mcps(new_data, template)
     seeder.record_consent(new_data, template, app_consent, check_consent, by_sub)
     old_consent = old_data.get("consent") or {}
@@ -1134,13 +1185,13 @@ async def take(agent_slug: str, new_path: str, by_sub: str, by_role: str) -> dic
             raise HTTPException(404, "the stored copy is gone")
         slug = rel.parts[1]
         username = "" if head == "apps" else (
-            await asyncio.to_thread(task_store.get_username_by_sub, by_sub) or "")
+            await asyncio.to_thread(task_store.get_username_by_sub, by_sub) or "")  # type: ignore[arg-type]  # mypy solves to_thread's result from the "or" context (str) and then refuses the str | None callable
         if head == "user-apps" and not username:
             raise HTTPException(400, "you have no personal copy to replace")
         item = next((a for a in (template.apps if template else []) if a.slug == slug), None)
         by, _why = seeder.admits(item, seeder.consent_entry(data, "apps", slug), agent_slug, username, by_sub) \
             if item else ("", "")
-        if by and not await asyncio.to_thread(seeder.copy_matches, item, src):
+        if by and not await asyncio.to_thread(seeder.copy_matches, cast("AppItem", item), src):  # by is "" without an item
             by = ""
         res = await app_blueprints.import_folder(
             agent_slug, username, by_sub if username else None, slug, src,
@@ -1152,8 +1203,8 @@ async def take(agent_slug: str, new_path: str, by_sub: str, by_role: str) -> dic
         folder = src.parent
         try:
             doc = json.loads(seeder.guard(agent_dir, folder / "check.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raise HTTPException(404, "the stored copy is gone")
+        except (OSError, ValueError) as exc:
+            raise HTTPException(404, "the stored copy is gone") from exc
         script_name = (doc.get("script") or {}).get("run") if isinstance(doc.get("script"), dict) else None
         if script_name and not seeder.unlinked(folder / str(script_name), agent_dir):
             raise HTTPException(400, "not a stored new version")
@@ -1162,7 +1213,7 @@ async def take(agent_slug: str, new_path: str, by_sub: str, by_role: str) -> dic
             await asyncio.to_thread(documents.write_check, agent_slug, "", doc, script,
                                     updated_by=f"template:{data.get('slug')}@{version}")
         except documents.CheckError as e:
-            raise HTTPException(400, str(e))
+            raise HTTPException(400, str(e)) from e
         return {"status": "replaced", "path": f"config/checks/{rel.parts[1]}/check.json"}
     text = _read(src)
     if text is None:
@@ -1181,7 +1232,7 @@ async def take(agent_slug: str, new_path: str, by_sub: str, by_role: str) -> dic
         slug = rel.parts[1].removesuffix(".html")
         d = next((x for x in (template.dashboards if template else []) if x.slug == slug), None)
         if d is not None and d.visibility != "agent":
-            username = await asyncio.to_thread(task_store.get_username_by_sub, by_sub) or ""
+            username = await asyncio.to_thread(task_store.get_username_by_sub, by_sub) or ""  # type: ignore[arg-type]  # mypy solves to_thread's result from the "or" context (str) and then refuses the str | None callable
             dest = layout.user_dir(agent_dir, username) / layout.WORKSPACE / "apps" / rel.parts[1]
             if not username or not dest.is_file():
                 raise HTTPException(400, "you have no personal copy to replace")
@@ -1211,7 +1262,7 @@ def _report_words(report: dict) -> str:
     kept = [k for k in report.get("kept") or [] if k.get("reason") != REMOVED]
     removed = len(report.get("kept") or []) - len(kept)
     if kept:
-        bits.append(f"{len(kept)} kept as you had them (the new version is stored beside each)")
+        bits.append(f"{len(kept)} kept as you had them, the new version stored beside each")
     if removed:
         bits.append(f"{removed} left out (removed locally)")
     if report.get("pending_apps"):
@@ -1253,7 +1304,7 @@ async def maybe_notify_updates() -> int:
     from storage.identity import db_users
     try:
         registry = await community_agents_catalog.fetch_registry()
-    except Exception:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError):
         return 0
     entries = {e.get("slug"): e for e in registry.get("agents", [])}
     told = 0

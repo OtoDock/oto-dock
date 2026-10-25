@@ -189,3 +189,63 @@ async def test_a_delegate_result_keeps_its_files_and_verdict(temp_db):
     rows = [m for m in temp_db.get_chat_messages("sc-files") if m.get("event_type") == "delegate_result"]
     data = json.loads(rows[-1]["event_data"])
     assert data["files"] == files and data["verdict"] == verdict
+
+
+@pytest.mark.asyncio
+async def test_every_server_turn_names_its_cause_on_the_viewed_chat(temp_db, monkeypatch):
+    """``server_turn_start`` carries what started the turn, one cause per
+    caller: the dashboard draws a review's nudge line only on the review's
+    own turn, so two causes swapped would label the wrong turn."""
+    from types import SimpleNamespace
+
+    from ws import wire_events as wire
+    temp_db.create_chat("sc-cause", "user-admin", "a1")
+    layer = SimpleNamespace(capabilities_for=lambda sid: SimpleNamespace(
+        behaviour=SimpleNamespace(attach_images_inline=False)))
+
+    class _Viewer(_Conn):
+        chat_id = "sc-cause"
+        session_id = "sess-cause"
+        user_sub = "user-admin"
+        user = {"username": "admin"}
+
+        def __init__(self):
+            super().__init__()
+            self.layer = layer
+
+        async def _start_new_stream(self, prompt, **kw):
+            return object()
+
+        async def _enter_pump_loop(self):
+            return None
+
+        async def _resolve_layer_for_chat_async(self, cid):
+            return layer
+
+        async def _process_attachments(self, text, images, files, **kw):
+            return text, [], [], []
+
+    def _causes(conn):
+        return [f.get("cause") for f in conn.sent if f["type"] == wire.SERVER_TURN_START]
+
+    base = {"chat_id": "sc-cause", "session_id": "sess-cause"}
+    for notification, cause in (
+        ({"type": wire.NOTIFY_BG_NUDGE, "count": 1, "labels": [], **base}, wire.CAUSE_BG_REVIEW),
+        ({"type": wire.NOTIFY_BG_COMMAND_NUDGE, "count": 2, "labels": [], **base},
+         wire.CAUSE_BG_REVIEW),
+        ({"type": wire.NOTIFY_TASK_RESULT_PROMPT, "task_id": "t-c", "task_name": "lane",
+          "result_prompt": "p", "delegate_agent": "w", "output_text": "done",
+          "status": "completed", **base}, wire.CAUSE_DELEGATE_RESULT),
+        ({"type": wire.NOTIFY_CONTINUATION_PROMPT, "prompt": "check back", "task_id": "w-1",
+          **base}, wire.CAUSE_WAKE),
+    ):
+        conn = _Viewer()
+        await conn._handle_server_notification(notification)
+        assert _causes(conn) == [cause], notification["type"]
+    # A backgrounded warmup's first turn, when the page is back on its chat.
+    conn = _Viewer()
+    await conn._run_kick_headless_turn("sc-cause", "sess-cause", "first words", [], [],
+                                       force_headless=False)
+    assert _causes(conn) == [wire.CAUSE_KICK]
+    assert {wire.CAUSE_BG_REVIEW, wire.CAUSE_DELEGATE_RESULT, wire.CAUSE_WAKE,
+            wire.CAUSE_KICK} == wire.SERVER_TURN_CAUSES

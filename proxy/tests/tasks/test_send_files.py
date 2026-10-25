@@ -39,12 +39,10 @@ from services.delegation.file_transfer import (
     prefetch_remote_sources,
     validate_send_path,
 )
+from storage import database as task_store, remote_store
 from storage.agents import agent_store
 from storage.files import db_file_transfers
 from storage.mcp import mcp_store
-from storage import remote_store
-from storage import database as task_store
-
 
 SRC = "xfer-src"
 TGT_COLLAB = "xfer-collab"        # collaborative, default user
@@ -389,7 +387,7 @@ class TestCopy:
             / "shared.txt"
         )
         assert dest.read_text() == "shared"
-        assert result.landed == ["workspace/inbox/%s/shared.txt" % SRC]
+        assert result.landed == [f"workspace/inbox/{SRC}/shared.txt"]
 
     def test_transfer_row_recorded(self, send_env):
         result = _send(_user_session(), ["reports"], dest_dir="drop", note="x" * 600)
@@ -513,7 +511,7 @@ class _FakeSatellite:
         data = self.tree.get(ref.value)
         if data is None:
             return False
-        dest.write_bytes(data)
+        dest.write_bytes(data)  # noqa: ASYNC240  # a test's own temporary files
         return True
 
     async def _command(self, machine_id, msg, *, timeout=30.0, command_id=None):

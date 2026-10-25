@@ -4,7 +4,7 @@
 
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, Route, Routes } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({ logout: vi.fn() }))
 
@@ -28,5 +28,31 @@ describe('PlatformSetupGuard sign-out escape hatch', () => {
     const signOut = screen.getByRole('button', { name: /sign out/i })
     fireEvent.click(signOut)
     expect(h.logout).toHaveBeenCalledOnce()
+  })
+
+  it('lets a gated member into every User Settings section, where the gate sends them', () => {
+    for (const path of ['/user-settings', '/user-settings/ai-engines', '/user-settings/general']) {
+      const r = render(
+        <MemoryRouter initialEntries={[path]}>
+          <Routes>
+            <Route element={<PlatformSetupGuard />}>
+              <Route path="*" element={<p>settings page</p>} />
+            </Route>
+          </Routes>
+        </MemoryRouter>,
+      )
+      expect(screen.getByText('settings page')).toBeTruthy()
+      expect(screen.queryByText('Platform Setup Required')).toBeNull()
+      r.unmount()
+    }
+  })
+
+  it('still blocks a page that only starts like User Settings', () => {
+    render(
+      <MemoryRouter initialEntries={['/user-settingsx']}>
+        <PlatformSetupGuard />
+      </MemoryRouter>,
+    )
+    expect(screen.getByText('Platform Setup Required')).toBeTruthy()
   })
 })

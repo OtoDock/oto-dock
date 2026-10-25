@@ -10,8 +10,17 @@ import {
   useRevokeUserApiKey,
   type CreatedUserApiKey,
 } from '../api/userApiKeys'
+import { errorText, toastError } from '../lib/http/apiJson'
+import { useDialogs } from '../components/ui/dialogs'
+import Dialog from '../components/ui/Dialog'
+import Button from '../components/ui/Button'
+import { Input, Label } from '../components/ui/Field'
+import { BUTTON_DANGER_QUIET, CARD } from '../components/ui/classes'
+import { Badge } from '../components/ui/SettingsControls'
+import InfoTip from '../components/ui/InfoTip'
 
 function ApiKeysSection() {
+  const dialogs = useDialogs()
   const { data: keys = [], isLoading } = useUserApiKeys()
   const createM = useCreateUserApiKey()
   const revokeM = useRevokeUserApiKey()
@@ -19,17 +28,19 @@ function ApiKeysSection() {
   const [newName, setNewName] = useState('')
   const [perms, setPerms] = useState<{ triggers: boolean }>({ triggers: true })
   const [createdKey, setCreatedKey] = useState<CreatedUserApiKey | null>(null)
+  const [createError, setCreateError] = useState('')
 
   const onCreate = async (e: React.FormEvent) => {
     e.preventDefault()
+    setCreateError('')
     if (!newName.trim()) {
-      alert('Key name required')
+      setCreateError('Give the key a name.')
       return
     }
     const permList: string[] = []
     if (perms.triggers) permList.push('triggers')
     if (permList.length === 0) {
-      alert('At least one permission required')
+      setCreateError('Pick at least one permission.')
       return
     }
     try {
@@ -37,8 +48,8 @@ function ApiKeysSection() {
       setCreatedKey(created)
       setNewName('')
       setShowCreate(false)
-    } catch (e: any) {
-      alert(`Create failed: ${e?.message ?? e}`)
+    } catch (e) {
+      setCreateError(errorText(e) || 'The key was not created.')
     }
   }
 
@@ -48,42 +59,43 @@ function ApiKeysSection() {
   }
 
   const onRevoke = async (id: string, name: string) => {
-    if (!confirm(`Revoke key "${name}"? Webhooks using it will immediately fail.`)) return
-    try {
-      await revokeM.mutateAsync(id)
-    } catch (e: any) {
-      alert(`Revoke failed: ${e?.message ?? e}`)
-    }
+    if (!(await dialogs.confirm({
+      title: `Revoke the key "${name}"?`,
+      body: 'Webhooks using it fail at once.',
+      confirmLabel: 'Revoke',
+      tone: 'danger',
+    }))) return
+    await revokeM.mutateAsync(id).catch(toastError('The key was not revoked'))
   }
 
   return (
     <div className="mb-8">
-      <h2 className="text-lg font-medium text-p-text mb-3">API Keys</h2>
-      <p className="text-sm text-p-text-secondary mb-4">
+      <h2 className="font-display text-lg font-semibold text-primary mb-3">API Keys</h2>
+      <p className="text-sm text-secondary mb-4">
         Personal API keys for webhook triggers. External systems authenticate to
         your user-scoped trigger webhooks with these.
       </p>
 
       {isLoading ? (
-        <p className="text-sm text-p-text-secondary">Loading...</p>
+        <p className="text-sm text-secondary">Loading...</p>
       ) : (
         <div className="space-y-2">
           {keys.length === 0 && (
-            <p className="text-sm text-p-text-secondary">No API keys yet.</p>
+            <p className="text-sm text-secondary">No API keys yet.</p>
           )}
           {keys.map((k) => (
-            <div key={k.id} className="bg-white dark:bg-p-surface rounded-lg border border-p-border-light p-3 flex items-center gap-3">
+            <div key={k.id} className={`${CARD} p-3 flex items-center gap-3`}>
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className="font-medium text-p-text">{k.name}</span>
+                  <span className="font-medium text-primary">{k.name}</span>
                   {k.permissions.map((p) => (
-                    <span key={p} className="px-1.5 py-0.5 text-xs rounded-sm bg-p-bg text-p-text-secondary">{p}</span>
+                    <Badge key={p}>{p}</Badge>
                   ))}
                   {k.revoked_at && (
-                    <span className="px-1.5 py-0.5 text-xs rounded-sm bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">revoked</span>
+                    <Badge variant="danger">revoked</Badge>
                   )}
                 </div>
-                <p className="text-xs text-p-text-secondary mt-0.5">
+                <p className="text-xs text-secondary mt-0.5">
                   Created {new Date(k.created_at).toLocaleDateString()}
                   {k.last_used_at ? ` · last used ${new Date(k.last_used_at).toLocaleString()}` : ' · never used'}
                 </p>
@@ -91,7 +103,7 @@ function ApiKeysSection() {
               {!k.revoked_at && (
                 <button
                   onClick={() => onRevoke(k.id, k.name)}
-                  className="px-2 py-1 rounded-sm text-xs font-medium bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/30 dark:text-red-400 dark:hover:bg-red-900/50"
+                  className={BUTTON_DANGER_QUIET}
                 >
                   Revoke
                 </button>
@@ -101,72 +113,63 @@ function ApiKeysSection() {
         </div>
       )}
 
-      <button
-        onClick={() => setShowCreate(true)}
-        className="mt-3 px-3 py-1.5 rounded-lg bg-brand text-white text-sm font-medium hover:bg-brand-hover"
-      >
+      <Button variant="primary" onClick={() => { setCreateError(''); setShowCreate(true) }} className="mt-3">
         + Create key
-      </button>
+      </Button>
 
       {showCreate && (
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={() => setShowCreate(false)}>
-          <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light max-w-md w-full p-4" onClick={(e) => e.stopPropagation()}>
-            <h3 className="font-semibold text-p-text mb-3">Create API key</h3>
-            <form onSubmit={onCreate} className="space-y-3">
+        <Dialog title="Create API key" onClose={() => setShowCreate(false)} busy={createM.isPending}>
+            <form onSubmit={onCreate} className="space-y-3 p-4">
               <div>
-                <label className="block text-xs font-medium text-p-text mb-1">Name</label>
-                <input
+                <Label htmlFor="user-key-name">Name</Label>
+                <Input
+                  id="user-key-name"
+                  autoFocus
                   value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
+                  onChange={(e) => { setNewName(e.target.value); setCreateError('') }}
                   placeholder="e.g. GitHub webhook"
-                  className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-p-text mb-1">Permissions</label>
+                <div className="mb-1">
+                  <label className="text-xs font-medium text-primary">Permissions</label>
+                  <InfoTip label="Permissions">More permissions are coming soon, like chat, tasks and notifications.</InfoTip>
+                </div>
                 <label className="flex items-center gap-2 text-sm">
                   <input
                     type="checkbox"
                     checked={perms.triggers}
                     onChange={(e) => setPerms({ ...perms, triggers: e.target.checked })}
+                    className="accent-action"
                   />
-                  <span>triggers — fire user-scoped webhook triggers</span>
+                  <span><code>triggers</code>: fire your own webhook triggers</span>
                 </label>
-                <p className="text-xs text-p-text-secondary mt-2">
-                  More permissions (chat / tasks / notifications) coming soon.
-                </p>
               </div>
+              {createError && <p role="alert" className="text-xs text-status-danger-fg">{createError}</p>}
               <div className="flex justify-end gap-2 pt-2">
-                <button type="button" onClick={() => setShowCreate(false)} className="px-3 py-1.5 rounded-lg border border-p-border-light text-sm">
-                  Cancel
-                </button>
-                <button type="submit" disabled={createM.isPending} className="px-3 py-1.5 rounded-lg bg-brand text-white text-sm font-medium hover:bg-brand-hover disabled:opacity-50">
+                <Button onClick={() => setShowCreate(false)} disabled={createM.isPending}>Cancel</Button>
+                <Button type="submit" variant="primary" disabled={createM.isPending}>
                   {createM.isPending ? 'Creating…' : 'Create'}
-                </button>
+                </Button>
               </div>
             </form>
-          </div>
-        </div>
+        </Dialog>
       )}
 
       {createdKey && (
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={() => setCreatedKey(null)}>
-          <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light max-w-md w-full p-4" onClick={(e) => e.stopPropagation()}>
-            <h3 className="font-semibold text-p-text mb-2">API key created</h3>
-            <p className="text-sm text-amber-700 bg-amber-50 rounded-sm p-2 mb-3">
-              <span className="font-medium">Copy this key now.</span> It will not be shown again — if you lose it, revoke and recreate.
+        // The key is shown once: only Escape or Done closes it, never a stray click.
+        <Dialog title="API key created" onClose={() => setCreatedKey(null)} dismissible="escape">
+          <div className="p-4">
+            <p className="text-sm text-status-warning-fg bg-status-warning-bg rounded-card p-2 mb-3">
+              <span className="font-medium">Copy this key now.</span> It will not be shown again. If you lose it, revoke it and create a new one.
             </p>
-            <div className="bg-p-bg rounded-sm p-2 mb-3 font-mono text-xs break-all">{createdKey.key}</div>
+            <div className="bg-surface-sunken text-primary rounded-card p-2 mb-3 font-mono text-xs break-all">{createdKey.key}</div>
             <div className="flex justify-end gap-2">
-              <button onClick={onCopy} className="px-3 py-1.5 rounded-lg bg-brand text-white text-sm font-medium hover:bg-brand-hover">
-                Copy to clipboard
-              </button>
-              <button onClick={() => setCreatedKey(null)} className="px-3 py-1.5 rounded-lg border border-p-border-light text-sm">
-                Done
-              </button>
+              <Button variant="primary" onClick={onCopy}>Copy to clipboard</Button>
+              <Button onClick={() => setCreatedKey(null)}>Done</Button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
     </div>
   )
@@ -183,37 +186,38 @@ export function IntegrationsTab() {
   // click on the row starts a connect flow — never the arrival itself.
   const [searchParams] = useSearchParams()
   const provider = searchParams.get('provider') || ''
-  const [highlight, setHighlight] = useState('')
+  const [highlightDone, setHighlightDone] = useState('')
+  const highlight = provider && highlightDone !== provider && integrations?.some((i) => i.mcp_name === provider)
+    ? provider : ''
   useEffect(() => {
-    if (!provider || !integrations?.some((i) => i.mcp_name === provider)) return
-    setHighlight(provider)
-    document.getElementById(`integration-${provider}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
-    const timer = setTimeout(() => setHighlight(''), 2500)
+    if (!highlight) return
+    document.getElementById(`integration-${highlight}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    const timer = setTimeout(() => setHighlightDone(highlight), 2500)
     return () => clearTimeout(timer)
-  }, [provider, integrations])
+  }, [highlight])
   return (
     <div>
       <div className="mb-8">
-        <h2 className="text-lg font-medium text-p-text mb-3">Connected Accounts</h2>
-        <p className="text-sm text-p-text-secondary mb-4">
+        <h2 className="font-display text-lg font-semibold text-primary mb-3">Connected Accounts</h2>
+        <p className="text-sm text-secondary mb-4">
           Configure your personal credentials for MCP tools. These are used when agents access external services on your behalf.
         </p>
         {isLoading ? (
-          <div className="text-sm text-p-text-light">Loading...</div>
+          <div className="text-sm text-tertiary">Loading...</div>
         ) : integrations && integrations.length > 0 ? (
           <div className="space-y-3">
             {integrations.map(i => (
               <div
                 key={i.mcp_name}
                 id={`integration-${i.mcp_name}`}
-                className={`rounded-xl transition-shadow ${highlight === i.mcp_name ? 'ring-2 ring-brand ring-offset-2 ring-offset-p-bg' : ''}`}
+                className={`rounded-card transition-shadow ${highlight === i.mcp_name ? 'ring-2 ring-focus-ring ring-offset-2 ring-offset-surface-page' : ''}`}
               >
                 <UserAccountsManager integration={i} />
               </div>
             ))}
           </div>
         ) : (
-          <div className="text-sm text-p-text-light border border-p-border-light rounded-xl p-6 text-center">
+          <div className={`${CARD} text-sm text-tertiary p-6 text-center`}>
             No integrations available for your assigned agents.
           </div>
         )}

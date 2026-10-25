@@ -6,7 +6,7 @@ and stops at the first failure."""
 from __future__ import annotations
 
 import contextlib
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 RUNNERS: dict[str, Callable[..., Awaitable]] = {}
 

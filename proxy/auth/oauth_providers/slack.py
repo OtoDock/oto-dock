@@ -163,7 +163,7 @@ class SlackOAuthProvider(OAuthProvider):
                     if payload.get("ok"):
                         profile = (payload.get("user") or {}).get("profile") or {}
                         email = str(profile.get("email") or "")
-            except Exception:
+            except (httpx.HTTPError, ValueError):
                 pass
         if not email:
             # url is "https://<domain>.slack.com/"
@@ -194,7 +194,7 @@ class SlackOAuthProvider(OAuthProvider):
                 resp.status_code, resp.text[:200],
             )
             return False
-        except Exception as e:
+        except (httpx.HTTPError, ValueError) as e:
             logger.warning("Slack token revocation failed: %s", e)
             return False
 

@@ -14,7 +14,7 @@ the manifest schema is importable without pulling in the registry engine.
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 
 @dataclass
@@ -125,6 +125,11 @@ class ServerConfig:
     # build backend runs on the host; a catalog entry names an exception here
     # (a dependency with no wheel) and the curation review sees it.
     source_build: list[str] = field(default_factory=list)
+    # Seconds Codex gives one tool call of this server before it fails the
+    # call; 0 leaves Codex's own default (60 s, short of a media generation
+    # or a document conversion). Written as ``tool_timeout_sec`` into the
+    # Codex TOML only: Claude Code has its own limit and reads no such key.
+    tool_timeout_sec: int = 0
 
 
 @dataclass
@@ -151,6 +156,11 @@ class CredentialConfig:
     ui_type: str = ""
     has_service_account: bool = False
     app_credential_fields: list[dict[str, str]] = field(default_factory=list)
+    # The kinds of vendor application an admin may register for the
+    # provider, each with its own admin fields (``credentials.oauth.app_kinds``,
+    # validated at parse; storage/identity/oauth_app_kinds.py). None = the
+    # OAuth App alone, its fields ``app_credential_fields``.
+    app_kinds: dict | None = None
 
 
 @dataclass
@@ -698,9 +708,6 @@ class McpManifest:
     requires_display: bool = False
     device_capability: str | None = None  # None | "computer" | "browser" | "app"
     companion_app: CompanionAppConfig | None = None
-    # Tools EXCLUDED from the device auto-approve (still prompt even when the
-    # capability is granted) — RCE-class app-connector tools.
-    device_high_risk_tools: list[str] = field(default_factory=list)
     # The sources this entry supersedes, with their credential key renames.
     replaces: list[ReplacesDecl] = field(default_factory=list)
     patched: bool = False
@@ -753,7 +760,7 @@ def _runtime_of_server(server) -> Runtime | None:
     return runtime_of(getattr(server, "runtime", "") if server is not None else "")
 
 
-def is_container(server) -> bool:
+def is_container(server) -> TypeGuard[ServerConfig]:
     """A Docker MCP: a container the platform host drives (its status pill,
     start / stop / restart, the compose rewrite). Total over ``None``."""
     rt = _runtime_of_server(server)

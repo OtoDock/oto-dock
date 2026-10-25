@@ -6,11 +6,12 @@
  */
 import { useCallback } from 'react'
 import type { PendingFile } from '../../../components/chat/ChatInput'
-import { fmtSize } from '../../../components/common/TransferBar'
+
 import { useFlag } from '../../../hooks/useFlag'
 import { enqueueChatUpload, dequeueChatUpload, patchPendingFile } from '../../../lib/chatUploadQueue'
 import { FOLDER_UPLOAD_MAX_FILES, leftOutNote, type CollectedItems } from '../../../lib/droppedItems'
 import { useChatStore } from '../../../store/chatStore'
+import { fmtSize } from '../../../components/common/transferFormat'
 
 /** Why a collected folder cannot be attached, or '' when it can. */
 export function folderRefusal(got: CollectedItems, uploadCap: number): string {
@@ -21,7 +22,7 @@ export function folderRefusal(got: CollectedItems, uploadCap: number): string {
       return `${n} item${n === 1 ? '' : 's'} can't be read: nothing to attach`
     }
     const left = leftOutNote(got)
-    return left ? `Nothing to attach: ${left}` : 'An empty folder: nothing to attach'
+    return left ? `Nothing to attach. ${left}` : 'An empty folder: nothing to attach'
   }
   const over = got.files.find((f) => f.file.size > uploadCap)
   if (over) {

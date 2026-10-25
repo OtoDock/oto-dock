@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from unittest.mock import patch, MagicMock
-
+from unittest.mock import MagicMock, patch
 
 from services.oauth import oauth_engine
 

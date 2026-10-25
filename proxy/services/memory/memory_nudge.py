@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
+import psycopg
+
 NUDGE_TEXT = (
     "Reminder: if this session has surfaced durable facts, preferences, or "
     "decisions, save them with the `memory` tool now — update existing "
@@ -27,7 +29,7 @@ NUDGE_TEXT = (
 
 # session_id → user turns since the last memory tool call. Opportunistically
 # pruned (oldest first) so abandoned sessions can't grow it unbounded.
-_counters: "OrderedDict[str, int]" = OrderedDict()
+_counters: OrderedDict[str, int] = OrderedDict()
 _MAX_TRACKED_SESSIONS = 4096
 
 
@@ -35,7 +37,7 @@ def _threshold() -> int:
     try:
         from storage.agents import memory_store
         return int(memory_store.get_settings().get("nudge_turns") or 0)
-    except Exception:
+    except (psycopg.Error, ValueError):
         return 0
 
 

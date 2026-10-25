@@ -36,7 +36,9 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
+
+import psycopg
 
 from auth import webhook_providers
 from auth.webhook_providers.base import NormalizedEvent
@@ -47,8 +49,7 @@ from services.webhooks.event_normalizer import (
     vendor_event_key,
     walk_path,
 )
-from storage.automation import trigger_store
-from storage.automation import webhook_subscription_store
+from storage.automation import trigger_store, webhook_subscription_store
 from storage.pg import run_db
 
 logger = logging.getLogger("otodock.webhook-dispatcher")
@@ -111,8 +112,9 @@ class _LoopBound:
         self.waiting = 0
         self.capture_lock: asyncio.Lock | None = None
         self.relay_lock: asyncio.Lock | None = None
+        self.forwarded: dict[str, asyncio.Lock] = {}
 
-    def current(self) -> "_LoopBound":
+    def current(self) -> _LoopBound:
         loop = asyncio.get_running_loop()
         if self.loop is not loop:
             self.loop = loop
@@ -120,6 +122,7 @@ class _LoopBound:
             self.waiting = 0
             self.capture_lock = asyncio.Lock()
             self.relay_lock = asyncio.Lock()
+            self.forwarded = {}
         return self
 
 
@@ -156,10 +159,12 @@ _relay_secret: tuple[str, float] | None = None
 
 
 def reset_caches() -> None:
-    """Forget the signature counters and the relay secret (tests)."""
+    """Forget the signature counters, the relay secret and the app secrets
+    (tests)."""
     global _relay_secret
     _signature_failures.clear()
     _relay_secret = None
+    _app_secrets.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +244,7 @@ async def dispatch_webhook(
         context, refusal = await load_receive_context(provider_id, subscription_id)
         if refusal is not None:
             return refusal
+        context = cast("ReceiveContext", context)  # no refusal: a context
     row, manifest, signing_secret = context.row, context.manifest, context.signing_secret
 
     # 2. Resolve manifest + provider implementation.
@@ -324,6 +330,226 @@ async def dispatch_webhook(
     return (200, response, {"content-type": "application/json"})
 
 
+# ---------------------------------------------------------------------------
+# The app webhook (a GitHub App's one hook, the app-level secret)
+# ---------------------------------------------------------------------------
+
+# The app secret per provider from memory while younger than a minute, read
+# again at once after a refused signature (a rotation): an unauthenticated
+# flood never costs a job in the shared pre-auth gate.
+_APP_SECRET_TTL_S = 60.0
+_APP_SECRET_RETRY_S = 5.0
+_app_secrets: dict[str, tuple[str, float]] = {}
+_APP_DEDUP_PREFIX = "app:"
+# A forwarded lifecycle event re-lists every account it touches with its own
+# token. The relay waits ten seconds for an answer: past this many the
+# delivery is answered and the re-list finishes behind it.
+_FORWARDED_ANSWER_S = 8.0
+
+
+@dataclass
+class AppReceiveContext:
+    """What the app route loads before the body: the manifest, its
+    ``app_webhook`` block and the app secret."""
+
+    manifest: Any
+    webhooks_block: dict
+    signing_secret: str
+
+
+def _read_app_secret(manifest: Any, webhooks_block: dict) -> str:
+    """The app-level webhook secret from the admin's bundle, only while the
+    bundle's kind is a GitHub App (any other kind has no app webhook)."""
+    from storage.identity import credential_store, oauth_app_kinds
+    oauth = (manifest.credentials.oauth or {}) if manifest and manifest.credentials else {}
+    bundle = str(oauth.get("app_credential") or "")
+    key = str((webhooks_block.get("app_webhook") or {}).get("secret_credential_key") or "")
+    if not bundle or not key:
+        return ""
+    creds = credential_store.get_infra_credentials(bundle) or {}
+    if oauth_app_kinds.active_kind(oauth, creds) != oauth_app_kinds.KIND_GITHUB_APP:
+        return ""
+    return str(creds.get(key) or "")
+
+
+async def _app_secret(provider_id: str, manifest: Any, webhooks_block: dict, *, max_age_s: float) -> str:
+    hit = _app_secrets.get(provider_id)
+    if hit is not None and time.monotonic() - hit[1] < max_age_s:
+        return hit[0]
+    async with cast("asyncio.Lock", _bound.current().relay_lock):  # current() sets it
+        hit = _app_secrets.get(provider_id)
+        if hit is not None and time.monotonic() - hit[1] < max_age_s:
+            return hit[0]
+        try:
+            async with _preauth_slot():
+                value = await run_db(_read_app_secret, manifest, webhooks_block)
+        except _Busy:
+            return hit[0] if hit is not None else ""
+        _app_secrets[provider_id] = (value, time.monotonic())
+        return value
+
+
+async def load_app_receive_context(provider_id: str) -> tuple[AppReceiveContext | None, tuple | None]:
+    """Step 1 of an app receive, before the body: the manifest with an
+    ``app_webhook`` block for the provider and the app secret (404 before
+    the body when there is no block, another kind, or no secret)."""
+    manifest, webhooks_block = _manifest_for_webhook_provider(provider_id)
+    if manifest is None or not webhooks_block.get("app_webhook"):
+        return None, (404, {"error": "no app webhook for this provider"}, _JSON_CT)
+    secret = await _app_secret(provider_id, manifest, webhooks_block, max_age_s=_APP_SECRET_TTL_S)
+    if not secret:
+        return None, (404, {"error": "no app webhook secret is set"}, _JSON_CT)
+    return AppReceiveContext(manifest, webhooks_block, secret), None
+
+
+async def dispatch_app_webhook(
+    *,
+    provider_id: str,
+    raw_body: bytes,
+    headers: dict[str, str],
+    context: AppReceiveContext,
+) -> tuple[int, dict, dict[str, str]]:
+    """Receive a delivery of the app's own webhook: the signature against
+    the app secret (401 on a mismatch, a rotation re-read once), the parse,
+    the delivery id through the dedup ring, the installation lifecycle
+    (every account that holds the installation learns of the change), then
+    every subscription on that installation runs the standard pipeline."""
+    try:
+        provider = webhook_providers.get_provider(provider_id)
+    except KeyError:
+        return (500, {"error": f"unknown provider {provider_id}"}, _JSON_CT)
+    headers_lc = {k.lower(): v for k, v in (headers or {}).items()}
+    sig_block = context.webhooks_block.get("signature") or {}
+    verify = await _verified(
+        provider, raw_body=raw_body, headers=headers_lc,
+        signing_secret=context.signing_secret, manifest_sig_block=sig_block,
+    )
+    if not verify.ok:
+        fresh = await _app_secret(provider_id, context.manifest, context.webhooks_block,
+                                  max_age_s=_APP_SECRET_RETRY_S)
+        if fresh and fresh != context.signing_secret:
+            verify = await _verified(
+                provider, raw_body=raw_body, headers=headers_lc,
+                signing_secret=fresh, manifest_sig_block=sig_block,
+            )
+    if not verify.ok:
+        return (401, {"error": "signature verification failed", "reason": verify.reason}, _JSON_CT)
+    parsed_body = await _parse_body(raw_body)
+    body = parsed_body if isinstance(parsed_body, dict) else {}
+    delivery_id = provider.extract_event_id(body=body, headers=headers_lc, manifest_block=context.webhooks_block)
+    if delivery_id and await _is_duplicate(_APP_DEDUP_PREFIX + provider_id, delivery_id):
+        return (200, {"status": "duplicate", "fired": 0}, _JSON_CT)
+    return await _dispatch_installation_event(
+        provider_id=provider_id, provider=provider, manifest=context.manifest,
+        webhooks_block=context.webhooks_block, body=body, headers_lc=headers_lc,
+        confirm=True, delivery_mode="vendor",
+    )
+
+
+async def _dispatch_installation_event(
+    *, provider_id: str, provider: Any, manifest: Any, webhooks_block: dict, body: dict,
+    headers_lc: dict[str, str], confirm: bool, delivery_mode: str,
+) -> tuple[int, dict, dict[str, str]]:
+    """The lifecycle, then the subscriptions on the installation (vendor
+    rows for the app route, relay rows for the forwarded path)."""
+    from services.oauth import github_app_lifecycle
+    from storage.identity import oauth_app_kinds
+    app_hook = webhooks_block.get("app_webhook") or {}
+    installation_id = str(walk_path(body=body, headers=headers_lc,
+                                    path=str(app_hook.get("installation_id_path") or "")) or "")
+    event_type = str(headers_lc.get("x-github-event") or "")
+    if confirm:
+        # A plain thread, not the bulk store lane: the confirmations call GitHub.
+        await asyncio.to_thread(
+            github_app_lifecycle.apply, provider_id, manifest, event_type, body,
+            installation_id=installation_id, confirm=True,
+        )
+    else:
+        from core import background
+        task = background.spawn(
+            _forwarded_lifecycle(provider_id, manifest, event_type, body, installation_id),
+            name=f"forwarded-{installation_id or 'authorization'}", owner="github-app",
+        )
+        await asyncio.wait({task}, timeout=_FORWARDED_ANSWER_S)
+        failed = task.exception() if task.done() and not task.cancelled() else None
+        if failed is not None:
+            # Failed within the answer's window: the caller forgets the
+            # delivery and answers 500, so the relay's retry runs it. A
+            # re-list still running past the window keeps its answer.
+            raise failed
+    if not installation_id:
+        return (200, {"status": "ignored", "reason": "no_installation"}, _JSON_CT)
+    rows = [
+        r for r in await run_db(
+            webhook_subscription_store.list_subscriptions,
+            provider_id=provider_id, vendor_target=installation_id,
+            target_kind=oauth_app_kinds.INSTALLATION_TARGET_KIND, delivery_mode=delivery_mode,
+        )
+        if r.get("status") in webhook_subscription_store.RECEIVING
+    ]
+    if not rows:
+        return (200, {"status": "ignored", "reason": "unknown_installation", "fired": 0}, _JSON_CT)
+    standing = await asyncio.to_thread(_installation_rows_standing, rows, installation_id)
+    total_fired = 0
+    results: list[dict[str, Any]] = []
+    for row, why in zip(rows, standing, strict=True):
+        if why:
+            logger.info("installation %s: subscription %s skipped (%s)", installation_id, row["id"], why)
+            results.append({"subscription_id": row["id"], "fired": 0, "skipped": why})
+            continue
+        resp = await _process_subscription_events(
+            row=row, provider=provider, webhooks_block=webhooks_block,
+            parsed_body=body, headers_lc=headers_lc,
+        )
+        total_fired += int(resp.get("fired", 0))
+        results.append({"subscription_id": row["id"], **resp})
+    return (200, {"status": "ok", "fired": total_fired, "results": results}, _JSON_CT)
+
+
+async def _forwarded_lifecycle(
+    provider_id: str, manifest: Any, event_type: str, body: dict, installation_id: str,
+) -> None:
+    """One forwarded delivery's lifecycle, after the ones before it on the
+    same installation: an older listing never lands over a newer one."""
+    from services.oauth import github_app_lifecycle
+    lock = _bound.current().forwarded.setdefault(installation_id or "authorization", asyncio.Lock())
+    async with lock:
+        await asyncio.to_thread(
+            github_app_lifecycle.apply, provider_id, manifest, event_type, body,
+            installation_id=installation_id, confirm=False,
+        )
+
+
+def _installation_rows_standing(rows: list[dict], installation_id: str) -> list[str]:
+    """Why each installation subscription may not receive now, ``""`` when
+    it may: its subscriber must still own the installation (the account's
+    meta as the last listing left it), and a service row's agent must still
+    be bound to that account and the binding cover that very installation
+    (``oauth_app_kinds.binding_covers``). The standing was checked once at
+    the create; a Refresh or a rebind since does not touch the row."""
+    from services.oauth import credential_resolver
+    from services.webhooks import subscription_manager
+    from storage.identity import oauth_app_kinds
+    out: list[str] = []
+    for row in rows:
+        scope = str(row.get("scope") or "user")
+        agent = row.get("agent") or None
+        mcp_name = str(row.get("mcp_name") or "")
+        label = str(row.get("account_label") or "")
+        meta = subscription_manager._account_meta(
+            scope=scope, owner=str(row.get("owner") or ""), agent=agent, mcp_name=mcp_name,
+            account_label=label,
+        )
+        if scope == "service":
+            bound = credential_resolver.pick_account(mcp_name, agent or "")
+            if bound is None or bound.label != label or not oauth_app_kinds.binding_covers(
+                    bound.installation_id, meta, installation_id):
+                out.append("not the agent's bound installation")
+                continue
+        out.append(oauth_app_kinds.installation_standing(meta, installation_id))
+    return out
+
+
 async def dispatch_relay_webhook(
     *,
     provider_id: str,
@@ -353,7 +579,8 @@ async def dispatch_relay_webhook(
         return (404, {"error": f"no manifest declares provider {provider_id!r}"},
                 json_ct)
     workspace_id_path = webhooks_block.get("workspace_id_path", "")
-    if not workspace_id_path:
+    app_hook = webhooks_block.get("app_webhook") or {}
+    if not workspace_id_path and not app_hook:
         return (404, {"error": "provider is not relay-capable on this install"},
                 json_ct)
 
@@ -384,6 +611,30 @@ async def dispatch_relay_webhook(
                       "reason": verify.reason}, json_ct)
 
     parsed_body = await _parse_body(raw_body)
+    if app_hook and not workspace_id_path:
+        # The relay forwards the app's deliveries (signed by GitHub, not
+        # confirmed: the lifecycle re-lists), routed by the installation,
+        # once per delivery.
+        try:
+            provider = webhook_providers.get_provider(provider_id)
+        except KeyError:
+            return (500, {"error": f"unknown provider {provider_id}"}, json_ct)
+        body = parsed_body if isinstance(parsed_body, dict) else {}
+        delivery_id = provider.extract_event_id(body=body, headers=headers_lc, manifest_block=webhooks_block)
+        ring = _APP_DEDUP_PREFIX + "relay:" + provider_id
+        if delivery_id and await _is_duplicate(ring, delivery_id):
+            return (200, {"status": "duplicate", "fired": 0}, json_ct)
+        try:
+            return await _dispatch_installation_event(
+                provider_id=provider_id, provider=provider, manifest=manifest,
+                webhooks_block=webhooks_block, body=body,
+                headers_lc=headers_lc, confirm=False, delivery_mode="relay",
+            )
+        except Exception:
+            # The relay retries a failed forward: it must not read as a repeat.
+            if delivery_id:
+                await _forget_delivery(ring, delivery_id)
+            raise
     workspace_id = walk_path(
         body=parsed_body, headers=headers_lc, path=workspace_id_path,
     )
@@ -467,7 +718,7 @@ async def _process_subscription_events(
         # the receipt but don't fan out.
         try:
             await run_db(webhook_subscription_store.record_event_received, subscription_id)
-        except Exception as ex:
+        except psycopg.Error as ex:
             logger.warning(
                 "record_event_received failed for sub=%s: %s",
                 subscription_id, ex,
@@ -588,7 +839,7 @@ async def _process_subscription_events(
     # 7. Record receive housekeeping (best-effort, once per inbound request).
     try:
         await run_db(webhook_subscription_store.record_event_received, subscription_id)
-    except Exception as e:
+    except psycopg.Error as e:
         logger.warning(
             "record_event_received failed for sub=%s: %s", subscription_id, e,
         )
@@ -704,7 +955,7 @@ async def _note_refusal(row: dict, what: str) -> None:
     try:
         await run_db(webhook_subscription_store.note_last_error,
                      sid, f"{what} ({count} refused)")
-    except Exception:
+    except psycopg.Error:
         logger.warning("refusal note failed for sub=%s", sid, exc_info=True)
 
 
@@ -725,7 +976,7 @@ async def _forward_secret(*, max_age_s: float) -> str:
     hit = _relay_secret
     if hit is not None and time.monotonic() - hit[1] < max_age_s:
         return hit[0]
-    async with _bound.current().relay_lock:
+    async with cast("asyncio.Lock", _bound.current().relay_lock):  # current() sets it
         hit = _relay_secret
         if hit is not None and time.monotonic() - hit[1] < max_age_s:
             return hit[0]
@@ -760,7 +1011,7 @@ async def _handle_token_capture(
     if not signing_secret:
         # The check and the write are two executor hops now, so two setup
         # POSTs at once are serialized and the second sees the first's secret.
-        async with _bound.current().capture_lock:
+        async with cast("asyncio.Lock", _bound.current().capture_lock):  # current() sets it
             current = await run_db(
                 webhook_subscription_store.get_signing_secret, subscription_id)
             if not current:
@@ -824,6 +1075,16 @@ async def _is_duplicate(subscription_id: str, event_id: str) -> bool:
         return False
 
 
+async def _forget_delivery(subscription_id: str, event_id: str) -> None:
+    """Drop a recorded delivery whose processing failed (``_is_duplicate``
+    records before the work runs)."""
+    key = f"{subscription_id}:{event_id}"
+    async with _DEDUP_LOCK:
+        kept = [(k, ts) for k, ts in _DEDUP_RING if k != key]
+        _DEDUP_RING.clear()
+        _DEDUP_RING.extend(kept)
+
+
 def _matching_triggers(rows: list[dict], event: NormalizedEvent) -> list[dict]:
     """The subscription's enabled triggers (already read for this request)
     whose event_filter matches the event."""
@@ -870,7 +1131,7 @@ async def _fan_out_fire(
                 event_id=event_id,
             )
             return _DUPLICATE if (res or {}).get("actions") == [_DUPLICATE] else None
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # a trigger's failure becomes its result line, the others still fire
             return f"trigger {trigger_row.get('id')}: {type(e).__name__}: {e}"
 
     results = await asyncio.gather(

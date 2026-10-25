@@ -17,10 +17,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
-from core.remote.remote_execution import RemoteExecutionLayer  # noqa: E402
+from core.remote.remote_execution import RemoteExecutionLayer
 
 
 def _push_action(rp: str):
@@ -65,14 +66,13 @@ async def _run_sync(tmp_path, monkeypatch, actions, cm, progress_cb=None,
     import config as _cfg
     from core.remote import file_sync
     from core.session import visibility
-    from storage.files import sync_state_store
-    from storage.files import file_tombstones_store
+    from storage.files import file_tombstones_store, sync_state_store
 
     agent_dir = tmp_path / "test-agent"
     agent_dir.mkdir(parents=True, exist_ok=True)
     for a in actions:
         p = agent_dir / a.rel_path
-        if os.path.lexists(p):
+        if os.path.lexists(p):  # noqa: ASYNC240  # a test's own temporary files
             continue
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"content-" + a.rel_path.encode())
@@ -187,6 +187,7 @@ async def test_tiny_files_bypass_gate_held_by_large_fanout(tmp_path, monkeypatch
     """A parked large fan-out holding the ONLY slot must not block a
     below-threshold warmup storm (the 4MB bypass)."""
     import asyncio
+
     import config
     from core.remote import transfer_gate
     monkeypatch.setattr(config, "SYNC_FANOUT_CONCURRENCY", 1, raising=False)
@@ -222,10 +223,10 @@ async def test_no_deadlock_sync_plus_live_fanout_share_gate(tmp_path, monkeypatc
     completes, no machine runs two large pushes at once, no deadlock across
     sync-lock/_window/path-lock/gate."""
     import asyncio
+
     import config
-    from core.remote import transfer_gate
+    from core.remote import satellite_connection as sc, transfer_gate
     from services.remote import workspace_fanout
-    from core.remote import satellite_connection as sc
     monkeypatch.setattr(config, "SYNC_FANOUT_CONCURRENCY", 1, raising=False)
     monkeypatch.setattr(config, "SYNC_FANOUT_MIN_MB", 0, raising=False)
     transfer_gate.reset_for_tests()
@@ -276,6 +277,7 @@ async def test_no_deadlock_sync_plus_live_fanout_share_gate(tmp_path, monkeypatc
 @pytest.mark.asyncio
 async def test_manifest_work_runs_on_the_sync_cpu_executor(tmp_path, monkeypatch):
     import threading
+
     from core import loop_watchdog
 
     seen = []
@@ -335,8 +337,12 @@ def _action(op: str, rp: str, **kw):
 def _record_delete_bookkeeping(monkeypatch):
     from services.notifications import notification_manager
     from services.remote import workspace_fanout
-    from storage.files import file_author_store, file_tombstones_store
-    from storage.files import recover_bin_store, sync_state_store
+    from storage.files import (
+        file_author_store,
+        file_tombstones_store,
+        recover_bin_store,
+        sync_state_store,
+    )
     seen = {"tombstone": [], "clear_base": [], "clear_author": [], "fan_out": [],
             "capture": []}
     monkeypatch.setattr(file_tombstones_store, "record",
@@ -382,7 +388,7 @@ async def test_a_platform_delete_removes_a_link_at_the_name_never_its_target(tmp
                 capture_side="platform", capture_reason="deleted"),
     ]
     await _run_sync(tmp_path, monkeypatch, actions, cm)
-    assert not os.path.lexists(ws / "doc.txt")
+    assert not os.path.lexists(ws / "doc.txt")  # noqa: ASYNC240  # a test's own temporary files
     assert (ws / "target.txt").is_file() and not (ws / "target.txt").is_symlink()
     assert not (ws / "plain.txt").exists()
     assert sorted(seen["tombstone"]) == ["workspace/doc.txt", "workspace/plain.txt"]
@@ -442,6 +448,7 @@ async def test_a_failed_pinned_push_drops_the_cached_manifest_hash(tmp_path, mon
     it fails. The failure drops that path's entry, so the next merge hashes
     the file again and the push heals."""
     from collections import OrderedDict
+
     from core.remote import file_sync
     from storage.files import sync_state_store
     monkeypatch.setattr(file_sync, "_HASH_CACHE", OrderedDict())
@@ -574,3 +581,143 @@ async def test_a_restore_pull_lands_with_the_machines_time(tmp_path, monkeypatch
     agent_dir = tmp_path / "test-agent" / "workspace"
     assert os.stat(agent_dir / "notes.md").st_mtime == 1000.0
     assert os.stat(agent_dir / "other.md").st_mtime > 1000.0
+
+
+@pytest.mark.asyncio
+async def test_a_merge_push_expects_the_manifests_copy_and_a_stale_answer_keeps_the_hash(
+    tmp_path, monkeypatch, caplog,
+):
+    """The frame's expectation is the machine's own stat from the manifest
+    (its float mtime back in ns), "live" for a file it did not list. A push
+    the machine refused as stale is counted apart, keeps the cached hash and
+    marks the platform copy ahead there with the machine's stat as the
+    baseline."""
+    from collections import OrderedDict
+
+    from core.remote import file_sync, remote_file_flow
+    from storage.files import sync_state_store
+    monkeypatch.setattr(file_sync, "_HASH_CACHE", OrderedDict())
+    monkeypatch.setattr(sync_state_store, "record_one", lambda *a: None)
+    remote_file_flow._platform_ahead.clear()
+    cm, _ = _make_cm({})
+    cm.effective_sync_cap = MagicMock(return_value=1 << 30)
+    cm.effective_ignore_rules = MagicMock(return_value=None)
+    cm.send_command = AsyncMock(return_value={"files": [
+        {"path": "workspace/busy.txt", "hash": "sha256:" + "9" * 64, "size": 7,
+         "mtime": 1700000000.123456},
+    ]})
+    expects: dict[str, object] = {}
+
+    async def _push(machine_id, ref, content, agent_slug="", **kw):
+        expects[ref.value] = kw.get("expect")
+        if ref.value == "workspace/busy.txt":
+            kw["stale_out"].update(reason="live", size=9, mtime_ns=1_700_000_001_000_000_000)
+            return False
+        return True
+    cm.push_file = _push
+    actions = [_action("push", "workspace/busy.txt", base_hash="sha256:" + "1" * 64),
+               _action("push", "workspace/new.txt", base_hash="sha256:" + "2" * 64)]
+    try:
+        with caplog.at_level("INFO", logger="remote-layer"):
+            await _run_sync(tmp_path, monkeypatch, actions, cm, manifest_fn=file_sync.compute_manifest)
+        assert expects["workspace/new.txt"] == "live"
+        busy = expects["workspace/busy.txt"]
+        assert busy["size"] == 7 and abs(busy["mtime_ns"] - 1_700_000_000_123_456_000) < 1_000
+        assert {k.rsplit("/", 1)[-1] for k in file_sync._HASH_CACHE} == {"busy.txt", "new.txt"}
+        assert "stale=1" in caplog.text and "Push of workspace/busy.txt held" in caplog.text
+        mark = remote_file_flow._platform_ahead[("machine-1", "test-agent", "workspace/busy.txt")]
+        st = (tmp_path / "test-agent" / "workspace" / "busy.txt").stat()
+        assert (mark["size"], mark["mtime_ns"]) == (st.st_size, st.st_mtime_ns)
+        assert mark["machine"] == {"exists": True, "size": 9, "mtime_ns": 1_700_000_001_000_000_000}
+    finally:
+        remote_file_flow._platform_ahead.clear()
+
+
+def _stale_push_cm():
+    """A cm whose every push the machine refuses as stale and whose pull
+    writes the machine's bytes."""
+    cm, _ = _make_cm({})
+    cm.effective_sync_cap = MagicMock(return_value=1 << 30)
+    cm.effective_ignore_rules = MagicMock(return_value=None)
+
+    async def _push(machine_id, ref, content, agent_slug="", **kw):
+        kw["stale_out"].update(reason="live", size=9, mtime_ns=1_700_000_001_000_000_000)
+        return False
+    cm.push_file = _push
+
+    async def _pull(machine_id, ref, dest, agent_slug="", **kw):
+        from pathlib import Path
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        Path(dest).write_bytes(b"the machine's bytes")  # noqa: ASYNC240  # a test's own temporary files
+        return True
+    cm.pull_file_to_path = _pull
+    return cm
+
+
+@pytest.mark.asyncio
+async def test_a_capture_before_a_push_the_machine_refuses_is_undone(tmp_path, monkeypatch):
+    """The merge copies the losing machine copy to the recover bin before a
+    push; the machine then refuses the push as stale, so nothing was
+    replaced: the entry goes and its owner is not told their version was
+    replaced."""
+    from core.remote import remote_file_flow
+    from storage.files import recover_bin_store, sync_state_store
+    remote_file_flow._platform_ahead.clear()
+    monkeypatch.setattr(sync_state_store, "record_one", lambda *a: None)
+    captured, deleted = [], []
+    monkeypatch.setattr(
+        recover_bin_store, "capture",
+        lambda agent, rp, data, reason: captured.append((rp, reason))
+        or {"entry_id": "e-1", "original_name": "busy.txt"})
+    monkeypatch.setattr(recover_bin_store, "delete", deleted.append)
+    notify = AsyncMock()
+    monkeypatch.setattr(RemoteExecutionLayer, "_notify_conflict_losers", notify)
+    cm = _stale_push_cm()
+    actions = [_action("push", "workspace/busy.txt", base_hash="sha256:" + "1" * 64,
+                       capture_side="satellite", capture_reason="conflict", notify_user="bob")]
+    try:
+        await _run_sync(tmp_path, monkeypatch, actions, cm)
+    finally:
+        remote_file_flow._platform_ahead.clear()
+    assert captured == [("workspace/busy.txt", "conflict")]
+    assert deleted == ["e-1"]
+    notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_merge_pull_that_settles_a_refused_save_keeps_the_save(tmp_path, monkeypatch):
+    """The platform copy is a save the machine refused as stale; this merge
+    takes the machine's copy for the path. The save goes to the recover bin
+    as a conflict and its author is told, whatever the merge's own capture
+    rule said for the path; the pull clears the mark."""
+    from core.remote import remote_file_flow
+    from storage.files import file_author_store, recover_bin_store
+    remote_file_flow._platform_ahead.clear()
+    captured = []
+    monkeypatch.setattr(
+        recover_bin_store, "capture",
+        lambda agent, rp, data, reason: captured.append((rp, data, reason))
+        or {"entry_id": "e-2", "original_name": "notes.md"})
+    monkeypatch.setattr(file_author_store, "get", lambda agent, rp: "alice")
+    notify = AsyncMock()
+    monkeypatch.setattr(RemoteExecutionLayer, "_notify_conflict_losers", notify)
+    cm = _stale_push_cm()
+    saved = tmp_path / "test-agent" / "workspace" / "notes.md"
+    saved.parent.mkdir(parents=True)
+    saved.write_bytes(b"the person's save")
+    st = saved.stat()
+    remote_file_flow.note_platform_ahead("machine-1", "test-agent", "workspace/notes.md",
+                                         st.st_size, st.st_mtime_ns,
+                                         machine={"exists": True, "size": 9, "mtime_ns": 1},
+                                         stale=True)
+    # A same-user divergence: the merge's own rule captures nothing.
+    actions = [_action("pull", "workspace/notes.md"), _action("pull", "workspace/plain.md")]
+    try:
+        await _run_sync(tmp_path, monkeypatch, actions, cm)
+        assert captured == [("workspace/notes.md", b"the person's save", "conflict")]
+        assert saved.read_bytes() == b"the machine's bytes"
+        notify.assert_awaited_once()
+        assert notify.await_args.args[1] == [("alice", "notes.md")]
+        assert not remote_file_flow.stale_hold("machine-1", "test-agent", "workspace/notes.md")
+    finally:
+        remote_file_flow._platform_ahead.clear()

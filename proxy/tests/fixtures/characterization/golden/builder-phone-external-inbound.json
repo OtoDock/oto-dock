@@ -1,0 +1,159 @@
+{
+ "calls": [
+  {
+   "args": [
+    "char-agent",
+    null
+   ],
+   "call": "build_session_mcp_config",
+   "kwargs": {
+    "call_ask_back": false,
+    "external": true,
+    "extra_mcps": null,
+    "mcp_config_format": "json",
+    "phone_mode": true,
+    "placement": {},
+    "session_id": "s-phone",
+    "target_browser": {},
+    "user_role": "viewer"
+   }
+  },
+  {
+   "args": [
+    "char-agent",
+    [
+     "char-files",
+     "phone-mcp"
+    ]
+   ],
+   "call": "get_dynamic_contexts",
+   "kwargs": {
+    "trigger_payload": null,
+    "user_role": "viewer",
+    "user_sub": ""
+   }
+  },
+  {
+   "args": [
+    "char-agent"
+   ],
+   "call": "build_agent_prompt",
+   "kwargs": {
+    "client_type": "phone",
+    "dynamic_contexts": null,
+    "excluded_mcps": null,
+    "execution_path": "claude-code-cli",
+    "external": true,
+    "external_home": "",
+    "placement": {},
+    "role": "viewer",
+    "sandboxed": true,
+    "skip_http_mcps": false,
+    "user_role": "viewer",
+    "username": null
+   }
+  },
+  {
+   "args": [
+    {
+     "agent": "char-agent",
+     "config_visible": false,
+     "external_channel": "phone",
+     "external_claim": "phone:",
+     "is_admin_agent": false,
+     "principal": "external",
+     "role": "viewer",
+     "session_scope": "agent",
+     "username": ""
+    }
+   ],
+   "call": "build_permission_context",
+   "kwargs": {
+    "assigned_mcp_names": [
+     "char-files",
+     "phone-mcp"
+    ],
+    "execution_path": "claude-code-cli"
+   }
+  },
+  {
+   "args": [
+    "char-agent"
+   ],
+   "call": "ensure_persistent_agent_dir",
+   "kwargs": {
+    "execution_path": "claude-code-cli",
+    "external_home": null,
+    "no_shell": true,
+    "scope": "agent",
+    "username": ""
+   }
+  },
+  {
+   "args": [
+    "claude-code-cli",
+    null
+   ],
+   "call": "resolve_subscription_env",
+   "kwargs": {
+    "agent_info": {
+     "admin_only": false,
+     "collaborative": true,
+     "color": "",
+     "community_template": null,
+     "community_template_data": {},
+     "community_template_version": null,
+     "created_at": "<stamp>",
+     "created_by": "",
+     "default_effort": "",
+     "default_execution_mode": "",
+     "default_for_new_users_role": "",
+     "default_model": "",
+     "default_scope": "user",
+     "department_id": "",
+     "department_level_id": "",
+     "description": "",
+     "display_name": "Char Agent",
+     "execution_path": "claude-code-cli",
+     "execution_paths": "",
+     "execution_target": "local",
+     "setup_completed_at": null,
+     "slug": "char-agent",
+     "updated_at": "<stamp>"
+    },
+    "model": "claude-char-1"
+   }
+  }
+ ],
+ "config": {
+  "agent_name": "char-agent",
+  "client_type": "phone",
+  "credential_env": {
+   "MCP_CRED": "1",
+   "PROXY_API_KEY": "<session-token>"
+  },
+  "effort": "high",
+  "execution_path": "claude-code-cli",
+  "extra_env": {
+   "SUB_ENV": "1"
+  },
+  "model": "claude-char-1",
+  "permission_mode": "auto",
+  "sandbox_host_claude_dir": "/char/.claude",
+  "security_context": {
+   "agent": "char-agent",
+   "config_visible": false,
+   "external_channel": "phone",
+   "external_claim": "phone:",
+   "is_admin_agent": false,
+   "principal": "external",
+   "role": "viewer",
+   "session_scope": "agent",
+   "username": ""
+  },
+  "subscription_id": "sub-char",
+  "subscription_user_sub": "",
+  "system_prompt": "PROMPT\n\nPERMISSIONS\n\nYou are on a live phone call. This is voice — not chat.\nRULES:\n- ALWAYS respond in the SAME LANGUAGE the user speaks.\n- Keep responses SHORT: 1-3 sentences maximum. Summarize instead of listing details.\n- Talk naturally like a real person on the phone — use casual, conversational language.\n- Avoid stiff/formal phrasing. Say things the way you'd say them out loud.\n- NEVER read tables, lists, JSON, code, or formatted output aloud. Describe results naturally in plain speech.\n- If there are many items (services, devices, etc.), give a high-level summary, NOT individual details.\n- Don't spell out URLs, paths, or IPs unless asked.\n- Before ANY tool call, FIRST write one short spoken line saying what you're doing (e.g. 'Let me check that for you'). NEVER go silent into a tool — on a call, silence feels broken. During multi-step tool work, add a brief spoken progress line between steps, then summarize the result in 1-2 short sentences.\n- To end the call (e.g. user says goodbye or the conversation is clearly over): say your goodbye first, then call the end_call tool if you have it; without that tool, append [CALL_COMPLETE] at the end of your final message. Nothing you write after the tool call or the marker is heard.\n",
+  "token_minted_at": "<now>"
+ }
+}

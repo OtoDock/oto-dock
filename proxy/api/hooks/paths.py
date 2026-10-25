@@ -7,27 +7,27 @@ One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 ``router``; the facade includes it.
 """
 
+import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
-import re
-
 import config
+from api.sessions.sessions import verify_session_match_async
+from auth import roles
 from auth.path_policy import (
     SecurityContext,
-    enforce_agent_tree_rbac,
     check_host_path_access,
+    enforce_agent_tree_rbac,
 )
-from api.sessions.sessions import verify_session_match_async
+from core import layout
 from core.session.session_state import (
     get_session_security,
 )
-from auth import roles
-from core import layout
 
 if TYPE_CHECKING:
     from services.path_policy_v2 import PathResolution
@@ -247,8 +247,8 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
                 create_host = (agent_dir / rel).resolve()
                 try:
                     create_host.relative_to(agent_dir.resolve())
-                except ValueError:
-                    raise HTTPException(status_code=403, detail="access denied")
+                except ValueError as exc:
+                    raise HTTPException(status_code=403, detail="access denied") from exc
                 return _answer(str(create_host), ctx)
 
     # Translate sandbox-internal paths to host paths (local sessions). Re-gate
@@ -257,7 +257,7 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
     # protected after translation. Mirrors _gate_in_tree_host on the pull path.
     host_path = _sandbox_to_host(raw, ctx, agent_dir)
     try:
-        in_tree = Path(host_path).resolve().is_relative_to(agent_dir.resolve())
+        in_tree = await asyncio.to_thread(_resolves_under, host_path, agent_dir)
     except (OSError, ValueError):
         in_tree = False
     if in_tree:
@@ -265,6 +265,11 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
         if not acc.allowed:
             raise HTTPException(status_code=403, detail=acc.reason or "access denied")
     return _answer(host_path, ctx)
+
+
+def _resolves_under(host_path: str, agent_dir: Path) -> bool:
+    """``host_path`` resolves inside ``agent_dir`` (links followed)."""
+    return Path(host_path).resolve().is_relative_to(agent_dir.resolve())
 
 
 def _answer(host_path: str, ctx) -> dict:
@@ -466,7 +471,7 @@ async def resolve_tool_arg_paths(
     )
 
     out: list[dict] = []
-    for item, r in zip(req.items, resolutions):
+    for item, r in zip(req.items, resolutions, strict=False):
         allowed, error = r.allowed, r.error
         # path_policy_v2 admits any in-tree path incl. /users/OTHER —
         # re-impose cross-user + role RBAC per item (honouring its write flag).

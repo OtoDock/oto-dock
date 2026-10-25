@@ -500,7 +500,7 @@ def prepare_mcp_config_for_sandbox(
         # broker tokens and the destination dir is agent-writable — a planted
         # symlink must never redirect it.
         write_no_follow(dst, _json.dumps(config_data, indent=2).encode())
-    except Exception:
+    except (OSError, ValueError, ImportError):
         # Fallback: simple copy without rewriting (same no-follow rule —
         # falling back to a follow-prone copy would void the guard above).
         write_no_follow(dst, src.read_bytes())
@@ -597,6 +597,9 @@ def refuse_session_on_agent_state(ctx) -> None:
             shared_only=is_shared_only(getattr(ctx, "agent", "") or ""))
 
 
+_SSH_HOSTS = "ssh-hosts"
+
+
 def session_takes_ssh_keys(ctx) -> bool:
     """Whether a session is handed the agent's SSH keys, locally or on a
     machine: the editor tier of its SecurityContext (the keys are the
@@ -605,14 +608,12 @@ def session_takes_ssh_keys(ctx) -> bool:
     material must not land in a tree a caller's session reaches), never a
     check's judge (it reads; its MCPs are the check's list), and never a
     session with no context or no role. The one predicate the Claude and
-    Codex layers and the satellite session-file broker share; the role is
-    read off the context alone, never inferred from a token or a name."""
-    from auth import roles
-    from core.session.external_identity import is_external_ctx
-    if ctx is None or is_external_ctx(ctx) or getattr(ctx, "read_only", False) is True:
-        return False
-    role = getattr(ctx, "role", "")
-    return isinstance(role, str) and roles.can_edit(role)
+    Codex layers, the satellite session-file broker and the command gate's
+    attached-host opening share (``path_shell_hosts.takes_attached_hosts``);
+    the role is read off the context alone, never inferred from a token or a
+    name."""
+    from auth.path_shell_hosts import takes_attached_hosts
+    return takes_attached_hosts(ctx)
 
 
 def clear_ssh_keys_for_sandbox(host_config_dir: str | Path) -> None:
@@ -704,18 +705,12 @@ def collect_authorized_ssh_keys(agent_name: str) -> dict[str, Path]:
     Shared by the local sandbox materializer above and the remote
     session-file provisioning in ``core/remote/remote_session_start``.
     """
-    from services.mcp import mcp_registry
-    from storage.mcp import mcp_store
-
-    manifest = mcp_registry.get_manifest("ssh-hosts")
+    manifest, instances = _authorizing_ssh_instances(agent_name)
     if manifest is None:
         return {}
-    if not any(m.name == "ssh-hosts" for m in mcp_registry.get_agent_mcps(agent_name)):
-        return {}
-
     keys_dir = manifest.mcp_dir / "keys"
     out: dict[str, Path] = {}
-    for inst in mcp_store.get_mcp_instances_for_agent("ssh-hosts", agent_name):
+    for inst in instances:
         key = ((inst.get("field_values") or {}).get("key_name") or "").strip()
         if not key or os.path.basename(key) != key or key in (".", ".."):
             continue
@@ -723,3 +718,48 @@ def collect_authorized_ssh_keys(agent_name: str) -> dict[str, Path]:
         if src.is_file():
             out[key] = src
     return out
+
+
+def _authorizing_ssh_instances(agent_name: str):
+    """ssh-hosts' manifest and the instances authorizing ``agent_name``:
+    ``(None, [])`` when the MCP isn't installed or isn't enabled for the agent
+    (visible + manager-enabled + platform-enabled, the gate every runtime
+    surface uses). The keys and the attached hosts read the same answer."""
+    from services.mcp import mcp_registry
+    from storage.mcp import mcp_store
+
+    manifest = mcp_registry.get_manifest(_SSH_HOSTS)
+    if manifest is None or not any(
+            m.name == _SSH_HOSTS for m in mcp_registry.get_agent_mcps(agent_name)):
+        return None, []
+    return manifest, mcp_store.get_mcp_instances_for_agent(_SSH_HOSTS, agent_name)
+
+
+def attached_ssh_hosts(agent_name: str) -> tuple[tuple[str, str], ...]:
+    """The ``(host, user)`` pairs the agent's authorizing ssh-hosts instances
+    name, normalised for the command gate's match: every instance with a host
+    (a missing key still attaches the host: the login may fail, the gate is
+    not where that is decided). Read live per shell call by the permission
+    hook, so an instance an admin removes stops admitting at once."""
+    from auth.path_shell_hosts import attached_host
+    _, instances = _authorizing_ssh_instances(agent_name)
+    pairs = []
+    for inst in instances:
+        fv = inst.get("field_values") or {}
+        host = str(fv.get("host") or "").strip()
+        if host:
+            pairs.append(attached_host(host, str(fv.get("username") or "")))
+    return tuple(dict.fromkeys(pairs))
+
+
+def wants_attached_ssh_hosts(ctx, command: str) -> bool:
+    """Whether one shell call reads the agent's attached SSH hosts: a local
+    session whose role takes them below the platform admin (a manager or an
+    editor; an admin needs none, a paired machine keeps its own rule), and a
+    command that names ssh, scp or rsync. The name only decides whether to
+    look, never what is allowed: a spelling that hides it gets no hosts and is
+    refused."""
+    from auth import roles
+    from auth.path_shell_hosts import SSH_COMMANDS, takes_attached_hosts
+    return (ctx is not None and not ctx.placement.is_remote and not roles.is_admin(ctx.role)
+            and takes_attached_hosts(ctx) and any(name in command for name in SSH_COMMANDS))

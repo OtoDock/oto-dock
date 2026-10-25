@@ -28,11 +28,20 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from core.execution_layer import DEFAULT_EXECUTION_PATH
-from core import placement
-from core.session import session_kind
+
+import psycopg
+
 from auth.providers import effective_role_of
+from core import placement
 from core.background import spawn
+from core.permission_modes import (
+    AUTO_REVIEW_MODE,
+    DONT_ASK_MODE,
+    UNATTENDED_MODE,
+    entry_mode,
+)
+from core.session import session_kind
+from storage.agents.schema import DEFAULT_EXECUTION_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +61,20 @@ class OtodockSessionError(Exception):
     message is relayed verbatim to the otodock terminal (``local_session_error``)."""
 
 
+def otodock_mode(word: str) -> str:
+    """The chat mode a machine's ``otodock`` command asked for: a 1.9
+    satellite sends the platform's word (Auto when the person named none);
+    an older one sends ``--mode`` as typed, where ``auto`` was Don't Ask."""
+    word = word.strip()
+    if word == UNATTENDED_MODE:
+        return DONT_ASK_MODE
+    return entry_mode(word or AUTO_REVIEW_MODE)
+
+
 async def _owner_for_machine(machine_id: str):
     """Resolve + validate the machine owner. Returns ``(machine, owner_sub, owner)``
     or raises :class:`OtodockSessionError` with a user-facing reason."""
-    from storage import remote_store
-    from storage import database as db
+    from storage import database as db, remote_store
     machine = await asyncio.to_thread(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise OtodockSessionError("this machine is not paired with the platform")
@@ -88,7 +106,7 @@ def _model_for_path(agent: str, execution_path: str, requested: str) -> str:
     if not m:
         try:
             m = config.resolve_agent_model(agent)
-        except Exception:
+        except (RuntimeError, psycopg.Error):
             m = ""
     if m and execution_path not in config.get_model_layers(m):
         opts = [o["value"] for o in config.get_layer_models(execution_path) if o.get("value")]
@@ -110,8 +128,8 @@ def _chat_ids_with_messages(chat_ids: list) -> set:
     from the picker. One batched query."""
     if not chat_ids:
         return set()
-    from storage import database as db
-    with db.get_conn() as conn:
+    from storage.pg import get_conn
+    with get_conn() as conn:
         rows = conn.execute(
             "SELECT DISTINCT chat_id FROM chat_messages WHERE chat_id = ANY(%s)",
             (list(chat_ids),),
@@ -178,8 +196,8 @@ async def _mark_attached_read(chat_id: str) -> None:
     local terminal, so clear the unread marker + sidebar dot under the chat's
     history-owner identity (the chat row's user_sub carries it already).
     Best-effort: never blocks the open."""
-    from storage import database as db
     from services.notifications import notification_manager
+    from storage import database as db
     try:
         chat = await asyncio.to_thread(db.get_chat, chat_id)
         owner = (chat or {}).get("user_sub") or ""
@@ -198,14 +216,14 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
     ``machine_id``. Returns ``{"session_id", "chat_id"}`` on success. Raises
     :class:`OtodockSessionError` with a user-facing reason on any authz/validation
     failure (the caller relays it). Other exceptions bubble as internal errors."""
-    from storage import database as db
-    from core.config.config_builder import build_agent_config, release_config_seat
-    from core.session.session_manager import get_execution_layer
     from core.concurrency import acquire_chat_slot, release_chat_slot
+    from core.config.config_builder import build_agent_config, release_config_seat
     from core.session import interactive_session
+    from core.session.session_manager import get_execution_layer
+    from storage import database as db
 
     model = (args.get("model") or "").strip()
-    perm_mode = (args.get("mode") or "default").strip() or "default"
+    perm_mode = otodock_mode(args.get("mode") or "")
     resume_chat_id = (args.get("resume_chat_id") or "").strip()
     # The local otodock terminal forwards its $TERM so the remote PTY renders to
     # match it; empty → the satellite keeps its xterm-256color default.
@@ -290,9 +308,9 @@ async def open_local_session(machine_id: str, args: dict) -> dict:
     # this machine (the chat ran here). Mirrors the dashboard's per-machine agent
     # assignment: only agents you've assigned to a machine run there.
     if not resume:
-        from storage import remote_store
+        from services.remote import remote_status
         nat_target, _reason = await asyncio.to_thread(
-            remote_store.resolve_execution_target, agent, owner_sub, role,
+            remote_status.resolve_execution_target, agent, owner_sub, role,
         )
         if not placement.runs_on(nat_target, machine_id):
             raise OtodockSessionError(

@@ -98,7 +98,7 @@ def _mini_app() -> FastAPI:
         # the route becomes its own 500.
         try:
             return await call_next(request)
-        except Exception:
+        except Exception:  # noqa: BLE001  # the test's middleware turns any error into a 500 as the app does
             from starlette.responses import JSONResponse
             return JSONResponse({"detail": "Internal Server Error"}, status_code=500)
 
@@ -220,7 +220,7 @@ def test_the_shim_resolves_the_client_and_keeps_the_peer(_bare_metal):
 
 def test_the_server_is_built_with_the_shim_and_two_listeners(_bare_metal, monkeypatch):
     import config
-    from app import _BoundedWebSocketProtocol, _ClientAddressShim, _build_server
+    from app import _BoundedWebSocketProtocol, _build_server, _ClientAddressShim
     monkeypatch.setattr(config, "HOST", "127.0.0.1")
     monkeypatch.setattr(config, "PORT", 0)
     server, sockets = _build_server(_echo_client)

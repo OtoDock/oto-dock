@@ -6,6 +6,14 @@ import { GRANTEE_KIND } from '../../api/shares'
 import { appKind } from '../../lib/kinds/app'
 import { unpinWords } from './appRow'
 import { anchorBoxOf, usePopoverPlacement, type AnchorBox } from '../ui/popoverPosition'
+import { usePortalRoot } from '../ui/portalRoot'
+import { MENU_ITEM, POPOVER } from '../ui/classes'
+import { pushEscHandler } from '../../lib/escStack'
+
+// A destructive row: its own string, never MENU_ITEM plus a red text class.
+const DANGER_ITEM =
+  'flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-status-danger-fg ' +
+  'transition-colors duration-fast hover:bg-status-danger-bg'
 
 /**
  * The app's three-dot menu — one component for the active chip, the solo
@@ -74,11 +82,19 @@ export default function AppMenu({
   const open = anchor !== null
   const buttonRef = useRef<HTMLButtonElement | null>(null)
   const panelRef = useRef<HTMLDivElement | null>(null)
+  const portalRoot = usePortalRoot()
   const placement = usePopoverPlacement(anchor, panelRef)
   const navigate = useNavigate()
   const title = app.title || app.slug
 
   const close = () => setAnchor(null)
+  // An item gives the focus back to the menu's button before it acts, so a
+  // dialog it opens returns the focus there when it closes (the item is gone).
+  const pick = (act: () => void) => () => {
+    close()
+    buttonRef.current?.focus()
+    act()
+  }
   const toggle = () => {
     if (anchor) { close(); return }
     const rect = buttonRef.current?.getBoundingClientRect()
@@ -92,18 +108,17 @@ export default function AppMenu({
       const t = e.target as Node
       if (!panelRef.current?.contains(t) && !buttonRef.current?.contains(t)) close()
     }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
     // Fixed coordinates go stale the moment anything under them moves.
     const onMove = () => close()
     document.addEventListener('mousedown', onDown)
-    document.addEventListener('keydown', onKey)
     window.addEventListener('resize', onMove)
     window.addEventListener('scroll', onMove, true)
+    const popEsc = pushEscHandler(() => { close(); buttonRef.current?.focus() }, () => panelRef.current)
     return () => {
       document.removeEventListener('mousedown', onDown)
-      document.removeEventListener('keydown', onKey)
       window.removeEventListener('resize', onMove)
       window.removeEventListener('scroll', onMove, true)
+      popEsc()
     }
   }, [open])
 
@@ -114,7 +129,6 @@ export default function AppMenu({
   // the real unpin instead.
   const canHide = !removesForMe && (app.scope === 'shared' || !!app.granted || !!app.placement) && app.pin_scope !== 'chat' && app.pin_scope !== 'project' && !!onHideForMe
   const canUnpin = app.can_manage && !!onUnpin
-  const item = 'block w-full px-3 py-1.5 text-left text-xs text-p-text transition-colors hover:bg-p-surface-hover disabled:cursor-not-allowed disabled:text-p-text-light disabled:hover:bg-transparent'
 
   return (
     <div className="relative">
@@ -127,8 +141,8 @@ export default function AppMenu({
         aria-expanded={open}
         title="App options"
         className={onChip
-          ? '-mr-1 rounded-full p-0.5 text-white/70 transition-colors hover:bg-white/20 hover:text-white'
-          : 'flex h-6 w-6 items-center justify-center rounded-full border border-p-border-light bg-p-bg/70 text-p-text-light backdrop-blur-sm transition-colors hover:bg-p-surface-hover hover:text-p-text'}
+          ? '-mr-1 rounded-full p-0.5 transition-colors hover:bg-surface-hover'
+          : 'flex h-6 w-6 items-center justify-center rounded-full bg-surface-card text-tertiary shadow-elevation-1 transition-colors hover:text-primary'}
       >
         <svg className="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
           <circle cx="5" cy="12" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="19" cy="12" r="2" />
@@ -147,72 +161,72 @@ export default function AppMenu({
             zIndex: 60,
             maxHeight: 'min(60vh, 320px)',
           }}
-          className="w-44 overflow-y-auto rounded-lg border border-p-border-light bg-p-surface py-1 text-p-text shadow-lg"
+          className={`w-52 overflow-y-auto py-1 ${POPOVER}`}
         >
           {!fullScreen && (
-            <button role="menuitem" className={item} onClick={() => { close(); navigate(`/apps/${app.id}`) }}>
+            <button role="menuitem" className={MENU_ITEM} onClick={() => { close(); navigate(`/apps/${app.id}`) }}>
               Open full screen
             </button>
           )}
           {onShare && (
-            <button role="menuitem" className={item} onClick={() => { close(); onShare() }}>
+            <button role="menuitem" className={MENU_ITEM} onClick={pick(() => { onShare() })}>
               Share
             </button>
           )}
           {onRollback && app.has_previous_release && (
-            <button role="menuitem" className={item} onClick={() => { close(); onRollback() }} title={kind.keepsData ? 'Serve the previous release again, with the data as it was before this one' : 'Serve the previous release again'}>
+            <button role="menuitem" className={MENU_ITEM} onClick={pick(() => { onRollback() })} title={kind.keepsData ? 'Serve the previous release again, with the data as it was before this one' : 'Serve the previous release again'}>
               Roll back
             </button>
           )}
           {onTogglePreview && kind.hasPreviewBuild && app.can_manage && !!app.preview_sha && (
-            <button role="menuitem" className={item} onClick={() => { close(); onTogglePreview() }} title="The working copy the agent started as a preview">
+            <button role="menuitem" className={MENU_ITEM} onClick={pick(() => { onTogglePreview() })} title="The working copy the agent started as a preview">
               {previewing ? 'View the live release' : 'View the working copy'}
             </button>
           )}
           {onLogs && kind.mayServe && app.can_manage && (
-            <button role="menuitem" className={item} onClick={() => { close(); onLogs() }}>
+            <button role="menuitem" className={MENU_ITEM} onClick={pick(() => { onLogs() })}>
               Logs
             </button>
           )}
           {onSettings && kind.hasSettings && app.can_manage && (
-            <button role="menuitem" className={item} onClick={() => { close(); onSettings() }} title="The secrets the app needs, set by a person">
+            <button role="menuitem" className={MENU_ITEM} onClick={pick(() => { onSettings() })} title="The secrets the app needs, set by a person">
               Settings
             </button>
           )}
           {canHide && (
-            <button role="menuitem" className={item} onClick={() => { close(); onHideForMe?.() }}>
+            <button role="menuitem" className={MENU_ITEM} onClick={pick(() => { onHideForMe?.() })}>
               Hide for me
             </button>
           )}
           {onWhereFrom && app.placement && (
-            <button role="menuitem" className={item} onClick={() => { close(); onWhereFrom() }}>
+            <button role="menuitem" className={MENU_ITEM} onClick={pick(() => { onWhereFrom() })}>
               Where it comes from
             </button>
           )}
           {onRemoveFromAgent && app.placement?.can_remove && (
-            <button role="menuitem" className={`${item} text-red-600 dark:text-red-400`} onClick={() => { close(); onRemoveFromAgent() }}
+            <button role="menuitem" className={DANGER_ITEM} onClick={pick(() => { onRemoveFromAgent() })}
               title="Everyone here loses it. The app stays with its own agent.">
               Remove from this agent
             </button>
           )}
           {removesForMe && (
-            <button role="menuitem" className={`${item} text-red-600 dark:text-red-400`} onClick={() => { close(); onRemoveForMe?.() }}
+            <button role="menuitem" className={DANGER_ITEM} onClick={pick(() => { onRemoveForMe?.() })}
               title="Removes the share. The person who shared it can share it again.">
               Remove for me
             </button>
           )}
           {canUnpin && (
-            <button role="menuitem" className={`${item} text-red-600 dark:text-red-400`} onClick={() => { close(); onUnpin?.() }}>
+            <button role="menuitem" className={DANGER_ITEM} onClick={pick(() => { onUnpin?.() })}>
               {unpinWords(app).action}
             </button>
           )}
           {onDelete && kind.deletable && app.can_manage && (
-            <button role="menuitem" className={`${item} text-red-600 dark:text-red-400`} onClick={() => { close(); onDelete() }} title="Removes the app, its releases and its database">
+            <button role="menuitem" className={DANGER_ITEM} onClick={pick(() => { onDelete() })} title="Removes the app, its releases and its database">
               Delete app and its data
             </button>
           )}
         </div>,
-        document.body,
+        portalRoot,
       )}
     </div>
   )

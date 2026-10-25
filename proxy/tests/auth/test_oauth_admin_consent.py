@@ -13,9 +13,7 @@ unit tests pin the state-engine contract that the routes depend on.
 
 from __future__ import annotations
 
-
 from services.oauth import oauth_engine
-
 
 # ---------------------------------------------------------------------------
 # Admin-consent state — create + validate

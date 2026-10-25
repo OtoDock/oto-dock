@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useLayoutEffect } from 'react'
 import type { MessageBlock } from '@/components/chat/types'
 import { eventToBlock } from '@/lib/messageBlocks'
 import { replayableDisplayEvents } from '@/lib/displayReplay'
@@ -112,7 +112,7 @@ export function useArtifactWindows(
   ws: InteractiveWs,
   chatId: string,
   /** A document push: the chat's document pane takes it, not a window. */
-  onDocument?: (event: any) => void,
+  onDocument?: (event: unknown) => void,
 ) {
   const { subscribe } = ws
   const [windows, setWindows] = useState<ArtifactWindow[]>([])
@@ -120,9 +120,11 @@ export function useArtifactWindows(
   const idRef = useRef(0)
   const allocId = useCallback(() => ++idRef.current, [])
   const windowsRef = useRef(windows)
-  windowsRef.current = windows
   const onDocumentRef = useRef(onDocument)
-  onDocumentRef.current = onDocument
+  useLayoutEffect(() => {
+    windowsRef.current = windows
+    onDocumentRef.current = onDocument
+  })
 
   const close = useCallback((id: number) => {
     // X = permanent for this browser: remember the persisted row id so the
@@ -156,15 +158,21 @@ export function useArtifactWindows(
     })
   }, [])
 
-  useEffect(() => {
-    // New chat / session / left interactive → start with no windows; the
-    // replay seed below re-opens the final turn's persisted artifacts. An
-    // empty chatId (not interactive) clears + does not subscribe.
+  // A new chat, or leaving the interactive view (an empty id), starts with
+  // no windows (in render, on the change); the replay seed below re-opens
+  // the final turn's persisted artifacts.
+  const [forChat, setForChat] = useState(chatId)
+  if (forChat !== chatId) {
+    setForChat(chatId)
     setWindows([])
     setMinimized(new Set())
+  }
+  useEffect(() => {
+    // An empty chatId (not interactive) does not subscribe.
     if (!chatId) return
 
-    const unsub = subscribe(WIRE.PTY_ARTIFACT, (msg: any) => {
+    const unsub = subscribe(WIRE.PTY_ARTIFACT, (msg) => {
+      if (msg.type !== WIRE.PTY_ARTIFACT) return
       if (msg.chat_id && msg.chat_id !== chatId) return
       const event = msg.event
       const t = event?.type

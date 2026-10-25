@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
+from typing import cast
 
 from .base import PhoneAdapterError
 
@@ -58,7 +59,7 @@ class AMIClient:
     def __repr__(self) -> str:  # never leak the secret
         return f"<AMIClient {self.username}@{self.host}:{self.port}>"
 
-    async def __aenter__(self) -> "AMIClient":
+    async def __aenter__(self) -> AMIClient:
         await self.connect()
         try:
             await self.login()
@@ -87,8 +88,9 @@ class AMIClient:
                 f"AMI connect failed ({self.host}:{self.port}): {e}", status_code=502,
             ) from e
         try:
+            # The connection above set the reader.
             banner = await asyncio.wait_for(
-                self._reader.readline(), timeout=_READ_TIMEOUT,
+                cast("asyncio.StreamReader", self._reader).readline(), timeout=_READ_TIMEOUT,
             )
         except asyncio.TimeoutError as e:
             await self.close()  # tear down the half-open socket
@@ -118,7 +120,7 @@ class AMIClient:
         try:
             self._writer.close()
             await self._writer.wait_closed()
-        except Exception:
+        except Exception:  # noqa: BLE001  # closing a socket that is already going away
             pass
         self._reader = None
         self._writer = None

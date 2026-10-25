@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import {
   PoolCapResponse, PoolCapStatus, PoolCapUpdate, PoolCapFields, PoolCapField,
   useMyPoolCap, useSetMyPoolCap, useAdminPoolCap, useSetAdminPoolCap,
@@ -8,15 +8,19 @@ import { engineLabels } from '@/lib/engines'
 import {
   CAP_FIELDS, engineName, fieldShort, formatCap, formatReading, readingTone,
 } from './poolCap'
+import Button from '../ui/Button'
+import { Input, Select } from '../ui/Field'
+import { CARD } from '../ui/classes'
+import InfoTip from '../ui/InfoTip'
 
 // One subscription pool's readings per engine and its cap form. The
 // platform pool (Setup → Usage) and each user's own accounts (User
 // Settings → Usage) share this; the data hooks differ.
 
 const TONE_CLASS = {
-  error: 'text-p-error font-medium',
-  warn: 'text-p-accent-yellow font-medium',
-  plain: 'text-p-text-secondary',
+  error: 'text-status-danger-fg font-medium',
+  warn: 'text-status-warning-fg font-medium',
+  plain: 'text-secondary',
 }
 
 // One engine's pool: the name and account count, then one labelled cell per
@@ -29,46 +33,26 @@ function EngineLine({ status }: { status: PoolCapStatus }) {
   return (
     <div data-testid="pool-engine" className="space-y-1.5">
       <div className="flex items-baseline gap-2 text-sm">
-        <span className="font-medium text-p-text">{engineName(status.layer, engineLabels(layers))}</span>
-        <span className="text-xs text-p-text-light">
+        <span className="font-medium text-primary">{engineName(status.layer, engineLabels(layers))}</span>
+        <span className="text-xs text-tertiary">
           {status.accounts} {status.accounts === 1 ? 'account' : 'accounts'}
         </span>
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1.5">
         {CAP_FIELDS.map(key => (
           <div key={key} data-testid={`pool-reading-${key}`}
-            title={status.caps[key] != null ? `cap ${formatCap(key, status.caps[key])}` : 'no cap'}>
-            <div className="text-[11px] text-p-text-light">{fieldShort(key)}</div>
+            title={status.caps[key] != null ? `Cap ${formatCap(key, status.caps[key])}` : 'No cap'}>
+            <div className="text-2xs text-tertiary">{fieldShort(key)}</div>
             <div className={`text-sm ${TONE_CLASS[readingTone(status, key)]}`}>
               {formatReading(key, status.readings[key])}
               {status.caps[key] != null && (
-                <span className="text-xs text-p-text-light font-normal"> / {formatCap(key, status.caps[key])}</span>
+                <span className="text-xs text-tertiary font-normal"> / {formatCap(key, status.caps[key])}</span>
               )}
             </div>
           </div>
         ))}
       </div>
     </div>
-  )
-}
-
-// A small ⓘ that opens a one-paragraph note in place (a click works on a
-// phone, where hover tooltips do not).
-function InfoTip({ text }: { text: string }) {
-  const [open, setOpen] = useState(false)
-  return (
-    <>
-      <button
-        type="button"
-        aria-label="More about this cap"
-        aria-expanded={open}
-        onClick={() => setOpen(o => !o)}
-        className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full border border-p-border-light text-[10px] leading-none text-p-text-light hover:text-p-text align-text-bottom"
-      >
-        i
-      </button>
-      {open && <p className="text-xs text-p-text-light mt-1" data-testid="pool-cap-info">{text}</p>}
-    </>
   )
 }
 
@@ -96,10 +80,13 @@ export function PoolCapForm({ data, onSave, saving, error }: {
 }) {
   const [form, setForm] = useState(() => toForm(data.caps))
   const [onReached, setOnReached] = useState(data.on_reached)
-  useEffect(() => {
+  // A new server snapshot replaces the draft (in render, on the change).
+  const [shown, setShown] = useState(data)
+  if (shown !== data) {
+    setShown(data)
     setForm(toForm(data.caps))
     setOnReached(data.on_reached)
-  }, [data])
+  }
 
   const submit = () => {
     const update: PoolCapUpdate = { on_reached: onReached }
@@ -115,38 +102,35 @@ export function PoolCapForm({ data, onSave, saving, error }: {
     <div className="space-y-2">
       <div className="flex flex-wrap items-end gap-3">
         {INPUTS.map(inp => (
-          <div key={inp.key}>
-            <div className="text-xs text-p-text-secondary mb-1">{inp.label}</div>
-            <input
+          <div key={inp.key} className="w-24">
+            <div className="text-xs text-secondary mb-1">{inp.label}</div>
+            <Input
               type="number" min="0" max={inp.max} step={inp.step} placeholder="No cap"
               aria-label={inp.label}
               value={form[inp.key]}
               onChange={e => setForm(f => ({ ...f, [inp.key]: e.target.value }))}
-              className="w-24 px-2 py-1 rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-sm text-p-text"
             />
           </div>
         ))}
         <div>
-          <div className="text-xs text-p-text-secondary mb-1">When reached</div>
-          <select
+          <div className="text-xs text-secondary mb-1">When reached</div>
+          <Select
             aria-label="When reached"
             value={onReached}
             onChange={e => setOnReached(e.target.value as 'stop' | 'continue')}
-            className="px-2 py-1 rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-sm text-p-text"
           >
             <option value="stop">Stop</option>
             <option value="continue">Continue on API keys</option>
-          </select>
+          </Select>
         </div>
-        <button onClick={submit} disabled={saving}
-          className="px-3 py-1.5 text-xs rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-50">
+        <Button variant="primary" size="xs" onClick={submit} disabled={saving}>
           Save
-        </button>
+        </Button>
       </div>
-      <p className="text-xs text-p-text-light">
+      <p className="text-xs text-tertiary">
         Empty means no cap. Less than 14.3% a day cannot use a whole week.
       </p>
-      {error && <p className="text-xs text-p-error">{error}</p>}
+      {error && <p className="text-xs text-status-danger-fg">{error}</p>}
     </div>
   )
 }
@@ -164,22 +148,24 @@ export function PoolCapPanel({ title, intro, info, empty, data, isLoading, onSav
 }) {
   const engines = data ? Object.values(data.engines) : []
   return (
-    <div className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface overflow-hidden">
-      <div className="px-4 py-3 border-b border-p-border-light">
-        <h3 className="text-sm font-medium text-p-text">{title}</h3>
-        <p className="text-xs text-p-text-light mt-0.5">
+    <div className={`${CARD} overflow-hidden`}>
+      <div className="px-4 py-3 border-b border-subtle">
+        <div>
+          <h3 className="inline text-sm font-medium text-primary">{title}</h3>
+          <InfoTip label={title}>{info}</InfoTip>
+        </div>
+        <p className="text-xs text-tertiary mt-0.5">
           {intro}
-          <InfoTip text={info} />
         </p>
       </div>
       <div className="px-4 py-3 space-y-3">
-        {isLoading && <div className="text-xs text-p-text-light">Loading...</div>}
+        {isLoading && <div className="text-xs text-tertiary">Loading...</div>}
         {!isLoading && engines.length === 0 && (
-          <div className="text-xs text-p-text-light">{empty}</div>
+          <div className="text-xs text-tertiary">{empty}</div>
         )}
         {engines.map(s => <EngineLine key={s.layer} status={s} />)}
         {data && (
-          <div className="pt-3 border-t border-p-border-light">
+          <div className="pt-3 border-t border-subtle">
             <PoolCapForm data={data} onSave={onSave} saving={saving} error={error} />
           </div>
         )}
@@ -193,10 +179,10 @@ export function PlatformPoolCapSection() {
   const save = useSetAdminPoolCap()
   return (
     <PoolCapPanel
-      title="Subscription pool"
-      intro="You can cap the accounts in the agent pool on each engine to a percentage of their weekly window or to an equivalent API cost."
-      info="The percentage is measured against all the pooled subscriptions of each engine, everyone's use of the accounts included. The API cost counts agent work over the last 7 days and 24 hours. The first cap reached stops new agent work, or moves it onto an API key."
-      empty="No subscription accounts in the agent pool."
+      title="Shared subscriptions"
+      intro="You can cap the shared subscriptions of each engine. Cap them at a percentage of their weekly window, or at the matching API cost."
+      info="The percentage covers all the shared subscriptions of each engine. Everyone's use of the accounts counts. The API cost counts agent work over the last 7 days and 24 hours. The first cap reached stops new agent work, or moves it onto an API key."
+      empty="No subscription accounts are shared with agents."
       data={data} isLoading={isLoading}
       onSave={u => save.mutate(u)} saving={save.isPending}
       error={save.error ? save.error.message : null}
@@ -210,8 +196,8 @@ export function MyPoolCapSection() {
   return (
     <PoolCapPanel
       title="My subscriptions"
-      intro="You can cap your own connected accounts on each engine to a percentage of their weekly window or to an equivalent API cost."
-      info="The percentage is measured against all the enabled subscriptions of each engine, everything you do on the accounts included. The API cost counts your chats over the last 7 days and 24 hours. The first cap reached stops your new chats, or moves them onto an API key."
+      intro="You can cap your own connected accounts on each engine. Cap them at a percentage of their weekly window, or at the matching API cost."
+      info="The percentage covers all the enabled subscriptions of each engine. Everything you do on the accounts counts. The API cost counts your chats over the last 7 days and 24 hours. The first cap reached stops your new chats, or moves them onto an API key."
       empty="No connected subscription accounts."
       data={data} isLoading={isLoading}
       onSave={u => save.mutate(u)} saving={save.isPending}

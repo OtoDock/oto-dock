@@ -9,18 +9,22 @@ path (file → text with word timings), plus capability/billing metadata and the
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, ClassVar
+from typing import Any, ClassVar
 
-from audio.capabilities import STTCapabilities, BillingUnit
+from audio.capabilities import BillingUnit, STTCapabilities
 from audio.log_policy import log_transcript
 from audio.providers.credential_resolver import CredentialResolver
 from audio.providers.model_succession import successor_of
 
-__all__ = ["STTProvider", "TranscriptResult", "LanguageGuess", "Word"]
+__all__ = ["HEARD_KEEP_S", "Heard", "STTProvider", "TranscriptResult", "Word"]
+
+#: The finals the ``heard`` ledger keeps, in seconds of the provider's audio
+#: clock behind the newest audio.
+HEARD_KEEP_S = 30.0
 
 
 @dataclass
@@ -30,6 +34,27 @@ class Word:
     word: str
     start: float
     end: float
+    confidence: float | None = None
+
+
+@dataclass(frozen=True)
+class Heard:
+    """One decoded result as evidence: numbers only, never the text.
+    An empty result is an entry with ``words == 0``: it says the stream heard
+    this span and found nothing, which is not the same as not having
+    answered yet. ``start``, ``end`` and the marks are on the provider's
+    audio clock (``STTProvider.audio_offered_s``). ``marks`` places each
+    word, ``(start, end, confidence)``, when the result times them: a
+    result's window grows over a whole utterance, so the words say where in
+    it they were heard; without marks the words count as spread evenly over
+    the entry."""
+
+    start: float
+    end: float
+    words: int
+    confidence: float   # the words' mean; the result's own when its words carry none; 0 when words == 0
+    final: bool
+    marks: tuple[tuple[float, float, float], ...] = ()
 
 
 @dataclass
@@ -44,17 +69,6 @@ class TranscriptResult:
     # The engine's confidence in ``language`` when it identified it (0.0 when
     # the language was given or the engine reports none).
     language_confidence: float = 0.0
-
-
-@dataclass
-class LanguageGuess:
-    """What a batch identification of one utterance said: the base language
-    code, the engine's confidence (0 to 1) and the text it heard in that
-    language (the call's first turn when the guess changes the language)."""
-
-    language: str
-    confidence: float
-    text: str = ""
 
 
 class STTProvider(ABC):
@@ -112,7 +126,7 @@ class STTProvider(ABC):
             return
         try:
             cb(text)
-        except Exception:
+        except Exception:  # noqa: BLE001  # a consumer's partial-final callback must not break the stream
             logging.getLogger(type(self).__module__).debug(
                 "on_partial_final callback failed", exc_info=True)
 
@@ -131,11 +145,63 @@ class STTProvider(ABC):
         """Opt this instance into dictation semantics (see attribute docs)."""
         self.dictation_mode = True
 
+    # Dictation's second listen (Deepgram's ``relisten.py``): a provider that
+    # re-listens the speech a live window left without words asks this gate
+    # at every final (None: always); the language streams let only the
+    # stream the person sees, or the one about to be, re-listen. The batch
+    # seconds it bought are billed audio on top of the stream's.
+    relisten_gate: Callable[[], bool] | None = None
+    # The second listen's budget counts the whole dictation: the language
+    # streams point every stream at the dictation's stream seconds and at
+    # the batch seconds all its streams bought (None: the stream's own).
+    dictation_seconds: Callable[[], float] | None = None
+    dictation_relistened: Callable[[], float] | None = None
+
+    @property
+    def relisten_seconds(self) -> float:
+        return 0.0
+
+    def bound_finish(self, seconds: float) -> None:
+        """The next ``finish()`` waits at most ``seconds`` for work the
+        provider still owes (a held window's re-listen). Default: nothing
+        to bound."""
+        return
+
+    # A call's second listen (Deepgram's ``relisten.TurnRelisten``): the
+    # phone pipeline turns it on for every call STT; a provider without one
+    # keeps these no-ops.
+    def enable_turn_relisten(self) -> None:
+        """Listen again, in the background, to a live final that came back
+        with no word over speech (calls and live voice). Default: never."""
+        return
+
+    async def complete_turn(self, text: str, bound: float) -> str:
+        """The turn's ``text`` with the words its second listen recovered,
+        waiting at most ``bound`` for a re-listen still out. Default: the
+        text as it is."""
+        return text
+
+    def turn_taken(self) -> None:
+        """The turn went out: what its second listen still owes is dropped."""
+        return
+
+    async def release_wordless_turn(self, timeout: float) -> bool:
+        """A turn whose every live final came back with no word: wait at most
+        ``timeout`` for its second listen and queue the words it recovered as
+        the turn's final. True when something was queued. Default: False."""
+        return False
+
+    @property
+    def display_interim(self) -> str:
+        """The live partial as the dictation composer shows it (a provider
+        that holds windows puts their text ahead of it)."""
+        return self.latest_interim
+
     # ── Construction from an audio_providers row ───────────────────
 
     @classmethod
     @abstractmethod
-    def from_row(cls, row: dict, resolver: CredentialResolver) -> "STTProvider":
+    def from_row(cls, row: dict, resolver: CredentialResolver) -> STTProvider:
         """Build an instance from an ``audio_providers`` row + a credential resolver.
 
         Keeps the row→kwargs mapping next to the provider (each provider knows
@@ -180,39 +246,12 @@ class STTProvider(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support file transcription")
 
-    # ── Language identification (one utterance, batch) ─────────────
-
-    async def identify_language(self, audio_wav: bytes) -> LanguageGuess | None:
-        """Identify the language of one short utterance (a WAV file) through
-        the provider's batch endpoint with no language given. The call
-        pipeline uses it ONCE per call to lock the caller's language;
-        ``None`` means the provider cannot identify (the route's language
-        stays). Default: no identification."""
-        return None
+    # ── The languages a stream can be opened in ────────────────────
 
     def streams_language(self, language: str) -> bool:
-        """Whether the streaming model can transcribe ``language`` (a base
-        code): a language the identification names but the stream cannot
-        handle must not lock a call. Default: every language."""
-        return True
-
-    @property
-    def multi_languages(self) -> frozenset[str] | None:
-        """The base codes the automatic stream (``start`` with ``multi``)
-        transcribes, or None when it identifies every language on its own.
-        The dictation relay locks a language the automatic stream does not
-        cover: it identifies the first utterance (``identify_language``) and
-        reopens the stream in it (``restart``). Default: None."""
-        return None
-
-    async def restart(self, language: str) -> bool:
-        """Reopen the stream in ``language`` with the connection's stored
-        parameters (the rate, interims, endpointing). The lock changes the
-        language mid-call; ``ensure_alive`` only reconnects a dead socket.
-        Default: a plain close and start (providers keep their own params)."""
-        with contextlib.suppress(Exception):
-            await self.close()
-        await self.start(language=language)
+        """Whether a stream can be opened in ``language`` (a base code):
+        asked when the language rule opens a candidate stream. Default:
+        every language."""
         return True
 
     # ── Core streaming methods ─────────────────────────────────────
@@ -269,8 +308,13 @@ class STTProvider(ABC):
 
         Called at SPEECH_END so providers with slow server-side endpointing
         flush their buffered tokens without waiting for the full endpoint
-        delay.  Default: no-op.
+        delay. On a provider whose capabilities say ``reports_confidence``
+        it may also come while speech goes on (a language candidate that is
+        behind gets one once it has caught up, or at the hold's bound,
+        ``stt/streams.py``), so a final mid-speech must keep every word.
+        Default: no-op.
         """
+        return
 
     @property
     def latest_interim(self) -> str:
@@ -280,6 +324,21 @@ class STTProvider(ABC):
         ``""`` (provider streams no interims).
         """
         return ""
+
+    @property
+    def speech_evidence(self) -> bool:
+        """Any sign the speech being heard is producing text: a live partial
+        or a pending final. The barge-in pause and the turn timer's phantom
+        check read this (never the text), so a provider made of several
+        streams answers over all of them."""
+        return bool(self.latest_interim) or self.has_pending_finals
+
+    @property
+    def interim_evidence(self) -> str:
+        """The live partials as one string, for a monitor that watches
+        whether they EVOLVE (an evolving partial is a speaker still
+        talking); a provider of several streams joins theirs."""
+        return self.latest_interim
 
     @property
     def has_pending_finals(self) -> bool:
@@ -293,6 +352,14 @@ class STTProvider(ABC):
         mid-sentence caller). Default: nothing pending.
         """
         return False
+
+    @property
+    def has_drainable_finals(self) -> bool:
+        """Finals the next ``drain_transcript`` returns as text. The same as
+        ``has_pending_finals`` for one stream; a provider of several
+        streams answers for the one its drains read, so a consumer that
+        commits on a drain never waits on another stream's final."""
+        return self.has_pending_finals
 
     def pop_fatal_error(self) -> str | None:
         """Fatal stream failure (auth/quota/connection) to surface to the
@@ -314,9 +381,64 @@ class STTProvider(ABC):
         ``self._last_result_at`` in their result handlers; the default keeps
         non-streaming providers exempt (0.0 with no speech accumulation ever
         reaching the guard's threshold requires the pipeline's counter,
-        which only the call pipeline runs).
+        which only the call pipeline runs). ``LanguageStreams`` reads it too:
+        a candidate stream has answered its replay once a result lands after
+        it, so a stream that never stamps it never wins a switch.
         """
         return getattr(self, "_last_result_at", 0.0)
+
+    # ── The evidence ledger and the audio clock ────────────────────
+    #
+    # Created lazily per instance: a provider whose ``__init__`` never calls
+    # ``super().__init__`` must not share a class-level list with every other
+    # stream.
+
+    @property
+    def heard(self) -> tuple[Heard, ...]:
+        """The finals of the last ``HEARD_KEEP_S`` clock seconds and the
+        latest interim, oldest first. Filled only by a provider whose
+        capabilities say ``reports_confidence``; ``clear_queue`` and
+        ``finish`` leave it alone."""
+        finals = tuple(self.__dict__.get("_ledger_finals", ()))
+        interim = self.__dict__.get("_ledger_interim")
+        return finals + (interim,) if interim is not None else finals
+
+    @property
+    def heard_version(self) -> int:
+        """Moves with every entry the ledger takes: a consumer compares only
+        when it changed."""
+        return self.__dict__.get("_ledger_version", 0)
+
+    def _heard_interim(self, entry: Heard) -> None:
+        """A live interim: it replaces the previous interim entry."""
+        self.__dict__["_ledger_interim"] = entry
+        self.__dict__["_ledger_version"] = self.heard_version + 1
+
+    def _heard_final(self, entry: Heard) -> None:
+        """A final: it replaces the interim it completes (one that began
+        before the final's end), and finals older than ``HEARD_KEEP_S`` of
+        the clock go."""
+        finals = self.__dict__.setdefault("_ledger_finals", [])
+        self.__dict__["_ledger_version"] = self.heard_version + 1
+        interim = self.__dict__.get("_ledger_interim")
+        if interim is not None and interim.start < entry.end:
+            self.__dict__["_ledger_interim"] = None
+        finals.append(entry)
+        horizon = max(self.audio_offered_s, entry.end) - HEARD_KEEP_S
+        while finals and finals[0].end < horizon:
+            finals.pop(0)
+
+    @property
+    def audio_offered_s(self) -> float:
+        """The provider's audio clock: the seconds of audio offered to
+        ``send_audio`` since the first ``start`` (the bytes a dead socket
+        skipped and the silence fed during playback included). ``Heard``
+        entries are on this clock, whatever reconnects happened."""
+        return self.__dict__.get("_audio_offered", 0.0)
+
+    def _count_offered(self, nbytes: int, rate: int, channels: int = 1) -> None:
+        if rate > 0 and nbytes > 0:
+            self.__dict__["_audio_offered"] = self.audio_offered_s + nbytes / (rate * 2 * channels)
 
     @abstractmethod
     async def close(self) -> None:
@@ -336,6 +458,7 @@ class STTProvider(ABC):
 
         Default: no-op (suitable for providers unaffected by echo).
         """
+        return
 
     def on_tts_finished(self, was_interrupted: bool) -> None:
         """Called when TTS playback ends.
@@ -351,6 +474,7 @@ class STTProvider(ABC):
 
         Default: no-op.
         """
+        return
 
     # ── Echo management during long opening TTS ────────────────────
 
@@ -363,6 +487,7 @@ class STTProvider(ABC):
 
         Default: no-op.
         """
+        return
 
     # ── Liveness: keepalive, health, reconnect ─────────────────────
 
@@ -386,6 +511,7 @@ class STTProvider(ABC):
 
         Default: no-op.
         """
+        return
 
     async def ensure_alive(self, language: str, *, clear_queue: bool = False) -> bool:
         """Health probe + reconnect from the provider's stored start() params.

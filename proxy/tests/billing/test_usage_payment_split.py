@@ -13,6 +13,7 @@ Run: cd proxy && python -m pytest tests/billing/test_usage_payment_split.py -v
 import sys
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -84,9 +85,9 @@ class TestPaymentClassification:
 class TestUserLimitGating:
     def test_own_sub_user_never_blocked(self, temp_db):
         """Heavy own-subscription usage never trips the platform-auth budget."""
+        from services.billing import usage_service
         from storage import database as db
         from storage.billing import subscription_store
-        from services.billing import usage_service
 
         own = subscription_store.add_subscription(
             "claude-code-cli", "anthropic", "oauth", owner_sub="user-1")
@@ -98,9 +99,9 @@ class TestUserLimitGating:
 
     def test_borrowed_usage_blocks(self, temp_db):
         """Borrowed platform-credential usage over the limit blocks."""
+        from services.billing import usage_service
         from storage import database as db
         from storage.billing import subscription_store
-        from services.billing import usage_service
 
         admin_api = subscription_store.add_subscription(
             "codex-cli", "openai", "api_key", owner_sub="admin", contribute_platform=True)

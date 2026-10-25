@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { answerDialog, renderWithDialogs } from './dialogsHarness'
 
 // ─── Admin Skills page: a package ahead of the catalog (1.7.1) ───
 //
@@ -19,7 +20,6 @@ import * as authApi from '@/api/auth'
 import SkillsPage from '@/pages/admin/SkillsPage'
 
 const fetchSpy = vi.spyOn(authApi, 'apiFetch')
-let confirmSpy: ReturnType<typeof vi.spyOn> | undefined
 
 function pkg(name: string, version: string) {
   return {
@@ -59,7 +59,7 @@ function mockApi(calls: string[]) {
 
 function renderPage() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  return renderWithDialogs(
     <MemoryRouter>
       <QueryClientProvider client={qc}>
         <SkillsPage />
@@ -71,32 +71,31 @@ function renderPage() {
 describe('SkillsPage — a package ahead of the catalog', () => {
   afterEach(() => {
     fetchSpy.mockReset()
-    confirmSpy?.mockRestore()
-    confirmSpy = undefined
   })
 
   it('is a revert behind a confirm, never an update offer', async () => {
     const calls: string[] = []
     mockApi(calls)
-    confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
     renderPage()
     // The Skills page reads the check it runs itself.
     fireEvent.click(await screen.findByRole('button', { name: /Check Updates/ }))
-    const revert = await screen.findByRole('button', { name: 'Revert to catalog 1.0.0' })
+    const revert = await screen.findByRole('button', { name: 'Revert to 1.0.0' })
     // One offer (doc-writer), the ahead package not counted.
     expect(screen.getAllByRole('button', { name: 'Update' })).toHaveLength(1)
     expect(screen.queryByText('2 updates')).not.toBeInTheDocument()
     fireEvent.click(revert)
+    await act(async () => { await answerDialog('Revert', /Revert ".*" to the community version 1.0.0\?/) })
     await waitFor(() => expect(calls).toEqual(['POST /v1/admin/mcps/theme-factory/update']))
   })
 
   it('a cancelled confirm reverts nothing', async () => {
     const calls: string[] = []
     mockApi(calls)
-    confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
     renderPage()
     fireEvent.click(await screen.findByRole('button', { name: /Check Updates/ }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Revert to catalog 1.0.0' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Revert to 1.0.0' }))
+    await act(async () => { await answerDialog('Cancel') })
+    expect(screen.queryByRole('alertdialog')).toBeNull()
     expect(calls).toEqual([])
   })
 })

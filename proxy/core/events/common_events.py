@@ -7,9 +7,8 @@ instead of ClaudeStreamChunk, making it execution-layer agnostic.
 This is the contract between execution layers and the pump.
 """
 
-from dataclasses import dataclass, field
 import time
-
+from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
 # Event type constants
@@ -42,6 +41,7 @@ DONE = "done"                    # turn boundary
 ERROR = "error"
 QUEUE_TURN = "queue_turn"        # queued user message boundary
 ARTIFACT_TURN = "artifact_turn"  # queued artifact-interaction delivery boundary
+BG_REVIEW_TURN = "bg_review_turn"  # a run's own review of its finished background work
 PRODUCER_DONE = "producer_done"  # producer finished (all turns complete)
 
 
@@ -60,6 +60,8 @@ class CommonEvent:
 
     TEXT:
         {"content": str}
+        {"content": str, "note": True}  a progress note (text for every reader)
+        {"content": "", "note": True}   the note mark (``note_mark``)
 
     THINKING:
         {"phase": "start"|"delta"|"end", "text": str}
@@ -185,19 +187,47 @@ class CommonEvent:
         inputs = the drained messages (core/events/input_queue.py), one
         user row each, and accepted resolves to their message ids once
         the pump's lane job wrote the rows (a meeting round puts none).
-        The task producer's nudge still sends the older
-        {"text": str} (an "event_data" is read when present).
+        A phone call's spoken words go as {"text": str, "accepted"} (an
+        "event_data" is read when present): one user row.
 
     ARTIFACT_TURN:
         {"interactions": [{"token": str, "title": str, "payload": Any,
                            "payload_json": str}], "text": str}
         text = the framed prompt already sent to the engine; the pump
         persists one artifact_interaction event row per entry.
+
+    BG_REVIEW_TURN:
+        {"nudges": [{"event_type": str, "count": int, "labels": [str],
+                     "tool_use_ids": [str]}]}
+        the task producer's review of the run's finished background work,
+        one entry per kind (``bg_nudge`` agents first, then
+        ``bg_command_nudge``); the pump persists one event row per entry
+        (``count`` and ``labels``, never a "user" row), clears the named
+        jobs' badges by ``tool_use_ids`` and forwards the kind's
+        ``bg_*_complete`` frame with ``review``. The nudge prompt goes to
+        the engine as it is.
     """
 
     type: str
     data: dict = field(default_factory=dict)
     timestamp: float = field(default_factory=time.monotonic)
+
+
+#: The note mark's payload: a TEXT with ``note`` and no content says the text
+#: that just streamed is a progress note (the agent's words right before a
+#: tool call). The translator that knows its message's blocks sends it; the
+#: pump turns its open text segment into a note, the page its last text block.
+NOTE_MARK = {"content": "", "note": True}
+
+
+def note_mark() -> CommonEvent:
+    """The note mark as an event (``NOTE_MARK``)."""
+    return CommonEvent(type=TEXT, data=dict(NOTE_MARK))
+
+
+def is_note_mark(data: dict) -> bool:
+    """A TEXT payload is the note mark: ``note`` and no content."""
+    return bool(data.get("note")) and not data.get("content")
 
 
 @dataclass

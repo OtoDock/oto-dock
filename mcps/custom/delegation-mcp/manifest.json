@@ -2,7 +2,7 @@
   "name": "delegation-mcp",
   "label": "Delegation",
   "description": "Delegate work to parallel agent sessions, monitor them, and hand files back with a result",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "category": "core",
 
   "server": {
@@ -76,7 +76,7 @@
       "id": "delegation-guide",
       "loading": "on_demand",
       "file": "skills/delegation-guide/SKILL.md",
-      "description": "Reference for the delegation tools — the delegate signature and surfaces, callbacks, monitoring with list_sessions/peek_session, project mode with the board file and staged flow, send_files, attach_result_files (a worker's deliverables), reading other agents' sessions. Use before delegating work or running a multi-lane project.",
+      "description": "Reference for the delegation tools — the delegate signature and surfaces, callbacks, monitoring with list_sessions/peek_session, project mode with the board file and staged flow, send_files, attach_result_files (a worker's deliverables), moving a chat with move_chat, reading other agents' sessions. Use before delegating work or running a multi-lane project.",
       "default_exclude_from": []
     }
   ],
@@ -91,6 +91,10 @@
       {
         "tool": "peek_session",
         "tier": "open"
+      },
+      {
+        "tool": "move_chat",
+        "tier": "sensitive"
       }
     ]
   },

@@ -179,9 +179,9 @@ def resolve_cookie(args) -> str:
     # Mint by importing the proxy's auth module (must run in the proxy venv).
     sys.path.insert(0, str(_PROXY))
     try:
-        from storage import database as task_store
         from auth.providers import create_session_jwt
-    except Exception as e:  # noqa: BLE001
+        from storage import database as task_store
+    except ImportError as e:
         sys.exit(f"--mint-as needs the proxy venv + DB ({e}); use --session-cookie instead")
     user = task_store.get_user_by_email(args.mint_as) if hasattr(task_store, "get_user_by_email") else None
     if not user:
@@ -234,9 +234,9 @@ async def drive_session(idx: int, args, cookie: str, stop: asyncio.Event) -> Non
                     await asyncio.wait_for(ws.recv(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
-                except Exception:  # noqa: BLE001
+                except Exception:  # noqa: BLE001  # the load driver stops reading on any socket failure
                     break
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001  # one driven session's failure must not stop the load run
         print(f"  [session {idx}] driver error: {e}", file=sys.stderr)
 
 

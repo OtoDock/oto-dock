@@ -5,7 +5,7 @@ chat_id}``; both the HTTP mint and the ``/ws/duplex`` attach enforce chat
 access against those claims with the SAME two gates the dashboard chat path
 applies:
 
-1. the by-id chat rule (``api/agents/chats.py::can_access_chat``, the one
+1. the by-id chat rule (``core/session/visibility.py::can_access_chat``, the one
    ``resume_chat`` binds by: the chat's owner decides, never the agent's
    current mode), and
 2. the task continue-gate (a ``task-<run_id>`` chat must never be driven by a
@@ -24,8 +24,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from storage import database as task_store
 from core.session import session_kind
+from storage import database as task_store
 
 if TYPE_CHECKING:
     from auth.providers import UserContext
@@ -37,9 +37,8 @@ def chat_access_denied_reason(chat_id: str, user: UserContext | None) -> str | N
     """None when ``user`` may drive this chat over a duplex session; else the
     refusal reason. Both gates, always. Synchronous: call it on the DB
     executor."""
-    from api.agents.chats import can_access_chat
     from auth.providers import acting_role_of
-    from ws.dashboard import _task_continue_allowed
+    from core.session.visibility import _task_continue_allowed, can_access_chat
 
     chat = task_store.get_chat(chat_id)
     if not chat:
@@ -56,7 +55,8 @@ def chat_access_denied_reason(chat_id: str, user: UserContext | None) -> str | N
     from core.session import visibility
     if visibility.is_shared_chat_owner(chat.get("user_sub")):
         from core.sandbox.session_config_dir import (
-            AgentStateRefused, refuse_agent_state_below_editor,
+            AgentStateRefused,
+            refuse_agent_state_below_editor,
         )
         agent = chat.get("agent") or ""
         try:

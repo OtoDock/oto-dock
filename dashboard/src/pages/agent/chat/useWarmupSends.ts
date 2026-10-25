@@ -10,7 +10,7 @@
  * a chat switch in that window drops it, as the single slot this replaces
  * did.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useLayoutEffect } from 'react'
 import { mintQueueId, type WireImage } from '../../../hooks/useDashboardWs'
 import type { QueuedMessage } from '../../../store/types'
 
@@ -36,7 +36,7 @@ export function useWarmupSends(
   const heldRef = useRef<HeldSend[]>([])
   const [held, setHeld] = useState<HeldSend[]>([])
   const handBackRef = useRef(onHandBack)
-  handBackRef.current = onHandBack
+  useLayoutEffect(() => { handBackRef.current = onHandBack })
 
   const take = useCallback((): HeldSend[] => {
     const items = heldRef.current
@@ -78,5 +78,5 @@ export function useWarmupSends(
     files: h.files,
   })), [held])
 
-  return { send, handBack, discard, chips }
+  return useMemo(() => ({ send, handBack, discard, chips }), [send, handBack, discard, chips])
 }

@@ -30,6 +30,8 @@ from services.mcp import mcp_registry
 from services.webhooks import subscription_manager
 from storage import database as task_store
 from storage.automation import trigger_store, webhook_subscription_store
+from storage.identity import oauth_app_kinds
+from storage.pg import run_db
 
 logger = logging.getLogger("otodock.api.subscriptions")
 # No route here takes an anonymous caller (auth.providers.require_user).
@@ -197,10 +199,10 @@ async def create_subscription(
                 "action": "reconnect",
                 **(e.detail or {}),
             },
-        )
+        ) from e
     except subscription_manager.SubscriptionError as e:
-        raise HTTPException(e.status, detail={"message": str(e), **(e.detail or {})})
-    except pg_errors.UniqueViolation:
+        raise HTTPException(e.status, detail={"message": str(e), **(e.detail or {})}) from e
+    except pg_errors.UniqueViolation as exc:
         # Service rows fill every column of the unique index, so re-submitting
         # a paired loop after a partial failure hits the index on the rows
         # that already exist. A clean 409 lets the client skip them.
@@ -211,7 +213,7 @@ async def create_subscription(
                 "message": "A subscription for this target already exists "
                            "for this account in this scope",
             },
-        )
+        ) from exc
     return row
 
 
@@ -343,8 +345,33 @@ async def renew_subscription(
     try:
         updated = await subscription_manager.renew_subscription(subscription_id)
     except subscription_manager.SubscriptionError as e:
-        raise HTTPException(e.status, detail={"message": str(e), **(e.detail or {})})
+        raise HTTPException(e.status, detail={"message": str(e), **(e.detail or {})}) from e
     return updated or {"error": "not_renewable"}
+
+
+def _installation_target_spec(meta: dict, *, scope: str, agent: str | None, mcp_name: str) -> dict:
+    from services.oauth import credential_resolver, github_apps
+    owned = [i for i in oauth_app_kinds.installations_of(meta) if i.get("admin") and not i.get("suspended_at")]
+    help_text = "One subscription covers every repository the installation reaches, now and later."
+    not_owned = "Install the app on GitHub first. You can subscribe only to an installation you own."
+    if scope == "service":
+        # The ones the agent's binding covers: its pinned installation, or
+        # on a hosted account (no installation identity) every owned one.
+        bound = credential_resolver.pick_account(mcp_name, agent or "")
+        owned = [i for i in owned
+                 if bound is not None and oauth_app_kinds.binding_covers(bound.installation_id, meta, str(i.get("id")))]
+        if not owned:
+            help_text = (not_owned if oauth_app_kinds.is_hosted_app_meta(meta) else
+                         "First pick an installation as this agent's GitHub account in Agent Settings, MCPs.")
+    elif not owned:
+        help_text = not_owned
+    return {
+        "kind": "static_list", "label": "Installation", "help_text": help_text,
+        "static_options": [
+            {"value": str(i.get("id")), "label": f"{i.get('account', '')} ({github_apps.reach_label(i)})"}
+            for i in owned
+        ],
+    }
 
 
 @router.get("/v1/mcps/{mcp_name}/webhook-event-catalog")
@@ -389,13 +416,38 @@ async def get_event_catalog(
     reg_block = webhooks.get("registration", {}) or {}
     effective_mode = reg_block.get("mode", "manual")
     vendor_target_prefill = ""
+    vendor_target_spec = webhooks.get("vendor_target_spec", {})
+    granted_scopes: list[str] | None = None
+    target_kind = ""
     if account_label and scope in ("user", "service"):
         owner = (u.sub or "") if scope == "user" else ""
+        # A GitHub-App account subscribes to one of its installations: the
+        # app's own webhook delivers, so the target is a pick among the
+        # owned ones (an agent's: the ones its binding covers).
+        if webhooks.get("app_webhook"):
+            meta = subscription_manager._account_meta(
+                scope=scope, owner=owner, agent=agent, mcp_name=mcp_name, account_label=account_label,
+            )
+            if oauth_app_kinds.is_github_app_meta(meta):
+                target_kind = oauth_app_kinds.INSTALLATION_TARGET_KIND
+                vendor_target_spec = _installation_target_spec(meta, scope=scope, agent=agent, mcp_name=mcp_name)
         with contextlib.suppress(Exception):
             effective_mode = subscription_manager.resolve_effective_registration_mode(
                 mcp_name=mcp_name, scope=scope, owner=owner, agent=agent,
-                account_label=account_label,
+                account_label=account_label, target_kind=target_kind,
             )
+        # What the create-time check reads, so the modal's line and the
+        # refusal agree; unknown for a token and for an installation. A
+        # person's own (``owner`` is set on the user scope alone), or an
+        # agent's, the bound owner's, for the agent's managers (only they
+        # subscribe there).
+        if not target_kind and (owner or u.can_manage_agent(agent or "")):
+            granted = await run_db(
+                subscription_manager._read_granted_scopes,
+                scope=scope, owner=owner, agent=agent, provider_id=webhooks.get("provider_id", ""),
+                mcp_name=mcp_name, account_label=account_label,
+            )
+            granted_scopes = sorted(granted) if granted is not None else None
         extra_key = (webhooks.get("vendor_target_spec") or {}).get(
             "account_extra_key", "")
         if extra_key:
@@ -406,13 +458,13 @@ async def get_event_catalog(
                     account_label=account_label,
                 )
                 vendor_target_prefill = str(extra.get(extra_key, "") or "")
-            except Exception:
+            except (OSError, ValueError):
                 vendor_target_prefill = ""
 
     return {
         "provider_id": webhooks.get("provider_id", ""),
         "event_catalog": catalog,
-        "vendor_target_spec": webhooks.get("vendor_target_spec", {}),
+        "vendor_target_spec": vendor_target_spec,
         "webhook_base": (config.DASHBOARD_PUBLIC_URL or "").rstrip("/"),
         "registration": {
             "mode": effective_mode,
@@ -423,7 +475,24 @@ async def get_event_catalog(
             (webhooks.get("signature") or {}).get(
                 "per_subscription_secret", False)),
         "vendor_target_prefill": vendor_target_prefill,
+        # What the asked account subscribes to: an installation for a
+        # GitHub-App account, else the manifest's kinds (``""``).
+        "target_kind": target_kind,
+        # The account's recorded scopes (``None``: not known) and, for each
+        # scope a service asks for, that service's label: the modal says
+        # which one to tick when the events need more.
+        "granted_scopes": granted_scopes,
+        "scope_services": _scope_services(manifest),
     }
+
+
+def _scope_services(manifest) -> dict[str, str]:
+    services = ((manifest.credentials.oauth or {}) if manifest.credentials else {}).get("services") or []
+    named: dict[str, str] = {}
+    for service in services:
+        for scope_name in service.get("scopes") or []:
+            named.setdefault(str(scope_name), str(service.get("label") or service.get("key") or ""))
+    return named
 
 
 @router.get("/v1/subscriptions/{subscription_id}/signing-secret")

@@ -1,8 +1,9 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useLayoutEffect } from 'react'
 import { Capacitor } from '@capacitor/core'
 import { PushNotifications } from '@capacitor/push-notifications'
 import { subscribePush } from '../api/notifications'
 import { askNative } from '../lib/nativeBridge'
+import { debugWarn } from '../lib/debug/log'
 
 /** A click_url is only safe to navigate if it is a plain absolute path — a
  *  notification's source server is untrusted, so reject scheme/host/protocol-
@@ -21,8 +22,15 @@ export function appNotificationPath(data: Record<string, unknown>): string | nul
   return /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(data.id) ? `/apps/${data.id}` : null
 }
 
+/** The platform an app's push token is stored under: `ios` on an iPhone (the
+ *  relay then adds Apple's block to its messages), `android` otherwise. A
+ *  browser registers `web` through usePushSubscription. */
+export function pushPlatform(): 'ios' | 'android' {
+  return Capacitor.getPlatform() === 'ios' ? 'ios' : 'android'
+}
+
 /**
- * Registers for FCM push notifications on Android (Capacitor native).
+ * Registers for FCM push notifications in the app (Capacitor native).
  * No-op in web browsers — usePushSubscription handles Web Push there.
  *
  * Mounted once at the authenticated app root (RequireAuth) so registration is
@@ -35,7 +43,7 @@ export function appNotificationPath(data: Record<string, unknown>): string | nul
 export function useFcmPush(navigate?: (path: string) => void, enabled: boolean = true) {
   const registered = useRef(false)
   const navigateRef = useRef(navigate)
-  navigateRef.current = navigate
+  useLayoutEffect(() => { navigateRef.current = navigate })
 
   useEffect(() => {
     if (!enabled) return
@@ -49,7 +57,7 @@ export function useFcmPush(navigate?: (path: string) => void, enabled: boolean =
         // Request permission
         const result = await PushNotifications.requestPermissions()
         if (result.receive !== 'granted') {
-          console.warn('Push notification permission not granted')
+          debugWarn('Push notification permission not granted')
           return
         }
 
@@ -61,15 +69,15 @@ export function useFcmPush(navigate?: (path: string) => void, enabled: boolean =
         // six app restarts). Capacitor's own docs order it this way.
         await PushNotifications.addListener('registration', async (token) => {
           try {
-            await subscribePush('android', token.value)
+            await subscribePush(pushPlatform(), token.value)
           } catch (err) {
-            console.error('Failed to send FCM token to server:', err)
+            debugWarn('Failed to send FCM token to server:', err)
           }
         })
 
         // Registration error
         await PushNotifications.addListener('registrationError', (error) => {
-          console.error('FCM registration failed:', error)
+          debugWarn('FCM registration failed:', error)
         })
 
         // Register with FCM
@@ -104,7 +112,7 @@ export function useFcmPush(navigate?: (path: string) => void, enabled: boolean =
           }
         })
       } catch (err) {
-        console.error('FCM setup error:', err)
+        debugWarn('FCM setup error:', err)
       }
     }
 

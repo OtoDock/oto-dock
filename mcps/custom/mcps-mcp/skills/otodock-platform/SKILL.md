@@ -1,6 +1,6 @@
 ---
 name: otodock-platform
-description: "How the OtoDock platform itself works and where every setting lives — installing and first-run setup, agents, AI engines, sessions, apps and sharing, checks, departments and delegation, shared knowledge libraries, tasks/triggers/notifications, remote machines, voice, and the role-labeled settings map. Use when helping a user set up, configure, administer, troubleshoot, or navigate OtoDock."
+description: "How the OtoDock platform itself works and where every setting lives: installing and first-run setup, agents, AI engines, permission modes, sessions and where a chat runs, apps and sharing, checks, departments and delegation, shared knowledge libraries, tasks, triggers and notifications, remote machines, the Android app, voice, and the role-labeled settings map. Use when helping a user set up, configure, administer, troubleshoot, or navigate OtoDock."
 ---
 
 # OtoDock Platform Guide
@@ -22,9 +22,10 @@ deeper than this file, read the matching reference in `references/`.
 - **Sessions** are live running instances of an agent (a chat, a task run, a call).
   The platform warms, resumes, and idles them automatically. A message typed while the
   agent works reaches a Claude Code or Codex turn at its next step, otherwise it waits
-  as a faded "queued" bubble at the end of the conversation (every tab of the chat sees
-  it) and goes out with the next turn. A turn that cannot finish ends with a card that says why and, where a
-  retry helps, **Send again**.
+  as a "queued" bubble with a dashed edge at the end of the conversation (every tab of the chat sees
+  it) and goes out with the next turn. A turn that cannot finish ends with a card that says why. Where
+  the turn had started, **Resume** asks the agent to carry on from where it stopped. Where nothing
+  ran, **Send again** sends the message again.
 - **Apps** are pages an agent builds and keeps running (buttons that put it to work,
   live data, a server and database when needed): **shared** with the agent's team or
   **personal**, shareable with a person, another agent or a department, or by
@@ -35,7 +36,9 @@ deeper than this file, read the matching reference in `references/`.
 - Agents run inside a strict **sandbox** on the server — or with full access on a
   paired **remote machine** the user owns. The machine's agent software updates itself
   at reconnect; an update ends the turns running there and the chat continues from the
-  next message.
+  next message. Each chat shows where it runs, and a person can move it (references/agents.md).
+- The **Android app** opens the same dashboard and adds push notifications, the alarm for
+  urgent ones and the phone's location for agents that ask (references/setup.md).
 
 ## The two role systems — always state the required role
 
@@ -72,8 +75,10 @@ installing tools and skills is **admin**, installing an agent from the community
   Engines (personal subscriptions) · Audio · Usage.
 - **Agent Settings** (per agent): Overview · MCPs · Skills · Configuration (persona
   file, engines/model, visibility mode, department, delegation targets, shared
-  knowledge, memory) · Checks · Monitoring (scheduled tasks, triggers, notifications,
-  meetings).
+  knowledge, memory) · Checks · Monitoring (conversations, scheduled tasks, triggers,
+  notifications, meetings).
+- Every settings page shows the labels. A setting's longer explanation sits behind the
+  small round **i** beside its name: hover or tap it.
 - **Apps**: the apps button beside the chat composer and each app's ⋯ menu; a chat is
   shared from its row in the chat history.
 - **Documents** an agent delivers open in the chat's document pane (the right half of
@@ -82,9 +87,9 @@ installing tools and skills is **admin**, installing an agent from the community
   and reopen earlier deliveries read-only under its Versions button. The pane saves when
   it is minimized or hidden and before a message is sent, so the agent's next turn reads
   the edit.
-- **Admin** (admins only): Users · Usage · MCP Servers · Skills · MCP Requests · Remote
-  Machines · Shares · Monitoring · **Setup** (tabs: General · AI Engines · OtoDock ·
-  Audio · Phone · Security · System Settings).
+- **Admin** (admins only): Overview · **Setup** (tabs: General · AI Engines · OtoDock ·
+  Audio · Phone · Security · System Settings) · Users · Usage · MCP Servers · Skills ·
+  MCP Requests · Remote Machines · Shares · Reports · Monitoring.
 - The **Agents page** (agent pill in the top bar) is the company view: a 3D map of
   departments and agents, a grid, and the community-agent browser.
 

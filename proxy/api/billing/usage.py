@@ -1,30 +1,30 @@
 """Usage tracking and limits API endpoints."""
 
+import asyncio
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import get_current_user, require_auth, require_admin, UserContext, require_user
+from auth import roles
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_admin,
+    require_auth,
+    require_human,
+    require_user,
+)
 from services.billing import pool_caps, usage_service
 from storage import database as task_store
 from storage.billing import subscription_store
 
-import asyncio
-from auth import roles
-
 # No route here takes an anonymous caller (auth.providers.require_user).
+# The caller's own budget controls change from their dashboard session only
+# (``require_human``): the session token every agent subprocess holds
+# resolves to the session's owner, and these caps bound that agent's spend.
+# Reading them is fine, lifting them is not.
 router = APIRouter(dependencies=[Depends(require_user)])
-
-
-def _require_dashboard_user(user: UserContext | None) -> UserContext:
-    """The caller's own budget controls change from their dashboard session
-    only. The session token every agent subprocess holds resolves to the
-    session owner (``require_admin`` rejects it for the same reason), and
-    these caps exist to bound that agent's spend: reading them is fine,
-    lifting them is not."""
-    u = require_auth(user)
-    if getattr(u, "is_api_key", False):
-        raise HTTPException(status_code=403, detail="User authentication required (not API key)")
-    return u
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +78,7 @@ def _pool_cap_payload(scope: str, target: str) -> dict:
 
 def _write_pool_cap(scope: str, target: str, req: PoolCapRequest, by: str) -> None:
     current = subscription_store.get_pool_cap(scope, target) or {}
-    values = {f: current.get(f) for f in pool_caps.CAP_FIELDS}
+    values: dict[str, Any] = {f: current.get(f) for f in pool_caps.CAP_FIELDS}
     on_reached = current.get("on_reached") or "stop"
     for f in req.model_fields_set:
         if f == "on_reached":
@@ -110,7 +110,7 @@ async def set_my_pool_cap(
     req: PoolCapRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_dashboard_user(user)
+    require_human(user)
     await asyncio.to_thread(_write_pool_cap, "user", user.sub, req, user.sub)
     return await asyncio.to_thread(_pool_cap_payload, "user", user.sub)
 
@@ -177,7 +177,7 @@ async def set_my_limit(
     req: SetMyLimitRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_dashboard_user(user)
+    require_human(user)
     if req.period not in ("weekly", "monthly"):
         raise HTTPException(400, "period must be weekly or monthly")
     if req.cost_limit_usd is None:
@@ -199,7 +199,7 @@ async def delete_my_limit(
     req: DeleteMyLimitRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_dashboard_user(user)
+    require_human(user)
     deleted = await asyncio.to_thread(
         task_store.delete_usage_limit, "user_self", user.sub, req.period,
     )

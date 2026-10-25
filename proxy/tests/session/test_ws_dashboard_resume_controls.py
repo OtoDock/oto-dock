@@ -26,7 +26,6 @@ from tests.fixtures.ws_dashboard_harness import (
     warm_new_chat,
 )
 
-
 # A 1x1 transparent PNG — enough for Pillow to validate and save.
 _PNG_DATA_URL = (
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlE"
@@ -108,7 +107,7 @@ class TestResumeValidation:
             frame = await ws.next_frame()
             assert (frame["type"], frame["chat_id"]) == ("chat_history", cid), frame
             await ws.expect({"type": "warmup_ready", "session_id": None, "chat_id": cid,
-                             "mode": "default", "model": TEST_MODEL,
+                             "mode": "ask", "model": TEST_MODEL,
                              "execution_path": "claude-code-cli",
                              "execution_mode": "", "needs_warmup": True})
             await ws.expect({"type": "queue_snapshot", "chat_id": cid, "messages": []})
@@ -197,7 +196,7 @@ class TestByIdFramesFollowTheOpenRule:
                 await ws.expect({"type": "mode_changed", "mode": "plan", "chat_id": pool})
 
             row = task_store.get_chat(pre_switch)
-            assert row["permission_mode"] == "default"
+            assert row["permission_mode"] == "ask"
             assert (row.get("execution_mode") or "") == ""
             assert "sid-foreign" in layer.alive and layer.closed_sessions == []
             assert layer.started == [] and layer.messages == []
@@ -283,8 +282,8 @@ class TestByIdFramesFollowTheOpenRule:
         run_ws_scenario(scenario)
 
         row = task_store.get_chat(pool)
-        assert row["permission_mode"] == "default" and (row.get("execution_mode") or "") == ""
-        assert get_session_mode(live_sid) == "default"
+        assert row["permission_mode"] == "ask" and (row.get("execution_mode") or "") == ""
+        assert get_session_mode(live_sid) == "ask"
         assert layer.mode_changes == [] and layer.model_changes == []
         assert layer.closed_sessions == [] and layer.messages == []
         assert live_sid in layer.alive
@@ -325,7 +324,7 @@ class TestByIdFramesFollowTheOpenRule:
                 hist = await ws.next_frame()
                 assert hist["type"] == "chat_history" and "drive_refusal" not in hist, hist
         run_ws_scenario(scenario)
-        assert task_store.get_chat(private)["permission_mode"] == "default"
+        assert task_store.get_chat(private)["permission_mode"] == "ask"
 
     def test_a_read_only_viewer_is_never_the_sink_the_zone_or_the_location(
             self, temp_db, monkeypatch):
@@ -335,7 +334,7 @@ class TestByIdFramesFollowTheOpenRule:
         from core.session.session_state import get_session_user_tz
         from core.session.visibility import shared_chat_owner
         from storage import database as task_store
-        from ws import dashboard, dashboard_dispatch
+        from ws import dashboard, dashboard_prompts
         layer = FakeExecutionLayer()
         stub_dashboard_seams(monkeypatch, layer)
         slug = make_test_agent(collaborative=False, default_scope="agent")
@@ -344,7 +343,7 @@ class TestByIdFramesFollowTheOpenRule:
         layer.alive.add(live_sid)
         pool = _make_chat(slug, user_sub=shared_chat_owner(slug), session_id=live_sid)
         answered = []
-        monkeypatch.setattr(dashboard_dispatch, "resolve_location",
+        monkeypatch.setattr(dashboard_prompts, "resolve_location",
                             lambda rid, result, **kw: answered.append(rid) or True)
         contributor = session_cookie(sub="user-viewer", email="viewer@test.com",
                                      name="Viewer User", role="member")
@@ -524,6 +523,83 @@ class TestByIdFramesFollowTheOpenRule:
         assert sess.on_close is not None
         assert [f["state"] for f in sent if f["type"] == "pty_status"] == ["attached"]
 
+    def test_live_output_during_the_attach_follows_its_replay(self, temp_db, monkeypatch):
+        """Output the terminal prints while "attached" is being sent waits in
+        the held outbox and follows the scrollback replay; a status the
+        transport raises meanwhile keeps its place behind it."""
+        import base64
+
+        from core.session import interactive_session
+        from tests.fixtures.ws_dashboard_harness import FakeInteractiveSession
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        chat = _make_chat(slug, user_sub="user-admin", session_id="sid-order")
+        sess = FakeInteractiveSession("sid-order", chat, scrollback=b"screen")
+        sess.may_drive = lambda sub: True
+        monkeypatch.setitem(interactive_session._sessions, "sid-order", sess)
+
+        async def scenario():
+            conn = _bare_connection(chat, "sid-order", user_sub="user-admin", agent=slug, layer=layer)
+            conn._pty_viewer_sid = None
+            conn._pty_listener = None
+            plain_send = conn._send
+
+            async def _send(frame):
+                await plain_send(frame)
+                if frame.get("state") == "attached":
+                    sess.output_listener(b"live")
+                    sess.on_status("reconnecting")
+            conn._send = _send
+            await conn._attach_pty_viewer(sess)
+            for _ in range(20):
+                await asyncio.sleep(0)
+            return conn.sent
+
+        sent = asyncio.run(scenario())
+        order = [
+            f.get("state") if f["type"] == "pty_status"
+            else base64.b64decode(f["data"]).decode()
+            for f in sent if f["type"] in ("pty_status", "pty_output")
+        ]
+        assert order == ["attached", "screen", "live", "reconnecting"]
+
+    def test_an_evicted_viewer_gets_nothing_after_its_exit(self, temp_db, monkeypatch):
+        """A take-over evicts the first tab while its outbox holds a replay
+        and "reconnected": that tab must not receive them (it would answer
+        with its own size and resize the new controller's terminal)."""
+        from core.session import interactive_session
+        from tests.fixtures.ws_dashboard_harness import FakeInteractiveSession
+        layer = FakeExecutionLayer()
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        chat = _make_chat(slug, user_sub="user-admin", session_id="sid-evict")
+        sess = FakeInteractiveSession("sid-evict", chat, scrollback=b"screen")
+        sess.may_drive = lambda sub: True
+
+        class _Ring:
+            def scrollback(self):
+                return b"screen"
+        sess.pty = _Ring()
+        monkeypatch.setitem(interactive_session._sessions, "sid-evict", sess)
+
+        async def scenario():
+            conn = _bare_connection(chat, "sid-evict", user_sub="user-admin", agent=slug, layer=layer)
+            conn._pty_viewer_sid = None
+            conn._pty_listener = None
+            await conn._attach_pty_viewer(sess)
+            for _ in range(10):
+                await asyncio.sleep(0)
+            conn.sent.clear()
+            sess.on_status("reconnected")      # queues a replay + "reconnected"
+            await sess.evict_cb("superseded")  # before the drain runs
+            for _ in range(20):
+                await asyncio.sleep(0)
+            return conn
+        conn = asyncio.run(scenario())
+        assert [f["type"] for f in conn.sent] == ["pty_exit"]
+        assert conn._pty_outbox is None
+
 
 class _FakeTerminal:
     """A live interactive session: the identity rule and what was driven."""
@@ -614,6 +690,7 @@ class TestBoundTaskChatFramesPassTheContinueGate:
 
     def test_terminal_frames_on_a_task_terminal(self, temp_db, monkeypatch):
         import base64
+
         from core.session import interactive_session
         from storage import database as task_store
         slug = make_test_agent()
@@ -684,14 +761,14 @@ class TestBoundTaskChatFramesPassTheContinueGate:
             return conn.sent
 
         sent = asyncio.run(scenario())
-        assert get_session_mode("sid-pool") == "default"
+        assert get_session_mode("sid-pool") == "ask"
         # The viewer holds no role row on the Shared-only agent, so the drive
         # gate refuses first and the picker gets the stored mode back; a
         # below-editor viewer WITH a row on the agent's terminal gets the
         # terminal's own read_only answer. Either refusal leaves the
         # colleague's mode alone.
         assert any(f.get("state") == "read_only"
-                   or f == {"type": "mode_changed", "chat_id": pool, "mode": "default"}
+                   or f == {"type": "mode_changed", "chat_id": pool, "mode": "ask"}
                    for f in sent), sent
         assert layer.mode_changes == []
 
@@ -742,7 +819,7 @@ class TestResumeIdleChat:
                     "context_used": 0, "context_max": 0,
                     "cache_read": 0, "cache_write": 0, "output_tokens": 0,
                     "execution_path": "claude-code-cli",
-                    "execution_mode": "", "model": TEST_MODEL, "mode": "default",
+                    "execution_mode": "", "model": TEST_MODEL, "mode": "ask",
                     "process_alive": False,  # dead session → cross-engine options may show
                 })
                 assert [(m["role"], m["content"])
@@ -752,7 +829,7 @@ class TestResumeIdleChat:
                 # dead session → NO spawn for browsing, warmup deferred to send
                 await ws.expect({
                     "type": "warmup_ready", "session_id": None,
-                    "chat_id": cid, "mode": "default", "model": TEST_MODEL,
+                    "chat_id": cid, "mode": "ask", "model": TEST_MODEL,
                     "execution_path": "claude-code-cli",
                     "execution_mode": "", "needs_warmup": True,
                 })
@@ -785,12 +862,12 @@ class TestResumeIdleChat:
                     "context_used": 0, "context_max": 0,
                     "cache_read": 0, "cache_write": 0, "output_tokens": 0,
                     "execution_path": "claude-code-cli",
-                    "execution_mode": "", "model": TEST_MODEL, "mode": "default",
+                    "execution_mode": "", "model": TEST_MODEL, "mode": "ask",
                     "process_alive": True,  # live session → engine stays locked
                 })
                 await ws.expect({
                     "type": "warmup_ready", "session_id": live_sid,
-                    "chat_id": cid, "mode": "acceptEdits",
+                    "chat_id": cid, "mode": "autoReview",
                     "model": TEST_MODEL,
                     "execution_path": "claude-code-cli",
                     "interactive": False,
@@ -851,12 +928,12 @@ class TestWarmupTargetMismatchFields:
                 # Lazy warmup_ready carries the 4-field mismatch payload.
                 await ws.expect({
                     "type": "warmup_ready", "session_id": None,
-                    "chat_id": cid, "mode": "default", "model": TEST_MODEL,
+                    "chat_id": cid, "mode": "ask", "model": TEST_MODEL,
                     "execution_path": "claude-code-cli",
                     "execution_mode": "", "needs_warmup": True,
                     "pinned_target": "m-office", "pinned_label": "Office-PC",
                     "resolved_target": "local",
-                    "resolved_label": "local sandbox",
+                    "resolved_label": "the OtoDock platform",
                 })
                 await ws.expect({"type": "queue_snapshot", "chat_id": cid,
                                  "messages": []})
@@ -890,7 +967,7 @@ class TestWarmupTargetMismatchFields:
                 assert history["type"] == "chat_history"
                 await ws.expect({
                     "type": "warmup_ready", "session_id": None,
-                    "chat_id": cid, "mode": "default", "model": TEST_MODEL,
+                    "chat_id": cid, "mode": "ask", "model": TEST_MODEL,
                     "execution_path": "claude-code-cli",
                     "execution_mode": "", "needs_warmup": True,
                 })
@@ -915,7 +992,7 @@ class TestWarmupTargetMismatchFields:
                 assert history["type"] == "chat_history"
                 await ws.expect({
                     "type": "warmup_ready", "session_id": None,
-                    "chat_id": cid, "mode": "default", "model": TEST_MODEL,
+                    "chat_id": cid, "mode": "ask", "model": TEST_MODEL,
                     "execution_path": "claude-code-cli",
                     "execution_mode": "", "needs_warmup": True,
                 })
@@ -939,14 +1016,22 @@ class TestModeModelChange:
                 await drain_startup(ws)
                 chat_id, sid = await warm_new_chat(ws, layer, slug)
 
+                ws.client_send({"type": "mode_change", "mode": "dontAsk",
+                                "chat_id": chat_id})
+                await ws.expect({"type": "mode_changed",
+                                 "mode": "dontAsk", "chat_id": chat_id})
+                await sync_dispatch(ws)
+                assert layer.mode_changes == [(sid, "dontAsk")]
+                assert temp_db.get_chat(chat_id)["permission_mode"] == "dontAsk"
+
+                # A tab opened before 1.9 sends the old word: it lands as
+                # the current one.
                 ws.client_send({"type": "mode_change", "mode": "acceptEdits",
                                 "chat_id": chat_id})
                 await ws.expect({"type": "mode_changed",
-                                 "mode": "acceptEdits"})
+                                 "mode": "autoReview", "chat_id": chat_id})
                 await sync_dispatch(ws)
-                assert layer.mode_changes == [(sid, "acceptEdits")]
-                assert temp_db.get_chat(chat_id)["permission_mode"] == \
-                    "acceptEdits"
+                assert temp_db.get_chat(chat_id)["permission_mode"] == "autoReview"
 
                 ws.client_send({"type": "mode_change", "mode": "yolo",
                                 "chat_id": chat_id})
@@ -967,7 +1052,7 @@ class TestModeModelChange:
         from storage.billing import subscription_store
         monkeypatch.setattr(
             subscription_store, "list_models",
-            lambda path: [{"model_id": TEST_MODEL, "enabled": True},
+            lambda layer=None: [{"model_id": TEST_MODEL, "enabled": True},
                           {"model_id": "other-model", "enabled": True}],
         )
 
@@ -979,15 +1064,15 @@ class TestModeModelChange:
                 ws.client_send({"type": "model_change", "model": "other-model"})
                 await ws.expect({"type": "model_changed",
                                  "model": "other-model"})
-                ws.client_send({"type": "mode_change", "mode": "acceptEdits"})
+                ws.client_send({"type": "mode_change", "mode": "dontAsk"})
                 await ws.expect({"type": "mode_changed",
-                                 "mode": "acceptEdits"})
+                                 "mode": "dontAsk"})
                 await sync_dispatch(ws)
                 assert layer.model_changes == []
                 assert layer.mode_changes == []
                 row_a = temp_db.get_chat(chat_a)
                 assert row_a["model"] == TEST_MODEL
-                assert row_a["permission_mode"] == "default"
+                assert row_a["permission_mode"] == "autoReview"
 
                 # The next new chat starts on the deferred picks.
                 layer.start_gate = asyncio.Event()
@@ -1001,7 +1086,7 @@ class TestModeModelChange:
                 layer.start_gate.set()
                 await ws.expect({
                     "type": "warmup_ready", "session_id": ANY,
-                    "chat_id": started["chat_id"], "mode": "acceptEdits",
+                    "chat_id": started["chat_id"], "mode": "dontAsk",
                     "model": "other-model", "execution_path": "claude-code-cli",
                     "execution_target": "local", "fallback_reason": None,
                     "offline_machine_name": "", "interactive": False,
@@ -1038,7 +1123,7 @@ class TestModeModelChange:
                 assert layer.model_changes == []
                 assert layer.mode_changes == []
                 assert temp_db.get_chat(chat_b)["permission_mode"] == "plan"
-                assert temp_db.get_chat(chat_a)["permission_mode"] == "default"
+                assert temp_db.get_chat(chat_a)["permission_mode"] == "autoReview"
         run_ws_scenario(scenario)
 
     def test_resume_clears_a_new_chat_deferral(self, temp_db, monkeypatch):
@@ -1082,12 +1167,12 @@ class TestModeModelChange:
                     "context_used": 0, "context_max": 0,
                     "cache_read": 0, "cache_write": 0, "output_tokens": 0,
                     "execution_path": "claude-code-cli",
-                    "execution_mode": "", "model": TEST_MODEL, "mode": "default",
+                    "execution_mode": "", "model": TEST_MODEL, "mode": "ask",
                     "process_alive": False,
                 })
                 await ws.expect({
                     "type": "warmup_ready", "session_id": None,
-                    "chat_id": chat_b, "mode": "default", "model": TEST_MODEL,
+                    "chat_id": chat_b, "mode": "ask", "model": TEST_MODEL,
                     "execution_path": "claude-code-cli",
                     "execution_mode": "", "needs_warmup": True,
                 })
@@ -1134,7 +1219,7 @@ class TestModeModelChange:
 
 class TestStreamingTurnControls:
     def test_queue_and_cancel_during_stream(self, temp_db, monkeypatch):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
 
         layer = FakeExecutionLayer()
         stub_dashboard_seams(monkeypatch, layer)
@@ -1235,7 +1320,7 @@ class TestStreamingTurnControls:
     async def _busy_turn(self, ws, layer, slug, hold):
         """Warm a chat and open a turn that waits on ``hold``; returns
         (chat_id, sid) with the prelude frames consumed."""
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
 
         async def first_turn():
             yield CommonEvent(type=TEXT, data={"content": "working…"})
@@ -1286,6 +1371,7 @@ class TestStreamingTurnControls:
         # dropped (queued here, the steer refused) and its drained turn keeps
         # the photo.
         import json
+
         import config as cfg
         layer = FakeExecutionLayer()
         layer.steer_accepts = True
@@ -1460,7 +1546,7 @@ class TestStreamingTurnControls:
         # running turn: `steered` frame (no queue entry) with its row's id,
         # the row recorded in stream order, and the queue drain never runs
         # it as a second turn.
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
 
         layer = FakeExecutionLayer()
         layer.steer_accepts = True
@@ -1544,7 +1630,7 @@ class TestStreamingTurnControls:
         # persists the partial text — and the graceful flag suppresses the
         # next turn's cancelled-context injection while last_turn_aborted
         # still feeds the delegate user_interrupted status.
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
 
         layer = FakeExecutionLayer()
         layer.abort_graceful = True
@@ -1626,7 +1712,7 @@ class TestStreamingTurnControls:
         run_ws_scenario(scenario)
 
     def test_abort_during_stream(self, temp_db, monkeypatch):
-        from core.events.common_events import CommonEvent, TEXT
+        from core.events.common_events import TEXT, CommonEvent
 
         layer = FakeExecutionLayer()
         stub_dashboard_seams(monkeypatch, layer)
@@ -1734,7 +1820,7 @@ class TestStreamingTurnControls:
         run_ws_scenario(scenario)
 
     def test_permission_prompt_roundtrip(self, temp_db, monkeypatch):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
         from core.session.session_state import get_permission_queue
 
         layer = FakeExecutionLayer()
@@ -1819,7 +1905,10 @@ class TestPlanFilenameCarryOver:
         forking a second file. (Was a dead closure local — the carry-over
         only worked through the resume-from-DB path.)"""
         from core.events.common_events import (
-            CommonEvent, TEXT, TOOL_INPUT, DONE,
+            DONE,
+            TEXT,
+            TOOL_INPUT,
+            CommonEvent,
         )
         from core.events.stream_pump import _active_pumps
 
@@ -1923,7 +2012,7 @@ class TestWedgedPumpReap:
     ceiling reaps (the Mode D false-reap incident)."""
 
     def _hanging_turn(self, layer):
-        from core.events.common_events import CommonEvent, TEXT
+        from core.events.common_events import TEXT, CommonEvent
 
         async def turn(sid, prompt):
             yield CommonEvent(type=TEXT, data={"content": "working"})
@@ -2148,6 +2237,7 @@ class TestTaskChatModeRestore:
 
     def test_task_chat_history_carries_auto_mode(self, temp_db, monkeypatch):
         import uuid as _uuid
+
         from storage import database as task_store
 
         layer = FakeExecutionLayer()
@@ -2181,6 +2271,7 @@ class TestTaskChatModeRestore:
         too, but it keeps the task gate: no drive_refusal rides its history
         (the pickers lock only for a chat that runs as the agent)."""
         import uuid as _uuid
+
         from core.session.visibility import shared_chat_owner
         from storage import database as task_store
 
@@ -2219,6 +2310,7 @@ class TestReattachToRunningPump:
     def test_reattach_sends_warmup_ready_from_the_chat_row(self, monkeypatch):
         import contextlib
         from unittest.mock import AsyncMock, patch
+
         import ws.dashboard  # noqa: F401  # assembles the controller first
         from ws import dashboard_chat_send as mod
 
@@ -2265,7 +2357,7 @@ class TestReattachToRunningPump:
                                    role=self.user_role)
 
         monkeypatch.setattr(mod.task_store, "get_chat", lambda cid: chat_row)
-        monkeypatch.setattr(mod, "_role_and_layer",
+        monkeypatch.setattr("ws.dashboard._role_and_layer",
                             lambda *a, **k: ("admin", object()))
         monkeypatch.setattr(mod, "get_session_mode", lambda sid: "")
         monkeypatch.setattr(mod.notification_manager, "set_chat_turn_origin",
@@ -2366,7 +2458,7 @@ class TestPhoneChatReadOnly:
 
     def test_a_message_during_a_call_turn_is_refused_not_queued(self, temp_db, monkeypatch):
         from core.events import input_queue, stream_pump
-        from core.events.common_events import CommonEvent, PRODUCER_DONE, TEXT
+        from core.events.common_events import PRODUCER_DONE, TEXT, CommonEvent
         from core.session import session_kind
         from ws.dashboard_chat_support import PHONE_CHAT_READ_ONLY
         layer, cid, sid = self._call(monkeypatch)

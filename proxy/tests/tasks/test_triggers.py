@@ -23,8 +23,10 @@ import time
 from datetime import datetime, timezone
 
 import pytest
+from psycopg.errors import UniqueViolation
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -90,8 +92,8 @@ def test_trigger_payload_flows_to_dynamic_context_phone_token(temp_db):
     ``dynamic_context._build_trigger_tokens`` (same module). Smoke-test the
     contract end-to-end so a future schema change to either side surfaces
     quickly."""
-    from services.scheduler.trigger_manager import _build_trigger_payload
     from services.mcp.dynamic_context import _build_trigger_tokens
+    from services.scheduler.trigger_manager import _build_trigger_payload
 
     row = {"slug": "support-line", "scope": "agent", "agent": "support"}
     body = {"phone": "+15551234", "email": "alice@x.com"}
@@ -188,8 +190,8 @@ def test_register_rejects_cross_user_task_linkage(temp_db):
 def test_register_rejects_non_trigger_task_type(temp_db):
     """Trigger can only run task_type='trigger' tasks."""
     _seed_user("user-test")
-    from storage import database as task_store
     from services.scheduler import trigger_manager as tm
+    from storage import database as task_store
     # Create a regular one_time task
     task_store.create_dynamic_task(
         "dyn-onetime", "agent-x", "OneTime", "do {{x}}", "cli",
@@ -351,7 +353,7 @@ def test_slug_uniqueness_within_scope_owner(temp_db):
         notify_enabled=True, notify_title="X", notify_body="Y",
     )
     # Same user + same slug → unique violation
-    with pytest.raises(Exception):
+    with pytest.raises(UniqueViolation):
         tm.register_trigger(
             name="B", slug="dup",
             scope="user", agent="agent-x", created_by="user-test",
@@ -601,9 +603,9 @@ def test_substitute_fences_values_for_a_prompt(temp_db):
 
 def test_the_linked_task_prompt_is_fenced(temp_db, monkeypatch):
     import asyncio
+
     from services.infra import external_data
-    from services.scheduler import scheduler
-    from services.scheduler import trigger_manager as tm
+    from services.scheduler import scheduler, trigger_manager as tm
     from storage import database as task_store
     captured = {}
 
@@ -913,9 +915,11 @@ def test_trigger_routes_hold_the_caller_to_the_notify_reach(temp_db):
     agent's own no-user session cannot aim a trigger's notify at every user;
     a manager may rename an admin's global trigger but not re-aim it."""
     import asyncio
+
     from fastapi import HTTPException
-    from auth.providers import UserContext
+
     from api.events import triggers as api
+    from auth.providers import UserContext
     from storage.agents import agent_store
     agent_store.create_agent("agent-x", "X", created_by="user-admin")
     _seed_user("user-ed", "ed")
@@ -1000,7 +1004,9 @@ def test_firing_a_trigger_by_id_needs_the_edit_authority(temp_db, monkeypatch):
     manager may; a user-backed session only on its own agent. ``can_fire``
     says the same."""
     import asyncio
+
     from fastapi import HTTPException
+
     from api.events import triggers as api
     tx, ty, cookie, session = _by_id_world()
     fired = []
@@ -1032,9 +1038,11 @@ def test_a_user_backed_session_manages_only_its_own_agents_triggers(temp_db):
     as create does — a manager's (or an admin's) session included; a no-user
     session keeps its own agent's triggers."""
     import asyncio
+
     from fastapi import HTTPException
-    from auth.providers import UserContext
+
     from api.events import triggers as api
+    from auth.providers import UserContext
     from storage.automation import trigger_store
     tx, ty, _cookie, session = _by_id_world()
     for ctx in (session("user-m", "agent-y"), session("user-admin", "agent-y", "admin")):
@@ -1043,10 +1051,10 @@ def test_a_user_backed_session_manages_only_its_own_agents_triggers(temp_db):
             api._check_trigger_mutation_authority(tx, ctx)
         assert e.value.status_code == 403
         for call in (
-            lambda: api._edit_impl(tx["id"], api.EditTriggerRequest(name="x"), ctx),
-            lambda: api.pause_trigger_endpoint(tx["id"], user=ctx),
-            lambda: api.resume_trigger_endpoint(tx["id"], user=ctx),
-            lambda: api.delete_trigger_endpoint(tx["id"], user=ctx),
+            lambda ctx=ctx: api._edit_impl(tx["id"], api.EditTriggerRequest(name="x"), ctx),
+            lambda ctx=ctx: api.pause_trigger_endpoint(tx["id"], user=ctx),
+            lambda ctx=ctx: api.resume_trigger_endpoint(tx["id"], user=ctx),
+            lambda ctx=ctx: api.delete_trigger_endpoint(tx["id"], user=ctx),
         ):
             with pytest.raises(HTTPException) as e:
                 asyncio.run(call())
@@ -1080,7 +1088,9 @@ def test_the_keyed_read_re_raises_a_client_disconnect():
     """A body the middleware cut at its tier reaches the route as a
     disconnect; the fire must not proceed with an empty payload."""
     import asyncio
+
     from starlette.requests import ClientDisconnect
+
     from api.events import triggers
 
     async def receive():
@@ -1092,6 +1102,7 @@ def test_the_keyed_read_re_raises_a_client_disconnect():
 
 def test_the_keyed_read_tolerates_a_malformed_body():
     import asyncio
+
     from api.events import triggers
 
     async def receive():
@@ -1106,6 +1117,7 @@ def test_a_verified_key_lifts_the_cap_to_the_keyed_one(monkeypatch):
     HTTP middleware lets it through."""
     import asyncio
     import json as _json
+
     import config
     from api.events import triggers, webhook_body
     monkeypatch.setattr(config, "MAX_WEBHOOK_BODY_BYTES", 1024)
@@ -1124,8 +1136,10 @@ def test_a_verified_key_lifts_the_cap_to_the_keyed_one(monkeypatch):
 
 def test_a_body_over_the_keyed_cap_is_413(monkeypatch):
     import asyncio
-    import config
+
     from fastapi import HTTPException
+
+    import config
     from api.events import triggers
     monkeypatch.setattr(config, "MAX_WEBHOOK_BODY_BYTES", 1024)
     monkeypatch.setattr(config, "MAX_WEBHOOK_KEYED_BODY_BYTES", 2048)
@@ -1144,6 +1158,7 @@ def test_a_vendor_event_runs_a_linked_task_once_and_the_bearer_path_is_unchanged
     vendor event) keeps its documented behaviour: the header keys app
     deliveries only."""
     import asyncio
+
     from auth.webhook_providers.base import NormalizedEvent
     from services.scheduler import trigger_manager as tm
     monkeypatch.setattr(tm, "_vendor_task_fires", {})
@@ -1171,6 +1186,7 @@ def test_a_vendor_event_runs_a_linked_task_once_and_the_bearer_path_is_unchanged
 
 def test_a_vendor_task_fire_that_failed_leaves_the_event_to_the_next_delivery(temp_db, monkeypatch):
     import asyncio
+
     from auth.webhook_providers.base import NormalizedEvent
     from services.scheduler import trigger_manager as tm
     monkeypatch.setattr(tm, "_vendor_task_fires", {})

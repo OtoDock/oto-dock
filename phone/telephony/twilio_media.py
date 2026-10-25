@@ -65,8 +65,8 @@ async def read_stream_start(ws, timeout_s: float = 10.0) -> dict:
             raise TwilioMediaError("no start event within handshake timeout")
         try:
             msg = await asyncio.wait_for(ws.receive(), timeout=remaining)
-        except asyncio.TimeoutError:
-            raise TwilioMediaError("no start event within handshake timeout")
+        except asyncio.TimeoutError as exc:
+            raise TwilioMediaError("no start event within handshake timeout") from exc
         if msg.type != WSMsgType.TEXT:
             raise TwilioMediaError(f"socket ended during handshake ({msg.type})")
         try:
@@ -149,9 +149,9 @@ class TwilioMediaStreamConnection(MediaTransport):
                     digit = (data.get("dtmf") or {}).get("digit", "")
                     if digit:
                         self._put_dropping_audio((FRAME_DTMF, digit.encode()))
-                        logger.info(f"[{self.peer_addr}] DTMF digit received")
+                        logger.info("[%s] DTMF digit received", self.peer_addr)
                 # connected / unknown events: ignore.
-        except Exception:
+        except Exception:  # noqa: BLE001  # the reader's last line: a dropped socket ends the read
             pass
         finally:
             self._mark_closed()
@@ -176,8 +176,8 @@ class TwilioMediaStreamConnection(MediaTransport):
                 self._mic_drops += 1
                 if self._mic_drops % 50 == 1:
                     logger.warning(
-                        f"[{self.peer_addr}] mic backlog: dropped oldest "
-                        f"frame (total {self._mic_drops})"
+                        "[%s] mic backlog: dropped oldest "
+                        "frame (total %s)", self.peer_addr, self._mic_drops
                     )
             for f in backlog:
                 self._audio_q.put_nowait(f)
@@ -193,7 +193,7 @@ class TwilioMediaStreamConnection(MediaTransport):
                     self._out_q.task_done()
         except asyncio.CancelledError:
             return
-        except Exception:
+        except Exception:  # noqa: BLE001  # the writer's last line: any send failure marks the link closed
             self._mark_closed()
 
     def _mark_closed(self) -> None:

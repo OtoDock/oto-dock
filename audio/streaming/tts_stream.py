@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable
 
 from audio.providers.tts.base import TTSProvider
 

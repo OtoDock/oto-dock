@@ -13,7 +13,13 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import get_current_user, mask_email, require_admin, UserContext, require_user
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    mask_email,
+    require_admin,
+    require_user,
+)
 from services.infra import retention
 
 # No route here takes an anonymous caller (auth.providers.require_user).

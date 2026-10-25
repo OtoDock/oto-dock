@@ -14,11 +14,15 @@ import this package without the platform.
 """
 
 import logging
+from typing import TYPE_CHECKING, cast
 
+from services.scheduler import task_kinds
 from storage import database as task_store
 from storage.agents import agent_store
 from storage.automation import run_status
-from services.scheduler import task_kinds
+
+if TYPE_CHECKING:
+    from core.events.stream_pump import ChatStreamPump
 
 logger = logging.getLogger("otodock.scheduler")
 
@@ -49,11 +53,9 @@ async def try_steer_continue(
     from core.events import input_queue
     from core.events.common_events import TurnInput
     from core.events.stream_pump import _active_pumps
-    from core.session import session_kind
+    from core.session import interactive_session, session_kind
     from core.session.session_delivery import chat_layer
     from storage.pg import run_db
-
-    from core.session import interactive_session
 
     chat_id = chat.get("id", "")
     if not chat_id or not parent_chat_id:
@@ -86,8 +88,8 @@ async def try_steer_continue(
         ) is None:
             return None
         logger.info(
-            f"lane steer: follow-up queued on the live terminal of run={run['id']} "
-            f"chat={chat_id[:8]} by {source_agent}"
+            "lane steer: follow-up queued on the live terminal of run=%s "
+            "chat=%s by %s", run['id'], chat_id[:8], source_agent
         )
         return {
             "task_id": run.get("task_id"),
@@ -96,6 +98,7 @@ async def try_steer_continue(
             "agent": chat.get("agent"),
             "steered": True,
         }
+    pump = cast("ChatStreamPump", pump)  # no terminal: the live pump's branch
     layer = await chat_layer(chat)
     if layer is None:
         return None
@@ -104,9 +107,9 @@ async def try_steer_continue(
         if not caps.behaviour.supports_steer:
             return None
         accepted = await layer.steer(pump.session_id, prompt)
-    except Exception:
+    except Exception:  # noqa: BLE001  # a failed steer falls back to a fresh turn
         logger.warning(
-            f"lane steer: attempt failed for chat={chat_id[:8]}", exc_info=True,
+            "lane steer: attempt failed for chat=%s", chat_id[:8], exc_info=True,
         )
         return None
     if not accepted:
@@ -130,8 +133,8 @@ async def try_steer_continue(
         await input_queue.record_steer_late(chat_id, qi, extra_meta=meta,
                                             frame_extra={"event_data": meta})
     logger.info(
-        f"lane steer: follow-up steered into run={run['id']} chat={chat_id[:8]} "
-        f"by {source_agent}"
+        "lane steer: follow-up steered into run=%s chat=%s "
+        "by %s", run['id'], chat_id[:8], source_agent
     )
     return {
         "task_id": run.get("task_id"),

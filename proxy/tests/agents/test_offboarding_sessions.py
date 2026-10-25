@@ -18,8 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from services.agents import offboarding
-from services.agents import offboarding_sessions as closer
+from services.agents import offboarding, offboarding_sessions as closer
 from services.agents.offboarding import AgentLoss, OffboardEvent
 from storage import database as db
 from tests._paths import PROXY_DIR
@@ -59,8 +58,12 @@ def world(temp_db, monkeypatch):
     """Two people with usernames, fake registries, and a record of every
     close, pump stop and run stop."""
     from core.events import stream_pump
-    from core.session import interactive_session, session_manager, session_state
-    from core.session import prewarm_session_registry as prewarm
+    from core.session import (
+        interactive_session,
+        prewarm_session_registry as prewarm,
+        session_manager,
+        session_state,
+    )
     from services.scheduler import scheduler, shared
 
     pat = db.create_local_user("pat@t.com", "Pat Person", "Pat", "member", "x")

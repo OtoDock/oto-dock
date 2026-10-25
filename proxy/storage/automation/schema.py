@@ -135,6 +135,13 @@ def init_tasks(conn) -> None:
             -- (spawn_authz.validate_spawn_overrides), never at fire time.
             override_model TEXT DEFAULT '',
             override_execution_path TEXT DEFAULT '',
+            -- The machine the runs go to ('' = the agent's default), checked
+            -- on write and again at fire time (core/config/task_config_builder.py).
+            target_machine TEXT DEFAULT '',
+            -- The run's permission mode: '' = Don't Ask (the unattended
+            -- word), 'autoReview' = Auto, the engine's own review. Existing
+            -- DBs: run_migrations.
+            permission_mode TEXT DEFAULT '',
             -- An app handler on a schedule (task_type='app', APPS.md
             -- "Handlers"): the app row and the handler name; the prompt
             -- stays empty and the runner never opens a session for it.

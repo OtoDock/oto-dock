@@ -13,11 +13,11 @@ import asyncio
 import pytest
 from fastapi import HTTPException
 
-from api.meetings.meetings import create_meeting, CreateMeetingRequest
+from api.meetings.meetings import CreateMeetingRequest, create_meeting
 from auth.providers import UserContext
+from storage import database as task_store
 from storage.agents import agent_store
 from storage.mcp import mcp_store
-from storage import database as task_store
 
 
 def _user(role_map: dict[str, str], sub: str = "u-1") -> UserContext:
@@ -84,3 +84,23 @@ def test_admin_config_raises_cap(two_agents):
     _create(two_agents, ["a1", "a2"], x_agent_name="a1")
     _create(two_agents, ["a1", "a2"], x_agent_name="a1")
     assert _create(two_agents, ["a1", "a2"], x_agent_name="a1")["status"] == "pending"
+
+
+@pytest.mark.parametrize("value", ["0", " 0 "])
+def test_a_cap_of_zero_allows_no_meeting(two_agents, value):
+    """0 reads as none, as the delegation MCP's limit does since 1.8.0."""
+    mcp_store.set_mcp_config_value("meetings-mcp", "MAX_PARALLEL_SPAWNS", value)
+    with pytest.raises(HTTPException) as ei:
+        _create(two_agents, ["a1", "a2"], x_agent_name="a1")
+    assert ei.value.status_code == 403
+    assert "limited to 0 participants" in ei.value.detail
+
+
+@pytest.mark.parametrize("value", ["-1", "", "many"])
+def test_a_negative_empty_or_unreadable_cap_is_the_default(two_agents, value):
+    mcp_store.set_mcp_config_value("meetings-mcp", "MAX_PARALLEL_SPAWNS", value)
+    _create(two_agents, ["a1", "a2"], x_agent_name="a1")
+    _create(two_agents, ["a1", "a2"], x_agent_name="a1")
+    with pytest.raises(HTTPException) as ei:
+        _create(two_agents, ["a1", "a2"], x_agent_name="a1")
+    assert "max 4 total" in ei.value.detail

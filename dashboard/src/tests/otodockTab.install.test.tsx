@@ -71,7 +71,7 @@ describe('ThisInstallCard', () => {
     h.notice = { ...BASE, running: '', enabled: false, reason: 'OTODOCK_AIR_GAPPED is set' }
     noteServerVersion('1.8.0-dev')
     show()
-    await screen.findByText('Release checks are off (OTODOCK_AIR_GAPPED is set).')
+    await screen.findByText('Release checks are off: OTODOCK_AIR_GAPPED is set.')
     expect(screen.getByTestId('running-version').textContent).toBe('OtoDock 1.8.0-dev')
     expect(screen.queryByRole('button', { name: 'Check now' })).toBeNull()
   })
@@ -79,7 +79,7 @@ describe('ThisInstallCard', () => {
   it('reports an up-to-date install and the last error', async () => {
     h.notice = { ...BASE, latest: '1.8.0', checked_at: '2026-10-21T03:00:00+00:00', error: 'HTTP 403 from x' }
     show()
-    await screen.findByText('Up to date (the latest release is 1.8.0).')
+    await screen.findByText('Up to date. The latest release is 1.8.0.')
     expect(screen.getByText(/Last check failed: HTTP 403 from x/)).toBeTruthy()
   })
 })

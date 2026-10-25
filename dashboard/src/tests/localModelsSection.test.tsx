@@ -35,9 +35,9 @@ vi.mock('@/api/executionLayers', async (importOriginal) => {
         },
       }],
     }),
-    useSetLocalEndpointEngine: () => ({ mutate: setEngine, isPending: false, isError: false }),
+    useSetLocalEndpointEngine: () => ({ mutate: setEngine, mutateAsync: (v: unknown) => Promise.resolve(setEngine(v)), isPending: false, isError: false }),
     useAddLocalEndpoint: () => ({ mutate: addEndpoint, isPending: false, isError: false }),
-    useDeleteLocalEndpoint: () => ({ mutate: delEndpoint, isPending: false, isError: false }),
+    useDeleteLocalEndpoint: () => ({ mutate: delEndpoint, mutateAsync: vi.fn(() => Promise.resolve()), isPending: false, isError: false }),
   }
 })
 
@@ -48,7 +48,7 @@ describe('LocalModelsSection', () => {
     const onDiscover = vi.fn()
     render(<LocalModelsSection layer="direct-llm" onDiscover={onDiscover} />)
     expect(screen.getByText('Local Qwen')).toBeTruthy()
-    expect(screen.getByText('key set')).toBeTruthy()
+    expect(screen.getByText('Key set')).toBeTruthy()
     const direct = screen.getByLabelText('Direct LLM API') as HTMLInputElement
     const codex = screen.getByLabelText('Codex') as HTMLInputElement
     expect(direct.checked).toBe(true)
@@ -66,15 +66,37 @@ describe('LocalModelsSection', () => {
     expect((screen.getByText('Discover') as HTMLButtonElement).disabled).toBe(true)
   })
 
+  // Forms open where they are invoked: the add form under its button, above
+  // the servers; what a server's row opens (its discover panel), under it.
+  it('the add form opens above the server list', () => {
+    render(<LocalModelsSection layer="direct-llm" onDiscover={vi.fn()} />)
+    fireEvent.click(screen.getByText('+ Local server'))
+    const address = screen.getByLabelText('Server address')
+    const row = screen.getByText('Local Qwen')
+    expect(address.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it("a row's panel renders right under that row", () => {
+    render(
+      <LocalModelsSection
+        layer="direct-llm" onDiscover={vi.fn()}
+        belowRow={(id) => (id === 'd1' ? <p>Discovered models</p> : null)}
+      />,
+    )
+    const row = screen.getByText('Local Qwen')
+    const panel = screen.getByText('Discovered models')
+    expect(row.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
   it('adds an endpoint for every local-capable engine by default', () => {
     render(<LocalModelsSection layer="codex-cli" onDiscover={vi.fn()} />)
-    fireEvent.click(screen.getByText('+ Local endpoint'))
+    fireEvent.click(screen.getByText('+ Local server'))
     const both = [
       screen.getByLabelText('Use with Direct LLM API') as HTMLInputElement,
       screen.getByLabelText('Use with Codex') as HTMLInputElement,
     ]
     expect(both.map((b) => b.checked)).toEqual([true, true])
-    fireEvent.change(screen.getByLabelText('Endpoint URL'), { target: { value: 'http://192.168.1.8:8080/v1' } })
+    fireEvent.change(screen.getByLabelText('Server address'), { target: { value: 'http://192.168.1.8:8080/v1' } })
     fireEvent.click(both[1])
     fireEvent.click(screen.getByText('Add'))
     expect(addEndpoint).toHaveBeenCalledWith(

@@ -1,8 +1,11 @@
 <p align="center">
-  <img src=".github/media/logo-mark.png" alt="OtoDock" width="112" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/media/logo-mark-white.png" />
+    <img src=".github/media/logo-mark.png" alt="OtoDock" width="112" />
+  </picture>
 </p>
 
-<p align="center"><b>OtoDock — Collaborative Agents</b></p>
+<p align="center"><b>OtoDock · Collaborative Agents</b></p>
 
 <h1 align="center">The self-hosted platform for your company's AI agents.</h1>
 
@@ -15,7 +18,7 @@ chats, on schedules, on the phone and on your own machines.
 
 <p align="center">
   <a href="LICENSE"><img alt="License: FSL-1.1-ALv2" src="https://img.shields.io/badge/license-FSL--1.1--ALv2-146bb5"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.8.1-146bb5">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.9.0-146bb5">
   <a href="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://docs.otodock.io"><img alt="Docs" src="https://img.shields.io/badge/docs-docs.otodock.io-0d9488"></a>
   <a href="https://otodock.io"><img alt="Website" src="https://img.shields.io/badge/website-otodock.io-673a97"></a>
@@ -25,6 +28,7 @@ chats, on schedules, on the phone and on your own machines.
   <a href="#quick-start">Install</a> ·
   <a href="#the-two-minute-video">Video</a> ·
   <a href="https://docs.otodock.io">Docs</a> ·
+  <a href="https://otodock.io">Website</a> ·
   <a href="https://otodock.io/features">Features</a> ·
   <a href="https://github.com/OtoDock/oto-dock/discussions">Discussions</a> ·
   <a href="https://x.com/otodock">X</a> ·
@@ -32,7 +36,7 @@ chats, on schedules, on the phone and on your own machines.
 </p>
 
 <p align="center">
-  <a href="#the-two-minute-video"><img src=".github/media/hero.gif" alt="Four views of the OtoDock dashboard: a chat beside the Excel workbook it built, an app an agent built and deployed, the 3D company map of departments, and the Claude Code terminal inside the dashboard" width="100%" /></a>
+  <a href="#the-two-minute-video"><img src=".github/media/hero.gif" alt="Four views of the OtoDock dashboard: a chat beside the PowerPoint deck it built, an app an agent built and deployed, the 3D company map of departments, and the Claude Code terminal inside the dashboard" width="100%" /></a>
 </p>
 
 <p align="center"><em>Dashboard highlights. <a href="#the-two-minute-video">Watch the two-minute video</a>, made by an OtoDock agent.</em></p>
@@ -53,10 +57,13 @@ work with your agents on your self-hosted dashboard, or you can even give
 them a phone line and talk to them. All of it runs on your own Anthropic and
 OpenAI subscriptions, and on local models.
 
+OtoDock is built, tested and shipped by agents running on OtoDock.
+
 ## Quick start
 
-You need a Linux server (x86-64 or arm64) with Docker, or a Mac with Apple
-silicon and Docker Desktop, with at least 4 GB of RAM
+You need a Linux server (x86-64 or arm64) with Docker Engine 26 and Docker
+Compose 2.26 or later, or a Mac with Apple silicon and Docker Desktop, with
+at least 4 GB of RAM
 ([sizing](https://docs.otodock.io/getting-started/installation#how-much-ram))
 and about 13 GB of free disk, plus a Claude or ChatGPT subscription, an API
 key or a local model server. Then, in its own folder:
@@ -84,16 +91,10 @@ people who will work with them.
 
 ## Build your own AI agents
 
-Every agent is a digital employee. You give it a name and a job, like a
-Personal Assistant, a System Admin or a Marketing Manager, and you set it up
-to do your company's tasks or to work alongside you. It runs on your server.
-
-An agent is made of six parts, and you can edit every one of them. The
-persona tells it who it is and how it works, in plain language. The memory
-keeps what it learns across chats. The workspace is the folder where the
-everyday work lands. The knowledge folder keeps reference documents on hand.
-Skills are the techniques it applies to its work. Tools are what it is
-allowed to use ([agents](https://docs.otodock.io/concepts/agents)).
+Every agent is a digital employee you give a job. It has its own knowledge,
+workspace, skills and tools. The
+[Agents page](https://docs.otodock.io/concepts/agents) in the docs explains
+each part.
 
 ## Four ways to share one agent
 
@@ -109,7 +110,8 @@ workspace lives: private for each person, shared by the whole team, or both.
 
 ## Everyone gets the right seat
 
-Admins add each person to the agents they need.
+Each person has a role on every agent they use. The role decides what they
+can see and do there. Admins add each person to the agents they need.
 
 | Three platform roles | Four roles on every agent |
 |---|---|
@@ -122,22 +124,44 @@ Admins add each person to the agents they need.
 
 Claude Code runs on your Anthropic subscription, and Codex runs on your
 ChatGPT subscription. Every user connects their own subscription or API key,
-or an admin shares a pool. Local models on your own hardware work as well,
-through Ollama or any OpenAI-compatible server. You pick the engine per
-agent, and you can switch it per chat
-([AI engines](https://docs.otodock.io/concepts/ai-engines)).
+or an admin shares theirs with the team.
+
+Local models on your own hardware work as well, through Ollama or any
+OpenAI-compatible server. You pick the engine per agent, and you can switch
+it per chat ([AI engines](https://docs.otodock.io/concepts/ai-engines)).
 
 ## They work while you are away
 
 Agents run on any schedule, when a webhook event fires, or once at a time
-you choose. They work in your workspace, where their reports and files land,
-and they notify you when something needs you, from a quiet chime to a
-persistent danger alarm. Every run is a full chat you can open, read and
-continue, and the checks you attach judge the work at the end of a turn and
-send the agent back for another round when it falls short
-([tasks](https://docs.otodock.io/features/tasks),
-[triggers](https://docs.otodock.io/features/triggers),
-[checks](https://docs.otodock.io/features/checks)).
+you choose. They work in your workspace, where their reports and files land.
+They notify you when something needs you, from a quiet chime to a persistent
+danger alarm ([tasks](https://docs.otodock.io/features/tasks),
+[triggers](https://docs.otodock.io/features/triggers)).
+
+Every run is a full chat you can open, read and continue. The checks you
+attach judge the work at the end of a turn, and send the agent back for
+another round when it falls short
+([checks](https://docs.otodock.io/features/checks)).
+
+## Runs on your server. Works on your machines.
+
+The same agent, with the same files and tools, moves to any of your
+computers and keeps working there. By default, all your agents run on your
+server, in an isolated sandbox, with one dashboard controlling all of them.
+On your computer, the agent has full access to the machine, and you still
+work with it from the same dashboard, anywhere.
+
+You pair a laptop, a workstation or a PC running macOS, Linux or Windows
+with a one-line install. The machine keeps a single outbound connection to
+your server, so it needs no open ports, and its files stay in sync. If the
+machine goes offline, your server takes over
+([remote machines](https://docs.otodock.io/remote-machines/overview)).
+
+<p align="center">
+  <img src=".github/media/story-remote.jpg" alt="Your server with its agents, linked to a paired laptop, workstation and PC" />
+</p>
+
+<h3 align="center">Your own cloud of agents.</h3>
 
 ## Build and deploy full apps, just by asking your agent.
 
@@ -166,23 +190,6 @@ colleague when the conversation needs a person. Bring your own Twilio
 account, or connect the Asterisk or FreePBX server you already run
 ([phone](https://docs.otodock.io/features/phone)).
 
-## Runs on your server. Works on your machines.
-
-By default, all your agents run on your server, in an isolated sandbox, with
-one dashboard controlling all of them. You can also pair a laptop, a
-workstation or a PC running macOS, Linux or Windows with a one-line install.
-The machine keeps a single outbound connection to your server, so it needs
-no open ports, and its files stay in sync. The same agent then runs on that
-machine with full access to it, and you work with it from the same
-dashboard, anywhere. If the machine goes offline, your server takes over
-([remote machines](https://docs.otodock.io/remote-machines/overview)).
-
-<p align="center">
-  <img src=".github/media/story-remote.jpg" alt="Your server with its agents, linked to a paired laptop, workstation and PC" />
-</p>
-
-<h3 align="center">Your own cloud of agents.</h3>
-
 ## The two-minute video
 
 https://github.com/user-attachments/assets/743de1c6-e582-42f6-9996-cde277befbf2
@@ -194,8 +201,8 @@ https://github.com/user-attachments/assets/743de1c6-e582-42f6-9996-cde277befbf2
 
 <table>
   <tr>
-    <td width="50%"><img src=".github/media/screen-map.jpg" alt="The 3D company map: the Engineering, Marketing and Independent departments with their agents and the delegation lines between them" /></td>
-    <td width="50%"><img src=".github/media/screen-meeting.jpg" alt="The CEO agent opening a meeting with the developer agent, its work streaming live in the chat" /></td>
+    <td width="50%"><img src=".github/media/screen-map.jpg" alt="The 3D company map: departments with their agents, and the delegation lines between them" /></td>
+    <td width="50%"><img src=".github/media/screen-meeting.jpg" alt="A meeting between two agents: one opens it, and the other's work streams live in the chat" /></td>
   </tr>
   <tr>
     <td><b>Departments.</b> Organize your agents into departments. A department's delegation mode decides who can hand work to whom: <b>Down only</b>, <b>Down and across</b>, <b>All directions</b> or <b>Off</b>.</td>
@@ -203,7 +210,7 @@ https://github.com/user-attachments/assets/743de1c6-e582-42f6-9996-cde277befbf2
   </tr>
   <tr>
     <td><img src=".github/media/screen-terminal.jpg" alt="A Claude Code terminal running inside the dashboard with the agent's tools loaded" /></td>
-    <td><img src=".github/media/tour-documents.jpg" alt="An Excel workbook opened and edited inside the chat, sheets and charts included" /></td>
+    <td><img src=".github/media/tour-documents.jpg" alt="A chat beside the PowerPoint deck its agent built, open for editing in the dashboard" /></td>
   </tr>
   <tr>
     <td><b>Terminal.</b> The Claude Code or Codex terminal opens in the dashboard, with the agent's tools already loaded.</td>
@@ -223,10 +230,12 @@ the [advisories](https://github.com/OtoDock/oto-dock/security/advisories)).
 - **Network isolation, always on.** From the sandbox, private ranges, your LAN
   and cloud metadata endpoints are unreachable, and a tool that needs one
   internal service gets a path to that host alone.
-- **Secure credentials.** Credentials are encrypted at rest, and a session
-  carries only the ones its own work runs on, never another person's or the
-  platform's. git and gh fetch a connected GitHub account's token per command,
-  so it sits in no file or environment variable.
+- **Secure credentials.** Credentials saved in the database are encrypted.
+  Your chats run on your own AI and connected accounts, or on a shared key
+  your admin allows. git and gh fetch a connected GitHub account's token per
+  command, so it sits in no file or environment variable. A manager can narrow
+  what an agent does on GitHub to chosen repositories, or to reading. Anyone
+  can do the same with their own GitHub account, agent by agent.
 - **Ready for teams.** SSO sign-in, two-factor auth, and per-user cost
   budgets come standard, from the first install.
 - **Releases you can verify.** Images are built on GitHub from this
@@ -271,7 +280,7 @@ See all features at [otodock.io/features](https://otodock.io/features).
 ```
  proxy/       The platform core (FastAPI): sessions, security, scheduling,
               the agent sandbox and the WebSocket hub the dashboard talks to
- dashboard/   The React dashboard
+ dashboard/   The React dashboard, and android/ wraps it in the Android app
  mcps/        The first-party MCP tool servers and the community mirrors
  audio/       The speech package: speech to text, text to speech, voice activity
  phone/       The phone service: live calls over Twilio or Asterisk and FreePBX
@@ -295,11 +304,11 @@ step to the dashboard, and PostgreSQL holds the state.
 ChatGPT subscription for Codex, an API key, or a local model server will do,
 and each person [connects their
 own](https://docs.otodock.io/getting-started/connecting-ai) or an admin shares
-a pool.
+theirs with the team.
 
 **What does the install need?** It needs a Linux server or an Apple silicon
-Mac with Docker, 4 GB of RAM, 13 GB of disk, and sudo once on Ubuntu 24.04 and
-later.
+Mac with Docker (Engine 26 and Compose 2.26 or later), 4 GB of RAM, 13 GB of
+disk, and sudo once on Ubuntu 24.04 and later.
 
 **Is my data on my server?** Yes. It goes only to the AI providers you connect
 and the services you integrate. The install's [own
@@ -353,16 +362,3 @@ seats](https://otodock.io/pricing). Same software, signed key, no feature
 gates on your data or your agents. If a key lapses, everyone and everything
 already there keeps working. The install stops adding users, and 30 days past
 the key's end date, agents too.
-
-## A note from the author
-
-OtoDock started with Claude Code. I wanted to use it beyond the terminal
-and connect it to my services. So I built the platform around that idea.
-It has since become the place where my own agents work: large parts of
-OtoDock were built, tested, and shipped by agents running on OtoDock.
-
-It's fair source so you can run it the same way for your company, and you
-can share your builds in the
-[discussions](https://github.com/OtoDock/oto-dock/discussions).
-
-— Dimitris Mourtzis

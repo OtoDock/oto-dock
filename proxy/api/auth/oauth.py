@@ -9,6 +9,9 @@ Routes:
   GET    /v1/oauth/{provider}/accounts     — list current user's accounts for (provider, mcp_name)
   POST   /v1/oauth/{provider}/disconnect   — body: {mcp_name, account_label}
 
+The GitHub App routes of an account (the install page, the app's setup URL,
+the re-listing of its installations) are ``api/auth/oauth_app.py``.
+
 Account routing:
   * Account-label resolution: state carries an optional
     ``account_label_hint``; on callback, if missing or empty, the engine
@@ -35,26 +38,40 @@ import hmac
 import html
 import logging
 import uuid
-from urllib.parse import quote
-
-from urllib.parse import urlsplit
+from typing import TYPE_CHECKING, cast
+from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 import config
-from storage.identity import credential_store
-from storage import database as task_store
-from services.billing import relay_client
-from services.mcp import mcp_registry
-from services.oauth import mcp_authorization, oauth_engine, oauth_account_store
-from storage.pg import run_db
 from auth.oauth_providers import canonical_provider_id, get_provider
 from auth.providers import UserContext, get_current_user, require_admin, require_human
+from services.billing import relay_client
+from services.mcp import mcp_registry
+from services.oauth import (
+    github_apps,
+    mcp_authorization,
+    oauth_account_store,
+    oauth_engine,
+)
+from storage import database as task_store
+from storage.identity import credential_store, oauth_app_kinds
+from storage.pg import run_db
+
+if TYPE_CHECKING:
+    from services.mcp.mcp_manifest_types import McpManifest
 
 logger = logging.getLogger("otodock.oauth-api")
 router = APIRouter()
+
+# The start's refusals of a way to sign in: a pick the install does not
+# serve, a kind with no client set yet, and the relay's refusals of a picked
+# kind that have no sentence of their own (its row lacks that app).
+_KIND_NOT_HERE = "This way to sign in is not set up here. Pick another one."
+_NOT_SET_UP = "This way to sign in is not set up on this install yet. An admin sets it up in Admin, MCP Servers."
+_KIND_REFUSALS = dict.fromkeys(("provider_disabled", "kind_unknown"), "This way to sign in is not available right now. Pick another one.")
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +84,7 @@ class OAuthStartRequest(BaseModel):
     services: list[str]
     account_label: str = ""        # optional override; defaults to userinfo.email
     mobile: bool = False
+    app_kind: str = ""             # the kind of app picked (oauth_app_kinds.KINDS); "" = the kind in use
 
 
 class OAuthExchangeRequest(BaseModel):
@@ -103,11 +121,11 @@ def _popup_origin() -> str:
     return "/".join(parts[:3]) if len(parts) >= 3 else base
 
 
-def _success_html(provider: str, email: str) -> str:
+def _success_html(provider: str, email: str, title: str = "") -> str:
     # Dynamic values reach the inline script only via HTML-escaped data
     # attributes (attribute-safe: html.escape encodes &<>"'), so the script
     # itself is fully static; `.dataset` reads decode back to the original.
-    label = html.escape(provider.capitalize())
+    label = html.escape(title or f"{provider.capitalize()} Account Connected")
     return f"""\
 <!DOCTYPE html>
 <html><head><title>Connected</title>
@@ -123,7 +141,7 @@ def _success_html(provider: str, email: str) -> str:
 <body><div class="card" id="result" data-provider="{html.escape(provider)}"
   data-email="{html.escape(email)}" data-origin="{html.escape(_popup_origin())}">
   <div class="check">&#10003;</div>
-  <h2>{label} Account Connected</h2>
+  <h2>{label}</h2>
   <p>{html.escape(email)}</p>
   <p id="hint" style="margin-top:1rem;color:#999;font-size:0.8rem;">This window will close automatically.</p>
 </div>
@@ -213,9 +231,12 @@ def _connect_ring(cookie: str | None) -> list[str]:
 def _bound_response(payload: dict, prior: str | None, state: str) -> JSONResponse:
     """The start's answer, with the browser's ring of states extended by
     this one."""
+    return _bind(JSONResponse(payload), prior, state)
+
+
+def _bind(resp, prior: str | None, state: str):
     ring = (_connect_ring(prior) + [_state_hash(state)])[-_CONNECT_RING_MAX:]
     name, path = _connect_cookie()
-    resp = JSONResponse(payload)
     resp.set_cookie(
         name, ".".join(ring), max_age=oauth_engine.STATE_TTL_SECONDS,
         httponly=True, secure=config.COOKIE_SECURE, samesite="lax", path=path,
@@ -293,7 +314,7 @@ def _validate_services_against_manifest(
         # Some providers allow login-only flows with no service keys.
         if not valid_keys:
             return
-        raise HTTPException(400, "At least one service must be selected")
+        raise HTTPException(400, "Tick at least one service.")
     invalid = set(services) - valid_keys
     if invalid:
         raise HTTPException(
@@ -334,30 +355,48 @@ async def oauth_start(
     send the browser back to."""
     require_human(user)
     _validate_provider_for_mcp(body.mcp_name, provider)
-    _validate_services_against_manifest(body.mcp_name, body.services)
+    if body.app_kind and body.app_kind not in oauth_app_kinds.KINDS:
+        raise HTTPException(400, "Pick one of the ways to sign in shown.")
+    manifest = cast("McpManifest", mcp_registry.get_manifest(body.mcp_name))
+    oauth_block = manifest.credentials.oauth or {}
+    # The lane and the admin credential kind come first: a GitHub-App
+    # connect asks for no services (the app's permissions decide) and the
+    # kind's client signs the consent URL. The rule (`registered_client_mode`)
+    # also decides which token files count as connected, so the two never
+    # disagree.
+    registered = await run_db(mcp_authorization.registered_client_mode, manifest)
+    hosted = not registered and await run_db(
+        relay_client.hosted_oauth_active, body.mcp_name, manifest,
+    )
+    app_cred = oauth_block.get("app_credential", "")
+    creds = (
+        await run_db(credential_store.get_infra_credentials, app_cred)
+        if app_cred and not registered and not hosted else {}
+    )
+    app_kind = await _app_kind_for(provider, oauth_block, creds, registered=registered, hosted=hosted, requested=body.app_kind)
+    github_app_kind = app_kind == oauth_app_kinds.KIND_GITHUB_APP
+    services = [] if github_app_kind else list(body.services)
+    if not github_app_kind:
+        _validate_services_against_manifest(body.mcp_name, body.services)
     # A caller-supplied label rides the state to the callback where it
     # becomes a token FILENAME — validate up front so a bad one is a clear
     # 400 now instead of an opaque callback-page failure later.
     if body.account_label:
         try:
             oauth_account_store.validate_account_label(body.account_label.strip())
-        except ValueError:
+        except ValueError as exc:
             raise HTTPException(
                 400,
                 "Account label may only use letters, numbers, spaces and "
                 ". _ @ + - (no leading/trailing space, max 128 characters)",
-            )
+            ) from exc
 
-    manifest = mcp_registry.get_manifest(body.mcp_name)
-    oauth_block = manifest.credentials.oauth or {}
     redirect_uri = _redirect_uri(provider)
     _refuse_another_address(request, body.mobile)
 
     # The MCP server names its own authorization server: the install signs
-    # in through the client it registered there (or registers first). The
-    # rule (`registered_client_mode`) also decides which token files count
-    # as connected, so the two never disagree.
-    if await run_db(mcp_authorization.registered_client_mode, manifest):
+    # in through the client it registered there (or registers first).
+    if registered:
         url, state = await _start_registered_client(
             provider, body, manifest, oauth_block, redirect_uri, user,
         )
@@ -368,17 +407,18 @@ async def oauth_start(
     # OtoDock's client_secret, is the redirect target, performs the exchange,
     # and bounces the user's tokens back to install_callback echoing state.
     # Stub raises RelayNotConfigured (→ 503) until the relay is built.
-    if await run_db(relay_client.hosted_oauth_active, body.mcp_name, manifest):
+    if hosted:
         state = oauth_engine.create_state(
             user_sub=user.sub,
             mcp_name=body.mcp_name,
             provider_id=provider,
-            services=body.services,
+            services=services,
             account_label_hint=body.account_label,
             mobile=body.mobile,
             redirect_uri=redirect_uri,
+            app_kind=app_kind,
         )
-        scopes = mcp_registry.build_oauth_scopes(body.mcp_name, body.services)
+        scopes = [] if github_app_kind else mcp_registry.build_oauth_scopes(body.mcp_name, services)
         try:
             url = await relay_client.oauth_authorize_url(
                 provider_id=provider,
@@ -386,29 +426,26 @@ async def oauth_start(
                 state=state,
                 install_callback=redirect_uri,
                 user_sub=user.sub,
+                # A kind the person picked is named; an unpicked OAuth App
+                # sends none, and the relay picks it by the scopes.
+                app_kind=app_kind if github_app_kind or body.app_kind else "",
             )
         except relay_client.RelayNotConfigured as e:
-            raise HTTPException(503, str(e))
+            raise HTTPException(503, str(e)) from e
         except relay_client.RelayError as e:
             # The relay rejected the connect (e.g. seat_exceeded — the install is
             # over its licensed user cap). Surface the mapped, user-facing message.
-            raise HTTPException(403, relay_client.relay_error_message(e.code))
+            refusal = _KIND_REFUSALS.get(e.code, "") if body.app_kind else ""
+            raise HTTPException(403, relay_client.relay_error_message(e.code, refusal)) from e
         return _bound_response({"url": url}, connect_ring, state)
 
-    # SELF-MANAGED: confirm OAuth app credentials are configured (DB lookup).
-    app_cred = oauth_block.get("app_credential", "")
-    creds = (
-        await run_db(credential_store.get_infra_credentials, app_cred) if app_cred else {}
-    )
+    # SELF-MANAGED: confirm the app credentials of the kind in use are
+    # configured (the bundle was read above).
     client_id, client_secret = oauth_engine._resolve_app_credentials(
-        oauth_block, creds,
+        oauth_block, creds, app_kind,
     )
     if not client_id or not client_secret:
-        raise HTTPException(
-            500,
-            f"OAuth app credentials for {app_cred!r} are not configured. "
-            f"Admin must set them in MCP Servers.",
-        )
+        raise HTTPException(500, _NOT_SET_UP)
 
     provider_impl = get_provider(provider)
 
@@ -417,15 +454,18 @@ async def oauth_start(
         user_sub=user.sub,
         mcp_name=body.mcp_name,
         provider_id=provider,
-        services=body.services,
+        services=services,
         account_label_hint=body.account_label,
         mobile=body.mobile,
         redirect_uri=redirect_uri,
+        app_kind=app_kind,
     )
 
     # Build the scope list from the manifest — manifest is the source
-    # of truth for which scopes back which services.
-    scopes = mcp_registry.build_oauth_scopes(body.mcp_name, body.services)
+    # of truth for which scopes back which services. A GitHub App has no
+    # scopes: its permissions are the app's, and whether the user token
+    # expires (and a refresh token comes) is the app's own setting.
+    scopes = [] if github_app_kind else mcp_registry.build_oauth_scopes(body.mcp_name, services)
 
     # Incremental scope grant. Two triggers:
     #   1. Provider-level (google): ALWAYS send `include_granted_scopes=true`.
@@ -493,6 +533,29 @@ async def oauth_start(
     return _bound_response({"url": url}, connect_ring, state)
 
 
+async def _app_kind_for(
+    provider: str, oauth_block: dict, creds: dict, *, registered: bool, hosted: bool,
+    requested: str = "",
+) -> str:
+    """The admin credential kind a connect goes through: none for a
+    registered client; on a hosted MCP whose manifest declares kinds, the
+    kind the person picked (the relay holds both of the provider's apps and
+    judges it), else the relay's app (a provider with one kind never asks);
+    else the kind the admin's bundle is in, which a pick must name."""
+    if registered:
+        return ""
+    if hosted and oauth_app_kinds.declared_kinds(oauth_block):
+        if not requested:
+            return await asyncio.to_thread(relay_client.hosted_app_kind, provider)
+        if oauth_app_kinds.kind_block(oauth_block, requested):
+            return requested
+        raise HTTPException(409, _KIND_NOT_HERE)
+    kind = oauth_app_kinds.KIND_OAUTH_APP if hosted else oauth_app_kinds.active_kind(oauth_block, creds)
+    if requested and requested != kind:
+        raise HTTPException(409, _KIND_NOT_HERE)
+    return kind
+
+
 async def _start_registered_client(
     provider: str, body: OAuthStartRequest, manifest, oauth_block: dict,
     redirect_uri: str, user: UserContext,
@@ -530,7 +593,7 @@ async def _start_registered_client(
             for_resource=mcp_authorization.canonical_resource(manifest.server.url_template or ""),
         )
     except mcp_authorization.AuthorizationError as e:
-        raise HTTPException(e.status, str(e))
+        raise HTTPException(e.status, str(e)) from e
     scope = mcp_authorization.scopes_for(
         block,
         service_scopes=mcp_registry.build_oauth_scopes(body.mcp_name, body.services),
@@ -572,8 +635,11 @@ async def oauth_callback(
     state: str = Query(None),
     error: str = Query(None),
     iss: str = Query(None),
+    setup_action: str = Query(None),
+    installation_id: str = Query(None),
 ):
     """OAuth callback — web popup (HTML) or mobile deep-link (302)."""
+    from api.auth import oauth_app  # the GitHub App's install page and setup
     # Reject an unknown provider before reflecting it anywhere; the canonical
     # id comes from the registry's key set, not the request path (defense in
     # depth on top of the HTML escaping in the templates).
@@ -593,9 +659,14 @@ async def oauth_callback(
             return HTMLResponse(_error_html(
                 provider, "The authorization response carries no issuer",
             ))
-        return HTMLResponse(_error_html(provider, f"Provider returned: {error}"))
+        return HTMLResponse(_error_html(
+            provider, relay_client.CALLBACK_ERROR_MESSAGES.get(error) or f"Provider returned: {error}"))
+    if not state and (installation_id or setup_action):
+        return oauth_app.no_connect_page(setup_action)  # installed or changed on GitHub's own page
     if not code or not state:
         return HTMLResponse(_error_html(provider, "Missing code or state parameter"))
+    if oauth_engine.peek_state_install(state):  # the app asks for the authorization during its install
+        return await oauth_app.app_setup(provider, request, state, setup_action, installation_id)
 
     identity = oauth_engine.peek_state_identity(state)
     if identity is None:
@@ -639,7 +710,7 @@ async def oauth_callback(
             f"Token exchange failed ({type(e).__name__}). "
             "Check the proxy logs for details.",
         ))
-    return HTMLResponse(_success_html(provider, result.email))
+    return await oauth_app.connect_page(provider, result, request)
 
 
 @router.post("/v1/oauth/{provider}/exchange")
@@ -735,8 +806,8 @@ async def oauth_disconnect(
 
     try:
         oauth_account_store.validate_account_label(body.account_label)
-    except ValueError:
-        raise HTTPException(400, "Invalid account label")
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid account label") from exc
     username = await asyncio.to_thread(
         task_store.get_username_by_sub, user.sub,
     )
@@ -761,6 +832,12 @@ async def _disconnect_locked(
     provider: str, provider_id: str, body: OAuthDisconnectRequest,
     user: UserContext, manifest, token_dir,
 ) -> dict:
+    # A hosted GitHub-App account: the relay unbinds its GitHub person for
+    # this whole install at the revoke, so the person's other accounts
+    # re-list there right after the local delete.
+    prior_meta = await asyncio.to_thread(
+        credential_store.get_account_meta, user.sub, body.mcp_name, body.account_label,
+    )
     if token_dir is not None:
         token_data = await asyncio.to_thread(
             oauth_account_store.read_account_token, token_dir, body.account_label,
@@ -786,6 +863,9 @@ async def _disconnect_locked(
                 elif registered:
                     await _revoke_registered_client(token_data, refresh_token)
                 else:
+                    # The client that issued the token is in the file; the
+                    # bundle's active kind is the fallback for an older
+                    # file (the admin may have switched kinds since).
                     oauth_block = (manifest.credentials.oauth or {}) if manifest else {}
                     app_cred = oauth_block.get("app_credential", "")
                     creds = await asyncio.to_thread(
@@ -794,13 +874,15 @@ async def _disconnect_locked(
                     client_id, client_secret = oauth_engine._resolve_app_credentials(
                         oauth_block, creds,
                     )
+                    client_id = str(token_data.get("client_id") or client_id)
+                    client_secret = str(token_data.get("client_secret") or client_secret)
                     provider_impl = get_provider(provider)
                     await provider_impl.revoke(
                         token=refresh_token,
                         client_id=client_id,
                         client_secret=client_secret,
                     )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # the vendor revoke may fail, the local disconnect must still run
                 logger.warning("Best-effort revoke failed for %s: %s", provider, e)
 
     # Best-effort vendor DELETE for webhook subscriptions tied
@@ -820,6 +902,7 @@ async def _disconnect_locked(
         bindings = await asyncio.to_thread(
             credential_store.list_service_agent_bindings, body.mcp_name,
         )
+        installations: set[str] = set()
         for b in bindings:
             if (b.get("account_owner_sub") == user.sub
                     and b.get("account_label") == body.account_label):
@@ -830,9 +913,15 @@ async def _disconnect_locked(
                 )
                 await asyncio.to_thread(functools.partial(
                     credential_store.remove_service_agent_binding,
-                    body.mcp_name, b.get("agent_name"),
+                    body.mcp_name, cast("str", b.get("agent_name")),
                     owner_sub=user.sub, account_label=body.account_label,
                 ))
+                if b.get("installation_id"):
+                    installations.add(str(b["installation_id"]))
+        # An installation's token file stays while another person's binding
+        # still names it.
+        for installation_id in installations:
+            await asyncio.to_thread(github_apps.reap_if_orphan, provider_id, installation_id)
     except Exception:
         logger.exception(
             "Subscription cleanup raised for %s/%s (continuing with disconnect)",
@@ -849,6 +938,15 @@ async def _disconnect_locked(
         credential_store.delete_user_credentials,
         user.sub, body.mcp_name, body.account_label,
     )
+    if oauth_app_kinds.is_github_app_meta(prior_meta) and prior_meta.get("user_id"):
+        names = [m.name for m in (mcp_registry.get_mcps_by_provider(provider_id) or [])]
+        others = await asyncio.to_thread(
+            credential_store.accounts_by_github_user, names, int(prior_meta["user_id"]),
+        )
+        for a in others:
+            await asyncio.to_thread(
+                github_apps.relist_at_relay, a["user_sub"], a["mcp_name"], a["account_label"],
+            )
 
     logger.info(
         "OAuth disconnected: provider=%s mcp=%s user=%s account=%s",
@@ -917,11 +1015,7 @@ def _app_creds_for(provider: str, mcp_name: str, flow: str = "") -> tuple[str, s
     creds = credential_store.get_infra_credentials(app_cred) if app_cred else {}
     client_id, client_secret = oauth_engine._resolve_app_credentials(oauth_block, creds)
     if not client_id or not client_secret:
-        raise HTTPException(
-            500,
-            f"OAuth app credentials for {app_cred!r} are not configured. "
-            f"Admin must set them in MCP Servers.",
-        )
+        raise HTTPException(500, _NOT_SET_UP)
     return client_id, client_secret, oauth_block
 
 
@@ -1177,7 +1271,7 @@ async def pat_save(
     _validate_provider_for_mcp(body.mcp_name, provider)
 
     # Gate: manifest must declare personal_access_token as a valid flow.
-    manifest = mcp_registry.get_manifest(body.mcp_name)
+    manifest = cast("McpManifest", mcp_registry.get_manifest(body.mcp_name))
     oauth_block = manifest.credentials.oauth or {}
     flows = oauth_block.get("flows", [])
     if "personal_access_token" not in flows:
@@ -1198,7 +1292,8 @@ async def pat_save(
         )
     except Exception as e:
         # Most likely: token is invalid → userinfo 401.
-        raise HTTPException(401, f"PAT validation failed: {e}") from e
+        logger.warning("Personal access token for %s refused: %s", provider, e)
+        raise HTTPException(401, "That token was refused. Check it and try again.") from e
 
     if not userinfo.email:
         # Some providers (GitHub) don't return email if user hides it.
@@ -1219,12 +1314,12 @@ async def pat_save(
     # trailing space or an emoji in a user-typed label.
     try:
         oauth_account_store.validate_account_label(account_label)
-    except ValueError:
+    except ValueError as exc:
         raise HTTPException(
             400,
             "Account label may only use letters, numbers, spaces and "
             ". _ @ + - (no leading/trailing space, max 128 characters)",
-        )
+        ) from exc
 
     # PATs have no client_id/client_secret; persist empty strings so the
     # refresh worker's zero-expiry guard skips them safely.
@@ -1298,9 +1393,8 @@ async def admin_consent_start(
     if tenant_id == "common":
         raise HTTPException(
             400,
-            "Microsoft tenant-admin consent requires MS_TENANT_ID to be set "
-            "on the OAuth app credentials. Paste your Azure AD tenant UUID "
-            "in Admin → MCP Servers → m365-mcp → OAuth App Credentials.",
+            "Admin consent needs your Microsoft tenant ID (MS_TENANT_ID). "
+            "Paste it in Admin, MCP Servers, m365-mcp, OAuth App Credentials.",
         )
 
     redirect_uri = (

@@ -10,35 +10,50 @@ import contextlib
 import functools
 import json
 import logging
-from core.events import input_queue, tool_roles
-from core import placement
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, cast
 
-from storage import database as task_store
-from storage.agents import agent_store
-from storage.chat import meeting_status
-from storage.pg import run_db
-from core.session.session_manager import get_execution_layer
+from auth import roles
+from core import placement
+from core.background import spawn
+from core.events import input_queue, tool_roles
+from core.events.bg_command_state import get_bg_command_registry
 from core.events.common_events import (
-    CommonEvent, TEXT, THINKING, PRODUCER_DONE,
-    SYSTEM, QUEUE_TURN, TOOL_USE, TOOL_INPUT, TOOL_RESULT, METADATA,
+    METADATA,
     PLAN_MODE,
+    PRODUCER_DONE,
+    QUEUE_TURN,
+    SYSTEM,
+    TEXT,
+    THINKING,
+    TOOL_INPUT,
+    TOOL_RESULT,
+    TOOL_USE,
+    CommonEvent,
+)
+from core.events.pump_bg_monitors import (
+    _bg_agent_monitor,
+    _bg_command_monitor,
+    bg_command_monitor_running,
+    bg_monitor_running,
 )
 from core.events.stream_pump import ChatStreamPump, _active_pumps
-from core.events.bg_command_state import get_bg_command_registry
-from core.execution_layer import DEFAULT_EXECUTION_PATH
-from core.events.pump_bg_monitors import (
-    _bg_agent_monitor, bg_monitor_running,
-    _bg_command_monitor, bg_command_monitor_running,
-)
+from core.session import session_kind
+from core.session.session_manager import get_execution_layer
 from core.session.session_state import (
-    _sessions, _save_sessions,
-    get_permission_queue, get_subagent_registry, set_meeting_session_info,
-    cleanup_meeting_session_info, cleanup_session_permission_state,
-    clear_meeting_turn_routed, note_meeting_turn_text,
+    _save_sessions,
+    _sessions,
+    cleanup_meeting_session_info,
+    cleanup_session_permission_state,
+    clear_meeting_turn_routed,
+    get_permission_queue,
+    get_subagent_registry,
+    note_meeting_turn_text,
+    set_meeting_session_info,
 )
+
 # Config + per-turn prompt builders live in services.meetings.meeting_context; imported
 # here so existing call sites and tests (meeting_orchestrator.build_meeting_agent_config
 # / build_turn_prompt / _parse_directed_agents) are unchanged.
@@ -46,11 +61,18 @@ from services.meetings.meeting_context import (
     _parse_directed_agents,
     build_meeting_agent_config,
     build_turn_prompt,
+    departure_entry,
+    parent_note,
 )
-from core.session import session_kind
-from auth import roles
+from storage import database as task_store
+from storage.agents import agent_store
+from storage.agents.schema import DEFAULT_EXECUTION_PATH
+from storage.chat import meeting_status
+from storage.pg import run_db
 from ws import wire_events as wire
-from core.background import spawn
+
+if TYPE_CHECKING:
+    from core.execution_layer import ExecutionLayer
 
 logger = logging.getLogger("otodock")
 
@@ -63,8 +85,8 @@ async def shutdown_meetings() -> None:
         return
 
     count = len(_active_meetings)
-    logger.info(f"Meeting shutdown: cancelling {count} active meeting(s)")
-    for meeting_id, task in list(_active_meetings.items()):
+    logger.info("Meeting shutdown: cancelling %s active meeting(s)", count)
+    for _meeting_id, task in list(_active_meetings.items()):
         if not task.done():
             task.cancel()
 
@@ -73,7 +95,7 @@ async def shutdown_meetings() -> None:
         done, pending = await asyncio.wait(tasks, timeout=15)
         if pending:
             logger.warning(
-                f"Meeting shutdown: {len(pending)} meeting(s) didn't finish in 15s"
+                "Meeting shutdown: %s meeting(s) didn't finish in 15s", len(pending)
             )
 
     logger.info("Meeting shutdown: all active meetings cancelled")
@@ -233,7 +255,7 @@ class _TurnTracker:
 # get_execution_layer at those sites would re-resolve WITHOUT the meeting
 # creator's user_sub/role and, for a user-override meeting, return the wrong
 # layer (sending/closing on local while the session lives on the user's box).
-_meeting_session_layers: dict[str, object] = {}
+_meeting_session_layers: "dict[str, ExecutionLayer]" = {}
 
 
 def _start_participant_bg_monitors(
@@ -298,13 +320,23 @@ def _departed(active: list[str], meeting: dict | None) -> list[str]:
     return [a for a in active if a not in row_active]
 
 
+async def _note_departure(agent_slug: str, transcript: list[dict]) -> dict | None:
+    """The departure's line on the transcript (``departure_entry``); returns
+    the agent's row for the caller's announcement."""
+    ad = await run_db(agent_store.get_agent, agent_slug)
+    transcript.append(departure_entry(agent_slug, (ad or {}).get("display_name", agent_slug)))
+    return ad
+
+
 async def _announce_departure(
     agent_slug: str, agent_sessions: dict[str, str], event_queue: asyncio.Queue,
+    transcript: list[dict],
 ) -> None:
-    """A participant is out of the meeting: the dashboard greys it out, its
-    hook route is dropped and its session closes now (the meeting's end
-    closes every session again, which a closed one tolerates)."""
-    ad = await run_db(agent_store.get_agent, agent_slug)
+    """A participant is out of the meeting: the others read it in their next
+    prompt, the dashboard greys it out, its hook route is dropped and its
+    session closes now (the meeting's end closes every session again, which a
+    closed one tolerates)."""
+    ad = await _note_departure(agent_slug, transcript)
     await event_queue.put(CommonEvent(type=SYSTEM, data={
         "subtype": wire.SUBTYPE_MEETING_AGENT_LEFT,
         "agent": agent_slug,
@@ -375,8 +407,8 @@ async def _run_live_turn(
                 event.data["_meeting_agent"] = agent_slug
                 await event_queue.put(event)
 
-    except Exception as e:
-        logger.error(f"Meeting {meeting_id}: agent {agent_slug} failed: {e}")
+    except Exception as e:  # noqa: BLE001  # an agent's failed turn becomes a failure event, the meeting goes on
+        logger.error("Meeting %s: agent %s failed: %s", meeting_id, agent_slug, e)
         await event_queue.put(CommonEvent(type=SYSTEM, data={
             "subtype": wire.SUBTYPE_MEETING_AGENT_FAILED,
             "agent": agent_slug,
@@ -457,8 +489,8 @@ async def _run_parallel_batch(
                     if not tracker.observe(event):
                         continue
                         await q.put(event)
-        except Exception as e:
-            logger.error(f"Meeting {meeting_id}: agent {agent_slug} failed: {e}")
+        except Exception as e:  # noqa: BLE001  # an agent's failed turn is marked failed, the meeting goes on
+            logger.error("Meeting %s: agent %s failed: %s", meeting_id, agent_slug, e)
             tracker.tools_called.add("_failed")
         finally:
             clear_meeting_turn_routed(sid)
@@ -554,355 +586,476 @@ async def meeting_produce(
     """Producer for the meeting — directed message routing with parallel execution."""
     meeting = await run_db(task_store.get_meeting, meeting_id)
     if not meeting:
+        # The host chat's pump ends only on PRODUCER_DONE.
+        await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))
         return
 
-    max_turns = meeting.get("max_turns", 30)
-    moderator = meeting["moderator"]
-    active_participants = json.loads(meeting["active_participants"])
-
+    run = _MeetingRun(meeting_id, agent_sessions, event_queue, pump, meeting)
     # Emit meeting_started as the very first event (so WS receives it live)
     await event_queue.put(CommonEvent(type=SYSTEM, data={
         "subtype": wire.SUBTYPE_MEETING_STARTED,
         "meeting_id": meeting_id,
         "topic": meeting["topic"],
         "participants": meeting_participants or [],
-        "moderator": moderator,
-        "max_turns": max_turns,
+        "moderator": run.moderator,
+        "max_turns": run.max_turns,
     }))
-    transcript: list[dict] = []
-    total_turns = 0
-    meeting_total_cost = 0.0
-    # Per-agent cumulative cost tracking — METADATA from CLI is cumulative,
-    # so we compute per-turn delta: turn_cost = metadata_cost - last_cost.
-    _agent_cumulative_cost: dict[str, float] = {}
-    last_speaker: str | None = None
-    turns_since_moderator = 0
-    paused_pending: dict | None = None
-    meeting_active = True
-    # Thin-turn auto-restate state: one restate per agent per meeting
-    # (loop-proof), and the thin turn's routing deferred until the restated
-    # message exists so the recipient isn't queued to read an empty report.
-    restated_agents: set[str] = set()
-    pending_restates: dict[str, list[str] | None] = {}
-
-    # Per-agent pending queues
-    pending: dict[str, list] = {a: [] for a in active_participants}
 
     try:
         # Moderator speaks first. Inside the try: a moderator that is not a
         # participant ends the meeting with an error and PRODUCER_DONE still
         # goes out, so the host chat's pump ends.
-        pending[moderator].append({"type": "start"})
-        while meeting_active and total_turns < max_turns:
-            # Find agents with pending messages
-            ready = [a for a in active_participants if pending.get(a)]
-
-            # A pending restate runs ALONE. The thin turn's routing is
-            # deferred, but another agent's routing from the same round can
-            # still queue a recipient — running it in parallel with the
-            # restate lets it read the transcript without the restated
-            # findings (observed live: the moderator ended the meeting while
-            # the restate was still streaming, and the batch's end_meeting
-            # break discarded the restated content entirely).
-            if pending_restates:
-                restate_ready = [a for a in ready if a in pending_restates]
-                if restate_ready:
-                    ready = restate_ready
-
-            if not ready:
-                if last_speaker == moderator or moderator not in active_participants:
-                    # Moderator was last (natural conclusion), or is out of
-                    # the meeting: a wrap-up queued for it would never run
-                    # and the loop would go round without yielding.
-                    break
-                else:
-                    # Auto-queue moderator for wrap-up
-                    pending.setdefault(moderator, []).append({"type": "wrapup"})
-                    continue
-
-            # Snapshot pending for ready agents, then clear
-            pending_snapshot = {a: list(pending.get(a, [])) for a in ready}
-            for a in ready:
-                pending[a] = []
-
-            if len(ready) == 1:
-                # Single agent: stream live to pump (no buffering)
-                batch_results = [await _run_live_turn(
-                    ready[0], agent_sessions, meeting, transcript,
-                    pending_snapshot, event_queue, meeting_id,
-                )]
-            else:
-                # Multiple agents: parallel execution, sequential display
-                batch_results = await _run_parallel_batch(
-                    ready, agent_sessions, meeting, transcript,
-                    pending_snapshot, event_queue, meeting_id,
-                )
-
-            # Process results: update transcript, route responses
-            batch_agents = set(r.agent for r in batch_results)
-
-            for result in batch_results:
-                if "_failed" in result.tools_called:
-                    active_participants = [a for a in active_participants if a != result.agent]
-                    pending_restates.pop(result.agent, None)
-                    # Under the row's lock: a leave written by the route
-                    # meanwhile stays written.
-                    await run_db(task_store.remove_active_participant, meeting_id,
-                                 result.agent, meeting_status.LEAVABLE)
-                    try:
-                        _sid = agent_sessions[result.agent]
-                        layer = _meeting_session_layers.get(_sid) or get_execution_layer(result.agent)
-                        await layer.close_session(_sid)
-                    except Exception:
-                        pass
-                    # A failed agent must not strand the meeting: if the
-                    # MODERATOR failed there is nobody to drive rounds or
-                    # conclude — end now (the meeting previously froze with no
-                    # further turns until a proxy restart marked it orphaned).
-                    # If too few participants remain, wrap up via the
-                    # moderator (mirrors the leave_meeting path).
-                    if result.agent == moderator:
-                        meeting_active = False
-                    elif len(active_participants) < 2:
-                        pending.setdefault(moderator, []).append({"type": "wrapup"})
-                    continue
-
-                total_turns += 1
-                last_speaker = result.agent
-
-                # Compute per-turn cost delta.
-                # CLI METADATA is cumulative per session → compute delta.
-                # Codex/Direct METADATA has cost_is_delta=True → use directly.
-                raw_cost = result.cost or 0
-                if result.cost_is_delta:
-                    # Cost is already per-turn (Codex, Direct LLM)
-                    turn_delta = raw_cost
-                else:
-                    # Cost is cumulative (CLI) — compute delta per agent session
-                    prev_cost = _agent_cumulative_cost.get(result.agent, 0)
-                    turn_delta = max(0, raw_cost - prev_cost)
-                    if raw_cost > 0:
-                        _agent_cumulative_cost[result.agent] = raw_cost
-                meeting_total_cost += turn_delta
-
-                # Emit cost as metadata so the pump can forward to frontend.
-                # The turn_end event has cost=0; this separate event carries the delta.
-                if turn_delta > 0:
-                    await event_queue.put(CommonEvent(type=METADATA, data={
-                        "cost_usd": turn_delta,
-                        "_meeting_cost": True,  # flag so pump knows this is meeting cost
-                        # The speaker's session: the pump resolves cost_billed
-                        # (show/hide) per participant account, not the host's.
-                        "session_id": agent_sessions.get(result.agent, ""),
-                    }))
-
-                # Add to transcript
-                entry = {
-                    "agent": result.agent,
-                    "content": result.content,
-                    "thinking": result.thinking,
-                    "tools": result.tools,
-                    "role": "assistant",
-                }
-                transcript.append(entry)
-
-                # Save to DB
-                await run_db(
-                    task_store.add_meeting_turn,
-                    meeting_id, total_turns, 0, result.agent, "assistant",
-                    result.content, result.thinking,
-                    json.dumps(result.tools),
-                    agent_sessions.get(result.agent, ""),
-                    turn_delta,
-                )
-
-                # Check end_meeting — the MODERATOR's only. The signal is
-                # recorded at TOOL_INPUT, before the API refuses a
-                # participant's call (403), so without this guard any
-                # participant could end the meeting by calling it.
-                if "end_meeting" in result.tools_called and result.agent == moderator:
-                    meeting_active = False
-                    break
-
-                # Check propose_conclude — pause, queue only moderator
-                if "propose_conclude" in result.tools_called:
-                    paused_pending = {a: list(pending.get(a, [])) for a in pending}
-                    for a in pending:
-                        pending[a] = []
-                    pending.setdefault(moderator, []).append({
-                        "type": "conclude_proposal",
-                        "from": result.agent,
-                    })
-                    break
-
-                # Check leave_meeting
-                if "leave_meeting" in result.tools_called:
-                    active_participants = [a for a in active_participants if a != result.agent]
-                    pending_restates.pop(result.agent, None)
-                    pending.pop(result.agent, None)
-                    # The route's own write took it out already when the
-                    # call succeeded; under the row's lock either way, so a
-                    # concurrent leave stays written.
-                    await run_db(task_store.remove_active_participant, meeting_id,
-                                 result.agent, meeting_status.LEAVABLE)
-                    await _announce_departure(result.agent, agent_sessions, event_queue)
-                    if result.agent == moderator:
-                        # Nobody is left to drive the rounds or conclude:
-                        # the meeting ends, as when the moderator fails.
-                        meeting_active = False
-                    elif len(active_participants) < 2:
-                        if last_speaker != moderator:
-                            pending.setdefault(moderator, []).append({"type": "wrapup"})
-                        else:
-                            meeting_active = False
-                    continue
-
-                # Thin-turn auto-restate: data tools ran but no text followed
-                # the last data-tool result — the findings stayed in
-                # (non-streamed) thinking and the relay would deliver nothing
-                # of substance. Queue the SAME agent to restate before the
-                # recipients run; the thin entry stays on the transcript
-                # (routing controls turn order, not visibility).
-                directed = result.directed_to
-                if result.agent in pending_restates:
-                    # This turn IS the restate — deliver it, inheriting the
-                    # deferred targets when it didn't call direct_to again.
-                    deferred = pending_restates.pop(result.agent)
-                    if directed is None:
-                        directed = deferred
-                else:
-                    ran_data_tools = any(
-                        t.get("name") and _tool_resets_tail(t["name"])
-                        for t in result.tools
-                    )
-                    relayable = len(result.content.strip())
-                    if (result.agent not in restated_agents
-                            and (relayable == 0
-                                 or (ran_data_tools and result.tail_text == 0
-                                     and relayable < _THIN_TURN_MAX_CHARS))):
-                        restated_agents.add(result.agent)
-                        pending_restates[result.agent] = directed
-                        pending.setdefault(result.agent, []).append({"type": "restate"})
-                        logger.info(
-                            f"Meeting {meeting_id}: thin turn from {result.agent} "
-                            f"({len(result.content)} chars, no text after tools) — restating"
-                        )
-                        continue
-
-                # Route response based on direct_to
-                if directed is not None:
-                    for target in directed:
-                        if target in active_participants and target != result.agent:
-                            pending.setdefault(target, []).append(entry)
-                else:
-                    # Broadcast to all except self and agents in same batch
-                    for other in active_participants:
-                        if other != result.agent and other not in batch_agents:
-                            pending.setdefault(other, []).append(entry)
-
-            # Check if moderator decided to resume after propose_conclude, or
-            # whether an end or a leave landed from outside this loop.
-            meeting = await run_db(task_store.get_meeting, meeting_id)
-            # A leave through the route (the creator, an admin, the master
-            # key, or the agent's own call) edits only the row: the agents it
-            # took out leave the loop here, after the round they may have
-            # spoken in, and the work queued for them is dropped.
-            gone = _departed(active_participants, meeting)
-            if gone:
-                active_participants = [a for a in active_participants if a not in gone]
-                for agent in gone:
-                    pending.pop(agent, None)
-                    pending_restates.pop(agent, None)
-                    if paused_pending:
-                        paused_pending.pop(agent, None)
-                    await _announce_departure(agent, agent_sessions, event_queue)
-                if moderator in gone:
-                    meeting_active = False
-                elif len(active_participants) < 2 and meeting_active:
-                    if last_speaker != moderator:
-                        pending.setdefault(moderator, []).append({"type": "wrapup"})
-                    else:
-                        meeting_active = False
-            if meeting and meeting["status"] == meeting_status.PAUSED:
-                # The moderator spoke without ending: resume. One conditional
-                # write, so an end that lands between the read and here
-                # (CONCLUDING) is never overwritten back to ACTIVE.
-                if moderator in batch_agents and meeting_active and await run_db(
-                        task_store.update_meeting_if, meeting_id,
-                        (meeting_status.PAUSED,), status=meeting_status.ACTIVE):
-                    if paused_pending:
-                        for a, msgs in paused_pending.items():
-                            if a != moderator and msgs and a in active_participants:
-                                pending.setdefault(a, []).extend(msgs)
-                        paused_pending = None
-            elif meeting and meeting["status"] in meeting_status.ROUND_STOPS:
-                meeting_active = False
-
-            # Auto-queue moderator after 3+ turns without speaking
-            if moderator in batch_agents:
-                turns_since_moderator = 0
-            else:
-                turns_since_moderator += len([r for r in batch_results if "_failed" not in r.tools_called])
-
-            # Hold the check-in while a restate is in flight — a moderator
-            # turn queued now would run in parallel with the restating agent
-            # and read the transcript before the restated findings exist.
-            if (turns_since_moderator >= 3 and not pending.get(moderator)
-                    and not pending_restates):
-                pending.setdefault(moderator, []).append({"type": "checkin"})
-                turns_since_moderator = 0
-
-            # Check for user messages: the chat's queue, read per round (a
-            # meeting turn never takes a steer). The pump writes their rows,
-            # after the round's content, and clears the chips.
-            queued_now = input_queue.get(pump.chat_id).take()
-            if queued_now:
-                await event_queue.put(CommonEvent(type=QUEUE_TURN, data={"inputs": queued_now}))
-            for queued in queued_now:
-                # The agents read the engine text (attachment paths included);
-                # the row keeps the raw text and the attachment meta.
-                user_entry = {
-                    "agent": "user",
-                    "content": queued.item.cli_text,
-                    "thinking": "",
-                    "tools": [],
-                    "role": "user",
-                }
-                transcript.append(user_entry)
-                # User messages go only to the moderator — the moderator
-                # decides how to act (route to others, answer directly, etc.)
-                pending.setdefault(moderator, []).append(user_entry)
-
-            # Background-work nudges from the bg monitors (system_queue).
-            _drain_system_notes(pump, transcript, pending, moderator)
-
+        run.pending[run.moderator].append({"type": "start"})
+        while run.meeting_active and run.total_turns < run.max_turns:
+            if await run.next_round():
+                break
         # Meeting concluded
         await event_queue.put(CommonEvent(type=SYSTEM, data={
             "subtype": wire.SUBTYPE_MEETING_CONCLUDED,
             "meeting_id": meeting_id,
-            "total_turns": total_turns,
-            "cost_usd": meeting_total_cost,
+            "total_turns": run.total_turns,
+            "cost_usd": run.meeting_total_cost,
         }))
-
     except asyncio.CancelledError:
-        logger.info(f"Meeting {meeting_id} cancelled")
+        run.ending = _STOPPED
+        logger.info("Meeting %s cancelled", meeting_id)
         await event_queue.put(CommonEvent(type=SYSTEM, data={
             "subtype": wire.SUBTYPE_MEETING_CONCLUDED,
             "meeting_id": meeting_id,
-            "total_turns": total_turns,
-            "cost_usd": meeting_total_cost,
+            "total_turns": run.total_turns,
+            "cost_usd": run.meeting_total_cost,
             "cancelled": True,
         }))
     except Exception as e:
-        logger.error(f"Meeting {meeting_id} producer error: {e}", exc_info=True)
+        run.ending = _FAILED
+        logger.exception("Meeting %s producer error: %s", meeting_id, e)
         await event_queue.put(CommonEvent(type=SYSTEM, data={
             "subtype": wire.SUBTYPE_MEETING_CONCLUDED,
             "meeting_id": meeting_id,
-            "total_turns": total_turns,
+            "total_turns": run.total_turns,
             "error": str(e)[:200],
         }))
     finally:
-        await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))
+        # Before PRODUCER_DONE: the turn the pump's end lets start reads it.
+        # The note is best effort; the done event is not (the host chat's
+        # pump ends only on it).
+        try:
+            await _leave_parent_note(meeting_id, run.transcript, run.total_turns, run.ending,
+                                     summary=run.ended_by_moderator)
+        finally:
+            await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))
+
+
+class _MeetingRun:
+    """One meeting producer's state: the meeting row, who speaks and who
+    waits, the transcript, the cost, the turn counts the rounds move, and
+    how the producer ended."""
+
+    def __init__(self, meeting_id: str, agent_sessions: dict[str, str],
+                 event_queue: asyncio.Queue, pump: ChatStreamPump, meeting: dict) -> None:
+        self.meeting_id = meeting_id
+        self.agent_sessions = agent_sessions
+        self.event_queue = event_queue
+        self.pump = pump
+        self.meeting = meeting
+        self.max_turns = self.meeting.get("max_turns", 30)
+        self.moderator = self.meeting["moderator"]
+        self.active_participants = json.loads(self.meeting["active_participants"])
+        self.transcript: list[dict] = []
+        self.total_turns = 0
+        self.meeting_total_cost = 0.0
+        # Per-agent cumulative cost tracking — METADATA from CLI is cumulative,
+        # so we compute per-turn delta: turn_cost = metadata_cost - last_cost.
+        self._agent_cumulative_cost: dict[str, float] = {}
+        self.last_speaker: str | None = None
+        self.turns_since_moderator = 0
+        self.paused_pending: dict | None = None
+        self.meeting_active = True
+        # Thin-turn auto-restate state: one restate per agent per meeting
+        # (loop-proof), and the thin turn's routing deferred until the restated
+        # message exists so the recipient isn't queued to read an empty report.
+        self.restated_agents: set[str] = set()
+        self.pending_restates: dict[str, list[str] | None] = {}
+
+        # Per-agent pending queues
+        self.pending: dict[str, list] = {a: [] for a in self.active_participants}
+        # How the producer ended: only an ended meeting leaves its host chat a note,
+        # and its closing words are a summary only when the moderator ended it.
+        self.ending = _ENDED
+        self.ended_by_moderator = False
+
+    async def next_round(self) -> bool:
+        """One round: the agents with work queued speak (one live, several
+        in parallel and shown in turn) and their turns are routed. True when
+        nobody is left to speak."""
+        # Find agents with pending messages
+        ready = [a for a in self.active_participants if self.pending.get(a)]
+
+        # A pending restate runs ALONE. The thin turn's routing is
+        # deferred, but another agent's routing from the same round can
+        # still queue a recipient — running it in parallel with the
+        # restate lets it read the transcript without the restated
+        # findings (observed live: the moderator ended the meeting while
+        # the restate was still streaming, and the batch's end_meeting
+        # break discarded the restated content entirely).
+        if self.pending_restates:
+            restate_ready = [a for a in ready if a in self.pending_restates]
+            if restate_ready:
+                ready = restate_ready
+
+        if not ready:
+            if self.last_speaker == self.moderator or self.moderator not in self.active_participants:
+                # Moderator was last (natural conclusion), or is out of
+                # the meeting: a wrap-up queued for it would never run
+                # and the loop would go round without yielding.
+                return True
+            else:
+                # Auto-queue moderator for wrap-up
+                self.pending.setdefault(self.moderator, []).append({"type": "wrapup"})
+                return False
+
+        batch_results = await self._run_batch(ready)
+        # Process results: update transcript, route responses
+        batch_agents = set(r.agent for r in batch_results)
+
+        for result in batch_results:
+            if await self._apply_result(result, batch_agents):
+                break
+        await self._after_round(batch_agents, batch_results)
+        return False
+
+    async def _run_batch(self, ready: list[str]) -> list:
+        """The ready agents' turns: one streams live, several run in parallel."""
+        # Snapshot pending for ready agents, then clear
+        pending_snapshot = {a: list(self.pending.get(a, [])) for a in ready}
+        for a in ready:
+            self.pending[a] = []
+
+        if len(ready) == 1:
+            # Single agent: stream live to pump (no buffering)
+            batch_results = [await _run_live_turn(
+                ready[0], self.agent_sessions, self.meeting, self.transcript,
+                pending_snapshot, self.event_queue, self.meeting_id,
+            )]
+        else:
+            # Multiple agents: parallel execution, sequential display
+            batch_results = await _run_parallel_batch(
+                ready, self.agent_sessions, self.meeting, self.transcript,
+                pending_snapshot, self.event_queue, self.meeting_id,
+            )
+        return batch_results
+
+    async def _apply_result(self, result, batch_agents: set[str]) -> bool:
+        """One turn of the round: its cost, its transcript entry and row, an
+        end, a proposal to conclude, a leave, a restate, its routing. True
+        when the rest of the batch is not routed (an end, a proposal)."""
+        if await self._drop_failed(result):
+            return False
+        entry = await self._record_turn(result)
+        # Check end_meeting — the MODERATOR's only. The signal is
+        # recorded at TOOL_INPUT, before the API refuses a
+        # participant's call (403), so without this guard any
+        # participant could end the meeting by calling it.
+        if "end_meeting" in result.tools_called and result.agent == self.moderator:
+            self.meeting_active = False
+            self.ended_by_moderator = True
+            return True
+
+        # Check propose_conclude — pause, queue only moderator
+        if "propose_conclude" in result.tools_called:
+            self.paused_pending = {a: list(self.pending.get(a, [])) for a in self.pending}
+            for a in self.pending:
+                self.pending[a] = []
+            self.pending.setdefault(self.moderator, []).append({
+                "type": "conclude_proposal",
+                "from": result.agent,
+            })
+            return True
+        if await self._left(result):
+            return False
+        # Thin-turn auto-restate: data tools ran but no text followed
+        # the last data-tool result — the findings stayed in
+        # (non-streamed) thinking and the relay would deliver nothing
+        # of substance. Queue the SAME agent to restate before the
+        # recipients run; the thin entry stays on the transcript
+        # (routing controls turn order, not visibility).
+        directed = result.directed_to
+        if result.agent in self.pending_restates:
+            # This turn IS the restate — deliver it, inheriting the
+            # deferred targets when it didn't call direct_to again.
+            deferred = self.pending_restates.pop(result.agent)
+            if directed is None:
+                directed = deferred
+        else:
+            ran_data_tools = any(
+                t.get("name") and _tool_resets_tail(t["name"])
+                for t in result.tools
+            )
+            relayable = len(result.content.strip())
+            if (result.agent not in self.restated_agents
+                    and (relayable == 0
+                         or (ran_data_tools and result.tail_text == 0
+                             and relayable < _THIN_TURN_MAX_CHARS))):
+                self.restated_agents.add(result.agent)
+                self.pending_restates[result.agent] = directed
+                self.pending.setdefault(result.agent, []).append({"type": "restate"})
+                logger.info(
+                    "Meeting %s: thin turn from %s "
+                    "(%s chars, no text after tools) — restating",
+                    self.meeting_id, result.agent, len(result.content)
+                )
+                return False
+
+        # Route response based on direct_to
+        if directed is not None:
+            for target in directed:
+                if target in self.active_participants and target != result.agent:
+                    self.pending.setdefault(target, []).append(entry)
+        else:
+            # Broadcast to all except self and agents in same batch
+            for other in self.active_participants:
+                if other != result.agent and other not in batch_agents:
+                    self.pending.setdefault(other, []).append(entry)
+        return False
+
+    async def _drop_failed(self, result) -> bool:
+        """A turn that failed takes its agent out of the meeting (a failed
+        moderator ends it). True for such a turn."""
+        if "_failed" in result.tools_called:
+            self.active_participants = [a for a in self.active_participants if a != result.agent]
+            self.pending_restates.pop(result.agent, None)
+            await _note_departure(result.agent, self.transcript)
+            # Under the row's lock: a leave written by the route
+            # meanwhile stays written.
+            await run_db(task_store.remove_active_participant, self.meeting_id,
+                         result.agent, meeting_status.LEAVABLE)
+            try:
+                _sid = self.agent_sessions[result.agent]
+                layer = _meeting_session_layers.get(_sid) or get_execution_layer(result.agent)
+                await layer.close_session(_sid)
+            except Exception:  # noqa: BLE001  # closing a meeting agent's session at the meeting's end
+                pass
+            # A failed agent must not strand the meeting: if the
+            # MODERATOR failed there is nobody to drive rounds or
+            # conclude — end now (the meeting previously froze with no
+            # further turns until a proxy restart marked it orphaned).
+            # If too few participants remain, wrap up via the
+            # moderator (mirrors the leave_meeting path).
+            if result.agent == self.moderator:
+                self.meeting_active = False
+            elif len(self.active_participants) < 2:
+                self.pending.setdefault(self.moderator, []).append({"type": "wrapup"})
+            return True
+        return False
+
+    async def _record_turn(self, result) -> dict:
+        """Count the turn, add its cost (a CLI session reports a running
+        total), and store it in the transcript and the meeting's rows."""
+        self.total_turns += 1
+        self.last_speaker = result.agent
+
+        # Compute per-turn cost delta.
+        # CLI METADATA is cumulative per session → compute delta.
+        # Codex/Direct METADATA has cost_is_delta=True → use directly.
+        raw_cost = result.cost or 0
+        if result.cost_is_delta:
+            # Cost is already per-turn (Codex, Direct LLM)
+            turn_delta = raw_cost
+        else:
+            # Cost is cumulative (CLI) — compute delta per agent session
+            prev_cost = self._agent_cumulative_cost.get(result.agent, 0)
+            turn_delta = max(0, raw_cost - prev_cost)
+            if raw_cost > 0:
+                self._agent_cumulative_cost[result.agent] = raw_cost
+        self.meeting_total_cost += turn_delta
+
+        # Emit cost as metadata so the pump can forward to frontend.
+        # The turn_end event has cost=0; this separate event carries the delta.
+        if turn_delta > 0:
+            await self.event_queue.put(CommonEvent(type=METADATA, data={
+                "cost_usd": turn_delta,
+                "_meeting_cost": True,  # flag so pump knows this is meeting cost
+                # The speaker's session: the pump resolves cost_billed
+                # (show/hide) per participant account, not the host's.
+                "session_id": self.agent_sessions.get(result.agent, ""),
+            }))
+
+        # Add to transcript
+        entry = {
+            "agent": result.agent,
+            "content": result.content,
+            "thinking": result.thinking,
+            "tools": result.tools,
+            "role": "assistant",
+        }
+        self.transcript.append(entry)
+
+        # Save to DB
+        await run_db(
+            task_store.add_meeting_turn,
+            self.meeting_id, self.total_turns, 0, result.agent, "assistant",
+            result.content, result.thinking,
+            json.dumps(result.tools),
+            self.agent_sessions.get(result.agent, ""),
+            turn_delta,
+        )
+        return entry
+
+    async def _left(self, result) -> bool:
+        """A turn that called leave_meeting: its agent leaves (the moderator's
+        leave ends the meeting). True for such a turn."""
+        # Check leave_meeting
+        if "leave_meeting" in result.tools_called:
+            self.active_participants = [a for a in self.active_participants if a != result.agent]
+            self.pending_restates.pop(result.agent, None)
+            self.pending.pop(result.agent, None)
+            # The route's own write took it out already when the
+            # call succeeded; under the row's lock either way, so a
+            # concurrent leave stays written.
+            await run_db(task_store.remove_active_participant, self.meeting_id,
+                         result.agent, meeting_status.LEAVABLE)
+            await _announce_departure(result.agent, self.agent_sessions, self.event_queue,
+                                      self.transcript)
+            if result.agent == self.moderator:
+                # Nobody is left to drive the rounds or conclude:
+                # the meeting ends, as when the moderator fails.
+                self.meeting_active = False
+            elif len(self.active_participants) < 2:
+                if self.last_speaker != self.moderator:
+                    self.pending.setdefault(self.moderator, []).append({"type": "wrapup"})
+                else:
+                    self.meeting_active = False
+            return True
+        return False
+
+    async def _after_round(self, batch_agents: set[str], batch_results: list) -> None:
+        """What the round leaves to settle: the meeting row read again (a
+        leave, an end or a resume from outside), the moderator's check-in,
+        the person's messages and the background notes."""
+        # Check if moderator decided to resume after propose_conclude, or
+        # whether an end or a leave landed from outside this loop.
+        self.meeting = await run_db(task_store.get_meeting, self.meeting_id)
+        # A leave through the route (the creator, an admin, the master
+        # key, or the agent's own call) edits only the row: the agents it
+        # took out leave the loop here, after the round they may have
+        # spoken in, and the work queued for them is dropped.
+        gone = _departed(self.active_participants, self.meeting)
+        if gone:
+            self.active_participants = [a for a in self.active_participants if a not in gone]
+            for agent in gone:
+                self.pending.pop(agent, None)
+                self.pending_restates.pop(agent, None)
+                if self.paused_pending:
+                    self.paused_pending.pop(agent, None)
+                await _announce_departure(agent, self.agent_sessions, self.event_queue, self.transcript)
+            if self.moderator in gone:
+                self.meeting_active = False
+            elif len(self.active_participants) < 2 and self.meeting_active:
+                if self.last_speaker != self.moderator:
+                    self.pending.setdefault(self.moderator, []).append({"type": "wrapup"})
+                else:
+                    self.meeting_active = False
+        if self.meeting and self.meeting["status"] == meeting_status.PAUSED:
+            # The moderator spoke without ending: resume. One conditional
+            # write, so an end that lands between the read and here
+            # (CONCLUDING) is never overwritten back to ACTIVE.
+            if self.moderator in batch_agents and self.meeting_active and await run_db(
+                    task_store.update_meeting_if, self.meeting_id,
+                    (meeting_status.PAUSED,), status=meeting_status.ACTIVE):
+                if self.paused_pending:
+                    for a, msgs in self.paused_pending.items():
+                        if a != self.moderator and msgs and a in self.active_participants:
+                            self.pending.setdefault(a, []).extend(msgs)
+                    self.paused_pending = None
+        elif self.meeting and self.meeting["status"] in meeting_status.ROUND_STOPS:
+            self.meeting_active = False
+
+        # Auto-queue moderator after 3+ turns without speaking
+        if self.moderator in batch_agents:
+            self.turns_since_moderator = 0
+        else:
+            self.turns_since_moderator += len([r for r in batch_results if "_failed" not in r.tools_called])
+
+        # Hold the check-in while a restate is in flight — a moderator
+        # turn queued now would run in parallel with the restating agent
+        # and read the transcript before the restated findings exist.
+        if (self.turns_since_moderator >= 3 and not self.pending.get(self.moderator)
+                and not self.pending_restates):
+            self.pending.setdefault(self.moderator, []).append({"type": "checkin"})
+            self.turns_since_moderator = 0
+
+        # Check for user messages: the chat's queue, read per round (a
+        # meeting turn never takes a steer). The pump writes their rows,
+        # after the round's content, and clears the chips.
+        queued_now = input_queue.get(self.pump.chat_id).take()
+        if queued_now:
+            await self.event_queue.put(CommonEvent(type=QUEUE_TURN, data={"inputs": queued_now}))
+        for queued in queued_now:
+            # The agents read the engine text (attachment paths included);
+            # the row keeps the raw text and the attachment meta.
+            user_entry = {
+                "agent": "user",
+                "content": queued.item.cli_text,
+                "thinking": "",
+                "tools": [],
+                "role": "user",
+            }
+            self.transcript.append(user_entry)
+            # User messages go only to the moderator — the moderator
+            # decides how to act (route to others, answer directly, etc.)
+            self.pending.setdefault(self.moderator, []).append(user_entry)
+
+        # Background-work nudges from the bg monitors (system_queue).
+        _drain_system_notes(self.pump, self.transcript, self.pending, self.moderator)
+
+
+_ENDED, _STOPPED, _FAILED = "ended", "stopped", "failed"
+
+
+async def _leave_parent_note(meeting_id: str, transcript: list[dict], turns: int,
+                             ending: str, *, summary: bool) -> None:
+    """Store the host chat's note (``meeting_context.parent_note``) as a
+    note in the chat's pending wakes (``WAKE_NOTE``): the chat's next typed
+    message claims and prepends it, and nothing runs it as a turn of its own
+    (the redelivery sweeps, a pump end and a terminal's start leave it).
+    Only for a meeting that ended (a stop or a shutdown cancels the
+    producer, an error fails it) with at least one turn, never on a task
+    run's chat (its run takes the summary as its result). ``summary``: the
+    moderator ended it, so its last turn is the meeting's summary."""
+    if ending != _ENDED or turns <= 0:
+        return
+    try:
+        meeting = await run_db(task_store.get_meeting, meeting_id)
+        chat_id = (meeting or {}).get("parent_chat_id") or ""
+        if (not meeting or not chat_id or session_kind.is_task_chat_id(chat_id)
+                or meeting.get("parent_run_id")):
+            return
+        moderator = meeting.get("moderator", "")
+        last_words = next((e.get("content") or "" for e in reversed(transcript)
+                           if e.get("agent") == moderator), "")
+
+        def _write() -> bool:
+            from auth.providers import acting_role_of
+            chat = task_store.get_chat(chat_id)
+            if not chat:
+                return False
+            slugs = json.loads(meeting.get("participants") or "[]")
+            names = [(agent_store.get_agent(a) or {}).get("display_name", a) for a in slugs]
+            creator = meeting.get("created_by") or ""
+            person = creator if creator and task_store.get_user(creator) else ""
+            role = acting_role_of(person, chat.get("agent") or "") if person else ""
+            note = parent_note(
+                meeting, turns=turns, names=names, last_words=last_words, summary=summary,
+                ended_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            )
+            return bool(task_store.append_pending_delegate_wake(
+                chat_id, note, person=person, role=role, note=True))
+
+        if await run_db(_write):
+            logger.info("Meeting %s: its note waits for chat %s's next typed message",
+                        meeting_id, chat_id[:8])
+    except Exception:  # noqa: BLE001  # the host chat's note is best effort; the meeting's end must go out
+        logger.warning("Meeting %s: the host chat's note was not stored", meeting_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -947,7 +1100,7 @@ async def _notify_meeting_failed(meeting_id: str, reason: str, *,
         await run_db(task_store.update_meeting, meeting_id, status=meeting_status.FAILED,
                      summary=(reason or "")[:5000])
     except Exception:
-        logger.exception(f"Meeting {meeting_id}: failed-status update failed")
+        logger.exception("Meeting %s: failed-status update failed", meeting_id)
     parent_chat_id = ""
     try:
         meeting = await run_db(task_store.get_meeting, meeting_id)
@@ -978,7 +1131,7 @@ async def _notify_meeting_failed(meeting_id: str, reason: str, *,
         pump = ChatStreamPump(
             chat_id=parent_chat_id,
             session_id=pump_session_id,
-            producer=None,
+            producer=cast("asyncio.Task", None),  # set below, before the pump starts
             event_queue=event_queue,
             perm_queue=get_permission_queue(pump_session_id),
             scope=meeting.get("scope", "user"),
@@ -989,11 +1142,11 @@ async def _notify_meeting_failed(meeting_id: str, reason: str, *,
         input_queue.get(parent_chat_id).release(claim)
         try:
             pump.start()
-            await pump._task
+            await cast("asyncio.Task", pump._task)  # start() set it
         finally:
             cleanup_session_permission_state(pump_session_id)
     except Exception:
-        logger.exception(f"Meeting {meeting_id}: failure surfacing failed")
+        logger.exception("Meeting %s: failure surfacing failed", meeting_id)
     finally:
         if parent_chat_id:
             input_queue.get(parent_chat_id).release(claim)
@@ -1021,10 +1174,10 @@ async def start_meeting(meeting_id: str) -> None:
     """Start the meeting orchestrator."""
     meeting = await run_db(task_store.get_meeting, meeting_id)
     if not meeting:
-        logger.error(f"Meeting {meeting_id} not found")
+        logger.error("Meeting %s not found", meeting_id)
         return
     if meeting["status"] != meeting_status.PENDING:
-        logger.error(f"Meeting {meeting_id} status is {meeting['status']}, expected pending")
+        logger.error("Meeting %s status is %s, expected pending", meeting_id, meeting['status'])
         return
 
     # ── Usage limit pre-check (mirrors the scheduler + chat gates) ──
@@ -1070,11 +1223,11 @@ async def start_meeting(meeting_id: str) -> None:
             ):
                 blocked_reason = cap.short_reason()
         if blocked_reason:
-            logger.warning(f"Meeting {meeting_id} blocked by usage limit: {blocked_reason}")
+            logger.warning("Meeting %s blocked by usage limit: %s", meeting_id, blocked_reason)
             await _notify_meeting_failed(meeting_id, blocked_reason)
             return
-    except Exception as e:
-        logger.error(f"Meeting {meeting_id} usage limit pre-check failed: {e}")
+    except Exception as e:  # noqa: BLE001  # a failed usage pre-check lets the meeting start
+        logger.error("Meeting %s usage limit pre-check failed: %s", meeting_id, e)
 
     # Pending to active in one conditional write: a second start of the same
     # meeting, or a failure written while the checks above awaited (the
@@ -1082,7 +1235,7 @@ async def start_meeting(meeting_id: str) -> None:
     # runs nothing.
     if not await run_db(task_store.update_meeting_if, meeting_id,
                         (meeting_status.PENDING,), status=meeting_status.ACTIVE):
-        logger.info(f"Meeting {meeting_id}: no longer pending, not started")
+        logger.info("Meeting %s: no longer pending, not started", meeting_id)
         return
     parent_chat_id = meeting["parent_chat_id"]
     participants = json.loads(meeting["participants"])
@@ -1100,7 +1253,7 @@ async def start_meeting(meeting_id: str) -> None:
     # starter, then holds the chat through the participants' setup until its
     # own pump is registered.
     if (existing_pump and not existing_pump.is_done) or input_queue.is_claimed(parent_chat_id):
-        logger.info(f"Meeting {meeting_id}: waiting for the turn on {parent_chat_id[:8]} to end")
+        logger.info("Meeting %s: waiting for the turn on %s to end", meeting_id, parent_chat_id[:8])
     claim = await input_queue.claim_when_free(parent_chat_id, timeout=_START_CLAIM_WAIT_S)
     if claim is None:
         await _notify_meeting_failed(
@@ -1149,17 +1302,18 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
         from services.engines.subscription_pool import NoSubscriptionError
         refused = isinstance(_build_err, AgentStateRefused)
         if refused:
-            logger.info(f"Meeting {meeting_id}: a participant is below the editor tier: {_build_err}")
+            logger.info("Meeting %s: a participant is below the editor tier: %s", meeting_id, _build_err)
         else:
-            logger.error(f"Meeting {meeting_id}: failed to build participant configs: {_build_err}",
+            logger.error("Meeting %s: failed to build participant configs: %s",
+                         meeting_id, _build_err,
                          exc_info=_build_err)
-        for slug, r in zip(participants, _built):
+        for slug, r in zip(participants, _built, strict=False):
             if not isinstance(r, BaseException):
                 release_config_seat(session_id_map[slug], r)
         if refused:
             # A participant would run as the agent below the editor tier: the
             # refusal is the reason, named with its participant.
-            who = next(slug for slug, r in zip(participants, _built) if r is _build_err)
+            who = next(slug for slug, r in zip(participants, _built, strict=False) if r is _build_err)
             await _notify_meeting_failed(
                 meeting_id, f"The meeting could not start: {who}: {_build_err}",
                 claim=claim)
@@ -1176,7 +1330,7 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
                 claim=claim,
             )
         return
-    agent_cfgs = dict(zip(participants, _built))
+    agent_cfgs = dict(zip(participants, _built, strict=False))
     sid_targets = {session_id_map[slug]: (cfg.execution_target or placement.LOCAL)
                    for slug, cfg in agent_cfgs.items()}
     sid_paths = {session_id_map[slug]: (cfg.execution_path or "")
@@ -1190,7 +1344,7 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
     adm = await acquire_meeting_slots(all_sids, targets=sid_targets, exec_paths=sid_paths,
                                       mcp_paths=sid_mcps)
     if not adm:
-        logger.error(f"Meeting {meeting_id}: denied — {adm.user_message}")
+        logger.error("Meeting %s: denied — %s", meeting_id, adm.user_message)
         for slug, cfg in agent_cfgs.items():
             release_config_seat(session_id_map[slug], cfg)
         await _notify_meeting_failed(
@@ -1240,7 +1394,7 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
         if first_err is not None:
             raise first_err
         pump_session_id = "meeting-" + meeting_id
-        for agent_slug, sid in results:
+        for agent_slug, sid in cast("list[tuple[str, str]]", results):  # an exception among them was raised above
             agent_sessions[agent_slug] = sid
             _sessions.setdefault(sid, {"created": True, "message_count": 0})
             _sessions[sid].update({
@@ -1264,7 +1418,7 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
         _save_sessions()
 
     except Exception as e:
-        logger.error(f"Meeting {meeting_id}: failed to create sessions: {e}", exc_info=True)
+        logger.exception("Meeting %s: failed to create sessions: %s", meeting_id, e)
         # Roll back from the per-spawn layer map — NOT agent_sessions, which is
         # populated only after a fully-successful gather and is always empty
         # here (the pre-fix rollback closed nothing, orphaning every sibling
@@ -1309,7 +1463,7 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
     pump = ChatStreamPump(
         chat_id=parent_chat_id,
         session_id=pump_session_id,
-        producer=None,
+        producer=cast("asyncio.Task", None),  # set below, before the pump starts
         event_queue=event_queue,
         perm_queue=get_permission_queue(pump_session_id),
         scope=meeting["scope"],
@@ -1326,11 +1480,11 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
 
     _active_pumps[parent_chat_id] = pump
     input_queue.get(parent_chat_id).release(claim)
-    _active_meetings[meeting_id] = asyncio.current_task()
+    _active_meetings[meeting_id] = cast("asyncio.Task", asyncio.current_task())  # a coroutine runs in a task
 
     try:
         pump.start()
-        await pump._task
+        await cast("asyncio.Task", pump._task)  # start() set it
     finally:
         _active_meetings.pop(meeting_id, None)
 
@@ -1342,7 +1496,7 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
             try:
                 layer = _meeting_session_layers.get(sid) or get_execution_layer(slug)
                 await layer.close_session(sid)
-            except Exception:
+            except Exception:  # noqa: BLE001  # closing the sessions of a meeting that failed to start
                 pass
             _meeting_session_layers.pop(sid, None)
         release_meeting_slots(list(agent_sessions.values()))
@@ -1370,7 +1524,7 @@ async def _start_meeting_claimed(meeting_id: str, meeting: dict, parent_chat_id:
         # The pump's _total_cost_delta includes meeting per-turn deltas, and it records
         # one usage_records entry. No separate recording here to avoid double-counting.
 
-        logger.info(f"Meeting {meeting_id} concluded, cost=${total_cost:.4f}")
+        logger.info("Meeting %s concluded, cost=$%.4f", meeting_id, total_cost)
 
 
 # ---------------------------------------------------------------------------

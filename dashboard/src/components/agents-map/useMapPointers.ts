@@ -1,8 +1,7 @@
 /** The pointer layer of the 3D map: the gesture refs, `pick`, the link /
  * unlink / move actions, the department tap, the five pointer handlers,
  * `endPointer`, the document capture sweep and the context menu (split out
- * of AgentsMap3D.tsx on 2026-09-10; every dependency array is the
- * component's, verbatim). */
+ * of AgentsMap3D.tsx on 2026-09-10). */
 import { useCallback, useEffect, useRef } from 'react'
 import type { Dispatch, RefObject, SetStateAction } from 'react'
 import * as THREE from 'three'
@@ -23,6 +22,7 @@ import {
 } from './mapConstants'
 import type { MenuState, PopupState } from './mapConstants'
 import type { SceneBag } from './sceneBag'
+import { apiJson, withMessage } from '../../lib/http/apiJson'
 
 export function useMapPointers({
   bagRef, containerRef, nodeBySlug, qc, setLinkFrom, setNotice, setMoveFrom,
@@ -75,12 +75,14 @@ export function useMapPointers({
   const activePointers = useRef<PointerMap>(new Map())
   // Pointers a LIVE gesture owns — excluded from ghost prunes (a pinch or
   // slow-drag finger legitimately holds still past the stale window).
-  const gestureOwnedIds = () => {
+  // A stable identity: the scene effect lists it, and a new function per
+  // render would rebuild every chip.
+  const gestureOwnedIds = useCallback(() => {
     const ids = new Set<number>()
     if (pinch.current) { ids.add(pinch.current.a); ids.add(pinch.current.b) }
     if (swipe.current) ids.add(swipe.current.id)
     return ids
-  }
+  }, [])
 
   const pick = useCallback((clientX: number, clientY: number) => {
     const bag = bagRef.current
@@ -102,7 +104,7 @@ export function useMapPointers({
       }
     }
     return null
-  }, [])
+  }, [bagRef, containerRef])
 
   /** DIRECTIONAL link (matches the config semantics: each agent owns its
    * OUTGOING targets): merge `to` into `from`'s target list only. Linking
@@ -113,9 +115,8 @@ export function useMapPointers({
     const fromName = nodeBySlug.get(from)?.displayName ?? from
     const toName = nodeBySlug.get(to)?.displayName ?? to
     try {
-      const res = await apiFetch(`/v1/agents/${from}/delegation-targets`)
-      if (!res.ok) throw new Error(`No access to ${from}'s delegation config`)
-      const data = await res.json()
+      const data = await apiJson<{ targets?: string[] }>(`/v1/agents/${from}/delegation-targets`)
+        .catch(withMessage(`No access to ${from}'s delegation settings`))
       const targets: string[] = data.targets ?? []
       if (!targets.includes(to)) {
         const put = await apiFetch(`/v1/agents/${from}/delegation-targets`, {
@@ -124,7 +125,7 @@ export function useMapPointers({
         })
         if (!put.ok) {
           const e = await put.json().catch(() => ({}))
-          throw new Error(e.detail || `Failed to link ${from} → ${to}`)
+          throw new Error(e.detail || `Could not let ${from} delegate to ${to}`)
         }
       }
       setNotice(`${fromName} can now delegate to ${toName}`)
@@ -134,7 +135,7 @@ export function useMapPointers({
       qc.invalidateQueries({ queryKey: ['delegation-edges-all'] })
       qc.invalidateQueries({ queryKey: ['delegation-targets'] })
     }
-  }, [qc, nodeBySlug])
+  }, [qc, nodeBySlug, setLinkFrom, setNotice])
   const attemptLinkRef = useRef(attemptLink)
   useEffect(() => { attemptLinkRef.current = attemptLink }, [attemptLink])
 
@@ -144,9 +145,8 @@ export function useMapPointers({
   const attemptUnlink = useCallback(async (a: string, b: string) => {
     try {
       const removeDir = async (agent: string, target: string) => {
-        const res = await apiFetch(`/v1/agents/${agent}/delegation-targets`)
-        if (!res.ok) throw new Error(`No access to ${agent}'s delegation config`)
-        const data = await res.json()
+        const data = await apiJson<{ targets?: string[] }>(`/v1/agents/${agent}/delegation-targets`)
+          .catch(withMessage(`No access to ${agent}'s delegation settings`))
         const targets: string[] = data.targets ?? []
         if (!targets.includes(target)) return
         const put = await apiFetch(`/v1/agents/${agent}/delegation-targets`, {
@@ -155,7 +155,7 @@ export function useMapPointers({
         })
         if (!put.ok) {
           const e = await put.json().catch(() => ({}))
-          throw new Error(e.detail || `Failed to unlink ${agent} → ${target}`)
+          throw new Error(e.detail || `Could not stop ${agent} delegating to ${target}`)
         }
       }
       await removeDir(a, b)
@@ -167,7 +167,7 @@ export function useMapPointers({
       qc.invalidateQueries({ queryKey: ['delegation-edges-all'] })
       qc.invalidateQueries({ queryKey: ['delegation-targets'] })
     }
-  }, [qc])
+  }, [qc, setNotice])
 
   const completeMove = useCallback((
     slug: string, deptId: string, levelId: string,
@@ -188,7 +188,7 @@ export function useMapPointers({
         onError: (e) => setNotice(e.message),
       },
     )
-  }, [updateAgent, qc, nodeBySlug])
+  }, [updateAgent, qc, nodeBySlug, setMoveFrom, setLevelPick, setNotice])
 
   /** Move-mode department tap: the Independent blob/page clears the
    * assignment, single-level depts assign directly, multi-level ones open
@@ -217,7 +217,7 @@ export function useMapPointers({
     const levels = [...dept.levels].sort((a, b) => a.rank - b.rank)
     if (levels.length === 0) {
       setMoveFrom(null)
-      setNotice(`“${dept.name}” has no levels yet — add levels in the Departments editor first`)
+      setNotice(`“${dept.name}” has no levels yet. Add levels in the Departments editor first.`)
       return
     }
     if (levels.length === 1) {
@@ -225,7 +225,10 @@ export function useMapPointers({
       return
     }
     setLevelPick({ slug, departmentId, x, y })
-  }, [departments, completeMove, nodeBySlug, updateAgent, qc])
+  }, [
+    departments, completeMove, nodeBySlug, updateAgent, qc, setMoveFrom,
+    setLevelPick, setNotice,
+  ])
 
   const onDeptTap = useCallback((
     departmentId: string, x: number, y: number,
@@ -236,7 +239,7 @@ export function useMapPointers({
       return
     }
     enterStage(departmentId)
-  }, [beginMoveTo, enterStage])
+  }, [beginMoveTo, enterStage, moveFromRef])
   const onDeptTapRef = useRef(onDeptTap)
   useEffect(() => { onDeptTapRef.current = onDeptTap }, [onDeptTap])
 
@@ -250,7 +253,7 @@ export function useMapPointers({
       return
     }
     onDeptTap(hit.departmentId, clientX, clientY)
-  }, [pick, onDeptTap])
+  }, [pick, onDeptTap, setMenu, setPopup])
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     // Taps/long-presses belong to the canvas only (events bubbling up
@@ -319,7 +322,7 @@ export function useMapPointers({
       const b = bagRef.current
       if (b) { b.par.dragging = false; b.par.tx = 0; b.par.ty = 0 }
     }, 550)
-  }, [pick])
+  }, [bagRef, gestureOwnedIds, pick, setMenu])
 
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const tracked = activePointers.current.get(e.pointerId)
@@ -337,7 +340,7 @@ export function useMapPointers({
     }
     if (pinch.current) {
       const p = pinch.current
-      let d = pinchSpan(activePointers.current, p.a, p.b)
+      const d = pinchSpan(activePointers.current, p.a, p.b)
       if (d == null) {
         // A pinch finger vanished (cancel/prune): re-seat on the newest
         // two or drop — never measure against a ghost.
@@ -421,7 +424,7 @@ export function useMapPointers({
       swipe.current.lastX = e.clientX
       swipe.current.lastT = now
     }
-  }, [])
+  }, [bagRef, exitStageRef])
 
   const onPointerUp = useCallback((e: React.PointerEvent) => {
     activePointers.current.delete(e.pointerId)
@@ -469,7 +472,7 @@ export function useMapPointers({
     const dx = e.clientX - down.x
     const dy = e.clientY - down.y
     if (dx * dx + dy * dy < 25) handleTap(e.clientX, e.clientY)
-  }, [handleTap])
+  }, [bagRef, handleTap, pageDeltaRef])
 
   // Cancelled pointers (system edge-swipe, palm rejection, scroll takeover,
   // a chip torn down under the finger). A cancelled gesture must clean up
@@ -495,7 +498,7 @@ export function useMapPointers({
       bag.par.tx = 0
       bag.par.ty = 0
     }
-  }, [])
+  }, [bagRef])
   const onPointerCancel = useCallback((e: React.PointerEvent) => {
     endPointer(e.pointerId)
   }, [endPointer])
@@ -535,7 +538,7 @@ export function useMapPointers({
       departmentId: hit?.departmentId || null,
       departmentName: hit?.departmentName,
     })
-  }, [pick])
+  }, [pick, setMenu])
 
   return {
     activePointers, gestureOwnedIds, attemptLinkRef, onDeptTapRef,

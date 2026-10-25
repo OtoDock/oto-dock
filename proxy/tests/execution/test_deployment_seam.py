@@ -369,7 +369,7 @@ def test_browser_close_url_t2_service_dns(t2, camoufox_manifest):
 
 
 def test_browser_close_url_none_without_manifest(t2, monkeypatch):
-    from services.mcp import mcp_registry
     from services.infra import browser_session
+    from services.mcp import mcp_registry
     monkeypatch.setattr(mcp_registry, "get_manifest", lambda name: None)
     assert browser_session._base_url() is None

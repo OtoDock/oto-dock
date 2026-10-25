@@ -22,8 +22,9 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from .. import config
-from ..config import otodock_dir
 from .._vendored import layout
+from ..background import spawn
+from ..config import otodock_dir
 from .lifecycle_update import (
     _finalize_post_update_state,
     _self_uninstall_and_exit,
@@ -172,9 +173,11 @@ def _sweep_satellite_screenshots(agents_dir: "Path", keep: int) -> None:
             with contextlib.suppress(OSError):
                 p.unlink()
 
-# Threshold beyond which a monotonic gap signals system sleep, not a slow
-# scheduler. 3× the heartbeat interval gives plenty of slack on busy hosts
-# while catching real sleep events.
+# A heartbeat tick this late (on either clock) means the link is almost
+# certainly dead whatever the cause: a system sleep (the monotonic clock
+# stood, the sleep clock ran on) or a daemon that did not run (both clocks
+# moved: a paused host, a starved process). 3× the heartbeat interval gives
+# plenty of slack on busy hosts.
 _CLOCK_JUMP_THRESHOLD = 60
 
 # Reconnect backoff: exponential from BASE, capped at CAP, with ±50% jitter
@@ -231,7 +234,7 @@ def _get_system_load() -> dict:
             "cpu_pct": round(psutil.cpu_percent(interval=None), 1),
             "mem_pct": round(psutil.virtual_memory().percent, 1),
         }
-    except Exception:
+    except (ImportError, OSError, RuntimeError):
         return {"cpu_pct": 0.0, "mem_pct": 0.0}
 
 
@@ -271,6 +274,67 @@ _INSECURE_RECONNECT_WAIT_S = 600.0
 
 class _InsecureUninstallRefused(Exception):
     """The platform asked for a self-uninstall over a plaintext link."""
+
+
+# The platform frames whose work runs as a task of its own: the session
+# manager's method that does it (the task is named after it) and whether the
+# method takes the client.
+_SPAWNED_FRAMES: dict[str, tuple[str, bool]] = {
+    "start_session": ("start_session", True),
+    "send_message": ("send_message", True),
+    "abort": ("abort", True),
+    # Soft headless-CLI abort: stop the generation, keep the
+    # process + MCP sidecars alive (proxy ≥ gates on 0.5.89).
+    "interrupt_turn": ("interrupt_turn", False),
+    "close_session": ("close_session", True),
+    # Interactive PTY.
+    "pty_open": ("pty_open", True),
+    "pty_input": ("pty_input", False),
+    "pty_resize": ("pty_resize", False),
+    "pty_close": ("pty_close", False),
+    # Server-prompt injection into an otodock-attached CLI's
+    # stdin (the delegation-delivery PTY rung); always answers
+    # with a pty_inject_result frame.
+    "pty_inject": ("pty_inject", True),
+    # Dual-control: the dashboard took over — detach the local
+    # `otodock` terminal but keep the PTY alive.
+    "pty_local_detach": ("evict_local_conn", True),
+    "stop_turn": ("stop_turn", False),
+    # Native-permission answer from proxy → CLI stdin
+    "control_response": ("control_response", False),
+    "control_request": ("control_request", False),
+    # Rotation fan-out: rewrite a scope dir's CLI credential
+    # file (the live CLIs re-read it — no process touched).
+    "credentials_update": ("credentials_update", True),
+    "check_session_resumable": ("check_session_resumable", True),
+    # Manual thread compaction on a headless Codex session
+    # (remote twin of the local layer.compact()); always acks.
+    "codex_compact": ("codex_compact", True),
+    # Mid-turn steering into a running headless turn (remote
+    # twin of layer.steer()); acks {steered}. codex_steer is
+    # the Codex frame's released name, steer_turn the Claude
+    # CLI's (0.5.128); one handler serves both.
+    "steer_turn": ("steer_turn", True),
+    "codex_steer": ("steer_turn", True),
+    # Background-terminal list pull for the proxy's bg-command
+    # drain (remote twin of its list RPC); always acks.
+    "codex_bg_terminals": ("codex_bg_terminals", True),
+    "check_session_process": ("check_session_process", True),
+    "resume_session_stream": ("resume_session_stream", True),
+    "request_manifest": ("request_manifest", True),
+    "file_push": ("file_push", True),
+    # Cheap cache-revalidation probe (0.5.95+) — replies as
+    # a command ack; validation mirrors file_pull.
+    "file_stat": ("file_stat", True),
+    # The retention sweep's keep list (0.5.150): the
+    # transcripts it does not name go; answered as an ack.
+    "session_files_retention": ("session_files_retention", True),
+    "sync_mcps": ("sync_mcps", True),
+    "sync_mcps_verify": ("sync_mcps_verify", True),
+    # An app step (proxy APPS.md "Steps", 0.5.122): its own
+    # task, so a long script never blocks the loop.
+    "step_run": ("step_run", True),
+}
 
 
 class SatelliteWSClient:
@@ -327,7 +391,7 @@ class SatelliteWSClient:
             return
         try:
             cb(status)
-        except Exception:
+        except Exception:  # noqa: BLE001  # the registered status sink (the tray) must not break the link
             logger.debug("status callback failed", exc_info=True)
 
     async def pause(self) -> None:
@@ -348,7 +412,7 @@ class SatelliteWSClient:
         if ws is not None:
             try:
                 await ws.send(json.dumps({"type": "pause"}))
-            except Exception as e:
+            except websockets.WebSocketException as e:
                 logger.debug("pause notify send: %s", e)
             with contextlib.suppress(Exception):
                 await ws.close(code=1000, reason="paused")
@@ -394,7 +458,7 @@ class SatelliteWSClient:
             writer_task: asyncio.Task | None = None
             heartbeat_task: asyncio.Task | None = None
             try:
-                logger.info(f"Connecting to {self.config.platform_url}...")
+                logger.info("Connecting to %s...", self.config.platform_url)
                 async with websockets.connect(
                     self.config.platform_url,
                     ping_interval=_WS_PING_INTERVAL,
@@ -403,7 +467,6 @@ class SatelliteWSClient:
                 ) as ws:
                     self._ws = ws
                     self._authenticated = False
-                    backoff = _RECONNECT_BACKOFF_BASE
 
                     # Apply TCP keepalive on the underlying socket. The
                     # websockets library exposes the transport's socket via
@@ -420,6 +483,10 @@ class SatelliteWSClient:
                     # us (otherwise queued messages would race the auth frame).
                     await self._authenticate()
                     logger.info("Authenticated with platform")
+                    # The backoff resets only once the platform accepted us:
+                    # a refused auth (4001, a 1013 the platform could not
+                    # check this machine now) keeps doubling to the cap.
+                    backoff = _RECONNECT_BACKOFF_BASE
                     self._set_status("connected")
 
                     # Start writer + heartbeat tasks.
@@ -438,7 +505,7 @@ class SatelliteWSClient:
                 await asyncio.sleep(_INSECURE_RECONNECT_WAIT_S)
                 continue
             except ConnectionClosed as e:
-                logger.warning(f"WS connection closed: {e.code} {e.reason}")
+                logger.warning("WS connection closed: %d %s", e.code, e.reason)
                 # Close code 4006 (machine_deleted) → run the uninstall script +
                 # exit instead of looping forever.
                 if e.code == 4006:
@@ -470,7 +537,7 @@ class SatelliteWSClient:
                     # Fall through to normal reconnect loop in case the
                     # update task failed; the proxy will retry the push.
             except (ConnectionError, OSError) as e:
-                logger.warning(f"WS connection error: {e}")
+                logger.warning("WS connection error: %s", e)
             except Exception:
                 logger.exception("Unexpected error in WS loop")
             finally:
@@ -544,7 +611,7 @@ class SatelliteWSClient:
             # jitter de-synchronizes a fleet's reconnects after a shared
             # proxy outage; the low cap keeps recovery snappy.
             delay = backoff * (0.5 + random.random() * 0.5)
-            logger.info(f"Reconnecting in {delay:.0f}s...")
+            logger.info("Reconnecting in %.0fs...", delay)
             self._set_status("reconnecting")
             await asyncio.sleep(delay)
             backoff = min(backoff * 2, _RECONNECT_BACKOFF_CAP)
@@ -841,25 +908,19 @@ class SatelliteWSClient:
         # reconcile on reconnect — re-adopt survivors, exit the dead, reap orphans.
         # Always sent (empty on a fresh connect). Queued now; the writer task
         # (started after auth) drains it AFTER any output buffered during the drop.
-        try:
-            await self.enqueue_send({
-                "type": "pty_alive",
-                "session_ids": list(self.sm.pty_sessions.keys()),
-            })
-        except Exception:
-            logger.debug("pty_alive enqueue failed", exc_info=True)
+        await self.enqueue_send({
+            "type": "pty_alive",
+            "session_ids": list(self.sm.pty_sessions.keys()),
+        })
 
         # Headless twin of pty_alive: live CLI sessions + their in-flight
         # turn state, so a RESTARTED proxy can re-adopt running turns
         # (Mode C) instead of failing them blind at startup, and every other
         # headless session held, so it takes an idle one back or closes it.
-        try:
-            from ..sessions import alive_report
-            frame = alive_report.sessions_alive_frame(self.sm)
-            if frame is not None:
-                await self.enqueue_send(frame)
-        except Exception:
-            logger.debug("sessions_alive enqueue failed", exc_info=True)
+        from ..sessions import alive_report
+        frame = alive_report.sessions_alive_frame(self.sm)
+        if frame is not None:
+            await self.enqueue_send(frame)
 
         # Cache the satellite-host policy locally so
         # we can re-validate satellite_host file writes/reads in
@@ -932,202 +993,196 @@ class SatelliteWSClient:
                     loop,
                 )
 
-            asyncio.create_task(asyncio.to_thread(
-                reconcile_cli_versions, cli_pins, _report_cli_status,
-            ))
+            spawn(
+                asyncio.to_thread(reconcile_cli_versions, cli_pins, _report_cli_status),
+                name="cli_reconcile", owner="link",
+            )
 
     async def _message_loop(self) -> None:
         """Route incoming platform messages to session manager."""
         async for raw in self._ws:
+            # A frame the loop cannot read is dropped and logged by its kind
+            # and size, never its content: the link stays up.
             try:
                 msg = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.warning(f"Invalid JSON from platform: {raw[:100]}")
+            except (ValueError, RecursionError):
+                logger.warning("Unreadable frame from platform (%s, length %d)",
+                               type(raw).__name__, len(raw))
+                continue
+            if not isinstance(msg, dict):
+                logger.warning("Frame from platform is not an object (%s, length %d)",
+                               type(msg).__name__, len(raw))
                 continue
 
             msg_type = msg.get("type", "")
             try:
-                if msg_type == "start_session":
-                    asyncio.create_task(self.sm.start_session(msg, self))
-                elif msg_type == "send_message":
-                    asyncio.create_task(self.sm.send_message(msg, self))
-                elif msg_type == "abort":
-                    asyncio.create_task(self.sm.abort(msg, self))
-                elif msg_type == "interrupt_turn":
-                    # Soft headless-CLI abort: stop the generation, keep the
-                    # process + MCP sidecars alive (proxy ≥ gates on 0.5.89).
-                    asyncio.create_task(self.sm.interrupt_turn(msg))
-                elif msg_type == "close_session":
-                    asyncio.create_task(self.sm.close_session(msg, self))
-                # Interactive PTY.
-                elif msg_type == "pty_open":
-                    asyncio.create_task(self.sm.pty_open(msg, self))
-                elif msg_type == "pty_input":
-                    asyncio.create_task(self.sm.pty_input(msg))
-                elif msg_type == "pty_resize":
-                    asyncio.create_task(self.sm.pty_resize(msg))
-                elif msg_type == "pty_close":
-                    asyncio.create_task(self.sm.pty_close(msg))
-                elif msg_type == "pty_inject":
-                    # Server-prompt injection into an otodock-attached CLI's
-                    # stdin (the delegation-delivery PTY rung); always answers
-                    # with a pty_inject_result frame.
-                    asyncio.create_task(self.sm.pty_inject(msg, self))
-                elif msg_type == "pty_local_detach":
-                    # Dual-control: the dashboard took over — detach the local
-                    # `otodock` terminal but keep the PTY alive.
-                    asyncio.create_task(self.sm.evict_local_conn(msg, self))
-                elif msg_type == "stop_turn":
-                    asyncio.create_task(self.sm.stop_turn(msg))
-                elif msg_type == "control_response":
-                    # Native-permission answer from proxy → CLI stdin
-                    asyncio.create_task(self.sm.control_response(msg))
-                elif msg_type == "control_request":
-                    asyncio.create_task(self.sm.control_request(msg))
-                elif msg_type == "credentials_update":
-                    # Rotation fan-out: rewrite a scope dir's CLI credential
-                    # file (the live CLIs re-read it — no process touched).
-                    asyncio.create_task(self.sm.credentials_update(msg, self))
-                elif msg_type == "policy_update":
-                    # Live policy refresh (admin / user toggled allow_full_fs or
-                    # device_grants from the dashboard). Stores into the same
-                    # local cache used at auth time so subsequent satellite_host
-                    # writes/reads + device-tool calls re-check the new policy.
-                    from ..host.satellite_policy import set_policy
-                    set_policy(msg.get("policy") or {})
-                    logger.info("Policy updated: %s", msg.get("policy"))
-                elif msg_type == "check_session_resumable":
-                    asyncio.create_task(
-                        self.sm.check_session_resumable(msg, self)
-                    )
-                elif msg_type == "codex_compact":
-                    # Manual thread compaction on a headless Codex session
-                    # (remote twin of the local layer.compact()); always acks.
-                    asyncio.create_task(self.sm.codex_compact(msg, self))
-                elif msg_type in ("steer_turn", "codex_steer"):
-                    # Mid-turn steering into a running headless turn (remote
-                    # twin of layer.steer()); acks {steered}. codex_steer is
-                    # the Codex frame's released name, steer_turn the Claude
-                    # CLI's (0.5.128); one handler serves both.
-                    asyncio.create_task(self.sm.steer_turn(msg, self))
-                elif msg_type == "codex_bg_terminals":
-                    # Background-terminal list pull for the proxy's bg-command
-                    # drain (remote twin of its list RPC); always acks.
-                    asyncio.create_task(self.sm.codex_bg_terminals(msg, self))
-                elif msg_type == "check_session_process":
-                    asyncio.create_task(
-                        self.sm.check_session_process(msg, self)
-                    )
-                elif msg_type == "resume_session_stream":
-                    asyncio.create_task(
-                        self.sm.resume_session_stream(msg, self)
-                    )
-                elif msg_type == "request_manifest":
-                    asyncio.create_task(self.sm.request_manifest(msg, self))
-                elif msg_type == "file_push":
-                    asyncio.create_task(self.sm.file_push(msg, self))
-                elif msg_type == "file_pull":
-                    # Registered here, not at the task's first step: a cancel
-                    # read in the same batch as its pull must find it.
-                    task = asyncio.create_task(self.sm.file_pull(msg, self))
-                    rid = msg.get("request_id", "")
-                    if rid:
-                        self.sm._pulls[rid] = task
-                        task.add_done_callback(
-                            lambda t, rid=rid: self.sm._pulls.pop(rid, None)
-                            if self.sm._pulls.get(rid) is t else None)
-                elif msg_type == "file_pull_cancel":
-                    # The platform gave up on a pull (0.5.137): stop producing.
-                    self.sm.file_pull_cancel(msg, self)
-                elif msg_type == "file_stat":
-                    # Cheap cache-revalidation probe (0.5.95+) — replies as
-                    # a command ack; validation mirrors file_pull.
-                    asyncio.create_task(self.sm.file_stat(msg, self))
-                elif msg_type == "sync_mcps":
-                    asyncio.create_task(self.sm.sync_mcps(msg, self))
-                elif msg_type == "sync_mcps_verify":
-                    asyncio.create_task(self.sm.sync_mcps_verify(msg, self))
-                elif msg_type == "step_run":
-                    # An app step (proxy APPS.md "Steps", 0.5.122): its own
-                    # task, so a long script never blocks the loop.
-                    asyncio.create_task(self.sm.step_run(msg, self))
-                elif msg_type in ("mcp_gateway_token", "mcp_gateway_wipe"):
-                    # The credential gateway: a vendor token for a session,
-                    # pushed before its spawn and renewed under its lease, or
-                    # the wipe at the session's close. Handled inline so a push
-                    # that precedes the spawn frame lands first; acknowledged
-                    # so the proxy repeats a push the link dropped.
-                    if self.tunnel is not None:
-                        if msg_type == "mcp_gateway_token":
-                            ok = self.tunnel.gateway.table.push(msg)
-                        else:
-                            self.tunnel.gateway.table.wipe(msg)
-                            ok = True
-                    else:
-                        ok = False
-                    if msg.get("command_id"):
-                        await self.enqueue_send({
-                            "type": "ack", "command_id": msg["command_id"],
-                            "status": "ok" if ok else "error",
-                            **({} if ok else {"error": "gateway unavailable or frame incomplete"}),
-                        })
-                elif msg_type in ("uninstall", "update_required") and getattr(self, "_insecure_link", False):
-                    # Code and the end of the install never come over a
-                    # plaintext link: refused, said once.
-                    self._log_insecure_refusal(msg_type)
-                elif msg_type == "uninstall":
-                    # Platform asked us to self-uninstall (admin/user
-                    # deleted the remote machine from the dashboard). Run
-                    # the uninstall script and exit cleanly.
-                    logger.info("Received uninstall command — self-cleaning")
-                    asyncio.create_task(_self_uninstall_and_exit())
-                elif msg_type == "update_required":
-                    # Auto-update: platform pushed a fresh
-                    # satellite tarball. Apply it atomically, restart
-                    # via systemd, the new code reconnects on the new
-                    # version. WS close 4007 is sent right after this
-                    # message by the proxy.
-                    logger.info(
-                        "Received update_required %s → %s — applying",
-                        msg.get("previous_version", "?"),
-                        msg.get("target_version", "?"),
-                    )
-                    # Say the push arrived before applying it (the update
-                    # task blocks this loop while it unpacks, then exits):
-                    # the proxy counts a rollback only for a delivered push.
-                    await self._acknowledge_update(msg)
-                    asyncio.create_task(_self_update_and_restart(msg))
-                elif msg_type in ("local_session_opened", "local_session_error",
-                                  "local_session_listed"):
-                    # otodock-CLI: response to our local_session_open / _list request.
-                    fut = self._local_session_futures.pop(msg.get("request_id", ""), None)
-                    if fut is not None and not fut.done():
-                        fut.set_result(msg)
-                elif msg_type == "http_response":
-                    # Tunneled HTTP response — synchronous dispatch into
-                    # the matching pending stream's queue. Fast; no upstream
-                    # call from the satellite side.
-                    if self.tunnel is not None:
-                        self.tunnel.dispatch_response(msg)
-                elif msg_type == "http_response_chunk":
-                    if self.tunnel is not None:
-                        self.tunnel.dispatch_response(msg)
-                elif msg_type == "pong":
-                    pass
-                else:
-                    logger.debug(f"Unknown message type: {msg_type}")
+                await self._dispatch_frame(msg_type, msg)
             except Exception:
-                logger.exception(f"Error handling {msg_type}")
+                logger.exception("Error handling %s", msg_type)
+
+    # The frames the loop answers itself, before it reads the next one: the
+    # client's method for each.
+    _INLINE_FRAMES = {
+        "policy_update": "_frame_policy_update",
+        "file_pull": "_frame_file_pull",
+        "file_pull_cancel": "_frame_file_pull_cancel",
+        "session_move": "_frame_session_move",
+        "mcp_gateway_token": "_frame_gateway",
+        "mcp_gateway_wipe": "_frame_gateway",
+        "uninstall": "_frame_uninstall",
+        "update_required": "_frame_update_required",
+        "local_session_opened": "_frame_local_session_reply",
+        "local_session_error": "_frame_local_session_reply",
+        "local_session_listed": "_frame_local_session_reply",
+        "http_response": "_frame_http_response",
+        "http_response_chunk": "_frame_http_response",
+        "pong": "_frame_pong",
+    }
+
+    async def _dispatch_frame(self, msg_type, msg: dict) -> None:
+        """One platform frame: its work started as a task of its own, or
+        answered here. A type that is not a string is unknown, as no frame
+        type ever equals it."""
+        if isinstance(msg_type, str):
+            spawned = _SPAWNED_FRAMES.get(msg_type)
+            if spawned is not None:
+                method, with_client = spawned
+                handler = getattr(self.sm, method)
+                spawn(handler(msg, self) if with_client else handler(msg), name=method, owner="link")
+                return
+            inline = self._INLINE_FRAMES.get(msg_type)
+            if inline is not None:
+                await getattr(self, inline)(msg)
+                return
+        logger.debug("Unknown message type: %s", msg_type)
+
+    async def _frame_policy_update(self, msg: dict) -> None:
+        # Live policy refresh (admin / user toggled allow_full_fs or
+        # device_grants from the dashboard). Stores into the same
+        # local cache used at auth time so subsequent satellite_host
+        # writes/reads + device-tool calls re-check the new policy.
+        from ..host.satellite_policy import set_policy
+        set_policy(msg.get("policy") or {})
+        logger.info("Policy updated: %s", msg.get("policy"))
+
+    async def _frame_file_pull(self, msg: dict) -> None:
+        # Registered here, not at the task's first step: a cancel
+        # read in the same batch as its pull must find it.
+        task = spawn(self.sm.file_pull(msg, self), name="file_pull", owner="link")
+        rid = msg.get("request_id", "")
+        if rid:
+            self.sm._pulls[rid] = task
+            task.add_done_callback(
+                lambda t, rid=rid: self.sm._pulls.pop(rid, None)
+                if self.sm._pulls.get(rid) is t else None)
+
+    async def _frame_session_move(self, msg: dict) -> None:
+        # The session move (0.5.156). A pull is registered before the next
+        # frame is read, as a file_pull is; a pushed chunk is written before
+        # any await (the chunks arrive in order and must be written in
+        # order); the other ops run as tasks of their own.
+        from ..sessions import session_move as mv
+        op = msg.get("op")
+        if op == mv.OP_PULL:
+            task = spawn(self.sm.session_move_pull(msg, self), name="session_move_pull", owner="link")
+            rid = msg.get("request_id", "")
+            if rid:
+                self.sm._pulls[rid] = task
+                task.add_done_callback(
+                    lambda t, rid=rid: self.sm._pulls.pop(rid, None)
+                    if self.sm._pulls.get(rid) is t else None)
+        elif op == mv.OP_PUSH:
+            await self.enqueue_send(self.sm.session_move_push(msg))
+        else:
+            spawn(self.sm.session_move(msg, self), name="session_move", owner="link")
+
+    async def _frame_file_pull_cancel(self, msg: dict) -> None:
+        # The platform gave up on a pull (0.5.137): stop producing.
+        self.sm.file_pull_cancel(msg, self)
+
+    async def _frame_gateway(self, msg: dict) -> None:
+        # The credential gateway: a vendor token for a session,
+        # pushed before its spawn and renewed under its lease, or
+        # the wipe at the session's close. Handled inline so a push
+        # that precedes the spawn frame lands first; acknowledged
+        # so the proxy repeats a push the link dropped.
+        if self.tunnel is not None:
+            if msg["type"] == "mcp_gateway_token":
+                ok = self.tunnel.gateway.table.push(msg)
+            else:
+                self.tunnel.gateway.table.wipe(msg)
+                ok = True
+        else:
+            ok = False
+        if msg.get("command_id"):
+            await self.enqueue_send({
+                "type": "ack", "command_id": msg["command_id"],
+                "status": "ok" if ok else "error",
+                **({} if ok else {"error": "gateway unavailable or frame incomplete"}),
+            })
+
+    async def _frame_uninstall(self, msg: dict) -> None:
+        if getattr(self, "_insecure_link", False):
+            # Code and the end of the install never come over a
+            # plaintext link: refused, said once.
+            self._log_insecure_refusal("uninstall")
+            return
+        # Platform asked us to self-uninstall (admin/user
+        # deleted the remote machine from the dashboard). Run
+        # the uninstall script and exit cleanly.
+        logger.info("Received uninstall command — self-cleaning")
+        spawn(_self_uninstall_and_exit(), name="uninstall", owner="link")
+
+    async def _frame_update_required(self, msg: dict) -> None:
+        if getattr(self, "_insecure_link", False):
+            self._log_insecure_refusal("update_required")
+            return
+        # Auto-update: platform pushed a fresh
+        # satellite tarball. Apply it atomically, restart
+        # via systemd, the new code reconnects on the new
+        # version. WS close 4007 is sent right after this
+        # message by the proxy.
+        logger.info(
+            "Received update_required %s → %s — applying",
+            msg.get("previous_version", "?"),
+            msg.get("target_version", "?"),
+        )
+        # Say the push arrived before applying it (the update
+        # task blocks this loop while it unpacks, then exits):
+        # the proxy counts a rollback only for a delivered push.
+        await self._acknowledge_update(msg)
+        spawn(_self_update_and_restart(msg), name="update", owner="link")
+
+    async def _frame_local_session_reply(self, msg: dict) -> None:
+        # otodock-CLI: response to our local_session_open / _list request.
+        fut = self._local_session_futures.pop(msg.get("request_id", ""), None)
+        if fut is not None and not fut.done():
+            fut.set_result(msg)
+
+    async def _frame_http_response(self, msg: dict) -> None:
+        # Tunneled HTTP response — synchronous dispatch into
+        # the matching pending stream's queue. Fast; no upstream
+        # call from the satellite side.
+        if self.tunnel is not None:
+            self.tunnel.dispatch_response(msg)
+
+    async def _frame_pong(self, msg: dict) -> None:
+        """The heartbeat's answer: nothing to do."""
 
     async def _heartbeat_loop(self) -> None:
         """Send heartbeat every 20s with system load info.
 
-        Tracks monotonic clock between iterations. A large gap means the
-        OS slept (laptop closed) — the WS is now almost certainly dead
-        even though no error fired yet, so we close it explicitly to
-        trigger the reconnect path.
+        Tracks two clocks between iterations: the monotonic one, which stops
+        in suspend on Linux and macOS, and ``host_probe.sleep_clock``, which
+        does not (``None`` on a host with no second clock). A large gap on
+        either means the WS is almost certainly dead even though no error
+        fired yet, so we close it explicitly to trigger the reconnect path;
+        the two gaps together name the cause (a sleep, or a daemon that did
+        not run) where the host can tell them apart.
         """
+        from ..host.host_probe import late_tick_line, sleep_clock
         last_tick = time.monotonic()
+        last_sleep_clock = sleep_clock()
         last_fp_compute = 0.0
         agent_fingerprints: dict[str, str] = {}
         while True:
@@ -1136,20 +1191,20 @@ class SatelliteWSClient:
             except asyncio.CancelledError:
                 return
             now = time.monotonic()
+            now_sleep_clock = sleep_clock()
             elapsed = now - last_tick
-            if elapsed > _CLOCK_JUMP_THRESHOLD:
-                logger.warning(
-                    "Clock jump detected (%.1fs gap, expected ~%ds) — "
-                    "system likely slept; forcing reconnect",
-                    elapsed, _HEARTBEAT_INTERVAL,
-                )
+            slept_for = (None if now_sleep_clock is None or last_sleep_clock is None
+                         else now_sleep_clock - last_sleep_clock)
+            if max(elapsed, slept_for or 0.0) > _CLOCK_JUMP_THRESHOLD:
+                logger.warning("%s", late_tick_line(elapsed, slept_for, _HEARTBEAT_INTERVAL))
                 try:
                     if self._ws is not None:
                         await self._ws.close(code=4004, reason="clock-jump")
-                except Exception:
+                except Exception:  # noqa: BLE001  # closing a link the clock jump already declared dead
                     pass
                 return
             last_tick = now
+            last_sleep_clock = now_sleep_clock
             # Recompute per-agent STAT fingerprints at most every
             # _FINGERPRINT_INTERVAL — off-thread so a large tree never blocks the
             # loop; the cached value rides intervening heartbeats. The proxy gates
@@ -1160,14 +1215,14 @@ class SatelliteWSClient:
                         self.sm.compute_agent_fingerprints
                     )
                     last_fp_compute = now
-                except Exception:
+                except Exception:  # noqa: BLE001  # the heartbeat loop's fingerprint step: a raise stops heartbeats
                     logger.debug("fingerprint compute failed", exc_info=True)
                 try:
                     await asyncio.to_thread(
                         _sweep_satellite_screenshots,
                         self.sm.config.agents_dir, _SCREENSHOTS_KEEP,
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001  # the heartbeat loop's screenshot sweep: a raise stops heartbeats
                     logger.debug("screenshots sweep failed", exc_info=True)
             try:
                 await self.enqueue_send({

@@ -10,7 +10,6 @@ mid-stream, and a session rebuild per reset was the old binding's cost).
 """
 
 import pytest
-
 from audio.constants import SAMPLE_WIDTH
 
 

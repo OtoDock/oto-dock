@@ -12,19 +12,21 @@
  * Cross-module ref plumbing is what makes a split of this page fragile, so
  * there is exactly one seam: the callbacks read the page values declared
  * AFTER this call — `interactive`, `draftKey`, `refetchChats` — through the
- * `latest` ref the page assigns every render (`latest.current = {...}` right
+ * `latestRef` the page writes in a layout effect (`latestRef.current = {...}` right
  * after those values exist). useDashboardWs refreshes its callbacks every
  * render, so a callback always ran with the newest render's closure;
- * `latest.current` makes that same "read the latest state" guarantee
+ * `latestRef.current` makes that same "read the latest state" guarantee
  * explicit across the module boundary. The stable refs the callbacks
  * share with the page's handlers are created here, before the call, and
  * returned — one instance each.
  */
-import { useRef, useEffect, useState } from 'react'
+import { useRef, useEffect, useState, useCallback, useLayoutEffect, useEffectEvent } from 'react'
 import type { RefObject } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import type { NavigateFunction } from 'react-router-dom'
 import { useChatStream } from '../../../hooks/useChatStream'
-import { WIRE } from '../../../api/wireEvents'
+import { WARMUP_FAILED_REASON, WIRE } from '../../../api/wireEvents'
+import { AUTO_REVIEW_MODE } from '../../../lib/engines/modes'
 import type { useInteractiveChat } from '../../../hooks/useInteractiveChat'
 import type { useChatNotifications } from '../../../hooks/useChatNotifications'
 import type { useAgents } from '../../../api/agents'
@@ -37,6 +39,9 @@ import type { useFindBar } from './useFindBar'
 import { isTaskChatId } from '../../../lib/session/kind'
 import { withWorkspaceParams } from '../../../lib/workspaceParams'
 import { useWarmupSends, type HeldSend } from './useWarmupSends'
+import { isNativePlatform } from '../../../audio/types'
+import { chatTargetsKey } from '../../../api/remoteMachines'
+import { emitAppToast } from '../../../lib/appToasts'
 
 type Selection = ReturnType<typeof useModelEngineSelection>
 type FindBar = ReturnType<typeof useFindBar>
@@ -52,7 +57,7 @@ export function useAgentChatStream({
   agents, urlChatId, agentDefaultModel, agentExecutionPath, agentName, navigate, isFavoriteAgent, preWarmPath,
   warmingUp, setWarmingUp, chatNotif, sessionInteractiveRef, duplexActiveRef,
   setChatActiveLayer, setProcessAlive, setPendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError,
-  pendingFindQuery, setFindInput, setFindQuery, setFindBarOpen, setDriveRefusal,
+  pendingFindQueryRef, setFindInput, setFindQuery, setFindBarOpen, setDriveRefusal,
 }: {
   agents: ReturnType<typeof useAgents>['data']
   urlChatId: string | undefined
@@ -72,7 +77,7 @@ export function useAgentChatStream({
   setPendingEngineSwitch: Selection['setPendingEngineSwitch']
   setEngineSwitchBusy: Selection['setEngineSwitchBusy']
   setEngineSwitchError: Selection['setEngineSwitchError']
-  pendingFindQuery: FindBar['pendingFindQuery']
+  pendingFindQueryRef: FindBar['pendingFindQueryRef']
   setFindInput: FindBar['setFindInput']
   setFindQuery: FindBar['setFindQuery']
   setFindBarOpen: FindBar['setFindBarOpen']
@@ -80,9 +85,21 @@ export function useAgentChatStream({
    *  person may drive it): the page locks its pickers with it. */
   setDriveRefusal: (refusal: { chatId: string; text: string } | null) => void
 }) {
-  // Assigned by the page every render (see the header); never read before
-  // the first render completes, so the placeholder is never observed.
-  const latest = useRef<AgentChatLatest>(null as unknown as AgentChatLatest)
+  // Written by the page in a layout effect (see the header); never read
+  // before the first commit, so the placeholder is never observed.
+  const latestRef = useRef<AgentChatLatest>(null as unknown as AgentChatLatest)
+  // The place picked for the new chat this page composes ({agent, target};
+  // null: where the agent's new chats start). State for the pill, a ref the
+  // socket reads when it sends the chat's first frames.
+  const [newChatPlace, setNewChatPlace] = useState<{ agent: string; target: string } | null>(null)
+  const newChatPlaceRef = useRef(newChatPlace)
+  const pickNewChatPlace = useCallback((agent: string, target: string | null) => {
+    const next = target ? { agent, target } : null
+    newChatPlaceRef.current = next
+    setNewChatPlace(next)
+  }, [])
+  // The "Runs on" chip's query, refreshed when a move of the open chat ends.
+  const queryClient = useQueryClient()
   // A phone call drives the viewed chat (chat_view_only): the banner shows
   // until the socket re-resumes the chat at the call's end.
   const [phoneCallActive, setPhoneCallActive] = useState(false)
@@ -124,11 +141,13 @@ export function useAgentChatStream({
   // and is wired in through the options below. NOTE: the option callbacks below
   // and is wired in through the options below. NOTE: the option callbacks
   // below reference page values declared after this call (interactive,
-  // draftKey, refetchChats) through `latest.current` — the page assigns it
+  // draftKey, refetchChats) through `latestRef.current` — the page assigns it
   // every render, and the callbacks only run later, from WS events.
   const stream = useChatStream({
     agents,
-    defaultMode: 'default',
+    newChatTarget: (agent) => (newChatPlaceRef.current?.agent === agent
+      ? newChatPlaceRef.current.target : undefined),
+    defaultMode: AUTO_REVIEW_MODE,
     initialChatId: urlChatId || null,
     fallbackModel: agentDefaultModel,
     // A failed pre-warm on an EMPTY new chat still gets the red
@@ -136,18 +155,20 @@ export function useAgentChatStream({
     // duplicate "Warmup failed" strip was removed from InstallProgressBar.
     appendErrorOnEmptyWarmupFail: true,
     queue: {
-      addQueued: (index, item) => { if (latest.current.draftKey) useChatStore.getState().addQueuedMessage(latest.current.draftKey, index, item) },
-      clearQueued: () => { if (latest.current.draftKey) useChatStore.getState().clearQueuedMessages(latest.current.draftKey) },
+      addQueued: (index, item) => { if (latestRef.current.draftKey) useChatStore.getState().addQueuedMessage(latestRef.current.draftKey, index, item) },
+      clearQueued: () => { if (latestRef.current.draftKey) useChatStore.getState().clearQueuedMessages(latestRef.current.draftKey) },
       // A cancelled queued message hands its attachments back to the
       // composer: the photos by their saved path (re-sent in place, shown
-      // through the agent files URL), the files as already-uploaded chips.
+      // through the agent files URL), or as the data a refused send carried
+      // before anything was saved; the files as already-uploaded chips.
       restoreAttachments: (images, files) => {
-        const key = latest.current.draftKey
+        const key = latestRef.current.draftKey
         if (!key) return
         const st = useChatStore.getState()
         if (images.length) {
-          st.addPendingImages(key, images.filter(i => i.path).map(i => ({
-            id: `img-${i.path}`, path: i.path, name: i.name,
+          st.addPendingImages(key, images.filter(i => i.path || i.base64).map((i, n) => ({
+            id: i.path ? `img-${i.path}` : `img-returned-${n}-${i.name}`,
+            path: i.path, base64: i.base64, name: i.name,
           })))
         }
         if (files.length) {
@@ -159,7 +180,7 @@ export function useAgentChatStream({
       },
     },
     clearQueueOnAbort: false,
-    onWarmupRefetch: () => latest.current.refetchChats(),
+    onWarmupRefetch: () => latestRef.current.refetchChats(),
     onWarmupReadyExtra: (data) => {
       setChatActiveLayer(data.execution_path || agentExecutionPath)  // Lock to chat's actual layer
       setWarmingUp(false)
@@ -168,7 +189,7 @@ export function useAgentChatStream({
       // warmup and the backend delivers them (submit_prompt / server kick);
       // the hook's flush + decline replay only remain for the attachments
       // stash. 'none' = not interactive: fall through to the server-kick.
-      const interactiveStatus = latest.current.interactive.onWarmupReady(data, {
+      const interactiveStatus = latestRef.current.interactive.onWarmupReady(data, {
         onDecline: (t, cid) => { serverKickPendingRef.current = false; ws.sendMessage(t, cid) },
       })
       const kick = serverKickPendingRef.current
@@ -183,7 +204,7 @@ export function useAgentChatStream({
         serverKickPendingRef.current = false
         ws.setStreaming(true)
         if (data.chat_id) useChatStore.getState().setStreaming(data.chat_id)
-        setTurnStartTime(Date.now())
+        startTurnNow()
       }
       // The alive-session reuse paths emit warmup_ready WITHOUT a preceding
       // warmup_started (pre-warmed reuse is decided in the backgrounded spawn
@@ -200,7 +221,13 @@ export function useAgentChatStream({
       }
     },
     onWarmupStartedExtra: (data) => {
-      latest.current.refetchChats()
+      // The minted chat took the page's place pick: the next new chat starts afresh.
+      if (data?.new_chat === true) {
+        newChatPlaceRef.current = null
+        setNewChatPlace(null)
+      }
+      latestRef.current.refetchChats()
+      latestRef.current.interactive.switchStarted(data?.chat_id)
       // Own the URL as soon as the chat_id exists (during spawn), not at
       // warmup_ready — so a refresh/back re-resumes the in-flight warmup
       // instead of losing the chat.
@@ -220,32 +247,48 @@ export function useAgentChatStream({
       setWarmingUp(false)
       warmupHandBackRef.current()
     },
-    onWarmupFailedReset: () => {
+    // A live switch refused before its re-warm started gets no warmup_ready:
+    // its refusal unlocks the terminal toggle.
+    onErrorExtra: (message) => latestRef.current.interactive.switchErrored(message),
+    onWarmupFailedReset: (data) => {
       // Clear warmup state so input re-enables and the user can retry
       // (e.g. once the admin brings the satellite back online).
       setWarmingUp(false)
+      // A place refused before the mint goes: the next send starts at the
+      // default (the card says why).
+      if (!data.chat_id && data.reason === WARMUP_FAILED_REASON.TARGET_UNAVAILABLE) {
+        newChatPlaceRef.current = null
+        setNewChatPlace(null)
+      }
+      latestRef.current.interactive.switchFailed()
       warmupHandBackRef.current()
       // A failed phone-mode mint must not leave the apps keep-open armed —
       // the NEXT ordinary chat entry would re-open a panel the user closed.
       keepAppsOnChatEntryRef.current = false
     },
-    onTitleUpdated: () => latest.current.refetchChats(),
+    onTitleUpdated: () => latestRef.current.refetchChats(),
     onChatViewOnly: (data) => {
       // A phone call drives the viewed chat: the banner shows while the
       // history is read-only; the socket re-resumes the chat when the call
       // ends and clears this with null.
       setPhoneCallActive(data !== null)
     },
-    onChatMoved: () => {
-      // move_chat ack for the open chat: the backend rebound the pin and
-      // dropped this connection's session binding — re-resume so the fresh
-      // warmup runs on the new target and the "moved" history card arrives
-      // (the same re-open path as clicking the chat row; no page reset
-      // needed, the chat_history reload is wholesale anyway).
+    onChatMoved: (data: { chat_id: string; ok?: boolean; message?: string }) => {
+      // A move of the open chat ended (every tab viewing it hears it, the
+      // mover's included): the backend closed the session and rebound the
+      // pin (or, when the move failed, left it) — re-resume so the next
+      // warmup runs where the chat now is and the "moved" history card
+      // arrives (the same re-open path as clicking the chat row; no page
+      // reset needed, the chat_history reload is wholesale anyway). The
+      // "Runs on" chip reads its place again; a failed move says why.
       const cid = chatIdRef.current
       if (!cid) return
+      void queryClient.invalidateQueries({ queryKey: chatTargetsKey(cid) })
+      if (data.ok === false && data.message) {
+        emitAppToast({ severity: 'warning', title: 'The chat was not moved', body: data.message })
+      }
       setSessionId(null)
-      latest.current.interactive.resetSession()  // the old session (interactive included) was closed server-side
+      latestRef.current.interactive.resetSession()  // the old session (interactive included) was closed server-side
       ws.resumeChat(cid)
     },
     onEngineSwitched: (data) => {
@@ -263,7 +306,7 @@ export function useAgentChatStream({
       setPendingEngineSwitch(null)
       setEngineSwitchBusy(false)
       setEngineSwitchError(null)
-      latest.current.refetchChats()
+      latestRef.current.refetchChats()
     },
     onSwitchEngineDenied: (data) => {
       // Rendered inside the switch dialog — the generic error rail only
@@ -323,18 +366,18 @@ export function useAgentChatStream({
       // Restore the per-chat interactive toggle from the stored execution_mode.
       // The live flag stays false until a warmup_ready{interactive} arrives — a
       // dead interactive chat shows its DB history with the toggle reflected on.
-      latest.current.interactive.restoreFromMeta(data.execution_mode)
+      latestRef.current.interactive.restoreFromMeta(data.execution_mode)
       setDriveRefusal(data.drive_refusal && data.chat_id
         ? { chatId: data.chat_id, text: data.drive_refusal } : null)
     },
     onExecutionModeChanged: (executionMode) => {
-      latest.current.interactive.applyStoredExecMode(executionMode)
+      latestRef.current.interactive.applyStoredExecMode(executionMode)
     },
     onChatHistoryLoaded: (_data) => {
       // Open find bar if deferred from URL ?q= param (after messages are loaded)
-      if (pendingFindQuery.current) {
-        const q = pendingFindQuery.current
-        pendingFindQuery.current = null
+      if (pendingFindQueryRef.current) {
+        const q = pendingFindQueryRef.current
+        pendingFindQueryRef.current = null
         setFindInput(q)
         setFindQuery(q)
         setFindBarOpen(true)
@@ -360,7 +403,7 @@ export function useAgentChatStream({
       }
       // Fire an interactive switch that was deferred so it wouldn't cut
       // this (now-finished) -p turn.
-      latest.current.interactive.flushDeferredSwitch(chatIdRef.current)
+      latestRef.current.interactive.flushDeferredSwitch(chatIdRef.current)
       // Turn end arrives while the reply's TTS tail is still PLAYING in a
       // live voice session (the engine paces audio in real time, so several
       // seconds of speech follow the done event). The refetch triggers a
@@ -370,17 +413,17 @@ export function useAgentChatStream({
       // literally mid-sentence: run it when speech goes idle (immediately
       // when nothing is speaking — the old fixed 2.5s only guessed the
       // tail and only covered duplex).
-      speechIdle(() => latest.current.refetchChats())
+      speechIdle(() => latestRef.current.refetchChats())
     },
     onTurnComplete: (_data) => {
       // Origin-routed end-of-turn ping: a hidden tab or a background chat
       // (useChatStream already drops it for the visible viewed chat, which
       // onTurnDone pings). The native app alerts via FCM instead.
       try {
-        if ((window as any).Capacitor?.isNativePlatform?.()) return
+        if (isNativePlatform()) return
       } catch { /* not native */ }
       if (!duplexActiveRef.current && !isDictationActive()) chatNotif.playPing()
-      speechIdle(() => latest.current.refetchChats())
+      speechIdle(() => latestRef.current.refetchChats())
     },
     enableDefensiveRefetch: true,
     // The defensive history refetch remounts the whole message list — a
@@ -397,12 +440,14 @@ export function useAgentChatStream({
     ws, setTurnStartTime, chatIdRef, setSessionId, setModel, setContextMax, chatId, seedDbHistory, setMode,
     sessionId, model, mode, setEditText,
   } = stream
+  // The turn's clock starts at the adoption, not at the spawn.
+  const startTurnNow = useCallback(() => setTurnStartTime(Date.now()), [setTurnStartTime])
 
   // Sends typed during "Getting ready": kept in order; what is still held
   // when the warmup fails goes back to the composer, attachments included.
   const warmupSends = useWarmupSends(ws, chatId, (held: HeldSend[]) => {
     setEditText(held.map((h) => h.text).filter(Boolean).join('\n\n'))
-    const key = latest.current.draftKey
+    const key = latestRef.current.draftKey
     if (!key) return
     const st = useChatStore.getState()
     const images = held.flatMap((h) => h.images ?? [])
@@ -419,7 +464,7 @@ export function useAgentChatStream({
       })))
     }
   })
-  warmupHandBackRef.current = warmupSends.handBack
+  useLayoutEffect(() => { warmupHandBackRef.current = warmupSends.handBack })
 
   // --- Connect on mount ---
 
@@ -431,11 +476,12 @@ export function useAgentChatStream({
 
   // "Shared with you" (SHARING.md): the frame reaches the notifications
   // hook through the socket's generic registry, the way any frame with no
-  // option of its own does; the ref keeps the newest handler.
-  const shareInboxRef = useRef(chatNotif.onShareInbox)
-  shareInboxRef.current = chatNotif.onShareInbox
+  // option of its own does; the effect event sees the newest handler.
+  const onShareInbox = useEffectEvent(chatNotif.onShareInbox)
   const wsSubscribe = ws.subscribe
-  useEffect(() => wsSubscribe(WIRE.SHARE_INBOX, (msg) => shareInboxRef.current(msg)), [wsSubscribe])
+  useEffect(() => wsSubscribe(WIRE.SHARE_INBOX, (msg) => {
+    if (msg.type === WIRE.SHARE_INBOX) onShareInbox(msg)
+  }), [wsSubscribe])
 
   // Eager pre-warmup: start MCP init when landing on the FAVORITE agent's
   // new-chat page. Non-favorite agents warm lazily on first interaction
@@ -467,9 +513,10 @@ export function useAgentChatStream({
 
   return {
     ...stream,
-    latest,
+    latestRef,
     chatRowsTimerRef, preWarmedRef, lastResumedChatIdRef,
     warmupSends, serverKickPendingRef, keepAppsOnChatEntryRef,
     phoneCallActive,
+    newChatPlace, pickNewChatPlace,
   }
 }

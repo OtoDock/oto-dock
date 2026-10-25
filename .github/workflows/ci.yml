@@ -10,7 +10,7 @@ name: ci
 #
 # Branch protection on main requires `proxy`, `dashboard`, `satellite` and
 # `phone`; every other job here reports without blocking a merge. The
-# dashboard's ESLint gate and the proxy's mypy allowlist run in their own jobs
+# dashboard's ESLint gate and the proxy's mypy check run in their own jobs
 # (`dashboard-lint`, `typecheck`) for that reason.
 
 on:
@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        image: postgres:16.15-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36
         env:
           POSTGRES_USER: otodock
           POSTGRES_PASSWORD: otodock
@@ -45,11 +45,11 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
           cache: pip
@@ -106,7 +106,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     services:
       postgres:
-        image: postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+        image: postgres:16.15-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36
         env:
           POSTGRES_USER: otodock
           POSTGRES_PASSWORD: otodock
@@ -117,11 +117,11 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
           cache: pip
@@ -159,11 +159,11 @@ jobs:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
           cache: pip
@@ -194,11 +194,11 @@ jobs:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.10'
           cache: pip
@@ -225,11 +225,11 @@ jobs:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
           cache: pip
@@ -252,13 +252,13 @@ jobs:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24'
+          node-version: '26'
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
 
@@ -278,22 +278,19 @@ jobs:
         working-directory: dashboard
         run: npx vitest run
 
-  # ESLint on the dashboard: every rule an error, the findings the code had
-  # when the gate was adopted frozen per file and rule in
-  # dashboard/eslint-suppressions.json. This cut lacks a few files the
-  # suppressions name, so an unused suppression passes here. Not a required
-  # check.
+  # ESLint on the dashboard: every rule an error; dashboard/eslint-suppressions.json
+  # is empty (a finding is fixed, never suppressed). Not a required check.
   dashboard-lint:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24'
+          node-version: '26'
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
 
@@ -303,20 +300,20 @@ jobs:
 
       - name: eslint
         working-directory: dashboard
-        run: npm run lint -- --pass-on-unpruned-suppressions
+        run: npm run lint
 
-  # mypy on the proxy's allowlist (proxy/mypy.ini `files`), with the proxy's
+  # mypy on the whole proxy (proxy/mypy.ini `files = .`), with the proxy's
   # dependencies installed so their types are the ones a local run sees. Not
   # a required check.
   typecheck:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
           cache: pip
@@ -336,6 +333,44 @@ jobs:
         working-directory: proxy
         run: mypy
 
+  # The Android app as a contributor builds it: the web bundle synced into
+  # the Gradle project, the debug APK and the native unit tests. No
+  # google-services.json (the app then builds without push) and no signing
+  # values (only release packaging needs them). Not a required check.
+  android:
+    if: github.repository == 'OtoDock/oto-dock'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Build web bundle + sync to android
+        working-directory: dashboard
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          npx cap sync android
+
+      - name: gradle assembleDebug
+        working-directory: dashboard/android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: gradle testDebugUnitTest
+        working-directory: dashboard/android
+        run: ./gradlew testDebugUnitTest --no-daemon
 
   # Secrets in the tracked tree, the Dockerfiles, the workflows and the
   # licensing (REUSE.toml), each tool at a pinned version checked against its
@@ -352,7 +387,7 @@ jobs:
       ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
       REUSE_VERSION: 6.2.0
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -387,7 +422,7 @@ jobs:
       - name: actionlint
         run: actionlint -no-color
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
 
@@ -410,11 +445,11 @@ jobs:
     if: github.repository == 'OtoDock/oto-dock'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
 

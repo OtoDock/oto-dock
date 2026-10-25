@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 import ActiveChatsPanel from '@/components/chat/ActiveChatsPanel'
+import { GLASS } from '@/components/ui/glass'
 
 // ─── ActiveChatsPanel (render logic; hook + agents mocked) ──────────────────
 
@@ -32,9 +33,6 @@ describe('ActiveChatsPanel', () => {
     // The collapse prefs persist in localStorage — isolate every test.
     localStorage.clear()
   })
-
-  const expandHome = () =>
-    fireEvent.click(screen.getByRole('button', { name: /Active now/ }))
 
   it('renders nothing when no chats are active', () => {
     const { container } = render(
@@ -194,7 +192,6 @@ describe('ActiveChatsPanel', () => {
     render(
       <ActiveChatsPanel variant="home" currentAgent="alpha" activeChatId={null} onSelect={onSelect} />,
     )
-    expandHome()
     fireEvent.click(screen.getByText('Local'))
     expect(onSelect).toHaveBeenCalledWith('c1')
     expect(navigateMock).not.toHaveBeenCalled()
@@ -209,7 +206,7 @@ describe('ActiveChatsPanel', () => {
     const onSelect = vi.fn()
     render(<ActiveChatsPanel currentAgent="alpha" activeChatId={null} onSelect={onSelect} />)
     const row = screen.getByTitle('Task running…')
-    expect(row.className).toContain('ring-p-accent-purple/40')
+    expect(row.className).toContain('ring-accent-agent-border')
     expect(row.className).toContain('oto-row-live-purple')
     expect(screen.getByText('Beta Agent · task')).toBeTruthy()
     fireEvent.click(screen.getByText('Nightly digest'))
@@ -236,8 +233,8 @@ describe('ActiveChatsPanel', () => {
     const streaming = screen.getByTitle('Generating response…')
     expect(streaming.className).toContain('oto-row-live')
     expect(streaming.querySelector('span.w-2.h-2')).toBeNull()
-    const finished = screen.getByTitle('Finished — not opened yet')
-    expect(finished.className).toContain('bg-brand-surface')
+    const finished = screen.getByTitle('Finished, not opened yet')
+    expect(finished.className).toContain('bg-action-subtle')
     expect(finished.className).not.toContain('oto-row-live')
     expect(finished.querySelector('span.w-2.h-2')).toBeTruthy()
   })
@@ -251,7 +248,9 @@ describe('ActiveChatsPanel', () => {
     )
     expect(screen.getByTestId('active-chats-home')).toBeTruthy()
     expect(screen.queryByTestId('active-chats-panel')).toBeNull()
-    expandHome()
+    // The home strip sits under the top bar on the chat chrome's glass.
+    const strip = screen.getByTestId('active-chats-home').firstElementChild as HTMLElement
+    for (const c of GLASS.split(' ')) expect(strip.className.split(/\s+/)).toContain(c)
     expect(screen.getByText('Fix the tests')).toBeTruthy()
 
     rowsMock.mockReturnValue([])
@@ -276,27 +275,27 @@ describe('ActiveChatsPanel', () => {
     expect(container.className).toContain('max-h-34')
   })
 
-  it('home variant starts collapsed with a live dot; expanding persists', () => {
+  it('home variant starts expanded; collapsing persists and the live dot takes over', () => {
     rowsMock.mockReturnValue([
-      { id: 'c1', agent: 'beta', title: 'Hidden until expanded', phase: 'streaming' },
+      { id: 'c1', agent: 'beta', title: 'Visible until collapsed', phase: 'streaming' },
     ])
     const first = render(
       <ActiveChatsPanel variant="home" currentAgent="alpha" activeChatId={null} onSelect={() => {}} />,
     )
     const header = screen.getByRole('button', { name: /Active now · 1/ })
-    expect(header.getAttribute('aria-expanded')).toBe('false')
-    expect(screen.queryByText('Hidden until expanded')).toBeNull()
+    expect(header.getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByText('Visible until collapsed')).toBeTruthy()
+    fireEvent.click(header)
+    expect(screen.queryByText('Visible until collapsed')).toBeNull()
     // Collapsed + something generating → the header carries the pulse dot.
     expect(header.querySelector('span.animate-pulse')).toBeTruthy()
-    fireEvent.click(header)
-    expect(screen.getByText('Hidden until expanded')).toBeTruthy()
-    expect(localStorage.getItem('active-now-home')).toBe('open')
+    expect(localStorage.getItem('active-now-home')).toBe('closed')
     first.unmount()
     // A fresh mount honors the persisted choice.
     render(
       <ActiveChatsPanel variant="home" currentAgent="alpha" activeChatId={null} onSelect={() => {}} />,
     )
-    expect(screen.getByText('Hidden until expanded')).toBeTruthy()
+    expect(screen.queryByText('Visible until collapsed')).toBeNull()
   })
 
   it('sidebar variant starts expanded; collapsing persists', () => {

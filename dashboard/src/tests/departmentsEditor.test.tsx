@@ -19,7 +19,12 @@ const h = vi.hoisted(() => ({
 vi.mock('@/api/departments', () => ({
   useDepartments: () => ({ data: h.departments, isLoading: false }),
   useCreateDepartment: () => ({ mutate: h.createMutate, isPending: false, error: null }),
-  useUpdateDepartment: () => ({ mutate: h.updateMutate, isPending: false, error: null }),
+  useUpdateDepartment: () => ({
+    mutate: h.updateMutate,
+    mutateAsync: (v: unknown) => Promise.resolve(h.updateMutate(v)),
+    isPending: false,
+    error: null,
+  }),
   useDeleteDepartment: () => ({ mutate: h.deleteMutate, isPending: false, error: null }),
   useSetDepartmentLevels: () => ({ mutate: h.setLevelsMutate, isPending: false, error: null }),
 }))
@@ -92,7 +97,7 @@ describe('DepartmentsEditor', () => {
     const bob = screen.getByText('Bob')
     expect(bob.className).toContain('opacity-50')
     expect(
-      screen.getByText("Assignment lives in each agent's settings (Department field)."),
+      screen.getByText("Each agent's department is set in its settings, in the Department field."),
     ).toBeInTheDocument()
   })
 
@@ -145,10 +150,25 @@ describe('DepartmentsEditor', () => {
     fireEvent.click(group('New department delegation mode').getByLabelText('Down and across'))
     fireEvent.click(group('New department reach').getByLabelText('Whole department'))
     expect(
-      screen.getByText('Each level delegates to the level below it, and agents on the same level delegate to each other.'),
+      screen.getByText('Each level delegates to the level below it. Agents on the same level also delegate to each other.'),
     ).toBeInTheDocument()
     fireEvent.click(screen.getByText('Create department'))
     expect(h.createMutate.mock.calls[0][0]).toMatchObject({ mode: 'down_across', reach: 'subtree' })
+  })
+
+  it('a renamed department says Saved after its name field, never inside the card\'s toggle', async () => {
+    h.departments = [makeDept()]
+    renderEditor()
+    fireEvent.click(screen.getByText('Engineering'))
+    const field = screen.getByLabelText('Department name')
+    fireEvent.change(field, { target: { value: 'Platform' } })
+    fireEvent.blur(field)
+    expect(h.updateMutate).toHaveBeenCalledWith({ id: 'd1', name: 'Platform' })
+    const saved = await screen.findByText('Saved')
+    expect(field.parentElement!.contains(saved)).toBe(true)
+    const toggle = screen.getByRole('button', { expanded: true })
+    expect(toggle.contains(saved)).toBe(false)
+    expect(toggle.querySelector('[role=status]')).toBeNull()
   })
 
   it('the card shows the wiring and autosaves a mode or reach pick', () => {

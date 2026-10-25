@@ -89,7 +89,7 @@ async def _notify(on_state, state: str) -> None:
         return
     try:
         await on_state(state)
-    except Exception:
+    except Exception:  # noqa: BLE001  # a caller's on_state callback must never block or fail a push
         logger.debug("transfer_gate on_state(%s) failed", state, exc_info=True)
 
 

@@ -10,19 +10,25 @@ RemoteExecutionLayer; split out of remote_execution.py.
 """
 
 import asyncio
-from concurrent.futures import Future
 import logging
 import time
+from concurrent.futures import Future
+from typing import TYPE_CHECKING, cast
 
-from core.execution_layer import AgentConfig
+from auth.roles import row_role
 from core import placement
+from core.execution_layer import AgentConfig
 from core.remote.remote_session_info import RemoteSessionInfo
 from core.session import session_state as _state
 from core.session.session_state import (
-    _record_session_use, register_session_state, cleanup_session_permission_state,
-    mark_starting, clear_starting, session_is_held, REMOTE_START_MARK_TTL_S,
+    REMOTE_START_MARK_TTL_S,
+    _record_session_use,
+    cleanup_session_permission_state,
+    clear_starting,
+    mark_starting,
+    register_session_state,
+    session_is_held,
 )
-from auth.roles import row_role
 from storage.pg import run_db
 from ws import wire_events as wire
 
@@ -79,7 +85,8 @@ def _collect_session_files(
 
     from core.credentials import mcp_broker
     from core.sandbox.session_config_dir import (
-        collect_authorized_ssh_keys, session_takes_ssh_keys,
+        collect_authorized_ssh_keys,
+        session_takes_ssh_keys,
     )
     from services.oauth import credential_resolver
 
@@ -120,7 +127,91 @@ def _collect_session_files(
     return files
 
 
-class RemoteSessionStartMixin:
+if TYPE_CHECKING:
+    from auth.path_policy import SecurityContext
+    from core.remote.remote_host import RemoteLayerHost as _Host
+else:
+    _Host = object
+
+
+def placement_refuses(machine_id: str, config: AgentConfig) -> bool:
+    """Whether ``placement.may_run_on`` refuses this session on the machine:
+    the config's person (``user_sub``, "" for a run with no person) at its
+    session's role. A machine row that is gone refuses nothing here (the
+    start fails on the missing connection). Synchronous."""
+    from auth import roles
+    from storage import remote_store
+    machine = remote_store.get_remote_machine(machine_id)
+    if machine is None:
+        return False
+    role = getattr(config.security_context, "role", "") or ""
+    return not placement.may_run_on(machine, run_sub=config.user_sub or None,
+                                    run_can_manage=roles.can_manage(role),
+                                    user_paired_allowed=True)
+
+
+async def _tools_row(chat_id: str, message: str) -> None:
+    """A line in the chat about its machine's tools, persisted so a reload
+    shows it where it was written, and sent to the chat's open tabs."""
+    import functools
+    import json
+
+    from core.events import chat_writer
+    from storage import database as task_store
+    block = {"type": wire.SYSTEM, "subtype": wire.SUBTYPE_TOOLS_INSTALLING,
+             "message": message}
+    await chat_writer.submit(chat_id, functools.partial(
+        task_store.add_chat_message, chat_id, "event", "",
+        event_type=wire.SYSTEM, event_data=json.dumps(block)), label="tools_installing")
+    _state.broadcast_chat_frame(chat_id, {**block, "chat_id": chat_id})
+
+
+async def _tell_tools_installing(chat_id: str, place: str, installing: list[str],
+                                 watch) -> None:
+    """The chat's line when its session starts with tools still installing on
+    its machine, naming them, and a second one when the same plan's listener
+    learns how they ended, unless the chat no longer runs there. Once per
+    chat per plan: a restart, a resume or a warm-up during the same plan adds
+    nothing. The running session is never restarted for them: a new chat on
+    the machine has them."""
+    from services.mcp import mcp_sync
+    if watch is not None:
+        if chat_id in watch.told:
+            return
+        watch.told.add(chat_id)
+    try:
+        await _tools_row(chat_id, mcp_sync.installing_sentence(
+            mcp_sync.tool_labels(installing), place))
+    except Exception:  # noqa: BLE001  # the line spans the writer and the db: the session starts anyway
+        logger.warning("chat %s: the still-installing line was not written", chat_id[:8],
+                       exc_info=True)
+        return
+    if watch is None:
+        return
+
+    async def _settled(w) -> None:
+        ok, failed, unknown = w.outcome(installing)
+        if unknown:
+            logger.info("chat %s: no line for the tools whose install never ended: %s",
+                        chat_id[:8], unknown)
+            return
+        try:
+            from storage import database as task_store
+            chat = await run_db(task_store.get_chat, chat_id)
+            pin = (chat or {}).get("execution_target")
+            if chat is None or (pin and placement.machine_of(pin) != w.machine_id):
+                logger.info("chat %s: moved off %s, no line for its tools", chat_id[:8],
+                            w.machine_id[:8])
+                return
+            await _tools_row(chat_id, mcp_sync.finished_sentence(
+                mcp_sync.tool_labels(ok), mcp_sync.tool_labels(failed), place))
+        except Exception:  # noqa: BLE001  # the chat may be gone by then
+            logger.warning("chat %s: the tools line was not written", chat_id[:8], exc_info=True)
+
+    watch.when_settled(_settled)
+
+
+class RemoteSessionStartMixin(_Host):
     # --- ExecutionLayer interface: start ---
 
     @staticmethod
@@ -187,6 +278,12 @@ class RemoteSessionStartMixin:
         # the editor tier the session is refused as it is locally.
         from core.sandbox.session_config_dir import refuse_session_on_agent_state
         refuse_session_on_agent_state(config.security_context)
+        # The placement guard: never a session on a place its person may not
+        # use (a shared chat another person placed on their computer, a task's
+        # stale machine, an admin machine below the owner tier). The chat
+        # builder names the place first; this holds every other spawn.
+        if await asyncio.to_thread(placement_refuses, machine_id, config):
+            raise placement.PlacementRefused(placement.REFUSED_SENTENCE)
 
         if not self._cm.is_connected(machine_id):
             raise RuntimeError(
@@ -214,7 +311,9 @@ class RemoteSessionStartMixin:
         # the chat / dashboard selection), else the agent's default — the same
         # resolution every other spawn path uses.
         from core.session.session_manager import (
-            capabilities_for_path, get_layer_by_path, resolve_execution_path,
+            capabilities_for_path,
+            get_layer_by_path,
+            resolve_execution_path,
         )
         execution_path = resolve_execution_path(config.agent_name, config.execution_path)
         _rcaps = capabilities_for_path(execution_path)
@@ -271,8 +370,7 @@ class RemoteSessionStartMixin:
         # credentials. Compute the target username once and pass it down;
         # admin-shared machines pass None and see everything. Keyed on the
         # stable pairing_scope, NOT the owner's mutable platform role.
-        from storage import remote_store as _rs
-        from storage import database as _db
+        from storage import database as _db, remote_store as _rs
         target_username: str | None = None
         machine = await run_db(_rs.get_remote_machine, machine_id)
         if machine and not placement.machine_is_admin_paired(machine):
@@ -343,8 +441,8 @@ class RemoteSessionStartMixin:
         # scheduler paths drive the same lifecycle with no dashboard WS
         # listener; events accumulate in the registry's bounded history and
         # the sweeper drops the entry after 600s ("fire and drop").
-        from services.mcp import mcp_sync
         from core.remote import install_registry
+        from services.mcp import mcp_sync
 
         await install_registry.register(
             machine_id, config.agent_name, getattr(config, "user_sub", "") or "",
@@ -457,7 +555,7 @@ class RemoteSessionStartMixin:
                         config.security_context, "knowledge_rw", False)),
                     progress_cb=_sync_progress,
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # workspace sync spans disk, db and satellite: the session starts anyway
                 logger.warning(
                     "Initial workspace sync failed for session %s: %s",
                     session_id[:8], e,
@@ -466,11 +564,19 @@ class RemoteSessionStartMixin:
                 # The MCPs this session leaves out by its context alone stay
                 # wanted: a task start never makes the next chat rebuild them.
                 lifted = await mcp_sync.lifted_by_context(config, set(assigned_mcps))
+                # A person's chat (and sooner, a phone call) waits a short
+                # while for its installs, then starts with the tools that are
+                # ready while the rest go on installing; a run nobody watches
+                # waits for its plan.
+                from core.session import session_kind
                 sync_result = await mcp_sync.sync_mcps_for_session(
                     machine_id, session_id, list(assigned_mcps), also_wanted=lifted,
                     plan_cb=_on_plan, progress_cb=_on_progress,
+                    early_start_s=mcp_sync.early_start_for(config.client_type),
                 )
-                lifted_failed = sync_result.excluded_names - set(assigned_mcps)
+                installing = sorted(sync_result.still_installing & set(assigned_mcps))
+                not_failed = sync_result.still_installing | sync_result.not_installed
+                lifted_failed = (sync_result.excluded_names - not_failed - set(assigned_mcps))
                 lifted_cold = set(sync_result.warmup_failed) - set(assigned_mcps)
                 if lifted_failed or lifted_cold:
                     logger.info(
@@ -493,15 +599,18 @@ class RemoteSessionStartMixin:
                         session_id[:8],
                         {
                             n: sync_result.failed.get(n, "install failed")
-                            for n in sorted(excluded)
-                        },
+                            for n in sorted(excluded) if n not in not_failed
+                        } | {n: "still installing" for n in sorted(excluded & sync_result.still_installing)}
+                        | {n: "not installed yet" for n in sorted(excluded & sync_result.not_installed)},
                     )
                     for failed_name in sorted(excluded):
                         # Memoized skips attempted nothing this session — a
                         # lone failure frame outside a started/done lifecycle
                         # would seed a ghost "installing" bar client-side.
                         # The exclusion itself (config strip) still applies.
-                        if failed_name in sync_result.memoized:
+                        # One still installing (or left for the next start
+                        # beside another plan) has not failed.
+                        if failed_name in sync_result.memoized or failed_name in not_failed:
                             continue
                         await install_registry.emit(machine_id, config.agent_name, {
                             "type": wire.MCP_INSTALL_FAILED,
@@ -510,6 +619,13 @@ class RemoteSessionStartMixin:
                             "mcp": failed_name,
                             "error": sync_result.failed.get(failed_name, "install failed"),
                         })
+                # A person reads the line; a call's prompt names them alone.
+                if installing and config.chat_id and session_kind.attended(config.client_type):
+                    sc = config.security_context
+                    place = (getattr(getattr(sc, "placement", None), "label", "")
+                             or "this machine")
+                    await _tell_tools_installing(config.chat_id, place, installing,
+                                                 sync_result.watch)
                 # A lifted MCP this session does not launch never shows on
                 # its card (logged with the lifted install failures above).
                 warmup_failures = sorted(n for n in sync_result.warmup_failed if n in assigned_mcps)
@@ -521,15 +637,18 @@ class RemoteSessionStartMixin:
                         {k: sync_result.warmup_failed[k] for k in warmup_failures},
                     )
                 # Only close the lifecycle if we actually opened it (real work).
-                # An empty diff emits nothing — no bar, no 100%-flicker.
+                # An empty diff emits nothing — no bar, no 100%-flicker. A
+                # session that starts with tools still installing names them,
+                # so the bar goes without "Install complete".
                 if install_started_flag["v"]:
                     await install_registry.emit(machine_id, config.agent_name, {
                         "type": wire.INSTALL_DONE,
                         "machine_id": machine_id,
                         "agent": config.agent_name,
                         "warmup_failures": warmup_failures,
+                        "still_installing": sorted(sync_result.still_installing),
                     })
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # mcp sync spans registry, db and satellite: the ui gets install_failed
                 # Missing MCP sync shouldn't block session start entirely — the
                 # CLI will simply fail to launch those MCPs. Log and surface
                 # as install_failed so the UI can show the error.
@@ -584,7 +703,7 @@ class RemoteSessionStartMixin:
         # session started; the engine's plan says how long that may take (a
         # Codex session on a local model waits out its MCP warm gate first).
         try:
-            await self._cm.send_command(machine_id, {
+            ack = await self._cm.send_command(machine_id, {
                 "type": "start_session",
                 "session_id": session_id,
                 "agent_slug": config.agent_name,
@@ -594,6 +713,11 @@ class RemoteSessionStartMixin:
         except Exception:
             self._cm.remove_session_queue(machine_id, session_id)
             raise
+        if isinstance(ack, dict) and ack.get("resume_refused") and config.chat_id:
+            # The engine refused the session the chat names (a Codex thread,
+            # satellite 0.5.156): its first turn restores the history.
+            from core.session.history_seed import mark_resume_refused
+            await run_db(mark_resume_refused, config.chat_id)
 
         # Register session info
         info = RemoteSessionInfo(
@@ -605,7 +729,7 @@ class RemoteSessionStartMixin:
             use_native_permissions=config.use_native_permissions,
             allow_full_fs=bool(
                 config.security_context is not None
-                and config.security_context.placement.allow_full_fs
+                and cast("SecurityContext", config.security_context).placement.allow_full_fs
             ),
             model=config.model,
             mode=config.permission_mode,
@@ -647,7 +771,8 @@ class RemoteSessionStartMixin:
         if not config.subscription_id:
             return None
         from services.engines.subscription_pool import (
-            bind_session, credential_scope_key,
+            bind_session,
+            credential_scope_key,
         )
         # The binding writer's future: the start awaits it so the row is
         # durable before the session runs.

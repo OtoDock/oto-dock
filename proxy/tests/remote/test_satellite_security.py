@@ -15,9 +15,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.remote.file_sync import compute_manifest, diff_manifests, FileEntry
+from core.remote.file_sync import FileEntry, compute_manifest, diff_manifests
 from tests._paths import PROXY_DIR
-
 
 # ---------------------------------------------------------------------------
 # 1. compute_manifest filter
@@ -189,8 +188,9 @@ def _make_user(sub="admin-sub", role="admin"):
 class TestAssignAgentAdminGate:
     @pytest.mark.asyncio
     async def test_rejects_non_admin_machine(self):
-        from api.remote.remote_machines import assign_agent, AssignAgentRequest
         from fastapi import HTTPException
+
+        from api.remote.remote_machines import AssignAgentRequest, assign_agent
 
         admin_user = _make_user("admin-1", "admin")
         with patch("api.remote.remote_machines.remote_store.get_remote_machine") as gm:
@@ -212,7 +212,7 @@ class TestAssignAgentAdminGate:
 
     @pytest.mark.asyncio
     async def test_accepts_admin_machine(self):
-        from api.remote.remote_machines import assign_agent, AssignAgentRequest
+        from api.remote.remote_machines import AssignAgentRequest, assign_agent
 
         admin_user = _make_user("admin-1", "admin")
         with patch("api.remote.remote_machines.remote_store") as rs, \
@@ -249,7 +249,7 @@ class TestAdminPairAllowFullFsDefault:
 
     @pytest.mark.asyncio
     async def test_admin_pair_defaults_home_only(self):
-        from api.remote.remote_machines import pair_machine, PairMachineRequest
+        from api.remote.remote_machines import PairMachineRequest, pair_machine
 
         admin_user = _make_user("admin-1", "admin")
         with patch("api.remote.remote_machines.remote_store") as rs, \
@@ -265,7 +265,7 @@ class TestAdminPairAllowFullFsDefault:
 
     @pytest.mark.asyncio
     async def test_admin_pair_explicit_full_fs_opt_in(self):
-        from api.remote.remote_machines import pair_machine, PairMachineRequest
+        from api.remote.remote_machines import PairMachineRequest, pair_machine
 
         admin_user = _make_user("admin-1", "admin")
         with patch("api.remote.remote_machines.remote_store") as rs, \
@@ -285,9 +285,10 @@ class TestUpdateAgentAdminGate:
     @pytest.mark.asyncio
     async def test_creator_cannot_set_remote_target(self):
         """Even a platform creator can't point an agent default at any remote machine."""
-        from api.agents.agents import update_agent
         from fastapi import HTTPException
         from pydantic import BaseModel
+
+        from api.agents.agents import update_agent
 
         # UpdateAgentRequest may have many fields; mock minimal
         creator_user = _make_user("mgr-1", "creator")
@@ -310,13 +311,14 @@ class TestUpdateAgentAdminGate:
             with pytest.raises(HTTPException) as exc:
                 await update_agent("my-agent", req, creator_user)
             assert exc.value.status_code == 403
-            assert "only admins" in exc.value.detail.lower()
+            assert "only an admin" in exc.value.detail.lower()
 
     @pytest.mark.asyncio
     async def test_admin_rejected_on_non_admin_machine(self):
-        from api.agents.agents import update_agent
         from fastapi import HTTPException
         from pydantic import BaseModel
+
+        from api.agents.agents import update_agent
 
         admin_user = _make_user("admin-1", "admin")
 
@@ -357,7 +359,7 @@ class TestAgentScopeOnUserPairedRefused:
         from core.session import session_manager
 
         with patch("storage.agents.agent_store.get_agent") as ga, \
-             patch("storage.remote_store.resolve_execution_target") as ret, \
+             patch("services.remote.remote_status.resolve_execution_target") as ret, \
              patch("storage.remote_store.get_remote_machine") as gm:
             ga.return_value = {"execution_path": "claude-code-cli"}
             ret.return_value = ("user-machine", None)
@@ -381,7 +383,7 @@ class TestAgentScopeOnUserPairedRefused:
         from core.session import session_manager
 
         with patch("storage.agents.agent_store.get_agent") as ga, \
-             patch("storage.remote_store.resolve_execution_target") as ret, \
+             patch("services.remote.remote_status.resolve_execution_target") as ret, \
              patch("storage.remote_store.get_remote_machine") as gm, \
              patch.object(session_manager, "_get_remote_layer") as grl:
             ga.return_value = {"execution_path": "claude-code-cli"}
@@ -406,7 +408,7 @@ class TestAgentScopeOnUserPairedRefused:
         from core.session import session_manager
 
         with patch("storage.agents.agent_store.get_agent") as ga, \
-             patch("storage.remote_store.resolve_execution_target") as ret, \
+             patch("services.remote.remote_status.resolve_execution_target") as ret, \
              patch("storage.remote_store.get_remote_machine") as gm, \
              patch.object(session_manager, "_get_remote_layer") as grl:
             ga.return_value = {"execution_path": "claude-code-cli"}

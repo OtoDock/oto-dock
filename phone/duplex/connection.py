@@ -118,8 +118,9 @@ class DuplexEngineConnection(MediaTransport):
                         self._mic_drops += 1
                         if self._mic_drops % 50 == 1:
                             logger.warning(
-                                f"[{self.peer_addr}] mic backlog: dropped "
-                                f"oldest frame (total {self._mic_drops})"
+                                "[%s] mic backlog: dropped "
+                                "oldest frame (total %s)",
+                                self.peer_addr, self._mic_drops
                             )
                     self._audio_q.put_nowait(bytes(raw))
                     continue
@@ -128,7 +129,7 @@ class DuplexEngineConnection(MediaTransport):
                 except json.JSONDecodeError:
                     continue
                 await self._route_json(msg)
-        except Exception:
+        except Exception:  # noqa: BLE001  # the reader's last line: a dropped socket ends the read
             pass
         finally:
             self._mark_closed()
@@ -193,7 +194,7 @@ class DuplexEngineConnection(MediaTransport):
                     self._out_q.task_done()
         except asyncio.CancelledError:
             return
-        except Exception:
+        except Exception:  # noqa: BLE001  # the writer's last line: any send failure marks the link closed
             self._mark_closed()
 
     def _mark_closed(self) -> None:

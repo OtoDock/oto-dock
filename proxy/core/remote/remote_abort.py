@@ -10,6 +10,7 @@ remote_execution.py.
 import asyncio
 import logging
 import time
+from typing import TYPE_CHECKING
 
 from core.session.session_state import resolve_session_permissions
 
@@ -32,7 +33,13 @@ _REMOTE_INTERRUPT_WATCHDOG_S = 30.0
 _remote_watchdog_tasks: set[asyncio.Task] = set()
 
 
-class RemoteAbortMixin:
+if TYPE_CHECKING:
+    from core.remote.remote_host import RemoteLayerHost as _Host
+else:
+    _Host = object
+
+
+class RemoteAbortMixin(_Host):
     # --- ExecutionLayer interface: abort ---
 
     async def abort(self, session_id: str) -> bool:
@@ -73,27 +80,20 @@ class RemoteAbortMixin:
             # waiter must not strand the turn we just asked to close.
             resolve_session_permissions(session_id, approved=False)
             frame = self._adapter(info).soft_interrupt_frame()
-            try:
-                await self._cm.send_fire_and_forget(info.machine_id, {
-                    "type": frame,
-                    "session_id": session_id,
-                })
-            except Exception as e:
-                logger.warning(
-                    "Remote soft interrupt send failed for session %s: %s — "
-                    "falling back to hard abort", session_id[:8], e,
-                )
-            else:
-                self._adapter(info).note_interrupt(info)
-                _wd = asyncio.create_task(
-                    self._soft_interrupt_watchdog(
-                        session_id, info.current_send_command_id,
-                    ),
-                    name=f"remote-interrupt-watchdog-{session_id[:8]}",
-                )
-                _remote_watchdog_tasks.add(_wd)
-                _wd.add_done_callback(_remote_watchdog_tasks.discard)
-                return True
+            await self._cm.send_fire_and_forget(info.machine_id, {
+                "type": frame,
+                "session_id": session_id,
+            })
+            self._adapter(info).note_interrupt(info)
+            _wd = asyncio.create_task(
+                self._soft_interrupt_watchdog(
+                    session_id, info.current_send_command_id,
+                ),
+                name=f"remote-interrupt-watchdog-{session_id[:8]}",
+            )
+            _remote_watchdog_tasks.add(_wd)
+            _wd.add_done_callback(_remote_watchdog_tasks.discard)
+            return True
         return await self._hard_abort(session_id)
 
     async def _hard_abort(self, session_id: str) -> bool:
@@ -120,14 +120,10 @@ class RemoteAbortMixin:
         # Fire-and-forget the abort command itself: we don't block the Stop
         # button on it (the dashboard gets `aborted` immediately); the
         # confirmation rides back asynchronously as `session_aborted`.
-        try:
-            await self._cm.send_fire_and_forget(info.machine_id, {
-                "type": "abort",
-                "session_id": session_id,
-            })
-        except Exception as e:
-            logger.warning("Remote abort send failed for session %s: %s",
-                           session_id[:8], e)
+        await self._cm.send_fire_and_forget(info.machine_id, {
+            "type": "abort",
+            "session_id": session_id,
+        })
         # An engine whose hard abort kills its process (Claude: the persistent
         # subprocess exits as part of the abort) is flagged dead so the
         # dashboard's auto-resume path (``is_session_process_dead``) spawns a
@@ -166,7 +162,7 @@ class RemoteAbortMixin:
                 "type": self._adapter(info).soft_interrupt_frame(),
                 "session_id": session_id,
             })
-        except Exception as e:
+        except RuntimeError as e:
             logger.warning(
                 "Remote stop-and-send interrupt failed for session %s: %s",
                 session_id[:8], e,

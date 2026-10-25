@@ -1,5 +1,7 @@
 import { useState } from 'react'
 import type { EngineProvider } from '../../api/engineDescriptor'
+import Button from '../ui/Button'
+import { Input, Select } from '../ui/Field'
 
 // The API-key form both AI Engines cards use: the admin tab binds it to the
 // admin add mutation, the user card to the user add mutation (the key kept
@@ -44,50 +46,46 @@ export function ApiKeyForm({ layer, providers, onDone, mutation, ownerType }: {
   }
 
   return (
-    <div className="mt-3 p-3 bg-p-bg rounded-lg border border-p-border-light space-y-2">
+    <div className="mt-3 p-3 bg-surface-raised shadow-elevation-2 rounded-card space-y-2">
       {showProviderSelect && (
-        <select
+        <Select
           value={provider}
           onChange={(e) => setProvider(e.target.value)}
-          className="w-full px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
         >
           {providers.map((p) => (
             <option key={p.id} value={p.id}>{p.label}</option>
           ))}
-        </select>
+        </Select>
       )}
-      <input
+      <Input
         type="text"
-        placeholder="Label (optional)"
+        placeholder="Label, optional"
         value={label}
         onChange={(e) => setLabel(e.target.value)}
-        className="w-full px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
       />
-      <input
+      <Input
         type="password"
         placeholder="API key"
         aria-label="API key"
         value={apiKey}
         onChange={(e) => setApiKey(e.target.value)}
-        className="w-full px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 font-mono"
+        className="font-mono"
       />
       <div className="flex gap-2">
-        <button
+        <Button variant="primary" size="sm"
           onClick={handleSubmit}
           disabled={!apiKey.trim() || mutation.isPending}
-          className="px-3 py-1.5 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors disabled:opacity-40"
         >
           {mutation.isPending ? 'Adding...' : 'Add'}
-        </button>
-        <button
+        </Button>
+        <Button variant="ghost" size="sm"
           onClick={onDone}
-          className="px-3 py-1.5 text-sm rounded-lg text-p-text-secondary hover:bg-p-bg-hover transition-colors"
         >
           Cancel
-        </button>
+        </Button>
       </div>
       {mutation.isError && (
-        <p className="text-xs text-red-500">{(mutation.error as Error).message}</p>
+        <p className="text-xs text-status-danger-fg">{(mutation.error as Error).message}</p>
       )}
     </div>
   )

@@ -7,7 +7,7 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import SystemEvent from '@/components/chat/SystemEvent'
-import { SYSTEM_SUBTYPE, UNDELIVERED_REASON } from '@/api/wireEvents'
+import { SYSTEM_SUBTYPE, UNDELIVERED_REASON, type SystemFrame } from '@/api/wireEvents'
 import { eventToBlock, liveBlockToMessageBlock } from '@/lib/messageBlocks'
 
 describe('the undelivered-input card', () => {
@@ -39,7 +39,7 @@ describe('the undelivered-input card', () => {
   })
 
   it('keeps its reason through a history row and a live block, so a reload says the same', () => {
-    const evt = { type: 'system', subtype: SYSTEM_SUBTYPE.UNDELIVERED_INPUT,
+    const evt: SystemFrame = { type: 'system', subtype: SYSTEM_SUBTYPE.UNDELIVERED_INPUT,
                   reason: UNDELIVERED_REASON.QUEUED, message: 'hello' }
     expect(eventToBlock(evt)).toMatchObject({ type: 'system', reason: UNDELIVERED_REASON.QUEUED })
     expect(liveBlockToMessageBlock(evt)).toMatchObject({ type: 'system', reason: UNDELIVERED_REASON.QUEUED })
@@ -53,5 +53,13 @@ describe('the machine-reconnecting line', () => {
     expect(screen.getByTestId('machine-reconnecting')).toBeTruthy()
     expect(screen.getByText('The machine is reconnecting')).toBeTruthy()
     expect(screen.getByText(/Send it again once it is back/)).toBeTruthy()
+  })
+
+  it('tells a machine that is not answering from one that is reconnecting', () => {
+    render(<SystemEvent subtype={SYSTEM_SUBTYPE.MACHINE_NOT_ANSWERING}
+                        message="Not sent: the machine running this chat is not answering. Send it again in a moment." />)
+    expect(screen.getByTestId('machine-not-answering')).toBeTruthy()
+    expect(screen.getByText('The machine is not answering')).toBeTruthy()
+    expect(screen.queryByText('The machine is reconnecting')).toBeNull()
   })
 })

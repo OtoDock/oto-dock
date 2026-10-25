@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { dbMessagesToDisplay, eventToBlock, liveBlockToMessageBlock } from '../lib/messageBlocks'
+import { type DocumentPreviewFrame } from '@/api/wireEvents'
 
 // A document push renders as a card per push (one per file per message);
 // the history rebuild keeps every message's card, and the version number
@@ -58,7 +59,7 @@ describe('document_preview history rebuild', () => {
 })
 
 describe('the version number on every block path', () => {
-  const frame = {
+  const frame: DocumentPreviewFrame = {
     type: 'document_preview', wopi_url: '/c', filename: 'a.docx',
     file_id: 'f1', download_url: '/d', snapshot_id: 'sX', generation: 7, version: 3,
   }

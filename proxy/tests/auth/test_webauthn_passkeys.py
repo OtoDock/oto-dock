@@ -14,13 +14,16 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 from webauthn.helpers import bytes_to_base64url
-from webauthn.helpers.exceptions import InvalidAuthenticationResponse, InvalidRegistrationResponse
+from webauthn.helpers.exceptions import (
+    InvalidAuthenticationResponse,
+    InvalidRegistrationResponse,
+)
 
 import config
 from api.auth import webauthn as wa
 from app import app
-from auth.password import hash_password
 from auth import rate_limiter
+from auth.password import hash_password
 from auth.providers import UserContext, get_current_user
 from auth.rate_limiter import clear_rate_limit
 from storage import database as db

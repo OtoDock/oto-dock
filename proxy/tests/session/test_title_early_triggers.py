@@ -16,7 +16,7 @@ import asyncio
 import pytest
 
 from core.events.common_events import TOOL_USE, CommonEvent
-from core.events.stream_pump import ChatStreamPump, _TITLE_TOOL_THRESHOLD
+from core.events.stream_pump import _TITLE_TOOL_THRESHOLD, ChatStreamPump
 from core.session.interactive_session import InteractiveSession
 
 pytestmark = pytest.mark.asyncio

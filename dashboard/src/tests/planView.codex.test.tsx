@@ -1,5 +1,6 @@
 /**
- * PlanView renders the CODEX implement affordance from a synthesized exit card.
+ * PlanView renders the CODEX implement affordance from a stored exit card (a
+ * chat from before 1.9; a Codex plan is a plan review now).
  *
  * A codex plan card has plan CONTENT but no plan FILE (isCodexPlan), so the
  * implement buttons must call onImplementCodex (mode switch + build turn), not
@@ -25,7 +26,7 @@ describe('PlanView — codex synthesized plan', () => {
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Start Implementation' }))
-    expect(onImplementCodex).toHaveBeenCalledWith('acceptEdits')
+    expect(onImplementCodex).toHaveBeenCalledWith('autoReview')
     fireEvent.click(screen.getByRole('button', { name: 'Full Permissions' }))
     expect(onImplementCodex).toHaveBeenCalledWith('dontAsk')
     // Never the Claude file-based path for a codex (fileless) plan.

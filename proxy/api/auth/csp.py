@@ -12,8 +12,8 @@ capped at 64 KB (``middleware._ROUTE_CAPS``) and nothing is stored.
 from __future__ import annotations
 
 import json
-import re
 import logging
+import re
 import time
 from urllib.parse import urlsplit
 

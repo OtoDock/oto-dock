@@ -15,11 +15,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
-from core.remote.remote_execution import RemoteExecutionLayer  # noqa: E402
-
+from core.remote.remote_execution import RemoteExecutionLayer
 
 # --- run_idle_fingerprint_sweep: trigger gating -----------------------------
 

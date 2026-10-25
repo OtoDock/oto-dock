@@ -484,7 +484,7 @@ class TestSuccessMarkerStaleness:
         assert _venv_is_stale(req, venv, mcp) is True
 
     def test_healthy_unmarked_venv_backfills_without_rebuild(self, tmp_path):
-        from services.mcp.mcp_venv_bootstrap import _venv_is_stale, _read_marker
+        from services.mcp.mcp_venv_bootstrap import _read_marker, _venv_is_stale
         mcp, req, venv, h = self._mcp(tmp_path, with_pkg=True)
         assert _venv_is_stale(req, venv, mcp) is False
         assert _read_marker(mcp).get("requirements_sha256") == h
@@ -592,6 +592,7 @@ async def test_npm_rebuild_runs_under_the_installers_environment(fake_mcps_root,
 async def test_a_hung_npm_rebuild_is_killed_and_retried_next_boot(fake_mcps_root, tmp_path, monkeypatch):
     import asyncio
     import os
+
     from services.mcp import mcp_installer
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -643,7 +644,7 @@ async def test_the_first_venv_is_pinned_to_the_proxy_and_inside_the_sandbox(fake
     assert kw["python_spec"] == _SPEC
     roots = kw["sandbox_roots"]
     assert (fake_mcps_root.resolve() / ".uv-python") in roots
-    assert mcp_dir.resolve() in roots and Path("/usr").resolve() in roots
+    assert mcp_dir.resolve() in roots and Path("/usr").resolve() in roots  # noqa: ASYNC240  # a test resolving its fixture folder and /usr
     assert _marker(mcp_dir)["python"] == _SPEC
 
 
@@ -793,6 +794,7 @@ async def test_the_cli_session_reports_why_a_failed_mcp_did_not_start(fake_mcps_
     """The init frame names failed MCPs by their config key; the session maps
     them to manifests and logs the cause the folder shows."""
     from types import SimpleNamespace
+
     from core.layers.cli import session as cli_session
     from services.mcp import mcp_registry
     monkeypatch.setattr(mcp_venv_bootstrap, "_causes_logged", set())

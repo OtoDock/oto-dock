@@ -20,11 +20,11 @@
 // Dev harnesses: `?wakeDebug=<slug>` on any page triggers the full wake
 // action without mic/worker/secure-context — the live-verify path for
 // plain-HTTP installs where getUserMedia does not exist. `?wakeDiag=1` on
-// `/user-settings` (or the settings button) switches the diagnostics recorder on
+// any User Settings path (or the settings button) switches the diagnostics recorder on
 // (audio/wakeDiag.ts): the last 30 s of what the spotter hears plus an
 // event log, saved locally on request.
 
-import { useEffect, useRef, useSyncExternalStore } from 'react'
+import { useEffect, useRef, useSyncExternalStore, useLayoutEffect, useEffectEvent } from 'react'
 import { useLocation, type NavigateFunction } from 'react-router-dom'
 import { apiFetch } from '../api/auth'
 import { useChatAudioCapability } from './useChatAudioCapability'
@@ -38,6 +38,8 @@ import {
   isWakeDiagOn, setWakeDiag, subscribeWakeDiag, wakeDiagContext, wakeDiagEvent,
   wakeDiagFrames, wakeDiagListening,
 } from '../audio/wakeDiag'
+import { debugLog, debugWarn } from '../lib/debug/log'
+import { isUserSettingsPath } from '../components/settings/sections'
 
 // The directory name is the immutable-cache buster: a rebuilt engine ships
 // in a new directory (the -r2 suffix is the revision of the engine patch
@@ -115,23 +117,20 @@ export function useWakeWord(navigate: NavigateFunction, authed: boolean) {
   const busy = useSyncExternalStore(subscribeMic, micBusy, micBusy)
   const diag = useSyncExternalStore(subscribeWakeDiag, isWakeDiagOn, () => false)
   const diagRef = useRef(diag)
-  diagRef.current = diag
-
-  const navigateRef = useRef(navigate)
-  navigateRef.current = navigate
-  const playRef = useRef(playPing)
-  playRef.current = playPing
+  useLayoutEffect(() => { diagRef.current = diag })
   const lastWakeRef = useRef(0)
 
-  const wake = (slug: string) => {
+  // The wake itself, called from the effects below with the latest
+  // navigate and chime.
+  const wake = useEffectEvent((slug: string) => {
     const now = Date.now()
     if (now - lastWakeRef.current < WAKE_COOLDOWN_MS) {
-      console.log(`[wake] cooldown — swallowed detection for "${slug}"`)
+      debugLog(`[wake] cooldown — swallowed detection for "${slug}"`)
       wakeDiagEvent('cooldown swallowed', { slug })
       return
     }
     lastWakeRef.current = now
-    playRef.current()
+    playPing()
     wakeDiagEvent('wake', { slug })
     // Fire-and-forget CLI pre-warm: the earcon + SPA navigation + chat-WS
     // connect take ~0.5-1.5s before the normal warmup can spawn — this buys
@@ -142,20 +141,18 @@ export function useWakeWord(navigate: NavigateFunction, authed: boolean) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ agent: slug }),
     }).catch(() => { /* best-effort */ })
-    navigateRef.current(`/chat/${slug}?wake=1`)
-  }
-  const wakeRef = useRef(wake)
-  wakeRef.current = wake
+    navigate(`/chat/${slug}?wake=1`)
+  })
 
   // Dev harnesses: synthetic wake (no mic involved) and the recorder switch.
   useEffect(() => {
     if (!authed) return
     const params = new URLSearchParams(location.search)
-    // Only on the settings page that holds the recorder's own button: a
-    // link to any other page must not switch a person's recorder on.
-    if (params.get('wakeDiag') === '1' && location.pathname === '/user-settings') setWakeDiag(true)
+    // Only in User Settings, which holds the recorder's own button: a link
+    // to any other page must not switch a person's recorder on.
+    if (params.get('wakeDiag') === '1' && isUserSettingsPath(location.pathname)) setWakeDiag(true)
     const slug = params.get('wakeDebug')
-    if (slug) wakeRef.current(slug)
+    if (slug) wake(slug)
   }, [location.search, location.pathname, authed])
 
   // Engine vs capture are SEPARATE lifecycles: the wasm spotter boots in
@@ -188,12 +185,12 @@ export function useWakeWord(navigate: NavigateFunction, authed: boolean) {
         if (cancelled) return
         if (readyAt && Date.now() - readyAt > WORKER_STABLE_MS) attempt = 0
         if (attempt >= WORKER_REBUILD_DELAYS_MS.length) {
-          console.warn(`[wake] engine ${why} — giving up after ${attempt} rebuilds`)
+          debugWarn(`[wake] engine ${why} — giving up after ${attempt} rebuilds`)
           wakeDiagEvent('engine gone', { why })
           return
         }
         const delay = WORKER_REBUILD_DELAYS_MS[attempt++]
-        console.log(`[wake] engine ${why} — rebuilding in ${delay / 1000}s`)
+        debugLog(`[wake] engine ${why} — rebuilding in ${delay / 1000}s`)
         wakeDiagEvent('engine rebuild scheduled', { why, delay_ms: delay, attempt })
         rebuildTimer = window.setTimeout(() => { if (!cancelled) spawn() }, delay)
       }
@@ -203,22 +200,22 @@ export function useWakeWord(navigate: NavigateFunction, authed: boolean) {
         const msg = ev.data
         if (msg?.type === 'ready') {
           readyAt = Date.now()
-          console.log(`[wake] engine ready in ${readyAt - t0}ms`)
+          debugLog(`[wake] engine ready in ${readyAt - t0}ms`)
           wakeDiagEvent('engine ready', { boot_ms: readyAt - t0 })
         } else if (msg?.type === 'detect' && typeof msg.keyword === 'string') {
-          console.log(`[wake] detected "${msg.keyword}" — navigating`)
+          debugLog(`[wake] detected "${msg.keyword}" — navigating`)
           wakeDiagEvent('detected', { keyword: msg.keyword, at_s: msg.at_s, engine: msg.engine })
-          wakeRef.current(msg.keyword)
+          wake(msg.keyword)
         } else if (msg?.type === 'diag') {
           wakeDiagEvent(String(msg.event), msg.data)
         } else if (msg?.type === 'error') {
-          console.warn('[wake] worker error:', msg.message)
+          debugWarn('[wake] worker error:', msg.message)
           drop(`error: ${msg.message}`)
         }
       }
       worker.onerror = (e) => {
         if (workerRef.current !== worker) return
-        console.warn('[wake] worker failed:', e.message)
+        debugWarn('[wake] worker failed:', e.message)
         drop(`failed: ${e.message}`)
       }
       worker.postMessage({
@@ -289,20 +286,20 @@ export function useWakeWord(navigate: NavigateFunction, authed: boolean) {
       if (cancelled) return
       if (gumFailed && !ctx && !stream) {
         gumFailed = false
-        console.log(`[wake] retrying failed capture (${why})`)
+        debugLog(`[wake] retrying failed capture (${why})`)
         wakeDiagEvent('capture retry', { why })
         void start()
         return
       }
       const c = ctx
       if (!c || c.state === 'running') return
-      console.log(`[wake] ctx ${c.state} (${why}) — resuming`)
+      debugLog(`[wake] ctx ${c.state} (${why}) — resuming`)
       wakeDiagEvent('ctx not running', { state: c.state, why })
       void c.resume().catch(() => { /* verified below */ })
       window.clearTimeout(recoverTimer)
       recoverTimer = window.setTimeout(() => {
         if (cancelled || !ctx || ctx.state === 'running') return
-        console.log('[wake] resume failed — full capture cycle')
+        debugLog('[wake] resume failed — full capture cycle')
         wakeDiagEvent('capture cycle', { why: 'resume failed' })
         stopCapture()
         void start()
@@ -360,12 +357,12 @@ export function useWakeWord(navigate: NavigateFunction, authed: boolean) {
         node.connect(ctx.destination)
         gumFailed = false
         retried = false
-        console.log('[wake] listening')
+        debugLog('[wake] listening')
         wakeDiagEvent('listening', { context_rate: rate, ctx_state: ctx.state, ...trackSettings(stream) })
         wakeDiagListening(true)
       } catch (e) {
         if (cancelled || myRun !== run) return
-        console.warn('[wake] listener unavailable:', e)
+        debugWarn('[wake] listener unavailable:', e)
         wakeDiagEvent('listener unavailable', { error: e instanceof Error ? e.message : String(e) })
         stopCapture()
         gumFailed = true

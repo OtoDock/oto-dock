@@ -14,9 +14,9 @@ import hashlib
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 
+from auth import roles
 from auth.providers import UserContext, get_current_user, require_auth, require_user
 from services.community import community_icons
-from auth import roles
 
 router = APIRouter(dependencies=[Depends(require_user)])
 

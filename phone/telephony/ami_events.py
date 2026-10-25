@@ -34,7 +34,7 @@ import itertools
 import logging
 import re
 import time
-from typing import Callable
+from collections.abc import Callable
 
 from telephony.ami_client import AMIError, format_action, read_packet
 
@@ -141,11 +141,11 @@ class AmiEventClient:
                 await self._connect_and_read()
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # the AMI events reconnect loop must outlive any error
                 if self._closing:
                     break
                 logger.warning(
-                    f"AMI events [{self.server_key}] connection lost: {e}"
+                    "AMI events [%s] connection lost: %s", self.server_key, e
                 )
             finally:
                 await self._teardown_connection()
@@ -154,7 +154,8 @@ class AmiEventClient:
             if time.monotonic() - started >= STABLE_AFTER_S:
                 backoff = self.backoff_min_s
             logger.info(
-                f"AMI events [{self.server_key}] reconnecting in {backoff:.0f}s"
+                "AMI events [%s] reconnecting in %.0fs",
+                self.server_key, backoff
             )
             try:
                 await asyncio.sleep(backoff)
@@ -181,8 +182,8 @@ class AmiEventClient:
             self._writer.write(format_action(action))
             await self._writer.drain()
             return await asyncio.wait_for(fut, timeout=ACTION_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            raise AMIError(f"AMI action {action.get('Action')!r} timed out")
+        except asyncio.TimeoutError as exc:
+            raise AMIError(f"AMI action {action.get('Action')!r} timed out") from exc
         finally:
             self._pending.pop(action_id, None)
 
@@ -227,7 +228,7 @@ class AmiEventClient:
                     {"Action": "Events", "EventMask": "on"})
 
         self._connected = True
-        logger.info(f"AMI events [{self.server_key}] connected + subscribed")
+        logger.info("AMI events [%s] connected + subscribed", self.server_key)
         self._ping_task = asyncio.create_task(self._ping_loop())
         await self._read_loop()
 
@@ -272,7 +273,7 @@ class AmiEventClient:
                 await self.send_action({"Action": "Ping"})
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001  # the ping loop ends the link on any send failure
                 # Dead socket: force the read loop out of its timeout wait.
                 if self._writer is not None:
                     with contextlib.suppress(Exception):
@@ -294,7 +295,7 @@ class AmiEventClient:
             try:
                 self._writer.close()
                 await self._writer.wait_closed()
-            except Exception:
+            except Exception:  # noqa: BLE001  # closing a socket that is already going away
                 pass
         self._reader = None
         self._writer = None
@@ -378,7 +379,7 @@ class AmiListenerManager:
                 )
                 task = asyncio.create_task(client.run())
                 self._clients[key] = (coords, client, task)
-                logger.info(f"AMI events [{key}] listener started")
+                logger.info("AMI events [%s] listener started", key)
 
     async def stop(self) -> None:
         async with self._lock:
@@ -395,7 +396,7 @@ class AmiListenerManager:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
-        logger.info(f"AMI events [{key}] listener stopped")
+        logger.info("AMI events [%s] listener stopped", key)
 
     def _desired_servers(self, cfg) -> dict[str, tuple]:
         """AMI-capable servers as ``key → (host, port, username, secret)``.
@@ -449,8 +450,8 @@ class AmiListenerManager:
             # same DID can cross-pair (pre-existing limitation, documented
             # in AUDIOSOCKET.md). Count-only — no identifiers.
             logger.warning(
-                f"AMI events [{server_key}] overwriting a live DTMF "
-                f"registration (simultaneous same-DID calls?)"
+                "AMI events [%s] overwriting a live DTMF "
+                "registration (simultaneous same-DID calls?)", server_key
             )
         self._calls[key] = (conn, ami_channel)
 
@@ -508,8 +509,8 @@ class AmiListenerManager:
         self.register_call(key[0], uniqueid, conn, channel)
         self._outbound_regs[key] = uniqueid
         logger.info(
-            f"AMI events [{key[0]}] outbound call {key[1][:8]} bound to its channel "
-            f"(signalled DTMF)"
+            "AMI events [%s] outbound call %s bound to its channel "
+            "(signalled DTMF)", key[0], key[1][:8]
         )
 
     def _on_originate(
@@ -525,8 +526,8 @@ class AmiListenerManager:
             # A failed originate reports no channel (Uniqueid <unknown>); the
             # dial watchdog fails the call as before.
             logger.info(
-                f"AMI events [{server_key}] originate of call {audio_uuid[:8]} failed "
-                f"(reason {reason or 'unknown'})"
+                "AMI events [%s] originate of call %s failed "
+                "(reason %s)", server_key, audio_uuid[:8], reason or 'unknown'
             )
             return
         if not UNIQUEID_RE.fullmatch(uniqueid) or not CHANNEL_RE.fullmatch(channel):
@@ -534,10 +535,11 @@ class AmiListenerManager:
             # the dialled number, so only its shape is logged.
             outside = "".join(sorted(set(_CHANNEL_CHAR.sub("", channel))))
             logger.warning(
-                f"AMI events [{server_key}] OriginateResponse for call {audio_uuid[:8]} "
-                f"names an unusable channel (uniqueid {uniqueid[:80]!r}, a channel of "
-                f"{len(channel)} characters with {outside!r} outside the alphabet) "
-                f"— in-band digit detection only"
+                "AMI events [%s] OriginateResponse for call %s "
+                "names an unusable channel (uniqueid %r, a channel of "
+                "%s characters with %r outside the alphabet) "
+                "— in-band digit detection only",
+                server_key, audio_uuid[:8], uniqueid[:80], len(channel), outside
             )
             return
         key = (server_key, audio_uuid)
@@ -564,7 +566,7 @@ class AmiListenerManager:
             if client_entry is not None:
                 client_entry[1].unmatched_events += 1
             logger.debug(
-                f"AMI events [{server_key}] DTMF for unregistered call"
+                "AMI events [%s] DTMF for unregistered call", server_key
             )
             return
         conn = entry[0]
@@ -572,4 +574,4 @@ class AmiListenerManager:
         if inject is None:
             return
         inject(digit, duration_ms)
-        logger.info(f"AMI events [{server_key}] DTMF digit received")
+        logger.info("AMI events [%s] DTMF digit received", server_key)

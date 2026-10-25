@@ -13,8 +13,6 @@ the one that flows on: the check is on the string the scanner tracks.
 import os
 from pathlib import Path
 
-import config
-
 
 class PathOutsideRoot(ValueError):
     """The candidate path does not lie inside the root it must stay under."""
@@ -67,10 +65,3 @@ def join_under(root: str | Path, *parts: str) -> Path:
         raise PathOutsideRoot(f"{os.sep.join(parts)} would leave {root}")
     return Path(joined)
 
-
-def safe_agent_dir(agent: str) -> Path:
-    """``config.get_agent_dir`` for a request-supplied name: the same
-    ``AGENTS_DIR / agent`` join, refused when the name would leave the
-    agents tree (the check ``config.is_safe_agent_name`` makes, in barrier
-    shape)."""
-    return join_under(config.AGENTS_DIR, agent)

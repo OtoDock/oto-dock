@@ -26,7 +26,10 @@ def _now() -> str:
 
 def _make_manifest(name, category="custom", skills=None, tmp_path=None):
     from services.mcp.mcp_registry import (
-        McpManifest, ServerConfig, CredentialConfig, SkillDef,
+        CredentialConfig,
+        McpManifest,
+        ServerConfig,
+        SkillDef,
     )
     skill_defs = []
     mcp_dir = None
@@ -83,6 +86,7 @@ def _seed_agent(slug: str):
 def client(temp_db, monkeypatch):
     from fastapi import Request
     from fastapi.testclient import TestClient
+
     from auth.providers import UserContext, get_current_user
 
     admin_ctx = UserContext(
@@ -213,6 +217,7 @@ def test_patch_unknown_skill_404s(wired):
 
 def test_scan_first_wins_on_name_collision(temp_db, tmp_path, monkeypatch):
     import json as _json
+
     import config as app_config
     from services.mcp import mcp_registry
 
@@ -286,6 +291,7 @@ def test_delete_custom_mcp_still_rejected(wired, monkeypatch):
 
 def test_delete_rescans_off_the_loop(wired, monkeypatch):
     import asyncio
+
     from services.mcp import mcp_registry
     scans = []
 

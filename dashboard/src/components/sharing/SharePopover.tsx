@@ -18,10 +18,14 @@ import {
 import { passkeyConfirm } from '../../api/webauthn'
 import { startOidcConfirm } from '../../api/auth'
 import { useAuth } from '../../contexts/AuthContext'
-import { pushEscHandler } from '../../lib/escStack'
 import { formatExpiry } from '../../lib/format'
 import { AGENT_ROLES, ROLE, actingRole, isAdmin, rank, roleLabel, type AgentRole } from '../../lib/permissions'
-import { savePending, takeConfirm, takePending, type PendingShare } from '../../lib/shareConfirm'
+import { peekConfirm, peekPending, savePending, takeConfirm, takePending, type PendingShare } from '../../lib/shareConfirm'
+import Dialog from '../ui/Dialog'
+import { SaveState } from '../ui/SettingsControls'
+import { useSaveState } from '../../hooks/useSaveState'
+import Button from '../ui/Button'
+import { DIALOG_PANEL } from '../ui/classes'
 
 /**
  * The share popover (SHARING.md): who an app is shared with and how to add
@@ -78,12 +82,15 @@ const NEVER_CHOICE: ExpiryChoice = { value: 'never', label: 'Never expires' }
  * not one of them, and "Never expires" only while nothing caps it (first
  * for people, last for a link, whose default stays a duration so a forever
  * link is a choice). The server refuses anything past the cap, so the form
- * never offers it. */
-export function expiryChoices(capDays: number | null | undefined, form: 'people' | 'link'): ExpiryChoice[] {
+ * never offers it; the cap's own choice says it is the longest allowed. */
+function expiryChoices(capDays: number | null | undefined, form: 'people' | 'link'): ExpiryChoice[] {
   const days = capDays
     ? [...new Set([...DAY_CHOICES.filter((d) => d <= capDays), capDays])].sort((a, b) => a - b)
     : DAY_CHOICES
-  const durations = days.map((d) => ({ value: `${d}d`, label: `Expires in ${d} day${d === 1 ? '' : 's'}` }))
+  const durations = days.map((d) => ({
+    value: `${d}d`,
+    label: `Expires in ${d} day${d === 1 ? '' : 's'}${d === capDays ? ', the longest allowed' : ''}`,
+  }))
   if (capDays !== null) return durations
   return form === 'people' ? [NEVER_CHOICE, ...durations] : [...durations, NEVER_CHOICE]
 }
@@ -91,7 +98,7 @@ export function expiryChoices(capDays: number | null | undefined, form: 'people'
 /** What a form shows selected: the person's pick while it is still offered,
  * else the default: Never for people with no cap, 30 days for a link, and
  * under a cap the longest it allows. */
-export function pickExpiry(choices: ExpiryChoice[], picked: string, form: 'people' | 'link'): string {
+function pickExpiry(choices: ExpiryChoice[], picked: string, form: 'people' | 'link'): string {
   if (choices.some((c) => c.value === picked)) return picked
   if (form === 'people' && choices[0]?.value === NEVER_CHOICE.value) return NEVER_CHOICE.value
   if (choices.some((c) => c.value === '30d') && form === 'link') return '30d'
@@ -145,30 +152,55 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
   const settingsKnown = capDays !== undefined
   const peopleExpiryChoices = expiryChoices(capDays, 'people')
   const linkExpiryChoices = expiryChoices(capDays, 'link')
-  const [includeTools, setIncludeTools] = useState(false)
   const create = useCreateShare()
   const patch = usePatchShare()
+  // The Buttons box saves through the step-up flow, so its indication is
+  // set once the write lands, on the first try or the retry.
+  const { stateOf, markSaved } = useSaveState()
   const user = useAuth()?.user ?? null
   // The account the identity-provider round trip files its entries under.
   const sub = user?.sub ?? ''
-  const [tab, setTab] = useState<Tab>(initialTab ?? 'people')
+  // Back from the identity provider (SHARING.md "The confirm"): the choices
+  // come back as they were, the link tab opens, and the token arms the
+  // button. They are the form's first state; the entries are taken once
+  // the popover is up. Nothing fires without a click.
+  const [restored] = useState(() => {
+    const pending = peekPending(sub)
+    if (!pending || pending.app_id !== target.id) return null
+    const token = confirmError ? null : peekConfirm(sub)
+    return { pending, token }
+  })
+  useEffect(() => {
+    if (!restored) return
+    takePending(sub, target.id)
+    takeConfirm(sub)
+  }, [restored, sub, target.id])
+  const [includeTools, setIncludeTools] = useState(restored?.pending.fields.include_tools ?? false)
+  const [tab, setTab] = useState<Tab>(restored ? 'link' : initialTab ?? 'people')
   const [who, setWho] = useState('')
   const [kind, setKind] = useState<GranteeKind>(GRANTEE_KIND.PERSON)
   const [agentPick, setAgentPick] = useState('')
   const [deptPick, setDeptPick] = useState('')
   const [cap, setCap] = useState<AgentRole>(ROLE.VIEWER)
   const [expiresPick, setExpiresIn] = useState('')
-  const [notice, setNotice] = useState('')
-  const [error, setError] = useState('')
+  const [notice, setNotice] = useState(() => {
+    if (!restored?.token) return ''
+    return restored.pending.op === 'create' ? 'Confirmed. Make the link now.' : 'Confirmed. Turn the buttons on now.'
+  })
+  const [error, setError] = useState(() => {
+    if (!restored) return ''
+    if (confirmError) return confirmError
+    return restored.token ? '' : 'Your confirmation took too long. Make the link again.'
+  })
   const [copied, setCopied] = useState('')
   // Link form.
-  const [publicLink, setPublicLink] = useState(false)
-  const [publicUnderstood, setPublicUnderstood] = useState(false)
-  const [linkExpiryPick, setLinkExpiry] = useState('30d')
+  const [publicLink, setPublicLink] = useState(restored?.pending.fields.public ?? false)
+  const [publicUnderstood, setPublicUnderstood] = useState(restored?.pending.fields.public ?? false)
+  const [linkExpiryPick, setLinkExpiry] = useState(restored?.pending.fields.expiry ?? '30d')
   // What the two selects show and send: the pick while the cap allows it.
   const expiresIn = pickExpiry(peopleExpiryChoices, expiresPick, 'people')
   const linkExpiry = pickExpiry(linkExpiryChoices, linkExpiryPick, 'link')
-  const [linkButtons, setLinkButtons] = useState(false)
+  const [linkButtons, setLinkButtons] = useState(restored?.pending.fields.buttons ?? false)
   const [made, setMade] = useState<CreateShareResult | null>(null)
   // The confirm the server asked for, and what to run once given.
   const [confirmAsk, setConfirmAsk] = useState<{
@@ -181,35 +213,11 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
   const [confirmPassword, setConfirmPassword] = useState('')
   // A confirm token the identity-provider round trip brought back, armed
   // for the write it was asked for; the next matching click spends it.
-  const [armed, setArmed] = useState<{ token: string; op: 'create' | 'patch'; share_id?: string } | null>(null)
-
-  useEffect(() => pushEscHandler(onClose), [onClose])
-
-  // Back from the identity provider (SHARING.md "The confirm"): the
-  // choices come back as they were, the link tab opens, and the token arms
-  // the button. Nothing fires without a click.
-  useEffect(() => {
-    const pending = takePending(sub, target.id)
-    if (!pending) return
-    setTab('link')
-    setPublicLink(pending.fields.public)
-    setPublicUnderstood(pending.fields.public)
-    setLinkExpiry(pending.fields.expiry)
-    setLinkButtons(pending.fields.buttons)
-    setIncludeTools(pending.fields.include_tools)
-    if (confirmError) {
-      setError(confirmError)
-      return
-    }
-    const token = takeConfirm(sub)
-    if (!token) {
-      setError('Your confirmation took too long. Make the link again.')
-      return
-    }
-    setArmed({ token, op: pending.op, share_id: pending.share_id })
-    setNotice(pending.op === 'create' ? 'Confirmed. Make the link now.' : 'Confirmed. Turn the buttons on now.')
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  const [armed, setArmed] = useState<{ token: string; op: 'create' | 'patch'; share_id?: string } | null>(
+    () => (restored?.token
+      ? { token: restored.token, op: restored.pending.op, share_id: restored.pending.share_id }
+      : null),
+  )
 
   const title = app.title || app.slug
   const link = `${typeof window !== 'undefined' ? window.location.origin : ''}/apps/${app.id}`
@@ -358,6 +366,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
   const toggleButtons = (s: Share) => {
     void withConfirm(async (extra) => {
       await patch.mutateAsync({ id: s.id, allow_actions: !s.allow_actions, ...extra })
+      markSaved(`buttons:${s.id}`)
     }, () => ({
       app_id: app.id, target_kind: target.kind, op: 'patch', share_id: s.id, tab: 'link',
       fields: { public: false, expiry: linkExpiry, buttons: false, include_tools: includeTools, allow_actions: !s.allow_actions },
@@ -382,20 +391,22 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
     return (
       <li key={s.id} className="flex items-center gap-2 py-1.5">
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm text-p-text">
+          <p className="truncate text-sm text-primary">
             {prefix}{name}
-            {capWord && <span className="ml-1 rounded bg-p-accent-teal/15 px-1 py-px text-[10px] text-p-accent-teal">{capWord}</span>}
+            {capWord && <span className="ml-1 rounded-sm bg-surface-muted px-1 py-px text-3xs text-secondary">{capWord}</span>}
           </p>
-          {state && <p className="text-[11px] text-p-text-light">{state}</p>}
+          {state && <p className="text-2xs text-tertiary">{state}</p>}
         </div>
         {s.state === 'suspended' && (
-          <button type="button" onClick={() => patch.mutate({ id: s.id, resume: true }, { onError: failed })}
-            className="rounded-md border border-p-border-light px-2 py-0.5 text-[11px] text-p-text-secondary hover:bg-p-surface-hover">
+          <Button
+            type="button"
+            onClick={() => patch.mutate({ id: s.id, resume: true }, { onError: failed })}
+          >
             Resume
-          </button>
+          </Button>
         )}
         <button type="button" onClick={() => patch.mutate({ id: s.id, revoke: true }, { onError: failed })}
-          className="rounded-md px-2 py-0.5 text-[11px] text-red-600 hover:bg-red-500/10 dark:text-red-400"
+          className="rounded-control px-2 py-0.5 text-2xs text-status-danger-fg hover:bg-status-danger-bg"
           aria-label={`Remove ${name}`}>
           Remove
         </button>
@@ -409,21 +420,22 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
     return (
       <li key={s.id} className="flex items-center gap-2 py-1.5">
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm text-p-text">
+          <p className="truncate text-sm text-primary">
             Link
-            {s.public && <span className="ml-1 rounded bg-amber-500/15 px-1 py-px text-[10px] text-amber-700 dark:text-amber-300">public</span>}
-            {s.state === 'suspended' && <span className="ml-1 text-[10px] text-amber-600">paused</span>}
+            {s.public && <span className="ml-1 rounded-sm bg-status-warning-bg px-1 py-px text-3xs text-status-warning-fg">public</span>}
+            {s.state === 'suspended' && <span className="ml-1 text-3xs text-status-warning-fg">paused</span>}
           </p>
-          <p className="text-[11px] text-p-text-light">{bits.join(' · ')}</p>
+          <p className="text-2xs text-tertiary">{bits.join(' · ')}</p>
         </div>
         {platformActions.length > 0 && (
-          <label className="flex items-center gap-1 text-[11px] text-p-text-secondary" title="Platform buttons on this link">
+          <label className="flex items-center gap-1 text-2xs text-secondary" title="Platform buttons on this link">
             <input type="checkbox" checked={s.allow_actions} onChange={() => toggleButtons(s)} aria-label={`Buttons on link ${s.id}`} />
             Buttons
           </label>
         )}
+        {platformActions.length > 0 && <SaveState state={stateOf(`buttons:${s.id}`)} />}
         <button type="button" onClick={() => patch.mutate({ id: s.id, revoke: true }, { onError: failed })}
-          className="rounded-md px-2 py-0.5 text-[11px] text-red-600 hover:bg-red-500/10 dark:text-red-400"
+          className="rounded-control px-2 py-0.5 text-2xs text-status-danger-fg hover:bg-status-danger-bg"
           aria-label={`Revoke link ${s.id}`}>
           Revoke
         </button>
@@ -433,7 +445,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
 
   const tabBtn = (t: Tab, label: string) => (
     <button type="button" onClick={() => { setTab(t); setError(''); setNotice('') }}
-      className={`flex-1 rounded-md px-2 py-1 text-center font-medium ${tab === t ? 'bg-brand-surface text-brand' : 'text-p-text-light hover:text-p-text'}`}>
+      className={`flex-1 rounded-sm px-2 py-1 text-center font-medium ${tab === t ? 'bg-action-subtle text-link' : 'text-secondary hover:text-primary'}`}>
       {label}
     </button>
   )
@@ -445,31 +457,38 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
       : 'Only you see this app. Add a colleague, or make a link.'
 
   const kindLabel = (k: GranteeKind) => k === GRANTEE_KIND.PERSON ? 'A person' : k === GRANTEE_KIND.AGENT ? 'An agent' : 'A department'
-  const selectClass = 'min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-sm text-p-text focus:border-brand focus:outline-none'
+  const selectClass = 'min-w-0 flex-1 rounded-control border border-strong bg-surface-card px-2 py-1.5 text-sm text-primary focus:border-action focus:outline-none'
 
+  // A made link's password and the confirm step must not go with a stray
+  // click on the backdrop; Escape and Close still close.
+  const keep = !!made || !!confirmAsk
   return (
-    <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/40 p-3 sm:items-center" onClick={onClose} role="presentation">
-      <div role="dialog" aria-modal="true" aria-label={`Share ${title}`} onClick={(e) => e.stopPropagation()}
-        className="max-h-[90dvh] w-full max-w-md overflow-y-auto rounded-2xl border border-p-border-light bg-p-surface p-4 text-p-text shadow-xl">
+    <Dialog
+      onClose={onClose}
+      placement="sheet"
+      dismissible={keep ? 'escape' : 'any'}
+      aria-label={`Share ${title}`}
+      panelClassName={`${DIALOG_PANEL} max-h-[90dvh] max-w-md overflow-y-auto p-4`}
+    >
         <div className="flex items-start gap-2">
           <div className="min-w-0 flex-1">
             <h2 className="truncate text-sm font-semibold">Share “{title}”</h2>
-            <p className="text-[11px] text-p-text-light">{subtitle}</p>
+            <p className="text-2xs text-tertiary">{subtitle}</p>
           </div>
           <button type="button" onClick={onClose} aria-label="Close"
-            className="flex h-7 w-7 items-center justify-center rounded-full text-p-text-light hover:bg-p-surface-hover hover:text-p-text">
+            className="flex h-7 w-7 items-center justify-center rounded-full text-secondary hover:bg-surface-hover hover:text-primary">
             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
         </div>
 
-        <div className="mt-3 flex items-center gap-1 rounded-lg border border-p-border-light p-0.5 text-xs">
+        <div className="mt-3 flex items-center gap-1 rounded-control border border-default p-0.5 text-xs">
           {tabBtn('people', 'People')}
           {tabBtn('link', 'Link')}
         </div>
         {isChat && (
-          <label className="mt-2 flex items-center gap-1.5 text-[11px] text-p-text-secondary">
+          <label className="mt-2 flex items-center gap-1.5 text-2xs text-secondary">
             <input type="checkbox" checked={includeTools} onChange={(e) => setIncludeTools(e.target.checked)} aria-label="Include tool calls" />
             Include the tool calls and thinking blocks
           </label>
@@ -491,7 +510,7 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                       onChange={(e) => setWho(e.target.value)}
                       placeholder={people ? 'Name or username' : 'Exact username or email'}
                       aria-label="Who to share with"
-                      className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-sm text-p-text placeholder:text-p-text-light focus:border-brand focus:outline-none" />
+                      className="min-w-0 flex-1 rounded-control border border-strong bg-surface-card px-2 py-1.5 text-sm text-primary placeholder:text-tertiary focus:border-action focus:outline-none" />
                     {people && (
                       <datalist id={`share-directory-${app.id}`}>
                         {candidates.map((u) => <option key={u.sub} value={u.name || u.username}>{u.username}</option>)}
@@ -512,37 +531,35 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                   </select>
                 )}
                 <select value={expiresIn} onChange={(e) => setExpiresIn(e.target.value)} aria-label="Expiry"
-                  className="rounded-md border border-p-border-light bg-p-bg px-2 py-1.5 text-xs text-p-text-secondary focus:border-brand focus:outline-none">
+                  className="rounded-control border border-strong bg-surface-card px-2 py-1.5 text-xs text-secondary focus:border-action focus:outline-none">
                   {peopleExpiryChoices.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
                 </select>
               </div>
               {capChoices.length > 0 && (
-                <label className="flex items-center gap-2 text-[11px] text-p-text-secondary">
+                <label className="flex items-center gap-2 text-2xs text-secondary">
                   <span className="shrink-0">They act as</span>
                   <select value={capChoices.includes(cap) ? cap : ROLE.VIEWER} onChange={(e) => setCap(e.target.value as AgentRole)} aria-label="Role"
-                    className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs text-p-text focus:border-brand focus:outline-none">
+                    className="min-w-0 flex-1 rounded-control border border-strong bg-surface-card px-2 py-1 text-xs text-primary focus:border-action focus:outline-none">
                     {capChoices.map((r) => <option key={r} value={r}>{roleLabel(r)}</option>)}
                   </select>
                 </label>
               )}
               <div className="flex items-center gap-2">
-                <button type="submit" disabled={!canSubmit}
-                  className="rounded-md bg-brand px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-brand-hover disabled:opacity-50">
+                <Button variant="primary" size="xs" type="submit" disabled={!canSubmit}>
                   Share
-                </button>
-                {notice && <span className="text-[11px] text-p-text-secondary">{notice}</span>}
+                </Button>
+                {notice && <span className="text-2xs text-secondary">{notice}</span>}
               </div>
             </form>
             {!isChat && (
               <>
-                <div className="mt-3 flex items-center gap-2 border-t border-p-border-light/60 pt-2">
-                  <code className="min-w-0 flex-1 truncate rounded bg-black/5 px-2 py-1 font-mono text-[11px] text-p-text-secondary dark:bg-white/5" title={link}>{link}</code>
-                  <button type="button" onClick={() => copy(link, 'link')}
-                    className="rounded-md border border-p-border-light px-2 py-1 text-[11px] text-p-text-secondary hover:bg-p-surface-hover">
+                <div className="mt-3 flex items-center gap-2 border-t border-subtle pt-2">
+                  <code className="min-w-0 flex-1 truncate rounded-sm bg-surface-sunken px-2 py-1 font-mono text-2xs text-secondary" title={link}>{link}</code>
+                  <Button type="button" onClick={() => copy(link, 'link')}>
                     {copied === 'link' ? 'Copied' : 'Copy link'}
-                  </button>
+                  </Button>
                 </div>
-                <p className="mt-1 text-[10px] text-p-text-light">The link opens for members and for everyone above after they sign in.</p>
+                <p className="mt-1 text-3xs text-tertiary">The link opens for members and for everyone above after they sign in.</p>
               </>
             )}
           </>
@@ -551,26 +568,24 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
         {tab === 'link' && (
           <>
             {made ? (
-              <div className="mt-3 rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-3 text-xs">
-                <p className="font-medium text-p-text">Your link is ready. The password is shown only now.</p>
+              <div className="mt-3 rounded-card border border-status-success-border bg-status-success-bg p-3 text-xs">
+                <p className="font-medium text-primary">Your link is ready. The password is shown only now.</p>
                 <div className="mt-2 flex items-center gap-2">
-                  <code className="min-w-0 flex-1 truncate rounded bg-black/5 px-2 py-1 font-mono text-[11px] dark:bg-white/5" title={made.link}>{made.link}</code>
-                  <button type="button" onClick={() => copy(made.link || '', 'made-link')}
-                    className="rounded-md border border-p-border-light px-2 py-1 text-[11px] text-p-text-secondary hover:bg-p-surface-hover">
+                  <code className="min-w-0 flex-1 truncate rounded-sm bg-surface-sunken px-2 py-1 font-mono text-2xs" title={made.link}>{made.link}</code>
+                  <Button type="button" onClick={() => copy(made.link || '', 'made-link')}>
                     {copied === 'made-link' ? 'Copied' : 'Copy link'}
-                  </button>
+                  </Button>
                 </div>
                 {made.password && (
                   <div className="mt-2 flex items-center gap-2">
-                    <span className="text-p-text-light">Password</span>
-                    <code className="rounded bg-black/5 px-2 py-1 font-mono text-[12px] tracking-wider dark:bg-white/5">{made.password}</code>
-                    <button type="button" onClick={() => copy(made.password || '', 'password')}
-                      className="rounded-md border border-p-border-light px-2 py-1 text-[11px] text-p-text-secondary hover:bg-p-surface-hover">
+                    <span className="text-tertiary">Password</span>
+                    <code className="rounded-sm bg-surface-sunken px-2 py-1 font-mono text-xs tracking-wider">{made.password}</code>
+                    <Button type="button" onClick={() => copy(made.password || '', 'password')}>
                       {copied === 'password' ? 'Copied' : 'Copy'}
-                    </button>
+                    </Button>
                   </div>
                 )}
-                <button type="button" onClick={() => setMade(null)} className="mt-2 text-[11px] text-p-text-light underline decoration-dotted">
+                <button type="button" onClick={() => setMade(null)} className="mt-2 text-2xs text-secondary underline decoration-dotted">
                   Make another link
                 </button>
               </div>
@@ -583,43 +598,47 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
                   </label>
                   <label className="flex items-center gap-1.5">
                     <input type="radio" name={`link-mode-${app.id}`} checked={publicLink} onChange={() => setPublicLink(true)} />
-                    Public <span className="rounded bg-amber-500/15 px-1 py-px text-[10px] text-amber-700 dark:text-amber-300">anyone with the URL</span>
+                    Public <span className="rounded-sm bg-status-warning-bg px-1 py-px text-3xs text-status-warning-fg">anyone with the URL</span>
                   </label>
                   <select value={linkExpiry} onChange={(e) => setLinkExpiry(e.target.value)} aria-label="Link expiry"
-                    className="ml-auto rounded-md border border-p-border-light bg-p-bg px-2 py-1 text-xs text-p-text-secondary focus:border-brand focus:outline-none">
+                    className="ml-auto rounded-control border border-strong bg-surface-card px-2 py-1 text-xs text-secondary focus:border-action focus:outline-none">
                     {linkExpiryChoices.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
                   </select>
                 </div>
                 {publicLink && (
-                  <label className="flex items-start gap-1.5 text-[11px] text-amber-700 dark:text-amber-300">
+                  <label className="flex items-start gap-1.5 text-2xs text-status-warning-fg">
                     <input type="checkbox" checked={publicUnderstood} onChange={(e) => setPublicUnderstood(e.target.checked)} />
                     I understand anyone holding this URL can open the app without a password.
                   </label>
                 )}
                 {hasSteps && (
-                  <p className="text-[11px] text-amber-700 dark:text-amber-300" data-testid="share-steps-note">
+                  <p className="text-2xs text-status-warning-fg" data-testid="share-steps-note">
                     This app runs scripts on its own. Whatever a visitor of the link sends is data to those scripts, never instructions.
                   </p>
                 )}
                 {platformActions.length > 0 && (
-                  <label className="flex items-start gap-1.5 text-[11px] text-p-text-secondary">
+                  <label className="flex items-start gap-1.5 text-2xs text-secondary">
                     <input type="checkbox" checked={linkButtons} onChange={(e) => setLinkButtons(e.target.checked)} aria-label="Buttons on the link" />
                     <span>
                       Let the link use the buttons {platformActions.map((a) => `“${a.label}”`).join(', ')}
                       {app.scope === PERSONAL_SCOPE
-                        ? ' — they run with your connected accounts, as you.'
-                        : ' — they run on the agent\'s own authority.'}
+                        ? '. They run with your connected accounts, as you.'
+                        : '. They run on the agent\'s own authority.'}
                     </span>
                   </label>
                 )}
                 <div className="flex items-center gap-2">
-                  <button type="submit" disabled={create.isPending || !settingsKnown || (publicLink && !publicUnderstood)}
-                    className="rounded-md bg-brand px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-brand-hover disabled:opacity-50">
+                  <Button
+                    variant="primary"
+                    size="xs"
+                    type="submit"
+                    disabled={create.isPending || !settingsKnown || (publicLink && !publicUnderstood)}
+                  >
                     Make link
-                  </button>
+                  </Button>
                   {notice
-                    ? <span className="text-[11px] text-emerald-700 dark:text-emerald-300" role="status">{notice}</span>
-                    : <span className="text-[10px] text-p-text-light">You will be asked to confirm it is you.</span>}
+                    ? <span className="text-2xs text-status-success-fg" role="status">{notice}</span>
+                    : <span className="text-3xs text-tertiary">You will be asked to confirm it is you.</span>}
                 </div>
               </form>
             )}
@@ -629,69 +648,68 @@ export default function SharePopover({ app: appProp, target: targetProp, onClose
         {confirmAsk && (
           <form
             onSubmit={(e) => { e.preventDefault(); void confirmAsk.retry({ password: confirmPassword }) }}
-            className="mt-3 rounded-lg border border-p-border-light bg-p-bg p-3 text-xs"
+            className="mt-3 rounded-card bg-surface-sunken p-3 text-xs"
           >
             {confirmAsk.method === 'oidc' ? (
               <>
-                <p className="font-medium text-p-text">Confirm it is you</p>
-                <p className="mt-1 text-p-text-secondary">
+                <p className="font-medium text-primary">Confirm it is you</p>
+                <p className="mt-1 text-secondary">
                   This page goes to {confirmAsk.provider} to check it is you, then comes back here.
                   {isChat ? ' Open the share again when you are back.' : ' The link and its password are shown when you return.'}
                 </p>
                 <div className="mt-2 flex gap-2">
-                  <button type="button" onClick={continueToProvider}
-                    className="rounded-md bg-brand px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-hover">
+                  <Button variant="primary" size="xs" type="button" onClick={continueToProvider}>
                     Continue to {confirmAsk.provider}
-                  </button>
-                  <button type="button" onClick={() => setConfirmAsk(null)}
-                    className="rounded-md border border-p-border-light px-2 py-1.5 text-xs text-p-text-secondary hover:bg-p-surface-hover">
+                  </Button>
+                  <Button size="xs" type="button" onClick={() => setConfirmAsk(null)}>
                     Cancel
-                  </button>
+                  </Button>
                 </div>
               </>
             ) : confirmAsk.method === 'password' ? (
               <>
-                <p className="font-medium text-p-text">Confirm it is you</p>
+                <p className="font-medium text-primary">Confirm it is you</p>
                 <div className="mt-2 flex gap-2">
                   <input type="password" autoComplete="current-password" value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)} aria-label="Your password" placeholder="Your password"
-                    className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-surface px-2 py-1.5 text-sm text-p-text focus:border-brand focus:outline-none" />
-                  <button type="submit" disabled={!confirmPassword}
-                    className="rounded-md bg-brand px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-hover disabled:opacity-50">
+                    className="min-w-0 flex-1 rounded-control border border-strong bg-surface-card px-2 py-1.5 text-sm text-primary focus:border-action focus:outline-none" />
+                  <Button variant="primary" size="xs" type="submit" disabled={!confirmPassword}>
                     Confirm
-                  </button>
-                  <button type="button" onClick={() => { setConfirmAsk(null); setConfirmPassword('') }}
-                    className="rounded-md border border-p-border-light px-2 py-1.5 text-xs text-p-text-secondary hover:bg-p-surface-hover">
+                  </Button>
+                  <Button
+                    size="xs"
+                    type="button"
+                    onClick={() => { setConfirmAsk(null); setConfirmPassword('') }}
+                  >
                     Cancel
-                  </button>
+                  </Button>
                 </div>
               </>
             ) : (
-              <p className="text-p-text-secondary">
-                Links need a confirmation, and this account has neither a password nor a passkey to confirm with.
+              <p className="text-secondary">
+                Links need you to confirm it is you. This account has no password or passkey to do that.
               </p>
             )}
           </form>
         )}
         {/* Everything this is shared with, people, agents, departments and
             links alike, under either tab: one glance says who can open it. */}
-        <div className="mt-3 border-t border-p-border-light/60 pt-2" data-testid="share-list">
-          <p className="text-[10px] font-semibold uppercase tracking-wide text-p-text-light">Shared with</p>
+        <div className="mt-3 border-t border-subtle pt-2" data-testid="share-list">
+          <p className="text-3xs font-semibold uppercase tracking-wide text-tertiary">Shared with</p>
           {isLoading ? (
-            <p className="py-1.5 text-xs text-p-text-light">Loading…</p>
+            <p className="py-1.5 text-xs text-tertiary">Loading…</p>
           ) : loadError ? (
-            <p className="py-1.5 text-xs text-red-600 dark:text-red-400">{(loadError as Error).message}</p>
+            <p className="py-1.5 text-xs text-status-danger-fg">{(loadError as Error).message}</p>
           ) : internal.length || external.length ? (
-            <ul className="divide-y divide-p-border-light/60">
+            <ul className="divide-y divide-subtle">
               {internal.map(shareRow)}
               {external.map(linkRow)}
             </ul>
           ) : (
-            <p className="py-1.5 text-xs text-p-text-light">Nobody yet.</p>
+            <p className="py-1.5 text-xs text-tertiary">Nobody yet.</p>
           )}
         </div>
-        {error && <p className="mt-2 text-[11px] text-red-600 dark:text-red-400" role="alert">{error}</p>}
-      </div>
-    </div>
+        {error && <p className="mt-2 text-2xs text-status-danger-fg" role="alert">{error}</p>}
+    </Dialog>
   )
 }

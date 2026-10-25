@@ -13,9 +13,9 @@ import pathlib
 import pytest
 
 import config as app_config
-from core.session import session_kind
 from core.layers.codex import session as codex_session
 from core.layers.codex.session import CodexAppServerSession
+from core.session import session_kind
 
 
 def _session(**kw) -> CodexAppServerSession:
@@ -34,32 +34,65 @@ def test_the_unattended_kinds_are_the_no_human_set():
 
 def test_every_thread_trusts_the_hook():
     """The trust is fixed per thread while the mode moves per turn, so an
-    attended chat trusts its hook too; the gate decides per call whether it
-    judges (OTO_HOOK_BRIDGED)."""
+    attended chat trusts its hook too, and the hook judges every call."""
     attended = _session(permission_mode="dontAsk")._thread_overrides()
     assert attended["config"] == {"bypass_hook_trust": True}
     assert attended["approvalPolicy"] == "never" and attended["approvalsReviewer"] == "user"
-    asking = _session(permission_mode="default", sandbox_mode="workspace-write")._thread_overrides()
+    asking = _session(permission_mode="ask", sandbox_mode="workspace-write")._thread_overrides()
     assert asking["config"] == {"bypass_hook_trust": True}
-    assert asking["approvalPolicy"] == "untrusted"
+    assert (asking["approvalPolicy"], asking["approvalsReviewer"]) == ("on-request", "user")
+    reviewed = _session(permission_mode="autoReview", sandbox_mode="workspace-write")._thread_overrides()
+    assert (reviewed["approvalPolicy"], reviewed["approvalsReviewer"]) == ("on-request", "auto_review")
     floored = _session(hooks_floor=True, permission_mode="auto")._thread_overrides()
     assert floored["config"] == {"bypass_hook_trust": True}
     assert floored["approvalPolicy"] == "never"
 
 
-def test_daemon_env_marks_deny_only_no_forward_and_bridged(monkeypatch):
+def test_daemon_env_marks_deny_only_and_no_forward(monkeypatch):
+    """The hook judges every call of every session: no session is marked as
+    bridged (the gate honours the mark only from a satellite before 1.9),
+    and a stray value from the session's own env never reaches one."""
     from core.sandbox import env_builder
     monkeypatch.setattr(env_builder, "build_session_env", lambda *a, **k: {"PATH": "/usr/bin"})
     monkeypatch.setattr(app_config, "CODEX_BIN", "/usr/bin/codex", raising=False)
-    env = _session(hooks_floor=True)._build_env()
-    assert env["OTO_HOOK_DENY_ONLY"] == "1" and env["OTO_HOOK_NO_FORWARD"] == "1"
-    assert "OTO_HOOK_BRIDGED" not in env
-    # A stray value from the session's own env never reaches a floored session.
-    env = _session(hooks_floor=True, extra_env={"OTO_HOOK_BRIDGED": "1"})._build_env()
-    assert "OTO_HOOK_BRIDGED" not in env
-    env = _session()._build_env()
-    assert env["OTO_HOOK_DENY_ONLY"] == "1" and env["OTO_HOOK_NO_FORWARD"] == "1"
-    assert env["OTO_HOOK_BRIDGED"] == "1"
+    for kw in ({"hooks_floor": True}, {}):
+        env = _session(**kw)._build_env()
+        assert env["OTO_HOOK_DENY_ONLY"] == "1" and env["OTO_HOOK_NO_FORWARD"] == "1"
+        assert "OTO_HOOK_BRIDGED" not in env
+        env = _session(**kw, extra_env={"OTO_HOOK_BRIDGED": "1"})._build_env()
+        assert "OTO_HOOK_BRIDGED" not in env
+
+
+def test_the_daemon_env_carries_a_command_line_token_over_the_final_session_token(monkeypatch):
+    """Codex's shell inherits the daemon's env: the token mirrors the
+    session token the daemon ends up with (the session's own env, applied
+    after the builder's, may replace it)."""
+    from auth.session_token import create_session_token, validate_cli_token
+    from core.sandbox import env_builder
+    sid = "11111111-2222-4333-8444-555555555555"
+    monkeypatch.setattr(env_builder, "build_session_env", lambda *a, **k: {
+        "PATH": "/usr/bin", "PROXY_API_KEY": create_session_token(sid, "support", "")})
+    monkeypatch.setattr(app_config, "CODEX_BIN", "/usr/bin/codex", raising=False)
+    final = create_session_token(sid, "support", "user-x")
+    env = _session(extra_env={"PROXY_API_KEY": final})._build_env()
+    assert validate_cli_token(env["OTO_CLI_TOKEN"])["user_sub"] == "user-x"
+
+
+def test_the_terminal_env_carries_a_command_line_token_over_the_final_session_token(monkeypatch):
+    """The bare Codex TUI's shell inherits ``_tui_env``: the token mirrors
+    the session token the subscription env leaves last."""
+    from auth.session_token import create_session_token, validate_cli_token
+    from core.layers.codex import layer as codex_layer
+    from core.sandbox import env_builder
+    sid = "11111111-2222-4333-8444-555555555557"
+    monkeypatch.setattr(env_builder, "build_session_env", lambda *a, **k: {
+        "PATH": "/usr/bin", "PROXY_API_KEY": create_session_token(sid, "support", "")})
+    final = create_session_token(sid, "support", "user-x")
+    env = codex_layer._tui_env(sid, "support", "", "", "/usr/bin/codex",
+                               {"PROXY_API_KEY": final, "CODEX_HOME": "/tmp/codex-home"})
+    cli = validate_cli_token(env["OTO_CLI_TOKEN"])
+    assert cli["sid"] == sid and cli["user_sub"] == "user-x"
+    assert env["OTO_INTERACTIVE"] == "1" and env["OTO_HOOK_DENY_ONLY"] == "1"
 
 
 @pytest.mark.asyncio
@@ -71,10 +104,11 @@ async def test_create_codex_session_threads_the_flag(monkeypatch):
     monkeypatch.setattr(CodexAppServerSession, "start", _start)
     s = await codex_session.create_codex_session(
         "11111111-2222-4333-8444-555555555556", "support", "gpt-6",
-        config_dir="/tmp/codex-home", hooks_floor=True,
+        config_dir="/tmp/codex-home", hooks_floor=True, thread_cwd="/users/alice",
     )
     try:
         assert seen == {"hooks_floor": True} and s.hooks_floor is True
+        assert s.thread_cwd == "/users/alice" and s.working_dir == ""
     finally:
         await codex_session.close_codex_session(s.session_id)
 
@@ -133,73 +167,48 @@ def test_subagent_tracker_stays_quiet_on_app_server_threads(monkeypatch):
     assert len(calls) == 1
 
 
-def test_attended_chats_send_untrusted_and_fall_back_once_on_rejection():
-    """An attended app-server chat (no floor) asks for every command and
-    patch through the bridge (approvalPolicy "untrusted"); a daemon that
-    rejects the value drops the session to on-request once; unattended
-    sessions keep never/on-request as before (HOOKS.md "Attended Codex
-    chats")."""
-    from core.layers.codex.app_server_client import AppServerError
-    attended = CodexAppServerSession(
+def test_an_attended_chats_policy_follows_its_mode():
+    """An attended app-server chat: Ask takes its sandbox's policy (the hook
+    judges every call, the bridge takes a sandbox crossing), Auto runs
+    on-request with Codex's own reviewer, Don't Ask runs under never; an
+    unattended session keeps the floor (HOOKS.md "Codex chats")."""
+    chat = CodexAppServerSession(
         session_id="11111111-2222-4333-8444-555555555557", agent_name="support",
         model="gpt-6", sandbox_mode="workspace-write", working_dir="",
-        config_dir="/tmp/codex-home",
+        config_dir="/tmp/codex-home", permission_mode="ask",
     )
-    assert attended.approval_policy == "untrusted"
-    assert attended._thread_overrides()["approvalPolicy"] == "untrusted"
-    attended.set_mode("plan", "read-only")
-    assert attended.approval_policy == "untrusted" and attended.plan_mode
-    attended.set_mode("dontAsk", "danger-full-access")
-    assert attended.approval_policy == "never" and not attended.plan_mode
-    attended.set_mode("default", "workspace-write")
-    # The rejection: once, then on-request for the session.
-    assert attended._note_untrusted_rejection(AppServerError("unknown variant `untrusted`")) is True
-    assert attended.approval_policy == "on-request"
-    assert attended._note_untrusted_rejection(AppServerError("unknown variant `untrusted`")) is False
-    # Any other error is not the fallback trigger.
-    fresh = CodexAppServerSession(
-        session_id="11111111-2222-4333-8444-555555555558", agent_name="support",
-        model="gpt-6", sandbox_mode="workspace-write", working_dir="",
-        config_dir="/tmp/codex-home",
-    )
-    assert fresh._note_untrusted_rejection(AppServerError("thread not found")) is False
-    assert fresh.approval_policy == "untrusted"
-    # Unattended: the floor, never untrusted.
+    assert chat.approval_policy == "on-request"
+    chat.set_mode("plan", "read-only")
+    assert chat.approval_policy == "on-request" and chat.plan_mode
+    chat.set_mode("dontAsk", "danger-full-access")
+    assert chat.approval_policy == "never" and not chat.plan_mode
+    chat.set_mode("autoReview", "workspace-write")
+    overrides = chat._thread_overrides()
+    assert (overrides["approvalPolicy"], overrides["approvalsReviewer"]) == ("on-request", "auto_review")
     floored = _session(hooks_floor=True, sandbox_mode="workspace-write")
     assert floored.approval_policy == "on-request"
     assert _session(hooks_floor=True).approval_policy == "never"
 
 
-def test_a_full_access_machines_default_mode_asks_through_the_bridge():
-    """On a machine paired with full access default and acceptEdits run under
-    danger-full-access: the policy stays untrusted (the cards), never only in
-    dontAsk / auto, and a mode switch moves it both ways on the next turn."""
-    chat = _session(permission_mode="default")  # sandbox danger-full-access
-    assert chat.approval_policy == "untrusted"
-    chat.set_mode("acceptEdits", "danger-full-access")
-    assert chat.approval_policy == "untrusted"
-    chat.set_mode("dontAsk", "danger-full-access")
+def test_a_full_access_machines_ask_chat_is_judged_by_the_hook():
+    """On a machine paired with full access Ask runs under
+    danger-full-access: nothing crosses a sandbox, so the policy is never and
+    the hook judges every call (its cards); Auto keeps the workspace sandbox
+    and the reviewer, and a mode switch moves it both ways."""
+    chat = _session(permission_mode="ask")  # sandbox danger-full-access
     assert chat.approval_policy == "never"
-    chat.set_mode("auto", "danger-full-access")
-    assert chat.approval_policy == "never"
-    chat.set_mode("default", "danger-full-access")
-    assert chat.approval_policy == "untrusted"
-    # A daemon that refuses untrusted: never there (no command leaves a
-    # sandbox, so on-request would judge nothing), the hook judges with the
-    # stored mode; a workspace sandbox falls back to on-request.
-    from core.layers.codex.app_server_client import AppServerError
-    assert chat._note_untrusted_rejection(AppServerError("unknown variant `untrusted`")) is True
-    assert chat.approval_policy == "never"
-    chat.set_mode("default", "workspace-write")
+    chat.set_mode("autoReview", "workspace-write")
     assert chat.approval_policy == "on-request"
     chat.set_mode("dontAsk", "danger-full-access")
+    assert chat.approval_policy == "never"
+    chat.set_mode("ask", "danger-full-access")
     assert chat.approval_policy == "never"
 
 
 @pytest.mark.asyncio
 async def test_a_layer_mode_change_moves_the_policy_on_the_next_turn(monkeypatch):
     from core.layers.codex import layer as codex_layer
-    chat = _session(permission_mode="default", sandbox_mode="workspace-write")
+    chat = _session(permission_mode="ask", sandbox_mode="workspace-write")
 
     async def _get(_sid):
         return chat
@@ -210,7 +219,10 @@ async def test_a_layer_mode_change_moves_the_policy_on_the_next_turn(monkeypatch
     assert (chat.permission_mode, chat.sandbox_mode) == ("dontAsk", "danger-full-access")
     assert chat._thread_overrides()["approvalPolicy"] == "never"
     await lay.change_mode(chat.session_id, "plan")
-    assert chat.plan_mode and chat.approval_policy == "untrusted"
+    assert chat.plan_mode and chat.approval_policy == "on-request"
+    await lay.change_mode(chat.session_id, "autoReview")
+    assert (chat.permission_mode, chat.sandbox_mode) == ("autoReview", "workspace-write")
+    assert chat._thread_overrides()["approvalsReviewer"] == "auto_review"
 
 
 def test_layer_and_remote_payload_share_the_floor_rule():
@@ -229,12 +241,10 @@ class _Stop(Exception):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("untrusted_retry", [False, True])
-async def test_a_resume_asks_for_no_turns(monkeypatch, untrusted_retry):
+async def test_a_resume_asks_for_no_turns(monkeypatch):
     """``thread/resume`` sends ``excludeTurns`` (Codex deprecates hydrating
-    the history into the answer, which nothing here reads), on the retry
-    after an ``untrusted`` refusal too, and never on ``thread/start``."""
-    from core.layers.codex.app_server_client import AppServerError
+    the history into the answer, which nothing here reads), never
+    ``thread/start``."""
     calls = []
 
     class _Client:
@@ -243,13 +253,9 @@ async def test_a_resume_asks_for_no_turns(monkeypatch, untrusted_retry):
 
         async def request(self, method, params=None):
             calls.append((method, dict(params or {})))
-            if method == "thread/resume" and untrusted_retry and len(calls) == 1:
-                raise AppServerError("approvalPolicy untrusted is not supported")
             raise _Stop()
 
     s = _session(thread_id="thread-1")
-    if untrusted_retry:
-        monkeypatch.setattr(s, "approval_policy", codex_session.UNTRUSTED_POLICY)
 
     async def _connect(env, cwd):
         s._client = _Client()
@@ -260,5 +266,70 @@ async def test_a_resume_asks_for_no_turns(monkeypatch, untrusted_retry):
     resumes = [p for m, p in calls if m == "thread/resume"]
     assert resumes and all(p.get("excludeTurns") is True and p["threadId"] == "thread-1"
                            for p in resumes)
-    assert len(resumes) == (2 if untrusted_retry else 1)
+    assert len(resumes) == 1
     assert "excludeTurns" not in s._thread_overrides()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread_id", ["thread-moved", None])
+async def test_the_thread_runs_in_the_sandbox_folder(monkeypatch, thread_id):
+    """``thread/resume`` and ``thread/start`` carry the sandbox's folder as
+    ``cwd``: a resumed thread otherwise runs in the cwd its rollout recorded,
+    and a thread carried from a machine recorded a folder the sandbox does not
+    have (every stdio MCP failed at spawn there). The spawn cwd and the env's
+    username stay ``working_dir``'s."""
+    calls, spawn_cwds = [], []
+
+    class _Client:
+        def set_server_request_handler(self, h):
+            pass
+
+        async def request(self, method, params=None):
+            calls.append((method, dict(params or {})))
+            raise _Stop()
+
+    s = _session(thread_id=thread_id, thread_cwd="/users/alice")
+
+    async def _connect(env, cwd):
+        spawn_cwds.append(cwd)
+        s._client = _Client()
+    monkeypatch.setattr(s, "_connect_with_retry", _connect)
+    monkeypatch.setattr(s, "_build_env", lambda: {})
+    with pytest.raises(_Stop):
+        await s.start()
+    method, params = calls[0]
+    assert method == ("thread/resume" if thread_id else "thread/start")
+    assert params["cwd"] == "/users/alice"
+    assert spawn_cwds == [None]
+    assert "cwd" not in _session()._thread_overrides()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_resume_starts_a_new_thread_and_says_so(monkeypatch):
+    """A thread Codex will not open (a moved chat whose rollout it cannot
+    read): a new thread starts, and the session says the resume was refused
+    so the layer reseeds the chat from its history."""
+    from core.layers.codex.app_server_client import AppServerError
+
+    class _Client:
+        def set_server_request_handler(self, h):
+            pass
+
+        async def request(self, method, params=None):
+            if method == "thread/resume":
+                raise AppServerError("no rollout found for thread id thread-moved")
+            return {"thread": {"id": "thread-fresh"}}
+
+    s = _session(thread_id="thread-moved")
+
+    async def _connect(env, cwd):
+        s._client = _Client()
+
+    async def _warm():
+        raise _Stop()
+    monkeypatch.setattr(s, "_connect_with_retry", _connect)
+    monkeypatch.setattr(s, "_build_env", lambda: {})
+    monkeypatch.setattr(s, "_warm_mcps", _warm)
+    with pytest.raises(_Stop):
+        await s.start()
+    assert s.thread_id == "thread-fresh" and s.resume_refused is True

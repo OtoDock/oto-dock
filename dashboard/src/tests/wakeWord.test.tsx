@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
-import { act, render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { act, render, screen, waitFor, fireEvent, within } from '@testing-library/react'
 import { FakeAudioContext, installMicEnv, uninstallMicEnv } from './fakeMicEnv'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
@@ -109,11 +109,19 @@ describe('WakeWordSection', () => {
     })
   })
 
+  it('the On and Off choice is a named group whose pressed button is the saved value', async () => {
+    mockApi({ wakeEnabled: true })
+    render(<WakeWordSection />, { wrapper })
+    const group = screen.getByRole('group', { name: 'Wake word' })
+    await waitFor(() => expect(within(group).getByRole('button', { name: 'On' })).toHaveAttribute('aria-pressed', 'true'))
+    expect(within(group).getByRole('button', { name: 'Off' })).toHaveAttribute('aria-pressed', 'false')
+  })
+
   it('when enabled, lists the platform word target and wakeable phrases', async () => {
     mockApi({ wakeEnabled: true })
     render(<WakeWordSection />, { wrapper })
     await waitFor(() =>
-      expect(screen.getByText(/opens Alpha Helper \(your favorite agent\)/)).toBeInTheDocument())
+      expect(screen.getByText(/opens your favorite agent, Alpha Helper\./)).toBeInTheDocument())
     expect(screen.getByText(/“Hey Alpha Helper”/)).toBeInTheDocument()
   })
 
@@ -211,6 +219,16 @@ describe('useWakeWord', () => {
     mockApi()
     try {
       render(<Harness navigate={vi.fn()} entry="/user-settings?wakeDiag=1" />)
+      await waitFor(() => expect(isWakeDiagOn()).toBe(true))
+    } finally {
+      setWakeDiag(false)
+    }
+  })
+
+  it('?wakeDiag=1 on a User Settings section switches it on too (the ?tab= redirect keeps it)', async () => {
+    mockApi()
+    try {
+      render(<Harness navigate={vi.fn()} entry="/user-settings/general?wakeDiag=1" />)
       await waitFor(() => expect(isWakeDiagOn()).toBe(true))
     } finally {
       setWakeDiag(false)

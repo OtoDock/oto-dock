@@ -96,7 +96,7 @@ def normalize_event(
     manifest_block: dict,
     vendor_event_id: str = "",
     global_event_id: str = "",
-) -> "NormalizedEvent":
+) -> NormalizedEvent:
     """Apply a manifest's ``payload_normalization`` block to raw inbound.
 
     Reads ``event_type_path`` plus optional ``actor``, ``subject``,
@@ -170,7 +170,7 @@ def _resolve_namespace(
 
 
 def match_event_filter(
-    *, event: "NormalizedEvent", event_filter: dict,
+    *, event: NormalizedEvent, event_filter: dict,
 ) -> bool:
     """Equality-dict match: every key in event_filter must equal the
     corresponding field in the NormalizedEvent.
@@ -197,7 +197,7 @@ def match_event_filter(
     return True
 
 
-def _read_event_field(event: "NormalizedEvent", key: str) -> str:
+def _read_event_field(event: NormalizedEvent, key: str) -> str:
     """Read a NormalizedEvent field by dot-path.
 
     Top-level: ``event_type`` / ``vendor_event_id``. Nested:

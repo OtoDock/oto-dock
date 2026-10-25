@@ -21,16 +21,19 @@ import pytest
 from fastapi import HTTPException
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from auth.providers import UserContext  # noqa: E402
-from storage.agents import agent_store  # noqa: E402
-from storage import database as task_store  # noqa: E402
-from storage.automation import notification_store  # noqa: E402
-from storage.automation import trigger_store  # noqa: E402
-from storage.automation import webhook_subscription_store  # noqa: E402
+from auth.providers import UserContext
+from storage import database as task_store
+from storage.agents import agent_store
+from storage.automation import (
+    notification_store,
+    trigger_store,
+    webhook_subscription_store,
+)
 
 AG = "shared-agent"
 OTHER = "other-agent"
@@ -352,7 +355,9 @@ class TestSessionJwtTriggerScoping:
 
     def test_mutation_authority_nouser_own_agent_only(self, temp_db):
         from api.events.triggers import (
-            _can_manage_trigger, _check_trigger_mutation_authority)
+            _can_manage_trigger,
+            _check_trigger_mutation_authority,
+        )
         t1, _t2, t3, t4 = self._seed()
         nu = _nouser_session()
         # Own agent's agent-scope: allowed.
@@ -601,7 +606,9 @@ class TestNoUserEdgeReads:
 
     def test_trigger_mutation_still_own_agent(self, temp_db):
         from api.events.triggers import (
-            _can_manage_trigger, _check_trigger_mutation_authority)
+            _can_manage_trigger,
+            _check_trigger_mutation_authority,
+        )
         self._wire()
         t = trigger_store.create_trigger(slug="tr-obs", name="t", scope="agent", agent=OTHER, created_by="user-admin")
         nu = _nouser_session()
@@ -611,7 +618,9 @@ class TestNoUserEdgeReads:
 
     def test_notifications_list_gains_target(self, temp_db):
         from api.notifications.notifications import (
-            _check_notification_authority, list_notifications)
+            _check_notification_authority,
+            list_notifications,
+        )
         self._wire()
         notification_store.create_notification("n-own", "b", scope="agent", target=AG, created_by="user-admin")
         n_obs = notification_store.create_notification("n-obs", "b", scope="agent", target=OTHER, created_by="user-admin")

@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useLayoutEffect } from 'react'
 import { focusPreludeLine } from '../lib/focus'
 import type { WireImage } from './useDashboardWs'
 
@@ -7,6 +7,9 @@ import type { WireImage } from './useDashboardWs'
 // is mirrored to a themed xterm; this hook owns the per-chat toggle intent, the
 // live-session flag, and the few subtle rules for routing a send and handling
 // warmup_ready, so the two pages don't diverge.
+
+// The proxy's answer to a switch on a chat this person may not open.
+const SWITCH_REFUSED = 'Access denied'
 
 // Current dashboard light/dark mode — sent on interactive warmup so the backend
 // seeds Claude's TUI theme to match (and the xterm background follows it).
@@ -138,20 +141,32 @@ export type WarmupReadyResult = 'interactive' | 'declined' | 'none'
 export function useInteractiveChat(
   ws: InteractiveWs,
   agentDefaultMode: string = '',
+  opts: { taskChat?: boolean } = {},
 ) {
   // The per-chat execution-mode OVERRIDE (tri-state): '' = unset (follow the
   // agent default), 'interactive' / '-p' = an explicit per-chat choice. Sent as
   // execution_mode on warmup; restored from the chat's stored mode on open.
-  const [chatExecMode, setChatExecMode] = useState<'' | 'interactive' | '-p'>('')
-  // The EFFECTIVE on/off for the toggle + send routing: the per-chat override
-  // wins, else the agent's default execution mode. DERIVED (not state)
-  // so it tracks both inputs reactively — a brand-new
-  // chat with no override reflects the agent default the moment it loads.
-  const interactiveMode = (chatExecMode || agentDefaultMode) === 'interactive'
+  const [storedExecMode, setChatExecMode] = useState<'' | 'interactive' | '-p'>('')
   // A live PTY-backed session exists (from warmup_ready.interactive) → the page
   // renders the terminal instead of the message list. Cleared on chat switch
   // until the resumed chat's warmup_ready{interactive} arrives.
   const [sessionInteractive, setSessionInteractive] = useState(false)
+  // A task chat has no terminal toggle: a person's follow-up there must not
+  // start a terminal under the task's identity, whatever mode the chat
+  // stored (the runner stamps it, an earlier dashboard's toggle may have).
+  // It is interactive only while its run's own terminal is live, and a
+  // warmup asks for a headless session otherwise.
+  const taskChat = !!opts.taskChat
+  const chatExecMode: '' | 'interactive' | '-p' = taskChat
+    ? (sessionInteractive ? 'interactive' : '-p')
+    : storedExecMode
+  // The EFFECTIVE on/off for the toggle + send routing: the per-chat override
+  // wins, else the agent's default execution mode. DERIVED (not state)
+  // so it tracks both inputs reactively — a brand-new
+  // chat with no override reflects the agent default the moment it loads.
+  const interactiveMode = taskChat
+    ? sessionInteractive
+    : (chatExecMode || agentDefaultMode) === 'interactive'
   // The view-toggle: while a live terminal exists, the
   // user can flip to the DB rich history (and back) WITHOUT killing the session —
   // the page keeps <TerminalView> mounted (hidden) so the PTY stays attached and
@@ -174,6 +189,41 @@ export function useInteractiveChat(
   // A live switch (kill+rewarm) is in flight — locks the toggle until
   // the re-warm's warmup_ready lands, so it can't be double-fired.
   const [switching, setSwitching] = useState(false)
+  // Which chat the switch is for and how far it got: `asked` until that
+  // chat's warmup_started (only a refusal answers before it: an error frame),
+  // then `spawning` until warmup_ready or warmup_failed. The server handles a
+  // socket's messages in order and the switch awaits its whole re-warm, so
+  // an error frame during an `asked` switch is the switch's own.
+  // `before` is the chat's mode before the switch: a refused switch puts it back.
+  const switchRef = useRef<{ chatId: string; phase: 'asked' | 'spawning'; before: '' | 'interactive' | '-p' } | null>(null)
+  const storedModeRef = useRef(storedExecMode)
+  useLayoutEffect(() => { storedModeRef.current = storedExecMode })
+  const beginSwitch = useCallback((chatId: string) => {
+    switchRef.current = { chatId, phase: 'asked', before: storedModeRef.current }
+    setSwitching(true)
+  }, [])
+  const endSwitch = useCallback(() => {
+    switchRef.current = null
+    setSwitching(false)
+  }, [])
+  // The page's frame tails: the switched chat's warmup_started, an error
+  // frame, a warmup_failed for the viewed chat. The one error frame a refused
+  // switch gets is the chat gate's (`_open_chat_by_id`: a chat this person
+  // may not open); the drive and task gates answer with the stored mode
+  // (`applyStoredExecMode`). Any other error leaves the switch running.
+  const switchStarted = useCallback((chatId: string | undefined) => {
+    const sw = switchRef.current
+    if (sw && chatId && sw.chatId === chatId) sw.phase = 'spawning'
+  }, [])
+  const switchErrored = useCallback((message: string) => {
+    const sw = switchRef.current
+    if (sw?.phase !== 'asked' || message !== SWITCH_REFUSED) return
+    setChatExecMode(sw.before)
+    endSwitch()
+  }, [endSwitch])
+  const switchFailed = useCallback(() => {
+    if (switchRef.current) endSwitch()
+  }, [endSwitch])
 
   // Toggle the per-chat intent + persist it. Callers
   // only invoke this when no session is live (the switch is locked
@@ -205,11 +255,11 @@ export function useInteractiveChat(
       return 'deferred'
     }
     const next_mode = next ? 'interactive' : '-p'
+    beginSwitch(chatId)
     setChatExecMode(next_mode)
-    setSwitching(true)
     ws.switchExecutionMode(next_mode, chatId, currentDashboardTheme())
     return 'switched'
-  }, [ws])
+  }, [ws, beginSwitch])
 
   // Fire any switch deferred while a turn was streaming (call on turn-end).
   const flushDeferredSwitch = useCallback((chatId: string | null) => {
@@ -217,10 +267,10 @@ export function useInteractiveChat(
     const next = deferredSwitchRef.current
     deferredSwitchRef.current = null
     const next_mode = next ? 'interactive' : '-p'
+    beginSwitch(chatId)
     setChatExecMode(next_mode)
-    setSwitching(true)
     ws.switchExecutionMode(next_mode, chatId, currentDashboardTheme())
-  }, [ws])
+  }, [ws, beginSwitch])
 
   // Seed the per-chat override for a NEW chat from the agent's STICKY interactive
   // preference (agentPrefsStore.lastInteractive) — the interactive twin of seeding
@@ -248,8 +298,8 @@ export function useInteractiveChat(
   // tier). Takes the stored value and ends any switch the pick started.
   const applyStoredExecMode = useCallback((executionMode: string) => {
     setChatExecMode(executionMode === 'interactive' || executionMode === '-p' ? executionMode : '')
-    setSwitching(false)
-  }, [])
+    endSwitch()
+  }, [endSwitch])
 
   // Clear the live-session state on chat switch / new chat, and clear the
   // per-chat override so a brand-new chat falls back to the AGENT default (a
@@ -258,12 +308,12 @@ export function useInteractiveChat(
   const resetSession = useCallback(() => {
     setSessionInteractive(false)
     setShowRichView(false)
-    setSwitching(false)
+    endSwitch()
     setChatExecMode('')
     pendingPtyTextRef.current = null
     pendingPtyAttachmentsRef.current = null
     deferredSwitchRef.current = null
-  }, [])
+  }, [endSwitch])
 
   // Route a send. A live terminal → write the line straight to the PTY (no pump
   // turn, no bubble). Toggle on with nothing live yet → cold-start an
@@ -319,7 +369,7 @@ export function useInteractiveChat(
     const isInteractive = !!data.interactive
     setSessionInteractive(isInteractive)
     setShowRichView(false)  // a (re)warm landed → open on the terminal, not a stale rich snapshot
-    setSwitching(false)  // a re-warm landed → any in-flight live switch is done
+    endSwitch()  // a re-warm landed → any in-flight live switch is done
     if (isInteractive) {
       if (pendingPtyTextRef.current != null && data.chat_id) {
         const att = pendingPtyAttachmentsRef.current
@@ -343,7 +393,7 @@ export function useInteractiveChat(
       return 'declined'
     }
     return 'none'
-  }, [ws])
+  }, [ws, endSwitch])
 
   return {
     interactiveMode,
@@ -357,6 +407,9 @@ export function useInteractiveChat(
     showRichView,
     setShowRichView,
     switching,
+    switchStarted,
+    switchErrored,
+    switchFailed,
     pendingPtyTextRef,
     toggle,
     performSwitch,

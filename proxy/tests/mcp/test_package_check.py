@@ -140,11 +140,43 @@ def test_conventions_are_warnings(tmp_path):
     assert "pins 1.2.3" in joined
 
 
+def test_a_critical_rule_is_a_warning_naming_the_tool(tmp_path):
+    root = _folder(tmp_path, _manifest(permissions={"default_tier": "standard", "rules": [
+        {"tool": "read", "tier": "open"}, {"tool": "ban_user", "tier": "critical"}]}),
+        files={"icon.png": _png(256, 256)})
+    out = ci.check_package(root)
+    assert out["ok"] is True and out["errors"] == []
+    assert out["warnings"] == [
+        "permissions: critical is kept for OtoDock's own tools, so ban_user will run as sensitive"]
+
+
+def test_a_critical_default_tier_is_a_warning(tmp_path):
+    root = _folder(tmp_path, _manifest(permissions={"default_tier": "critical", "rules": [
+        {"tool": "send_*", "tier": "critical"}]}), files={"icon.png": _png(256, 256)})
+    out = ci.check_package(root)
+    assert out["ok"] is True and out["errors"] == []
+    assert out["warnings"] == [
+        "permissions: critical is kept for OtoDock's own tools, so default_tier, send_* "
+        "will run as sensitive"]
+
+
 def test_a_block_the_parser_rejects_is_an_error(tmp_path):
     root = _folder(tmp_path, _manifest(costs={"currency": "EUR", "provider": "x", "rules": []}))
     out = ci.check_package(root)
     assert out["ok"] is False
     assert any("rejected" in e or "costs" in e for e in out["errors"]), out["errors"]
+
+
+@pytest.mark.parametrize(("rules", "error"), [
+    (5, "permissions.rules must be a list, got int"),
+    (True, "permissions.rules must be a list, got bool"),
+    ([5, {"tool": "ban_user", "tier": "critical"}], "permissions.rules[0] must be an object, got int"),
+])
+def test_a_malformed_rules_block_is_the_parse_s_error_not_a_crash(tmp_path, rules, error):
+    root = _folder(tmp_path, _manifest(permissions={"default_tier": "standard", "rules": rules}))
+    out = ci.check_package(root)
+    assert out["ok"] is False
+    assert any(error in e for e in out["errors"]), out["errors"]
 
 
 def test_a_credential_token_in_agent_context_is_a_warning(tmp_path):
@@ -208,3 +240,29 @@ def test_a_schema_violation_the_installer_lets_through_is_a_warning(tmp_path):
     out = ci.check_package(root)
     assert any(w.startswith("catalog schema: /audience") for w in out["warnings"])
 
+
+
+def test_a_bundled_skills_front_matter_is_held_to_the_skill_schema_as_warnings(tmp_path):
+    # The installer refuses none of it (the scrub keeps the declarative
+    # keys); the author is told what an engine would stumble on.
+    skills = [{"id": "good", "file": "skills/good/SKILL.md"}, {"id": "bad", "file": "skills/bad/SKILL.md"},
+              {"id": "flat", "file": "skills/flat.md"}, {"id": "broken", "file": "skills/broken/SKILL.md"},
+              {"id": "other", "file": "skills/other/SKILL.md"}]
+    root = _folder(tmp_path, _manifest(skills=skills), files={
+        "skills/good/SKILL.md": "---\nname: good\ndescription: Does good things.\nallowed-tools: Bash\n---\nBody\n",
+        "skills/bad/SKILL.md": "---\nname: Bad Name\ndescription: ''\n---\nBody\n",
+        "skills/flat.md": "A flat skill file the platform frames itself.\n",
+        "skills/broken/SKILL.md": "---\nname: broken\ndescription: [unclosed\n---\nBody\n",
+        "skills/other/SKILL.md": "---\nname: elsewhere\ndescription: Named apart.\n---\nBody\n",
+    })
+    out = ci.check_package(root)
+    assert out["errors"] == [], out["errors"]
+    warnings = [w for w in out["warnings"] if "front matter" in w]
+    assert any(w.startswith("skills/bad/SKILL.md front matter: name: invalid skill name 'Bad Name'")
+               for w in warnings), warnings
+    assert any(w.startswith("skills/bad/SKILL.md front matter: description must not be empty") for w in warnings)
+    assert any(w.startswith("skills/broken/SKILL.md front matter is not valid YAML") for w in warnings)
+    assert "skills/other/SKILL.md front matter: name 'elsewhere' is not the skill's id 'other'" in warnings
+    assert not any("skills/good" in w or "skills/flat" in w for w in warnings), warnings
+    # Never a schema path or jsonschema's own words.
+    assert not any("does not match" in w or "$defs" in w for w in out["warnings"])

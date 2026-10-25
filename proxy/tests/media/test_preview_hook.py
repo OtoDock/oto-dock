@@ -12,11 +12,11 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import jwt
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from auth import tokens
 from storage import database as task_store
 
 
@@ -26,8 +26,9 @@ async def _pass_async(*a, **kw):
 
 @pytest.fixture
 def hook(monkeypatch, tmp_path):
-    import config
     from collections import OrderedDict
+
+    import config
     from api.hooks import hooks as hooks_mod, paths, preview, routing
 
     monkeypatch.setattr(preview, "_pushed_generations", OrderedDict())
@@ -55,7 +56,7 @@ def hook(monkeypatch, tmp_path):
     pushed: list[dict] = []
 
     class _Queue:
-        async def put(self, item):
+        def put_nowait(self, item):
             pushed.append(item)
     monkeypatch.setattr(preview, "get_permission_queue", lambda sid: _Queue())
     preview._wopi_token_cache.clear()
@@ -75,19 +76,24 @@ def hook(monkeypatch, tmp_path):
 
 def _persist(chat_id, item):
     """What the pump's flush (or the terminal drainer) stores for a push."""
-    from core.events.artifact_events import LIVE_ONLY_KEYS, artifact_event_from_perm_item
+    from core.events.artifact_events import (
+        LIVE_ONLY_KEYS,
+        artifact_event_from_perm_item,
+    )
     evt = {k: v for k, v in artifact_event_from_perm_item(item).items() if k not in LIVE_ONLY_KEYS}
     task_store.add_chat_message(chat_id, "event", "", event_type="document_preview",
                                 event_data=json.dumps(evt))
 
 
 def _claims(item):
-    return jwt.decode(item["access_token"], "test-secret", algorithms=["HS256"])
+    return tokens.decode(item["access_token"], tokens.WOPI)
 
 
-def test_the_token_names_the_chat_and_is_never_shared_across_chats(temp_db, hook):
+def test_the_token_names_the_chat_and_is_never_shared_across_chats(temp_db, hook, people):
     task_store.create_chat("chat-a", "user-a", "test-agent")
     task_store.create_chat("chat-b", "user-a", "test-agent")
+    people("chat-a", "bob-sub")
+    people("chat-b", "bob-sub", session="sess-b")
     a1, a2, b1 = hook("sess-a"), hook("sess-a"), hook("sess-b")
     assert _claims(a1)["chat_id"] == "chat-a"
     assert a2["access_token"] == a1["access_token"]  # reused within a chat
@@ -95,9 +101,10 @@ def test_the_token_names_the_chat_and_is_never_shared_across_chats(temp_db, hook
     assert b1["access_token"] != a1["access_token"]
 
 
-def test_a_push_with_no_chat_has_no_claim_number_or_version_copy(temp_db, hook, tmp_path):
+def test_a_push_with_no_chat_has_no_token_number_or_version_copy(temp_db, hook, tmp_path):
+    # No chat, no turn of a person to reach: no token to carry a claim.
     item = hook("sess-none")
-    assert "chat_id" not in _claims(item)
+    assert "access_token" not in item
     assert item["version"] == 0 and item["snapshot_id"] == ""
     assert not (tmp_path / "snaps").exists()
 
@@ -129,9 +136,10 @@ def test_a_push_trims_the_files_oldest_version_copies(temp_db, hook, monkeypatch
     assert (snaps / third["snapshot_id"]).exists()
 
 
-def test_expired_tokens_leave_the_cache(temp_db, hook):
+def test_expired_tokens_leave_the_cache(temp_db, hook, people):
     from api.hooks import preview
     task_store.create_chat("chat-a", "user-a", "test-agent")
+    people("chat-a", "bob-sub")
     preview._wopi_token_cache[("old", "edit", "chat-x")] = {"token": "t", "ttl": 0, "expires": 0}
     hook()
     assert ("old", "edit", "chat-x") not in preview._wopi_token_cache
@@ -139,6 +147,7 @@ def test_expired_tokens_leave_the_cache(temp_db, hook):
 
 def _opened(item):
     import urllib.parse
+
     from api.media import wopi
     query = urllib.parse.parse_qs(urllib.parse.urlparse(item["wopi_url"]).query)
     assert "_t" not in query
@@ -147,6 +156,7 @@ def _opened(item):
 
 def test_the_pushed_url_opens_the_push_generations_document(temp_db, hook, tmp_path):
     import os
+
     from api.hooks import preview
     from api.media import wopi
     task_store.create_chat("chat-a", "user-a", "test-agent")
@@ -178,6 +188,7 @@ def test_a_push_of_the_bytes_a_person_saved_keeps_the_document(temp_db, hook, tm
     # A pane save since the push: the document's base is the saved bytes,
     # and a preview_document of them opens the same document.
     import hashlib
+
     from api.hooks import preview
     from api.media import wopi
     task_store.create_chat("chat-a", "user-a", "test-agent")
@@ -198,6 +209,7 @@ def test_a_write_back_to_the_pushed_bytes_after_a_persons_save_opens_a_new_docum
     # Push X, the person saves Y (the document's base), the agent writes X
     # again: the document holds Y, so X is a change to it, a new document.
     import hashlib
+
     from api.hooks import preview
     from api.media import wopi
     task_store.create_chat("chat-a", "user-a", "test-agent")
@@ -253,42 +265,48 @@ def test_the_persons_own_role_decides_the_write(temp_db, hook, people):
     assert (claims["user_sub"], claims["permissions"]) == ("vi-sub", "view")
 
 
-def test_a_turn_without_a_person_keeps_the_agents_token(temp_db, hook, people):
+def test_a_turn_without_a_person_pushes_no_token(temp_db, hook, people):
+    # A task run, a wake: the push reaches nobody's connection in
+    # particular, so it mints nothing and every viewer's pane mints its own.
+    from api.hooks import preview
     task_store.create_chat("chat-a", "user-a", "test-agent")
-    claims = _claims(hook())
-    assert (claims["user_sub"], claims["user_name"], claims["permissions"]) == ("agent", "Agent", "edit")
+    assert "access_token" not in hook()
     people("chat-a", "")
-    assert _claims(hook())["user_sub"] == "agent"
+    assert "access_token" not in hook()
+    assert preview._wopi_token_cache == {}
 
 
 def test_the_token_cache_is_per_person(temp_db, hook, people):
+    from api.hooks import preview
     task_store.create_chat("chat-a", "user-a", "test-agent")
     people("chat-a", "bob-sub")
     first = hook()
     assert hook()["access_token"] == first["access_token"]
-    people("chat-a", "")
-    agents = hook()
-    assert _claims(agents)["user_sub"] == "agent"
-    assert agents["access_token"] != first["access_token"]
+    people("chat-a", "vi-sub")
+    vis = hook()
+    assert _claims(vis)["user_sub"] == "vi-sub"
+    assert vis["access_token"] != first["access_token"]
+    assert len(preview._wopi_token_cache) == 2
 
 
 def test_only_the_live_pump_of_the_push_names_the_person(temp_db, hook, people):
     # A finished pump, or one of another session, is not the turn the push
-    # belongs to: the agent's token.
+    # belongs to: no person, no token.
     task_store.create_chat("chat-a", "user-a", "test-agent")
     people("chat-a", "bob-sub", done=True)
-    assert _claims(hook())["user_sub"] == "agent"
+    assert "access_token" not in hook()
     people("chat-a", "bob-sub", session="sess-other")
-    assert _claims(hook())["user_sub"] == "agent"
+    assert "access_token" not in hook()
     people("chat-a", "bob-sub")
     assert _claims(hook())["user_sub"] == "bob-sub"
 
 
 
 
-def test_the_pushed_token_opens_only_its_push_and_a_new_push_mints_again(temp_db, hook, tmp_path):
+def test_the_pushed_token_opens_only_its_push_and_a_new_push_mints_again(temp_db, hook, people, tmp_path):
     from api.hooks import preview
     task_store.create_chat("chat-a", "user-a", "test-agent")
+    people("chat-a", "bob-sub")
     first = hook()
     assert _claims(first)["generation"] == _opened(first)[1]
     assert hook()["access_token"] == first["access_token"]   # same document: reused
@@ -300,10 +318,10 @@ def test_the_pushed_token_opens_only_its_push_and_a_new_push_mints_again(temp_db
     assert len(preview._wopi_token_cache) == 1               # replaced, not grown
 
 
-def test_a_meeting_participants_push_keeps_the_agents_token(temp_db, hook, people, monkeypatch):
+def test_a_meeting_participants_push_carries_no_token(temp_db, hook, people, monkeypatch):
     """A participant's push streams through the meeting's pump (no person)
     into the parent chat, where a person's own turn may have a pump of
-    another session: the token stays the agent's."""
+    another session: no token."""
     from api.hooks import routing
     task_store.create_chat("chat-a", "user-a", "test-agent")
     monkeypatch.setattr(routing, "get_meeting_session_info", lambda sid: {
@@ -312,9 +330,150 @@ def test_a_meeting_participants_push_keeps_the_agents_token(temp_db, hook, peopl
     monkeypatch.setattr(routing, "resolve_hook_chat_id",
                         AsyncMock(side_effect={"sess-p": "chat-a", "sess-a": "chat-a"}.get))
     people("chat-a", "bob-sub", session="sess-a")
-    assert _claims(hook("sess-p"))["user_sub"] == "agent"
+    assert "access_token" not in hook("sess-p")
     people("chat-a", "", session="meeting-1")
-    assert _claims(hook("sess-p"))["user_sub"] == "agent"
+    assert "access_token" not in hook("sess-p")
+
+
+@pytest.fixture
+def terminal(monkeypatch):
+    """A live interactive terminal registered under a session id: no pump,
+    its drainer hands the push to the socket of its sole driver."""
+    from core.session import interactive_session
+
+    def open_terminal(sub, *, chat_id="chat-a", session="sess-a"):
+        sess = interactive_session.InteractiveSession.__new__(interactive_session.InteractiveSession)
+        sess.session_id, sess.chat_id, sess.user_sub = session, chat_id, sub
+        sess._closing = sess._closed = False
+        sess.pty = SimpleNamespace(closed=False)
+        monkeypatch.setitem(interactive_session._sessions, session, sess)
+        return sess
+    return open_terminal
+
+
+def test_a_terminal_chats_push_names_the_person_at_the_terminal(temp_db, hook, people, terminal):
+    # A shared chat: the row's owner is the agent, Bob warmed the terminal.
+    task_store.create_chat("chat-a", "agent::test-agent", "test-agent")
+    terminal("bob-sub")
+    item = hook()
+    claims = _claims(item)
+    assert (claims["user_sub"], claims["user_name"], claims["permissions"]) == ("bob-sub", "Bob Builder", "edit")
+    assert item["token_person"] == "bob-sub"  # who may receive it (artifact_events.for_viewer)
+    # Their own role decides the write: a viewer at the terminal views.
+    terminal("vi-sub")
+    claims = _claims(hook())
+    assert (claims["user_sub"], claims["permissions"]) == ("vi-sub", "view")
+
+
+def test_a_terminal_without_one_driver_pushes_no_token(temp_db, hook, people, terminal, monkeypatch):
+    """A terminal anyone may drive (no owner recorded, a task chat), one of
+    another chat, a closing or closed one, an owner who is no person (a
+    delegated lane's source agent) and a session id a pump reads too: the
+    push names nobody, so it carries no token and mints none."""
+    from api.hooks import preview, routing
+    task_store.create_chat("chat-a", "user-a", "test-agent")
+    task_store.create_chat("task-run-1", "user-a", "test-agent")
+    monkeypatch.setattr(routing, "resolve_hook_chat_id",
+                        AsyncMock(side_effect={"sess-a": "chat-a", "sess-t": "task-run-1"}.get))
+    terminal("bob-sub", chat_id="task-run-1", session="sess-t")
+    assert "access_token" not in hook("sess-t")
+    for sub, chat_id in (("", "chat-a"), ("bob-sub", "chat-other"), ("personal-assistant", "chat-a")):
+        terminal(sub, chat_id=chat_id)
+        assert "access_token" not in hook(), (sub, chat_id)
+    terminal("bob-sub")._closing = True
+    assert "access_token" not in hook()
+    terminal("bob-sub")._closed = True
+    assert "access_token" not in hook()
+    terminal("bob-sub")
+    people("chat-a", "bob-sub")
+    assert "access_token" not in hook()
+    assert preview._wopi_token_cache == {}
+
+
+def test_a_resumed_task_names_the_person_who_resumed_it(temp_db, hook, people, monkeypatch):
+    # An agent-scope run pushes with no person; a manager resumes its chat
+    # and the turn runs as them, so the push names them.
+    from api.hooks import routing
+    task_store.create_chat("task-run-1", "agent::test-agent", "test-agent")
+    monkeypatch.setattr(routing, "resolve_hook_chat_id",
+                        AsyncMock(side_effect={"sess-t": "task-run-1"}.get))
+    assert "access_token" not in hook("sess-t")
+    people("task-run-1", "bob-sub", session="sess-t")
+    assert _claims(hook("sess-t"))["user_sub"] == "bob-sub"
+
+
+def test_a_takeover_switches_the_person(temp_db, hook, people, terminal):
+    from api.hooks import preview
+    from core.session import interactive_session
+    task_store.create_chat("chat-a", "agent::test-agent", "test-agent")
+    terminal("bob-sub")
+    bobs = hook()
+    # Vi takes over: Bob's session closes and leaves the registry ...
+    interactive_session._sessions.pop("sess-a")
+    assert "access_token" not in hook()
+    # ... and Vi's re-warm runs the same chat under the same session id.
+    terminal("vi-sub")
+    vis = hook()
+    assert (_claims(bobs)["user_sub"], _claims(vis)["user_sub"]) == ("bob-sub", "vi-sub")
+    assert len(preview._wopi_token_cache) == 2
+
+
+def test_a_takeover_during_the_push_keeps_the_token_from_the_next_person(
+        temp_db, hook, people, terminal, monkeypatch):
+    """The hook awaits after it mints (the version copy, its number, the
+    download link): a takeover meanwhile starts closing Bob's terminal and
+    hands the session id and its queue to the next person, so Bob's token
+    stays off the push. A re-warm of Bob's own keeps it."""
+    from services.media import preview_snapshots
+    task_store.create_chat("chat-a", "agent::test-agent", "test-agent")
+    real = preview_snapshots.stamp_and_cap
+    meanwhile: list = []
+
+    def _taken_over(*a, **kw):
+        meanwhile.pop()()
+        return real(*a, **kw)
+    monkeypatch.setattr(preview_snapshots, "stamp_and_cap", _taken_over)
+    bobs = terminal("bob-sub")
+    meanwhile.append(lambda: setattr(bobs, "_closing", True))
+    item = hook()
+    assert "access_token" not in item and "token_person" not in item
+    terminal("bob-sub")
+    meanwhile.append(lambda: terminal("vi-sub"))
+    assert "access_token" not in hook()
+    terminal("bob-sub")
+    meanwhile.append(lambda: terminal("bob-sub"))
+    assert _claims(hook())["user_sub"] == "bob-sub"
+
+
+def test_the_relay_admits_the_socket_of_the_person_at_the_terminal(temp_db, hook, terminal, monkeypatch):
+    """End to end: the token a terminal push carries opens the editor socket
+    for the person at the terminal (their sign-in cookie), and for nobody
+    else."""
+    import asyncio
+    from urllib.parse import quote
+
+    import auth.providers
+    from api.media import collabora_proxy, wopi
+    monkeypatch.setattr(auth.providers, "acting_role_of", lambda sub, agent: "editor")
+    pat = task_store.create_local_user("pat@t.com", "Pat", "Pat", "member", "x")
+    kim = task_store.create_local_user("kim@t.com", "Kim", "Kim", "member", "x")
+    task_store.create_chat("chat-a", "agent::test-agent", "test-agent")
+    terminal(pat)
+    token = hook()["access_token"]
+    src = quote("http://otodock-proxy:8400/wopi/files/YQ", safe="")
+    scope = {"type": "websocket", "raw_path": b"/collabora/cool/ws",
+             "query_string": f"WOPISrc={src}&access_token={token}".encode()}
+
+    def opened_by(sub):
+        cookie = tokens.mint(tokens.SIGN_IN, {"purpose": "session", "sub": sub, "jti": f"in-{sub}"},
+                             ttl_s=3600)
+        return asyncio.run(collabora_proxy._collabora_authorized(scope, {"session": cookie}))
+    wopi._holder_answers.clear()
+    try:
+        assert opened_by(pat) == pat
+        assert opened_by(kim) is None
+    finally:
+        wopi._holder_answers.clear()
 
 
 

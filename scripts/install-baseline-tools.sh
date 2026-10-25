@@ -28,7 +28,8 @@
 #                              `env_injection`) for github.com URLs.
 #
 # Idempotent — re-running installs what is missing, upgrades an older uv or pnpm
-# (a newer one stays), moves Bun and the two CLIs to their exact pins, and lets
+# (a newer one stays), builds the pinned pasta where the host's is older than the
+# floor, moves Bun and the two CLIs to their exact pins, and lets
 # apt bring its packages to the distro's current version; Node and sympy are
 # left once present. On macOS `brew install` brings each formula to brew's
 # current version.
@@ -89,6 +90,10 @@ SKIP_TIER_2="${SKIP_TIER_2:-false}"
 SKIP_CLAUDE_CLI="${SKIP_CLAUDE_CLI:-false}"
 SKIP_CODEX_CLI="${SKIP_CODEX_CLI:-false}"
 SKIP_CREDENTIAL_HELPER="${SKIP_CREDENTIAL_HELPER:-false}"
+# Where pasta comes from when the host's is absent or below the floor:
+# auto (build the pinned release, else fall back to what the distro offers),
+# required (build it or fail: the Docker image), distro (no build or download).
+OTODOCK_PASST_BUILD="${OTODOCK_PASST_BUILD:-auto}"
 
 # --- Auto-restart flag ---
 RESTART_PLATFORM=false
@@ -158,7 +163,7 @@ install_linux_tier_1() {
     # (pnpm + the claude/codex CLI installs) falls over with "npm not
     # present" — first hit on a fresh dev-VM satellite pairing. Same keyring
     # pattern as the gh repo above; idempotent.
-    local node_ver="${NODE_VERSION:-24.21.0}"
+    local node_ver="${NODE_VERSION:-26.12.1}"
     local node_major="${node_ver%%.*}"
     if ! command -v npm &>/dev/null; then
         info "Adding NodeSource apt repo (node ${node_major}.x)..."
@@ -186,7 +191,7 @@ install_linux_tier_1() {
     # A copy that does not run without $HOME is removed and the pin installed.
     # The install itself also replaces the installing user's ~/.local/bin/uv:
     # pipx --force takes that path whatever sits there.
-    local uv_ver="${UV_VERSION:-0.12.23}" uv_have="" uv_bin="/usr/local/bin/uv"
+    local uv_ver="${UV_VERSION:-0.13.5}" uv_have="" uv_bin="/usr/local/bin/uv"
     local uv_install=true uv_clean=""
     [ -x "$uv_bin" ] || uv_bin="$(command -v uv 2>/dev/null || true)"
     if [ -n "$uv_bin" ]; then uv_have="$(_cli_ver "$uv_bin")"; uv_have="${uv_have:-0}"; fi
@@ -246,7 +251,9 @@ install_linux_tier_1() {
     # pnpm — needs npm to bootstrap. PINNED to an exact version (keep
     # PNPM_VERSION in sync with VERSIONS.md; a new major is a deliberate bump),
     # with the uv rule above: absent or older is installed, newer is left alone.
-    local pnpm_ver="${PNPM_VERSION:-11.28.2}" pnpm_have=""
+    # --allow-scripts: pnpm 12's install step puts its native binary at the bin
+    # path; npm 12 skips it by default and leaves a shim that needs Node.
+    local pnpm_ver="${PNPM_VERSION:-12.15.0}" pnpm_have=""
     if command -v pnpm &>/dev/null; then pnpm_have="$(_cli_ver pnpm)"; pnpm_have="${pnpm_have:-0}"; fi
     if ! command -v npm &>/dev/null; then
         warn "npm not present — install Node ${node_major} LTS first, then re-run for pnpm."
@@ -254,9 +261,9 @@ install_linux_tier_1() {
         [ "$pnpm_have" = "$pnpm_ver" ] || warn "pnpm ${pnpm_have} is newer than the pin ${pnpm_ver} — left as it is"
     elif [ -z "$pnpm_have" ]; then
         info "Installing pnpm ${pnpm_ver} via npm..."
-        $SUDO npm install -g "pnpm@${pnpm_ver}"
+        $SUDO npm install -g --allow-scripts=pnpm "pnpm@${pnpm_ver}"
     elif info "Upgrading pnpm $(_shown "$pnpm_have") → ${pnpm_ver} via npm..." \
-            && $SUDO npm install -g "pnpm@${pnpm_ver}"; then
+            && $SUDO npm install -g --allow-scripts=pnpm "pnpm@${pnpm_ver}"; then
         hash -r
         _verify_resolved_cli "pnpm" "pnpm" "$pnpm_ver"
     else
@@ -274,7 +281,7 @@ install_bun() {
     # before VERSIONS.md is copied in, so the default is carried here). The
     # release zip is fetched straight from GitHub: no curl-pipe-bash, no rc
     # edits, the same bytes on every host.
-    local bun_ver="${BUN_VERSION:-1.4.2}"
+    local bun_ver="${BUN_VERSION:-1.4.4}"
     if command -v bun &>/dev/null && [ "$(bun --version 2>/dev/null)" = "$bun_ver" ]; then
         ok "bun ${bun_ver} already installed"
         return 0
@@ -318,50 +325,105 @@ install_netns_tools() {
     # `pasta`, which wraps every local agent sandbox in an isolated network
     # namespace; `iproute2` provides `ip` for the in-netns route blackholes.
     # The proxy's startup preflight (core/sandbox/sandbox.py::netns_preflight)
-    # hard-fails if either is missing, so a missing tool here would only defer
-    # the failure to first boot — install it now (auto-fetching the upstream
-    # static pasta on distros without it, e.g. Ubuntu 22.04/jammy). See
-    # VERSIONS.md (PASST_VERSION) + docs/architecture/SANDBOX.md.
+    # hard-fails if either is missing and warns on a pasta older than
+    # PASST_MIN_VERSION, so install it now. See VERSIONS.md (PASST_VERSION).
+    # A pasta at or above the floor stays; else the distro's passt when its
+    # candidate is at or above it (Ubuntu 24.04, Debian 13); else the pinned
+    # release is BUILT from its git tag (Debian 12, Ubuntu 22.04, the image):
+    # passt.top keeps no versioned static build and none for aarch64. The
+    # defaults follow VERSIONS.md (the Docker build runs this before it).
+    local passt_ver="${PASST_VERSION:-2026_10_02.cba3570}"
+    local passt_min="${PASST_MIN_VERSION:-2023_12_30}"
+    local passt_commit="cba357068dc586e7540971eb40bb56c5e62c4de1"
     info "Required — network-isolation tools (passt + iproute2)..."
     $SUDO apt-get install -y --no-install-recommends iproute2 || {
         err "iproute2 (ip) is required for sandbox network isolation."; exit 1; }
 
-    if command -v pasta >/dev/null 2>&1; then
+    local have candidate
+    have="$(_passt_date "$(pasta --version 2>/dev/null | head -1)")"
+    if [ -n "$have" ] && ! _older "$have" "$passt_min"; then
         ok "pasta already present ($(pasta --version 2>&1 | head -1))"
         return
     fi
-    if $SUDO apt-get install -y --no-install-recommends passt 2>/dev/null && \
-       command -v pasta >/dev/null 2>&1; then
-        ok "passt installed — pasta available"
+    candidate="$(apt-cache policy passt 2>/dev/null | sed -n 's/^ *Candidate: *//p')"
+    if [ "$OTODOCK_PASST_BUILD" != required ] && [ -n "$(_passt_date "$candidate")" ] \
+            && ! _older "$(_passt_date "$candidate")" "$passt_min" \
+            && $SUDO apt-get install -y --no-install-recommends passt && command -v pasta >/dev/null 2>&1; then
+        ok "passt installed — $(pasta --version 2>&1 | head -1)"
         return
     fi
-
-    # Not in this distro's apt (jammy) — fetch the upstream static build.
-    warn "passt not in apt — fetching the upstream static pasta build..."
-    local arch dl
-    case "$(dpkg --print-architecture 2>/dev/null || uname -m)" in
-        amd64|x86_64)  arch="x86_64" ;;
-        arm64|aarch64) arch="aarch64" ;;
-        *) err "no apt passt and no static build for this architecture — install \
-'pasta' manually (https://passt.top/builds/); isolation is mandatory."; exit 1 ;;
-    esac
-    for dl in \
-        "https://passt.top/builds/latest/${arch}/pasta" \
-        "https://passt.top/builds/latest/${arch}/passt" ; do
-        if $SUDO curl -fsSL "$dl" -o /usr/local/bin/pasta 2>/dev/null; then
-            $SUDO chmod 0755 /usr/local/bin/pasta
-            # pasta is passt invoked as argv0 'pasta' — keep a passt alias too.
-            $SUDO ln -sf /usr/local/bin/pasta /usr/local/bin/passt
-            if pasta --version >/dev/null 2>&1; then
-                ok "pasta installed (upstream static) — $(pasta --version 2>&1 | head -1)"
-                return
-            fi
+    if [ "$OTODOCK_PASST_BUILD" != distro ]; then
+        info "Building pasta ${passt_ver} from its release tag (the distro offers ${candidate:-no passt}, the floor is ${passt_min})..."
+        if _build_pinned_passt "$passt_ver" "$passt_commit"; then
+            ok "pasta installed — $(pasta --version 2>&1 | head -1)"; return
         fi
-    done
-    err "Could not obtain 'pasta' (sandbox network isolation is mandatory)."
-    err "  Install the upstream static build from https://passt.top/builds/"
-    err "  (pin: PASST_VERSION in VERSIONS.md) into /usr/local/bin, then re-run."
+        [ "$OTODOCK_PASST_BUILD" = required ] && {
+            err "pasta ${passt_ver} did not build, and this install takes no other (OTODOCK_PASST_BUILD=required)."; exit 1; }
+    fi
+
+    # The fallbacks a host had before the pinned build: what the distro
+    # offers, then upstream's moving static build (x86_64 only).
+    if [ -n "$have" ] || command -v pasta >/dev/null 2>&1; then
+        warn "pasta $(pasta --version 2>&1 | head -1) stays, below the floor ${passt_min}"; return
+    fi
+    if $SUDO apt-get install -y --no-install-recommends passt 2>/dev/null && command -v pasta >/dev/null 2>&1; then
+        warn "passt installed from the distro — $(pasta --version 2>&1 | head -1), below the floor ${passt_min}"; return
+    fi
+    # distro (a paired machine's bootstrap): such a host runs no agent
+    # sandbox, so a missing pasta is no reason to fetch a moving build or fail.
+    if [ "$OTODOCK_PASST_BUILD" = distro ]; then
+        warn "no pasta on this host (OTODOCK_PASST_BUILD=distro): an agent sandbox here cannot start"; return
+    fi
+    local tmp
+    tmp="$(mktemp -d)"
+    if [ "$(uname -m)" = x86_64 ] && warn "fetching upstream's latest static pasta build (not the pin)..." \
+            && curl -fsSL https://passt.top/builds/latest/x86_64/pasta -o "$tmp/passt" \
+            && _install_passt "$tmp/passt" && pasta --version >/dev/null 2>&1; then
+        rm -rf "$tmp"; ok "pasta installed (upstream static) — $(pasta --version 2>&1 | head -1)"; return
+    fi
+    rm -rf "$tmp"
+    err "Could not obtain 'pasta' (sandbox network isolation is mandatory). Build passt ${passt_ver}"
+    err "  from https://passt.top/passt (make passt) into /usr/local/bin, pasta linked to it, and re-run."
     exit 1
+}
+
+# The build date of a passt version: YYYY_MM_DD of an upstream tag, a git
+# build (2026_06_11.a9c61ff-31-g...) or a Debian version (0.0~git20230309...).
+_passt_date() {
+    if [[ "$1" =~ ([0-9]{4})_([0-9]{2})_([0-9]{2}) ]] || [[ "$1" =~ git([0-9]{4})([0-9]{2})([0-9]{2}) ]]; then
+        echo "${BASH_REMATCH[1]}_${BASH_REMATCH[2]}_${BASH_REMATCH[3]}"
+    fi
+}
+
+# passt into /usr/local/bin with pasta linked to it (argv0 picks the mode):
+# copied beside first, so a failed copy keeps the old one, then the old
+# static layout (pasta the file, passt a link to it) is replaced.
+_install_passt() {
+    $SUDO install -m 0755 "$1" /usr/local/bin/passt.new && $SUDO rm -f /usr/local/bin/pasta /usr/local/bin/passt \
+        && $SUDO mv /usr/local/bin/passt.new /usr/local/bin/passt && $SUDO ln -sf passt /usr/local/bin/pasta && hash -r
+}
+
+# Clone the release tag (the pinned commit, or for another tag one its short
+# sha prefixes) and build it with Tier 1's C toolchain; the licence texts and
+# the source tarball (GPL-2.0) go to /usr/local/share/doc/passt.
+_build_pinned_passt() {
+    local ver="$1" commit="$2" tmp head built=1
+    tmp="$(mktemp -d)"
+    if git -c advice.detachedHead=false clone -q --depth 1 --branch "$ver" https://passt.top/passt "$tmp/passt"; then
+        head="$(git -C "$tmp/passt" rev-parse HEAD)"
+        if [[ "$commit" == "${ver##*.}"* && "$head" != "$commit" ]] || [[ "$head" != "${ver##*.}"* ]]; then
+            err "passt ${ver} resolves to commit ${head}, not the pinned one"
+        elif make -s -C "$tmp/passt" passt >/dev/null && _install_passt "$tmp/passt/passt"; then
+            $SUDO install -d /usr/local/share/doc/passt
+            git -C "$tmp/passt" archive --format=tar.gz --prefix="passt-${ver}/" -o "$tmp/passt-${ver}.tar.gz" HEAD
+            $SUDO install -m 0644 "$tmp/passt/LICENSES/"*.txt "$tmp/passt-${ver}.tar.gz" /usr/local/share/doc/passt/
+            printf 'passt %s, built from https://passt.top/passt at commit %s. Its source is passt-%s.tar.gz.\nLicensed GPL-2.0-or-later, some files BSD-3-Clause (the texts beside this file).\n' \
+                "$ver" "$head" "$ver" | $SUDO tee /usr/local/share/doc/passt/SOURCE > /dev/null
+            built=0
+        fi
+    fi
+    rm -rf "$tmp"
+    return "$built"
 }
 
 install_quota_tools() {
@@ -463,7 +525,7 @@ install_sympy() {
 # _install_pinned_cli upgrades an existing install to the exact pin rather than
 # skipping it.
 CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.296}"
-CODEX_VERSION="${CODEX_VERSION:-0.162.1}"
+CODEX_VERSION="${CODEX_VERSION:-0.163.0}"
 
 # Extract the bare x.y.z from a CLI's --version output ("2.1.177 (Claude Code)",
 # "codex-cli 0.139.0").

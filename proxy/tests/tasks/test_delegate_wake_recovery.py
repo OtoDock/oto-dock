@@ -19,19 +19,18 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
-from services.scheduler import scheduler
-from services.scheduler import delivery
-from services.scheduler.scheduler import TaskDefinition
-from storage import database as task_store
-
-
 # The ws rung now has a LIVENESS GATE: queue presence alone no longer routes —
 # the target session must be alive. Tests that exercise the ws route register
 # a fake alive CLI session alongside their notify queue.
 from contextlib import contextmanager
 from types import SimpleNamespace
+
+import pytest
+
+from core.execution_layer import ResumeVerdict
+from services.scheduler import delivery, scheduler
+from services.scheduler.scheduler import TaskDefinition
+from storage import database as task_store
 
 
 @contextmanager
@@ -85,8 +84,8 @@ class _SpawnLayer:
         self.spawns: list[dict] = []
         self.cfgs: list = []
 
-    async def can_resume_session(self, sid, agent_name="", username=""):
-        return True
+    async def can_resume_session(self, sid, agent_name="", username="", external_home=""):
+        return ResumeVerdict.RESUMABLE
 
     async def is_session_alive(self, sid):
         return False
@@ -119,6 +118,7 @@ _SID = "11111111-2222-3333-4444-555555555555"
 def _member(sub: str, agent: str, role: str = "contributor") -> None:
     """A person who holds the agent (seeded users have no agent rows)."""
     from datetime import datetime, timezone
+
     from storage.agents import agent_store
     from storage.identity import db_users
     from storage.pg import get_conn
@@ -197,6 +197,49 @@ class TestPendingWakeStore:
         assert task_store.drop_pending_wakes_of("ann", None) == 2
         assert task_store.claim_pending_delegate_wake("chat-y") == []
 
+    def test_a_note_waits_for_a_typed_turn_and_the_wakes_for_their_delivery(self, temp_db):
+        """A note (a concluded meeting's) is not a wake: the wake claims and
+        the sweep's record claim leave it, the notes claim and a typed
+        turn's claim take it, each record once."""
+        task_store.create_chat("chat-n", "user-1", "pa")
+        assert task_store.append_pending_delegate_wake("chat-n", "W1", person="user-1",
+                                                       role="manager")
+        assert task_store.append_pending_delegate_wake("chat-n", "NOTE", person="user-1",
+                                                       role="manager", note=True)
+        assert task_store.append_pending_delegate_wake("chat-n", "W2")
+        assert task_store.claim_pending_delegate_wake("chat-n") == ["W1", "W2"]
+        assert task_store.claim_pending_wake_records("chat-n") == []
+        assert task_store.claim_pending_notes("chat-n") == ["NOTE"]
+        assert task_store.claim_pending_notes("chat-n") == []
+        task_store.append_pending_delegate_wake("chat-n", "N2", note=True)
+        task_store.append_pending_delegate_wake("chat-n", "W3")
+        assert task_store.claim_pending_notes("chat-n") == ["N2"]
+        assert task_store.claim_pending_delegate_wake("chat-n", notes=True) == ["W3"]
+        task_store.append_pending_delegate_wake("chat-n", "N3", note=True)
+        task_store.append_pending_delegate_wake("chat-n", "W4")
+        assert task_store.claim_pending_delegate_wake("chat-n", notes=True) == ["N3", "W4"]
+
+    def test_a_note_keeps_its_kind_through_another_persons_drop(self, temp_db):
+        task_store.create_chat("chat-nk", "agent::pa", "pa")
+        task_store.append_pending_delegate_wake("chat-nk", "ann's note", person="ann",
+                                                role="editor", note=True)
+        task_store.append_pending_delegate_wake("chat-nk", "bo's", person="bo", role="editor")
+        assert task_store.drop_pending_wakes_of("bo", None) == 1
+        assert task_store.claim_pending_wake_records("chat-nk") == []
+        assert task_store.claim_pending_wake_records("chat-nk", notes=True) == [
+            {"prompt": "ann's note", "person": "ann", "role": "editor", "by": "",
+             "kind": task_store.WAKE_NOTE}]
+
+    def test_a_chat_holding_notes_alone_is_no_sweep_candidate(self, temp_db):
+        task_store.create_chat("chat-only-note", "user-1", "pa")
+        task_store.append_pending_delegate_wake("chat-only-note", "N", note=True)
+        task_store.create_chat("chat-both", "user-1", "pa")
+        task_store.append_pending_delegate_wake("chat-both", "N", note=True)
+        task_store.append_pending_delegate_wake("chat-both", "W")
+        ids = [c["id"] for c in task_store.list_chats_with_pending_wakes()]
+        assert "chat-both" in ids and "chat-only-note" not in ids
+        assert "pending_delegate_wake" not in task_store.list_chats_with_pending_wakes()[0]
+
 
 class TestWakeFormatMigration:
     """1.7.0 stored a wake as a plain string; the migration rewrites each
@@ -205,8 +248,7 @@ class TestWakeFormatMigration:
 
     @staticmethod
     def _migrate():
-        from storage import pg as pg_pool
-        from storage import schema as pg_schema
+        from storage import pg as pg_pool, schema as pg_schema
         with pg_pool.get_conn() as conn:
             pg_schema.run_migrations(conn)
             conn.commit()
@@ -220,6 +262,7 @@ class TestWakeFormatMigration:
 
     def test_the_string_form_is_rewritten_once(self, temp_db):
         import json
+
         from storage.pg import get_conn
         for cid in ("m-old", "m-new", "m-bad", "m-none"):
             task_store.create_chat(cid, "agent::pa", "pa")
@@ -264,7 +307,7 @@ class TestWakeAdmission:
         seen: list = []
 
         async def _fake_rewarm(layer, session_id, agent, result_prompt,
-                               *, chat_id, base_cfg, chat_row):
+                               *, chat_id, base_cfg, chat_row, note_prompt=False):
             seen.append(ledger["C"]._sessions.get(session_id))
             return ""
         monkeypatch.setattr(delivery, "_rewarm_interactive_and_wake", _fake_rewarm)
@@ -335,8 +378,10 @@ class TestWakeAdmission:
 
     def test_oneshot_reads_its_placement_off_the_loop(self, temp_db, ledger, monkeypatch):
         import threading
-        from storage import remote_store
+
         from services.engines import subscription_pool as sp
+        from services.remote import remote_status
+        from storage import remote_store
         layer = _SpawnLayer()
         _stub_spawn(monkeypatch, layer)
         # A user-scope wake spawns on the person's subscription; this test
@@ -350,8 +395,10 @@ class TestWakeAdmission:
                 on_loop[name] = threading.current_thread() is threading.main_thread()
                 return fn(*a, **k)
             return _wrapped
-        for name in ("resolve_execution_target", "placement_of", "get_target_browser_settings"):
+        for name in ("placement_of", "get_target_browser_settings"):
             monkeypatch.setattr(remote_store, name, _record(name, getattr(remote_store, name)))
+        monkeypatch.setattr(remote_status, "resolve_execution_target",
+                            _record("resolve_execution_target", remote_status.resolve_execution_target))
         monkeypatch.setattr(task_store, "get_username_by_sub",
                             _record("get_username_by_sub", task_store.get_username_by_sub))
         assert asyncio.run(scheduler._deliver_via_oneshot(
@@ -562,8 +609,8 @@ class TestHandbackStore:
 class TestInteractiveRouting:
     def _fake_layer(self, captured: dict):
         class _FakeLayer:
-            async def can_resume_session(self, sid, agent_name="", username=""):
-                return True
+            async def can_resume_session(self, sid, agent_name="", username="", external_home=""):
+                return ResumeVerdict.RESUMABLE
 
             async def start_session(self, sid, cfg):
                 captured["headless_cfg"] = cfg
@@ -578,7 +625,7 @@ class TestInteractiveRouting:
                 return _Lock()
 
             async def send_message(self, sid, prompt):
-                from core.events.common_events import CommonEvent, TEXT
+                from core.events.common_events import TEXT, CommonEvent
                 yield CommonEvent(type=TEXT, data={"content": "ok"})
         return _FakeLayer()
 
@@ -602,7 +649,7 @@ class TestInteractiveRouting:
         rewarm_calls: list[dict] = []
 
         async def _fake_rewarm(layer, session_id, agent, result_prompt,
-                               *, chat_id, base_cfg, chat_row):
+                               *, chat_id, base_cfg, chat_row, note_prompt=False):
             rewarm_calls.append({
                 "chat_id": chat_id, "prompt": result_prompt,
                 "interactive": base_cfg.interactive, "resume": base_cfg.resume,
@@ -664,8 +711,8 @@ class TestRewarmInteractiveAndWake:
                 self.on_turn_complete("done")
 
     def _run(self, monkeypatch, isess, *, start_raises=False):
-        from core.session import interactive_session
         from core.execution_layer import AgentConfig
+        from core.session import interactive_session
 
         closed: list[str] = []
 
@@ -781,11 +828,17 @@ class TestHeadlessChokepointReplay:
     chokepoint (same claim shape as the history seed)."""
 
     def test_pending_wake_prepended_to_next_turn(self, temp_db, monkeypatch):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
         from tests.fixtures.ws_dashboard_harness import (
-            FakeExecutionLayer, dashboard_connection, drain_startup,
-            make_test_agent, run_ws_scenario, session_cookie, set_username,
-            stub_dashboard_seams, warm_new_chat,
+            FakeExecutionLayer,
+            dashboard_connection,
+            drain_startup,
+            make_test_agent,
+            run_ws_scenario,
+            session_cookie,
+            set_username,
+            stub_dashboard_seams,
+            warm_new_chat,
         )
 
         layer = FakeExecutionLayer()
@@ -818,11 +871,17 @@ class TestHeadlessChokepointReplay:
         """The pump of a dashboard turn runs as the socket's person: a system
         prompt it never sends is stored as that person's wake."""
         from core.events import stream_pump
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
         from tests.fixtures.ws_dashboard_harness import (
-            FakeExecutionLayer, dashboard_connection, drain_startup,
-            make_test_agent, run_ws_scenario, session_cookie, set_username,
-            stub_dashboard_seams, warm_new_chat,
+            FakeExecutionLayer,
+            dashboard_connection,
+            drain_startup,
+            make_test_agent,
+            run_ws_scenario,
+            session_cookie,
+            set_username,
+            stub_dashboard_seams,
+            warm_new_chat,
         )
 
         layer = FakeExecutionLayer()
@@ -855,6 +914,66 @@ class TestHeadlessChokepointReplay:
 
         run_ws_scenario(scenario)
         assert persons and set(persons) == {"user-admin"}
+
+    def test_a_meeting_note_rides_the_next_typed_turn_and_no_server_turn(
+            self, temp_db, monkeypatch):
+        """A server turn (a background agents' review) leaves the note; the
+        person's next message carries it ahead of their text."""
+        from core.events.common_events import DONE, TEXT, CommonEvent
+        from core.session.session_state import _dashboard_notify_queues
+        from tests.fixtures.ws_dashboard_harness import (
+            FakeExecutionLayer,
+            dashboard_connection,
+            drain_startup,
+            make_test_agent,
+            run_ws_scenario,
+            session_cookie,
+            set_username,
+            stub_dashboard_seams,
+            warm_new_chat,
+        )
+
+        layer = FakeExecutionLayer()
+        layer.turn_events = [
+            CommonEvent(type=TEXT, data={"text": "ok"}),
+            CommonEvent(type=DONE, data={}),
+        ]
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+        seen: dict = {}
+
+        async def _done(ws, chat_id):
+            for _ in range(60):
+                frame = await ws.next_frame()
+                if frame.get("type") == "done" and frame.get("chat_id", chat_id) == chat_id:
+                    return
+            raise AssertionError("turn never completed")
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                chat_id, sid = await warm_new_chat(ws, layer, slug)
+                task_store.append_pending_delegate_wake(chat_id, "MEETING NOTE X", note=True)
+                _dashboard_notify_queues[sid].put_nowait({
+                    "type": "bg_nudge", "count": 1, "chat_id": chat_id, "session_id": sid,
+                })
+                await _done(ws, chat_id)
+                seen["after_server_turn"] = (layer.messages[-1][1],
+                                             task_store.get_chat(chat_id)["pending_delegate_wake"])
+                ws.client_send({"type": "chat", "text": "user message"})
+                await _done(ws, chat_id)
+                seen["chat_id"] = chat_id
+
+        run_ws_scenario(scenario)
+        nudge_prompt, stored = seen["after_server_turn"]
+        assert "MEETING NOTE X" not in nudge_prompt and "MEETING NOTE X" in stored
+        sent_prompt = layer.messages[-1][1]
+        assert sent_prompt.index("MEETING NOTE X") < sent_prompt.index("user message")
+        assert task_store.claim_pending_wake_records(seen["chat_id"], notes=True) == []
+        rows = [m["content"] for m in task_store.get_chat_messages(seen["chat_id"])
+                if m["role"] == "user"]
+        assert rows and all("MEETING NOTE X" not in r for r in rows)
 
 
 class TestRedeliverPendingWakes:
@@ -1164,22 +1283,22 @@ class TestRedeliverPendingWakes:
         # claude-code-cli → the oneshot resolved the CODEX layer, whose
         # resumability pre-check refused the claude session every time.
         from core.session import session_manager
-        from storage import remote_store
+        from services.remote import remote_status
 
         task_store.create_chat("chat-l1", "user-1", "pa")
         task_store.update_chat("chat-l1", execution_path="claude-code-cli")
         seen = {}
 
         class _FakeLayer:
-            async def can_resume_session(self, sid, agent_name="", username=""):
-                return False
+            async def can_resume_session(self, sid, agent_name="", username="", external_home=""):
+                return ResumeVerdict.FRESH
 
         def _gel(agent, execution_path="", **kw):
             seen["path"] = execution_path
             return _FakeLayer()
 
         monkeypatch.setattr(session_manager, "get_execution_layer", _gel)
-        monkeypatch.setattr(remote_store, "resolve_execution_target",
+        monkeypatch.setattr(remote_status, "resolve_execution_target",
                             lambda agent, user_sub, role: ("local", ""))
 
         res = asyncio.run(scheduler._deliver_via_oneshot(
@@ -1193,7 +1312,7 @@ class TestRedeliverPendingWakes:
         # Same T1 live-hit family: empty cfg.model falls back to the AGENT
         # default model, which belongs to the other layer → API 400.
         from core.session import session_manager
-        from storage import remote_store
+        from services.remote import remote_status
 
         task_store.create_chat("chat-m5", "user-1", "pa")
         task_store.update_chat("chat-m5", execution_path="claude-code-cli",
@@ -1201,8 +1320,8 @@ class TestRedeliverPendingWakes:
         seen = {}
 
         class _FakeLayer:
-            async def can_resume_session(self, sid, agent_name="", username=""):
-                return True
+            async def can_resume_session(self, sid, agent_name="", username="", external_home=""):
+                return ResumeVerdict.RESUMABLE
 
             async def start_session(self, sid, cfg):
                 seen["model"] = cfg.model
@@ -1210,7 +1329,7 @@ class TestRedeliverPendingWakes:
 
         monkeypatch.setattr(session_manager, "get_execution_layer",
                             lambda agent, **kw: _FakeLayer())
-        monkeypatch.setattr(remote_store, "resolve_execution_target",
+        monkeypatch.setattr(remote_status, "resolve_execution_target",
                             lambda agent, user_sub, role: ("local", ""))
 
         with pytest.raises(RuntimeError, match="stop-after-cfg"):
@@ -1219,6 +1338,47 @@ class TestRedeliverPendingWakes:
                 chat_id="chat-m5",
             ))
         assert seen["model"] == "claude-sonnet-5"
+
+    def test_the_sweep_leaves_a_meeting_note_for_the_next_typed_turn(self, temp_db, monkeypatch):
+        """A note never runs as a turn of its own: a chat holding one alone is
+        not woken, and beside a wake only the wake is delivered."""
+        _member("user-1", "pa")
+        task_store.create_chat("chat-mn1", "user-1", "pa")
+        task_store.append_pending_delegate_wake("chat-mn1", "NOTE ONE", person="user-1",
+                                                role="contributor", note=True)
+        task_store.create_chat("chat-mn2", "user-1", "pa")
+        task_store.append_pending_delegate_wake("chat-mn2", "NOTE TWO", person="user-1",
+                                                role="contributor", note=True)
+        task_store.append_pending_delegate_wake("chat-mn2", "WAKE")
+        delivered: list = []
+        self._fake_ladder(monkeypatch, delivered)
+        assert asyncio.run(scheduler.redeliver_pending_wakes()) == 1
+        assert [(d[0], d[1]) for d in delivered] == [("chat-mn2", "WAKE")]
+        assert task_store.claim_pending_notes("chat-mn1") == ["NOTE ONE"]
+        assert task_store.claim_pending_notes("chat-mn2") == ["NOTE TWO"]
+
+    def test_a_pump_ends_replay_leaves_the_note(self, temp_db, monkeypatch):
+        from core.events import stream_pump
+        _member("user-1", "pa")
+        task_store.create_chat("chat-mn3", "user-1", "pa")
+        task_store.append_pending_delegate_wake("chat-mn3", "NOTE", note=True)
+        task_store.append_pending_delegate_wake("chat-mn3", "WAKE")
+        delivered: list = []
+        self._fake_ladder(monkeypatch, delivered)
+        asyncio.run(stream_pump._replay_stored_wakes("chat-mn3"))
+        assert [d[1] for d in delivered] == ["WAKE"]
+        assert task_store.claim_pending_notes("chat-mn3") == ["NOTE"]
+
+    def test_an_owner_who_lost_the_agent_loses_the_notes_with_the_wakes(
+            self, temp_db, monkeypatch):
+        task_store.create_chat("chat-mn4", "user-1", "pa")
+        task_store.append_pending_delegate_wake("chat-mn4", "NOTE", note=True)
+        task_store.append_pending_delegate_wake("chat-mn4", "WAKE")
+        delivered: list = []
+        self._fake_ladder(monkeypatch, delivered)
+        assert asyncio.run(scheduler.redeliver_pending_wakes()) == 0
+        assert delivered == []
+        assert task_store.claim_pending_wake_records("chat-mn4", notes=True) == []
 
 
 class TestWakeSeat:
@@ -1350,6 +1510,7 @@ def _person(sub: str, username: str, *, agent: str = "", agent_role: str = "",
             platform_role: str = "member") -> None:
     """A users row with a username, and an agent row when ``agent_role``."""
     from datetime import datetime, timezone
+
     from storage.identity import db_users
     from storage.pg import get_conn
     with get_conn() as conn:
@@ -1373,9 +1534,9 @@ class TestWakeRespawnConfig:
             super().__init__()
             self.resume_usernames: list[str] = []
 
-        async def can_resume_session(self, sid, agent_name="", username=""):
+        async def can_resume_session(self, sid, agent_name="", username="", external_home=""):
             self.resume_usernames.append(username)
-            return True
+            return ResumeVerdict.RESUMABLE
 
     def _stub(self, monkeypatch, *, config_path=None):
         """The layer and a build that returns a flat env with a manifest
@@ -1441,7 +1602,7 @@ class TestWakeRespawnConfig:
         seen: list = []
 
         async def _fake_rewarm(layer, session_id, agent, result_prompt,
-                               *, chat_id, base_cfg, chat_row):
+                               *, chat_id, base_cfg, chat_row, note_prompt=False):
             seen.append(base_cfg)
             return ""
         monkeypatch.setattr(delivery, "_rewarm_interactive_and_wake", _fake_rewarm)
@@ -1521,6 +1682,7 @@ class TestWakeRespawnConfig:
 
     def _capture_prompt(self, monkeypatch) -> list[tuple[bool, dict]]:
         import threading
+
         import config
         seen: list[tuple[bool, dict]] = []
 
@@ -1602,6 +1764,7 @@ class TestWakeRespawnConfig:
         woken session, whatever the admin's own agent row says. The assigned
         MCPs of the dynamic context are read off the loop."""
         import asyncio as _asyncio
+
         from services.engines import subscription_pool as sp
         from services.mcp import dynamic_context, mcp_registry
         from storage.agents import agent_store
@@ -1635,14 +1798,14 @@ class TestWakeRespawnConfig:
                                                             monkeypatch):
         # The chat's own placement, as the dashboard resumes it; the person's
         # own resolution would name another place.
-        from storage import remote_store
         from services.engines import subscription_pool as sp
+        from services.remote import remote_status
         from storage.agents import agent_store
         agent_store.create_agent("so", "SO", collaborative=False, default_scope="agent")
         _person("user-ed", "eddie", agent="so", agent_role="editor")
         layer, _ = self._stub(monkeypatch)
         monkeypatch.setattr(sp, "resolve_subscription_env", lambda *a, **k: ("sub-P", {}))
-        monkeypatch.setattr(remote_store, "resolve_execution_target",
+        monkeypatch.setattr(remote_status, "resolve_execution_target",
                             lambda *a, **k: ("machine-elsewhere", None))
         task_store.create_chat("chat-w7", "agent::so", "so")
         task_store.update_chat("chat-w7", execution_target="local")
@@ -1655,14 +1818,14 @@ class TestWakeRespawnConfig:
         # A chat its owner wakes runs at the row's placement too, as the
         # dashboard resumes it, not where the owner's resolution would place
         # a new chat now; the role change after the wait keeps it there.
-        from storage import remote_store
         from services.engines import subscription_pool as sp
+        from services.remote import remote_status
         from storage.agents import agent_store
         agent_store.create_agent("pa", "PA", collaborative=True, default_scope="user")
         _person("user-own", "owen", agent="pa", agent_role="editor")
         layer, _ = self._stub(monkeypatch)
         monkeypatch.setattr(sp, "resolve_subscription_env", lambda *a, **k: ("sub-P", {}))
-        monkeypatch.setattr(remote_store, "resolve_execution_target",
+        monkeypatch.setattr(remote_status, "resolve_execution_target",
                             lambda *a, **k: ("machine-elsewhere", None))
         task_store.create_chat("chat-w8", "user-own", "pa")
         task_store.update_chat("chat-w8", execution_target="local")
@@ -1672,14 +1835,14 @@ class TestWakeRespawnConfig:
 
     def test_a_personal_chat_with_no_recorded_placement_resolves_as_the_dashboard_does(
             self, temp_db, ledger, monkeypatch):
-        from storage import remote_store
         from services.engines import subscription_pool as sp
+        from services.remote import remote_status
         from storage.agents import agent_store
         agent_store.create_agent("pa", "PA", collaborative=True, default_scope="user")
         _person("user-own", "owen", agent="pa", agent_role="editor")
         layer, _ = self._stub(monkeypatch)
         monkeypatch.setattr(sp, "resolve_subscription_env", lambda *a, **k: ("sub-P", {}))
-        monkeypatch.setattr(remote_store, "resolve_execution_target",
+        monkeypatch.setattr(remote_status, "resolve_execution_target",
                             lambda *a, **k: ("machine-elsewhere", None))
         task_store.create_chat("chat-w11", "user-own", "pa")
         task_store.update_chat("chat-w11", execution_target="")
@@ -1818,6 +1981,7 @@ def test_the_wake_context_bound_covers_its_roster_read(monkeypatch):
     """The dynamic context of a respawned wake is bounded as a whole: a slow
     roster read gives up at the bound like a slow MCP does."""
     import time as _time
+
     from core import placement
     from services.mcp import dynamic_context, mcp_registry
     monkeypatch.setattr(delivery, "_WAKE_CONTEXT_TIMEOUT_S", 0.2)
@@ -1843,8 +2007,8 @@ class _NoConversationLayer(_SpawnLayer):
         super().__init__()
         self.closed: list[str] = []
 
-    async def can_resume_session(self, sid, agent_name="", username=""):
-        return False
+    async def can_resume_session(self, sid, agent_name="", username="", external_home=""):
+        return ResumeVerdict.FRESH
 
     async def close_session(self, sid):
         self.closed.append(sid)
@@ -1962,11 +2126,92 @@ class TestFreshSpawnRung:
         assert not input_queue.is_claimed("chat-f6")
         input_queue._registry.pop("chat-f6", None)
 
-    def test_a_remote_chat_keeps_the_skip(self, temp_db, ledger, monkeypatch):
-        from storage import remote_store
+    def test_a_chat_with_no_session_starts_fresh_and_keeps_its_seed(self, temp_db, ledger,
+                                                                    monkeypatch):
+        """A summarised move left the chat with no session and a pending
+        seed: the platform's resume starts a fresh session (never a resume
+        of a new id), in the chat's own mode and kind, and the seed's digest
+        rides ahead of the prompt."""
         layer = _NoConversationLayer()
         _stub_spawn(monkeypatch, layer)
-        monkeypatch.setattr(remote_store, "resolve_execution_target",
+        ran = self._echo(monkeypatch)
+        task_store.create_chat("chat-f7", "user-1", "pa")
+        task_store.update_chat("chat-f7", pending_history_seed="resume_failed")
+        task_store.add_chat_message("chat-f7", "user", "plan the launch")
+        task_store.add_chat_message("chat-f7", "assistant", "here is the plan")
+        out = asyncio.run(scheduler._deliver_via_oneshot(
+            "", "pa", "NUDGE", user_sub=None, role="manager", chat_id="chat-f7",
+            permission_mode="autoReview", client_type="dashboard",
+            fresh_without_session=True))
+        assert out == ""
+        [cfg] = layer.cfgs
+        assert cfg.resume is False and cfg.resume_handle == ""
+        assert (cfg.permission_mode, cfg.client_type) == ("autoReview", "dashboard")
+        [turn] = ran
+        assert "plan the launch" in turn["prompt"] and turn["prompt"].endswith("NUDGE")
+        chat = task_store.get_chat("chat-f7")
+        assert chat["session_id"] == turn["sid"] and not chat["pending_history_seed"]
+
+    def test_a_remote_chat_with_no_session_never_asks_its_machine(self, temp_db, ledger,
+                                                                  monkeypatch):
+        from services.remote import remote_status
+        from services.scheduler import delivery as dl
+        layer = _NoConversationLayer()
+        _stub_spawn(monkeypatch, layer)
+        monkeypatch.setattr(remote_status, "resolve_execution_target",
+                            lambda agent, user_sub, role: ("machine-1", ""))
+
+        async def _no_probe(*a, **k):
+            raise AssertionError("asked a machine about a session that does not exist")
+        monkeypatch.setattr(dl, "settle_resume", _no_probe)
+        spawned = []
+
+        async def _spawn(layer, session_id, agent, prompt, **kw):
+            spawned.append((session_id, kw["fresh"], kw["fresh_from"], kw["note_prompt"]))
+            return True, ""
+        monkeypatch.setattr(dl, "_spawn_wake_session", _spawn)
+        task_store.create_chat("chat-f8", "user-1", "pa")
+        assert asyncio.run(scheduler._deliver_via_oneshot(
+            "", "pa", "NUDGE", user_sub=None, role="manager", chat_id="chat-f8",
+            fresh_without_session=True, note_prompt=True)) == ""
+        [(sid, fresh, fresh_from, noted)] = spawned
+        assert sid and fresh and fresh_from == "" and noted
+
+    def test_a_fresh_start_from_no_session_given_back_restores_its_seed(self, temp_db, ledger,
+                                                                         monkeypatch):
+        from services.scheduler import wake_fresh
+        layer = _NoConversationLayer()
+        _stub_spawn(monkeypatch, layer)
+        self._echo(monkeypatch, out=None)
+        task_store.create_chat("chat-f9", "user-1", "pa")
+        task_store.update_chat("chat-f9", pending_history_seed="moved:legacy-place")
+        out = asyncio.run(wake_fresh.run_echo(layer, "new-sid-9", "", "chat-f9", "pa", "W",
+                                              person=""))
+        assert out is None and layer.closed == ["new-sid-9"]
+        chat = task_store.get_chat("chat-f9")
+        assert chat["session_id"] is None
+        assert chat["pending_history_seed"] == "moved:legacy-place"
+
+    def test_a_task_runs_chat_wakes_where_its_row_is_pinned(self, temp_db, monkeypatch):
+        from core import placement
+        from services.remote import remote_status
+        from services.scheduler import delivery as dl
+        up = {"m-1"}
+        monkeypatch.setattr(remote_status, "is_reachable", lambda mid: mid in up)
+        row = {"id": "task-run-abc", "agent": "pa", "execution_target": "m-1",
+               "user_sub": "task::pa"}
+        assert dl._chat_pin(row, None) == "m-1"            # no person: the row's pin
+        assert dl._chat_pin(row, "user-1") == "m-1"
+        up.clear()
+        assert dl._chat_pin(row, None) == placement.offline_sentinel("m-1")
+        assert dl._chat_pin({**row, "execution_target": "local"}, None) == placement.LOCAL
+        assert dl._chat_pin({**row, "execution_target": ""}, None) == ""
+
+    def test_a_remote_chat_keeps_the_skip(self, temp_db, ledger, monkeypatch):
+        from services.remote import remote_status
+        layer = _NoConversationLayer()
+        _stub_spawn(monkeypatch, layer)
+        monkeypatch.setattr(remote_status, "resolve_execution_target",
                             lambda agent, user_sub, role: ("machine-1", ""))
         task_store.create_chat("chat-f4", "user-1", "pa")
         task_store.update_chat("chat-f4", session_id=_SID)
@@ -1987,3 +2232,118 @@ class TestFreshSpawnRung:
         [cfg] = layer.cfgs
         assert cfg.resume is True
         assert task_store.get_chat("chat-f5")["session_id"] == _SID
+
+
+class TestTheWakeBuildsAsItsKind:
+    """A wake builds a task's turn, unless its kind names a dashboard chat:
+    the resume after the agent's own move continues the chat as its
+    person's turn would, with the chat's tools and prompt."""
+
+    _VIS = SimpleNamespace(mount_scope="user", mount_username="ann", mount_shared=False)
+
+    def test_the_mcp_set(self, monkeypatch):
+        from core import placement
+        from core.session import session_kind
+        from services.mcp import mcp_registry
+        seen: list[dict] = []
+        monkeypatch.setattr(mcp_registry, "build_session_mcp_config",
+                            lambda *a, **k: seen.append(k) or (None, {}, {}, {}, []))
+        for kind in ("", session_kind.TASK.name, session_kind.DASHBOARD.name):
+            delivery._wake_mcp_build(
+                "pa", "u-ann", username="ann", role="editor", vis=self._VIS, chat_id="c1",
+                where=placement.LOCAL_PLACEMENT, browser=None, mcp_format=None,
+                session_id="s1", targets=["pa"], kind=kind)
+        assert [k["task_mode"] for k in seen] == [True, True, False]
+
+    def test_the_prompt(self, monkeypatch):
+        import config
+        from auth import path_policy
+        from core import placement
+        from core.session import session_kind
+        from services.mcp import mcp_registry
+        seen: list[str] = []
+        monkeypatch.setattr(config, "build_agent_prompt",
+                            lambda *a, **k: seen.append(k["client_type"]) or "p")
+        monkeypatch.setattr(mcp_registry, "get_agent_mcps", lambda *a, **k: [])
+        monkeypatch.setattr(path_policy, "build_permission_context", lambda *a, **k: "")
+        for kind in ("", session_kind.DASHBOARD.name):
+            delivery._wake_prompt("pa", role="editor", vis=self._VIS,
+                                  where=placement.LOCAL_PLACEMENT, exec_path="claude-code-cli",
+                                  security=None, excluded={}, dynamic_contexts=None, kind=kind)
+        assert seen == [session_kind.TASK.name, session_kind.DASHBOARD.name]
+
+
+def test_an_agent_scope_session_on_a_personal_machine_carries_no_secret_file():
+    """The chat builder's rule, which every wake asks too: the agent's own
+    accounts stay on the platform when an agent-scope session (a Shared-only
+    chat) runs on a person's own computer."""
+    from core import placement
+    from core.config.config_builder import personal_machine_bundles
+    mine = placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m-ann")
+    admin = placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, machine_id="m-srv")
+    bundles = {"gh": {"token": "x"}}
+    assert personal_machine_bundles(bundles, mine, "", "pa", who="t") == {}
+    assert personal_machine_bundles(bundles, mine, "ann", "pa", who="t") == bundles
+    assert personal_machine_bundles(bundles, admin, "", "pa", who="t") == bundles
+    assert personal_machine_bundles(bundles, placement.LOCAL_PLACEMENT, "", "pa", who="t") == bundles
+
+
+class TestATaskChatsWakeMeetsThePlacementGuard:
+    """A task run's chat wakes where its row is pinned, whoever the wake runs
+    as, and the session that wake starts on a machine reaches the remote
+    layer's spawn with the wake's own identity: the placement guard there
+    (``remote_session_start.placement_refuses``, the rule a move applies)
+    refuses an admin machine to a role below manager, and lets a run with no
+    person through."""
+
+    def _wake_config(self, monkeypatch, user_sub, role):
+        import json
+
+        from core.session import session_manager
+        from services.engines import subscription_pool
+        from services.mcp import mcp_registry
+        from services.remote import remote_status
+        from storage.pg import get_conn
+        _member("user-ed", "pa", "editor")
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO remote_machines (id, name, registered_by, pairing_scope, capabilities,"
+                " created_at) VALUES ('m-srv', 'Server', 'user-admin', 'admin', %s,"
+                " '2026-10-19T00:00:00+00:00') ON CONFLICT DO NOTHING", (json.dumps({}),))
+            conn.commit()
+        cid = "task-run-guard"
+        task_store.create_chat(cid, "task::pa", "pa", "auto", execution_path="claude-code-cli")
+        task_store.update_chat(cid, execution_target="m-srv")
+        monkeypatch.setattr(remote_status, "is_reachable", lambda mid: mid == "m-srv")
+        monkeypatch.setattr(mcp_registry, "build_session_mcp_config",
+                            lambda *a, **k: (None, {}, {}, {}, []))
+        monkeypatch.setattr(subscription_pool, "resolve_subscription_env",
+                            lambda *a, **k: ("sub-1", {}))
+        seen = {}
+
+        class _Layer:
+            async def can_resume_session(self, sid, agent_name="", username="", external_home=""):
+                return ResumeVerdict.RESUMABLE
+
+            async def start_session(self, sid, cfg):
+                seen["cfg"] = cfg
+                raise RuntimeError("stop-after-cfg")
+
+        monkeypatch.setattr(session_manager, "get_execution_layer", lambda agent, **kw: _Layer())
+        with pytest.raises(RuntimeError, match="stop-after-cfg"):
+            asyncio.run(scheduler._deliver_via_oneshot(
+                "sess-guard", "pa", "hello", user_sub=user_sub, role=role, chat_id=cid))
+        return seen["cfg"]
+
+    def test_an_editors_wake_on_an_admin_machine_is_refused_at_the_spawn(self, temp_db,
+                                                                         monkeypatch):
+        from core.remote.remote_session_start import placement_refuses
+        cfg = self._wake_config(monkeypatch, "user-ed", "editor")
+        assert cfg.execution_target == "m-srv" and cfg.user_sub == "user-ed"
+        assert placement_refuses("m-srv", cfg)
+
+    def test_a_wake_with_no_person_runs_there(self, temp_db, monkeypatch):
+        from core.remote.remote_session_start import placement_refuses
+        cfg = self._wake_config(monkeypatch, None, "manager")
+        assert cfg.execution_target == "m-srv" and not cfg.user_sub
+        assert not placement_refuses("m-srv", cfg)

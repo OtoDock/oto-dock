@@ -313,6 +313,7 @@ def _manifest(name, *, exclude_from=("task",), audience="", remote_policy="",
 def _session(*, client_type="task", role="manager", kind="admin_remote",
              permission_mode="default", external=False):
     from types import SimpleNamespace
+
     from core.placement import PlacementCapabilities
     sc = SimpleNamespace(placement=PlacementCapabilities(kind=kind), role=role,
                          principal="external" if external else "user")
@@ -322,6 +323,7 @@ def _session(*, client_type="task", role="manager", kind="admin_remote",
 
 async def _lifted(manifests, config, launched=(), *, excluded_creds=(), env_instance=True):
     from types import SimpleNamespace
+
     from services.mcp import mcp_sync
     resolved = SimpleNamespace(excluded_mcps=set(excluded_creds))
     with patch("services.mcp.mcp_registry.get_agent_mcps", return_value=manifests), \

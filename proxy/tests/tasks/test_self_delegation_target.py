@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import asyncio
 
-from storage.agents import agent_store
-from storage import database as task_store
 from core import placement
+from storage import database as task_store
+from storage.agents import agent_store
 
 
 def _mk_user(sub: str, name: str, role: str = "member") -> str:
@@ -41,7 +41,7 @@ def _stub_capture(monkeypatch, tmp_path) -> dict:
     # Return a non-empty subscription_id: build_agent_config now blocks
     # user-scoped work with no resolved subscription (NoSubscriptionError).
     monkeypatch.setattr(cb.subscription_pool, "resolve_subscription_env", lambda *a, **k: ("sub-test", {}))
-    monkeypatch.setattr(cb.remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
+    monkeypatch.setattr(cb.remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
     monkeypatch.setattr(cb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT)
     monkeypatch.setattr(cb.config, "build_agent_prompt", lambda *a, **k: "PROMPT")
     monkeypatch.setattr(cb.config, "get_cli_model", lambda *a, **k: "m")

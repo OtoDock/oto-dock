@@ -16,6 +16,10 @@
  */
 
 import type { LimitPayload } from './usage'
+import type { NotificationDelivery } from './notifications'
+import type { ToolInput } from '../lib/tools/input'
+import type { DelegateBlockStatus } from '../lib/status/run'
+import type { MoveMemory } from './remoteMachines'
 
 /** The outbound frames (proxy → dashboard). */
 export const WIRE = {
@@ -43,6 +47,7 @@ export const WIRE = {
   PLAN_REVIEW: 'plan_review',
   QUESTION: 'question',
   PROMPT_RETIRED: 'prompt_retired',
+  PERMISSION_RESOLVED: 'permission_resolved',
   LOCATION_REQUEST: 'location_request',
   PLAN_MODE: 'plan_mode',
   SYSTEM: 'system',
@@ -99,6 +104,7 @@ export const WIRE = {
   CHAT_ROWS: 'chat_rows',
   CHAT_META: 'chat_meta',
   CHAT_MOVED: 'chat_moved',
+  CHAT_MOVE_PROGRESS: 'chat_move_progress',
   CHAT_VIEW_ONLY: 'chat_view_only',
   ENGINE_SWITCHED: 'engine_switched',
   SWITCH_ENGINE_DENIED: 'switch_engine_denied',
@@ -198,11 +204,12 @@ export const FRAMES: Record<WireType, FrameMeta> = {
   plan_review: { perChat: true, persisted: 'plan_review' },
   question: { perChat: true, persisted: 'question' },
   prompt_retired: { perChat: true, persisted: null },
+  permission_resolved: { perChat: true, persisted: null },
   location_request: { perChat: true, persisted: null },
   plan_mode: { perChat: true, persisted: 'plan_mode' },
   system: { perChat: true, persisted: 'system' },
   metadata: { perChat: true, persisted: 'metadata' },
-  mcp_cost: { perChat: true, persisted: null },
+  mcp_cost: { perChat: true, persisted: 'mcp_cost' },
   todo_update: { perChat: true, persisted: null },
   goal_update: { perChat: true, persisted: null },
   context_compact: { perChat: true, persisted: 'context_compact' },
@@ -254,6 +261,7 @@ export const FRAMES: Record<WireType, FrameMeta> = {
   chat_rows: { perChat: true, persisted: null },
   chat_meta: { perChat: true, persisted: null },
   chat_moved: { perChat: false, persisted: null },
+  chat_move_progress: { perChat: false, persisted: null },
   chat_view_only: { perChat: true, persisted: null },
   engine_switched: { perChat: false, persisted: null },
   switch_engine_denied: { perChat: false, persisted: null },
@@ -330,7 +338,14 @@ export const SYSTEM_SUBTYPE = {
   MEETING_AGENT_LEFT: 'meeting_agent_left',
   MEETING_FAILED: 'meeting_failed',
   MACHINE_RECONNECTING: 'machine_reconnecting',
+  MACHINE_NOT_ANSWERING: 'machine_not_answering',
   ENGINE_PROMPT_REFUSED: 'engine_prompt_refused',
+  // A person's move of the chat: where it went, or why it did not finish
+  // (`reason` CHAT_MOVED_REASON).
+  CHAT_MOVED: 'chat_moved',
+  // The chat's machine still installs some of its tools, or they ended: the
+  // server's sentence names them.
+  TOOLS_INSTALLING: 'tools_installing',
   // Dashboard-synthesised (never sent by the proxy).
   NO_SUBSCRIPTION: 'no_subscription',
   POOL_CAP: 'pool_cap',
@@ -339,6 +354,8 @@ export const SYSTEM_SUBTYPE = {
   BELOW_EDITOR: 'below_editor',
   BG_AGENTS_COMPLETED: 'bg_agents_completed',
   BG_COMMANDS_COMPLETED: 'bg_commands_completed',
+  // A queued or busy send the proxy refused (the error names its queue id).
+  QUEUE_REFUSED: 'queue_refused',
 } as const
 
 /** `undelivered_input.reason` (the proxy's `UNDELIVERED_*`): why a message
@@ -349,6 +366,39 @@ export const UNDELIVERED_REASON = {
   TURN_FAILED: 'turn_failed',
   STOPPED: 'stopped',
 } as const
+
+/** `chat_moved.reason` (the proxy's `MOVED_*`): none for a move that
+ *  finished, `failed` for one that did not (the chat stayed), and the two
+ *  ends of the agent's own move that did not resume the chat by itself. */
+export const CHAT_MOVED_REASON = {
+  FAILED: 'failed',
+  RESUME_STOPPED: 'resume_stopped',
+  RESUME_SKIPPED: 'resume_skipped',
+} as const
+
+/** `chat_move_progress.phase` (the proxy's `MOVE_PHASES`): the platform's
+ *  own staging copy, the bytes on the wire, the commit on the target. */
+export const MOVE_PHASE = {
+  STAGE: 'stage',
+  COPY: 'copy',
+  COMMIT: 'commit',
+} as const
+export type MovePhase = (typeof MOVE_PHASE)[keyof typeof MOVE_PHASE]
+
+/** A `schedule_wake` row's `source` (the proxy's `WAKE_SOURCE_MOVE`): the
+ *  platform resumed the chat after the agent moved it. */
+export const WAKE_SOURCE = { MOVE: 'move' } as const
+
+/** `server_turn_start.cause` (the proxy's `SERVER_TURN_CAUSES`): what started
+ *  the turn. Only a review's own turn draws the nudge line the
+ *  `bg_*_complete` frame before it noted. */
+export const SERVER_TURN_CAUSE = {
+  BG_REVIEW: 'bg_review',
+  DELEGATE_RESULT: 'delegate_result',
+  WAKE: 'wake',
+  KICK: 'kick',
+} as const
+export type ServerTurnCause = (typeof SERVER_TURN_CAUSE)[keyof typeof SERVER_TURN_CAUSE]
 
 /** The kind of a held prompt (`live_state.pending_permission.event_type`,
  *  the proxy's hook-queue `ITEM_*`): what a reconnect re-renders. */
@@ -420,21 +470,23 @@ export const OUT = {
 
 interface PerChat { chat_id?: string }
 
-export interface TextFrame extends PerChat { type: typeof WIRE.TEXT; content: string }
-export interface ThinkingFrame extends PerChat { type: typeof WIRE.THINKING; phase?: string; text?: string; estimated_tokens?: number }
+export interface TextFrame extends PerChat { type: typeof WIRE.TEXT; content: string; note?: boolean }
+export interface ThinkingFrame extends PerChat { type: typeof WIRE.THINKING; phase?: string; text?: string; estimated_tokens?: number; note?: boolean }
 export interface ToolStartFrame extends PerChat { type: typeof WIRE.TOOL_START; name: string; tool_id?: string }
-export interface ToolInfoFrame extends PerChat { type: typeof WIRE.TOOL_INFO; name: string; summary?: string; tool_input?: any; file_path?: string }
+export interface ToolInfoFrame extends PerChat { type: typeof WIRE.TOOL_INFO; name: string; summary?: string; tool_input?: ToolInput | null; file_path?: string }
 export interface ToolEndFrame extends PerChat { type: typeof WIRE.TOOL_END; name: string; tool_id?: string }
 export interface ToolResultFrame extends PerChat { type: typeof WIRE.TOOL_RESULT; tool_name: string; tool_use_id?: string; summary: string; result_content?: string }
-export interface TaskSpawnFrame extends PerChat { type: typeof WIRE.TASK_SPAWN; description: string; subagent_type?: string; run_in_background?: boolean; tool_use_id?: string; tool_input?: any }
+export interface TaskSpawnFrame extends PerChat { type: typeof WIRE.TASK_SPAWN; description: string; subagent_type?: string; run_in_background?: boolean; tool_use_id?: string; tool_input?: ToolInput | null }
 export interface BgAgentDoneFrame extends PerChat { type: typeof WIRE.BG_AGENT_DONE; tool_use_id?: string }
 export interface BgCommandSpawnFrame extends PerChat { type: typeof WIRE.BG_COMMAND_SPAWN; tool_use_id?: string; command?: string; description?: string }
 export interface BgCommandDoneFrame extends PerChat { type: typeof WIRE.BG_COMMAND_DONE; tool_use_id?: string; status?: string }
-export interface BgAgentsCompleteFrame extends PerChat { type: typeof WIRE.BG_AGENTS_COMPLETE; count: number }
-export interface BgCommandsCompleteFrame extends PerChat { type: typeof WIRE.BG_COMMANDS_COMPLETE; count: number }
+/** `review`: a run's own review starts here, inside the run's turn (the
+ *  task producer's), its nudge row stored in turn order. */
+export interface BgAgentsCompleteFrame extends PerChat { type: typeof WIRE.BG_AGENTS_COMPLETE; count: number; review?: boolean }
+export interface BgCommandsCompleteFrame extends PerChat { type: typeof WIRE.BG_COMMANDS_COMPLETE; count: number; review?: boolean }
 export interface FgAgentsCompleteFrame extends PerChat { type: typeof WIRE.FG_AGENTS_COMPLETE }
 export interface WorkflowStartFrame extends PerChat { type: typeof WIRE.WORKFLOW_START; tool_use_id: string; workflow_name?: string }
-export interface WorkflowProgressFrame extends PerChat { type: typeof WIRE.WORKFLOW_PROGRESS; tool_use_id: string; workflow_progress: any[] }
+export interface WorkflowProgressFrame extends PerChat { type: typeof WIRE.WORKFLOW_PROGRESS; tool_use_id: string; workflow_progress: unknown[] }
 export interface WorkflowEndFrame extends PerChat { type: typeof WIRE.WORKFLOW_END; tool_use_id: string }
 /** `chat_id` on the persisted row is the WORKER chat; on the live frame the
  *  stream loop's tag overwrites it (a payload collision, deferred). */
@@ -458,19 +510,26 @@ export interface DelegateResultFrame extends PerChat {
   verdict?: Record<string, unknown>
   // Background work still running when the worker's turn ended.
   background_pending?: number
+  // The worker's turn was cut short and left no report (no file, no
+  // "Blocked on:" line); absent otherwise.
+  report_missing?: boolean
   files?: DelegateResultFile[]
   files_skipped?: DelegateResultSkipped[]
 }
-export interface CheckVerdictFrame extends PerChat { type: typeof WIRE.CHECK_VERDICT; check?: string; status?: string; summary?: string; findings?: any[]; round?: number; rounds?: number; ran_on?: string; [k: string]: unknown }
-export interface PermissionPromptFrame extends PerChat { type: typeof WIRE.PERMISSION_PROMPT; request_id: string; tool_name: string; tool_input: any; description?: string; meeting_agent?: string }
-export interface PlanReviewFrame extends PerChat { type: typeof WIRE.PLAN_REVIEW; request_id: string; plan: string; tool_input: any; filename?: string }
-export interface QuestionFrame extends PerChat { type: typeof WIRE.QUESTION; tool_name: string; tool_input: any; request_id?: string }
+export interface CheckVerdictFrame extends PerChat { type: typeof WIRE.CHECK_VERDICT; check?: string; status?: string; pass?: boolean; score?: number | null; summary?: string; findings?: CheckFindingWire[]; findings_total?: number; round?: number; rounds?: number; ran_on?: string; cost_usd?: number; verdict_id?: string; [k: string]: unknown }
+export interface PermissionPromptFrame extends PerChat { type: typeof WIRE.PERMISSION_PROMPT; request_id: string; tool_name: string; tool_input: ToolInput | null; description?: string; meeting_agent?: string }
+export interface PlanReviewFrame extends PerChat { type: typeof WIRE.PLAN_REVIEW; request_id: string; plan: string; tool_input: ToolInput | null; filename?: string }
+export interface QuestionFrame extends PerChat { type: typeof WIRE.QUESTION; tool_name: string; tool_input: ToolInput | null; request_id?: string }
 /** A permission, plan review or held question card whose wait ended with no
  *  answer (its caller went away, it ran out, a Stop or a close released it). */
 export interface PromptRetiredFrame extends PerChat { type: typeof WIRE.PROMPT_RETIRED; request_id: string }
+/** A card answered on another socket of the chat: closed here the way its
+ *  own answer would close it (a permission with `approved`, a plan review
+ *  with its `action`, a question with the id alone). */
+export interface PermissionResolvedFrame extends PerChat { type: typeof WIRE.PERMISSION_RESOLVED; request_id: string; approved?: boolean; action?: string }
 export interface LocationRequestFrame extends PerChat { type: typeof WIRE.LOCATION_REQUEST; request_id: string }
-export interface PlanModeFrame extends PerChat { type: typeof WIRE.PLAN_MODE; action: string; plan?: string; filename?: string; tool_input?: any }
-export interface SystemFrame extends PerChat { type: typeof WIRE.SYSTEM; subtype: string; message?: string; agent?: string; agent_display_name?: string; agent_color?: string; round?: number; participants?: any[]; max_rounds?: number; max_turns?: number; meeting_id?: string; machine_name?: string; reason?: string; mcp?: string; pct?: number; phase?: string }
+export interface PlanModeFrame extends PerChat { type: typeof WIRE.PLAN_MODE; action: string; plan?: string; filename?: string; tool_input?: ToolInput | null }
+export interface SystemFrame extends PerChat { type: typeof WIRE.SYSTEM; subtype: string; message?: string; agent?: string; agent_display_name?: string; agent_color?: string; round?: number; participants?: MeetingParticipant[]; max_rounds?: number; max_turns?: number; meeting_id?: string; machine_name?: string; reason?: string; mcp?: string; pct?: number; phase?: string }
 export interface MetadataFrame extends PerChat { type: typeof WIRE.METADATA; cost_usd?: number; cost_billed?: boolean; duration_ms?: number; duration_api_ms?: number; context_used?: number; context_max?: number; cache_read?: number; cache_write?: number; input_tokens?: number; output_tokens?: number }
 export interface McpCostFrame extends PerChat { type: typeof WIRE.MCP_COST; cost_usd: number; cost_billed?: boolean; provider: string; model: string; tool: string; mcp: string }
 export interface TodoUpdateFrame extends PerChat { type: typeof WIRE.TODO_UPDATE; todos: Array<{ content: string; status: string; activeForm?: string }> }
@@ -489,13 +548,16 @@ export interface DoneFrame extends PerChat { type: typeof WIRE.DONE }
 /** A turn's typed ending rides the pump's error frame as `reason`
  *  (`core/events/turn_ending.REASONS`); a `done` follows it once the turn's
  *  rows landed. A bare error (one refused message) carries no `chat_id`. */
-export type TurnEndingReason = 'declined' | 'limit' | 'error' | 'exited' | 'silent' | 'lost' | 'stopped'
+export type TurnEndingReason = 'declined' | 'limit' | 'error' | 'exited' | 'silent' | 'lost' | 'stopped' | 'restarted'
 export const RESEND_REASONS: ReadonlySet<string> = new Set(['error', 'exited', 'silent', 'lost', 'stopped'])
 export interface ErrorFrame extends PerChat {
   type: typeof WIRE.ERROR
   message: string
   reason?: TurnEndingReason
   resets_at?: string
+  /** The refusal of a message the page drew no bubble for (a queue-only
+   *  send, a busy send): the page keeps its warmup and hands the text back. */
+  queue_id?: string
 }
 export interface AbortedFrame extends PerChat { type: typeof WIRE.ABORTED; session_id?: string }
 export interface LiveStateFrame extends PerChat {
@@ -503,18 +565,18 @@ export interface LiveStateFrame extends PerChat {
   streaming: boolean
   session_id: string
   started_at: number
-  live_blocks: any[]
-  active_tools: any[]
-  active_agents: any[]
-  active_delegates: any[]
-  active_commands?: any[]
-  pending_permission: any | null
+  live_blocks: LiveBlock[]
+  active_tools: unknown[]
+  active_agents: unknown[]
+  active_delegates: unknown[]
+  active_commands?: unknown[]
+  pending_permission: HeldPromptItem | null
   thinking_active?: boolean
   thinking_text?: string
   thinking_tokens?: number
   todos?: Array<{ content: string; status: string; activeForm?: string }>
   goal?: ThreadGoal | null
-  workflows?: Record<string, { tool_use_id: string; workflow_name?: string; progress?: any[]; active?: boolean }>
+  workflows?: Record<string, { tool_use_id: string; workflow_name?: string; progress?: unknown[]; active?: boolean }>
   meeting_agent?: string | null
   meeting_participants?: Array<{ slug: string; display_name: string; color: string }>
 }
@@ -541,7 +603,8 @@ export interface AppActionAckFrame { type: typeof WIRE.APP_ACTION_ACK; app_id: s
  * the server saved them (`{name, path}`) and the validated files
  * (`{path, name}`); absent when the message has none. */
 export interface QueueAttachments {
-  images?: Array<{ name: string; path?: string }>
+  /** A photo by its saved path; a refused send's by the data it carried. */
+  images?: Array<{ name: string; path?: string; base64?: string }>
   files?: Array<{ path: string; name: string }>
 }
 /** One waiting message of a chat's queue: its id (client-minted), its text,
@@ -561,6 +624,7 @@ export interface QueueChip extends QueueAttachments {
  *  teammate's terminal is open on the chat, it goes out when that closes. */
 export const QUEUE_WAITING = {
   RECONNECT: 'reconnect',
+  MACHINE: 'machine',
   TERMINAL: 'terminal',
 } as const
 /** On the author's sockets only: the message handed back to the composer. */
@@ -586,7 +650,10 @@ export interface QueueClearedFrame extends PerChat, QueueReturned {
   queue_ids?: string[]
   reason?: string
 }
-export interface QueueSnapshotFrame extends PerChat { type: typeof WIRE.QUEUE_SNAPSHOT; messages: QueueChip[] }
+/** `queue_chat_id`: the queue's own chat when the viewed chat is a sibling
+ *  run's (the resume's snapshot); the audience's snapshot names the queue's
+ *  chat as `chat_id` and each entry its `view_chat_id`. */
+export interface QueueSnapshotFrame extends PerChat { type: typeof WIRE.QUEUE_SNAPSHOT; messages: QueueChip[]; queue_chat_id?: string }
 /** A message the running turn took. `message_id` is its row (its place in
  *  the chat: the bubble renders at once); a delegated steer carries the
  *  delegating agent's identity in `event_data` (the same meta the row
@@ -605,7 +672,7 @@ export interface ModelChangedFrame extends PerChat { type: typeof WIRE.MODEL_CHA
  *  absent for a new chat's pick. */
 export interface ExecutionModeChangedFrame { type: typeof WIRE.EXECUTION_MODE_CHANGED; execution_mode: string; chat_id?: string }
 export interface PlanStatusFrame { type: typeof WIRE.PLAN_STATUS; filename: string; status: string }
-export interface ServerTurnStartFrame extends PerChat { type: typeof WIRE.SERVER_TURN_START }
+export interface ServerTurnStartFrame extends PerChat { type: typeof WIRE.SERVER_TURN_START; cause?: ServerTurnCause }
 export interface WarmupStartedFrame { type: typeof WIRE.WARMUP_STARTED; chat_id: string; agent: string; execution_path?: string; execution_target?: string; new_chat?: boolean }
 export interface WarmupHeartbeatFrame { type: typeof WIRE.WARMUP_HEARTBEAT; chat_id: string }
 export interface WarmupReadyFrame {
@@ -643,10 +710,10 @@ export interface ChatHistoryFrame {
   type: typeof WIRE.CHAT_HISTORY
   chat_id?: string
   agent?: string
-  messages: any[]
+  messages: DbMessageRow[]
   has_more?: boolean
-  restore?: { todos?: any[]; meeting?: { active?: boolean; participants?: any[]; max_turns?: number } | null; goal?: ThreadGoal | null }
-  plans?: any[]
+  restore?: { todos?: TodoItemWire[]; meeting?: MeetingRestore | null; goal?: ThreadGoal | null }
+  plans?: DbPlanRow[]
   total_cost?: number
   context_used?: number
   context_max?: number
@@ -683,7 +750,32 @@ export interface ChatStatusSnapshotFrame { type: typeof WIRE.CHAT_STATUS_SNAPSHO
 export interface ChatReadFrame { type: typeof WIRE.CHAT_READ; chat_id: string }
 export interface ChatRowsFrame { type: typeof WIRE.CHAT_ROWS; chat_id: string; agent?: string }
 export interface ChatMetaFrame { type: typeof WIRE.CHAT_META; chat_id: string; delegate_role?: string; project_id?: string }
-export interface ChatMovedFrame { type: typeof WIRE.CHAT_MOVED; chat_id: string; new_target: string; resolved_label?: string }
+/** A move of the chat ended, sent to every tab viewing it (the mover's
+ *  included): `ok` false keeps the chat where it was and `message` is the
+ *  sentence to show; `memory` says what went with it. */
+export interface ChatMovedFrame {
+  type: typeof WIRE.CHAT_MOVED
+  chat_id: string
+  move_id: string
+  ok: boolean
+  memory: MoveMemory
+  new_target: string
+  label: string
+  from_label: string
+  message: string
+}
+/** A running move's transfer, to every tab that sees the chat: `done` of
+ *  `total` bytes (`total` 0: unknown) in `phase`. Live only; `chat_moved`
+ *  ends it. */
+export interface ChatMoveProgressFrame {
+  type: typeof WIRE.CHAT_MOVE_PROGRESS
+  chat_id: string
+  move_id: string
+  to_label: string
+  done: number
+  total: number
+  phase: MovePhase
+}
 /** The viewed chat is driven from outside (`kind`: `phone`): sent before the
  *  read-only history of a full resume; the page re-resumes on `ready`. */
 export interface ChatViewOnlyFrame { type: typeof WIRE.CHAT_VIEW_ONLY; chat_id: string; kind: string }
@@ -694,16 +786,16 @@ export interface TitleUpdatedFrame { type: typeof WIRE.TITLE_UPDATED; chat_id: s
 export interface TurnCompleteFrame { type: typeof WIRE.TURN_COMPLETE; chat_id?: string; title?: string; body?: string }
 export interface PtyOutputFrame extends PerChat { type: typeof WIRE.PTY_OUTPUT; session_id: string; data: string; replay?: boolean; reset?: boolean }
 export interface PtyExitFrame extends PerChat { type: typeof WIRE.PTY_EXIT; session_id: string; reason: string; code?: number }
-export interface PtyPermissionFrame extends PerChat { type: typeof WIRE.PTY_PERMISSION; kind: string; session_id: string; request_id?: string; tool_name?: string; tool_input?: any; plan?: string; filename?: string; meeting_agent?: string }
-export interface PtyArtifactFrame extends PerChat { type: typeof WIRE.PTY_ARTIFACT; session_id: string; event: any }
+export interface PtyPermissionFrame extends PerChat { type: typeof WIRE.PTY_PERMISSION; kind: string; session_id: string; request_id?: string; tool_name?: string; tool_input?: ToolInput | null; plan?: string; filename?: string; meeting_agent?: string }
+export interface PtyArtifactFrame extends PerChat { type: typeof WIRE.PTY_ARTIFACT; session_id: string; event: PersistedEvent & { db_message_id?: number } }
 export interface PtyStatusFrame extends PerChat { type: typeof WIRE.PTY_STATUS; session_id: string; state: string; controller?: string; tui_theme?: string }
-export interface NotificationFrame { type: typeof WIRE.NOTIFICATION; delivery: any }
-export interface NotificationSilentFrame { type: typeof WIRE.NOTIFICATION_SILENT; delivery: any }
+export interface NotificationFrame { type: typeof WIRE.NOTIFICATION; delivery: NotificationDelivery }
+export interface NotificationSilentFrame { type: typeof WIRE.NOTIFICATION_SILENT; delivery: NotificationDelivery }
 export interface NotificationCountFrame { type: typeof WIRE.NOTIFICATION_COUNT; count: number }
 /** The viewer's "Shared with you" section changed: `pending` decisions wait,
  *  and the Apps panels of `agents` gained or lost a placed app (SHARING.md). */
 export interface ShareInboxFrame { type: typeof WIRE.SHARE_INBOX; pending?: number; agents?: string[] }
-export interface FileUpdatedFrame { type: typeof WIRE.FILE_UPDATED; agent_slug: string; rel_path: string; file_id?: string; source?: string; pin?: any }
+export interface FileUpdatedFrame { type: typeof WIRE.FILE_UPDATED; agent_slug: string; rel_path: string; file_id?: string; source?: string; pin?: boolean }
 export interface AppPushFrame { type: typeof WIRE.APP_PUSH; app_id: string; payload: unknown; ts: number }
 export interface AppStateFrame { type: typeof WIRE.APP_STATE; app_id: string; doc: Record<string, unknown>; rev: number }
 export interface OpenAppFrame {
@@ -732,11 +824,13 @@ export interface InstallDoneFrame extends InstallKeyed { type: typeof WIRE.INSTA
 export interface InstallFailedFrame extends InstallKeyed { type: typeof WIRE.INSTALL_FAILED; error: string }
 export interface McpInstallFailedFrame extends InstallKeyed { type: typeof WIRE.MCP_INSTALL_FAILED; mcp: string; error: string }
 interface TransferKeyed { transfer_id: string; agent_slug: string }
-export interface TransferStartedFrame extends TransferKeyed { type: typeof WIRE.TRANSFER_STARTED; rel_path: string; filename: string; kind: string; bytes_total: number; started_at: string; machines: Record<string, unknown> }
+/** One machine's row of a transfer (`transfer_started`, `transfer_state`). */
+export interface TransferMachineWire { machine_id: string; name?: string; state?: string; bytes_sent?: number; bytes_total?: number; error?: string }
+export interface TransferStartedFrame extends TransferKeyed { type: typeof WIRE.TRANSFER_STARTED; rel_path: string; filename: string; kind: string; bytes_total: number; started_at: string; machines: TransferMachineWire[] }
 export interface TransferMachineStateFrame extends TransferKeyed { type: typeof WIRE.TRANSFER_MACHINE_STATE; machine_id: string; state: string; error?: string }
 export interface TransferProgressFrame extends TransferKeyed { type: typeof WIRE.TRANSFER_PROGRESS; machine_id: string; bytes_sent: number; bytes_total: number }
 export interface TransferDoneFrame extends TransferKeyed { type: typeof WIRE.TRANSFER_DONE; ok: boolean }
-export interface TransferStateFrame extends TransferKeyed { type: typeof WIRE.TRANSFER_STATE; rel_path: string; filename: string; kind: string; bytes_total: number; started_at: string; machines: Record<string, unknown> }
+export interface TransferStateFrame extends TransferKeyed { type: typeof WIRE.TRANSFER_STATE; rel_path: string; filename: string; kind: string; bytes_total: number; started_at: string; machines: TransferMachineWire[]; done?: boolean }
 export interface SatelliteUpdatingFrame { type: typeof WIRE.SATELLITE_UPDATING; machine_id: string; machine_name?: string; from_version?: string; to_version: string; started_at?: string }
 export interface SatelliteUpdatedFrame { type: typeof WIRE.SATELLITE_UPDATED; machine_id: string; machine_name?: string; version: string }
 export interface SatelliteUpdateFailedFrame { type: typeof WIRE.SATELLITE_UPDATE_FAILED; machine_id: string; machine_name?: string; error: string; rolled_back_to?: string; attempts?: number; auto_update_paused?: boolean }
@@ -754,7 +848,8 @@ export type WireFrame =
   | BgAgentsCompleteFrame | BgCommandsCompleteFrame | FgAgentsCompleteFrame
   | WorkflowStartFrame | WorkflowProgressFrame | WorkflowEndFrame
   | DelegateSpawnFrame | DelegateResultFrame | CheckVerdictFrame
-  | PermissionPromptFrame | PlanReviewFrame | QuestionFrame | PromptRetiredFrame | LocationRequestFrame | PlanModeFrame
+  | PermissionPromptFrame | PlanReviewFrame | QuestionFrame | PromptRetiredFrame | PermissionResolvedFrame
+  | LocationRequestFrame | PlanModeFrame
   | SystemFrame | MetadataFrame | McpCostFrame | TodoUpdateFrame | GoalUpdateFrame | ContextCompactFrame
   | DoneFrame | ErrorFrame | AbortedFrame | LiveStateFrame | LimitWarningFrame | LimitReachedFrame
   | ImagesFrame | ImageGeneratingFrame | ImageGenFailedFrame | UrlFrame | FileFrame | VideoFrame | AudioFrame
@@ -764,7 +859,7 @@ export type WireFrame =
   | ModeChangedFrame | ModelChangedFrame | ExecutionModeChangedFrame | PlanStatusFrame | ServerTurnStartFrame
   | WarmupStartedFrame | WarmupHeartbeatFrame | WarmupReadyFrame | WarmupFailedFrame | PreWarmupReadyFrame
   | ChatHistoryFrame | ChatHistoryDeltaFrame | ChatStatusFrame | ChatStatusSnapshotFrame | ChatReadFrame | ChatRowsFrame | ChatMetaFrame
-  | ChatMovedFrame | ChatViewOnlyFrame | EngineSwitchedFrame | SwitchEngineDeniedFrame | LivenessFrame | TitleUpdatedFrame | TurnCompleteFrame
+  | ChatMovedFrame | ChatMoveProgressFrame | ChatViewOnlyFrame | EngineSwitchedFrame | SwitchEngineDeniedFrame | LivenessFrame | TitleUpdatedFrame | TurnCompleteFrame
   | PtyOutputFrame | PtyExitFrame | PtyPermissionFrame | PtyArtifactFrame | PtyStatusFrame
   | NotificationFrame | NotificationSilentFrame | NotificationCountFrame | ShareInboxFrame | FileUpdatedFrame
   | AppPushFrame | AppStateFrame | OpenAppFrame | AppDeployedFrame | CatalogFrame
@@ -776,3 +871,116 @@ export type WireFrame =
 
 /** The payload of one frame kind: `WirePayload<'text'>` is `TextFrame`. */
 export type WirePayload<T extends WireType> = Extract<WireFrame, { type: T }>
+
+// ---------------------------------------------------------------------------
+// The shapes the frames above carry inside them: a turn's events as the
+// history and the live state replay them, and their parts.
+// ---------------------------------------------------------------------------
+
+/** A meeting participant as the live `meeting_started` event names it. */
+export interface MeetingParticipant { slug: string; display_name: string; color: string }
+/** A participant in the history's restore: an older proxy sent the slug alone. */
+export type MeetingParticipantWire = string | Partial<MeetingParticipant>
+/** The meeting half of the history's restore. */
+export interface MeetingRestore { active?: boolean; participants?: MeetingParticipantWire[]; max_turns?: number }
+
+/** A check verdict's finding as the proxy writes it. */
+export interface CheckFindingWire { location: string; severity: string; text: string }
+
+/** A checklist item (`todo_update`, the history's restore). */
+export interface TodoItemWire { content: string; status: string; activeForm?: string }
+
+/** A stored plan the history restores to the plan panel. */
+export interface DbPlanRow { filename: string; content: string; status: string }
+
+/** A stored chat row as the history sends it; `event_data` is the event's
+ * JSON (an event row's `PersistedEvent`, a user row's attachment meta). */
+export interface DbMessageRow {
+  id: number
+  role: string
+  content?: string | null
+  event_type?: string | null
+  event_data?: string | null
+  created_at: string
+}
+
+/** A tool card's event: the persisted row (`panel_only` marks the checklist
+ * snapshot the panel restores) and the live state's running card. */
+export interface ToolBlockWire {
+  type: typeof PERSISTED.TOOL
+  name?: string
+  tool_id?: string
+  summary?: string
+  active?: boolean
+  panel_only?: boolean
+  tool_input?: ToolInput | null
+  tool_result?: string
+  result_summary?: string
+}
+
+/** The persisted kinds that are no frame of their own. */
+export interface ScheduleWakeEvent { type: typeof PERSISTED.SCHEDULE_WAKE; prompt?: string; source?: string }
+export interface BgNudgeEvent { type: typeof PERSISTED.BG_NUDGE | typeof PERSISTED.BG_COMMAND_NUDGE; count?: number; labels?: string[] }
+
+/** The keys the store adds to a frame it persists. */
+interface PersistedExtras { _meeting_agent?: string; dismissed?: boolean }
+
+/** A persisted row's event: the frame it was sent as (with the keys a
+ * stored card keeps: a permission's answer, a plan review's action, a
+ * subagent's report, a thinking block's text) or a persisted-only kind. */
+export type PersistedEvent = PersistedExtras & (
+  | Exclude<WireFrame, PermissionPromptFrame | PlanReviewFrame | TaskSpawnFrame | ThinkingFrame>
+  | (PermissionPromptFrame & { approved?: boolean })
+  | (PlanReviewFrame & { action?: string })
+  | (TaskSpawnFrame & { tool_result?: string })
+  | (ThinkingFrame & { content?: string })
+  | ToolBlockWire | ScheduleWakeEvent | BgNudgeEvent
+)
+
+/** The live state's own cards (`live_blocks[]` beside the replayed frames). */
+export interface LiveAgentBlock {
+  type: typeof LIVE_BLOCK.AGENT
+  description?: string
+  subagent_type?: string
+  active?: boolean
+  tool_use_id?: string
+  background?: boolean
+  tool_input?: ToolInput | null
+  tool_result?: string
+}
+export interface LiveDelegateBlock {
+  type: typeof LIVE_BLOCK.DELEGATE
+  task_name?: string
+  agent?: string
+  status?: DelegateBlockStatus
+  active?: boolean
+  task_id?: string
+  prompt?: string
+}
+export interface LiveCommandBlock {
+  type: typeof LIVE_BLOCK.COMMAND
+  command?: string
+  description?: string
+  active?: boolean
+  tool_use_id?: string
+}
+
+/** One block of `live_state.live_blocks`: a live card or a replayed frame
+ * (a live text or thinking block carries its `content`). */
+export type LiveBlock =
+  | LiveAgentBlock | LiveDelegateBlock | LiveCommandBlock | ToolBlockWire
+  | Exclude<WireFrame, ThinkingFrame | TextFrame>
+  | (ThinkingFrame & { content?: string })
+  | (TextFrame & { content?: string })
+
+/** The held prompt a reconnect re-presents (`live_state.pending_permission`,
+ * the hook queue's item: `event_type` names a plan review or a question). */
+export interface HeldPromptItem {
+  event_type?: string
+  request_id?: string
+  tool_name?: string
+  tool_input?: ToolInput | null
+  description?: string
+  plan?: string
+  filename?: string
+}

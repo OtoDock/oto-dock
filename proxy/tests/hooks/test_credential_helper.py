@@ -80,6 +80,7 @@ def env(broker, tmp_path):
         "HOME": str(home),
         "PROXY_URL": f"http://127.0.0.1:{broker.server_port}",
         "PROXY_API_KEY": "sess-token-1",
+        "OTO_CLI_TOKEN": "cli-token-1",
         "OTO_SESSION_ID": "sid-1",
     }
 
@@ -92,14 +93,35 @@ def _git(env, operation, host="github.com", timeout=30):
     )
 
 
-def test_git_get_answers_the_credential_under_the_session_token(env):
+def test_git_get_answers_the_credential_under_the_command_line_token(env):
     r = _git(env, "get")
     assert r.returncode == 0
     assert r.stdout == "username=x-access-token\npassword=ghp_live\n" and r.stderr == ""
     path, auth, body = _Broker.seen[-1]
-    assert path == "/v1/hooks/cli-credential" and auth == "Bearer sess-token-1"
-    assert body == {"session_id": "sid-1", "host": "github.com"}
+    assert path == "/v1/hooks/cli-credential" and auth == "Bearer cli-token-1"
+    assert body == {"session_id": "sid-1", "host": "github.com", "path": ""}
     assert not any((Path(env["HOME"])).iterdir())   # nothing written
+
+
+def test_git_sends_the_repository_path_it_names(env):
+    """With ``useHttpPath`` (a narrowed GitHub reach) git names the
+    repository, and the broker is told it."""
+    r = subprocess.run(
+        [sys.executable, "-I", str(HELPER), "git", "get"],
+        input="protocol=https\nhost=github.com\npath=octo/hello.git\n\n", capture_output=True, text=True,
+        env=env, timeout=30,
+    )
+    assert r.returncode == 0 and r.stdout.endswith("password=ghp_live\n")
+    assert _Broker.seen[-1][2] == {"session_id": "sid-1", "host": "github.com", "path": "octo/hello.git"}
+
+
+def test_a_session_started_before_the_upgrade_presents_its_session_token(env):
+    """Its env has no command-line token (the helper reached it from a
+    sibling's start in the same config dir): the session token, which the
+    route takes for such a session."""
+    del env["OTO_CLI_TOKEN"]
+    assert _git(env, "get").returncode == 0
+    assert _Broker.seen[-1][1] == "Bearer sess-token-1"
 
 
 @pytest.mark.parametrize("host,reason", [
@@ -169,10 +191,20 @@ def test_store_and_erase_are_silent(env):
     assert _Broker.seen == []
 
 
+def test_an_mcp_servers_env_is_told_the_credential_is_not_for_it(env):
+    """The platform names the command-line token empty in every MCP's env:
+    the helper asks nothing with the session token there."""
+    env["OTO_CLI_TOKEN"] = ""
+    r = _git(env, "get")
+    assert r.stdout == "quit=1\n" and "not available to MCP servers" in r.stderr
+    assert _Broker.seen == []
+
+
 def test_a_missing_platform_link_quits_too(env):
     del env["PROXY_API_KEY"]
+    del env["OTO_CLI_TOKEN"]
     r = _git(env, "get")
-    assert r.stdout == "quit=1\n" and "PROXY_API_KEY" in r.stderr
+    assert r.stdout == "quit=1\n" and "OTO_CLI_TOKEN" in r.stderr
 
 
 def _rig_wrapper(tmp_path, env):
@@ -213,6 +245,33 @@ def test_the_wrapper_runs_the_real_command_with_the_names_set(env, tmp_path):
     assert r.stderr == ""
     # The token travels in the one process's environment, never an argument.
     assert "ghp_" not in r.stdout.splitlines()[1]
+
+
+def test_the_wrapper_tells_the_broker_the_arguments_and_the_remotes(env, tmp_path):
+    cfg = _rig_wrapper(tmp_path, env)
+    repo = tmp_path / "work"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env, timeout=30)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/octo/hello.git"],
+                   check=True, env=env, timeout=30)
+    r = subprocess.run([sys.executable, "-I", str(cfg / "credential_helper.py"), "run", "github.com", "gh",
+                        "--", "pr", "list"], capture_output=True, text=True, env=env, timeout=30, cwd=repo)
+    assert r.returncode == 7
+    body = _Broker.seen[-1][2]
+    assert body["command"] == ["pr", "list"] and body["remotes"] == ["https://github.com/octo/hello.git"]
+    assert body["gh_repo"] == "" and body["gh_host"] == ""
+    # gh's own repository and host settings go along: gh reads them before the remote.
+    subprocess.run([sys.executable, "-I", str(cfg / "credential_helper.py"), "run", "github.com", "gh",
+                    "--", "issue", "list"], capture_output=True, text=True, timeout=30, cwd=repo,
+                   env={**env, "GH_REPO": "octo/secret", "GH_HOST": "github.com"})
+    assert (_Broker.seen[-1][2]["gh_repo"], _Broker.seen[-1][2]["gh_host"]) == ("octo/secret", "github.com")
+    # Outside a repository the remotes are none.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    env["GIT_CEILING_DIRECTORIES"] = str(tmp_path)
+    subprocess.run([sys.executable, "-I", str(cfg / "credential_helper.py"), "run", "github.com", "gh",
+                    "--", "api", "user"], capture_output=True, text=True, env=env, timeout=30, cwd=plain)
+    assert _Broker.seen[-1][2]["remotes"] == []
 
 
 def test_the_wrapper_runs_plainly_when_the_session_holds_no_account(env, tmp_path):

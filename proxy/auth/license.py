@@ -79,6 +79,8 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import psycopg
+
 import config
 from storage import database as db
 
@@ -161,7 +163,7 @@ def _key_obj(b64: str):
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         return Ed25519PublicKey.from_public_bytes(_b64url_decode(b64))
-    except Exception:
+    except (ImportError, ValueError):
         return None
 
 
@@ -201,7 +203,7 @@ def verify_license_token(token: str, public_key=None) -> dict | None:
         return payload
     except InvalidSignature:
         return None
-    except Exception:
+    except (ImportError, ValueError, TypeError):
         return None
 
 
@@ -306,7 +308,7 @@ def get_license_key() -> str:
             _LICENSE_CRED_KEY, "")
         if enc:
             return enc
-    except Exception:
+    except (ImportError, psycopg.Error):
         pass
     legacy = (db.get_platform_setting("license_key") or "").strip()
     if legacy:
@@ -315,7 +317,7 @@ def get_license_key() -> str:
             credential_store.set_infra_credentials(
                 _LICENSE_CRED_SLUG, {_LICENSE_CRED_KEY: legacy})
             db.set_platform_setting("license_key", "")
-        except Exception:
+        except (ImportError, RuntimeError, psycopg.Error):
             pass
     return legacy
 
@@ -333,10 +335,14 @@ def set_license_key(key: str) -> None:
             credential_store.delete_infra_credential_key(
                 _LICENSE_CRED_SLUG, _LICENSE_CRED_KEY)
         db.set_platform_setting("license_key", "")
-    except Exception:
+    except (ImportError, RuntimeError, psycopg.Error):
         # Credential store unavailable (e.g. unit tests, no DB) → keep it in
         # platform_settings so the license still works; migrates on next read.
         db.set_platform_setting("license_key", key)
+    # Every licence write passes here (the admin's paste and clear, the
+    # worker's adoptions): the relay identity the pushes send is read afresh.
+    from services.billing import relay_client
+    relay_client.reset_identity_cache()
 
 
 # ---------------------------------------------------------------------------

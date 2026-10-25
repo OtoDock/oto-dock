@@ -1,0 +1,7216 @@
+{
+ "chat": {
+  "cache_read": 0,
+  "cache_write": 0,
+  "codex_thread_id": null,
+  "context_max": 0,
+  "context_used": 0,
+  "engine_cost_session_id": "sid-pc-claude-tools",
+  "engine_cost_total": 0.046387,
+  "last_abort_graceful": false,
+  "last_response_at": false,
+  "last_turn_aborted": false,
+  "output_tokens": 0,
+  "permission_mode": "ask",
+  "thread_goal": null,
+  "title_generated": false,
+  "total_cost": 0.0
+ },
+ "events": [
+  [
+   "text",
+   {
+    "content": "Order: the"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " ls com"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "es first, and"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " the Write com"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "es before"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " the Read and"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " Edit. The Read has"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " to fin"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "ish before the Edit, because"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " the Edit needs a pr"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "ior"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " Read."
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " The ls and"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " the Write don"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "'t depend on each other, so"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " I'll run them together."
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "",
+    "note": true
+   }
+  ],
+  [
+   "tool_use",
+   {
+    "name": "Bash",
+    "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP"
+   }
+  ],
+  [
+   "tool_input",
+   {
+    "name": "Bash",
+    "summary": "List files in current directory",
+    "tool_input": {
+     "command": "ls -la",
+     "description": "List files in current directory"
+    }
+   }
+  ],
+  [
+   "tool_result",
+   {
+    "name": "Bash",
+    "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP"
+   }
+  ],
+  [
+   "tool_use",
+   {
+    "name": "Write",
+    "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh"
+   }
+  ],
+  [
+   "tool_input",
+   {
+    "name": "Write",
+    "summary": "note.txt",
+    "tool_input": {
+     "content": "first line\nsecond line\n",
+     "file_path": "/users/dev-admin/workspace/note.txt"
+    }
+   }
+  ],
+  [
+   "tool_result",
+   {
+    "name": "Write",
+    "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh"
+   }
+  ],
+  [
+   "tool_use",
+   {
+    "name": "Read",
+    "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA"
+   }
+  ],
+  [
+   "tool_input",
+   {
+    "name": "Read",
+    "summary": "note.txt",
+    "tool_input": {
+     "file_path": "/users/dev-admin/workspace/note.txt"
+    }
+   }
+  ],
+  [
+   "tool_result",
+   {
+    "name": "Read",
+    "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA"
+   }
+  ],
+  [
+   "tool_use",
+   {
+    "name": "Edit",
+    "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH"
+   }
+  ],
+  [
+   "tool_input",
+   {
+    "name": "Edit",
+    "summary": "note.txt",
+    "tool_input": {
+     "file_path": "/users/dev-admin/workspace/note.txt",
+     "new_string": "edited",
+     "old_string": "second line"
+    }
+   }
+  ],
+  [
+   "tool_result",
+   {
+    "name": "Edit",
+    "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "\n\n"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "I list"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "ed the emp"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "ty folder, created `note."
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "txt` with two lines,"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " read it back, and edited the"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " second line to"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " \""
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "edited\"."
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " All four"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " t"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "ool calls succ"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "eeded."
+   }
+  ],
+  [
+   "metadata",
+   {
+    "cache_read": 66591,
+    "cache_write": 8618,
+    "context_max": 1000000,
+    "context_used": 19599,
+    "cost_usd": 0.046387099999999994,
+    "duration_ms": 10038,
+    "input_tokens": 8,
+    "output_tokens": 524
+   }
+  ],
+  [
+   "done",
+   {}
+  ]
+ ],
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+   "event_data": {
+    "note": true
+   },
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "active": false,
+    "name": "Bash",
+    "summary": "List files in current directory",
+    "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+    "tool_input": {
+     "command": "ls -la",
+     "description": "List files in current directory"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "active": false,
+    "name": "Write",
+    "summary": "note.txt",
+    "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+    "tool_input": {
+     "content": "first line\nsecond line\n",
+     "file_path": "/users/dev-admin/workspace/note.txt"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "active": false,
+    "name": "Read",
+    "summary": "note.txt",
+    "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+    "tool_input": {
+     "file_path": "/users/dev-admin/workspace/note.txt"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "active": false,
+    "name": "Edit",
+    "summary": "note.txt",
+    "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+    "tool_input": {
+     "file_path": "/users/dev-admin/workspace/note.txt",
+     "new_string": "edited",
+     "old_string": "second line"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to \"edited\". All four tool calls succeeded.",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cache_read": 66591,
+    "cache_write": 8618,
+    "context_max": 1000000,
+    "context_used": 19599,
+    "cost_billed": true,
+    "cost_usd": 0.046387099999999994,
+    "duration_ms": 10038,
+    "input_tokens": 8,
+    "output_tokens": 524,
+    "type": "metadata"
+   },
+   "event_type": "metadata",
+   "role": "event"
+  }
+ ],
+ "seams": {
+  "ephemeral": [],
+  "kept": [],
+  "reconciles": [],
+  "relocated": [],
+  "replays": [],
+  "rests": [],
+  "status": [],
+  "titles": [],
+  "tool_starts": []
+ },
+ "trace": [
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "Order: the",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": " ls com",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls com",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "es first, and",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": " the Write com",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write com",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "es before",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": " the Read and",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": " Edit. The Read has",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and",
+     " Edit. The Read has"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": " to fin",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to fin",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and",
+     " Edit. The Read has",
+     " to fin"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "ish before the Edit, because",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and",
+     " Edit. The Read has",
+     " to fin",
+     "ish before the Edit, because"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": " the Edit needs a pr",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a pr",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and",
+     " Edit. The Read has",
+     " to fin",
+     "ish before the Edit, because",
+     " the Edit needs a pr"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "ior",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and",
+     " Edit. The Read has",
+     " to fin",
+     "ish before the Edit, because",
+     " the Edit needs a pr",
+     "ior"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": " Read.",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and",
+     " Edit. The Read has",
+     " to fin",
+     "ish before the Edit, because",
+     " the Edit needs a pr",
+     "ior",
+     " Read."
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": " The ls and",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and",
+     " Edit. The Read has",
+     " to fin",
+     "ish before the Edit, because",
+     " the Edit needs a pr",
+     "ior",
+     " Read.",
+     " The ls and"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": " the Write don",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and",
+     " Edit. The Read has",
+     " to fin",
+     "ish before the Edit, because",
+     " the Edit needs a pr",
+     "ior",
+     " Read.",
+     " The ls and",
+     " the Write don"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "'t depend on each other, so",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and",
+     " Edit. The Read has",
+     " to fin",
+     "ish before the Edit, because",
+     " the Edit needs a pr",
+     "ior",
+     " Read.",
+     " The ls and",
+     " the Write don",
+     "'t depend on each other, so"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": " I'll run them together.",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and",
+     " Edit. The Read has",
+     " to fin",
+     "ish before the Edit, because",
+     " the Edit needs a pr",
+     "ior",
+     " Read.",
+     " The ls and",
+     " the Write don",
+     "'t depend on each other, so",
+     " I'll run them together."
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "",
+      "note": true,
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Order: the",
+     " ls com",
+     "es first, and",
+     " the Write com",
+     "es before",
+     " the Read and",
+     " Edit. The Read has",
+     " to fin",
+     "ish before the Edit, because",
+     " the Edit needs a pr",
+     "ior",
+     " Read.",
+     " The ls and",
+     " the Write don",
+     "'t depend on each other, so",
+     " I'll run them together."
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Bash",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "type": "tool_start"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "Bash",
+      "summary": "",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "Bash",
+      "summary": "",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_01Q4q2uBR5u8erpcgAypmteP"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_use/Bash"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool_info"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_01Q4q2uBR5u8erpcgAypmteP"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_input/Bash"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Bash",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "type": "tool_end"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_result/Bash"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Write",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "type": "tool_start"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 2,
+      "active": true,
+      "name": "Write",
+      "summary": "",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "_insert_idx": 2,
+      "active": true,
+      "name": "Write",
+      "summary": "",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_01UkWQqvo6wBVXuKwbjFaSoh"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 2,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_use/Write"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool_info"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 2,
+      "active": true,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "_insert_idx": 2,
+      "active": true,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_01UkWQqvo6wBVXuKwbjFaSoh"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 2,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_input/Write"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Write",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "type": "tool_end"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 2,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_result/Write"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Read",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "type": "tool_start"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 3,
+      "active": true,
+      "name": "Read",
+      "summary": "",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "_insert_idx": 3,
+      "active": true,
+      "name": "Read",
+      "summary": "",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_01BFzFPi89o4c8TT8WqS2AkA"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 3,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_use/Read"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool_info"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 3,
+      "active": true,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "_insert_idx": 3,
+      "active": true,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_01BFzFPi89o4c8TT8WqS2AkA"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 3,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_input/Read"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Read",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "type": "tool_end"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 3,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_result/Read"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Edit",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "type": "tool_start"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 4,
+      "active": true,
+      "name": "Edit",
+      "summary": "",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "_insert_idx": 4,
+      "active": true,
+      "name": "Edit",
+      "summary": "",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_01UuhRLfyNozR2M3dzbe65FH"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_use/Edit"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool_info"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 4,
+      "active": true,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "_insert_idx": 4,
+      "active": true,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_01UuhRLfyNozR2M3dzbe65FH"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_input/Edit"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Edit",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "type": "tool_end"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_result/Edit"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "\n\n",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "I list",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI list",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "ed the emp",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the emp",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list",
+     "ed the emp"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "ty folder, created `note.",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list",
+     "ed the emp",
+     "ty folder, created `note."
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "txt` with two lines,",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.txt` with two lines,",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list",
+     "ed the emp",
+     "ty folder, created `note.",
+     "txt` with two lines,"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": " read it back, and edited the",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list",
+     "ed the emp",
+     "ty folder, created `note.",
+     "txt` with two lines,",
+     " read it back, and edited the"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": " second line to",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list",
+     "ed the emp",
+     "ty folder, created `note.",
+     "txt` with two lines,",
+     " read it back, and edited the",
+     " second line to"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": " \"",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to \"",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list",
+     "ed the emp",
+     "ty folder, created `note.",
+     "txt` with two lines,",
+     " read it back, and edited the",
+     " second line to",
+     " \""
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "edited\".",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to \"edited\".",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list",
+     "ed the emp",
+     "ty folder, created `note.",
+     "txt` with two lines,",
+     " read it back, and edited the",
+     " second line to",
+     " \"",
+     "edited\"."
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": " All four",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to \"edited\". All four",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list",
+     "ed the emp",
+     "ty folder, created `note.",
+     "txt` with two lines,",
+     " read it back, and edited the",
+     " second line to",
+     " \"",
+     "edited\".",
+     " All four"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": " t",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to \"edited\". All four t",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list",
+     "ed the emp",
+     "ty folder, created `note.",
+     "txt` with two lines,",
+     " read it back, and edited the",
+     " second line to",
+     " \"",
+     "edited\".",
+     " All four",
+     " t"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "ool calls succ",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to \"edited\". All four tool calls succ",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list",
+     "ed the emp",
+     "ty folder, created `note.",
+     "txt` with two lines,",
+     " read it back, and edited the",
+     " second line to",
+     " \"",
+     "edited\".",
+     " All four",
+     " t",
+     "ool calls succ"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "eeded.",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to \"edited\". All four tool calls succeeded.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "I list",
+     "ed the emp",
+     "ty folder, created `note.",
+     "txt` with two lines,",
+     " read it back, and edited the",
+     " second line to",
+     " \"",
+     "edited\".",
+     " All four",
+     " t",
+     "ool calls succ",
+     "eeded."
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+     "note": true,
+     "type": "text"
+    },
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "List files in current directory",
+     "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+     "tool_input": {
+      "command": "ls -la",
+      "description": "List files in current directory"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Write",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+     "tool_input": {
+      "content": "first line\nsecond line\n",
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Read",
+     "summary": "note.txt",
+     "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt"
+     },
+     "type": "tool"
+    },
+    {
+     "active": false,
+     "name": "Edit",
+     "summary": "note.txt",
+     "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/note.txt",
+      "new_string": "edited",
+      "old_string": "second line"
+     },
+     "type": "tool"
+    },
+    {
+     "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to \"edited\". All four tool calls succeeded.",
+     "type": "text"
+    },
+    {
+     "cache_read": 66591,
+     "cache_write": 8618,
+     "context_max": 1000000,
+     "context_used": 19599,
+     "cost_billed": true,
+     "cost_usd": 0.046387099999999994,
+     "duration_ms": 10038,
+     "input_tokens": 8,
+     "output_tokens": 524,
+     "type": "metadata"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "cache_read": 66591,
+      "cache_write": 8618,
+      "context_max": 1000000,
+      "context_used": 19599,
+      "cost_billed": true,
+      "cost_usd": 0.046387099999999994,
+      "duration_ms": 10038,
+      "input_tokens": 8,
+      "output_tokens": 524,
+      "type": "metadata"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to \"edited\". All four tool calls succeeded.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     66591,
+     8618
+    ],
+    "completed": false,
+    "context": [
+     19599,
+     1000000
+    ],
+    "cost_delta": 0.046387,
+    "cumulative_cost": 0.046387099999999994,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.046387099999999994,
+    "leftover": [],
+    "llm_cost_delta": 0.046387,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     8,
+     524
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:metadata"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "pump_type": "is_done"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Order: the ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+      "note": true,
+      "type": "text"
+     },
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "List files in current directory",
+      "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+      "tool_input": {
+       "command": "ls -la",
+       "description": "List files in current directory"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Write",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+      "tool_input": {
+       "content": "first line\nsecond line\n",
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Read",
+      "summary": "note.txt",
+      "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt"
+      },
+      "type": "tool"
+     },
+     {
+      "active": false,
+      "name": "Edit",
+      "summary": "note.txt",
+      "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/note.txt",
+       "new_string": "edited",
+       "old_string": "second line"
+      },
+      "type": "tool"
+     },
+     {
+      "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to \"edited\". All four tool calls succeeded.\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-claude-tools",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     66591,
+     8618
+    ],
+    "completed": false,
+    "context": [
+     19599,
+     1000000
+    ],
+    "cost_delta": 0.046387,
+    "cumulative_cost": 0.046387099999999994,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.046387099999999994,
+    "leftover": [],
+    "llm_cost_delta": 0.046387,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     8,
+     524
+    ],
+    "tool_seen": 4,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:done"
+  }
+ ]
+}

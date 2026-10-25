@@ -2,7 +2,8 @@
 the shape of ``tests/execution/test_engine_id_surface.py``.
 
 One helper per guard: ``services/infra/path_confinement.py`` (``resolve_under``,
-``join_under``, ``normalize_rel_path``, ``safe_agent_dir``) for filesystem
+``join_under``, ``normalize_rel_path``; ``config.get_agent_dir`` joins an agent name
+behind ``join_under``) for filesystem
 paths, ``auth/request_path.py`` (``has_traversal``) for request paths,
 ``services/infra/outbound_url.py`` for destinations the platform fetches;
 the satellite's ``host/auth_paths.py`` and its tunnel twin. A guard written
@@ -56,9 +57,11 @@ _MCP = ("an MCP process cannot import the helper: the interceptor gates its decl
 KNOWN_DOTDOT_SITES: dict[str, tuple[str, int]] = {
     "proxy/api/agents/files.py": ("a rename NAME: no separator and not a dot name", 1),
     "proxy/api/apps/app_proxy.py": ("the app's Location: header — a response, not a request path", 1),
+    "proxy/api/media/collabora_proxy.py": ("the editor relay's path, judged decoded: its WOPISrc segment "
+                                           "is an encoded URL, a %2F has_traversal refuses", 1),
     "proxy/api/sessions/sessions.py": ("a plan FILENAME: one segment, no dot name", 1),
     "proxy/auth/path_policy.py": ("the candidate-order heuristic of a relative tool path, never a verdict", 1),
-    "proxy/config.py": ("the agent-name rule; safe_agent_dir is its barrier form", 1),
+    "proxy/config.py": ("the agent-name rule; get_agent_dir is its barrier form", 1),
     "proxy/core/layers/direct/files.py": ("a glob PATTERN; every hit is re-confined with resolve() + is_relative_to", 1),
     "proxy/core/remote/file_sync.py": ("sync-rule NAMES (a twin of the satellite's, the gate pins it)", 1),
     "proxy/core/sandbox/session_config_dir.py": ("an ssh key NAME must be a bare basename", 1),

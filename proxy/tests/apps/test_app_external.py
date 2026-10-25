@@ -190,7 +190,7 @@ def test_a_dormant_owners_link_answers_404_whoever_made_it(upstream):
     its links too, whether the owner or a platform admin made the link (the
     link is judged on its creator, and a dormant app counts nobody's
     authority); a re-attach brings the link back."""
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     from storage.pg import get_conn
     row, _sha = _folder_app()
     _install(row, upstream.server_port)

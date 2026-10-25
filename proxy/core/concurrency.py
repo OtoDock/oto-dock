@@ -78,14 +78,15 @@ import json
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Callable, NamedTuple
+from typing import NamedTuple, cast
 
 import config
 from core import placement
-from core.session import background_leash
-from core.sandbox import host_resources
 from core.background import spawn
+from core.sandbox import host_resources
+from core.session import background_leash
 
 logger = logging.getLogger("otodock.concurrency")
 
@@ -176,10 +177,9 @@ def _deny_host_memory(est: int) -> Admission:
     # admin page (which can truthfully show 0 active sessions).
     return Admission(
         False, "host_memory",
-        f"The platform host is low on memory ({_live_available_mb()} MB free; about "
-        f"{est + _floor_mb} MB needed to start). This is host memory pressure, not "
-        "session count — free memory on the host machine, then retry. "
-        "Details: Admin Settings → Platform.",
+        f"This server is low on memory: {_live_available_mb()} MB free, about "
+        f"{est + _floor_mb} MB needed to start. Free some memory on the server, "
+        "then try again.",
     )
 
 # ---------------------------------------------------------------------------
@@ -261,7 +261,7 @@ def _stdio_mcp_count(path: str) -> int:
             servers = json.load(f).get("mcpServers") or {}
         return sum(1 for server in servers.values()
                    if isinstance(server, dict) and is_stdio_transport(server.get("type")))
-    except Exception:
+    except (OSError, ValueError):
         return 0
 
 
@@ -289,7 +289,7 @@ def _live_available_mb() -> int:
         # Never credits a fail-closed 0 read ("we know nothing" stays 0).
         if mb:
             mb += _swap_credit_mb()
-    except Exception:
+    except (OSError, ValueError):
         mb = 0
     _live_cache = (now, mb)
     return mb
@@ -372,7 +372,7 @@ def prewarm_allowed(execution_path: str | None = None, *, user_sub: str | None =
 def _add(session_id: str, kind: str, est: int, owner: str = "") -> None:
     """Reserve a slot. est is written ONLY here (never on idempotent re-acquire)."""
     global _reserved_mb
-    assert session_id not in _session_est, "double _add for %s" % session_id
+    assert session_id not in _session_est, f"double _add for {session_id}"
     _sessions[session_id] = kind
     _session_est[session_id] = est
     _session_added_at[session_id] = time.monotonic()
@@ -545,7 +545,7 @@ async def _acquire_queued(session_id: str, kind: str, est: int, *, prefer_user: 
     deadline = loop.time() + wait_s
     ticket: object = asyncio.current_task() or object()
     last: Admission | None = None
-    async with _cond:
+    async with cast("asyncio.Condition", _cond):
         _line.append(ticket)
     try:
         while True:
@@ -555,7 +555,7 @@ async def _acquire_queued(session_id: str, kind: str, est: int, *, prefer_user: 
                 if adm or adm.reason in ("host_memory", "user_cap"):
                     return adm
                 last = adm
-            async with _cond:
+            async with cast("asyncio.Condition", _cond):
                 if session_id in _sessions:
                     _fill_owner(session_id, owner)
                     return _ADMITTED
@@ -570,7 +570,7 @@ async def _acquire_queued(session_id: str, kind: str, est: int, *, prefer_user: 
                 if remaining <= 0:
                     break
                 with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(_cond.wait(), min(_QUEUE_SLICE_S, remaining))
+                    await asyncio.wait_for(cast("asyncio.Condition", _cond).wait(), min(_QUEUE_SLICE_S, remaining))
         adm = last or _deny_busy()
         logger.warning("Slot denied after %.0fs in the admission queue: %s (%s) reason=%s",
                        wait_s, session_id[:8], kind, adm.reason)
@@ -595,7 +595,7 @@ async def _make_room_under_user_cap(session_id: str, owner: str) -> Admission | 
     hold of its add: a second tab may take the seat meanwhile)."""
     floor_age: float | None = None
     while True:
-        async with _cond:
+        async with cast("asyncio.Condition", _cond):
             if session_id in _sessions:
                 _fill_owner(session_id, owner)
                 return _ADMITTED
@@ -675,7 +675,7 @@ async def _acquire_task(session_id: str, kind: str, est: int, owner: str = "",
     in the parked tasks' ring: the creators take turns. Task-side eviction is
     driven by the maintenance loop (keeps wait_for pure)."""
     global _parked_tasks
-    async with _cond:
+    async with cast("asyncio.Condition", _cond):
         if session_id in _sessions:
             _fill_owner(session_id, owner)
             return _ADMITTED
@@ -687,7 +687,7 @@ async def _acquire_task(session_id: str, kind: str, est: int, owner: str = "",
             logger.info("Task %s parked: no slot (reserved=%d/%dMB, sessions=%d)",
                         session_id[:8], _reserved_mb, _budget_mb, len(_sessions))
             try:
-                await _cond.wait_for(
+                await cast("asyncio.Condition", _cond).wait_for(
                     lambda: session_id in _sessions or _ring_turn(key, ticket))
             finally:
                 _parked_tasks -= 1  # decrement even on Cancelled/Timeout
@@ -736,7 +736,7 @@ async def _admit_with_eviction(session_id: str, kind: str, est: int, *,
     floor_age = min(config.SESSION_EVICT_FLOOR_S, await _idle_timeout())
     skipped_pending = 0
     while True:
-        async with _cond:
+        async with cast("asyncio.Condition", _cond):
             if session_id in _sessions:
                 _fill_owner(session_id, owner)
                 return _ADMITTED
@@ -781,7 +781,7 @@ async def _admit_with_eviction(session_id: str, kind: str, est: int, *,
             break  # nothing idle to reclaim → attribute + deny below
         await _evict_one(*scan.victim)
 
-    async with _cond:
+    async with cast("asyncio.Condition", _cond):
         gate1_ok, live, sessions_account = _pressure_snapshot(est)
     if gate1_ok and not sessions_account:
         log_denial(
@@ -840,7 +840,7 @@ async def reserve_background(session_id: str, *, target: str = placement.LOCAL,
             return True
         try:
             return bool(superseded())
-        except Exception:
+        except Exception:  # noqa: BLE001  # a caller's supersede predicate: a raise counts as superseded
             logger.warning("Wake %s: supersede check failed; not spawning",
                            session_id[:8], exc_info=True)
             return True
@@ -898,6 +898,23 @@ async def acquire_chat_slot(session_id: str, *, kind: str = "chat",
 
 def release_chat_slot(session_id: str) -> None:
     release(session_id)
+
+
+async def reap_session(session_id: str, close: Callable[[str], Awaitable[object]]) -> None:
+    """An idle reaper's close of one session: its chat slot and its
+    subscription seat are released whatever the close does (both releases
+    are pops, so a second one releases nothing), and a close that raises is
+    logged, never ending the reaper's batch."""
+    from services.engines.subscription_pool import release_subscription
+    try:
+        await close(session_id)
+    except Exception:  # one session's close must not leak its seat nor end the batch
+        logger.exception("Reaping session %s: the close failed", session_id[:8])
+    finally:
+        try:
+            release_chat_slot(session_id)
+        finally:
+            release_subscription(session_id)
 
 
 @asynccontextmanager
@@ -980,7 +997,7 @@ def _turn_live(sid: str, s: object) -> bool:
         from core.layers.direct.layer import DirectLLMExecutionLayer
         task = DirectLLMExecutionLayer._active_streams.get(sid)
         return task is not None and not task.done()
-    except Exception:
+    except ImportError:
         return False
 
 
@@ -1011,12 +1028,12 @@ async def _oldest_evictable_local(min_idle_s: float, *,
     now = time.monotonic()
     try:
         from core.session.prewarm_session_registry import _entries as _pw_entries
-    except Exception:
+    except ImportError:
         _pw_entries = {}
     try:
         from core.session.session_state import get_hook_activity
-    except Exception:
-        def get_hook_activity(_sid: str) -> float:
+    except ImportError:
+        def get_hook_activity(_sid: str) -> float:  # type: ignore[misc]  # an ImportError fallback: mypy wants conditional variants to share parameter names (checker limitation)
             return 0.0
     cands: list[tuple[int, float, str, str, bool]] = []
 
@@ -1046,26 +1063,30 @@ async def _oldest_evictable_local(min_idle_s: float, *,
         group = 0 if is_pw else (1 if (prefer_user and owner == prefer_user) else 2)
         cands.append((group, -age, sid, source, is_pw))
 
+    s: object
     try:
-        from core.layers.cli.session import _persistent_sessions, _persistent_sessions_lock
+        from core.layers.cli.session import (
+            _persistent_sessions,
+            _persistent_sessions_lock,
+        )
         async with _persistent_sessions_lock:
             for sid, s in list(_persistent_sessions.items()):
                 consider(sid, s, "cli")
-    except Exception:
+    except ImportError:
         pass
     try:
         from core.layers.direct.session import _direct_sessions, _direct_sessions_lock
         async with _direct_sessions_lock:
             for sid, s in list(_direct_sessions.items()):
                 consider(sid, s, "direct")
-    except Exception:
+    except ImportError:
         pass
     try:
         from core.layers.codex.session import _codex_sessions, _codex_sessions_lock
         async with _codex_sessions_lock:
             for sid, s in list(_codex_sessions.items()):
                 consider(sid, s, "codex")
-    except Exception:
+    except ImportError:
         pass
     try:
         from core.session import interactive_session as _is
@@ -1073,7 +1094,7 @@ async def _oldest_evictable_local(min_idle_s: float, *,
             s = _is.get(sid)
             if s is not None:
                 consider(sid, s, "interactive")
-    except Exception:
+    except ImportError:
         pass
 
     if not cands:
@@ -1095,9 +1116,9 @@ async def _evict_one(sid: str, source: str, is_prewarm: bool = False) -> bool:
             from core.session.prewarm_session_registry import claim
             if not await claim(sid):
                 return False
-        except Exception:
+        except ImportError:
             pass
-    async with _cond:
+    async with cast("asyncio.Condition", _cond):
         if sid not in _sessions:
             return False
         _remove(sid)
@@ -1110,7 +1131,7 @@ async def _evict_one(sid: str, source: str, is_prewarm: bool = False) -> bool:
         else:
             from core.session.session_manager import get_layer_by_path
             await get_layer_by_path(_EVICT_CLOSE[source]).close_session(sid)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # closing an evicted session must not skip the cache reset below
         logger.warning("Concurrency: eviction close failed for %s (%s): %s", sid[:8], source, e)
     # The victim's RSS is freed now — drop the ≤1s live-RAM cache so the
     # eviction loop's immediate re-check reads reality instead of evicting a
@@ -1159,7 +1180,7 @@ def _satellite_stats() -> list[dict]:
     try:
         from core.remote.satellite_connection import get_connection_manager
         return get_connection_manager().concurrency_stats()
-    except Exception:
+    except (ImportError, ValueError, TypeError):
         return []
 
 
@@ -1175,7 +1196,7 @@ async def maintenance_loop() -> None:
         await asyncio.sleep(_MAINTENANCE_INTERVAL_S)
         try:
             await _maintenance_pass()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the maintenance loop's tick: one failed pass must not end the loop
             logger.error("concurrency maintenance loop error: %s", e)
 
 
@@ -1223,7 +1244,7 @@ def _live_local_sids() -> set[str]:
     try:
         from core.session.interactive_session import live_session_ids
         live_sids.update(live_session_ids(local_only=True))
-    except Exception:
+    except ImportError:
         pass
     return live_sids
 
@@ -1268,5 +1289,5 @@ async def _reconciliation_loop() -> None:
             if released:
                 logger.info("Reconciliation released %d orphaned slot(s). reserved=%d/%dMB",
                             released, _reserved_mb, _budget_mb)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the reconciliation loop's tick: one failed pass must not end it
             logger.error("Reconciliation error: %s", e)

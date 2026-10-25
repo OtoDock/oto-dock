@@ -1,6 +1,11 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { usePlatformSettings, useSavePlatformSettings } from './PlatformPage.hooks'
-import { SavedBadge } from './PlatformPage.shared'
+import { SaveState } from '../../components/ui/SettingsControls'
+import InfoTip from '../../components/ui/InfoTip'
+import { useSaveState } from '../../hooks/useSaveState'
+import Button from '../../components/ui/Button'
+import { Input } from '../../components/ui/Field'
+import { FIELD, FIELD_REGULAR, FIELD_BORDER, CARD } from '../../components/ui/classes'
 
 // ---------------------------------------------------------------------------
 // General tab
@@ -11,69 +16,66 @@ export default function GeneralTab() {
 
   const [companyName, setCompanyName] = useState('')
   const [instructions, setInstructions] = useState('')
-  const [savedField, setSavedField] = useState('')
+  const { stateOf, run } = useSaveState()
 
-  useEffect(() => {
-    if (data) {
-      setCompanyName(data.company_name)
-      setInstructions(data.platform_instructions)
-    }
-  }, [data])
-
-  const save = (field: string, value: string | boolean) => {
-    saveMutation.mutate(
-      { [field]: value },
-      { onSuccess: () => { setSavedField(field); setTimeout(() => setSavedField(''), 2000) } },
-    )
+  // The saved settings fill the form when they arrive or change (in render).
+  const [filledFrom, setFilledFrom] = useState(data)
+  if (data && filledFrom !== data) {
+    setFilledFrom(data)
+    setCompanyName(data.company_name)
+    setInstructions(data.platform_instructions)
   }
 
-  if (isLoading) return <p className="text-sm text-p-text-secondary">Loading...</p>
+  const save = (field: string, value: string | boolean) => {
+    void run(field, () => saveMutation.mutateAsync({ [field]: value }), { failTitle: 'The setting was not saved' })
+  }
+
+  if (isLoading) return <p className="text-sm text-secondary">Loading...</p>
 
   return (
     <div className="space-y-6">
       {/* Identity */}
-      <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-5 space-y-5">
-        <h3 className="text-sm font-semibold text-p-text">Identity</h3>
+      <div className={`${CARD} p-5 space-y-5`}>
+        <h3 className="text-sm font-semibold text-primary">Identity</h3>
 
         <div>
-          <label className="block text-sm font-medium text-p-text mb-1">Company Name</label>
-          <p className="text-xs text-p-text-light mb-2">
-            Shown as a heading in every agent's system prompt.
-          </p>
+          <div className="mb-1">
+            <label className="text-sm font-medium text-primary">Company Name</label>
+            <InfoTip label="Company Name">Shown as a heading in every agent's system prompt.</InfoTip>
+            <SaveState state={stateOf('company_name')} />
+          </div>
           <div className="flex items-center gap-2">
-            <input
+            <Input
               type="text"
               value={companyName}
               onChange={(e) => setCompanyName(e.target.value)}
               onBlur={() => { if (companyName !== data?.company_name) save('company_name', companyName) }}
               placeholder="e.g., Acme Corp"
-              className="flex-1 px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
+              className="flex-1"
             />
-            <SavedBadge show={savedField === 'company_name'} />
           </div>
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-p-text mb-1">General Instructions</label>
-          <p className="text-xs text-p-text-light mb-2">
-            Rules and context injected into all agents' prompts.
-          </p>
+          <div className="mb-1">
+            <label className="text-sm font-medium text-primary">General Instructions</label>
+            <InfoTip label="General Instructions">Rules and context injected into all agents' prompts.</InfoTip>
+          </div>
           <textarea
             value={instructions}
             onChange={(e) => setInstructions(e.target.value)}
             rows={6}
             placeholder="e.g., Always respond in English. Be professional and concise."
-            className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 resize-y"
+            className={`${FIELD} ${FIELD_REGULAR} ${FIELD_BORDER} resize-y`}
           />
           <div className="flex items-center mt-2">
-            <button
+            <Button variant="primary" size="xs"
               onClick={() => save('platform_instructions', instructions)}
               disabled={instructions === data?.platform_instructions || saveMutation.isPending}
-              className="px-3 py-1.5 text-xs font-medium rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Save Instructions
-            </button>
-            <SavedBadge show={savedField === 'platform_instructions'} />
+            </Button>
+            <SaveState state={stateOf('platform_instructions')} />
           </div>
         </div>
       </div>

@@ -42,8 +42,8 @@ def _make_app(tmp_path, monkeypatch, *, role: str = "manager", username: str = "
     async def _stub_user():
         return user
 
-    from storage.agents import agent_store
     from storage import database as task_store
+    from storage.agents import agent_store
     monkeypatch.setattr(agent_store, "agent_exists", lambda name: name == "test-agent")
     monkeypatch.setattr(
         task_store, "get_username_by_sub",
@@ -1538,6 +1538,7 @@ def test_zip_response_is_a_file_with_length_and_range(tmp_path, monkeypatch):
 
 def test_zip_second_build_for_same_user_is_429(tmp_path, monkeypatch):
     import threading
+
     from api.agents import files as filesmod
     app, agent_dir = _make_app(tmp_path, monkeypatch)
     (agent_dir / "workspace").mkdir()
@@ -1915,8 +1916,8 @@ def test_session_token_for_another_agent_is_refused_on_every_write_route(tmp_pat
     import config
     from api.agents import agents
     from auth.providers import UserContext, get_current_user
-    from storage.agents import agent_store
     from storage import database as task_store
+    from storage.agents import agent_store
 
     agents_dir = tmp_path / "agents"
     for a in ("test-agent", "other-agent"):
@@ -1965,6 +1966,7 @@ def test_write_routes_run_the_filesystem_work_off_the_loop(tmp_path, monkeypatch
     """The helpers run in a worker thread (a running loop in the
     calling thread means the write ran on the loop)."""
     import asyncio
+
     from services.infra import safe_fs
     app, agent_dir = _make_app(tmp_path, monkeypatch)
     (agent_dir / "workspace").mkdir()
@@ -2051,6 +2053,56 @@ def test_a_zip_download_takes_only_a_token_minted_for_it():
     r = c.get(f"/v1/agents/zip-agent/zip-download?t={foreign}")
     assert r.status_code == 403 and r.json()["detail"] == "Invalid download token"
     minted = _create_zip_token("zip-agent", ["workspace"], "user-x", "viewer", "x")
-    assert _jwt.decode(minted, _config.JWT_SECRET, algorithms=["HS256"])["purpose"] == "zip_download"
+    from auth import tokens
+    assert tokens.decode(minted, tokens.ZIP_DOWNLOAD)["purpose"] == "zip_download"
     r = c.get(f"/v1/agents/zip-agent/zip-download?t={minted}")
     assert r.json().get("detail") != "Invalid download token"
+
+
+# ---------------------------------------------------------------------------
+# A failed file step reads as a plain sentence; the OS's text (with server
+# paths) goes to the log only
+# ---------------------------------------------------------------------------
+
+def test_a_file_error_reads_by_its_class():
+    import errno
+
+    from api.agents.files import _fs_error_reason
+    cases = {
+        errno.ENOENT: "That file or folder no longer exists.",
+        errno.EEXIST: "Something with that name already exists.",
+        errno.ENOTDIR: "A file is in the way of that folder.",
+        errno.EACCES: "OtoDock is not allowed to read or change this file.",
+        errno.EROFS: "These files cannot be changed.",
+        errno.ENOSPC: "The server's disk is full.",
+        errno.EDQUOT: ("This folder reached its storage limit. "
+                       "An admin can raise it in Setup, System Settings."),
+        errno.ENAMETOOLONG: "The name is too long.",
+        errno.ENOTEMPTY: "The folder is not empty.",
+        errno.EBUSY: "The file is in use. Try again in a moment.",
+        errno.EIO: "The disk could not be read or written.",
+        errno.ELOOP: "Could not change the file. The server log has the details.",
+    }
+    for code, sentence in cases.items():
+        assert _fs_error_reason(OSError(code, os.strerror(code), "/srv/agents/acme/x")) == sentence
+
+
+def test_a_refused_step_answers_its_status_without_the_path(caplog):
+    import errno
+
+    from api.agents.files import _fs_refusal
+    from services.infra import safe_fs
+    path = "/srv/agents/acme/workspace/x.md"
+    with caplog.at_level("WARNING", logger="otodock"):
+        refusal = _fs_refusal(PermissionError(errno.EACCES, "Permission denied", path), "acme", "save")
+    assert (refusal.status_code, refusal.detail) == (500, "OtoDock is not allowed to read or change this file.")
+    assert path in caplog.text and "save in agent acme" in caplog.text
+    assert _fs_refusal(OSError(errno.EDQUOT, "Disk quota exceeded", path), "acme", "save").status_code == 507
+    assert _fs_refusal(OSError(errno.ENOSPC, "No space left", path), "acme", "save").detail == (
+        "The server's disk is full.")
+    assert _fs_refusal(FileNotFoundError(2, "x", path), "acme", "delete").detail == (
+        "That file or folder no longer exists.")
+    assert _fs_refusal(FileExistsError(17, "x", path), "acme", "new folder").detail == (
+        "Something with that name already exists.")
+    assert _fs_refusal(safe_fs.SafeFsError("link"), "acme", "rename").detail == (
+        "That path is outside this agent's files.")

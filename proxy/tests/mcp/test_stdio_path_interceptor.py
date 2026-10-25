@@ -19,25 +19,25 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 _REPO_ROOT = _PROXY_DIR.parent
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from auth.path_policy import SecurityContext  # noqa: E402
-from satellite.sessions.mcp_interceptor import (  # noqa: E402
-    wrap_interceptor_in_mcp_config,
-)
+from auth.path_policy import SecurityContext
 from core import placement
-from satellite._vendored.stdio_path_interceptor import (  # noqa: E402
+from satellite._vendored.stdio_path_interceptor import (
     _looks_like_path,
     _process_inbound_line,
     _synthesize_error_response,
     _tokenize_jsonpath,
     _walk,
 )
-
+from satellite.sessions.mcp_interceptor import (
+    wrap_interceptor_in_mcp_config,
+)
 
 # ---------------------------------------------------------------------------
 # JSONPath tokenize + walk
@@ -563,6 +563,7 @@ def test_resolve_tool_arg_paths_refuses_the_machines_own_state(monkeypatch):
     session's declared path argument under the machine's OtoDock folder
     resolves to a refusal, its own tree still translates."""
     from unittest.mock import AsyncMock
+
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 

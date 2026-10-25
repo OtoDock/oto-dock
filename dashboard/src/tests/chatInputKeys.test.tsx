@@ -131,7 +131,7 @@ describe('ChatInput keys on a desktop', () => {
   it('the Send button names its keys', () => {
     render(<ChatInput {...props()} />)
     const send = screen.getByRole('button', { name: 'Send' })
-    expect(send).toHaveAttribute('title', 'Send (Shift+Enter)')
+    expect(send).toHaveAttribute('title', 'Send: Shift+Enter')
     expect(send).toHaveAttribute('aria-keyshortcuts', 'Shift+Enter Control+Enter Meta+Enter')
   })
 })

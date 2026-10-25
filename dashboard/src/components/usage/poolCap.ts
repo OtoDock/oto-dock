@@ -79,8 +79,8 @@ export function describeLimitReached(
     const hit = hitText(s)
     return {
       title: 'Subscription cap reached.',
-      body: `${engineName(s.layer, labels)}${hit ? `: ${hit}` : ''}. It clears as the accounts' windows reset; `
-        + (s.scope === 'user' ? 'change the cap in User Settings → Usage.' : 'an admin can change the cap in Setup → Usage.'),
+      body: `${engineName(s.layer, labels)}${hit ? `: ${hit}` : ''}. It clears as the accounts' windows reset. `
+        + (s.scope === 'user' ? 'You can change the cap in User Settings, Usage.' : 'An admin can change the cap in Admin, Usage.'),
     }
   }
   const self = info?.self
@@ -90,7 +90,7 @@ export function describeLimitReached(
   if (own) {
     return {
       title: 'Your API-key budget is reached.',
-      body: `$${own.used.toFixed(2)} of $${(own.limit ?? 0).toFixed(2)} spent on your own keys. Raise or clear it in User Settings → Usage.`,
+      body: `$${own.used.toFixed(2)} of $${(own.limit ?? 0).toFixed(2)} spent on your own keys. Raise or clear it in User Settings, Usage.`,
     }
   }
   return { title: 'Usage limit reached.', body: 'Contact your administrator to increase your limit.' }
@@ -100,7 +100,7 @@ export function describeLimitReached(
 export function describeLimitWarning(info: LimitPayload | null, labels: Record<string, string> = {}): string {
   if (info?.pool) {
     const s = info.pool
-    if (s.hits.length) return `Subscription cap reached (${hitText(s)}); continuing on an API key.`
+    if (s.hits.length) return `Subscription cap reached: ${hitText(s)}. Continuing on an API key.`
     const key = warningField(s)
     if (key) return `Subscription cap: ${describeReading(s, key)} on ${engineName(s.layer, labels)}.`
   }

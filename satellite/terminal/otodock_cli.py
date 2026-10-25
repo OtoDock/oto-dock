@@ -31,39 +31,69 @@ import re
 import signal
 import sys
 import threading
+
 # NOTE: ``termios``/``tty`` are POSIX-only and imported lazily inside
 # _PosixTerminal; ``ctypes`` is imported lazily inside _WindowsTerminal. Nothing
 # platform-specific loads at module import, so the client imports on both OSes.
 
 try:  # package import (the normal case: python -m satellite.otodock_cli)
-    from .otodock_proto import (
-        read_frame, encode, encode_json,
-        T_OPEN, T_INPUT, T_RESIZE, T_LIST,
-        T_OPENED, T_ERROR, T_OUTPUT, T_EXIT, T_LISTED,
-    )
-    from .local_socket import (
-        socket_path, named_pipe_path, set_pipe_byte_mode,
-        verify_pipe_server_identity,
-    )
     from .._vendored.terminal_queries import TERMINAL_MODE_RESET
-except ImportError:  # pragma: no cover - standalone fallback
-    from otodock_proto import (  # type: ignore
-        read_frame, encode, encode_json,
-        T_OPEN, T_INPUT, T_RESIZE, T_LIST,
-        T_OPENED, T_ERROR, T_OUTPUT, T_EXIT, T_LISTED,
-    )
-    from local_socket import (  # type: ignore
-        socket_path, named_pipe_path, set_pipe_byte_mode,
+    from .local_socket import (
+        named_pipe_path,
+        set_pipe_byte_mode,
+        socket_path,
         verify_pipe_server_identity,
     )
+    from .otodock_proto import (
+        T_ERROR,
+        T_EXIT,
+        T_INPUT,
+        T_LIST,
+        T_LISTED,
+        T_OPEN,
+        T_OPENED,
+        T_OUTPUT,
+        T_RESIZE,
+        encode,
+        encode_json,
+        read_frame,
+    )
+except ImportError:  # pragma: no cover - standalone fallback
     import os as _os
     import sys as _sys
+
+    from local_socket import (  # type: ignore
+        named_pipe_path,
+        set_pipe_byte_mode,
+        socket_path,
+        verify_pipe_server_identity,
+    )
+    from otodock_proto import (  # type: ignore
+        T_ERROR,
+        T_EXIT,
+        T_INPUT,
+        T_LIST,
+        T_LISTED,
+        T_OPEN,
+        T_OPENED,
+        T_OUTPUT,
+        T_RESIZE,
+        encode,
+        encode_json,
+        read_frame,
+    )
     _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
     from _vendored.terminal_queries import TERMINAL_MODE_RESET  # type: ignore
 
 _GS = 0x1d  # Ctrl-] — the detach escape lead-in (then 'q')
 
 _EXEC_PATHS = {"claude": "claude-code-cli", "codex": "codex-cli"}
+#: ``--mode``'s words → the platform's, which the proxy takes as they are (a
+#: satellite before 1.9 sent the word as typed, and the proxy reads its
+#: ``auto`` as Don't Ask). ``default`` and ``acceptEdits`` are the words
+#: before 1.9.
+_MODES = {"ask": "ask", "auto": "autoReview", "dontAsk": "dontAsk", "plan": "plan",
+          "default": "ask", "acceptEdits": "autoReview"}
 
 # Terminal device-query sequences (Primary DA ``ESC[…c`` + DSR ``ESC[…n``). On
 # Windows the satellite's OUTER ConPTY emits a DA query into the PTY output; if we
@@ -145,7 +175,7 @@ async def _connect_windows():
     return reader, writer
 
 
-async def _pick_resume_chat(agent: str, execution_path: str) -> "tuple[str, str] | None":
+async def _pick_resume_chat(agent: str, execution_path: str) -> tuple[str, str] | None:
     """--resume: fetch the owner's resumable chats for this agent/CLI and let the
     user pick one. Returns ``(chat_id, title)``, or None to cancel."""
     conn = await _connect()
@@ -188,7 +218,7 @@ async def _pick_resume_chat(agent: str, execution_path: str) -> "tuple[str, str]
             line += f"  ({folder})"
         print(line)
     try:
-        choice = input("\nResume which? [number, Enter to cancel]: ").strip()
+        choice = input("\nResume which? [number, Enter to cancel]: ").strip()  # noqa: ASYNC250  # the terminal's own prompt: a thread would hold Ctrl+C until Enter
     except (EOFError, KeyboardInterrupt):
         return None
     if not choice:
@@ -207,8 +237,8 @@ async def _pick_resume_chat(agent: str, execution_path: str) -> "tuple[str, str]
 async def _run(args: argparse.Namespace) -> int:
     cli = args.cli
     execution_path = _EXEC_PATHS[cli]
-    cwd = os.path.realpath(args.folder or os.getcwd())
-    if not os.path.isdir(cwd):
+    cwd = os.path.realpath(args.folder or os.getcwd())  # noqa: ASYNC240  # once as the command starts, before anything runs on the loop
+    if not os.path.isdir(cwd):  # noqa: ASYNC240  # once as the command starts, before anything runs on the loop
         print(f"otodock: not a directory: {cwd}", file=sys.stderr)
         return 2
 
@@ -231,7 +261,7 @@ async def _run(args: argparse.Namespace) -> int:
         "execution_path": execution_path,
         "cwd": cwd,
         "model": args.model or "",
-        "mode": args.mode or "default",
+        "mode": _MODES[args.mode],
         "rows": rows, "cols": cols,
         # Forward the local terminal's $TERM so the remote PTY renders to match
         # the user's actual terminal (the satellite otherwise forces
@@ -304,7 +334,7 @@ def _feed_stdin(data, *, writer, escape_armed, finish, exit_code) -> None:
     if out:
         try:
             writer.write(encode(T_INPUT, bytes(out)))
-        except Exception:
+        except (OSError, RuntimeError):
             finish(exit_code["v"])
 
 
@@ -485,7 +515,7 @@ class _WindowsTerminal:
             self._old_out_cp = self._k.GetConsoleOutputCP()
             self._k.SetConsoleCP(self._CP_UTF8)
             self._k.SetConsoleOutputCP(self._CP_UTF8)
-        except Exception:
+        except Exception:  # noqa: BLE001  # ctypes console calls into kernel32 raise by the platform's rules
             pass
 
     def _stdin_loop(self) -> None:
@@ -520,7 +550,7 @@ class _WindowsTerminal:
                     try:
                         self.writer.write(
                             encode_json(T_RESIZE, {"rows": sz[0], "cols": sz[1]}))
-                    except Exception:
+                    except (OSError, RuntimeError):
                         return
         except asyncio.CancelledError:
             return
@@ -567,7 +597,7 @@ class _WindowsTerminal:
                 self._k.SetConsoleCP(self._old_in_cp)
             if self._old_out_cp:
                 self._k.SetConsoleOutputCP(self._old_out_cp)
-        except Exception:
+        except Exception:  # noqa: BLE001  # restoring the console modes on the way out
             pass
 
     def teardown(self) -> None:
@@ -656,7 +686,7 @@ async def _relay(reader, writer, *, cli: str = "", agent: str = "",
     return exit_code["v"]
 
 
-def main(argv: "list[str] | None" = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="otodock",
         description="Run an interactive Claude/Codex session as your otodock agent "
@@ -669,8 +699,8 @@ def main(argv: "list[str] | None" = None) -> int:
     parser.add_argument("--folder", default="",
                         help="working directory (default: current directory)")
     parser.add_argument("--model", default="", help="override the model")
-    parser.add_argument("--mode", default="default",
-                        help="permission mode (default | plan | acceptEdits | auto)")
+    parser.add_argument("--mode", default="auto", choices=sorted(_MODES), metavar="MODE",
+                        help="permission mode: ask | auto | dontAsk | plan (default: auto)")
     parser.add_argument("--resume", action="store_true",
                         help="pick a previous conversation to resume")
     args = parser.parse_args(argv)

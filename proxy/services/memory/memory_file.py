@@ -42,9 +42,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import config
-from services.infra import safe_fs
-from services.infra.path_confinement import PathOutsideRoot, join_under, normalize_rel_path
 from core import layout
+from services.infra import safe_fs
+from services.infra.path_confinement import (
+    PathOutsideRoot,
+    join_under,
+    normalize_rel_path,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -174,11 +178,11 @@ def validate_rel(rel: str, *, mutating: bool = False, require_ext: bool = False)
         return ""
     try:
         normalize_rel_path(norm)
-    except PathOutsideRoot:
+    except PathOutsideRoot as exc:
         raise MemoryOpError(
             f"The path contains an invalid segment ({rel!r}). "
             "Please provide a valid path."
-        )
+        ) from exc
     for seg in parts:
         if seg.startswith("."):
             raise MemoryOpError(

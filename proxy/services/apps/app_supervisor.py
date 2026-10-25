@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import http.cookiejar
 import logging
 import os
 import signal
@@ -30,13 +31,14 @@ import socket
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import httpx
 
+from auth import roles
 from services.apps import app_sandbox, app_tokens, releases
 from services.scripts.runner import scrub
 from storage import database as task_store
-from auth import roles
 
 logger = logging.getLogger("otodock.apps")
 
@@ -176,7 +178,7 @@ def _allow_hosts(row: dict) -> list[str]:
     addresses only: a carve is a /32 that outranks the private-range
     blackholes, so a name its author points at a LAN or container address
     would open that address to the server."""
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     from services.infra.outbound_url import ip_blocked
     out: list[str] = []
     for host in _mf.parse_egress(row):
@@ -186,7 +188,7 @@ def _allow_hosts(row: dict) -> list[str]:
             logger.warning("App %s: egress host %s did not resolve", row.get("slug"), host)
             continue
         for info in infos:
-            addr = info[4][0]
+            addr: str = info[4][0]  # type: ignore[assignment]  # typeshed types getaddrinfo()[4][0] as str | int; it is a str for AF_INET and AF_INET6
             if ip_blocked(addr):
                 logger.warning("App %s: egress host %s resolved to %s, not a public address; "
                                "not opened", row.get("slug"), host, addr)
@@ -622,13 +624,13 @@ async def smoke(row: dict, tree_dir: Path) -> dict:
         # The declared hosts open only once a person approved the manifest
         # (the rendered check's rule); a smoke of an unapproved manifest
         # runs with none.
-        allow = None if task_store.app_actions_approved(row) else []
+        allow: list[str] | None = None if task_store.app_actions_approved(row) else []
         try:
             inst = await start(row, CHECK, release_dir=tree_dir, data_dir=Path(scratch),
                                allow_hosts=allow)
         except (app_sandbox.AppStartError, AppUnavailable) as e:
-            inst = _instances.pop(key, None)
-            tail = "\n".join(inst._tail[-20:]) if inst else ""
+            failed = _instances.pop(key, None)
+            tail = "\n".join(failed._tail[-20:]) if failed else ""
             return {"ok": False, "server": "failed", "reason": str(e), "log": tail}
         tail = "\n".join(inst._tail[-20:])
         await stop(row["id"], CHECK)
@@ -666,7 +668,7 @@ async def sweep_once() -> None:
 
 def _row_and_dormancy(row_id: str) -> tuple[dict | None, bool]:
     row = task_store.get_app(row_id)
-    return row, bool(row) and task_store.personal_row_dormant(row)
+    return row, bool(row) and task_store.personal_row_dormant(cast("dict", row))
 
 
 async def sweep_loop() -> None:
@@ -686,3 +688,42 @@ async def stop_all() -> None:
     await app_handlers.cancel_drains()
     for key in list(_instances):
         await stop(key[0], key[1])
+
+
+UPSTREAM_TIMEOUT_S = 30.0
+
+
+_client: httpx.AsyncClient | None = None
+
+
+class _NoCookieJar(http.cookiejar.CookieJar):
+    """A jar that keeps nothing: every app server lives on the same
+    loopback host, so a jar would replay one app's ``Set-Cookie`` to every
+    other app."""
+
+    def extract_cookies(self, response, request) -> None:
+        return None
+
+    def add_cookie_header(self, request) -> None:
+        return None
+
+
+def _http() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT_S, follow_redirects=False)
+        _client.cookies.jar = _NoCookieJar()
+    return _client
+
+
+async def forward(inst: Instance, method: str, path: str,
+                  headers: list[tuple[str, str]], body: bytes, *,
+                  timeout: float = UPSTREAM_TIMEOUT_S) -> httpx.Response:
+    """One request to a running instance over the shared client (no cookie
+    jar, no redirects), streamed — the caller reads and closes it. Shared by
+    the proxied routes, the handler fire (``services/apps/app_handlers.py``)
+    and the bindings broker."""
+    client = _http()
+    req = client.build_request(method, f"{inst.base_url}{path}", headers=headers,
+                               content=body, timeout=timeout)
+    return await client.send(req, stream=True)

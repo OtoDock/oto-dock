@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, Route, Routes } from 'react-router-dom'
 
 // Shared mock state — hoisted so the vi.mock factories below can close over it.
 const h = vi.hoisted(() => ({
@@ -15,7 +15,8 @@ vi.mock('@/api/agents', () => ({
 vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: { role: 'admin', sub: 'u1', agent_roles: {} } }),
 }))
-vi.mock('@/api/communityAgents', () => ({
+vi.mock('@/api/communityAgents', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/api/communityAgents')>()),
   useInstallCommunityAgent: () => ({ mutateAsync: h.installMock, isPending: false }),
   useInstallPreview: () => h.preview,
 }))
@@ -106,7 +107,7 @@ describe('AgentInstallModal — blocked-MCP gating', () => {
     renderModal()
     expect(screen.getByTestId('consent-app-home')).toHaveTextContent('one copy for each member')
     expect(screen.getByTestId('manifest-summary')).toHaveTextContent('api.open-meteo.com')
-    expect(screen.getByTestId('consent-check-lint')).toHaveTextContent('(mandatory)')
+    expect(screen.getByTestId('consent-check-lint')).toHaveTextContent(', mandatory')
     expect(screen.getByText(/for everyone who gets a copy/)).toBeInTheDocument()
     const button = screen.getByRole('button', { name: /Install and approve/ })
     fireEvent.click(button)
@@ -132,7 +133,7 @@ describe('AgentInstallModal — blocked-MCP gating', () => {
       checks: [{ name: 'lint', description: '', mandatory: false, applies: [], script: '', sig: 's', words: '' }],
     }
     renderModal()
-    expect(screen.getByText(/members approve theirs/)).toBeInTheDocument()
+    expect(screen.getByText(/Members approve theirs/)).toBeInTheDocument()
   })
 
   it('surfaces the server 400 detail message inline on install failure', async () => {
@@ -147,5 +148,78 @@ describe('AgentInstallModal — blocked-MCP gating', () => {
     await waitFor(() =>
       expect(screen.getByText(/Template requires 1 MCP/)).toBeInTheDocument(),
     )
+  })
+})
+
+describe('AgentInstallModal — what an install left out', () => {
+  beforeEach(() => {
+    h.installMock.mockReset()
+    h.preview.data = previewData([])
+    h.preview.isLoading = false
+  })
+
+  function mountRouted(onClose = vi.fn()) {
+    render(
+      <MemoryRouter initialEntries={['/agents']}>
+        <Routes>
+          <Route path="/agents" element={<AgentInstallModal open mode="install" template={template} onClose={onClose} />} />
+          <Route path="/agents/:slug/config" element={<p>config page</p>} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    return onClose
+  }
+
+  it('holds the dialog on the tasks whose model choice was left out, then opens the agent', async () => {
+    h.installMock.mockResolvedValue({ agent_slug: 'personal-assistant-pro', task_pins_dropped: ["The task 'digest' runs on the agent's usual model and engine. The model gpt-x is not turned on for OpenAI Codex."] })
+    const onClose = mountRouted()
+    fireEvent.click(installButton())
+    expect(await screen.findByText('Agent installed')).toBeInTheDocument()
+    const box = screen.getByTestId('install-pins-dropped')
+    expect(box.textContent).toContain('Model choices left out')
+    expect(box.textContent).toContain("The task 'digest' runs on the agent's usual model and engine.")
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Open the agent' }))
+    expect(onClose).toHaveBeenCalled()
+    expect(await screen.findByText('config page')).toBeInTheDocument()
+  })
+
+  it('closes the "Agent installed" dialog with Close and stays on the page', async () => {
+    h.installMock.mockResolvedValue({ agent_slug: 'personal-assistant-pro', task_pins_dropped: ["The task 'digest' runs on the agent's usual model and engine. The model gpt-x is not turned on for OpenAI Codex."] })
+    const onClose = mountRouted()
+    fireEvent.click(installButton())
+    expect(await screen.findByText('Agent installed')).toBeInTheDocument()
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText('config page')).toBeNull()
+  })
+
+  it('opens the agent at once when nothing was left out, an older proxy included', async () => {
+    h.installMock.mockResolvedValue({ agent_slug: 'personal-assistant-pro' })
+    const onClose = mountRouted()
+    fireEvent.click(installButton())
+    expect(await screen.findByText('config page')).toBeInTheDocument()
+    expect(onClose).toHaveBeenCalled()
+    expect(screen.queryByText('Agent installed')).toBeNull()
+  })
+
+  it("lists a refused template's problems apart, and a plain refusal as its sentence", async () => {
+    h.installMock.mockRejectedValueOnce(Object.assign(new Error('a; b'), {
+      status: 400,
+      body: { detail: { error: 'invalid_template', message: 'a; b', problems: ['agent.json: name is missing', 'tasks/x.json: cron is not valid'] } },
+    }))
+    mountRouted()
+    fireEvent.click(installButton())
+    const box = await screen.findByTestId('install-problems')
+    expect(box.querySelectorAll('li')).toHaveLength(2)
+    expect(box.textContent).toContain('This template cannot be installed')
+
+    h.installMock.mockRejectedValueOnce(Object.assign(new Error('Invalid catalog template: agent.json: name is missing'), {
+      status: 400, body: { detail: 'Invalid catalog template: agent.json: name is missing' },
+    }))
+    fireEvent.click(installButton())
+    expect(await screen.findByText('Invalid catalog template: agent.json: name is missing')).toBeInTheDocument()
+    expect(screen.queryByTestId('install-problems')).toBeNull()
   })
 })

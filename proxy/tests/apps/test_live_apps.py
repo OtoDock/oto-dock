@@ -82,6 +82,7 @@ def clock(monkeypatch):
     (100 ms for a push, 500 ms for a state write) must not depend on how
     fast the runner gets from one request to the next."""
     from types import SimpleNamespace
+
     from api.apps import apps as apps_api
     now = [1000.0]
     monkeypatch.setattr(apps_api, "time", SimpleNamespace(monotonic=lambda: now[0]))
@@ -260,6 +261,7 @@ async def test_drain_live_queue_forwards_everything_waiting():
     from ws.dashboard import DashboardConnection
     conn = DashboardConnection.__new__(DashboardConnection)
     conn.live_queue = nm.LiveQueue()
+    conn.notify_queue = nm.NotifyQueue()
     sent: list[dict] = []
 
     async def _send(d: dict) -> None:
@@ -362,7 +364,7 @@ def test_focus_line_only_for_a_visible_app_and_honours_the_setting(people):
 def test_prelude_matchers_strip_the_focus_line_for_titles():
     import ws.dashboard  # noqa: F401 — module import order
     from core.session.transcript_tailer import _title_from_prompt
-    from services.title_generator import deterministic_title
+    from storage.chat.chat_titles import deterministic_title
     from ws.dashboard_chat_text import _TIME_PRELUDE_RE as ws_re
     text = (
         "[Current time: Monday, June 1, 2026 10:00 (10:00 AM) Europe/Athens (UTC+03:00)]\n\n"
@@ -380,9 +382,12 @@ def test_prelude_matchers_strip_a_task_runs_parallel_activity_line():
     # A task run's first prompt carries the parallel-activity line after the
     # time; a satellite single-lines a Codex launch prompt.
     import ws.dashboard  # noqa: F401 — module import order
-    from core.session.codex_rollout_tailer import _title_from_prompt as codex_title, _user_row_key
+    from core.session.codex_rollout_tailer import (
+        _title_from_prompt as codex_title,
+        _user_row_key,
+    )
     from core.session.transcript_tailer import _title_from_prompt
-    from services.title_generator import deterministic_title
+    from storage.chat.chat_titles import deterministic_title
     from ws.dashboard_chat_text import _TIME_PRELUDE_RE as ws_re
     stamp = "[Current time: Friday, October 9, 2026 06:00 (6:00 AM) UTC (UTC+00:00)]"
     parallel = ("[Parallel activity — for awareness only, no action needed: sibling "

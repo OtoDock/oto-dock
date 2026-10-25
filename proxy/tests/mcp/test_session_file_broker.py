@@ -15,14 +15,15 @@ import pytest
 from fastapi import HTTPException
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-import config  # noqa: E402
-from core.credentials import mcp_broker  # noqa: E402
-from core.credentials.mcp_broker import SessionFile  # noqa: E402
+import config
 from core import placement
+from core.credentials import mcp_broker
+from core.credentials.mcp_broker import SessionFile
 
 
 @pytest.fixture(autouse=True)
@@ -242,6 +243,7 @@ def test_a_token_file_that_needs_a_reconnect_is_not_delivered(token_source, body
 
 def _remote_cfg(scope="user", username="alice", user_sub="sub-1"):
     from types import SimpleNamespace
+
     from core.execution_layer import AgentConfig
     return AgentConfig(
         agent_name="agent", user_sub=user_sub,
@@ -286,6 +288,7 @@ def test_a_judge_is_never_handed_the_ssh_keys(stub_collectors):
     """A check's judge (read_only) reads: on an admin-paired machine it gets
     the token files its MCPs may need, never the agent's SSH keys."""
     from types import SimpleNamespace
+
     from core.remote.remote_execution import _collect_session_files
     cfg = _remote_cfg()
     cfg.security_context = SimpleNamespace(session_scope="user", username="alice", read_only=True)
@@ -296,6 +299,7 @@ def test_a_judge_is_never_handed_the_ssh_keys(stub_collectors):
 def test_session_takes_ssh_keys():
     from types import SimpleNamespace
     from unittest.mock import MagicMock
+
     from core.sandbox.session_config_dir import session_takes_ssh_keys
     # The editor tier, read off the context's role; anything else is no keys.
     assert session_takes_ssh_keys(SimpleNamespace(role="editor", read_only=False)) is True
@@ -368,8 +372,8 @@ def test_shared_only_chat_resolves_as_service_scope(monkeypatch, tmp_path):
 
 def test_context_only_mcp_allowed_on_admin_paired_remote(monkeypatch, tmp_path):
     from services.mcp import mcp_registry
-    from tests.mcp.test_ssh_hosts import _context_only_manifest
     from tests.mcp.test_mcp_broker_activation import _stub_assembly
+    from tests.mcp.test_ssh_hosts import _context_only_manifest
     _stub_assembly(
         monkeypatch, [_context_only_manifest()], env_by_mcp={}, tmp_path=tmp_path,
     )
@@ -388,6 +392,7 @@ def test_context_only_mcp_allowed_on_admin_paired_remote(monkeypatch, tmp_path):
 
 def test_provider_renders_on_admin_paired_remote():
     from unittest.mock import patch
+
     from services.mcp.dynamic_context import _ssh_hosts_context
 
     rows = [{"id": 1, "field_values": {"name": "x", "host": "10.0.0.5",

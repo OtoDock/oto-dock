@@ -1,13 +1,13 @@
 /** The semantic-zoom state machine of the 3D map: enterStage / findCluster
  * / exitStage / pageDelta with their stable refs, the desktop arrow keys,
  * the stage-pose and whole-map-pose effects, Esc and the pager-strip
- * centering (split out of AgentsMap3D.tsx on 2026-09-10; every dependency
- * array is the component's, verbatim). */
-import { useCallback, useEffect, useRef } from 'react'
+ * centering (split out of AgentsMap3D.tsx on 2026-09-10). */
+import { useCallback, useEffect, useEffectEvent, useRef } from 'react'
 import type { Dispatch, RefObject, SetStateAction } from 'react'
 import * as THREE from 'three'
 import type { User } from '../../api/auth'
 import { pushEscHandler } from '../../lib/escStack'
+import { blockedByModal } from '../../lib/ui/modalLayers'
 import { stageExitPath } from './camera'
 import type { MapCluster, MapLayout, StageLayout } from './layout'
 import { STAGE_CAM_MAX, STAGE_CAM_MIN } from './mapConstants'
@@ -35,7 +35,7 @@ export function useStageMachine({
     setPopup(null)
     setMenu(null)
     setStage((cur) => (cur?.deptId === deptId ? cur : { deptId }))
-  }, [])
+  }, [setPopup, setMenu, setStage])
   const enterStageRef = useRef(enterStage)
   useEffect(() => { enterStageRef.current = enterStage }, [enterStage])
 
@@ -93,7 +93,7 @@ export function useStageMachine({
     // The flight lands into the paged whole-map machinery, standing
     // behind the exited department.
     setMapDept(cluster.departmentId)
-  }, [layout])
+  }, [bagRef, layout, setStage, setMapDept])
   const exitStageRef = useRef(exitStage)
   useEffect(() => { exitStageRef.current = exitStage }, [exitStage])
 
@@ -111,7 +111,7 @@ export function useStageMachine({
     const next = order[(i + dir + order.length) % order.length]
     if (bag.stageId !== null) setStage({ deptId: next })
     else setMapDept(next)
-  }, [layout])
+  }, [bagRef, layout, setStage, setMapDept])
   const pageDeltaRef = useRef(pageDelta)
   useEffect(() => { pageDeltaRef.current = pageDelta }, [pageDelta])
 
@@ -122,7 +122,7 @@ export function useStageMachine({
   // the map never steals keys from a form.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return
+      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || blockedByModal(e)) return
       const el = document.activeElement
       if (
         el instanceof HTMLElement
@@ -153,7 +153,28 @@ export function useStageMachine({
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [])
+  }, [bagRef, setStage])
+
+  // Remembered across sessions: the next open parks the camera at this pose
+  // while the data loads (see the renderer-setup note). Written ONLY when
+  // the stage IS the favorite's department — the parked pose is by
+  // construction the favorite's own stage, so the next open can never park
+  // rotated to the last-visited department. An effect event: a favorite
+  // change alone never re-runs the stage pose.
+  const rememberStagePose = useEffectEvent((
+    deptId: string, cam: THREE.Vector3, look: THREE.Vector3,
+  ) => {
+    try {
+      if (user?.default_agent && deptId === favDeptRef.current) {
+        localStorage.setItem('odk-map-pose-v2', JSON.stringify({
+          c: cam.toArray(),
+          t: look.toArray(),
+          d: deptId,
+          f: user.default_agent,
+        }))
+      }
+    } catch { /* storage blocked — cosmetic only */ }
+  })
 
   // Stage pose: compute the composed Vision-Pro framing whenever the staged
   // cluster (or its members) change — entering initializes the lerp from
@@ -229,23 +250,8 @@ export function useStageMachine({
       bag.stageCamPos!.copy(bag.stageCamGoal)
       bag.stageLook!.copy(bag.stageLookGoal)
     }
-    try {
-      // Remembered across sessions: the next open parks the camera here
-      // while the data loads (see the renderer-setup note). Written ONLY
-      // when this stage IS the favorite's department — the parked pose is
-      // by construction the favorite's own stage, so the next open can
-      // never park rotated to the last-visited department.
-      if (user?.default_agent && stage.deptId === favDeptRef.current) {
-        localStorage.setItem('odk-map-pose-v2', JSON.stringify({
-          c: bag.stageCamGoal.toArray(),
-          t: bag.stageLookGoal.toArray(),
-          d: stage.deptId,
-          f: user.default_agent,
-        }))
-      }
-    } catch { /* storage blocked — cosmetic only */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stage, stageData])
+    rememberStagePose(stage.deptId, bag.stageCamGoal, bag.stageLookGoal)
+  }, [bagRef, stage, stageData, setStage])
 
   // Whole-map paged pose (round 16): compose the behind-department framing
   // whenever the paged overview is active — paging lerps between poses,
@@ -295,7 +301,7 @@ export function useStageMachine({
       bag.mapCamPos.copy(pose.cam)
       bag.mapLook.copy(pose.look)
     }
-  }, [stage, mapDept, layout])
+  }, [bagRef, stage, mapDept, layout, setMapDept])
 
   // Esc backs out one level (keyboard affordance, not a button).
   useEffect(() => {

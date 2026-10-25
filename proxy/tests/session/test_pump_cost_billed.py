@@ -13,6 +13,7 @@ Run: env TEST_DATABASE_URL=... venv/bin/python -m pytest tests/session/test_pump
 import asyncio
 import json
 
+import psycopg
 import pytest
 
 from core.events import chat_writer
@@ -227,11 +228,53 @@ async def test_mcp_fee_frame_is_billed(temp_db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_mcp_fee_is_persisted_in_its_own_row(temp_db, monkeypatch):
+    """A reload adds the fees back up from their rows: the metadata row holds
+    the model's cost only, so the fee gets a row of its own kind."""
+    from core.events.common_events import TOOL_RESULT, TOOL_USE
+    from services.mcp import mcp_cost_engine
+
+    temp_db.create_chat("cb9", "user-admin", "a1")
+    _bill(monkeypatch, {"sess-cb9": False})
+    monkeypatch.setattr(
+        mcp_cost_engine, "find_costs_block_for_tool",
+        lambda name: ("image-gen-mcp", "generate_image", object()),
+    )
+    monkeypatch.setattr(
+        mcp_cost_engine, "evaluate",
+        lambda *a, **k: mcp_cost_engine.CostHit(
+            amount=0.04, provider="openai", model="gpt-image-1", currency="USD"),
+    )
+    pump = _mk_pump("cb9")
+    try:
+        pump.attach()
+        tool = {"name": "mcp__image-gen-mcp__generate_image", "tool_id": "t1"}
+        await pump._process_event(CommonEvent(type=TOOL_USE, data=dict(tool)))
+        await pump._process_event(CommonEvent(type=TOOL_RESULT, data=dict(tool)))
+        await pump._process_event(CommonEvent(type=METADATA, data={
+            "cost_usd": 0.0, "cost_is_delta": True,
+        }))
+        pump._save_turn_blocks()
+        assert await chat_writer.drain("cb9", timeout=5)
+    finally:
+        pump.producer.cancel()
+    rows = [(r["event_type"], json.loads(r["event_data"]))
+            for r in task_store.get_chat_messages("cb9") if r["role"] == "event"]
+    kinds = [k for k, _ in rows]
+    assert kinds.index("mcp_cost") < kinds.index("metadata")
+    assert [d for k, d in rows if k == "mcp_cost"] == [{
+        "type": "mcp_cost", "cost_usd": 0.04, "cost_billed": True,
+        "provider": "openai", "model": "gpt-image-1",
+        "tool": "generate_image", "mcp": "image-gen-mcp",
+    }]
+
+
+@pytest.mark.asyncio
 async def test_lookup_failure_shows_the_cost(temp_db, monkeypatch):
     temp_db.create_chat("cb6", "user-admin", "a1")
 
     def _boom(_sid):
-        raise RuntimeError("store down")
+        raise psycopg.OperationalError("store down")
 
     monkeypatch.setattr(subscription_pool, "session_cost_billed", _boom)
     pump = _mk_pump("cb6")

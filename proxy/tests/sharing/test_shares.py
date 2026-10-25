@@ -671,7 +671,7 @@ def test_a_person_accepts_an_app_into_an_agent_of_theirs_and_leaving_it_unplaces
     newcomer = _newcomer()
     # Pending opens, with the share's cap as the role; nothing is placed.
     assert apps_api.app_access(row, newcomer) is True
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     assert _mf.caller_role(row, newcomer) == "editor"
     _as(newcomer)
     assert [a for a in _panel(RECEIVING) if a.get("placement")] == []
@@ -901,6 +901,7 @@ def test_a_person_removes_a_share_they_accepted_and_may_be_shared_it_again():
     the sharer's list and the admin list lose it at once; a new share
     works."""
     import asyncio as _asyncio
+
     from services.notifications import notification_manager as nm
     from tests.session.test_notification_fanout import _Conn, _frames
     _agents()
@@ -1077,6 +1078,7 @@ def test_a_removal_beside_a_team_placement_leaves_the_team_row_at_its_own_cap():
 
 def test_a_demoted_admin_removes_a_placement_in_an_agent_they_no_longer_hold():
     import asyncio as _asyncio
+
     from services.notifications import notification_manager as nm
     from tests.session.test_notification_fanout import _Conn, _frames
     _agents()
@@ -1175,6 +1177,7 @@ def test_a_removed_share_stays_removed_through_every_reap():
     reconcile, an agent delete) set a share back to pending; a revoked row
     keeps its placed agent, and every reap leaves revoked rows alone."""
     import asyncio as _asyncio
+
     from services.agents import offboarding, offboarding_transfer
     from storage.agents import agent_store
     _agents()
@@ -1245,6 +1248,7 @@ def test_the_focus_line_names_a_placed_app_the_viewer_looks_at():
     """The focus line reads the row through ``app_access``, so an agent
     placement and a person's own placement name the app like a home row."""
     import asyncio as _asyncio
+
     from services.apps import focus_context
     from services.notifications import notification_manager as nm
     _agents()
@@ -1311,6 +1315,7 @@ def test_a_placement_hide_is_per_agent_and_the_audience_follows_it():
 
 def test_share_inbox_frames_reach_the_connected_recipients():
     import asyncio as _asyncio
+
     from services.notifications import notification_manager as nm
     from tests.session.test_notification_fanout import _Conn, _frames
     _agents()
@@ -1340,6 +1345,7 @@ def test_share_inbox_frames_reach_the_connected_recipients():
 
 def test_a_moved_placement_names_the_agent_it_left_in_the_frame():
     import asyncio as _asyncio
+
     from services.notifications import notification_manager as nm
     from tests.session.test_notification_fanout import _Conn, _frames
     _agents()
@@ -1366,7 +1372,7 @@ def test_a_moved_placement_names_the_agent_it_left_in_the_frame():
 
 
 def test_viewer_me_reports_the_role_the_share_gives():
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     _agents()
     me = {"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}
     canonical, err = _mf.validate_actions([me], AGENT, True)
@@ -1689,7 +1695,7 @@ def test_an_expired_share_takes_no_decision():
 
 
 def test_the_list_s_viewer_role_is_the_role_the_floors_judge():
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     from services.departments import edge_compiler
     from storage.agents import agent_store, db_departments
     _agents()
@@ -1725,6 +1731,7 @@ def test_the_list_s_viewer_role_is_the_role_the_floors_judge():
 
 def test_a_demoted_admin_s_placement_returns_to_their_section():
     import asyncio as _asyncio
+
     from services.agents import offboarding, offboarding_transfer
     _agents()
     row = _shared()
@@ -1870,6 +1877,7 @@ def test_the_admin_list_keeps_the_newest_of_each_kind_and_says_when_it_cut(monke
 
 def test_an_admin_revoke_from_the_list_ends_a_share_everywhere_and_tells_nobody():
     import asyncio as _asyncio
+
     from services.notifications import notification_manager as nm
     from tests.session.test_notification_fanout import _Conn, _frames
     _agents()

@@ -182,7 +182,7 @@ def _stage_skill(source: Path, skill_id: str, description: str,
         body = scrub_frontmatter(raw.decode("utf-8"), origin=str(source))
         safe_fs.atomic_write_beneath(
             config.AGENTS_DIR, f"{staging_rel}/SKILL.md",
-            f"---\n{fm}---\n\n{body}".encode("utf-8"), fsync=False,
+            f"---\n{fm}---\n\n{body}".encode(), fsync=False,
         )
 
 

@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { ScrollableTabs } from '../../components/ScrollableTabs'
+import { PAGE_TITLE } from '../../components/ui/classes'
 import GeneralTab from './GeneralTab'
 import ExecutionLayersTab from './ExecutionLayersTab'
 import OtodockTab from './OtodockTab'
@@ -34,12 +35,16 @@ export default function PlatformPage() {
   const [params] = useSearchParams()
   const asked = asTab(params.get('tab'))
   const [tab, setTab] = useState<Tab>(asked ?? 'general')
-  useEffect(() => { if (asked) setTab(asked) }, [asked])
+  const [asking, setAsking] = useState(asked)
+  if (asking !== asked) {
+    setAsking(asked)
+    if (asked) setTab(asked)
+  }
 
   return (
     <div className="max-w-3xl">
-      <h2 className="text-lg font-semibold text-p-text mb-1">Setup</h2>
-      <p className="text-sm text-p-text-light mb-4">
+      <h2 className={`${PAGE_TITLE} mb-1`}>Setup</h2>
+      <p className="text-sm text-tertiary mb-4">
         Configure your platform identity, AI engines, integrations, and policies.
       </p>
 

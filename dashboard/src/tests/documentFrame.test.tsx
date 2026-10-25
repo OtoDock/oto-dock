@@ -10,6 +10,7 @@ import { createRef, type ReactElement } from 'react'
 
 const h = vi.hoisted(() => ({
   authConfig: null as null | { collabora_origin?: string },
+  user: null as null | { sub: string },
   modified: false,
   reloadAvailable: false,
   frameWindow: null as Window | null,
@@ -38,7 +39,7 @@ function fakeReloadHook(args: { reload: () => void }) {
     modifiedRef: { get current() { return h.modified }, set current(v: boolean) { h.modified = v } },
   }
 }
-vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ authConfig: h.authConfig }) }))
+vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ authConfig: h.authConfig, user: h.user }) }))
 
 import DocumentFrame, {
   FOCUS_AFTER_LOAD_MS, LEAVE_SAVE_TIMEOUT_MS, RELOAD_DEDUPE_MS, SEND_SAVE_TIMEOUT_MS, type DocumentFrameHandle,
@@ -48,9 +49,19 @@ import type { PushedDocument } from '@/store/documentPaneStore'
 import { emitFileUpdate } from '@/lib/fileUpdates'
 
 const ORIGIN = window.location.origin
+/** A pushed WOPI token minted for ``sub`` (the claims the pane reads), its
+ * payload base64url without padding as the server writes it. */
+const pushToken = (sub: string, n = '') => {
+  const payload = btoa(JSON.stringify({ user_sub: sub, permissions: 'edit' }))
+    .replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_')
+  return `h.${payload}.s${n}`
+}
+const PUSH_TOK = pushToken('me')
+const PUSH_TOK_2 = pushToken('me', '2')
+const PUSH_TOK_3 = pushToken('me', '3')
 const pushedDoc = (over: Partial<PushedDocument> = {}): PushedDocument => ({
   fileId: 'f1', filename: 'report.docx', wopiUrl: `${ORIGIN}/collabora/browser/dist/cool.html?WOPISrc=x`,
-  accessToken: 'push-tok', accessTokenTtl: 9, downloadUrl: '/v1/media/f1', generation: Date.now(), ...over,
+  accessToken: PUSH_TOK, accessTokenTtl: 9, downloadUrl: '/v1/media/f1', generation: Date.now(), ...over,
 })
 
 function renderFrame(props: Partial<Parameters<typeof DocumentFrame>[0]> = {}) {
@@ -67,6 +78,7 @@ const posted = () => (document.querySelector('form input[name="access_token"]') 
 
 beforeEach(() => {
   h.authConfig = null
+  h.user = { sub: 'me' }
   h.modified = false
   h.reloadAvailable = false
   h.frameWindow = null
@@ -84,7 +96,7 @@ describe('DocumentFrame: the token of each load', () => {
     vi.stubGlobal('fetch', fetchMock)
     renderFrame({ pushed: pushedDoc() })
     expect(fetchMock).not.toHaveBeenCalled()
-    expect(posted()).toBe('push-tok')
+    expect(posted()).toBe(PUSH_TOK)
   })
 
   it('an older push, or none, mints through the chat-scoped route', async () => {
@@ -93,6 +105,45 @@ describe('DocumentFrame: the token of each load', () => {
     renderFrame({ pushed: pushedDoc({ generation: Date.now() - 16 * 60 * 1000 }) })
     await vi.waitFor(() => expect(posted()).toBe('minted'))
     expect(String(fetchMock.mock.calls[0][0])).toContain('/v1/documents/preview-wopi-url?chat_id=c1&file_id=f1')
+  })
+
+  it("a pushed token whose payload needs base64url's own letters still names its person", () => {
+    // This sub's payload encodes with both "-" and "_" in base64url.
+    const sub = 'local:a?>b~'
+    const token = pushToken(sub)
+    expect(token).toMatch(/-/)
+    expect(token).toMatch(/_/)
+    h.user = { sub }
+    const fetchMock = fetchOk({})
+    vi.stubGlobal('fetch', fetchMock)
+    renderFrame({ pushed: pushedDoc({ accessToken: token }) })
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(posted()).toBe(token)
+  })
+
+  it('a pushed token that names another person, or nobody, is never posted: the load mints', async () => {
+    // The editor relay admits only a token minted for the signed-in
+    // person: a teammate's token, the agent's, an agent-scope run's push
+    // (none), a signed-out page.
+    for (const [token, user] of [
+      [pushToken('someone-else'), { sub: 'me' }], [pushToken('agent'), { sub: 'me' }],
+      [undefined, { sub: 'me' }], ['not-a-jwt', { sub: 'me' }], [PUSH_TOK, null],
+      [`h.${btoa('{"permissions":"edit"}').replace(/=+$/, '')}.s`, { sub: 'me' }],
+    ] as const) {
+      h.user = user
+      const fetchMock = fetchOk({ wopi_url: `${ORIGIN}/collabora/x`, access_token: 'minted' })
+      vi.stubGlobal('fetch', fetchMock)
+      const { unmount } = renderFrame({ pushed: pushedDoc({ accessToken: token }) })
+      await vi.waitFor(() => expect(posted()).toBe('minted'))
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      unmount()
+    }
+    // A failed mint never falls back to a token for someone else.
+    h.user = { sub: 'me' }
+    vi.stubGlobal('fetch', fetchStatus(500))
+    renderFrame({ pushed: pushedDoc({ accessToken: pushToken('someone-else') }) })
+    await vi.waitFor(() => expect(screen.getByText('The document could not be opened.')).toBeInTheDocument())
+    expect(posted()).toBeUndefined()
   })
 
   it('a version mints a read-only snapshot token', async () => {
@@ -107,7 +158,7 @@ describe('DocumentFrame: the token of each load', () => {
     vi.stubGlobal('fetch', fetchStatus(500))
     const old = pushedDoc({ generation: Date.now() - 60 * 60 * 1000 })
     const { unmount } = renderFrame({ pushed: old })
-    await vi.waitFor(() => expect(posted()).toBe('push-tok'))
+    await vi.waitFor(() => expect(posted()).toBe(PUSH_TOK))
     unmount()
     renderFrame()
     await vi.waitFor(() => expect(screen.getByText('The document could not be opened.')).toBeInTheDocument())
@@ -321,7 +372,7 @@ describe('DocumentFrame: leaving a document the file changed under', () => {
     let result: boolean | undefined
     await act(async () => { result = await ref.current!.leave() })
     expect(result).toBe(false)
-    expect(screen.getByText(/Choose in the editor \(discard or overwrite\), then Reload/)).toBeInTheDocument()
+    expect(screen.getByText(/In the editor, choose discard or overwrite, then Reload/)).toBeInTheDocument()
   })
 })
 
@@ -476,13 +527,13 @@ describe('DocumentFrame: a change of the file on show (the real reload hook)', (
     expect(loads()).toBe(1)
     editInFrame()
     rerender(<DocumentFrame chatId="c1" fileId="f1" filename="report.docx" snapshotId={null} shown
-      pushed={pushedDoc({ generation: first.generation + 1000, accessToken: 'push-tok-2', wopiUrl: `${ORIGIN}/collabora/browser/dist/cool.html?WOPISrc=y` })} />)
+      pushed={pushedDoc({ generation: first.generation + 1000, accessToken: PUSH_TOK_2, wopiUrl: `${ORIGIN}/collabora/browser/dist/cool.html?WOPISrc=y` })} />)
     expect(screen.getByText(/This document changed. Reload/)).toBeInTheDocument()
     expect(loads()).toBe(1)
     fireEvent.click(screen.getByRole('button', { name: 'Reload' }))
     expect(loads()).toBeGreaterThan(1)
     // Reload opens the push it was offered for.
-    expect(posted()).toBe('push-tok-2')
+    expect(posted()).toBe(PUSH_TOK_2)
     expect(screen.queryByText(/This document changed/)).toBeNull()
   })
 
@@ -498,9 +549,9 @@ describe('DocumentFrame: a change of the file on show (the real reload hook)', (
     const first = pushedDoc({ wopiUrl: src(1) })
     const { rerender } = renderFrame({ pushed: first })
     expect(loads()).toBe(1)
-    show(pushedDoc({ wopiUrl: src(2), generation: first.generation + 1, accessToken: 'push-tok-2' }), rerender)
+    show(pushedDoc({ wopiUrl: src(2), generation: first.generation + 1, accessToken: PUSH_TOK_2 }), rerender)
     expect(loads()).toBe(2)
-    expect(posted()).toBe('push-tok-2')
+    expect(posted()).toBe(PUSH_TOK_2)
     disk()
     expect(loads()).toBe(2)
     expect(fetchMock).not.toHaveBeenCalled()
@@ -523,12 +574,12 @@ describe('DocumentFrame: a change of the file on show (the real reload hook)', (
     expect(posted()).toBe('minted')
     expect(fetchMock).toHaveBeenCalledTimes(1)
     // The turn's flush: the push of the document already open.
-    show(pushedDoc({ wopiUrl: src(2), generation: first.generation + 1, accessToken: 'push-tok-2' }), rerender)
+    show(pushedDoc({ wopiUrl: src(2), generation: first.generation + 1, accessToken: PUSH_TOK_2 }), rerender)
     expect(loads()).toBe(2)
     // A later push of another document loads it.
-    show(pushedDoc({ wopiUrl: src(3), generation: first.generation + 2, accessToken: 'push-tok-3' }), rerender)
+    show(pushedDoc({ wopiUrl: src(3), generation: first.generation + 2, accessToken: PUSH_TOK_3 }), rerender)
     expect(loads()).toBe(3)
-    expect(posted()).toBe('push-tok-3')
+    expect(posted()).toBe(PUSH_TOK_3)
   })
 
   it('the person\'s Refresh loads the newest document right after a load', async () => {
@@ -569,14 +620,14 @@ describe('DocumentFrame: a change of the file on show (the real reload hook)', (
     vi.setSystemTime(Date.now() + RELOAD_DEDUPE_MS + 10)
     disk()
     expect(fetchMock).toHaveBeenCalledTimes(1)          // the mint is in flight
-    show(pushedDoc({ wopiUrl: src(2), generation: first.generation + 1, accessToken: 'push-tok-2' }), rerender)
+    show(pushedDoc({ wopiUrl: src(2), generation: first.generation + 1, accessToken: PUSH_TOK_2 }), rerender)
     await vi.waitFor(() => expect(loads()).toBe(2))
-    expect(posted()).toBe('push-tok-2')
+    expect(posted()).toBe(PUSH_TOK_2)
     await act(async () => {
       land({ ok: true, status: 200, json: async () => ({ wopi_url: src(2), access_token: 'minted' }) })
     })
     expect(loads()).toBe(2)
-    expect(posted()).toBe('push-tok-2')
+    expect(posted()).toBe(PUSH_TOK_2)
   })
 })
 
@@ -596,7 +647,7 @@ describe("DocumentFrame: Collabora's idle end", () => {
     const fetchMock = fetchOk({ wopi_url: `${ORIGIN}/collabora/x`, access_token: 'fresh' })
     vi.stubGlobal('fetch', fetchMock)
     renderFrame({ pushed: pushedDoc() })
-    expect(posted()).toBe('push-tok')
+    expect(posted()).toBe(PUSH_TOK)
     fromFrame({ MessageId: 'User_Idle' })
     returnTo()
     await act(async () => { await vi.advanceTimersByTimeAsync(IDLE_ANSWER_TIMEOUT_MS + 10) })

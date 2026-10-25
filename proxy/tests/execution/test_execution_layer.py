@@ -9,10 +9,11 @@ Verifies that:
 - config_builder produces valid AgentConfig
 """
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from core.execution_layer import ResumeVerdict
 
 # ---------------------------------------------------------------------------
 # CommonEvent schema
@@ -21,7 +22,7 @@ import pytest
 
 class TestCommonEvent:
     def test_create_text_event(self):
-        from core.events.common_events import CommonEvent, TEXT
+        from core.events.common_events import TEXT, CommonEvent
 
         e = CommonEvent(type=TEXT, data={"content": "hello"})
         assert e.type == "text"
@@ -29,7 +30,7 @@ class TestCommonEvent:
         assert isinstance(e.timestamp, float)
 
     def test_create_done_event(self):
-        from core.events.common_events import CommonEvent, DONE
+        from core.events.common_events import DONE, CommonEvent
 
         e = CommonEvent(type=DONE)
         assert e.type == "done"
@@ -87,8 +88,8 @@ class TestCLIChunkTranslator:
         return ClaudeStreamChunk(**kwargs)
 
     def test_text_chunk(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import TEXT
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(text="hello", event_type="text")
         events = cli_chunk_to_events(chunk)
@@ -104,8 +105,8 @@ class TestCLIChunkTranslator:
         assert len(events) == 0
 
     def test_thinking_chunk(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import THINKING
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(
             event_type="thinking",
@@ -117,8 +118,8 @@ class TestCLIChunkTranslator:
         assert events[0].data["phase"] == "start"
 
     def test_tool_start_maps_to_tool_use(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import TOOL_USE
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(
             event_type="tool_start",
@@ -130,8 +131,8 @@ class TestCLIChunkTranslator:
         assert events[0].data["name"] == "Read"
 
     def test_tool_info_maps_to_tool_input(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import TOOL_INPUT
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(
             event_type="tool_info",
@@ -143,8 +144,8 @@ class TestCLIChunkTranslator:
         assert events[0].data["summary"] == "foo.py"
 
     def test_tool_end_maps_to_tool_result(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import TOOL_RESULT
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(
             event_type="tool_end",
@@ -155,8 +156,8 @@ class TestCLIChunkTranslator:
         assert events[0].type == TOOL_RESULT
 
     def test_task_spawn_maps_to_subagent_start(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import SUBAGENT_START
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(
             event_type="task_spawn",
@@ -168,8 +169,8 @@ class TestCLIChunkTranslator:
         assert events[0].data["run_in_background"] is True
 
     def test_metadata_chunk(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import METADATA
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(
             event_type="metadata",
@@ -181,16 +182,16 @@ class TestCLIChunkTranslator:
         assert events[0].data["cost_usd"] == 0.05
 
     def test_is_done_produces_done_event(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import DONE
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(is_done=True, event_type="text", text="")
         events = cli_chunk_to_events(chunk)
         assert any(e.type == DONE for e in events)
 
     def test_is_error_produces_error_event(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import ERROR
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(is_error=True, text="something went wrong")
         events = cli_chunk_to_events(chunk)
@@ -200,8 +201,8 @@ class TestCLIChunkTranslator:
 
     def test_text_plus_done_produces_two_events(self):
         """A chunk can have both text content AND is_done flag."""
+        from core.events.common_events import DONE, TEXT
         from core.layers.cli.layer import cli_chunk_to_events
-        from core.events.common_events import TEXT, DONE
 
         chunk = self._make_chunk(text="final", event_type="text", is_done=True)
         events = cli_chunk_to_events(chunk)
@@ -210,8 +211,8 @@ class TestCLIChunkTranslator:
         assert events[1].type == DONE
 
     def test_metadata_plus_done(self):
+        from core.events.common_events import DONE, METADATA
         from core.layers.cli.layer import cli_chunk_to_events
-        from core.events.common_events import METADATA, DONE
 
         chunk = self._make_chunk(
             event_type="metadata",
@@ -224,8 +225,8 @@ class TestCLIChunkTranslator:
         assert DONE in types
 
     def test_plan_mode_event(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import PLAN_MODE
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(
             event_type="plan_mode",
@@ -237,8 +238,8 @@ class TestCLIChunkTranslator:
         assert events[0].data["action"] == "enter"
 
     def test_permission_prompt(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import PERMISSION_REQUEST
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(
             event_type="permission_prompt",
@@ -249,8 +250,8 @@ class TestCLIChunkTranslator:
         assert events[0].type == PERMISSION_REQUEST
 
     def test_system_event(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import SYSTEM
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(
             event_type="system",
@@ -262,8 +263,8 @@ class TestCLIChunkTranslator:
         assert events[0].data["subtype"] == "task_notification"
 
     def test_delegate_spawn(self):
-        from core.layers.cli.layer import cli_chunk_to_events
         from core.events.common_events import DELEGATE_SPAWN
+        from core.layers.cli.layer import cli_chunk_to_events
 
         chunk = self._make_chunk(
             event_type="delegate_spawn",
@@ -281,8 +282,8 @@ class TestCLIChunkTranslator:
 
 class TestDirectEventTranslator:
     def test_text_event(self):
-        from core.layers.direct.layer import direct_event_to_common
         from core.events.common_events import TEXT
+        from core.layers.direct.layer import direct_event_to_common
 
         event = direct_event_to_common({"type": "text", "data": {"content": "hi"}})
         assert event.type == TEXT
@@ -295,8 +296,8 @@ class TestDirectEventTranslator:
         assert event is None
 
     def test_tool_start(self):
-        from core.layers.direct.layer import direct_event_to_common
         from core.events.common_events import TOOL_USE
+        from core.layers.direct.layer import direct_event_to_common
 
         event = direct_event_to_common({
             "type": "tool_start",
@@ -307,8 +308,8 @@ class TestDirectEventTranslator:
         assert event.data["tool_id"] == "t1"
 
     def test_tool_end(self):
-        from core.layers.direct.layer import direct_event_to_common
         from core.events.common_events import TOOL_RESULT
+        from core.layers.direct.layer import direct_event_to_common
 
         event = direct_event_to_common({
             "type": "tool_end",
@@ -317,15 +318,15 @@ class TestDirectEventTranslator:
         assert event.type == TOOL_RESULT
 
     def test_done(self):
-        from core.layers.direct.layer import direct_event_to_common
         from core.events.common_events import DONE
+        from core.layers.direct.layer import direct_event_to_common
 
         event = direct_event_to_common({"type": "done", "data": {}})
         assert event.type == DONE
 
     def test_error(self):
-        from core.layers.direct.layer import direct_event_to_common
         from core.events.common_events import ERROR
+        from core.layers.direct.layer import direct_event_to_common
 
         event = direct_event_to_common({
             "type": "error",
@@ -362,7 +363,7 @@ class TestExecutionLayerABC:
         cfg = AgentConfig(agent_name="test")
         assert cfg.agent_name == "test"
         assert cfg.system_prompt == ""
-        assert cfg.permission_mode == "default"
+        assert cfg.permission_mode == "ask"
         assert cfg.resume is False
         assert cfg.security_context is None
         assert cfg.credential_env == {}
@@ -405,8 +406,8 @@ class TestExecutionLayerABC:
 
 class TestSessionManager:
     def test_get_layer_for_cli_agent(self):
-        from core.session.session_manager import get_execution_layer
         from core.layers.cli.layer import CLIExecutionLayer
+        from core.session.session_manager import get_execution_layer
 
         with patch("core.session.session_manager.agent_store") as mock_store:
             mock_store.get_agent.return_value = {
@@ -416,8 +417,8 @@ class TestSessionManager:
             assert isinstance(layer, CLIExecutionLayer)
 
     def test_get_layer_for_direct_agent(self):
-        from core.session.session_manager import get_execution_layer
         from core.layers.direct.layer import DirectLLMExecutionLayer
+        from core.session.session_manager import get_execution_layer
 
         with patch("core.session.session_manager.agent_store") as mock_store:
             mock_store.get_agent.return_value = {
@@ -433,8 +434,8 @@ class TestSessionManager:
         # platform default is the right guess — it is what the row said.
         # Contrast test_unknown_path_fails_closed below: a KNOWN row naming
         # an unknown engine is a configuration error and does raise.
-        from core.session.session_manager import get_execution_layer
         from core.layers.cli.layer import CLIExecutionLayer
+        from core.session.session_manager import get_execution_layer
 
         with patch("core.session.session_manager.agent_store") as mock_store:
             mock_store.get_agent.return_value = None
@@ -444,11 +445,11 @@ class TestSessionManager:
     def test_execution_target_local_skips_resolution(self):
         """A provided execution_target='local' returns the local layer by
         path WITHOUT re-resolving — the resolver must not be consulted."""
-        from core.session.session_manager import get_execution_layer
         from core.layers.cli.layer import CLIExecutionLayer
+        from core.session.session_manager import get_execution_layer
 
         with patch("core.session.session_manager.agent_store") as mock_store, \
-                patch("storage.remote_store.resolve_execution_target") as mock_resolve:
+                patch("services.remote.remote_status.resolve_execution_target") as mock_resolve:
             mock_store.get_agent.return_value = {
                 "slug": "test", "execution_path": "claude-code-cli",
             }
@@ -465,7 +466,7 @@ class TestSessionManager:
 
         sentinel_layer = MagicMock()
         with patch("core.session.session_manager.agent_store") as mock_store, \
-                patch("storage.remote_store.resolve_execution_target") as mock_resolve, \
+                patch("services.remote.remote_status.resolve_execution_target") as mock_resolve, \
                 patch("storage.remote_store.get_remote_machine") as mock_machine, \
                 patch("core.session.session_manager._get_remote_layer", return_value=sentinel_layer):
             mock_store.get_agent.return_value = {
@@ -484,10 +485,11 @@ class TestSessionManager:
         refusal on user-paired machines (user_sub=None) — skipping resolution
         must not skip the isolation guards."""
         import pytest
+
         from core.session.session_manager import get_execution_layer
 
         with patch("core.session.session_manager.agent_store") as mock_store, \
-                patch("storage.remote_store.resolve_execution_target") as mock_resolve, \
+                patch("services.remote.remote_status.resolve_execution_target") as mock_resolve, \
                 patch("storage.remote_store.get_remote_machine") as mock_machine:
             mock_store.get_agent.return_value = {
                 "slug": "test", "execution_path": "claude-code-cli",
@@ -511,7 +513,7 @@ class TestSessionManager:
 
         sentinel_layer = MagicMock()
         with patch("core.session.session_manager.agent_store") as mock_store, \
-                patch("storage.remote_store.resolve_execution_target") as mock_resolve, \
+                patch("services.remote.remote_status.resolve_execution_target") as mock_resolve, \
                 patch("storage.remote_store.get_remote_machine") as mock_machine, \
                 patch("storage.database.get_platform_setting", return_value="1"), \
                 patch("core.session.session_manager._get_remote_layer", return_value=sentinel_layer):
@@ -532,7 +534,7 @@ class TestSessionManager:
         misleading 'Agent-scope sessions' error."""
         from core.session.session_manager import get_execution_layer
         with patch("core.session.session_manager.agent_store") as mock_store, \
-                patch("storage.remote_store.resolve_execution_target"), \
+                patch("services.remote.remote_status.resolve_execution_target"), \
                 patch("storage.remote_store.get_remote_machine") as mock_machine:
             mock_store.get_agent.return_value = {
                 "slug": "test", "execution_path": "claude-code-cli",
@@ -550,8 +552,11 @@ class TestSessionManager:
         # credentials, wrong sandbox, no error anywhere. An id no layer claims
         # is a configuration error and must surface as one.
         import pytest
+
         from core.session.session_manager import (
-            UnknownExecutionPath, get_execution_layer, get_layer_by_path,
+            UnknownExecutionPath,
+            get_execution_layer,
+            get_layer_by_path,
         )
 
         with pytest.raises(UnknownExecutionPath) as exc:
@@ -568,8 +573,10 @@ class TestSessionManager:
         # RuntimeError from this module and read it as "the remote target is
         # offline". A misconfigured engine must not masquerade as that.
         import pytest
+
         from core.session.session_manager import (
-            UnknownExecutionPath, get_layer_by_path,
+            UnknownExecutionPath,
+            get_layer_by_path,
         )
 
         assert not issubclass(UnknownExecutionPath, RuntimeError)
@@ -578,7 +585,9 @@ class TestSessionManager:
 
     def test_valid_execution_paths_is_the_registry(self):
         from core.session.session_manager import (
-            _LAYERS, register_layer, valid_execution_paths,
+            _LAYERS,
+            register_layer,
+            valid_execution_paths,
         )
 
         assert valid_execution_paths() == set(_LAYERS)
@@ -595,7 +604,8 @@ class TestSessionManager:
 
     def test_find_layer_for_session_asks_each_layer(self):
         from core.session.session_manager import (
-            find_layer_for_session, get_all_layers,
+            find_layer_for_session,
+            get_all_layers,
         )
 
         assert find_layer_for_session("no-such-session") is None
@@ -606,7 +616,11 @@ class TestSessionManager:
             assert layer.owns_session("no-such-session") is False
 
     def test_register_layer(self):
-        from core.session.session_manager import register_layer, get_layer_by_path, _LAYERS
+        from core.session.session_manager import (
+            _LAYERS,
+            get_layer_by_path,
+            register_layer,
+        )
 
         mock_layer = MagicMock()
         register_layer("test-layer", mock_layer)
@@ -622,7 +636,11 @@ class TestSessionManager:
 
 class TestSessionMode:
     def test_set_and_get(self):
-        from core.session.session_state import set_session_mode, get_session_mode, _session_modes
+        from core.session.session_state import (
+            _session_modes,
+            get_session_mode,
+            set_session_mode,
+        )
 
         sid = "test-session-mode-1"
         set_session_mode(sid, "plan")
@@ -636,12 +654,31 @@ class TestSessionMode:
         assert get_session_mode("nonexistent-session") == "auto"
 
     def test_overwrite(self):
-        from core.session.session_state import set_session_mode, get_session_mode, _session_modes
+        from core.session.session_state import (
+            _session_modes,
+            get_session_mode,
+            set_session_mode,
+        )
 
         sid = "test-session-mode-2"
-        set_session_mode(sid, "default")
+        set_session_mode(sid, "ask")
+        set_session_mode(sid, "autoReview")
+        assert get_session_mode(sid) == "autoReview"
+        _session_modes.pop(sid, None)
+
+    def test_a_word_from_before_1_9_is_recorded_in_the_current_vocabulary(self):
+        from core.session.session_state import (
+            _session_modes,
+            get_session_mode,
+            register_session_state,
+            set_session_mode,
+        )
+
+        sid = "test-session-mode-legacy"
         set_session_mode(sid, "acceptEdits")
-        assert get_session_mode(sid) == "acceptEdits"
+        assert get_session_mode(sid) == "autoReview"
+        register_session_state(sid, "default", None)
+        assert get_session_mode(sid) == "ask"
         _session_modes.pop(sid, None)
 
 
@@ -665,7 +702,7 @@ class TestCLICapabilities:
         assert caps.supports_context_compression is True
         assert caps.supports_control_commands is True
         assert "set_model" in caps.control_commands
-        assert "default" in caps.permission_modes
+        assert caps.permission_modes == ["ask", "autoReview", "dontAsk", "plan"]
         assert caps.mcp_config_format == "json"
 
     def test_backwards_compat_properties(self):
@@ -727,7 +764,7 @@ class TestDirectLifecycle:
         from core.layers.direct.layer import DirectLLMExecutionLayer
 
         layer = DirectLLMExecutionLayer()
-        assert await layer.can_resume_session("any-id") is False
+        assert await layer.can_resume_session("any-id") is ResumeVerdict.FRESH
 
     @pytest.mark.asyncio
     async def test_prepare_resume_is_noop(self):
@@ -741,6 +778,59 @@ class TestDirectLifecycle:
 # ---------------------------------------------------------------------------
 # Codex resume gate — thread-backed, survives proxy restarts
 # ---------------------------------------------------------------------------
+
+
+class TestCliResumeProbe:
+    """The local transcript probe reads line by line in a thread: the first
+    user line decides, a torn last line is no fault, a file with no user
+    line or none at all is fresh, a disk fault is undecided."""
+
+    def test_the_first_user_line_decides_and_a_torn_tail_is_no_fault(self, tmp_path):
+        from core.layers.cli.layer import CLIExecutionLayer
+        f = tmp_path / "s.jsonl"
+        f.write_bytes(b'{"type":"summary"}\n{"type":"user","message":"hi"}\n\xff\xfe torn')
+        assert CLIExecutionLayer._session_file_has_user_message(f) is ResumeVerdict.RESUMABLE
+        f.write_bytes(b'{"type": "user"}\n' + b"x" * 4096)
+        assert CLIExecutionLayer._session_file_has_user_message(f) is ResumeVerdict.RESUMABLE
+        f.write_bytes(b'{"type":"summary"}\n\xff')
+        assert CLIExecutionLayer._session_file_has_user_message(f) is ResumeVerdict.FRESH
+        f.write_bytes(b"")
+        assert CLIExecutionLayer._session_file_has_user_message(f) is ResumeVerdict.FRESH
+        assert CLIExecutionLayer._session_file_has_user_message(tmp_path / "gone.jsonl") is ResumeVerdict.FRESH
+
+    def test_a_disk_fault_is_undecided(self, tmp_path, monkeypatch):
+        import errno
+        from pathlib import Path
+
+        from core.layers.cli.layer import CLIExecutionLayer
+        f = tmp_path / "s.jsonl"
+        f.write_text('{"type":"user"}\n')
+
+        def _fault(self, *a, **kw):
+            raise OSError(errno.EIO, "Input/output error")
+        monkeypatch.setattr(Path, "open", _fault)
+        assert CLIExecutionLayer._session_file_has_user_message(f) is ResumeVerdict.UNKNOWN
+
+    @pytest.mark.asyncio
+    async def test_the_probe_runs_off_the_loop(self, temp_db, monkeypatch):
+        import threading
+
+        import config as app_config
+        from core.layers.cli.layer import CLIExecutionLayer
+        claude_dir = app_config.get_agent_dir("a1") / "users" / "alice" / ".claude"
+        (claude_dir / "projects" / "p1").mkdir(parents=True)
+        (claude_dir / "projects" / "p1" / "sess-thr.jsonl").write_text('{"type":"user"}\n')
+        threads: list = []
+        original = CLIExecutionLayer._session_file_has_user_message
+
+        def _record(session_file):
+            threads.append(threading.current_thread())
+            return original(session_file)
+        monkeypatch.setattr(CLIExecutionLayer, "_session_file_has_user_message", staticmethod(_record))
+        layer = CLIExecutionLayer()
+        assert await layer.can_resume_session(
+            "sess-thr", agent_name="a1", username="alice") is ResumeVerdict.RESUMABLE
+        assert threads and threads[0] is not threading.main_thread()
 
 
 class TestCodexResumeGate:
@@ -761,17 +851,17 @@ class TestCodexResumeGate:
 
         # Pool empty + no rollout on disk → genuine context loss, gate refuses.
         assert await layer.can_resume_session(
-            "sess-crg1", agent_name="a1", username="alice") is False
+            "sess-crg1", agent_name="a1", username="alice") is ResumeVerdict.FRESH
 
         rollout_dir = (app_config.get_agent_dir("a1") / "users" / "alice"
                        / ".codex" / "sessions" / "2026" / "07")
         rollout_dir.mkdir(parents=True)
         (rollout_dir / "rollout-2026-07-07T14-00-00-th-abc.jsonl").write_text("{}\n")
         assert await layer.can_resume_session(
-            "sess-crg1", agent_name="a1", username="alice") is True
+            "sess-crg1", agent_name="a1", username="alice") is ResumeVerdict.RESUMABLE
         # A different thread's rollout doesn't count.
         assert await layer.can_resume_session(
-            "sess-crg1", agent_name="a1", username="bob") is False
+            "sess-crg1", agent_name="a1", username="bob") is ResumeVerdict.FRESH
 
     @pytest.mark.asyncio
     async def test_agent_scope_falls_back_to_workspace_codex(self, temp_db):
@@ -786,7 +876,7 @@ class TestCodexResumeGate:
         (rollout_dir / "rollout-x-th-ws.jsonl").write_text("{}\n")
 
         layer = CodexCLIExecutionLayer()
-        assert await layer.can_resume_session("sess-crg2", agent_name="a1") is True
+        assert await layer.can_resume_session("sess-crg2", agent_name="a1") is ResumeVerdict.RESUMABLE
 
     @pytest.mark.asyncio
     async def test_no_thread_id_refuses(self, temp_db):
@@ -796,4 +886,4 @@ class TestCodexResumeGate:
         temp_db.update_chat("crg3", session_id="sess-crg3")
         layer = CodexCLIExecutionLayer()
         assert await layer.can_resume_session(
-            "sess-crg3", agent_name="a1", username="alice") is False
+            "sess-crg3", agent_name="a1", username="alice") is ResumeVerdict.FRESH

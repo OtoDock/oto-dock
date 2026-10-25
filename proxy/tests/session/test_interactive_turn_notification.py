@@ -14,7 +14,7 @@ from collections import deque
 
 import pytest
 
-from core.session.interactive_session import InteractiveSession, MIN_TURN_S
+from core.session.interactive_session import MIN_TURN_S, InteractiveSession
 
 pytestmark = pytest.mark.asyncio
 
@@ -67,9 +67,9 @@ def _patch_collaborators(monkeypatch):
         v.clear()
     _Reg.has_pending = False
 
-    from services.notifications import notification_manager as _nm
-    from services import title_generator as _tg
     from core.session import session_state as _ss
+    from services import title_generator as _tg
+    from services.notifications import notification_manager as _nm
     from storage import database as _db
 
     monkeypatch.setattr(_nm, "broadcast_chat_status", _fake_broadcast)
@@ -81,12 +81,12 @@ def _patch_collaborators(monkeypatch):
 
 
 async def _drain():
-    """Let the ``create_task``'d fire_ephemeral / title coroutines complete."""
-    for _ in range(10):
-        await asyncio.sleep(0)
-        if not [t for t in asyncio.all_tasks()
-                if t is not asyncio.current_task() and not t.done()]:
-            break
+    """Let the ``create_task``'d fire_ephemeral / title coroutines complete
+    (the notification reads the agent's label in a worker thread first)."""
+    pending = [t for t in asyncio.all_tasks()
+               if t is not asyncio.current_task() and not t.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=5)
 
 
 def _new_session(*, chat_id="chat-1", on_turn_complete=None, old=True,
@@ -98,6 +98,7 @@ def _new_session(*, chat_id="chat-1", on_turn_complete=None, old=True,
     s.agent_name = "researcher"
     s.user_sub = "user-1"
     s.target = "local"
+    s.transcript_kind = "claude"
     s.otodock_attached = otodock_attached
     s._loop = asyncio.get_running_loop()
     # Spawned long ago so MIN_TURN_S is satisfied (unless `old=False`).

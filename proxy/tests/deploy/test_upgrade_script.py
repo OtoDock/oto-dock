@@ -2,10 +2,13 @@
 
 The upgrade checks the target release's compose files against the install's
 own .env before it changes anything, writes no line of .env but
-OTODOCK_VERSION and (when needed) COMPOSE_FILE, builds COMPOSE_FILE base first
-without duplicating a file on a re-run, and has two failure regimes: before
-``docker compose up`` it puts the files back, after it it leaves the new files
-and points at the dump. The ``config`` checks run through the real Compose
+OTODOCK_VERSION and (when needed) COMPOSE_FILE and COLLABORA_SSL_TERMINATION,
+stops Collabora before up, builds COMPOSE_FILE base first
+without duplicating a file on a re-run, and has three failure regimes: before
+``docker compose up`` it puts the files back; an ``up`` that fails before
+anything of the new release ran puts the files back and starts the old
+release again; once something ran it leaves the new files and points at the
+dump. The ``config`` checks run through the real Compose
 loader where one is installed (it needs no daemon), so the refusal of a
 hostname in OTO_AUDIOSOCKET_PUBLIC_HOST is the loader's own. install.sh lists
 an override after the base file on the COMPOSE_FILE line it writes.
@@ -38,17 +41,29 @@ REAL_DOCKER = shutil.which("docker")
 # The recover-bin carry: `compose config --volumes` prints FAKE_VOLUMES;
 # `inspect` of the mounts prints FAKE_MOUNTS, of the writable layer
 # FAKE_SIZE_RW; `diff` prints the bin line when FAKE_DIFF_BIN is set, then
-# FAKE_DIFF_FILLER more lines; `exec ... du` prints FAKE_DU_K; `info -f`
+# FAKE_DIFF_FILLER more lines; `version` prints FAKE_API_VERSION (the Docker
+# Engine API, 1.51 by default) and `compose version --short`
+# FAKE_COMPOSE_VERSION (2.35.1); `exec ... du` prints FAKE_DU_K; `info -f`
 # prints FAKE_DOCKER_ROOT; `cp` writes a stand-in archive (FAKE_CP_RC);
 # `compose run` logs the bytes it read to FAKE_RUN_LOG (FAKE_RUN_RC). After
 # the first `compose up`, `ps` lists FAKE_CONTAINERS_AFTER_UP when it is set
-# (the server that up started).
+# (the server that up started), after the second FAKE_CONTAINERS_AFTER_UP2
+# when that is set; a later up exits FAKE_UP_AGAIN_RC (0). `ps` leaves out a
+# container a logged `rm` removed and fills a --format with a container's id
+# and name; `inspect` of a status and a start time answers per container
+# (`status`, `started`: a never-started one carries Docker's zero time;
+# `unreadable` fails it).
+# FAKE_ENV_LOG gets the COMPOSE_PROJECT_NAME each `compose` pull, stop, up
+# and run saw.
 FAKE_DOCKER = r'''#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_LOG"], "a") as fh:
     fh.write(json.dumps(args) + "\n")
 cs = json.loads(os.environ.get("FAKE_CONTAINERS", "[]"))
+if args[:1] == ["version"]:
+    print(os.environ.get("FAKE_API_VERSION", "1.51"))
+    sys.exit(0)
 if args[:1] == ["info"]:
     if "-f" in args:
         print(os.environ.get("FAKE_DOCKER_ROOT", ""))
@@ -63,18 +78,24 @@ if args[:1] == ["diff"]:
 if args[:1] == ["cp"]:
     sys.stdout.write("recover-bin/\n" * 10)
     sys.exit(int(os.environ.get("FAKE_CP_RC", "0")))
+with open(os.environ["FAKE_LOG"]) as fh:
+    logged = [json.loads(line) for line in fh]
+ups = sum(1 for a in logged if a[:2] == ["compose", "up"])
+removed = {a[-1] for a in logged if a[:1] == ["rm"]}
+if ups >= 2 and os.environ.get("FAKE_CONTAINERS_AFTER_UP2"):
+    cs = json.loads(os.environ["FAKE_CONTAINERS_AFTER_UP2"])
+elif ups >= 1 and os.environ.get("FAKE_CONTAINERS_AFTER_UP"):
+    cs = json.loads(os.environ["FAKE_CONTAINERS_AFTER_UP"])
+cs = [c for c in cs if c["id"] not in removed]
 if args[:1] == ["ps"]:
     want_all = "-a" in args
     labels = [args[i + 1].partition("=")[2] for i, a in enumerate(args) if a == "--filter"]
-    if os.environ.get("FAKE_CONTAINERS_AFTER_UP"):
-        with open(os.environ["FAKE_LOG"]) as fh:
-            if any(json.loads(line)[:2] == ["compose", "up"] for line in fh):
-                cs = json.loads(os.environ["FAKE_CONTAINERS_AFTER_UP"])
+    fmt = args[args.index("--format") + 1] if "--format" in args else "{{.ID}}"
     for c in cs:
         if not want_all and not c.get("running", True):
             continue
         if all(c["labels"].get(l.partition("=")[0]) == l.partition("=")[2] for l in labels):
-            print(c["id"])
+            print(fmt.replace("{{.ID}}", c["id"]).replace("{{.Names}}", c.get("name", c["id"])))
     sys.exit(0)
 if args[:1] == ["exec"]:
     if "du" in args:
@@ -93,6 +114,14 @@ if args[:1] == ["exec"]:
     sys.exit(0)
 if args[:1] == ["inspect"]:
     fmt = args[args.index("-f") + 1] if "-f" in args else ""
+    if "StartedAt" in fmt:
+        c = next((c for c in cs if c["id"] == args[-1]), None)
+        if c is None or c.get("unreadable"):
+            sys.exit(1)
+        status = c.get("status") or ("running" if c.get("running", True) else "exited")
+        started = c.get("started", "2026-10-01T09:00:00.123456789Z")
+        print(fmt.replace("{{.State.Status}}", status).replace("{{.State.StartedAt}}", started))
+        sys.exit(0)
     if "Mounts" in fmt:
         print("\n".join(os.environ.get("FAKE_MOUNTS", "/opt/otodock/agents").split()))
     elif "SizeRw" in fmt:
@@ -116,7 +145,12 @@ if args[:1] == ["compose"]:
             continue
         sub = a
         break
+    if sub in ("pull", "stop", "up", "run") and os.environ.get("FAKE_ENV_LOG"):
+        with open(os.environ["FAKE_ENV_LOG"], "a") as fh:
+            fh.write(os.environ.get("COMPOSE_PROJECT_NAME", "-") + "\n")
     if sub == "version":
+        if "--short" in args:
+            print(os.environ.get("FAKE_COMPOSE_VERSION", "2.35.1"))
         sys.exit(0)
     if sub == "config":
         if os.environ.get("REAL_DOCKER"):
@@ -136,9 +170,8 @@ if args[:1] == ["compose"]:
             fh.write(json.dumps({"read": len(data), "args": args}) + "\n")
         sys.exit(int(os.environ.get("FAKE_RUN_RC", "0")))
     if sub == "up":
-        with open(os.environ["FAKE_LOG"]) as fh:
-            ups = sum(1 for line in fh if json.loads(line)[:2] == ["compose", "up"])
-        sys.exit(int(os.environ.get("FAKE_UP_RC", "0")) if ups == 1 else 0)
+        rc = os.environ.get("FAKE_UP_RC", "0") if ups == 1 else os.environ.get("FAKE_UP_AGAIN_RC", "0")
+        sys.exit(int(rc))
 sys.exit(0)
 '''
 
@@ -192,6 +225,13 @@ PROXY = {"id": "proxy-t2", "labels": {"com.docker.compose.project": "otodock",
                                       "com.docker.compose.service": "otodock-proxy"}}
 PHONE = {"id": "phone-t2", "labels": {"com.docker.compose.project": "otodock",
                                       "com.docker.compose.service": "otodock-phone"}}
+COLLABORA = {"id": "collabora-t2", "labels": {"com.docker.compose.project": "otodock",
+                                             "com.docker.compose.service": "collabora"}}
+# What a docker compose up leaves: a server it created (a new id) that
+# started, or one it created that never ran (Docker's zero start time).
+NEVER = "0001-01-01T00:00:00Z"
+NEW_PROXY = dict(PROXY, id="proxy-new", name="otodock-otodock-proxy-1")
+NEVER_PROXY = dict(NEW_PROXY, running=False, status="created", started=NEVER)
 # A community MCP's container: another compose project, a name free to say anything.
 EVIL_PG = {"id": "evil-pg", "labels": {"com.docker.compose.project": "otodock-x-mcp-otodock-postgres",
                                        "com.docker.compose.service": "otodock-postgres"}}
@@ -654,7 +694,8 @@ def test_a_bad_download_stops_before_anything_changes(tmp_path, fakebin, raw):
 
 
 @pytest.mark.parametrize("failure, message", [
-    ({"FAKE_UP_RC": "1", "FAKE_STATUS": "exited"}, "docker compose up failed"),
+    ({"FAKE_UP_RC": "1", "FAKE_STATUS": "exited", "FAKE_CONTAINERS_AFTER_UP": json.dumps([PG, NEW_PROXY])},
+     "docker compose up failed"),
     ({"FAKE_HEALTH": "starting", "OTODOCK_UPGRADE_WAIT_S": "0"}, "did not report healthy within 0s"),
     # A crash loop is not waited out, however long the wait is allowed to be.
     ({"FAKE_HEALTH": "starting", "FAKE_STATUS": "restarting", "OTODOCK_UPGRADE_WAIT_S": "600"},
@@ -683,12 +724,155 @@ def test_a_first_boot_outlasting_the_compose_wait_is_waited_out(tmp_path, fakebi
     # still starting. The script waits for it itself, then starts the services
     # that were waiting on it.
     inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
-    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_UP_RC="1")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_UP_RC="1",
+             FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, NEW_PROXY]))
     assert r.returncode == 0, r.stderr
     assert "still starting: waiting for it here" in _said(r)
     assert "done: this install runs 1.7.0 (was 1.6.1)" in r.stdout
     assert _compose_subcommands(tmp_path).count("up -d") == 2
     assert "may already be migrated" not in _said(r)
+
+
+# ── an up that fails before anything of the new release ran is undone ─────
+
+def test_an_up_that_fails_before_anything_ran_puts_the_old_release_back(tmp_path, fakebin, raw):
+    # The shape Compose 2.36 left on a first 1.9.0 start: the old server
+    # stopped and renamed <12 hex>_<name> (its start time unchanged), the new
+    # one created under the name and never started. Nothing ran the new
+    # release, so the old files go back and the old release starts again.
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    before = _tree(inst)
+    ino = (inst / ".env").stat().st_ino
+    renamed = dict(PROXY, name="0123456789ab_otodock-otodock-proxy-1", running=False, status="exited")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_UP_RC="1",
+             FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, renamed, NEVER_PROXY]),
+             FAKE_CONTAINERS_AFTER_UP2=json.dumps([PG, PROXY]))
+    assert r.returncode == 1, r.stderr
+    assert _tree(inst) == before
+    assert (inst / ".env").stat().st_ino == ino
+    said = _said(r)
+    assert "the upgrade to 1.7.0 failed before the new server started" in said
+    assert "this install is back on 1.6.1" in said and "Nothing was migrated" in said
+    assert "bash upgrade.sh --to 1.7.0" in said
+    assert "may already be migrated" not in said and "did not finish" not in said
+    calls = _calls(tmp_path)
+    assert ["rm", "proxy-new"] in calls
+    assert ["rename", "proxy-t2", "otodock-otodock-proxy-1"] in calls
+    assert not any(a[:1] == ["rm"] and a[-1] == "proxy-t2" for a in calls)
+    assert "removing otodock-otodock-proxy-1, which the failed start created and never ran" in r.stdout
+    assert "renaming 0123456789ab_otodock-otodock-proxy-1 back to otodock-otodock-proxy-1" in r.stdout
+    assert _compose_subcommands(tmp_path).count("up -d") == 2
+    (snap,) = _snapshots(inst)
+    assert list(snap.glob("otodock-otodock-*.sql.gz"))  # the dump stays
+
+
+def test_an_up_that_fails_with_the_old_server_untouched_puts_the_old_release_back(tmp_path, fakebin, raw):
+    # The shape Compose 2.26 leaves: the old server still runs, the new
+    # container waits under a temporary name, never started.
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    waiting = dict(NEVER_PROXY, name="0123456789ab_otodock-otodock-proxy-1")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_UP_RC="1",
+             FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, PROXY, waiting]))
+    assert r.returncode == 1, r.stderr
+    assert "this install is back on 1.6.1" in _said(r)
+    calls = _calls(tmp_path)
+    assert ["rm", "proxy-new"] in calls
+    assert not any(a[:1] == ["rename"] for a in calls)
+    assert (inst / "docker-compose.yml").read_text().startswith("services:\n  otodock-proxy:")
+
+
+def test_a_rollback_that_cannot_start_the_old_release_says_what_to_do(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_UP_RC="1", FAKE_UP_AGAIN_RC="1",
+             FAKE_STATUS="exited", FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, NEVER_PROXY]))
+    assert r.returncode == 1, r.stderr
+    said = _said(r)
+    assert "putting 1.6.1 back did not finish" in said and "the database is as it was" in said
+    assert "docker ps -a --filter label=com.docker.compose.project=otodock" in said
+    assert "back on 1.6.1, with the files" not in said
+    assert _tree(inst) == before  # the files went back before the second up
+
+
+def _never_undone(r, inst) -> None:
+    said = _said(r)
+    assert r.returncode != 0
+    assert "may already be migrated" in said and "putting 1.6.1 back" not in said
+    assert (inst / "docker-compose.yml").read_text() == "# the 1.7.0 base file\n"
+
+
+def test_a_failed_up_after_the_database_init_ran_is_not_undone(tmp_path, fakebin, raw):
+    # The target's otodock-db-init converges the database's roles before the
+    # server starts: once it ran, the old release may not run on that
+    # database, so nothing is undone even though the server never started.
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    db_init = {"id": "dbinit-new", "running": False, "status": "exited",
+               "labels": {"com.docker.compose.project": "otodock", "com.docker.compose.service": "otodock-db-init"}}
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_UP_RC="1", FAKE_STATUS="exited",
+             FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, db_init, NEVER_PROXY]))
+    _never_undone(r, inst)
+
+
+def test_a_server_an_earlier_run_created_and_this_one_started_is_not_undone(tmp_path, fakebin, raw):
+    # An interrupted earlier run left the new server created and never
+    # started; this up started that same container (its start time moved).
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    waiting = dict(PROXY, running=False, status="created", started=NEVER)
+    ran = dict(PROXY, running=False, status="exited")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", containers=(PG, waiting), FAKE_UP_RC="1",
+             FAKE_STATUS="exited", FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, ran]))
+    _never_undone(r, inst)
+
+
+def test_a_release_raised_from_the_database_is_not_undone(tmp_path, fakebin, raw):
+    # .env names an older release than the one that last migrated the
+    # database: the copied files would run that older release on it.
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_DB_VERSION="1.6.5", FAKE_UP_RC="1",
+             FAKE_STATUS="exited", FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, NEVER_PROXY]))
+    assert "last migrated by 1.6.5" in r.stdout
+    assert "putting 1.6.5 back" not in _said(r)
+    assert "may already be migrated" in _said(r)
+
+
+def test_an_unknown_server_state_is_never_rolled_back(tmp_path, fakebin, raw):
+    # A container that cannot be read counts as one that ran: the files
+    # stay, and the advice is the restore.
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    ghost = dict(NEVER_PROXY, id="proxy-ghost", unreadable=True)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", FAKE_UP_RC="1", FAKE_STATUS="exited",
+             FAKE_CONTAINERS_AFTER_UP=json.dumps([PG, ghost]))
+    _never_undone(r, inst)
+
+
+def test_a_named_project_is_the_one_every_lookup_and_compose_call_takes(tmp_path, fakebin, raw):
+    def mine(c):
+        return dict(c, labels={**c["labels"], "com.docker.compose.project": "otodock-b"})
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    # Another install on this daemon (the project otodock) is never read.
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", containers=(PG, PROXY),
+             OTODOCK_COMPOSE_PROJECT="otodock-b")
+    assert r.returncode != 0
+    assert "no running otodock-postgres container found" in r.stderr
+    assert not any(a[:1] == ["exec"] for a in _changes(tmp_path))
+    (tmp_path / "docker.log").unlink()
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", containers=(mine(PG), mine(PROXY)),
+             OTODOCK_COMPOSE_PROJECT="otodock-b", FAKE_ENV_LOG=str(tmp_path / "env.log"))
+    assert r.returncode == 0, r.stderr
+    filters = [a[i + 1] for a in _calls(tmp_path) if a[:1] == ["ps"]
+               for i, x in enumerate(a) if x == "--filter" and a[i + 1].startswith("label=com.docker.compose.project=")]
+    assert filters and set(filters) == {"label=com.docker.compose.project=otodock-b"}
+    assert set((tmp_path / "env.log").read_text().split()) == {"otodock-b"}
+    # Unset, the project is the one compose resolves (otodock here), and
+    # every compose call is told so.
+    (tmp_path / "env.log").unlink()
+    inst2 = tmp_path / "second"
+    shutil.copytree(inst, inst2, ignore=shutil.ignore_patterns("backups"))
+    r = _run(inst2, tmp_path, fakebin, "--to", "1.7.0", FAKE_ENV_LOG=str(tmp_path / "env.log"))
+    assert r.returncode == 0, r.stderr
+    assert set((tmp_path / "env.log").read_text().split()) == {"otodock"}
+    (snap,) = _snapshots(inst)
+    assert "project=otodock-b" in (snap / "manifest").read_text().splitlines()
 
 
 def test_optional_example_files_fail_quietly(tmp_path, fakebin, raw):
@@ -725,6 +909,28 @@ def test_install_lists_an_override_after_the_base(tmp_path, fakebin, override, w
     # the phone ports follow the public host, else loopback; no stale default
     assert "listen on\n# OTO_AUDIOSOCKET_PUBLIC_HOST above, else on 127.0.0.1" in text
     assert "publish on\n# 127.0.0.1 by default" not in text
+
+
+def test_install_names_the_next_step_when_up_fails(tmp_path, fakebin):
+    # A second install.sh is refused in a folder holding the compose files,
+    # so a failed start must say to run docker compose up -d there.
+    inst = tmp_path / "inst"
+    inst.mkdir()
+    (tmp_path / "home").mkdir()
+    rel = tmp_path / "raw" / "main"
+    rel.mkdir(parents=True)
+    (rel / "docker-compose.yml").write_text("# the base file\n")
+    (rel / "docker-compose.phone.yml").write_text("# the phone overlay\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("POSTGRES_", "OTODOCK_", "COMPOSE_"))}
+    env.update({"PATH": f"{fakebin}:{env.get('PATH', '/usr/bin:/bin')}", "HOME": str(tmp_path / "home"),
+                "FAKE_LOG": str(tmp_path / "docker.log"), "FAKE_CURL_LOG": str(tmp_path / "curl.log"),
+                "FAKE_RAW_ROOT": str(tmp_path / "raw"), "FAKE_UP_RC": "1"})
+    r = subprocess.run(["bash", str(SCRIPTS / "install.sh")], cwd=inst, env=env,
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "docker compose up failed" in r.stderr
+    assert "run docker compose up -d in that folder" in " ".join(r.stderr.split())
+    assert (inst / "docker-compose.yml").is_file() and (inst / ".env").is_file()
 
 
 # ── the phone publish address: a literal this host does not hold ─────────────
@@ -964,6 +1170,49 @@ def test_the_database_version_raises_the_starting_release(tmp_path, fakebin, raw
     assert "upgrade notes from 1.6.2 to 1.7.0" in r.stdout
 
 
+CHANGELOG_1_8_0 = """\
+# Changelog
+
+## [Unreleased]
+
+## [1.8.0] - 2026-10-13
+
+### Upgrade notes
+- **The candidate's note:** admins set BAR.
+
+## [1.7.0] - 2026-09-29
+
+### Upgrade notes
+- A 1.7.0 note, below the starting release.
+"""
+
+
+@pytest.mark.parametrize("known_from", [True, False], ids=["from-1.7.0", "from-unknown"])
+def test_a_release_candidate_prints_the_notes_of_the_release_it_precedes(
+        tmp_path, fakebin, raw, candidate, known_from):
+    """The rc is built from its release's commit: its changelog's section is
+    the release's, which the one version rule places after the rc."""
+    (candidate / "CHANGELOG.md").write_text(CHANGELOG_1_8_0)
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + ("OTODOCK_VERSION=1.7.0\n" if known_from else ""))
+    if not known_from:
+        (inst / "docker-compose.yml").write_text(
+            "services:\n  otodock-proxy:\n    image: ghcr.io/otodock/otodock-proxy:latest\n")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.8.0-rc2", "--compose-dir", str(candidate), "--dry-run")
+    assert r.returncode == 0, r.stderr
+    start = "1.7.0" if known_from else "the current release"
+    assert f"upgrade notes from {start} to 1.8.0-rc2, the notes of 1.8.0" in r.stdout
+    assert "admins set BAR." in r.stdout and "A 1.7.0 note" not in r.stdout
+    assert "no upgrade notes" not in r.stdout
+
+
+def test_a_release_candidate_without_notes_links_its_release(tmp_path, fakebin, raw, candidate):
+    (candidate / "CHANGELOG.md").write_text("# Changelog\n\n## [1.8.0] - 2026-10-13\n\n### Fixed\n- A fix.\n")
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + "OTODOCK_VERSION=1.7.0\n")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.8.0-rc2", "--compose-dir", str(candidate), "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "no upgrade notes for 1.8.0-rc2" in r.stdout and "releases/tag/v1.8.0\n" in r.stdout
+
+
 BAD_YESNO = "OIDC_ENABLED=yse\nOTODOCK_AIR_GAPPED=1\nCOOKIE_SECURE=auto\nDASHBOARD_ENABLED=auto\n"
 
 
@@ -988,6 +1237,23 @@ def test_the_yes_no_rule_is_judged_only_for_a_target_of_1_8_0_or_later(tmp_path,
     r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--dry-run")
     assert r.returncode == 0, r.stderr
     assert "yes/no" not in r.stderr and "count as ON" not in r.stdout
+
+
+def test_a_candidate_of_1_8_0_is_judged_by_the_yes_no_rule(tmp_path, fakebin, raw, candidate):
+    """A release candidate runs its release's code: the version rule that
+    places 1.8.0-rc2 before 1.8.0 must not skip 1.8.0's yes/no check."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + BAD_YESNO)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.8.0-rc2", "--compose-dir", str(candidate), "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "not yes/no words" in r.stderr and "OIDC_ENABLED=yse" in r.stderr
+
+
+def test_an_install_on_a_candidate_of_1_8_0_already_reads_the_yes_no_rule(tmp_path, fakebin, raw_1_8):
+    """From 1.8.0-rc1 to 1.8.0 crosses no change of the yes/no words."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + "OIDC_ENABLED=1\nOTODOCK_VERSION=1.8.0-rc1\n")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.8.0", "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "count as ON" not in r.stdout
 
 
 def test_values_that_count_as_on_from_1_8_0_are_named_in_both_runs(tmp_path, fakebin, raw_1_8):
@@ -1027,7 +1293,8 @@ def test_the_snapshot_is_a_restore_run_directory(tmp_path, fakebin, raw):
     (dump,) = snap.glob("*.sql.gz")
     assert manifest["db"] == dump.name
     assert manifest["otodock_version"] == "1.6.1" and manifest["complete"] == "1"
-    assert manifest["agents"] == "skipped" and manifest["credential_keys"] == keys
+    assert manifest["trees"] == "none" and "agents" not in manifest and "ssh_keys" not in manifest
+    assert manifest["credential_keys"] == keys
     assert "credential_keys_floor" not in manifest
     assert stat.S_IMODE((snap / "manifest").stat().st_mode) & 0o077 == 0
     # A 1.7.1 database has no fingerprint row: the secret floor's record stands in.
@@ -1046,3 +1313,125 @@ def test_a_release_candidate_below_the_database_release_is_a_downgrade(tmp_path,
     r = _run(inst, tmp_path, fakebin, "--to", "1.8.0-rc2", "--compose-dir", str(candidate), FAKE_DB_VERSION="1.8.0")
     assert r.returncode != 0
     assert "last migrated by OtoDock 1.8.0" in r.stderr and "downgrade" in r.stderr
+
+
+# ── Collabora 26.04: the Engine floor, the scheme line, the stop before up ─────
+
+def test_an_engine_older_than_26_stops_before_anything_changes(tmp_path, fakebin, candidate):
+    """The key Collabora signs with is mounted as one file of a volume (a
+    subpath, Docker Engine 26): an older engine stops the run while the old
+    stack still runs."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--compose-dir", str(candidate),
+             FAKE_API_VERSION="1.44")
+    assert r.returncode != 0
+    assert "Docker Engine 26 or later" in r.stderr
+    assert _tree(inst) == before and not (inst / "backups").exists()
+    assert not _did(tmp_path, "pull") and not _did(tmp_path, "up")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--compose-dir", str(candidate), "--dry-run",
+             FAKE_API_VERSION="1.44")
+    assert r.returncode == 0 and "the real run stops here" in r.stderr
+
+
+@pytest.mark.parametrize("url, line, want", [
+    ("https://otodock.example.com", None, "COLLABORA_SSL_TERMINATION=true"),
+    ("HTTPS://otodock.example.com", "COLLABORA_SSL_TERMINATION=false", "COLLABORA_SSL_TERMINATION=true"),
+    ("http://192.168.1.5:8400", "COLLABORA_SSL_TERMINATION=true", "COLLABORA_SSL_TERMINATION=false"),
+    ("http://192.168.1.5:8400", None, None),
+    (None, None, None),
+])
+def test_the_collabora_scheme_line_follows_the_dashboard_url(tmp_path, fakebin, candidate, url, line, want):
+    """26.04 cannot derive ssl.termination from DASHBOARD_PUBLIC_URL at
+    start: the script owns the line, true for https, false (the file's
+    default, so no line is added for it) otherwise."""
+    env = SECRET_ENV + PHONE_LINE + (f"DASHBOARD_PUBLIC_URL={url}\n" if url else "") + (f"{line}\n" if line else "")
+    inst = _install(tmp_path, env)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--compose-dir", str(candidate))
+    assert r.returncode == 0, r.stderr
+    lines = [x for x in (inst / ".env").read_text().splitlines() if x.startswith("COLLABORA_SSL_TERMINATION")]
+    if want:
+        assert lines == [want]
+        assert want in r.stdout
+    else:
+        assert lines == ([line] if line else [])
+        assert "COLLABORA_SSL_TERMINATION" not in r.stdout
+
+
+def test_the_scheme_line_is_named_in_the_dry_run_and_rolled_back_with_the_rest(tmp_path, fakebin, candidate):
+    original = SECRET_ENV + PHONE_LINE + "DASHBOARD_PUBLIC_URL=https://otodock.example.com\n"
+    inst = _install(tmp_path, original)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--compose-dir", str(candidate), "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "set COLLABORA_SSL_TERMINATION=true in .env" in r.stdout
+    assert (inst / ".env").read_text() == original
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--compose-dir", str(candidate),
+             FAKE_IMAGES="ghcr.io/otodock/otodock-proxy:9.9.9")
+    assert r.returncode != 0
+    assert (inst / ".env").read_text() == original
+
+
+def test_collabora_stops_before_up_so_its_saves_reach_the_running_server(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--dry-run", containers=(PG, PROXY, COLLABORA))
+    assert r.returncode == 0 and "stop Collabora" in r.stdout
+    assert not _did(tmp_path, "stop")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", containers=(PG, PROXY, COLLABORA))
+    assert r.returncode == 0, r.stderr
+    subs = _compose_subcommands(tmp_path)
+    assert ["compose", "stop", "-t", "30", "collabora"] in _calls(tmp_path)
+    assert subs.index("stop -t") < subs.index("up -d")
+
+
+def test_no_collabora_running_means_no_stop(tmp_path, fakebin, raw):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0")
+    assert r.returncode == 0, r.stderr
+    assert not _did(tmp_path, "stop")
+
+
+
+def test_a_compose_older_than_2_26_stops_before_anything_changes(tmp_path, fakebin, candidate):
+    """Compose 2.25 reads the volume subpath and does not pass it on
+    (moby#47687): the editor's key would be the whole volume."""
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE)
+    before = _tree(inst)
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--compose-dir", str(candidate),
+             FAKE_COMPOSE_VERSION="2.25.0")
+    assert r.returncode != 0 and "older than 2.26" in r.stderr
+    assert _tree(inst) == before and not (inst / "backups").exists()
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--compose-dir", str(candidate),
+             FAKE_COMPOSE_VERSION="v2.26.1")
+    assert r.returncode == 0, r.stderr
+
+
+def test_the_scheme_line_holds_through_two_runs(tmp_path, fakebin, candidate):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + "DASHBOARD_PUBLIC_URL=https://otodock.example.com\n")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--compose-dir", str(candidate))
+    assert r.returncode == 0, r.stderr
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.1", "--compose-dir", str(candidate))
+    assert r.returncode == 0, r.stderr
+    lines = [x for x in (inst / ".env").read_text().splitlines() if "COLLABORA_SSL_TERMINATION" in x]
+    assert lines == ["COLLABORA_SSL_TERMINATION=true"]
+    assert "setting COLLABORA_SSL_TERMINATION" not in r.stdout
+
+
+@pytest.mark.parametrize("line, want", [
+    ("export COLLABORA_SSL_TERMINATION=false", ["COLLABORA_SSL_TERMINATION=true"]),
+    ("# COLLABORA_SSL_TERMINATION=true", ["# COLLABORA_SSL_TERMINATION=true", "COLLABORA_SSL_TERMINATION=true"]),
+])
+def test_the_scheme_line_reads_every_form(tmp_path, fakebin, candidate, line, want):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE
+                    + f"DASHBOARD_PUBLIC_URL=https://otodock.example.com\n{line}\n")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--compose-dir", str(candidate))
+    assert r.returncode == 0, r.stderr
+    assert [x for x in (inst / ".env").read_text().splitlines() if "COLLABORA_SSL_TERMINATION" in x] == want
+
+
+def test_a_scheme_value_in_the_shell_is_named_and_set_aside(tmp_path, fakebin, candidate):
+    inst = _install(tmp_path, SECRET_ENV + PHONE_LINE + "DASHBOARD_PUBLIC_URL=https://otodock.example.com\n")
+    r = _run(inst, tmp_path, fakebin, "--to", "1.7.0", "--compose-dir", str(candidate),
+             COLLABORA_SSL_TERMINATION="false")
+    assert r.returncode == 0, r.stderr
+    assert "your shell sets COLLABORA_SSL_TERMINATION" in r.stderr
+    assert "COLLABORA_SSL_TERMINATION=true" in (inst / ".env").read_text()

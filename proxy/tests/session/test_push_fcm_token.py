@@ -41,6 +41,9 @@ class _Creds:
 class _Request:
     """The google-auth transport callable the sender hands to ``refresh``."""
 
+    def __init__(self, session=None):
+        self.session = session
+
     def __call__(self, url, method="GET", body=None, headers=None, timeout=120, **kw):
         return None
 
@@ -66,6 +69,7 @@ def _byo(monkeypatch, *, fcm_status: int = 200):
             built.append(1)
             kw["transport"] = httpx.MockTransport(handler)
             kw.pop("verify", None)
+            kw.pop("mounts", None)
             super().__init__(*a, **kw)
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeClient)

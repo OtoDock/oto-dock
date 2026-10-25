@@ -15,8 +15,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import config
-from core.remote import remote_file_flow
-from core.remote import satellite_file_transfer as sft
+from core.remote import remote_file_flow, satellite_file_transfer as sft
 from core.remote.satellite_connection import SatelliteConnectionManager
 
 

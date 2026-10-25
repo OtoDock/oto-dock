@@ -47,7 +47,7 @@ describe('CommunityMcpsBrowser unpinned git entry', () => {
         </QueryClientProvider>
       </MemoryRouter>,
     )
-    expect(await screen.findByText('catalog pins no commit')).toHaveAttribute('title', expect.stringMatching(/pins a commit/))
+    expect(await screen.findByText('No pinned commit')).toHaveAttribute('title', expect.stringMatching(/pins a commit/))
     expect(screen.getAllByRole('button', { name: 'Update' })).toHaveLength(1)
   })
 })

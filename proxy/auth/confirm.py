@@ -44,8 +44,8 @@ async def confirm_password(u, password: str) -> dict:
         raise HTTPException(400, "This action needs a password-backed local account")
     try:
         ok = await verify_password_async(password or "", db_user["password_hash"])
-    except HashBusy:
-        raise hash_busy()
+    except HashBusy as exc:
+        raise hash_busy() from exc
     if not ok:
         raise HTTPException(401, "Password is incorrect")
     return db_user

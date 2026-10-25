@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import cast
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -86,15 +87,16 @@ async def gateway(mcp: str, rest: str, request: Request):
         raise HTTPException(status_code=413, detail="Request body too large")
     prepared = await mcp_gateway.prepare_forward(
         session_id, mcp, method, rest, request.scope.get("query_string") or b"",
-        request.headers.items(),
+        request.headers.items(), body,
     )
     if isinstance(prepared, mcp_gateway.Refusal):
         logger.info("mcp-gateway: %s refused for session %s mcp %r", prepared.reason,
                     session_id[:8], mcp)
         return _refuse(method, body, prepared.detail)
-    req = prepared.client.build_request(method, prepared.url, headers=prepared.headers,
-                                        content=body)
-    send = asyncio.ensure_future(prepared.client.send(req, stream=True))
+    client = cast("httpx.AsyncClient", prepared.client)  # mcp_gateway.client() built it
+    req = client.build_request(method, cast("httpx.URL", prepared.url), headers=prepared.headers,
+                               content=body if prepared.content is None else prepared.content)
+    send = asyncio.ensure_future(client.send(req, stream=True))
     try:
         while True:
             done, _ = await asyncio.wait({send}, timeout=_DISCONNECT_POLL_S)
@@ -105,7 +107,8 @@ async def gateway(mcp: str, rest: str, request: Request):
                 return Response(status_code=499)
         upstream = send.result()
     except httpx.HTTPError as e:
-        logger.warning("mcp-gateway: upstream error for mcp %r: %s", mcp, type(e).__name__)
+        # The text names a refused address when the dial refused one.
+        logger.warning("mcp-gateway: upstream error for mcp %r: %s: %s", mcp, type(e).__name__, e)
         return _refuse(method, body, "The MCP server did not answer.")
     if 300 <= upstream.status_code < 400:
         await upstream.aclose()

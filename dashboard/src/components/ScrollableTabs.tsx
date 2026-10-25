@@ -12,7 +12,7 @@
  *   - vertical mouse-wheel is translated to horizontal scroll on desktop, and
  *     released back to the page once the row hits an edge
  *
- * Shared by the User Settings and admin Setup pages so the two stay identical.
+ * The tab row of admin Setup.
  */
 
 import {
@@ -89,10 +89,21 @@ export function ScrollableTabs<T extends string>({
   }, [])
 
   // Keep the active tab in view — nudges it on-screen if off, leaves it alone
-  // if already visible (so a click doesn't jump the row around).
+  // if already visible (so a click doesn't jump the row around). Again once
+  // the arrows appear: they take width from the row, so a tab scrolled in
+  // before they mounted (a cold `?tab=` on a phone) would end up clipped.
+  // The row alone scrolls, never the page: a resize that adds or removes the
+  // arrows must not move the person off what they were reading.
   useEffect(() => {
-    tabRefs.current.get(active)?.scrollIntoView({ inline: 'nearest', block: 'nearest' })
-  }, [active])
+    const row = rowRef.current
+    const tab = tabRefs.current.get(active)
+    if (!row || !tab) return
+    const r = row.getBoundingClientRect()
+    const t = tab.getBoundingClientRect()
+    const fade = 20 // the edge fades' w-5
+    if (t.left < r.left + fade) row.scrollLeft -= r.left + fade - t.left
+    else if (t.right > r.right - fade) row.scrollLeft += t.right - (r.right - fade)
+  }, [active, overflow])
 
   const nudge = (dir: -1 | 1) => {
     const el = rowRef.current
@@ -146,12 +157,12 @@ export function ScrollableTabs<T extends string>({
   }
 
   const arrowCls =
-    'shrink-0 grid place-items-center w-6 h-7 rounded-md text-p-text-secondary ' +
-    'hover:text-p-text hover:bg-white/70 dark:hover:bg-p-surface/70 transition-colors ' +
+    'shrink-0 grid place-items-center w-6 h-7 rounded-control text-secondary ' +
+    'hover:text-primary hover:bg-surface-hover transition-colors ' +
     'disabled:opacity-30 disabled:pointer-events-none'
 
   return (
-    <div className={`flex items-center gap-1 bg-p-bg rounded-lg p-1 ${className}`}>
+    <div className={`flex items-center gap-1 bg-surface-page rounded-card p-1 ${className}`}>
       {overflow && (
         <button type="button" aria-label="Scroll tabs left" disabled={atStart} onClick={() => nudge(-1)} className={arrowCls}>
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -163,10 +174,10 @@ export function ScrollableTabs<T extends string>({
       <div className="relative flex-1 min-w-0">
         {/* Edge fades — only on the side that still has hidden tabs. */}
         {overflow && !atStart && (
-          <div className="pointer-events-none absolute left-0 inset-y-0 z-10 w-5 bg-linear-to-r from-p-bg to-transparent" />
+          <div className="pointer-events-none absolute left-0 inset-y-0 z-10 w-5 bg-linear-to-r from-surface-page to-transparent" />
         )}
         {overflow && !atEnd && (
-          <div className="pointer-events-none absolute right-0 inset-y-0 z-10 w-5 bg-linear-to-l from-p-bg to-transparent" />
+          <div className="pointer-events-none absolute right-0 inset-y-0 z-10 w-5 bg-linear-to-l from-surface-page to-transparent" />
         )}
 
         <div
@@ -191,10 +202,10 @@ export function ScrollableTabs<T extends string>({
               }}
               onClick={() => onChange(t.id)}
               aria-current={active === t.id}
-              className={`whitespace-nowrap shrink-0 px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${
+              className={`whitespace-nowrap shrink-0 px-4 py-1.5 text-sm font-medium rounded-control transition-colors ${
                 active === t.id
-                  ? 'bg-white dark:bg-p-surface text-p-text shadow-xs'
-                  : 'text-p-text-secondary hover:text-p-text'
+                  ? 'bg-surface-card text-primary shadow-elevation-1'
+                  : 'text-secondary hover:text-primary'
               }`}
             >
               {t.label}

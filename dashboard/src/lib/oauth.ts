@@ -41,7 +41,8 @@ export function deepLinkPending(): boolean {
 }
 
 /** Called from Android native via evaluateJavascript when an otodock://oauth/* deep link fires. */
-;(window as any)._handleDeepLink = (url: string) => {
+const deepLinkWindow: Window & { _handleDeepLink?: (url: string) => unknown } = window
+deepLinkWindow._handleDeepLink = (url: string) => {
   if (pendingDeepLink) {
     pendingDeepLink.resolve(url)
     return

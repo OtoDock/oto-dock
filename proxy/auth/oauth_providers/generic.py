@@ -23,23 +23,60 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 import httpx
 
-from auth.oauth_providers.base import OAuthProvider, OAuthTokenError, TokenSet, UserInfo
+from auth.oauth_providers.base import (
+    INVALID_CLIENT,
+    INVALID_GRANT,
+    OAuthProvider,
+    OAuthTokenError,
+    TokenSet,
+    UserInfo,
+)
 
 logger = logging.getLogger("otodock.oauth-providers.generic")
 
 
-def _json_object(resp: httpx.Response) -> dict:
-    """The response's JSON object, or an empty dict when the body is not one
-    (an HTML error page): the caller then reports the status alone."""
+# The token endpoint is asked for JSON (RFC 6749 requires it there): GitHub
+# answers form-encoded otherwise.
+_ACCEPT_JSON = {"Accept": "application/json"}
+
+# A vendor's own word for a standard OAuth error (GitHub's), mapped to the
+# code the refresh worker reads.
+_ERROR_WORDS = {
+    "bad_refresh_token": INVALID_GRANT,
+    "bad_verification_code": INVALID_GRANT,
+    "incorrect_client_credentials": INVALID_CLIENT,
+}
+
+
+def _token_payload(resp: httpx.Response) -> dict:
+    """The token endpoint's answer as a dict: its JSON object, a form-encoded
+    body (``application/x-www-form-urlencoded``, which GitHub sends when the
+    request did not ask for JSON) flattened to its first values, or an empty
+    dict when the body is neither (an HTML error page): the caller then
+    reports the status alone."""
+    content_type = resp.headers.get("content-type", "")
+    if isinstance(content_type, str) and "x-www-form-urlencoded" in content_type.lower():
+        form = parse_qs(resp.text, keep_blank_values=True)
+        return {k: v[0] for k, v in form.items() if v}
     try:
         payload = resp.json()
     except ValueError:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+
+def _error_code(payload: dict, status: int) -> str:
+    """The OAuth error code of a refused answer: the vendor's ``error``
+    (its own word mapped to the standard one), else the status."""
+    word = str(payload.get("error") or "")
+    if not word:
+        return f"http_{status}"
+    return _ERROR_WORDS.get(word, word)
 
 
 class GenericOAuthProvider(OAuthProvider):
@@ -131,12 +168,11 @@ class GenericOAuthProvider(OAuthProvider):
         if code_verifier:
             data["code_verifier"] = code_verifier
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(self.token_url, data=data)
-        payload = _json_object(resp)
+            resp = await client.post(self.token_url, data=data, headers=_ACCEPT_JSON)
+        payload = _token_payload(resp)
         if resp.status_code != 200 or "error" in payload:
             raise OAuthTokenError(
-                self.provider_id, "exchange",
-                str(payload.get("error") or f"http_{resp.status_code}"),
+                self.provider_id, "exchange", _error_code(payload, resp.status_code),
                 str(payload.get("error_description") or ""), resp.status_code,
             )
         return self.normalize_token_response(payload)
@@ -157,12 +193,12 @@ class GenericOAuthProvider(OAuthProvider):
                     "client_secret": client_secret,
                     "grant_type": "refresh_token",
                 },
+                headers=_ACCEPT_JSON,
             )
-        payload = _json_object(resp)
+        payload = _token_payload(resp)
         if resp.status_code != 200 or "error" in payload:
             raise OAuthTokenError(
-                self.provider_id, "refresh",
-                str(payload.get("error") or f"http_{resp.status_code}"),
+                self.provider_id, "refresh", _error_code(payload, resp.status_code),
                 str(payload.get("error_description") or ""), resp.status_code,
             )
         ts = self.normalize_token_response(payload)
@@ -254,7 +290,7 @@ class GenericOAuthProvider(OAuthProvider):
                 "%s token revocation returned %d", self.provider_id, resp.status_code,
             )
             return False
-        except Exception as e:
+        except (httpx.HTTPError, httpx.InvalidURL) as e:
             logger.warning("%s token revocation failed: %s", self.provider_id, e)
             return False
 
@@ -280,8 +316,8 @@ class GenericOAuthProvider(OAuthProvider):
         if extra:
             data.update(extra)
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(self.device_authorization_url, data=data)
-        payload = resp.json()
+            resp = await client.post(self.device_authorization_url, data=data, headers=_ACCEPT_JSON)
+        payload = _token_payload(resp)
         if resp.status_code != 200 or "error" in payload:
             err = payload.get("error_description") or payload.get("error") or str(payload)
             raise RuntimeError(f"{self.provider_id} device code start failed: {err}")
@@ -303,10 +339,12 @@ class GenericOAuthProvider(OAuthProvider):
                     "client_id": client_id,
                     "client_secret": client_secret,
                 },
+                headers=_ACCEPT_JSON,
             )
-        payload = resp.json()
-        # Pending state — caller waits + retries.
-        if resp.status_code != 200:
+        payload = _token_payload(resp)
+        # Pending state — caller waits + retries. GitHub answers it with a
+        # 200 that carries the error word.
+        if resp.status_code != 200 or payload.get("error"):
             err = (payload.get("error") or "").lower()
             if err in ("authorization_pending", "slow_down"):
                 return None
@@ -336,8 +374,8 @@ class GenericOAuthProvider(OAuthProvider):
         if extra:
             data.update(extra)
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(self.token_url, data=data)
-        payload = resp.json()
+            resp = await client.post(self.token_url, data=data, headers=_ACCEPT_JSON)
+        payload = _token_payload(resp)
         if resp.status_code != 200 or "error" in payload:
             err = payload.get("error_description") or payload.get("error") or str(payload)
             raise RuntimeError(

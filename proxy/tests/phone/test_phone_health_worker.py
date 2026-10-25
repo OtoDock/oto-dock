@@ -47,8 +47,7 @@ def _make_fake(phone_adapters, dids, healthy=True):
 
 
 def _setup_verified_server_with_route(did="+30210"):
-    from storage.phone import phone_route_store
-    from storage.phone import phone_server_store
+    from storage.phone import phone_route_store, phone_server_store
 
     s = phone_server_store.create_server({"name": "pbx", "adapter_type": "asterisk_manual"})
     phone_server_store.update_server(s["id"], {"bootstrap_status": "verified"})

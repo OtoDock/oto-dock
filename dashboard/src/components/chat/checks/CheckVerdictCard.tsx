@@ -8,10 +8,10 @@ import { isLocalTarget } from '../../../lib/placement'
 // the agent's Checks page.
 
 const TONE: Record<string, string> = {
-  pass: 'border-green-300 bg-green-50 text-green-900 dark:border-green-800 dark:bg-green-900/20 dark:text-green-200',
-  fail: 'border-red-300 bg-red-50 text-red-900 dark:border-red-800 dark:bg-red-900/20 dark:text-red-200',
-  error: 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-200',
-  skipped: 'border-p-border-light bg-p-surface text-p-text-secondary',
+  pass: 'border-status-success-border bg-status-success-bg text-status-success-fg',
+  fail: 'border-status-danger-border bg-status-danger-bg text-status-danger-fg',
+  error: 'border-status-warning-border bg-status-warning-bg text-status-warning-fg',
+  skipped: 'border-subtle bg-surface-muted text-secondary',
 }
 const WORDS: Record<string, string> = { pass: 'passed', fail: 'did not pass', error: 'could not run', skipped: 'skipped' }
 
@@ -23,7 +23,7 @@ export default function CheckVerdictCard({ check, status, score, summary, findin
   const [open, setOpen] = useState(status === 'fail')
   const where = isLocalTarget(ranOn) ? 'on the platform' : `on machine ${ranOn.slice(0, 8)}`
   return (
-    <div className={`my-1.5 rounded-lg border px-2.5 py-1.5 text-xs ${TONE[status] || TONE.error}`} data-testid="check-verdict-card">
+    <div className={`my-1.5 rounded-card border px-2.5 py-1.5 text-xs ${TONE[status] || TONE.error}`} data-testid="check-verdict-card">
       <button type="button" className="flex w-full items-center gap-2 text-left" onClick={() => setOpen((v) => !v)}>
         <span className="shrink-0" aria-hidden>{status === 'pass' ? '✓' : status === 'fail' ? '✗' : '!'}</span>
         <span className="font-medium">Check {check} {WORDS[status] || status}</span>

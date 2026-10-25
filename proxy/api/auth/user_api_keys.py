@@ -17,15 +17,15 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from storage.identity import api_key_store
-from storage.pg import run_db
-from services.infra import api_key_manager
 from auth.providers import (
     UserContext,
     get_current_user,
     require_auth,
     require_user,
 )
+from services.infra import api_key_manager
+from storage.identity import api_key_store
+from storage.pg import run_db
 
 logger = logging.getLogger("otodock.user-api-keys")
 # No route here takes an anonymous caller (auth.providers.require_user).
@@ -56,7 +56,7 @@ async def create_user_key(
             permissions=req.permissions,
         )
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     return {
         "status": "created",
         "id": row["id"],
@@ -121,5 +121,5 @@ async def revoke_user_key(
         raise HTTPException(404, "Key not found")
     if outcome == "already_revoked":
         return {"status": "already_revoked", "id": key_id}
-    logger.info(f"Revoked user_api_key {key_id[:8]} for user {u.sub[:8]}")
+    logger.info("Revoked user_api_key %s for user %s", key_id[:8], u.sub[:8])
     return {"status": "revoked", "id": key_id}

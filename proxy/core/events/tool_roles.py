@@ -131,6 +131,15 @@ TOOL_ROLES: dict[str, str] = {
     "request_user_input": "question",
     "CodexEscalation": "escalation",
     "CodexTerminalInput": "escalation",
+    "view_image": "read",
+    "spawn_agent": "subagent",
+    "send_input": "subagent",
+    "resume_agent": "subagent",
+    "wait_agent": "subagent",
+    "close_agent": "subagent",
+    "list_mcp_resources": "discovery",
+    "list_mcp_resource_templates": "discovery",
+    "read_mcp_resource": "discovery",
 }
 
 TOOL_PAYLOADS: dict[str, str] = {
@@ -169,6 +178,15 @@ TOOL_PAYLOADS: dict[str, str] = {
     "request_user_input": NONE,
     "CodexEscalation": NONE,
     "CodexTerminalInput": NONE,
+    "view_image": SEARCH_PATH,
+    "spawn_agent": NONE,
+    "send_input": NONE,
+    "resume_agent": NONE,
+    "wait_agent": NONE,
+    "close_agent": NONE,
+    "list_mcp_resources": NONE,
+    "list_mcp_resource_templates": NONE,
+    "read_mcp_resource": NONE,
 }
 
 SHELL_DIALECTS: dict[str, str] = {

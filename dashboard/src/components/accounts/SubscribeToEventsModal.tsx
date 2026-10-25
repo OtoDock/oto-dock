@@ -8,7 +8,9 @@
  *      `target_kinds` (GitHub: one repository, or every repository in an
  *      organization) puts the choice above the field; the chosen kind's
  *      hints and regex replace the flat ones.
- *   2. Event picker — checkbox list from manifest's `event_catalog`.
+ *   2. Event picker — checkbox list from manifest's `event_catalog`. When
+ *      the account's recorded scopes lack what the picked events need, one
+ *      line above the list says which permission and what to tick.
  *   3. Confirm — POST /v1/subscriptions; errors surface inline.
  *
  * Scope-agnostic: the same modal creates a personal subscription or one for
@@ -27,7 +29,12 @@ import {
   type WebhookEventCatalogEntry,
   type VendorTargetSpec,
 } from '../../api/subscriptions'
-import { describeSubscriptionError } from './SubscriptionRow'
+import Dialog from '../ui/Dialog'
+import Button from '../ui/Button'
+import { Input, Select } from '../ui/Field'
+import { BADGE_BASE, BADGE_TONE, DIALOG_PANEL } from '../ui/classes'
+import InfoTip from '../ui/InfoTip'
+
 
 interface Props {
   mcpName: string
@@ -37,7 +44,10 @@ interface Props {
   vendorTargetSpec: VendorTargetSpec
   /** EFFECTIVE registration mode for this account (relay = hosted delivery,
    * zero vendor-console steps). */
-  registrationMode?: 'relay' | 'auto' | 'manual'
+  registrationMode?: 'relay' | 'auto' | 'manual' | 'app'
+  /** The target is a GitHub App installation: the picker's help says how
+   * its events arrive, so no delivery line shows. */
+  installationTarget?: boolean
   manualInstructionsUrl?: string
   /** Prefill for the vendor-target input (slack: the account's team_id). */
   vendorTargetPrefill?: string
@@ -49,10 +59,72 @@ interface Props {
   /** Agents this account serves as service identity. Non-empty renders the
    * "Subscribe as" control (personal stays the default). */
   serviceOptions?: ServiceBindingSummary[]
+  /** The account's recorded scopes; null or absent when not known. */
+  grantedScopes?: string[] | null
+  /** Each scope a service asks for, with that service's label. */
+  scopeServices?: Record<string, string>
   onClose: () => void
 }
 
 const PERSONAL = '__me__'
+
+/** Plain words for a refused subscription request. Structured refusals
+ * (missing scopes, a duplicate) say what to do, the scopes in the scope
+ * line's words; anything else is the server's message. */
+function describeSubscriptionError(
+  err: unknown,
+  opts: ScopeContext,
+): string {
+  if (err instanceof SubscriptionRequestError && typeof err.detail !== 'string') {
+    const d = err.detail
+    if (d.error === 'missing_scopes') {
+      const missing = Array.isArray(d.required) ? d.required.map(String) : []
+      return scopeNotice(missing, opts)
+    }
+    if (d.error === 'exists') {
+      return 'A subscription for this target already exists here.'
+    }
+  }
+  return (err as Error).message
+}
+
+function joinAnd(words: string[]): string {
+  return words.length < 2
+    ? words.join('')
+    : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`
+}
+
+interface ScopeContext {
+  ownAccount: boolean
+  scopeServices: Record<string, string>
+  /** The scopes the picked events need, and the chosen target kind's. */
+  eventScopes: string[]
+  kindScopes: string[]
+}
+
+/** The line above the events when the account lacks a scope they need, and
+ * the create's refusal in the same words: which permission (a URL-shaped
+ * scope by its last segment), and which service to tick when reconnecting. */
+function scopeNotice(missing: string[], ctx: ScopeContext): string {
+  // One order on the line and in the refusal: the server sorts its list.
+  const scopes = [...new Set(missing)].sort()
+  const name = (s: string) => s.split('/').pop() || s
+  const noun = scopes.length === 1 ? 'permission' : 'permissions'
+  const fromEvents = scopes.some((s) => ctx.eventScopes.includes(s) || !ctx.kindScopes.includes(s))
+  const subject = fromEvents ? 'These events need' : 'This subscription needs'
+  const need = `${subject} the ${joinAnd(scopes.map(name))} ${noun}.`
+  // A scope no service asks for: no reconnect can grant it.
+  const known = Object.keys(ctx.scopeServices).length > 0
+  const ungranted = known ? scopes.filter((s) => !ctx.scopeServices[s]) : []
+  if (ungranted.length) {
+    return `${need} No service of this MCP grants ${joinAnd(ungranted.map(name))}, so its author needs to fix this.`
+  }
+  const labels = [...new Set(scopes.map((s) => ctx.scopeServices[s]).filter(Boolean))]
+  const tick = labels.length ? ` and tick ${joinAnd(labels)}` : ''
+  return ctx.ownAccount
+    ? `${need} Reconnect the account${tick}.`
+    : `${need} The account's owner must reconnect it${tick}.`
+}
 
 export function SubscribeToEventsModal({
   mcpName,
@@ -63,9 +135,12 @@ export function SubscribeToEventsModal({
   registrationMode = 'manual',
   manualInstructionsUrl,
   vendorTargetPrefill,
+  installationTarget = false,
   scope = 'user',
   agent,
   serviceOptions,
+  grantedScopes,
+  scopeServices = {},
   onClose,
 }: Props) {
   const create = useCreateSubscription()
@@ -111,6 +186,12 @@ export function SubscribeToEventsModal({
   // entry declares `resource_contains`, the resource picker disappears:
   // the user just ticks events, and submit creates one subscription per
   // selected event with its paired resource resolved automatically.
+  // A pick list with nothing to pick (no installation owned yet, no
+  // installation bound to the agent): the spec's help_text says what to do
+  // first, and nothing can be created.
+  const nothingToPick =
+    vendorTargetSpec.kind === 'static_list' && !vendorTargetSpec.static_options?.length
+
   const fullyPaired =
     vendorTargetSpec.kind === 'static_list' &&
     !!vendorTargetSpec.static_options?.length &&
@@ -176,8 +257,28 @@ export function SubscribeToEventsModal({
     ...(kinds.length ? { vendor_target_kind: kindKey === kinds[0].key ? '' : kindKey } : {}),
   })
 
-  const describe = (err: unknown) =>
-    describeSubscriptionError(err, { scope: chosenScope, accountLabel })
+  // The scopes the account lacks for what is picked: the ticked events',
+  // or before a tick the ones every listed event needs, with the chosen
+  // kind's. Unknown scopes (a token, an installation) say nothing.
+  const scopesOf = (e: WebhookEventCatalogEntry) => e.required_scopes ?? []
+  const ticked = eventCatalog.filter((e) => selectedEvents.has(e.key))
+  const neededByEvents = ticked.length
+    ? ticked.flatMap(scopesOf)
+    : (eventCatalog.length ? scopesOf(eventCatalog[0]) : []).filter((s) =>
+        eventCatalog.every((e) => scopesOf(e).includes(s)),
+      )
+  const granted = new Set(grantedScopes ?? [])
+  const missingScopes = grantedScopes
+    ? [...new Set([...neededByEvents, ...(kind?.required_scopes ?? [])])].filter(
+        (s) => !granted.has(s),
+      )
+    : []
+
+  const scopeContext: ScopeContext = {
+    ownAccount: !fixedAgent, scopeServices,
+    eventScopes: neededByEvents, kindScopes: kind?.required_scopes ?? [],
+  }
+  const describe = (err: unknown) => describeSubscriptionError(err, scopeContext)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -197,7 +298,7 @@ export function SubscribeToEventsModal({
         const target = pairedTargetFor(entry)
         if (!target) {
           setError(
-            `No resource option pairs with event '${entry.label}' — manifest bug`,
+            `The event ${entry.label} has no matching resource. The MCP's author needs to fix this.`,
           )
           return
         }
@@ -235,36 +336,35 @@ export function SubscribeToEventsModal({
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose()
-      }}
+    <Dialog
+      onClose={onClose}
+      busy={create.isPending}
+      aria-label={`Subscribe to ${providerId} events`}
+      panelClassName={`${DIALOG_PANEL} max-w-lg max-h-[90vh] overflow-y-auto`}
     >
-      <div className="bg-white dark:bg-gray-900 rounded-xl shadow-2xl max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto">
         <form onSubmit={handleSubmit}>
-          <header className="px-5 py-4 border-b border-p-border-light">
-            <h2 className="text-lg font-semibold">
+          <header className="px-5 py-4 border-b border-subtle">
+            <h2 className="font-display text-lg font-semibold">
               Subscribe to {providerId} events
             </h2>
-            <p className="text-sm text-p-text-light mt-1">
+            <p className="text-sm text-tertiary mt-1">
               Account: <span className="font-mono">{accountLabel}</span>
             </p>
             {fixedAgent && (
-              <p className="text-xs text-p-text-light mt-1">
-                For agent <span className="font-medium">{fixedAgent}</span>. The
-                webhook is registered with the account bound as its service
-                account; its triggers and shared apps fire from these events.
+              <p className="text-xs text-tertiary mt-1">
+                For agent <span className="font-medium">{fixedAgent}</span>, with
+                the account set as its service account. The agent&apos;s shared
+                triggers and apps fire on these events.
               </p>
             )}
-            {registrationMode === 'relay' && (
-              <p className="text-xs text-purple-700 dark:text-purple-300 mt-1">
-                Events are delivered through OtoDock — no vendor console
-                steps needed.
+            {registrationMode === 'relay' && !installationTarget && (
+              <p className="text-xs text-status-info-fg mt-1">
+                Events come through OtoDock. There is nothing to set up
+                anywhere else.
               </p>
             )}
             {registrationMode === 'manual' && (
-              <p className="text-xs text-p-text-light mt-1">
+              <p className="text-xs text-tertiary mt-1">
                 After creating, paste the webhook URL shown on the
                 subscription into the vendor console.
                 {manualInstructionsUrl && (
@@ -274,7 +374,7 @@ export function SubscribeToEventsModal({
                       href={safeHref(manualInstructionsUrl)}
                       target="_blank"
                       rel="noreferrer"
-                      className="text-brand hover:underline"
+                      className="text-link hover:underline"
                     >
                       Vendor instructions
                     </a>
@@ -293,13 +393,12 @@ export function SubscribeToEventsModal({
                 >
                   Subscribe as
                 </label>
-                <select
+                <Select
                   id="subscribe-as"
                   value={target}
                   onChange={(e) => setTarget(e.target.value)}
-                  className="w-full px-3 py-2 border border-p-border-light rounded-sm text-sm bg-white dark:bg-gray-800"
                 >
-                  <option value={PERSONAL}>Me (personal)</option>
+                  <option value={PERSONAL}>Me, personal</option>
                   {options.map((o) => (
                     <option
                       key={o.agent_name}
@@ -307,14 +406,14 @@ export function SubscribeToEventsModal({
                       disabled={!o.can_manage}
                     >
                       Agent {o.display_name}
-                      {o.can_manage ? '' : ' (managers only)'}
+                      {o.can_manage ? '' : ', managers only'}
                     </option>
                   ))}
-                </select>
-                <div className="text-xs text-p-text-light mt-1">
+                </Select>
+                <div className="text-xs text-tertiary mt-1">
                   {chosenScope === 'service'
-                    ? "An agent's subscription fires the agent's own triggers and shared apps."
-                    : 'A personal subscription fires only your own triggers. Choose an agent when a shared app or an agent trigger should react.'}
+                    ? "An agent's subscription fires the agent's shared triggers and apps."
+                    : 'A personal subscription fires only your own triggers and apps. Pick an agent when a shared trigger or app should react.'}
                 </div>
               </div>
             )}
@@ -334,8 +433,8 @@ export function SubscribeToEventsModal({
                     }}
                     className={`px-2.5 py-1 rounded-full border text-xs ${
                       k.key === kindKey
-                        ? 'bg-p-primary text-white border-p-primary'
-                        : 'bg-white dark:bg-gray-800 border-p-border-light text-p-text-secondary hover:text-p-text'
+                        ? 'bg-action text-action-fg border-action'
+                        : 'bg-surface-card border-subtle text-secondary hover:text-primary'
                     }`}
                   >
                     {k.label}
@@ -352,80 +451,77 @@ export function SubscribeToEventsModal({
             )}
 
             <div>
-              <label className="block text-sm font-medium mb-2">
-                Event types
-              </label>
-              {fullyPaired && (
-                <p className="text-xs text-p-text-light mb-2">
-                  Each selected event subscribes to its vendor resource
-                  automatically — one subscription is created per event.
+              <div className="mb-2">
+                <label className="text-sm font-medium">
+                  Event types
+                </label>
+                {fullyPaired && (
+                  <InfoTip label="Event types">
+                    Each selected event subscribes to its vendor resource on
+                    its own. One subscription is created for each event.
+                  </InfoTip>
+                )}
+              </div>
+              {missingScopes.length > 0 && (
+                <p className="text-xs text-status-warning-fg mb-2" data-testid="scope-notice">
+                  {scopeNotice(missingScopes, scopeContext)}
                 </p>
               )}
-              <ul className="space-y-2 border border-p-border-light rounded-sm p-3 max-h-72 overflow-y-auto">
+              <ul className="space-y-2 bg-surface-sunken rounded-card p-3 max-h-72 overflow-y-auto">
                 {eventCatalog.map((entry) => (
-                  <li key={entry.key}>
-                    <label className="flex items-start gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={selectedEvents.has(entry.key)}
-                        onChange={() => toggleEvent(entry.key)}
-                        className="mt-1"
-                      />
-                      <div className="flex-1">
-                        <div className="text-sm font-medium">
-                          {entry.label}
-                          {entry.delivery === 'bot' && (
-                            <span className="ml-1.5 inline-block px-1.5 rounded-sm text-[10px] uppercase font-semibold bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400 align-middle">
-                              bot
-                            </span>
-                          )}
-                        </div>
-                        {entry.description && (
-                          <div className="text-xs text-p-text-light">
-                            {entry.description}
-                          </div>
-                        )}
-                        {entry.required_scopes && entry.required_scopes.length > 0 && (
-                          <div className="text-xs text-p-text-light mt-0.5">
-                            Required scopes:{' '}
-                            <span className="font-mono">
-                              {entry.required_scopes.join(', ')}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    </label>
+                  <li key={entry.key} className="relative flex items-start gap-2">
+                    <input
+                      id={`subscribe-event-${entry.key}`}
+                      type="checkbox"
+                      checked={selectedEvents.has(entry.key)}
+                      onChange={() => toggleEvent(entry.key)}
+                      className="mt-1 accent-action cursor-pointer"
+                    />
+                    <div className="flex-1 text-sm font-medium">
+                      <label htmlFor={`subscribe-event-${entry.key}`} className="cursor-pointer after:absolute after:inset-0">
+                        {entry.label}
+                      </label>
+                      {entry.description && (
+                        <span className="relative z-10">
+                          <InfoTip label={entry.label}>{entry.description}</InfoTip>
+                        </span>
+                      )}
+                      {entry.delivery === 'bot' && (
+                        <span className={`${BADGE_BASE} ${BADGE_TONE.warning} ml-1.5 align-middle`}>
+                          bot
+                        </span>
+                      )}
+                    </div>
                   </li>
                 ))}
               </ul>
             </div>
 
             {error && (
-              <div className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-sm p-2 whitespace-pre-wrap">
+              <div className="text-sm text-status-danger-fg bg-status-danger-bg border border-status-danger-border rounded-card p-2 whitespace-pre-wrap">
                 {error}
               </div>
             )}
           </div>
 
-          <footer className="px-5 py-4 border-t border-p-border-light flex justify-end gap-2">
-            <button
+          <footer className="px-5 py-4 border-t border-subtle flex justify-end gap-2">
+            <Button variant="ghost" size="md"
               type="button"
               onClick={onClose}
-              className="px-4 py-2 text-sm text-p-text-light hover:bg-gray-100 dark:hover:bg-gray-800 rounded-sm"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="primary"
+              size="md"
               type="submit"
-              disabled={create.isPending}
-              className="px-4 py-2 text-sm bg-brand hover:bg-brand-hover text-white rounded-sm disabled:opacity-50"
+              disabled={create.isPending || nothingToPick}
             >
               {create.isPending ? 'Creating…' : 'Create subscription'}
-            </button>
+            </Button>
           </footer>
         </form>
-      </div>
-    </div>
+    </Dialog>
   )
 }
 
@@ -442,40 +538,37 @@ function VendorTargetField({
     <div>
       <label className="block text-sm font-medium mb-1">{spec.label}</label>
       {spec.kind === 'free_text' && (
-        <input
+        <Input
           type="text"
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder={spec.placeholder}
           /* Intentionally no HTML5 `pattern` — submit handler normalizes
              URL/`.git` paste sloppiness before regex validation. */
-          className="w-full px-3 py-2 border border-p-border-light rounded-sm text-sm bg-white dark:bg-gray-800"
         />
       )}
       {spec.kind === 'static_list' && spec.static_options && (
-        <select
+        <Select
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          className="w-full px-3 py-2 border border-p-border-light rounded-sm text-sm bg-white dark:bg-gray-800"
         >
           {spec.static_options.map((opt) => (
             <option key={opt.value} value={opt.value}>
               {opt.label}
             </option>
           ))}
-        </select>
+        </Select>
       )}
       {spec.kind === 'remote_list' && (
-        <input
+        <Input
           type="text"
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          placeholder="Remote-list picker coming soon — paste the vendor-side ID for now"
-          className="w-full px-3 py-2 border border-p-border-light rounded-sm text-sm bg-white dark:bg-gray-800"
+          placeholder="A picker is coming soon. For now, paste the ID from the vendor."
         />
       )}
       {spec.help_text && (
-        <div className="text-xs text-p-text-light mt-1">{spec.help_text}</div>
+        <div className="text-xs text-tertiary mt-1">{spec.help_text}</div>
       )}
     </div>
   )

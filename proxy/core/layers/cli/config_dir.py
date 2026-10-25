@@ -289,7 +289,8 @@ def ensure_persistent_claude_dir(
     os.chmod(claude_dir, 0o700)
 
     logger.debug(
-        f"Prepared .claude/ dir: {claude_dir} "
-        f"(agent={agent_name}, user={username or '(none)'})"
+        "Prepared .claude/ dir: %s "
+        "(agent=%s, user=%s)",
+        claude_dir, agent_name, username or '(none)'
     )
     return claude_dir

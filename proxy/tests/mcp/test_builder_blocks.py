@@ -32,7 +32,6 @@ from services.mcp.mcp_registry import (
 # Re-export the mock_mcp fixture so this file picks it up.
 from tests.fixtures.mock_mcp_server import mock_mcp  # noqa: F401
 
-
 # ---------------------------------------------------------------------------
 # Layer 1 — parser
 # ---------------------------------------------------------------------------
@@ -597,6 +596,7 @@ async def test_a_header_style_key_builder_reads_an_env_delivered_instance_field(
     builder takes the value from the agent's instance as the session build
     does, instead of skipping the block for a key the resolver never holds."""
     from types import SimpleNamespace
+
     from core.config import deployment
     from core.credentials import mcp_gateway
     from services.oauth import credential_resolver
@@ -633,3 +633,24 @@ async def test_a_header_style_key_builder_reads_an_env_delivered_instance_field(
         mcp_name="caller-mcp", agent_name="some-agent", user_sub="u-1",
     )
     assert rendered == "Got inst"
+
+
+@pytest.mark.asyncio
+async def test_a_builder_cancelled_on_its_own_renders_nothing(reset_manifests, monkeypatch):
+    """A builder ending in its own cancellation (a CancelledError is a
+    BaseException, not an Exception) drops its block like any failed
+    builder; it never reaches the rendered blocks."""
+    async def _execute(*, block, **kw):
+        if block.builder.tool.endswith("__gone"):
+            raise asyncio.CancelledError
+        return "kept"
+    monkeypatch.setattr(builder_executor, "execute_builder", _execute)
+    monkeypatch.setattr(dynamic_context, "_build_token_map", lambda *a, **kw: {})
+    owner = f"owner-{uuid.uuid4().hex[:6]}"
+    mcp_registry._manifests[owner] = _make_manifest(owner, agent_context=[
+        _block("x", tool="mcp__other__gone"), _block("y", tool="mcp__other__kept"),
+    ])
+    rendered = await dynamic_context._resolve_manifest_blocks(
+        owner, "test", user_sub="", user_role="", session_ctx={},
+    )
+    assert rendered == ["kept"]

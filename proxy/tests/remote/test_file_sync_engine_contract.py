@@ -25,18 +25,26 @@ if str(_REPO_ROOT) not in sys.path:
 _SATELLITE_FILE_SYNC = _REPO_ROOT / "satellite" / "transport" / "file_sync.py"
 
 
+def _unwrap_frozensets(node: ast.AST) -> ast.AST:
+    """``frozenset({...})`` displays become the set display they wrap, at the
+    top or as a dict's values, so ``ast.literal_eval`` reads them."""
+    if isinstance(node, ast.Call):
+        return node.args[0]
+    if isinstance(node, ast.Dict):
+        return ast.Dict(keys=node.keys, values=[_unwrap_frozensets(v) for v in node.values])
+    return node
+
+
 def _satellite_constant(name: str):
     """A module-level constant of the satellite's file_sync, read by AST: a
-    set / tuple display, or ``frozenset({...})``."""
+    set / tuple / dict display, or ``frozenset({...})`` (a dict's values
+    too, read as sets)."""
     tree = ast.parse(_SATELLITE_FILE_SYNC.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id == name for t in node.targets
         ):
-            value = node.value
-            if isinstance(value, ast.Call):        # frozenset({...})
-                value = value.args[0]
-            return ast.literal_eval(value)
+            return ast.literal_eval(ast.fix_missing_locations(_unwrap_frozensets(node.value)))
     raise AssertionError(f"satellite file_sync has no {name}")
 
 
@@ -82,6 +90,8 @@ def test_the_two_trees_walk_with_identical_blocks():
     # misattributes whole trees as deletes.
     assert _satellite_constant("INCLUDE_DOTTED_DIRS") == set(proxy_fs.INCLUDE_DOTTED_DIRS)
     assert _satellite_constant("_CLI_RUNTIME_CHILD_DIRS") == set(proxy_fs._CLI_RUNTIME_CHILD_DIRS)
+    assert _satellite_constant("_ENGINE_HOME_SYNCED_CHILDREN") == {
+        d: set(children) for d, children in proxy_fs._ENGINE_HOME_SYNCED_CHILDREN.items()}
     assert _satellite_constant("_CLAUDE_HOST_LOCAL_FILES") == set(proxy_fs._CLAUDE_HOST_LOCAL_FILES)
     assert _satellite_constant("_CODEX_HOST_LOCAL_FILES") == set(proxy_fs._CODEX_HOST_LOCAL_FILES)
     assert tuple(_satellite_constant("_CODEX_RUNTIME_GLOBS")) == tuple(proxy_fs._CODEX_RUNTIME_GLOBS)
@@ -140,3 +150,29 @@ def test_the_runtime_helpers_key_on_the_one_whitelist():
     assert not proxy_fs._is_cli_runtime_child("workspace", "projects")
     assert proxy_fs.is_engine_machinery_path("users/u/.credentials/x.json")
     assert not proxy_fs.is_engine_machinery_path("workspace/notes.md")
+
+
+def test_the_engine_homes_are_the_config_dirs_directly_under_a_scope_root():
+    # The allowlist (a person's own folders sync, nothing else) governs the
+    # engine HOMES, where the CLIs keep their own state; a config dir nested
+    # deeper is a repository's and keeps the general rules. The home
+    # predicate reads the one whitelist of config-dir names.
+    for d in proxy_fs.INCLUDE_DOTTED_DIRS:
+        assert proxy_fs._is_engine_home(f"workspace/{d}")
+        assert proxy_fs._is_engine_home(f"users/alice/{d}")
+        assert not proxy_fs._is_engine_home(f"workspace/repo/{d}")
+        assert not proxy_fs._is_engine_home(f"users/alice/workspace/{d}")
+        assert not proxy_fs._is_engine_home(f"knowledge/{d}")
+        assert not proxy_fs._is_engine_home(d)
+    assert not proxy_fs._is_engine_home("workspace/.git")
+    assert not proxy_fs._is_engine_home(".")
+    assert set(proxy_fs._ENGINE_HOME_SYNCED_CHILDREN) == set(proxy_fs.INCLUDE_DOTTED_DIRS)
+    assert proxy_fs._ENGINE_HOME_SYNCED_CHILDREN[".claude"] == {"skills", "commands", "agents", "output-styles"}
+    assert proxy_fs._ENGINE_HOME_SYNCED_CHILDREN[".codex"] == {"prompts", "skills"}
+    assert proxy_fs.is_unsynced_engine_home_path("workspace/.codex/history.jsonl")
+    assert not proxy_fs.is_unsynced_engine_home_path("workspace/.codex/skills/x/SKILL.md")
+    # A folder is the person's under one engine and the CLI's under the other.
+    assert not proxy_fs.is_unsynced_engine_home_path("workspace/.claude/commands/x.md")
+    assert proxy_fs.is_unsynced_engine_home_path("workspace/.codex/commands/x.md")
+    assert not proxy_fs.is_unsynced_engine_home_path("users/u/.codex/prompts/x.md")
+    assert proxy_fs.is_unsynced_engine_home_path("users/u/.claude/prompts/x.md")

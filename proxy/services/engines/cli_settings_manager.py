@@ -44,7 +44,7 @@ def seed_interactive_cli_config(
     cfg = Path(host_claude_dir) / ".claude.json"
     try:
         data = json.loads(cfg.read_text()) if cfg.exists() else {}
-    except Exception:
+    except (OSError, ValueError):
         data = {}
     if not isinstance(data, dict):
         data = {}
@@ -81,5 +81,5 @@ def seed_interactive_cli_config(
     try:
         cfg.parent.mkdir(parents=True, exist_ok=True)
         cfg.write_text(json.dumps(data, indent=2) + "\n")
-    except Exception:
+    except OSError:
         logger.warning("seed_interactive_cli_config: could not write %s", cfg, exc_info=True)

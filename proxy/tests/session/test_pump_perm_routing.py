@@ -158,9 +158,9 @@ async def test_an_answer_to_a_retired_card_leaves_the_retry_in_the_slot(temp_db,
     freed the slot resolves nothing and leaves the retry's prompt active
     (still re-presented on a reconnect); an answer to the retry moves on."""
     import ws.dashboard  # noqa: F401  (assembles the connection's mixins)
+    from core.session import session_state
     from ws.dashboard import DashboardConnection
     from ws.dashboard_dispatch import StreamCtx
-    from core.session import session_state
 
     temp_db.create_chat("rt3", "user-admin", "a1")
     pump = _mk_pump("rt3")
@@ -195,9 +195,9 @@ async def test_an_answer_to_a_retired_plan_review_leaves_the_retry_in_the_slot(t
     and leaves the retried call's review holding the slot; the answer to the
     retry moves on."""
     import ws.dashboard  # noqa: F401  (assembles the connection's mixins)
+    from core.session import session_state
     from ws.dashboard import DashboardConnection
     from ws.dashboard_dispatch import StreamCtx
-    from core.session import session_state
 
     temp_db.create_chat("rt5", "user-admin", "a1")
     pump = _mk_pump("rt5")
@@ -336,9 +336,9 @@ async def test_the_second_wave_card_is_forwarded_live_and_pings(temp_db, pings, 
     are answered, then the call the engine ran after them raises a fourth
     card once the third answer freed the slot."""
     import ws.dashboard  # noqa: F401  (assembles the connection's mixins)
+    from core.session import session_state
     from ws.dashboard import DashboardConnection
     from ws.dashboard_dispatch import StreamCtx
-    from core.session import session_state
 
     temp_db.create_chat("np2", "user-admin", "a1")
     pump = _mk_pump("np2")
@@ -627,7 +627,10 @@ async def test_the_card_never_waits_on_the_chat_read(temp_db, pings, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_a_plan_review_neither_pings_nor_takes_a_retry_entry(temp_db, pings):
+async def test_a_plan_review_pings_like_a_permission(temp_db, pings):
+    """A plan review waits on the person as a permission does: its card
+    pings once, under the same rules (a retried call whose first card pinged
+    stays quiet; a task pump's never pings)."""
     temp_db.create_chat("np13", "user-admin", "a1")
     pump = _mk_pump("np13")
     review = {"event_type": "plan_review", "request_id": "req-plan", "plan": "the plan",
@@ -640,8 +643,34 @@ async def test_a_plan_review_neither_pings_nor_takes_a_retry_entry(temp_db, ping
         _wait(pump, "req-plan")
         await pump._handle_perm_event(review)
         await _settle()
-        assert len(pings) == 1
+        assert [p["body"] for p in pings] == ["Allow mcp__platform__browser_navigate?",
+                                              "Review the plan"]
+        assert pings[1]["mid_turn"] is True and pings[1]["title"].endswith("needs your input")
+        # Another call's retry entry is not the plan's.
         assert list(pump._retried) == [stream_pump._call_key(_browser("req-1"))]
+        # The plan's caller went away: its retried call shows again without
+        # a second ping.
+        await _retire_gone(pump, "req-plan")
+        _wait(pump, "req-plan-2")
+        await pump._handle_perm_event({**review, "request_id": "req-plan-2"})
+        await _settle()
+        assert len(pings) == 2
+    finally:
+        _pending_permissions.pop(pump.session_id, None)
+        pump.producer.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_task_pumps_plan_review_does_not_ping(temp_db, pings):
+    from core.session import session_kind
+    temp_db.create_chat("np14", "user-admin", "a1")
+    pump = _mk_pump("np14", source_type=session_kind.TASK.source_type)
+    try:
+        _wait(pump, "req-plan-t")
+        await pump._handle_perm_event({"event_type": "plan_review", "request_id": "req-plan-t",
+                                       "plan": "p", "tool_input": {}})
+        await _settle()
+        assert pings == []
     finally:
         _pending_permissions.pop(pump.session_id, None)
         pump.producer.cancel()

@@ -144,7 +144,7 @@ async def catalog_icon(name: str) -> bytes | None:
 
         try:
             registry = await community_catalog.fetch_registry()
-        except Exception as exc:
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError) as exc:
             _registry_unavailable_until = now + RETRY_AFTER_SECONDS
             logger.warning("Community registry unavailable for icons (%s); retry in %ss",
                            exc, RETRY_AFTER_SECONDS)
@@ -164,7 +164,8 @@ async def catalog_icon(name: str) -> bytes | None:
         if entry is not None and entry.body is not None and entry.etag:
             headers["If-None-Match"] = entry.etag
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=False) as client:
+            async with community_catalog.http_client(
+                    timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=False) as client:
                 resp = await client.get(url, headers=headers)
         except httpx.HTTPError as exc:
             logger.warning("Icon fetch failed for %s (%s)", name, exc)
@@ -188,9 +189,56 @@ async def catalog_icon(name: str) -> bytes | None:
         return _stale_for_a_while(name, entry, now)
 
 
+def catalog_icon_known(name: str) -> bool:
+    """Whether the catalog gives ``name`` an icon, from what this process
+    already holds: a fresh answer of the icon cache, else the entry of the
+    last registry read, whatever its age. Never a fetch, so a list asks it
+    per row; False when neither knows."""
+    entry = _cache.get(name)
+    if entry is not None and entry.fresh(time.monotonic()):
+        return entry.body is not None
+    registry = community_catalog._registry_cache.value
+    if not isinstance(registry, dict):
+        return False
+    catalog_entry = next(
+        (e for e in registry.get("mcps", []) if isinstance(e, dict) and e.get("name") == name),
+        None,
+    )
+    return catalog_folder((catalog_entry or {}).get("icon_url")) is not None
+
+
+_warming: asyncio.Task | None = None
+
+
+def warm_registry() -> None:
+    """Read the registry in the background when this process holds no read
+    of it yet, so the next list knows which rows the catalog gives an icon.
+    One read at a time, one try per retry window, none under air-gapped."""
+    global _warming
+    if config.OTODOCK_AIR_GAPPED or community_catalog._registry_cache.value is not None:
+        return
+    if _warming is not None and not _warming.done():
+        return
+    if time.monotonic() < _registry_unavailable_until:
+        return
+    from core import background
+    _warming = background.spawn(_warm(), name="registry_warm", owner="community_icons")
+
+
+async def _warm() -> None:
+    global _registry_unavailable_until
+    try:
+        await community_catalog.fetch_registry()
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError) as exc:
+        _registry_unavailable_until = time.monotonic() + RETRY_AFTER_SECONDS
+        logger.warning("Community registry unavailable for icons (%s); retry in %ss",
+                       exc, RETRY_AFTER_SECONDS)
+
+
 def clear_cache() -> None:
     """Forget every cached icon (tests, and a deliberate refresh)."""
-    global _registry_unavailable_until
+    global _registry_unavailable_until, _warming
     _cache.clear()
     _locks.clear()
     _registry_unavailable_until = 0.0
+    _warming = None

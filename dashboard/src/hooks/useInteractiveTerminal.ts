@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useLayoutEffect } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
@@ -8,7 +8,10 @@ import { ClipboardAddon } from '@xterm/addon-clipboard'
 import { openTerminalLink } from '../lib/openExternal'
 import { createPtyBrandFilter } from '../lib/ptyBrandColors'
 import { applyCtrlHold } from '../lib/terminalCtrlHold'
-import { WIRE, type WireType } from '../api/wireEvents'
+import { attachImeEditRewriter } from '../lib/terminalImeInput'
+import { noteFold } from '../lib/nativeBridge'
+import { debugLog } from '../lib/debug/log'
+import { WIRE, type WireType, type WireFrame } from '../api/wireEvents'
 
 /**
  * Drives the dashboard side of an interactive CLI (PTY) session:
@@ -26,10 +29,11 @@ import { WIRE, type WireType } from '../api/wireEvents'
 
 // The interactive surface of the useDashboardWs bundle this hook needs.
 export interface InteractiveWs {
-  subscribe: (frameType: WireType, fn: (msg: any) => void) => () => void
+  subscribe: (frameType: WireType, fn: (msg: WireFrame) => void) => () => void
   sendPtyAttach: (chatId: string) => void
   sendPtyInput: (chatId: string, dataB64: string, composer?: boolean) => void
-  sendPtyResize: (chatId: string, rows: number, cols: number) => void
+  /** Whether the resize went out (a closed socket drops it). */
+  sendPtyResize: (chatId: string, rows: number, cols: number) => boolean
   sendPermission: (requestId: string, approved: boolean) => void
   sendPtyTakeover: (chatId: string) => void
 }
@@ -38,11 +42,11 @@ export interface PtyPermission {
   kind: string // 'permission' | 'plan_review' | 'question'
   requestId: string
   toolName: string
-  toolInput: any
+  toolInput: unknown
   meetingAgent?: string
 }
 
-// xterm themes matched to the dashboard light/dark mode (bg ≈ --p-bg, accents
+// xterm themes matched to the dashboard light/dark mode (bg = the page surface, accents
 // from the brand ramp: #146bb5 blue, #4CAF50 success green, #da3536 accent red,
 // #0d9488 teal, #673a97 purple). The chosen palette MUST match the
 // Claude TUI theme the backend seeds (from the same dashboard mode at warmup) —
@@ -50,10 +54,10 @@ export interface PtyPermission {
 // mount; it stays for the session to stay coherent with Claude's baked theme.
 // The TUI's truecolor diff rows are branded separately (lib/ptyBrandColors).
 const DARK_THEME = {
-  background: '#121620',
+  background: '#0d1117',
   foreground: '#dde3eb',
   cursor: '#1a7fce',
-  cursorAccent: '#121620',
+  cursorAccent: '#0d1117',
   selectionBackground: 'rgba(26,127,206,0.35)',
   black: '#1e1e1e', red: '#e25555', green: '#66bb6a', yellow: '#d7ba7d',
   blue: '#569cd6', magenta: '#b794d8', cyan: '#3fbfae', white: '#dde3eb',
@@ -90,6 +94,30 @@ const FONT_FAMILY =
 // synthetic wheel deltas by this so finger-tracking stays 1:1.
 const WHEEL_SCROLL_SENSITIVITY = 1.5
 
+// WebGL is tried again after a lost context, bounded; the budget refills
+// once the renderer has been up for a minute, so one loss a day never
+// exhausts it (the wake listener's shape).
+const WEBGL_RETRY_MS = [1500, 5000, 15000]
+const WEBGL_STABLE_MS = 60_000
+
+/** Whether a WebGL2 context can be created right now. The addon's renderer
+ *  appends its link canvas and starts the cursor blink before its own
+ *  WebGL2 check throws, so a construction that fails half-loads an addon:
+ *  a retry probes on a scratch canvas first, and loses that context at once
+ *  (live contexts are capped per page). The mount does not probe: a second
+ *  context per chat switch costs more on a phone than the half-load it
+ *  would prevent, which was the behaviour before the retries existed. */
+function webglAvailable(): boolean {
+  try {
+    const gl = document.createElement('canvas').getContext('webgl2') as WebGL2RenderingContext | null
+    if (!gl) return false
+    gl.getExtension('WEBGL_lose_context')?.loseContext()
+    return true
+  } catch {
+    return false
+  }
+}
+
 function b64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64)
   const out = new Uint8Array(bin.length)
@@ -112,7 +140,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
   // Latest onExit in a ref so the terminal-init effect (which must NOT re-run
   // when this changes) can fire it on a real pty_exit without listing it as a dep.
   const onExitRef = useRef(onExit)
-  onExitRef.current = onExit
+  useLayoutEffect(() => { onExitRef.current = onExit })
   // While the satellite WS is mid-reconnect the terminal is frozen and
   // keystrokes can't reach it — pause input (the onData closure reads this ref) +
   // surface a banner. Cleared on "reconnected" or a fresh attach.
@@ -205,12 +233,97 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     try { term.loadAddon(new ClipboardAddon()) } catch { /* optional */ }
 
     term.open(el)
-    // WebGL renderer after open; fall back to the DOM renderer on context loss.
-    try {
-      const webgl = new WebglAddon()
-      webgl.onContextLoss(() => { try { webgl.dispose() } catch { /* noop */ } })
-      term.loadAddon(webgl)
-    } catch { /* WebGL unavailable — canvas/DOM fallback */ }
+    // One line per terminal event for the Android app's fold log (and the
+    // debug console): a display switch on a foldable is read next to them.
+    const fold = (msg: string) => {
+      debugLog(`[terminal] ${msg}`)
+      noteFold(`terminal ${chatId.slice(0, 8)}: ${msg}`)
+    }
+    fold('mounted')
+
+    // The WebGL renderer, after open. A lost context leaves its canvas blank
+    // and the addon waits 3 s for a restore before it tells anyone: the
+    // capture-phase listener below hears the loss first (an ancestor's
+    // capture listener runs before the canvas's own, and a listener removed
+    // before the dispatch reaches the canvas never runs), swaps the DOM
+    // renderer in at once, and WebGL is tried again once the GPU had a
+    // moment (a display switch on a foldable, memory pressure, the per-page
+    // cap on live contexts). The addon's own onContextLoss stays as the belt
+    // for a loss the listener did not recognise. The two renderers size a
+    // cell differently (WebGL floors the width to device pixels, the DOM one
+    // does not), so every swap re-fits before it repaints. With more live
+    // terminals than the cap, a retry that succeeds evicts the oldest
+    // context (another pane's), whose own retry evicts the next: a cascade
+    // bounded at three tries per pane, after which the losers stay on the
+    // DOM renderer.
+    let webgl: WebglAddon | null = null
+    let webglCanvas: Element | null = null
+    let webglEverLoaded = false
+    let webglRetries = 0
+    let webglTimer = 0
+    let webglUpSince = 0
+    let tearingDown = false
+    const dropWebgl = (why: string) => {
+      const w = webgl
+      webgl = null
+      webglCanvas = null
+      if (!w) return
+      try { w.dispose() } catch { /* already gone */ }
+      if (Date.now() - webglUpSince > WEBGL_STABLE_MS) webglRetries = 0
+      fold(`webgl dropped (${why})`)
+      syncSize()
+    }
+    const loadWebgl = (retry: boolean): boolean => {
+      if (retry && !webglAvailable()) return false
+      try {
+        const w = new WebglAddon()
+        w.onContextLoss(() => { dropWebgl('context lost, late'); scheduleWebgl() })
+        term.loadAddon(w)
+        webgl = w
+        webglEverLoaded = true
+        // The renderer appends its canvas to the screen element last (after
+        // its link layer's), so the loss listener can tell it from the rest.
+        const canvases = el.querySelectorAll('.xterm-screen canvas')
+        webglCanvas = canvases.length ? canvases[canvases.length - 1] : null
+        webglUpSince = Date.now()
+        return true
+      } catch {
+        return false
+      }
+    }
+    // A retry runs only while the page is visible and the container is laid
+    // out (a context made while hidden is wasted, or evicted again); a tick
+    // that finds otherwise waits for the next show and spends nothing. A
+    // device whose first load failed (no WebGL2) is never retried.
+    const scheduleWebgl = () => {
+      if (tearingDown || webgl || !webglEverLoaded || webglRetries >= WEBGL_RETRY_MS.length) return
+      window.clearTimeout(webglTimer)
+      webglTimer = window.setTimeout(() => {
+        if (tearingDown || webgl) return
+        if (document.visibilityState !== 'visible' || !term.element?.isConnected
+            || el.clientWidth < 2 || el.clientHeight < 2) return
+        webglRetries++
+        if (loadWebgl(true)) {
+          fold('webgl back')
+          syncSize()
+          fullRepaint()
+        } else {
+          scheduleWebgl()
+        }
+      }, WEBGL_RETRY_MS[webglRetries])
+    }
+    const onContextLost = (e: Event) => {
+      if (tearingDown || !webgl || e.target !== webglCanvas) return
+      dropWebgl('context lost')
+      scheduleWebgl()
+    }
+    el.addEventListener('webglcontextlost', onContextLost, true)
+    loadWebgl(false)
+    // A phone keyboard's edit reaches the TUI as that edit, never as xterm's
+    // diff of its hidden textarea (lib/terminalImeInput).
+    const imeEdits = term.element && term.textarea
+      ? attachImeEditRewriter(term.element, term.textarea)
+      : null
 
     // Fit + size-sync chokepoint. Guarded (a 0-sized container mid-layout must
     // not fit — xterm would compute garbage dims) and deduped (only a CHANGED
@@ -221,19 +334,25 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     // the mono webfont loads computes too many rows — the TUI's input line
     // clips below the composer and the buffer "fits" the viewport so nothing
     // scrolls — and nothing re-fired fit on a desktop (container size never
-    // changes) until a reload.
+    // changes) until a reload. A size is recorded only once its resize went
+    // out, so one a closed socket dropped goes at the next refit; the return
+    // says the fit happened, whatever the send did.
     let lastSentSize = ''
     const syncSize = (): boolean => {
       if (!el.isConnected || el.clientWidth < 2 || el.clientHeight < 2) return false
       try { fit.fit() } catch { return false }
       const key = `${term.rows}x${term.cols}`
       if (key !== lastSentSize) {
-        lastSentSize = key
-        try { sendPtyResize(chatId, term.rows, term.cols) } catch { /* not connected */ }
+        let sent = false
+        try { sent = sendPtyResize(chatId, term.rows, term.cols) } catch { /* not connected */ }
+        if (sent) {
+          lastSentSize = key
+          fold(`resize ${key}`)
+        }
       }
       return true
     }
-    syncSize()
+    const fittedAtMount = syncSize()
     term.focus()
     // Container not laid out yet (flex/route transition): retry on frames,
     // bounded — the ResizeObserver takes over the moment the box gets a size.
@@ -243,7 +362,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       if (syncSize() || ++fitRetries > 60) return
       fitRetryRaf = requestAnimationFrame(retryFit)
     }
-    if (lastSentSize === '') fitRetryRaf = requestAnimationFrame(retryFit)
+    if (!fittedAtMount) fitRetryRaf = requestAnimationFrame(retryFit)
 
     // Copy/paste. In a terminal Ctrl-C is SIGINT, so: Ctrl/Cmd-C copies when
     // there's a selection (else falls through as interrupt), Ctrl/Cmd-V pastes.
@@ -281,7 +400,9 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       return true
     })
 
-    const onData = term.onData((d) => {
+    const onData = term.onData((raw) => {
+      const d = imeEdits ? imeEdits.rewrite(raw) : raw
+      if (!d) return
       // Drop keystrokes while the satellite is reconnecting (the PTY is
       // frozen on the far side; stale input into a TUI is worse than dropping).
       if (reconnectingRef.current) return
@@ -332,6 +453,8 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     }
     const onVisibility = () => {
       if (document.visibilityState !== 'visible') return
+      fold(`visible ${el.clientWidth}x${el.clientHeight}`)
+      if (!webgl) scheduleWebgl()
       // Re-fit BEFORE repainting: writes while the tab was hidden ran against
       // throttled rAF, and stale render dimensions leave the viewport's
       // scroll area wrong (the "can't scroll until I type" flavor — a
@@ -364,8 +487,15 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     // baked TUI theme (pty_status "attached" below).
     let appliedMode = mode
     let brand = createPtyBrandFilter(mode)
-    const unsubOut = subscribe(WIRE.PTY_OUTPUT, (m: any) => {
+    // The attach's time, until its first output answers it.
+    let attachedAt = 0
+    const unsubOut = subscribe(WIRE.PTY_OUTPUT, (m) => {
+      if (m.type !== WIRE.PTY_OUTPUT) return
       if (m.chat_id && m.chat_id !== chatId) return
+      if (attachedAt) {
+        fold(`first output +${Math.round(performance.now() - attachedAt)}ms`)
+        attachedAt = 0
+      }
       try {
         // Refresh-on-reconnect: a reset replay clears the mis-aligned
         // mirror so the scrollback re-renders cleanly from scratch (then the live
@@ -389,37 +519,10 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
         scheduleRepaint()
       } catch { /* malformed frame */ }
     })
-    // Pre-expiry re-warm: the platform replaced the CLI process to re-arm its
-    // auth token; the session lives on under the same id. Poll re-attach until
-    // the fresh process answers (registration takes a few seconds) — the
-    // 'attached' status frame stops the poll.
-    let rewarmTimer: ReturnType<typeof setInterval> | null = null
-    const stopRewarmPoll = () => {
-      if (rewarmTimer) { clearInterval(rewarmTimer); rewarmTimer = null }
-    }
-
-    const unsubExit = subscribe(WIRE.PTY_EXIT, (m: any) => {
+    const unsubExit = subscribe(WIRE.PTY_EXIT, (m) => {
+      if (m.type !== WIRE.PTY_EXIT) return
       if (m.chat_id && m.chat_id !== chatId) return
       const reason = m.reason || ''
-      if (reason === 'rewarmed') {
-        try { term.reset() } catch { /* noop */ }
-        try { term.write('\x1b[2m[refreshing session…]\x1b[0m\r\n') } catch { /* noop */ }
-        stopRewarmPoll()
-        let tries = 0
-        rewarmTimer = setInterval(() => {
-          if (++tries > 20) {
-            // The respawn never came back — fall through to the normal ended
-            // state (the next message re-warms the chat lazily).
-            stopRewarmPoll()
-            setExited(true)
-            exitedRef.current = true
-            setExitReason('')
-            return
-          }
-          try { sendPtyAttach(chatId) } catch { /* not connected */ }
-        }, 1000)
-        return
-      }
       setExited(true)
       exitedRef.current = true
       setExitReason(reason)
@@ -460,18 +563,20 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
       // on another device/terminal, not dead.
       if (!isTakeover && !isDeleted) onExitRef.current?.()
     })
-    const unsubPerm = subscribe(WIRE.PTY_PERMISSION, (m: any) => {
+    const unsubPerm = subscribe(WIRE.PTY_PERMISSION, (m) => {
+      if (m.type !== WIRE.PTY_PERMISSION) return
       if (m.chat_id && m.chat_id !== chatId) return
       setPendingPermission({
         kind: m.kind || 'permission',
-        requestId: m.request_id,
+        requestId: m.request_id ?? '',
         toolName: m.tool_name || '',
         toolInput: m.tool_input,
         meetingAgent: m.meeting_agent,
       })
     })
 
-    const unsubStatus = subscribe(WIRE.PTY_STATUS, (m: any) => {
+    const unsubStatus = subscribe(WIRE.PTY_STATUS, (m) => {
+      if (m.type !== WIRE.PTY_STATUS) return
       // "reconnecting" is REMOTE only (a satellite WS blip): the proxy held
       // the session in grace, so the terminal is alive, just frozen — show a
       // banner + pause input until it returns. "reconnected" ends that, and
@@ -498,9 +603,7 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
         return
       }
       if (st === 'attached') {
-        // Attach acknowledged — if this was a re-warm re-attach, the fresh
-        // process answered: stop polling and pin the replay to the bottom.
-        stopRewarmPoll()
+        // Attach acknowledged: pin the replay that follows to the bottom.
         pinBottomUntil = Date.now() + 1500
       }
       if (st === 'reconnecting') {
@@ -508,6 +611,8 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
         setReconnecting(true)
         try { term.write('\r\n\x1b[2m[reconnecting to the remote machine…]\x1b[0m\r\n') } catch { /* noop */ }
       } else if (st === 'reconnected') {
+        // An evicted or ended terminal no longer sizes the PTY.
+        if (exitedRef.current) return
         reconnectingRef.current = false
         setReconnecting(false)
         // The proxy sends a reset+scrollback replay (a `pty_output` with reset)
@@ -521,6 +626,8 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     // Subscribed — signal the backend to attach the PTY viewer + replay the
     // scrollback NOW (the handshake that avoids the subscribe-vs-replay race).
     sendPtyAttach(chatId)
+    attachedAt = performance.now()
+    fold('attach')
     pinBottomUntil = Date.now() + 1500  // keep the post-attach replay burst pinned to the bottom
 
     let raf = 0
@@ -542,7 +649,10 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
           // landing while hidden and a SAME-SIZE return re-renders nothing on
           // its own (fit dedupes) — repaint so the first visible frame isn't
           // stale.
-          if (wasZeroSize) fullRepaint()
+          if (wasZeroSize) {
+            fullRepaint()
+            if (!webgl) scheduleWebgl()
+          }
         }
         wasZeroSize = zeroNow
       })
@@ -652,20 +762,26 @@ export function useInteractiveTerminal(ws: InteractiveWs, chatId: string, onExit
     vv?.addEventListener('resize', onVvResize)
 
     return () => {
+      // First: the context loss the cleanup's own loseContext() fires below
+      // must load nothing and schedule nothing.
+      tearingDown = true
+      el.removeEventListener('webglcontextlost', onContextLost, true)
+      window.clearTimeout(webglTimer)
+      fold('disposed')
       cancelAnimationFrame(raf)
       cancelAnimationFrame(fitRetryRaf)
       clearTimeout(postAttachRepaint)
       clearInterval(idleRepaintTimer)
       try { document.fonts?.removeEventListener('loadingdone', onFontsLoaded) } catch { /* noop */ }
-      stopRewarmPoll()
       if (repaintTimer) clearTimeout(repaintTimer)
       document.removeEventListener('visibilitychange', onVisibility)
       onData.dispose()
+      imeEdits?.dispose()
       unsubOut(); unsubExit(); unsubPerm(); unsubStatus()
       ro.disconnect()
-      touchTarget.removeEventListener('touchstart', onTouchStart, { capture: true } as any)
-      touchTarget.removeEventListener('touchmove', onTouchMove, { capture: true } as any)
-      touchTarget.removeEventListener('touchend', onTouchEnd, { capture: true } as any)
+      touchTarget.removeEventListener('touchstart', onTouchStart, { capture: true })
+      touchTarget.removeEventListener('touchmove', onTouchMove, { capture: true })
+      touchTarget.removeEventListener('touchend', onTouchEnd, { capture: true })
       term.textarea?.removeEventListener('blur', onBlur)
       vv?.removeEventListener('resize', onVvResize)
       // Release the GL context explicitly BEFORE disposing: term.dispose()

@@ -16,17 +16,18 @@ from fastapi import HTTPException
 from psycopg import errors as pg_errors
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from auth.providers import UserContext  # noqa: E402
-from services.mcp import mcp_registry  # noqa: E402
-from services.oauth import credential_resolver  # noqa: E402
-from services.webhooks import subscription_manager  # noqa: E402
-from storage.agents import agent_store  # noqa: E402
-from storage.automation import trigger_store, webhook_subscription_store  # noqa: E402
-from storage.identity import credential_store  # noqa: E402
+from auth.providers import UserContext
+from services.mcp import mcp_registry
+from services.oauth import credential_resolver
+from services.webhooks import subscription_manager
+from storage.agents import agent_store
+from storage.automation import trigger_store, webhook_subscription_store
+from storage.identity import credential_store
 
 AG = "shared-agent"
 SOLO = "solo-agent"
@@ -130,7 +131,10 @@ class TestEnforceCreatePermission:
 
 class TestCreateRoute:
     def test_unique_violation_is_409(self, temp_db, monkeypatch):
-        from api.events.subscriptions import CreateSubscriptionRequest, create_subscription
+        from api.events.subscriptions import (
+            CreateSubscriptionRequest,
+            create_subscription,
+        )
         _seed_agents()
 
         async def dup(**kw):
@@ -146,7 +150,10 @@ class TestCreateRoute:
         assert ei.value.detail["error"] == "exists"
 
     def test_target_kind_reaches_the_manager(self, temp_db, monkeypatch):
-        from api.events.subscriptions import CreateSubscriptionRequest, create_subscription
+        from api.events.subscriptions import (
+            CreateSubscriptionRequest,
+            create_subscription,
+        )
         _seed_agents()
         seen: dict = {}
 

@@ -115,5 +115,5 @@ async def maybe_alert(machine_id: str, agent_slug: str, *, source: str,
         logger.info(
             "sync-delta alert: machine=%s agent=%s source=%s files=%d bytes=%d",
             machine_id[:8], agent_slug, source, new_files, new_bytes)
-    except Exception:
+    except Exception:  # noqa: BLE001  # sync-delta alert is telemetry over db and notifications, sync goes on
         logger.debug("sync-delta alert failed", exc_info=True)

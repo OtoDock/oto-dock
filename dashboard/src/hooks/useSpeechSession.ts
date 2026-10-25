@@ -5,17 +5,26 @@
 // error handling, a finals accumulator, and a once-per-session clean-end commit
 // (onCommit fires on silence/stop with the full transcript, NEVER on error).
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useLayoutEffect } from 'react'
 import { useChatAudioCapability } from './useChatAudioCapability'
 import { useMyAudioPrefs } from '../api/userAudio'
 import { acquireMic, releaseMic } from '../audio/micCoordinator'
 import { setDictationActive, stopActivePlayback } from '../audio/speechActivity'
 import { browserSttLang, isAutoLanguage } from '../audio/lang'
 import { resolveSttBackend } from '../audio/resolver'
-import { platformStt } from '../audio/backends/platformStt'
+import { platformStt, STOP_BACKLOG_MAX_MS, STOP_FINAL_WAIT_MS } from '../audio/backends/platformStt'
+import { DICTATION_FINISHING } from '../audio/backends/dictationWords'
 import { type STTBackend, type STTSession } from '../audio/types'
+import { debugWarn } from '../lib/debug/log'
 
-export type SpeechStatus = 'idle' | 'connecting' | 'recording'
+// 'finishing': the mic is off and the last words are still on the way (the
+// person stopped and the server's last final has not landed yet, or the
+// server stopped the session on its own).
+export type SpeechStatus = 'idle' | 'connecting' | 'recording' | 'finishing'
+
+// The longest a stop waits for its last words (the platform engine's bound
+// with a slow uplink's backlog): a start after a stop waits at most this.
+const STOP_WAIT_MAX_MS = STOP_FINAL_WAIT_MS + STOP_BACKLOG_MAX_MS
 
 const MIN_CONNECTING_MS = 500    // floor so the spinner doesn't flicker + gives the user a beat
 const CONNECT_TIMEOUT_MS = 8000  // give up if the recognizer never signals ready
@@ -31,9 +40,11 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 export interface SpeechHandlers {
   onInterim?: (text: string) => void   // live partial (replaces, not committed)
   onFinal?: (text: string) => void     // a finalized phrase
+  onReplace?: (text: string) => void   // the language switched: the session's words so far are this text
   onCommit?: (text: string) => void    // clean end (silence/stop): full accumulated transcript
   onActive?: (active: boolean) => void // recording start/stop
   onError?: (message: string) => void
+  onNotice?: (message: string | null) => void // a passing state worth a sentence (a slow link), null when over
 }
 
 export interface SpeechSession {
@@ -54,13 +65,23 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
   const [status, setStatus] = useState<SpeechStatus>('idle')
 
   const sessionRef = useRef<STTSession | null>(null)
+  // The previous attempt's stop while it still waits for its last words,
+  // and the attempt counter a stop bumps (a start waiting on that stop is
+  // abandoned when the person stops again meanwhile).
+  const stoppingRef = useRef<Promise<void> | null>(null)
+  const attemptRef = useRef(0)
+  // The attempt whose plain stop is still finishing: another plain stop with
+  // nothing live (a focus while the last words are on the way) leaves it be.
+  const finishingRef = useRef(-1)
+  // The session that reached recording (a stop before it owes no words).
+  const liveRef = useRef<STTSession | null>(null)
   // Kill switch for the CURRENT attempt's closure-local `dead` flag — set per
   // runWith invocation so stop(discardTail=true) can reach it.
   const killRef = useRef<(() => void) | null>(null)
   // Handlers may change every render; keep a live ref so the once-set session
   // callbacks always call the latest (avoids stale closures).
   const hRef = useRef(handlers)
-  hRef.current = handlers
+  useLayoutEffect(() => { hRef.current = handlers })
 
   const available = !!cap && cap.stt !== 'unavailable' && !!resolveSttBackend(cap, prefs?.stt_mode ?? 'auto')
 
@@ -77,11 +98,35 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
 
   const stop = useCallback((discardTail = false) => {
     if (discardTail) killRef.current?.()
+    if (!discardTail && !sessionRef.current && finishingRef.current === attemptRef.current) return
+    const attempt = ++attemptRef.current
     const s = sessionRef.current
     sessionRef.current = null
-    setStatus('idle')
+    // The composer stops treating edits as dictation at once: a late final
+    // lands after what was typed (kept dictating, the interim would join the
+    // base and the final would double it).
     hRef.current.onActive?.(false)
-    s?.stop().catch(() => {})
+    const stopped = s ? s.stop().catch(() => {}) : null
+    // A plain stop keeps delivering its last words: the next attempt waits
+    // for them (a discarded one drops them, nothing to wait for), and a
+    // session that was recording says so until they land (bounded).
+    const owes = !!stopped && !discardTail && s === liveRef.current
+    if (stopped && !discardTail) {
+      stoppingRef.current = stopped
+      void Promise.race([stopped, sleep(STOP_WAIT_MAX_MS)]).then(() => {
+        if (stoppingRef.current === stopped) stoppingRef.current = null
+        if (owes && attemptRef.current === attempt) { setStatus('idle'); hRef.current.onNotice?.(null) }
+      })
+    }
+    if (owes) {
+      finishingRef.current = attempt
+      setStatus('finishing')
+      hRef.current.onNotice?.(DICTATION_FINISHING)
+    } else {
+      setStatus('idle')
+      hRef.current.onNotice?.(null)
+    }
+    liveRef.current = null
   }, [])
 
   // Unmount stops a running session too (a plain stop: its tail still lands
@@ -100,6 +145,16 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
     stopActivePlayback()
 
     setStatus('connecting')
+    // The previous attempt's last words land before this one snapshots the
+    // composer: a quick tap after a stop would otherwise put the words it
+    // was still showing in the box twice.
+    const attempt = ++attemptRef.current
+    const previous = stoppingRef.current
+    if (previous) {
+      await Promise.race([previous, sleep(STOP_WAIT_MAX_MS)])
+      if (attemptRef.current !== attempt) return
+    }
+    hRef.current.onNotice?.(null)
     hRef.current.onActive?.(true)
 
     // PER-ATTEMPT state, deliberately closure-local: a stopped session's
@@ -145,8 +200,22 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
         finals = finals ? `${finals} ${v}` : v
         hRef.current.onFinal?.(v)
       })
+      session.onReplace?.((t) => {
+        if (dead) return
+        finals = t.trim()
+        hRef.current.onReplace?.(finals)
+      })
+      session.onNotice?.((t) => {
+        if (!dead && sessionRef.current === session) hRef.current.onNotice?.(t)
+      })
+      session.onFinishing?.(() => {
+        if (!dead && sessionRef.current === session) setStatus('finishing')
+      })
       session.onError((e) => {
         if (dead) return // the connect failure was already surfaced
+        // A stopped attempt's late error (its last words never arrived)
+        // must not land over the next recording.
+        if (sessionRef.current && sessionRef.current !== session) return
         errored = true
         hRef.current.onError?.(e?.message || 'Microphone error.')
         // Only the CURRENT session may flip the hook's state — a stopped
@@ -192,6 +261,7 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
         session.stop().catch(() => {})
         return
       }
+      liveRef.current = session
       setStatus('recording')
     }
 
@@ -206,7 +276,7 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
       if (backend.kind === 'native' && mode === 'auto' && cap.stt === 'either'
           && platformStt.isAvailable() && !sessionRef.current) {
         try {
-          console.warn('native STT start failed — falling back to platform:', e)
+          debugWarn('native STT start failed — falling back to platform:', e)
           await runWith(platformStt)
           return
         } catch { /* fall through to the shared error path */ }
@@ -216,8 +286,10 @@ export function useSpeechSession(handlers: SpeechHandlers): SpeechSession {
     }
   }, [cap, prefs])
 
+  // A tap while a stopped dictation finishes starts the next one (it waits
+  // for those last words); a tap on a live or connecting session stops it.
   const toggle = useCallback(() => {
-    if (sessionRef.current || status !== 'idle') stop()
+    if (sessionRef.current || status === 'recording' || status === 'connecting') stop()
     else void start()
   }, [status, start, stop])
 

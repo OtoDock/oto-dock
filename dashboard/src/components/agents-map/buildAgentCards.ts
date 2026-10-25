@@ -9,8 +9,8 @@ import type { SceneBuildParams } from './buildScene'
 
 export function buildAgentCards({
   bag, dynamic, layout, staged, arc, positions, memberCount, heat, liveSet,
-  streamingSet, user, moveFromRef, linkFromRef, attemptLinkRef, openAgentRef,
-  onDeptTapRef, setPopup,
+  streamingSet, defaultAgent, moveFromRef, linkFromRef, attemptLinkRef,
+  openAgentRef, onDeptTapRef, setPopup,
 }: SceneBuildParams) {
   // Agents: ONE glass language at both levels (operator round 7) — the
   // same panel anatomy, compact one-liner at overview, two-line ChartHop
@@ -28,7 +28,7 @@ export function buildAgentCards({
     // Live-but-idle sessions raise the glow floor — activity is the only
     // extra language the cards speak.
     const glow = live ? Math.max(h, 0.45) : h
-    const isFav = user?.default_agent === node.slug
+    const isFav = defaultAgent === node.slug
 
     const root = document.createElement('div')
     root.style.pointerEvents = 'none'
@@ -99,7 +99,7 @@ export function buildAgentCards({
     const name = document.createElement('button')
     name.textContent = (isFav ? '★ ' : '') + node.displayName
     name.title = node.grayed
-      ? `${node.displayName} (not a member)` : `Open ${node.displayName}`
+      ? `${node.displayName}: not a member` : `Open ${node.displayName}`
     name.style.cssText =
       `font-family:Comfortaa,system-ui,sans-serif;font-size:${onStage ? 21 : 18}px;` +
       'font-weight:600;letter-spacing:0.01em;background:none;border:0;' +

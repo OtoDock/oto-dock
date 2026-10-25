@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 import config
 from app import app
-from auth.providers import get_current_user, UserContext
+from auth.providers import UserContext, get_current_user
 
 client = TestClient(app)
 
@@ -84,7 +84,8 @@ def test_user_credits_canonical_shape():
 
     # Canonical shape — NOT a throwaway has_balance/billing-status.
     assert set(data.keys()) == {
-        "balance_usd", "balance_eur_approx", "low_threshold", "recent_transactions",
+        "balance_usd", "balance_eur_approx", "low_threshold", "recent_transactions", "unknown",
     }
     assert data["balance_usd"] == 0.0
+    assert data["unknown"] is False
     assert data["recent_transactions"] == []

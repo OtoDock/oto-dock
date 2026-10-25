@@ -15,7 +15,10 @@ from core.config import phone_config_builder as pcb
 from core.session import session_manager
 from services.mcp import mcp_registry
 from tests.phone.test_phone_config_builder_identity import (  # noqa: F401 (fixtures)
-    SID, _identity, agent, stubs,
+    SID,
+    _identity,
+    agent,
+    stubs,
 )
 
 
@@ -47,9 +50,16 @@ async def test_a_codex_phone_config_gets_its_credentials_without_the_bash_only_k
         return real_inject(mcp_config, credential_env, mcp_format=mcp_format, exclude_keys=exclude_keys)
     monkeypatch.setattr(mcp_registry, "inject_toml_credentials", _inject)
 
-    cfg = await pcb.build_phone_agent_config(agent, route_identity=_identity(agent), session_id=SID)
+    ident = _identity(agent)
+    cfg = await pcb.build_phone_agent_config(agent, route_identity=ident, session_id=SID)
 
     assert stubs["mcp_kwargs"]["mcp_config_format"] == "toml"
+    # The session's token rides the same environment: it names nobody and
+    # carries the caller's claim.
+    from auth.session_token import validate_session_token
+    claims = validate_session_token(seen["credential_env"].pop("PROXY_API_KEY"))
+    assert claims["sid"] == SID and claims["user_sub"] == ""
+    assert claims["ext"] == ident.external.claim
     assert seen == {"mcp_config": toml, "credential_env": env, "mcp_format": "toml",
                     "exclude_keys": {"GIT_CONFIG_COUNT"}}
     text = toml.read_text()

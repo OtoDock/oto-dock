@@ -16,12 +16,27 @@ import fnmatch
 import json
 import logging
 import re
-from urllib.parse import urlsplit
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import urlsplit
 
+import config
 from services.infra import path_confinement
+from services.mcp import mcp_validate_oauth as _mvo
 from services.mcp.mcp_manifest_types import (
+    _BUILDER_TOOL_RE,
+    _ENV_VAR_NAME_RE,
+    _VALID_DEVICE_CAPABILITIES,
+    _VALID_PLACEMENTS,
+    _VALID_REMOTE_POLICIES,
+    _VALID_TOOL_ARG_MODES,
+    PERMISSION_TIERS,
+    REPLACES_KEY_RE,
+    SKILL_AUDIENCES,
+    SKILL_ID_MAX_LEN,
+    SKILL_ID_RE,
+    SKILL_LOADING_DEFAULT,
+    VALID_SKILL_LOADING,
     AgentContextBlock,
     AgentContextBuilder,
     ConfigField,
@@ -36,34 +51,20 @@ from services.mcp.mcp_manifest_types import (
     McpManifest,
     NetworkTargetDecl,
     OutputRelocationDef,
-    PERMISSION_TIERS,
     PathEnvDecl,
     PathEnvValueRef,
     PermissionRule,
     PermissionsBlock,
-    REPLACES_KEY_RE,
     ReplacesDecl,
     ResultFilesDecl,
-    SKILL_AUDIENCES,
-    SKILL_ID_MAX_LEN,
-    SKILL_ID_RE,
-    SKILL_LOADING_DEFAULT,
-    VALID_SKILL_LOADING,
     SandboxMountDef,
     ServerConfig,
     SkillDef,
     SystemRequirements,
     ToolArgPathDeclaration,
     ToolFilterConfig,
-    _BUILDER_TOOL_RE,
-    _ENV_VAR_NAME_RE,
-    _VALID_DEVICE_CAPABILITIES,
-    _VALID_PLACEMENTS,
-    _VALID_REMOTE_POLICIES,
-    _VALID_TOOL_ARG_MODES,
     _parse_companion_app,
 )
-from services.mcp import mcp_validate_oauth as _mvo
 from services.mcp.mcp_validate_oauth import _validate_oauth_services
 from services.mcp.mcp_validate_webhooks import _validate_webhooks_block
 
@@ -77,6 +78,30 @@ _DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 # A PyPI distribution name (``server.source_build`` entries).
 SOURCE_BUILD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+# ``server.tool_timeout_sec``: whole seconds, at most an hour (a tool call
+# Codex waits on longer than that is a hung server, not a slow one).
+TOOL_TIMEOUT_SEC_MIN = 1
+TOOL_TIMEOUT_SEC_MAX = 3600
+
+
+def _tool_timeout_sec(srv_data: dict, name: str) -> int:
+    """The ``server.tool_timeout_sec`` a manifest declares, or 0 (Codex's
+    default) for an absent or malformed value, which is logged and dropped
+    like a bad ``version_constraint``: a catalog entry's typo must not keep
+    the MCP out of every session."""
+    raw = srv_data.get("tool_timeout_sec")
+    if raw is None:
+        return 0
+    if (isinstance(raw, int) and not isinstance(raw, bool)
+            and TOOL_TIMEOUT_SEC_MIN <= raw <= TOOL_TIMEOUT_SEC_MAX):
+        return raw
+    logger.warning(
+        "%s: server.tool_timeout_sec %r is not a whole number of seconds from "
+        "%d to %d; Codex keeps its default", name, raw,
+        TOOL_TIMEOUT_SEC_MIN, TOOL_TIMEOUT_SEC_MAX,
+    )
+    return 0
 
 
 def skill_file_error(value: Any) -> str | None:
@@ -114,6 +139,7 @@ def resolve_skill_file(mcp_dir: Path, rel: str) -> Path | None:
     return resolved if resolved.is_file() else None
 
 logger = logging.getLogger(__name__)
+_CRITICAL, _SENSITIVE = "critical", "sensitive"
 
 
 def _parse_permissions_block(raw: Any, mcp_name: str) -> PermissionsBlock | None:
@@ -181,6 +207,28 @@ def _parse_permissions_block(raw: Any, mcp_name: str) -> PermissionsBlock | None
         rules.append(PermissionRule(tool=tool, tier=tier))
 
     return PermissionsBlock(default_tier=default_tier, rules=rules)
+
+
+def ships_with_platform(mcp_dir: Path) -> bool:
+    """True if the MCP at ``mcp_dir`` was scanned from ``mcps/custom/``: the directory, never ``category``."""
+    try:
+        return Path(mcp_dir).resolve().parent == (config.MCPS_DIR / "custom").resolve()
+    except OSError:
+        return False
+
+
+def _bounded_tiers(block: PermissionsBlock | None, mcp_name: str, mcp_dir: Path) -> PermissionsBlock | None:
+    """``critical`` (a card in every mode, refused unattended) is the platform's own tier: a manifest
+    that does not ship with the platform loads those tiers as ``sensitive`` with one warning. Lowered,
+    never refused: an install keeps a catalog version from before the rule until its update arrives."""
+    lowered = ["default_tier"] if block and block.default_tier == _CRITICAL else []
+    lowered += [r.tool for r in block.rules if r.tier == _CRITICAL] if block else []
+    if block is None or not lowered or ships_with_platform(mcp_dir):
+        return block
+    logger.warning("MCP %s: critical is the platform's own tier; %s run as sensitive", mcp_name, ", ".join(lowered))
+    return PermissionsBlock(default_tier=_SENSITIVE if block.default_tier == _CRITICAL else block.default_tier,
+                            rules=[PermissionRule(tool=r.tool, tier=_SENSITIVE if r.tier == _CRITICAL else r.tier)
+                                   for r in block.rules])
 
 
 def _is_permission_glob(tool: str) -> bool:
@@ -922,7 +970,8 @@ def _validate_api_key_header(
     if not isinstance(value_from, str) or not _ENV_VAR_NAME_RE.match(value_from):
         raise ValueError("value_from must name a credential key")
     cred = cred_raw if isinstance(cred_raw, dict) else {}
-    oauth = cred.get("oauth") if isinstance(cred.get("oauth"), dict) else {}
+    oauth_raw = cred.get("oauth")
+    oauth = oauth_raw if isinstance(oauth_raw, dict) else {}
     if oauth.get("bearer_required"):
         raise ValueError("cannot be declared beside credentials.oauth.bearer_required")
     hosted = hosted_raw if isinstance(hosted_raw, dict) else {}
@@ -975,7 +1024,7 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
     """Parse a manifest.json file into an McpManifest."""
     try:
         data = json.loads(manifest_path.read_text())
-    except Exception as e:
+    except (OSError, ValueError) as e:
         logger.warning("Failed to read manifest %s: %s", manifest_path, e)
         return None
 
@@ -991,7 +1040,7 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         try:
             from packaging.specifiers import SpecifierSet
             SpecifierSet(version_constraint)
-        except Exception:
+        except (ImportError, ValueError, TypeError):
             logger.warning(
                 "%s: invalid server.version_constraint %r (expected a PEP 440 "
                 "specifier like '>=2,<3') — treating as unbounded",
@@ -1033,6 +1082,7 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         image=srv_data.get("image", ""),
         version_constraint=version_constraint,
         source_build=source_build,
+        tool_timeout_sec=_tool_timeout_sec(srv_data, data.get("name", manifest_path.parent.name)),
     )
 
     # Credential config. Credential directories (OAuth tokens etc.) are
@@ -1057,6 +1107,7 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         api_key_header=api_key_header,
         ui_type=cred_data.get("ui_type", ""),
         app_credential_fields=app_cred_fields,
+        app_kinds=oauth_data.get("app_kinds") if oauth_data else None,
     )
 
     # Config fields
@@ -1238,6 +1289,7 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         permissions = _parse_permissions_block(data.get("permissions"), name)
     except ValueError as e:
         raise ValueError(f"{name}: invalid permissions block — {e}") from e
+    permissions = _bounded_tiers(permissions, name, mcp_dir)
 
     # Per-session prompt blocks (optional). Same strict-validation contract.
     try:
@@ -1317,10 +1369,6 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         companion_app = _parse_companion_app(data.get("companion_app"), name)
     except ValueError as e:
         raise ValueError(f"{name}: invalid companion_app block — {e}") from e
-    device_high_risk_tools_raw = data.get("device_high_risk_tools") or []
-    if not isinstance(device_high_risk_tools_raw, list):
-        raise ValueError(f"{name}: device_high_risk_tools must be a list of tool names")
-    device_high_risk_tools = [str(t) for t in device_high_risk_tools_raw]
 
     return McpManifest(
         name=name,
@@ -1388,7 +1436,6 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         requires_display=bool(data.get("requires_display", False)),
         device_capability=device_capability,
         companion_app=companion_app,
-        device_high_risk_tools=device_high_risk_tools,
         replaces=parse_replaces(data.get("replaces"), name),
         patched=data.get("patched", False),
         patch_note=data.get("patch_note"),

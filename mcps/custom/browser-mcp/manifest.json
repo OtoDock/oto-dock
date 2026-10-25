@@ -12,7 +12,8 @@
     "args": [
       "index.js"
     ],
-    "source": "npm:@playwright/mcp@0.0.76"
+    "source": "npm:@playwright/mcp@0.0.76",
+    "tool_timeout_sec": 600
   },
   "credentials": {
     "type": "none"

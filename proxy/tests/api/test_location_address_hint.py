@@ -16,7 +16,10 @@ KEY_FIELD = "GOOGLE_MAPS_API_KEY"
 
 def _maps_manifest():
     from services.mcp.mcp_registry import (
-        CredentialConfig, InstanceConfig, McpManifest, ServerConfig,
+        CredentialConfig,
+        InstanceConfig,
+        McpManifest,
+        ServerConfig,
     )
     return McpManifest(
         name="google-maps", label="Google Maps", description="", version="0.3.2",
@@ -68,7 +71,8 @@ def _geocoder(monkeypatch, answer: dict) -> list[httpx.Request]:
         sent.append(request)
         return httpx.Response(200, json=answer)
 
-    monkeypatch.setattr(lifecycle.httpx, "AsyncClient",
+    # The hint's client is the checked one (``pinned_http``): replaced whole.
+    monkeypatch.setattr(httpx, "AsyncClient",
                         lambda **kw: real_client(transport=httpx.MockTransport(handler)))
     return sent
 

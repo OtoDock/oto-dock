@@ -1,6 +1,4 @@
-import { useEffect } from 'react'
-import { createPortal } from 'react-dom'
-import { pushEscHandler } from '../../lib/escStack'
+import AlertDialog from '../ui/AlertDialog'
 
 interface Props {
   /** All targets — usually one, multiple for batch delete. */
@@ -29,12 +27,10 @@ export default function DeleteConfirmDialog({
   isDir,
   childCount = 0,
   binSkippedCount = 0,
-  pending,
+  pending = false,
   onConfirm,
   onCancel,
 }: Props) {
-  useEffect(() => pushEscHandler(onCancel), [onCancel])
-
   const isBatch = names.length > 1
   const headline = isBatch
     ? `Delete ${names.length} items?`
@@ -47,50 +43,32 @@ export default function DeleteConfirmDialog({
   const preview = isBatch ? names.slice(0, PREVIEW_LIMIT) : []
   const remaining = isBatch ? Math.max(0, names.length - PREVIEW_LIMIT) : 0
 
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs"
-      onClick={onCancel}
+  return (
+    <AlertDialog
+      title="Confirm delete"
+      confirmLabel="Delete"
+      tone="danger"
+      busy={pending}
+      busyLabel="Deleting…"
+      onConfirm={onConfirm}
+      onCancel={onCancel}
     >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="w-[min(400px,90vw)] rounded-xl bg-white dark:bg-p-surface border border-p-border-light shadow-xl p-4"
-      >
-        <h3 className="text-sm font-semibold text-p-text mb-2">Confirm delete</h3>
-        <p className="text-sm text-p-text-secondary mb-2">{headline}</p>
-        {isBatch && (
-          <ul className="text-xs text-p-text-light mb-4 space-y-0.5">
-            {preview.map((n) => (
-              <li key={n} className="truncate">• {n}</li>
-            ))}
-            {remaining > 0 && <li>…and {remaining} more</li>}
-          </ul>
-        )}
-        {binSkippedCount > 0 && (
-          <p className="text-xs text-amber-600 dark:text-amber-500 mb-3">
-            {binSkippedCount === 1
-              ? 'One file is too large for the Recover bin — deleting it cannot be undone.'
-              : `${binSkippedCount} files are too large for the Recover bin — deleting them cannot be undone.`}
-          </p>
-        )}
-        <div className="flex items-center justify-end gap-2">
-          <button
-            onClick={onCancel}
-            disabled={pending}
-            className="px-3 py-1.5 text-xs rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-p-text hover:bg-p-surface-hover"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            disabled={pending}
-            className="px-3 py-1.5 text-xs rounded-lg bg-red-500 text-white hover:bg-red-600 disabled:opacity-60"
-          >
-            {pending ? 'Deleting…' : 'Delete'}
-          </button>
-        </div>
-      </div>
-    </div>,
-    document.body,
+      <p className="mb-2">{headline}</p>
+      {isBatch && (
+        <ul className="text-xs text-tertiary mb-2 space-y-0.5">
+          {preview.map((n) => (
+            <li key={n} className="truncate">• {n}</li>
+          ))}
+          {remaining > 0 && <li>…and {remaining} more</li>}
+        </ul>
+      )}
+      {binSkippedCount > 0 && (
+        <p className="text-xs text-status-warning-fg">
+          {binSkippedCount === 1
+            ? 'One file is too large for the Recover bin. Deleting it cannot be undone.'
+            : `${binSkippedCount} files are too large for the Recover bin. Deleting them cannot be undone.`}
+        </p>
+      )}
+    </AlertDialog>
   )
 }

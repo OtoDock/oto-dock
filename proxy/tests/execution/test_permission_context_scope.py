@@ -21,7 +21,7 @@ semantics + knowledge-vs-workspace prose moved to ``# Folders`` and
 
 from __future__ import annotations
 
-from auth.path_policy import build_permission_context, SecurityContext
+from auth.path_policy import SecurityContext, build_permission_context
 from storage.agents import agent_store
 
 

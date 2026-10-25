@@ -14,10 +14,9 @@ from fastapi.testclient import TestClient
 
 from auth.providers import UserContext, get_current_user
 from services.scheduler import scheduler
+from storage import database as task_store
 from storage.agents import agent_store
 from storage.mcp import mcp_store
-from storage import database as task_store
-
 
 AGENT = "pa"
 PARENT_SESSION = "11111111-1111-1111-1111-111111111111"
@@ -468,7 +467,7 @@ class TestSpawnOverrides:
     def test_overrides_ride_the_task_and_chat_pins(self, client, monkeypatch):
         from storage.billing import subscription_store
         monkeypatch.setattr(subscription_store, "list_models",
-                            lambda p: [{"model_id": "claude-opus-5-5", "enabled": True}])
+                            lambda layer=None: [{"model_id": "claude-opus-5-5", "enabled": True}])
         r = _spawn(client, surface="chat", model="claude-opus-5-5",
                    layer="claude-code-cli", mode="interactive")
         assert r.status_code == 200
@@ -498,7 +497,7 @@ class TestSpawnOverrides:
     def test_model_foreign_to_layer_400(self, client, monkeypatch):
         from storage.billing import subscription_store
         monkeypatch.setattr(subscription_store, "list_models",
-                            lambda p: [{"model_id": "other-model", "enabled": True}])
+                            lambda layer=None: [{"model_id": "other-model", "enabled": True}])
         r = _spawn(client, model="gpt-5.4")
         assert r.status_code == 400
         assert client.fired == []
@@ -633,8 +632,8 @@ class TestContinueModelChange:
         assert task_store.get_chat(worker)["model"] == self.CLAUDE_OLD
 
     def test_a_provider_pinned_engine_keeps_its_provider(self, client, monkeypatch):
-        from api.tasks import delegation as route
         import config as app_config
+        from api.tasks import delegation as route
         from core.session import session_manager
         caps = session_manager.get_layer_capabilities("claude-code-cli")
         pinned = type("Caps", (), {"display_name": "Engine X",
@@ -895,3 +894,65 @@ class TestContinueOntoALiveTerminal:
         assert r.status_code == 200
         assert "steered" not in r.json()
         assert term.queued == [] and len(client.fired) == 1
+
+
+class TestSpawnMachine:
+    """``machine`` on a fresh spawn: validated after the scope clamp, for the
+    delegating person on the worker agent (nobody for an agent-scope worker),
+    carried on the worker's task; ignored on continue_id, with no error."""
+
+    @pytest.fixture
+    def machines(self, client, monkeypatch):
+        from services.remote import remote_status
+        from storage import remote_store
+        remote_store.create_remote_machine("m-alice", "alice-laptop", "user-alice", pairing_scope="user")
+        remote_store.create_remote_machine("m-bob", "bob-laptop", "user-bob", pairing_scope="user")
+        monkeypatch.setattr(remote_status, "get_live_machine_status", lambda mid, machine=None: {
+            "state": "online", "last_heartbeat_age_s": 1, "last_seen_iso": "", "reachable": True})
+
+    def test_the_delegating_persons_own_machine_rides_the_worker(self, client, machines):
+        r = _spawn(client, machine="alice-laptop")
+        assert r.status_code == 200, r.text
+        assert client.fired[0]["task"].target_machine == "m-alice"
+        assert task_store.get_dynamic_task(r.json()["task_id"])["target_machine"] == "m-alice"
+        r = _spawn(client, machine="default")
+        assert r.status_code == 200 and client.fired[-1]["task"].target_machine == ""
+
+    def test_someone_elses_machine_is_refused_before_any_row(self, client, machines):
+        r = _spawn(client, surface="chat", machine="bob-laptop")
+        assert r.status_code == 400
+        assert "is not a machine this work can run on" in r.json()["detail"]
+        assert client.fired == []
+        assert task_store.list_dynamic_tasks(enabled_only=False) == []
+
+    def test_validated_after_the_clamp(self, client, machines):
+        """A Shared-only worker runs agent-scoped (the clamp), with no
+        person: even the delegating person's own machine is refused."""
+        agent_store.create_agent("shared-only", "SO", collaborative=False, default_scope="agent")
+        agent_store.set_delegation_targets(AGENT, ["shared-only"])
+        caller = _session_user()
+        caller.agents.append("shared-only")
+        caller.agent_roles["shared-only"] = "editor"
+        client.app_ref.state.user = caller
+        r = _spawn(client, agent="shared-only", scope="user", machine="alice-laptop")
+        assert r.status_code == 400
+        assert client.fired == []
+
+    def test_a_caller_without_a_person_names_only_the_default(self, client, machines):
+        from auth import roles
+        client.app_ref.state.user = UserContext(
+            sub="session:nouser", email="", name="", role=roles.SERVICE, is_api_key=True,
+            session_id=PARENT_SESSION, agent=AGENT)
+        r = _spawn(client, scope="agent", machine="alice-laptop")
+        assert r.status_code == 400
+        assert r.json()["detail"].startswith("Only a person can pick a machine")
+        assert _spawn(client, scope="agent", machine="default").status_code == 200
+
+    def test_a_continue_ignores_the_machine(self, client, machines):
+        prior_sid = str(uuid.uuid4())
+        task_store.create_chat("task-run-old9", "user-alice", AGENT, "auto",
+                               origin="delegated", title="old lane")
+        task_store.update_chat("task-run-old9", session_id=prior_sid)
+        r = _spawn(client, continue_id="task-run-old9", machine="bob-laptop")
+        assert r.status_code == 200, r.text
+        assert client.fired[0]["task"].target_machine == ""

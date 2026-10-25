@@ -18,15 +18,16 @@ import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 from urllib.parse import urlsplit
 
+import httpx
+import psycopg
 from fastapi import HTTPException
 
 import config
-from services.community import community_catalog
-from services.community import community_installer as installer
-from services.mcp import mcp_manifest_parse as _mmp
-from services.mcp import mcp_manifest_types as _mt
+from services.community import community_catalog, community_installer as installer
+from services.mcp import mcp_manifest_parse as _mmp, mcp_manifest_types as _mt
 from storage.mcp import mcp_update_state_store as state_store
 
 logger = logging.getLogger("otodock.mcp-source-swap")
@@ -202,7 +203,9 @@ def _block_keys(data: dict, block: str) -> set[str]:
         }
         provider = _oauth_provider(data)
         if provider:
-            from services.oauth.oauth_account_store import resolve_account_credential_keys
+            from services.oauth.oauth_account_store import (
+                resolve_account_credential_keys,
+            )
             keys.update(resolve_account_credential_keys(creds.get("oauth") or {}, provider))
         return keys
     if block == BLOCK_INSTANCES:
@@ -301,12 +304,12 @@ def collect_stored_keys(mcp_name: str) -> dict[str, set[str]]:
 def _read_manifest(mcp_dir) -> dict | None:
     try:
         data = json.loads((Path(mcp_dir) / "manifest.json").read_text())
-    except Exception:
+    except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
 
 
-async def detect_changes(manifests: dict, catalog: dict[str, dict]) -> tuple[dict[str, dict], set[str]]:
+async def detect_changes(manifests: dict, catalog: dict[str | None, dict]) -> tuple[dict[str, dict], set[str]]:
     """Compare every installed community MCP that has a catalog entry with
     the catalog's source identity. Returns ``(changes, unchanged)``:
     ``changes`` maps a name to the change record (the ``from_*`` and ``to_*``
@@ -323,7 +326,7 @@ async def detect_changes(manifests: dict, catalog: dict[str, dict]) -> tuple[dic
     ]
     try:
         rows = await asyncio.to_thread(state_store.list_source_changes)
-    except Exception:
+    except psycopg.Error:
         rows = []
     for row in rows:
         if row.get("status") == state_store.STATUS_PENDING and row["mcp_name"] not in catalog:
@@ -332,7 +335,7 @@ async def detect_changes(manifests: dict, catalog: dict[str, dict]) -> tuple[dic
     installed_data = await asyncio.to_thread(
         lambda: {name: _read_manifest(m.mcp_dir) for name, m, _e in candidates},
     )
-    for name, m, entry in candidates:
+    for name, _m, entry in candidates:
         data = installed_data.get(name)
         if data is None:
             continue
@@ -396,7 +399,7 @@ async def _catalog_manifest(entry: dict) -> dict | None:
         return None
     try:
         data = await community_catalog.fetch_manifest(folder)
-    except Exception as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         logger.warning("Catalog manifest of %s could not be read: %s", folder, exc)
         return None
     return data if isinstance(data, dict) else None
@@ -568,11 +571,11 @@ async def _finish(name: str, row: dict, *, installed: dict | None, result: dict,
                 container_started = bool(await asyncio.to_thread(
                     docker_manager.start_container, refreshed, force_recreate=True,
                 ))
-            except Exception as exc:
+            except (OSError, ValueError, psycopg.Error) as exc:
                 logger.warning("Container refresh of %s after the switch failed: %s", name, exc)
                 container_started = False
         swap_result["container_started"] = container_started
-        new_image = (refreshed.server.image or "") if new_is_container else ""
+        new_image = (cast("_mt.McpManifest", refreshed).server.image or "") if new_is_container else ""
         if (
             old_image and old_image != new_image and self_host
             and (not new_is_container or container_started)
@@ -649,6 +652,10 @@ async def switch(name: str, *, from_url: str, to_url: str, manifest_hash: str,
             state_store.set_source_change_status, name, state_store.STATUS_PENDING,
             result=_interrupted(),
         )
+        if row is None:  # removed meanwhile (the weekly check drops a reverted change)
+            raise HTTPException(
+                409, f"No source change is pending for '{name}'. Run Check updates first.",
+            )
     if row["status"] != state_store.STATUS_PENDING:
         raise HTTPException(
             409, f"The source change of '{name}' is not pending (status: {row['status']}).",
@@ -728,7 +735,7 @@ async def switch(name: str, *, from_url: str, to_url: str, manifest_hash: str,
             )
             if isinstance(exc, HTTPException):
                 raise
-            raise HTTPException(500, f"Switch failed: {detail}")
+            raise HTTPException(500, f"Switch failed: {detail}") from exc
 
         swap_result = await _finish(name, row, installed=installed, result=result, old_image=old_image)
         return _reply(name, row, swap_result, install_log=result.get("install_log", ""))
@@ -791,7 +798,7 @@ async def reconcile_interrupted() -> list[str]:
         )
         moved.append(name)
     if restored:
-        await asyncio.to_thread(mcp_registry.scan_manifests)
+        await mcp_registry.rescan()
     if moved:
         logger.warning("Source switches interrupted by a restart: %s", ", ".join(moved))
     if finished:

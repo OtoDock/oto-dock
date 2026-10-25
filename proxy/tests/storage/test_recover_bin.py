@@ -11,8 +11,9 @@ Run individually (the conftest DB pool exhausts if test files run together):
     proxy/venv/bin/python -m pytest tests/storage/test_recover_bin.py
 """
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 import config
 from storage.files import recover_bin_store as rb
@@ -399,7 +400,7 @@ def _fanout_calls(monkeypatch):
     async def _fake(agent_slug, rel_path, source, **kw):
         # The publish hands the fan-out the platform copy's Path (read beneath
         # the root there); the recorder reads it so the assertions see bytes.
-        content = source if isinstance(source, bytes) else Path(source).read_bytes()
+        content = source if isinstance(source, bytes) else Path(source).read_bytes()  # noqa: ASYNC240  # a test's own temporary files
         calls.append((agent_slug, rel_path, content))
 
     monkeypatch.setattr("services.remote.workspace_fanout.fan_out_write", _fake)
@@ -412,7 +413,7 @@ def _fanout_calls(monkeypatch):
 @pytest.mark.asyncio
 async def test_restore_no_collision_writes_original_path(_fanout_calls):
     _make_agent()
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     e = rb.capture(AGENT, "workspace/new.txt", b"data", "deleted")
 
     res = await restore_recover_bin(
@@ -430,7 +431,7 @@ async def test_restore_no_collision_writes_original_path(_fanout_calls):
 @pytest.mark.asyncio
 async def test_restore_collision_uses_suffix_never_overrides(_fanout_calls):
     _make_agent()
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     # A current file already occupies the original path.
     dest = config.get_agent_dir(AGENT) / "workspace/doc.txt"
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -456,7 +457,7 @@ async def test_restore_collision_uses_suffix_never_overrides(_fanout_calls):
 @pytest.mark.asyncio
 async def test_restore_denies_member_on_shared(_fanout_calls):
     _make_agent()
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     e = rb.capture(AGENT, "workspace/shared.txt", b"x", "deleted")  # scope=shared
 
     res = await restore_recover_bin(
@@ -473,7 +474,7 @@ async def test_restore_denies_member_on_shared(_fanout_calls):
 @pytest.mark.asyncio
 async def test_restore_allows_member_on_own_user_file(_fanout_calls, monkeypatch):
     _make_agent()
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     monkeypatch.setattr(
         "storage.database.get_user_sub_by_username",
         lambda slug: "user-viewer" if slug == "viewer" else None,
@@ -494,7 +495,7 @@ async def test_restore_denies_admin_on_other_users_personal(_fanout_calls, monke
     # Personal entries are owner-only: the blanket admin bypass is gone. The
     # entry is NOT consumed — the owner can still recover it themselves.
     _make_agent()
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     monkeypatch.setattr(
         "storage.database.get_user_sub_by_username",
         lambda slug: "user-viewer" if slug == "viewer" else None,
@@ -515,7 +516,7 @@ async def test_restore_denies_admin_on_other_users_personal(_fanout_calls, monke
 async def test_restore_admin_keeps_manager_tier_on_config(_fanout_calls):
     # Admins stay manager-equivalent for the SHARED scopes — config restores work.
     _make_agent()
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     e = rb.capture(AGENT, "config/prompt.md", b"prompt", "deleted")
 
     res = await restore_recover_bin(
@@ -529,7 +530,7 @@ async def test_restore_admin_keeps_manager_tier_on_config(_fanout_calls):
 @pytest.mark.asyncio
 async def test_discard_removes_without_restoring(_fanout_calls):
     _make_agent()
-    from api.agents.agents import discard_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, discard_recover_bin
     e = rb.capture(AGENT, "workspace/junk.txt", b"x", "deleted")
     res = await discard_recover_bin(
         AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]), _admin(),
@@ -543,7 +544,7 @@ async def test_discard_removes_without_restoring(_fanout_calls):
 @pytest.mark.asyncio
 async def test_discard_denies_member_on_shared():
     _make_agent()
-    from api.agents.agents import discard_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, discard_recover_bin
     e = rb.capture(AGENT, "workspace/shared.txt", b"x", "deleted")  # scope=shared
     res = await discard_recover_bin(
         AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]),
@@ -557,7 +558,7 @@ async def test_discard_denies_member_on_shared():
 @pytest.mark.asyncio
 async def test_restore_editor_can_restore_shared_workspace(_fanout_calls):
     _make_agent()
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     e = rb.capture(AGENT, "workspace/team.txt", b"data", "conflict")
     res = await restore_recover_bin(
         AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]),
@@ -570,7 +571,7 @@ async def test_restore_editor_can_restore_shared_workspace(_fanout_calls):
 @pytest.mark.asyncio
 async def test_restore_editor_denied_on_knowledge(_fanout_calls):
     _make_agent()
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     e = rb.capture(AGENT, "knowledge/ref.md", b"data", "conflict")
     res = await restore_recover_bin(
         AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]),
@@ -583,7 +584,7 @@ async def test_restore_editor_denied_on_knowledge(_fanout_calls):
 @pytest.mark.asyncio
 async def test_restore_manager_can_restore_config(_fanout_calls):
     _make_agent()
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     e = rb.capture(AGENT, "config/prompt.md", b"data", "conflict")
     res = await restore_recover_bin(
         AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]),
@@ -618,7 +619,7 @@ def _attach_library(source: str, consumer: str, *, writable: bool):
 async def test_restore_into_read_only_mirror_is_denied(_fanout_calls):
     _make_agent()
     _attach_library("lib-src", AGENT, writable=False)
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     rel = "knowledge/shared/lib-src/doc.md"
     e = rb.capture(AGENT, rel, b"stray", "conflict")
 
@@ -637,7 +638,7 @@ async def test_restore_into_read_only_mirror_is_denied(_fanout_calls):
 async def test_restore_into_writable_mirror_is_allowed(_fanout_calls):
     _make_agent()
     _attach_library("lib-rw", AGENT, writable=True)
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     rel = "knowledge/shared/lib-rw/doc.md"
     e = rb.capture(AGENT, rel, b"data", "conflict")
 
@@ -653,7 +654,7 @@ async def test_denied_mirror_entry_does_not_sink_the_batch(_fanout_calls):
     """One ineligible file must not abort the rest of the selection."""
     _make_agent()
     _attach_library("lib-ro", AGENT, writable=False)
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     bad = rb.capture(AGENT, "knowledge/shared/lib-ro/x.md", b"no", "conflict")
     good = rb.capture(AGENT, "workspace/ok.txt", b"yes", "deleted")
 
@@ -678,7 +679,7 @@ async def test_restore_publishes_like_every_other_write(_fanout_calls, monkeypat
         seen.append((agent_slug, rel_path, writer))
 
     monkeypatch.setattr("services.infra.file_bookkeeping.record_platform_write", _rec)
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     e = rb.capture(AGENT, "workspace/back.txt", b"data", "deleted")
     await restore_recover_bin(
         AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]), _admin(),
@@ -690,7 +691,7 @@ async def test_restore_publishes_like_every_other_write(_fanout_calls, monkeypat
 async def test_bare_shared_namespace_restore_is_denied(_fanout_calls):
     """`knowledge/shared/<file>` is the reserved mirror namespace itself."""
     _make_agent()
-    from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
+    from api.agents.agents import RecoverRestoreRequest, restore_recover_bin
     e = rb.capture(AGENT, "knowledge/shared/loose.md", b"x", "conflict")
     res = await restore_recover_bin(
         AGENT, RecoverRestoreRequest(entry_ids=[e["entry_id"]]), _admin(),

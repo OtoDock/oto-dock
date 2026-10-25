@@ -443,7 +443,7 @@ function hash01(i: number, salt: number): number {
 export function terrainHeightAt(
   x: number, z: number, clearings: EnvZone[],
 ): number {
-  let h = (
+  const h = (
     Math.sin(x * 0.045 + z * 0.03)
     + Math.sin(x * 0.021 - z * 0.052) * 0.7
     + Math.sin((x + z) * 0.013) * 1.2

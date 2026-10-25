@@ -5,7 +5,7 @@ claim of ``kind: check``, and reads the verdict from the 2xx body. The
 app must be approved and declare the handler under the event
 ``check:<name>`` (so the approval card says it and an old proxy refuses
 the manifest); the handler's platform methods are a handler's, for the
-run's minute (``app_proxy.register_inflight_check``).
+run's minute (``app_handlers.register_inflight_check``).
 """
 
 from __future__ import annotations
@@ -46,10 +46,15 @@ def find_app(agent: str, owner: str, username: str, slug: str) -> dict | None:
 
 async def run(check, target, changed: dict, *, round_no: int) -> Verdict:
     import asyncio
+
     import httpx
-    from api.apps import manifest as _mf
-    from api.apps.app_proxy import forward, register_inflight_check, unregister_inflight_check
-    from services.apps import app_supervisor, app_tokens
+
+    from services.apps import app_supervisor, app_tokens, manifest as _mf
+    from services.apps.app_handlers import (
+        register_inflight_check,
+        unregister_inflight_check,
+    )
+    from services.apps.app_supervisor import forward
     from storage import database as task_store
     started = time.monotonic()
     spec = check.doc.get("handler") or {}

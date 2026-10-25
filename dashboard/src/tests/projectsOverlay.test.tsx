@@ -155,7 +155,7 @@ describe('Dock — panel composition', () => {
         project: null,
       },
     })
-    expect(await screen.findByText(/review before they work/)).toBeTruthy()
+    expect(await screen.findByText(/Review it before use/)).toBeTruthy()
     expect(screen.getByText('Approve')).toBeTruthy()
   })
 })
@@ -185,7 +185,7 @@ describe('Dock — round scoping (reused project slug)', () => {
     expect(screen.getByText('Other project lanes (2)')).toBeTruthy()
     expect(screen.getByText('Old Lane').closest('details')).toBeTruthy()
     expect(screen.getByText('Round Zero').closest('details')).toBeTruthy()
-    // Two orchestrator labels: the anchor's amber card + Round Zero's
+    // Two orchestrator labels: the anchor's orchestrator card + Round Zero's
     // collapsed row — exactly one of them inside the disclosure.
     const orchLabels = screen.getAllByText('orchestrator · dev')
     expect(orchLabels).toHaveLength(2)

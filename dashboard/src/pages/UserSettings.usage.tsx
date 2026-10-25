@@ -1,29 +1,35 @@
 import { useState } from 'react'
 import { useMyUsage, useMyLimits, useSetMyLimit, PeriodUsage, UsageLimit } from '../api/usage'
 import { MyPoolCapSection } from '../components/usage/PoolCapSection'
+import { tooltipProps, useChartColors } from '../components/usage/chartColors'
+import { toastError } from '../lib/http/apiJson'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
+import Button from '../components/ui/Button'
+import { Input } from '../components/ui/Field'
+import { CARD } from '../components/ui/classes'
+import { PAGE_TITLE } from '../components/ui/classes'
 
 export function UsageBar({ period }: { period: PeriodUsage | null }) {
   if (!period) return null
   const hasLimit = period.limit !== null && period.limit !== undefined
   const pct = hasLimit ? Math.min(period.percent, 100) : 0
-  const barColor = !hasLimit ? 'bg-brand' : pct >= 100 ? 'bg-p-error' : pct >= 80 ? 'bg-p-accent-yellow' : 'bg-brand'
+  const barColor = !hasLimit ? 'bg-status-info-solid' : pct >= 100 ? 'bg-status-danger-solid' : pct >= 80 ? 'bg-status-warning-solid' : 'bg-status-info-solid'
 
   return (
     <div>
       <div className="flex justify-between text-sm mb-1">
-        <span className="text-p-text-secondary">
+        <span className="text-secondary">
           ${period.used.toFixed(2)}
           {hasLimit ? ` / $${period.limit!.toFixed(2)}` : ''}
         </span>
         {hasLimit && (
-          <span className={`font-medium ${pct >= 100 ? 'text-p-error' : pct >= 80 ? 'text-p-accent-yellow' : 'text-p-text-secondary'}`}>
+          <span className={`font-medium ${pct >= 100 ? 'text-status-danger-fg' : pct >= 80 ? 'text-status-warning-fg' : 'text-secondary'}`}>
             {period.percent.toFixed(0)}%
           </span>
         )}
       </div>
       {hasLimit && (
-        <div className="h-2 rounded-full bg-p-surface overflow-hidden">
+        <div className="h-2 rounded-full bg-surface-muted overflow-hidden">
           <div className={`h-full rounded-full transition-all ${barColor}`} style={{ width: `${pct}%` }} />
         </div>
       )}
@@ -41,35 +47,39 @@ export function MyLimitForm({ limits, onClose }: { limits: UsageLimit[]; onClose
   }
   const [monthly, setMonthly] = useState(() => current('monthly'))
   const [weekly, setWeekly] = useState(() => current('weekly'))
+  // Both periods save in one tick: Save stays off until both have answered.
+  const [saving, setSaving] = useState(false)
 
   const handleSave = () => {
     const m = monthly.trim() === '' ? null : parseFloat(monthly)
     const w = weekly.trim() === '' ? null : parseFloat(weekly)
-    setLimit.mutate({ period: 'monthly', cost_limit_usd: m == null || isNaN(m) ? null : m })
-    setLimit.mutate({ period: 'weekly', cost_limit_usd: w == null || isNaN(w) ? null : w })
-    onClose()
+    setSaving(true)
+    Promise.all([
+      setLimit.mutateAsync({ period: 'monthly', cost_limit_usd: m == null || isNaN(m) ? null : m }),
+      setLimit.mutateAsync({ period: 'weekly', cost_limit_usd: w == null || isNaN(w) ? null : w }),
+    ])
+      .then(onClose, toastError('The limits were not saved'))
+      .finally(() => setSaving(false))
   }
 
   return (
     <div className="flex flex-wrap items-end gap-3">
-      <div>
-        <div className="text-xs text-p-text-secondary mb-1">Monthly ($)</div>
-        <input type="number" min="0" step="1" placeholder="No cap" aria-label="Monthly ($)"
-          value={monthly} onChange={e => setMonthly(e.target.value)}
-          className="w-24 px-2 py-1 rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-sm text-p-text" />
+      <div className="w-24">
+        <div className="text-xs text-secondary mb-1">Monthly ($)</div>
+        <Input type="number" min="0" step="1" placeholder="No cap" aria-label="Monthly ($)"
+          value={monthly} onChange={e => setMonthly(e.target.value)} />
       </div>
-      <div>
-        <div className="text-xs text-p-text-secondary mb-1">Weekly ($)</div>
-        <input type="number" min="0" step="1" placeholder="No cap" aria-label="Weekly ($)"
-          value={weekly} onChange={e => setWeekly(e.target.value)}
-          className="w-24 px-2 py-1 rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-sm text-p-text" />
+      <div className="w-24">
+        <div className="text-xs text-secondary mb-1">Weekly ($)</div>
+        <Input type="number" min="0" step="1" placeholder="No cap" aria-label="Weekly ($)"
+          value={weekly} onChange={e => setWeekly(e.target.value)} />
       </div>
-      <button onClick={handleSave} className="px-3 py-1.5 text-xs rounded-sm bg-brand text-white hover:bg-brand-hover">
+      <Button variant="primary" size="xs" onClick={handleSave} disabled={saving}>
         Save
-      </button>
-      <button onClick={onClose} className="px-3 py-1.5 text-xs rounded-sm border border-p-border-light text-p-text-secondary hover:bg-p-surface">
+      </Button>
+      <Button variant="secondary" size="xs" onClick={onClose}>
         Cancel
-      </button>
+      </Button>
     </div>
   )
 }
@@ -78,28 +88,28 @@ export function MyApiKeysSection({ selfLimits }: { selfLimits: { monthly: Period
   const { data: limitsData } = useMyLimits()
   const [editing, setEditing] = useState(false)
   return (
-    <div className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface p-4 space-y-4 mb-4">
+    <div className={`${CARD} p-4 space-y-4 mb-4`}>
       <div className="flex items-baseline justify-between">
         <div>
-          <div className="text-xs font-medium text-p-text-secondary uppercase tracking-wide">My API keys</div>
-          <div className="text-xs text-p-text-light mt-0.5">
-            What your own Anthropic or OpenAI API keys spend, and the cap you set on it.
+          <div className="text-xs font-medium text-secondary uppercase tracking-wide">My API keys</div>
+          <div className="text-xs text-tertiary mt-0.5">
+            What your own Anthropic or OpenAI API keys spend. You can set a cap on it.
           </div>
         </div>
-        <button onClick={() => setEditing(e => !e)} className="text-xs text-brand hover:underline">
+        <button onClick={() => setEditing(e => !e)} className="text-xs text-link hover:underline">
           {editing ? 'Close' : 'Set cap'}
         </button>
       </div>
       <div>
-        <div className="text-xs text-p-text-light mb-1">This month</div>
+        <div className="text-xs text-tertiary mb-1">This month</div>
         <UsageBar period={selfLimits.monthly} />
       </div>
       <div>
-        <div className="text-xs text-p-text-light mb-1">This week</div>
+        <div className="text-xs text-tertiary mb-1">This week</div>
         <UsageBar period={selfLimits.weekly} />
       </div>
       {editing && (
-        <div className="pt-3 border-t border-p-border-light">
+        <div className="pt-3 border-t border-subtle">
           <MyLimitForm limits={limitsData?.limits ?? []} onClose={() => setEditing(false)} />
         </div>
       )}
@@ -109,12 +119,13 @@ export function MyApiKeysSection({ selfLimits }: { selfLimits: { monthly: Period
 
 export function UsageSection() {
   const { data: usage, isLoading } = useMyUsage()
+  const chart = useChartColors()
 
   if (isLoading) {
     return (
       <div className="mb-8">
-        <h2 className="text-lg font-medium text-p-text mb-3">Usage</h2>
-        <div className="text-sm text-p-text-light">Loading...</div>
+        <h2 className={`${PAGE_TITLE} mb-3`}>Usage</h2>
+        <div className="text-sm text-tertiary">Loading...</div>
       </div>
     )
   }
@@ -123,18 +134,18 @@ export function UsageSection() {
 
   return (
     <div className="mb-8">
-      <h2 className="text-lg font-medium text-p-text mb-3">Usage</h2>
-      <p className="text-sm text-p-text-secondary mb-4">
+      <h2 className={`${PAGE_TITLE} mb-3`}>Usage</h2>
+      <p className="text-sm text-secondary mb-4">
         Your subscription costs are measured at the equivalent API cost.
       </p>
 
       {/* Period summaries */}
-      <div className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface p-4 space-y-4 mb-4">
+      <div className={`${CARD} p-4 space-y-4 mb-4`}>
         {usage.monthly && (
           <div>
             <div className="flex items-baseline justify-between mb-1">
-              <span className="text-xs font-medium text-p-text-secondary uppercase tracking-wide">This Month · Platform API</span>
-              <span className="text-xs text-p-text-light">Own accounts: ${(usage.monthly.self_used ?? 0).toFixed(2)}</span>
+              <span className="text-xs font-medium text-secondary uppercase tracking-wide">This Month · Platform API</span>
+              <span className="text-xs text-tertiary">Own accounts: ${(usage.monthly.self_used ?? 0).toFixed(2)}</span>
             </div>
             <UsageBar period={usage.monthly} />
           </div>
@@ -142,14 +153,14 @@ export function UsageSection() {
         {usage.weekly && (
           <div>
             <div className="flex items-baseline justify-between mb-1">
-              <span className="text-xs font-medium text-p-text-secondary uppercase tracking-wide">This Week · Platform API</span>
-              <span className="text-xs text-p-text-light">Own accounts: ${(usage.weekly.self_used ?? 0).toFixed(2)}</span>
+              <span className="text-xs font-medium text-secondary uppercase tracking-wide">This Week · Platform API</span>
+              <span className="text-xs text-tertiary">Own accounts: ${(usage.weekly.self_used ?? 0).toFixed(2)}</span>
             </div>
             <UsageBar period={usage.weekly} />
           </div>
         )}
         {!usage.monthly && !usage.weekly && (
-          <div className="text-sm text-p-text-light">No usage data yet.</div>
+          <div className="text-sm text-tertiary">No usage data yet.</div>
         )}
       </div>
 
@@ -163,19 +174,19 @@ export function UsageSection() {
 
       {/* Daily chart */}
       {usage.daily_chart.length > 0 && (
-        <div className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface p-4 mb-4">
-          <div className="text-xs font-medium text-p-text-secondary uppercase tracking-wide mb-3">Daily Usage (30 days)</div>
+        <div className={`${CARD} p-4 mb-4`}>
+          <div className="text-xs font-medium text-secondary uppercase tracking-wide mb-3">Daily Usage, Last 30 Days</div>
           <div className="h-40">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={usage.daily_chart}>
-                <XAxis dataKey="date" tick={{ fontSize: 10 }} tickFormatter={(d: string) => d.slice(5)} />
-                <YAxis tick={{ fontSize: 10 }} tickFormatter={(v: number) => `$${v.toFixed(0)}`} width={35} />
+                <XAxis dataKey="date" stroke={chart.axis} tick={{ fontSize: 10, fill: chart.axis }} tickFormatter={(d: string) => d.slice(5)} />
+                <YAxis stroke={chart.axis} tick={{ fontSize: 10, fill: chart.axis }} tickFormatter={(v: number) => `$${v.toFixed(0)}`} width={35} />
                 <Tooltip
                   formatter={(value: number) => [`$${value.toFixed(4)}`, 'Cost']}
                   labelFormatter={(label: string) => label}
-                  contentStyle={{ fontSize: 12 }}
+                  {...tooltipProps(chart)}
                 />
-                <Bar dataKey="cost" fill="#146bb5" radius={[2, 2, 0, 0]} />
+                <Bar dataKey="cost" fill={chart.bar} radius={[2, 2, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -184,15 +195,15 @@ export function UsageSection() {
 
       {/* Agent breakdown */}
       {usage.agent_breakdown.length > 0 && (
-        <div className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface p-4">
-          <div className="text-xs font-medium text-p-text-secondary uppercase tracking-wide mb-3">By Agent (This Month)</div>
+        <div className={`${CARD} p-4`}>
+          <div className="text-xs font-medium text-secondary uppercase tracking-wide mb-3">By Agent, This Month</div>
           <div className="space-y-2">
             {usage.agent_breakdown.map(a => (
               <div key={a.agent} className="flex justify-between text-sm">
-                <span className="text-p-text">{a.agent}</span>
+                <span className="text-primary">{a.agent}</span>
                 <div className="flex gap-4">
-                  <span className="text-p-text-secondary">${a.cost.toFixed(2)}</span>
-                  <span className="text-p-text-light w-16 text-right">{a.messages} msgs</span>
+                  <span className="text-secondary">${a.cost.toFixed(2)}</span>
+                  <span className="text-tertiary w-16 text-right">{a.messages} msgs</span>
                 </div>
               </div>
             ))}

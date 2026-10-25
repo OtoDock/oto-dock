@@ -29,6 +29,13 @@ import {
 import { useAgentSkills, useSetAgentSkill } from '../api/mcps'
 import { useAuth } from '../contexts/AuthContext'
 import { isAdmin as isPlatformAdmin } from '../lib/permissions'
+import Dialog from './ui/Dialog'
+import Button from './ui/Button'
+import { Input, Select } from './ui/Field'
+import { BADGE_TONE, DIALOG_PANEL, FIELD, FIELD_BORDER, FIELD_REGULAR } from './ui/classes'
+
+// The small chips of a catalog card: a badge's tones at a dense size.
+const CHIP = 'inline-flex items-center rounded-chip px-1.5 py-0.5 text-3xs font-medium'
 
 interface Props {
   open: boolean
@@ -38,7 +45,7 @@ interface Props {
 }
 
 export default function CommunitySkillsBrowser({ open, onClose, agentSlug }: Props) {
-  const { data, isLoading, isError, error } = useCommunitySkills(open, agentSlug)
+  const { data, isLoading, isError } = useCommunitySkills(open, agentSlug)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<string>('all')
 
@@ -95,68 +102,69 @@ export default function CommunitySkillsBrowser({ open, onClose, agentSlug }: Pro
   if (!open) return null
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-8 pb-8" onClick={onClose}>
-      <div
-        className="bg-white dark:bg-gray-800 rounded-xl shadow-xl border border-p-border-light w-full max-w-6xl mx-4 max-h-[calc(100vh-4rem)] flex flex-col overflow-hidden"
-        onClick={e => e.stopPropagation()}
-      >
+    <Dialog
+      onClose={onClose}
+      placement="top"
+      aria-label="Browse Community Skills"
+      panelClassName={`${DIALOG_PANEL} max-w-6xl max-h-[calc(100vh-4rem)] flex flex-col overflow-hidden`}
+    >
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-p-border-light">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-subtle">
           <div>
-            <h3 className="text-base font-semibold text-p-text">Browse Community Skills</h3>
-            <p className="text-xs text-p-text-light mt-0.5">
+            <h3 className="text-base font-semibold text-primary">Browse Community Skills</h3>
+            <p className="text-xs text-tertiary mt-0.5">
               {agentSlug
                 ? `Showing skill packages available for ${agentSlug}.`
-                : 'Catalog of installable skill packages from the OtoDock community.'}
+                : 'Skill packages you can install, from the OtoDock community.'}
               {data?.fetched_from && !data?.catalog_unreachable && (
                 <>
-                  {' '}Catalog updated {data.updated_at ? new Date(data.updated_at).toLocaleString() : ''}.
+                  {' '}Community list updated {data.updated_at ? new Date(data.updated_at).toLocaleString() : ''}.
                 </>
               )}
             </p>
           </div>
-          <button onClick={onClose} className="text-p-text-light hover:text-p-text text-lg leading-none">&times;</button>
+          <button onClick={onClose} className="text-tertiary hover:text-primary text-lg leading-none">&times;</button>
         </div>
 
         {/* Filters */}
-        <div className="flex flex-wrap items-center gap-2 px-5 py-3 border-b border-p-border-light bg-gray-50/50 dark:bg-gray-900/30">
-          <input
+        <div className="flex flex-wrap items-center gap-2 px-5 py-3 border-b border-subtle">
+          <Input
             type="text"
             value={search}
             onChange={e => setSearch(e.target.value)}
             placeholder="Search by name, label, description, tag..."
-            className="flex-1 min-w-[200px] text-sm px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-gray-800 text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/50"
+            className="flex-1 min-w-[200px]"
           />
-          <select
+          <Select
             value={statusFilter}
             onChange={e => setStatusFilter(e.target.value)}
-            className="text-sm px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-gray-800 text-p-text"
+            className="sm:w-auto"
           >
             <option value="all">All statuses</option>
             <option value="installed">Installed</option>
             <option value="not_installed">Not installed</option>
             {agentSlug && <option value="enabled_here">Enabled for this agent</option>}
             {agentSlug && <option value="pending_request">Request pending</option>}
-          </select>
+          </Select>
         </div>
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto px-5 py-4">
           {isLoading && (
-            <div className="text-sm text-p-text-light">Loading catalog...</div>
+            <div className="text-sm text-tertiary">Loading the community list...</div>
           )}
           {isError && (
-            <div className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 p-3 text-sm text-red-700 dark:text-red-400">
-              Failed to load catalog: {(error as Error)?.message || 'unknown error'}
+            <div className="rounded-card border border-status-danger-border bg-status-danger-bg p-3 text-sm text-status-danger-fg">
+              Could not load the community list. Try again in a minute.
             </div>
           )}
           {data?.catalog_unreachable && (
-            <div className="mb-3 rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-3 text-sm text-amber-800 dark:text-amber-300">
-              Skills catalog unreachable — showing nothing; check network / try later.
+            <div className="mb-3 rounded-card border border-status-warning-border bg-status-warning-bg p-3 text-sm text-status-warning-fg">
+              Could not reach the community skills list. Check the network or try again later.
             </div>
           )}
           {data && !data.catalog_unreachable && filtered.length === 0 && (
-            <div className="text-sm text-p-text-light">No skill packages match the current filters.</div>
+            <div className="text-sm text-tertiary">No skill packages match the current filters.</div>
           )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
@@ -167,19 +175,15 @@ export default function CommunitySkillsBrowser({ open, onClose, agentSlug }: Pro
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-5 py-3 border-t border-p-border-light bg-gray-50/50 dark:bg-gray-900/30">
-          <p className="text-[11px] text-p-text-light">
+        <div className="flex items-center justify-between px-5 py-3 border-t border-subtle">
+          <p className="text-2xs text-tertiary">
             {data ? `${filtered.length} of ${data.skills.length} skill packages` : ''}
           </p>
-          <button
-            onClick={onClose}
-            className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors"
-          >
+          <Button onClick={onClose}>
             Close
-          </button>
+          </Button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }
 
@@ -210,11 +214,15 @@ function Card({ pkg, agentSlug, job }: { pkg: CommunitySkillEntry; agentSlug?: s
   const isAdmin = isPlatformAdmin(user)
   const showAdminInstall = !agentSlug
   const [error, setError] = useState<string | null>(null)
+  const clearError = () => {
+    setError(null)
+    setDismissedJob(job ?? null)
+  }
   const [enabling, setEnabling] = useState(false)
   const [showReasonModal, setShowReasonModal] = useState(false)
   const [reasonInput, setReasonInput] = useState('')
 
-  const pkgSkills = !!agentSlug
+  const pkgSkills = agentSlug
     ? (agentSkills.data ?? []).filter(s => s.mcp_name === pkg.name)
     : []
   // Manager can self-serve when the package is installed and visible to the
@@ -223,7 +231,7 @@ function Card({ pkg, agentSlug, job }: { pkg: CommunitySkillEntry; agentSlug?: s
   const canEnableDirectly = pkg.installed && pkgSkills.length > 0 && !enabledHere
 
   const handleInstall = () => {
-    setError(null)
+    clearError()
     // 202 semantics — the initial POST failing surfaces here; a background
     // failure surfaces via the polled job below.
     install.mutate(pkg.name, {
@@ -231,16 +239,19 @@ function Card({ pkg, agentSlug, job }: { pkg: CommunitySkillEntry; agentSlug?: s
     })
   }
 
-  useEffect(() => {
-    if (job?.status === 'failed' && job.error) setError(job.error)
-  }, [job?.status, job?.error])
+  // A background-install failure (from the poll) shows in the same inline
+  // banner the synchronous path uses, until the next install attempt
+  // dismisses that job.
+  const [dismissedJob, setDismissedJob] = useState<CatalogInstallJob | null>(null)
+  const jobError = job?.status === 'failed' && job.error && job !== dismissedJob ? job.error : null
+  const shownError = error ?? jobError
 
   // Direct enable (manager with visible installed package): PATCH-enable each
   // of the package's skills — the first PATCH auto-assigns the package
   // server-side. exclude_from is preserved as-is.
   const handleEnableDirectly = async () => {
     if (!agentSlug || pkgSkills.length === 0) return
-    setError(null)
+    clearError()
     setEnabling(true)
     try {
       for (const s of pkgSkills) {
@@ -259,7 +270,7 @@ function Card({ pkg, agentSlug, job }: { pkg: CommunitySkillEntry; agentSlug?: s
   }
 
   const openRequestModal = () => {
-    setError(null)
+    clearError()
     setReasonInput('')
     setShowReasonModal(true)
   }
@@ -277,7 +288,7 @@ function Card({ pkg, agentSlug, job }: { pkg: CommunitySkillEntry; agentSlug?: s
   // Admin one-click path: same endpoint, no reason — the backend
   // auto-approves (install + enable cascade) synchronously.
   const submitAdminDirect = () => {
-    setError(null)
+    clearError()
     createRequest.mutate(
       { mcp_name: pkg.name, reason: '', kind: 'skill' },
       {
@@ -288,20 +299,20 @@ function Card({ pkg, agentSlug, job }: { pkg: CommunitySkillEntry; agentSlug?: s
 
   const handleCancel = () => {
     if (!pkg.pending_request) return
-    setError(null)
+    clearError()
     cancelRequest.mutate(pkg.pending_request, {
       onError: e => setError((e as Error)?.message || 'Cancel failed'),
     })
   }
 
   return (
-    <div className="rounded-lg border border-p-border-light bg-white dark:bg-p-surface p-3 flex flex-col gap-2">
+    <div className="rounded-card border border-subtle p-3 flex flex-col gap-2">
       <div className="flex items-start gap-2">
         <Icon pkg={pkg} />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5 flex-wrap">
-            <h4 className="text-sm font-medium text-p-text truncate">{pkg.label}</h4>
-            <span className="text-[10px] text-p-text-light">
+            <h4 className="text-sm font-medium text-primary truncate">{pkg.label}</h4>
+            <span className="text-3xs text-tertiary">
               {pkg.installed_version || pkg.version ? `v${pkg.installed_version || pkg.version}` : 'latest'}
             </span>
             {pkg.author && (
@@ -310,39 +321,39 @@ function Card({ pkg, agentSlug, job }: { pkg: CommunitySkillEntry; agentSlug?: s
                 target="_blank"
                 rel="noreferrer"
                 onClick={e => { if (!safeHref(pkg.author_url)) e.preventDefault() }}
-                className="text-[10px] px-1.5 py-0.5 rounded-sm bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-800 hover:underline"
-                title={`Curated from ${pkg.author}'s official skills repository${pkg.license ? ` — ${pkg.license}` : ''}`}
+                className={`${CHIP} ${BADGE_TONE.neutral} hover:underline`}
+                title={`Curated from ${pkg.author}'s official skills repository.${pkg.license ? ` License: ${pkg.license}.` : ''}`}
               >
                 by {pkg.author}
               </a>
             )}
             {pkg.has_scripts && (
               <span
-                className="text-[10px] px-1.5 py-0.5 rounded-sm bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
+                className={`${CHIP} ${BADGE_TONE.warning}`}
                 title="This package bundles executable helper scripts the agent can run"
               >
-                bundles scripts
+                Bundles scripts
               </span>
             )}
             {pkg.deprecated && (
-              <span className="text-[10px] px-1 py-0.5 rounded-sm bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400">
+              <span className={`${CHIP} ${BADGE_TONE.danger}`}>
                 deprecated
               </span>
             )}
           </div>
-          <p className="text-xs text-p-text-light line-clamp-2 mt-0.5">{pkg.description}</p>
+          <p className="text-xs text-tertiary line-clamp-2 mt-0.5">{pkg.description}</p>
         </div>
       </div>
 
       <div className="flex items-center flex-wrap gap-1">
         {(pkg.tags ?? []).slice(0, 3).map(tag => (
-          <span key={tag} className="text-[10px] px-1.5 py-0.5 rounded-sm bg-gray-100 dark:bg-gray-800 text-p-text-light">
+          <span key={tag} className={`${CHIP} ${BADGE_TONE.neutral}`}>
             {tag}
           </span>
         ))}
       </div>
 
-      <div className="mt-auto pt-2 border-t border-p-border-light flex items-center justify-between gap-2">
+      <div className="mt-auto pt-2 border-t border-subtle flex items-center justify-between gap-2">
         <StatusPill
           pkg={pkg}
           enabledHere={enabledHere}
@@ -352,95 +363,94 @@ function Card({ pkg, agentSlug, job }: { pkg: CommunitySkillEntry; agentSlug?: s
         />
         <div className="flex items-center gap-1.5">
           {showAdminInstall && !installing && !pkg.installed && (
-            <button
-              onClick={handleInstall}
-              className="text-xs px-2 py-1 rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
-            >
+            <Button variant="primary" size="xs" onClick={handleInstall}>
               Install
-            </button>
+            </Button>
           )}
           {showAdminInstall && !installing && pkg.update_available && (
-            <button
-              onClick={handleInstall}
-              className="text-xs px-2 py-1 rounded-sm border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 disabled:opacity-40 transition-colors"
-            >
+            <Button variant="secondary" size="xs" onClick={handleInstall}>
               Update
-            </button>
+            </Button>
           )}
           {!showAdminInstall && !enabledHere && !pkg.pending_request && authLoading && (
-            <span className="text-[10px] text-p-text-light italic">Loading…</span>
+            <span className="text-3xs text-tertiary italic">Loading…</span>
           )}
           {!showAdminInstall && !enabledHere && !pkg.pending_request && !authLoading && canEnableDirectly && (
-            <button
+            <Button
+              variant="primary"
+              size="xs"
               onClick={handleEnableDirectly}
               disabled={enabling}
-              className="text-xs px-2 py-1 rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
-              title="Package is installed and available — enables its skills directly, then fine-tune them on the Skills tab"
+              title="This package is installed and available. Enabling turns on its skills. Fine-tune them on the Skills page."
             >
               {enabling ? 'Enabling...' : 'Enable'}
-            </button>
+            </Button>
           )}
           {!showAdminInstall && needsReinstall && isAdmin && !installing && (
-            <button
+            <Button
+              variant="primary"
+              size="xs"
               onClick={handleInstall}
-              className="text-xs px-2 py-1 rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
-              title="The package files are missing from the platform — reinstalls from the catalog; agent enablement is preserved"
+              title="The package files are missing. This reinstalls them from the community list. Agents that use it stay enabled."
             >
               Reinstall
-            </button>
+            </Button>
           )}
           {!showAdminInstall && needsReinstall && !isAdmin && !authLoading && !pkg.pending_request && (
-            <button
+            <Button
+              variant="primary"
+              size="xs"
               onClick={openRequestModal}
               disabled={createRequest.isPending}
-              className="text-xs px-2 py-1 rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
-              title="The package files are missing from the platform — asks an admin to reinstall"
+              title="The package files are missing. This asks an admin to reinstall them."
             >
               {createRequest.isPending ? 'Requesting...' : 'Request reinstall'}
-            </button>
+            </Button>
           )}
           {!showAdminInstall && !enabledHere && !pkg.pending_request && !authLoading && !canEnableDirectly && isAdmin && (
-            <button
+            <Button
+              variant="primary"
+              size="xs"
               onClick={submitAdminDirect}
               disabled={createRequest.isPending || agentSkills.isLoading}
-              className="text-xs px-2 py-1 rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
               title={pkg.installed
                 ? 'Enables this skill package for the agent in one step'
                 : 'Installs the skill package and enables it for this agent in one step'}
             >
               {createRequest.isPending ? (pkg.installed ? 'Enabling...' : 'Installing...') : (pkg.installed ? 'Enable' : 'Install')}
-            </button>
+            </Button>
           )}
           {!showAdminInstall && !enabledHere && !pkg.pending_request && !authLoading && !canEnableDirectly && !isAdmin && (
-            <button
+            <Button
+              variant="primary"
+              size="xs"
               onClick={openRequestModal}
               disabled={createRequest.isPending || agentSkills.isLoading}
-              className="text-xs px-2 py-1 rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
               title={pkg.installed
                 ? 'Requires admin to authorize this agent'
                 : 'Requires admin to install the skill package on the platform first'}
             >
               {createRequest.isPending ? 'Requesting...' : 'Request'}
-            </button>
+            </Button>
           )}
           {!showAdminInstall && pkg.pending_request && (
-            <button
+            <Button
+              size="xs"
               onClick={handleCancel}
               disabled={cancelRequest.isPending}
-              className="text-xs px-2 py-1 rounded-sm border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-40 transition-colors"
               title="Cancel pending request"
             >
               {cancelRequest.isPending ? 'Cancelling...' : 'Cancel request'}
-            </button>
+            </Button>
           )}
         </div>
       </div>
 
       {showAdminInstall && installing && <CatalogInstallBar job={job} />}
 
-      {error && (
-        <div className="rounded-sm border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-2 py-1.5">
-          <p className="text-[11px] text-red-700 dark:text-red-400 whitespace-pre-wrap">{error}</p>
+      {shownError && (
+        <div className="rounded-card border border-status-danger-border bg-status-danger-bg px-2 py-1.5">
+          <p className="text-2xs text-status-danger-fg whitespace-pre-wrap">{shownError}</p>
         </div>
       )}
 
@@ -469,13 +479,13 @@ function CatalogInstallBar({ job }: { job?: CatalogInstallJob }) {
   const message = job?.message || 'Starting…'
   const indeterminate = job?.phase === 'image'
   return (
-    <div className="mt-2 flex flex-col gap-1 text-[11px] text-p-text-light">
-      <div className="h-1 w-full bg-p-text-light/10 rounded-sm overflow-hidden">
+    <div className="mt-2 flex flex-col gap-1 text-2xs text-tertiary">
+      <div className="h-1 w-full bg-surface-muted rounded-full overflow-hidden">
         {indeterminate ? (
-          <div className="h-full w-full bg-p-text-light/60 animate-pulse" />
+          <div className="h-full w-full bg-status-info-solid animate-pulse" />
         ) : (
           <div
-            className="h-full bg-p-text-light/60 transition-[width] duration-300 ease-out"
+            className="h-full bg-status-info-solid transition-[width] duration-300 ease-out"
             style={{ width: `${pct}%` }}
           />
         )}
@@ -505,53 +515,45 @@ function RequestReasonModal({
   submitting: boolean
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
-      <div
-        className="bg-white dark:bg-gray-800 rounded-xl shadow-xl border border-p-border-light w-full max-w-md mx-4"
-        onClick={e => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-p-border-light">
-          <h3 className="text-base font-semibold text-p-text">
+    <Dialog
+      onClose={onClose}
+      busy={submitting}
+      aria-label="Request"
+      panelClassName={`${DIALOG_PANEL} max-w-md`}
+    >
+        <div className="flex items-center justify-between px-5 py-4 border-b border-subtle">
+          <h3 className="text-base font-semibold text-primary">
             Request <span className="font-mono">{skillLabel}</span>
           </h3>
-          <button onClick={onClose} className="text-p-text-light hover:text-p-text text-lg leading-none">&times;</button>
+          <button onClick={onClose} className="text-tertiary hover:text-primary text-lg leading-none">&times;</button>
         </div>
         <div className="p-5 space-y-3">
-          <p className="text-xs text-p-text-secondary">
-            For agent <span className="font-mono">{agentSlug}</span>. The admin will see your reason on the request — helps them prioritise.
+          <p className="text-xs text-secondary">
+            For agent <span className="font-mono">{agentSlug}</span>. The admin sees your reason on the request. It helps them prioritise.
           </p>
           <label className="block">
-            <span className="text-xs text-p-text-secondary">
-              Reason <span className="text-p-text-light">(optional)</span>
+            <span className="text-xs text-secondary">
+              Reason<span className="text-tertiary">, optional</span>
             </span>
             <textarea
               value={reason}
               onChange={e => onChangeReason(e.target.value)}
               rows={3}
               maxLength={500}
-              className="mt-1 w-full text-sm px-3 py-2 rounded-lg border border-p-border-light bg-white dark:bg-gray-900 text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/50"
-              placeholder="e.g. need PDF form-filling for the tax workflow"
+              className={`${FIELD} ${FIELD_REGULAR} ${FIELD_BORDER} mt-1`}
+              placeholder="Need PDF form-filling for the tax workflow"
             />
           </label>
         </div>
-        <div className="flex justify-end gap-2 px-5 py-3 border-t border-p-border-light bg-gray-50/50 dark:bg-gray-900/30">
-          <button
-            onClick={onClose}
-            disabled={submitting}
-            className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors disabled:opacity-40"
-          >
+        <div className="flex justify-end gap-2 px-5 py-3 border-t border-subtle">
+          <Button onClick={onClose} disabled={submitting}>
             Cancel
-          </button>
-          <button
-            onClick={onSubmit}
-            disabled={submitting}
-            className="px-3 py-1.5 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors disabled:opacity-40"
-          >
+          </Button>
+          <Button variant="primary" onClick={onSubmit} disabled={submitting}>
             {submitting ? 'Submitting...' : 'Submit request'}
-          </button>
+          </Button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }
 
@@ -570,28 +572,28 @@ function StatusPill({
 }) {
   if (agentScoped) {
     if (needsReinstall) {
-      return <Pill tone="amber">Enabled — package files missing, reinstall needed</Pill>
+      return <Pill tone="warning">Enabled: package files missing, reinstall needed</Pill>
     }
     if (enabledHere) {
-      return <Pill tone="green">Enabled for this agent</Pill>
+      return <Pill tone="success">Enabled for this agent</Pill>
     }
     if (pkg.pending_request) {
-      return <Pill tone="amber">Request pending admin approval</Pill>
+      return <Pill tone="warning">Request pending admin approval</Pill>
     }
     if (canEnableDirectly) {
-      return <Pill tone="green">Available — click Enable</Pill>
+      return <Pill tone="success">Available: click Enable</Pill>
     }
     if (pkg.installed) {
-      return <Pill tone="amber">Installed — needs admin authorization</Pill>
+      return <Pill tone="warning">Installed: needs admin authorization</Pill>
     }
-    return <Pill tone="gray">Not installed</Pill>
+    return <Pill tone="neutral">Not installed</Pill>
   }
   // Admin (global) context.
   if (pkg.update_available) {
     return (
-      <Pill tone="amber">
+      <Pill tone="warning">
         {pkg.version
-          ? `Update available (${pkg.installed_version} → ${pkg.version})`
+          ? `Update available: ${pkg.installed_version} → ${pkg.version}`
           : 'Update available'}
       </Pill>
     )
@@ -599,21 +601,16 @@ function StatusPill({
   if (pkg.installed) {
     const n = pkg.enabled_for_agents.length
     const reqLabel = pkg.pending_request_count > 0 ? ` · ${pkg.pending_request_count} pending` : ''
-    return <Pill tone="green">{n > 0 ? `Installed · enabled on ${n} agent${n === 1 ? '' : 's'}${reqLabel}` : `Installed${reqLabel}`}</Pill>
+    return <Pill tone="success">{n > 0 ? `Installed · enabled on ${n} agent${n === 1 ? '' : 's'}${reqLabel}` : `Installed${reqLabel}`}</Pill>
   }
   if (pkg.pending_request_count > 0) {
-    return <Pill tone="amber">Not installed · {pkg.pending_request_count} pending request{pkg.pending_request_count === 1 ? '' : 's'}</Pill>
+    return <Pill tone="warning">Not installed · {pkg.pending_request_count} pending request{pkg.pending_request_count === 1 ? '' : 's'}</Pill>
   }
-  return <Pill tone="gray">Not installed</Pill>
+  return <Pill tone="neutral">Not installed</Pill>
 }
 
-function Pill({ tone, children }: { tone: 'green' | 'amber' | 'gray'; children: React.ReactNode }) {
-  const classes = {
-    green: 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400',
-    amber: 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400',
-    gray: 'bg-gray-100 dark:bg-gray-800 text-p-text-light',
-  }[tone]
-  return <span className={`text-[10px] px-1.5 py-0.5 rounded-sm ${classes}`}>{children}</span>
+function Pill({ tone, children }: { tone: 'success' | 'warning' | 'neutral'; children: React.ReactNode }) {
+  return <span className={`${CHIP} ${BADGE_TONE[tone]}`}>{children}</span>
 }
 
 // ---------------------------------------------------------------------------
@@ -623,7 +620,7 @@ function Pill({ tone, children }: { tone: 'green' | 'amber' | 'gray'; children: 
 function Icon({ pkg }: { pkg: CommunitySkillEntry }) {
   const letter = (pkg.label || pkg.name).charAt(0).toUpperCase()
   return (
-    <div className="w-8 h-8 rounded-md bg-brand/15 text-brand flex items-center justify-center shrink-0 font-semibold text-sm">
+    <div className="w-8 h-8 rounded-control bg-surface-muted text-secondary flex items-center justify-center shrink-0 font-semibold text-sm">
       {letter}
     </div>
   )

@@ -11,18 +11,23 @@
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import pytest
 
 from auth.path_policy import SecurityContext
 from core.layers.providers.base import (
-    ProviderAdapter, ProviderStreamEvent, ProviderUsage,
+    ProviderAdapter,
+    ProviderStreamEvent,
+    ProviderUsage,
 )
 from core.layers.providers.registry import register_adapter
 from core.sandbox.sandbox import SandboxConfig
 from core.session.session_state import (
-    get_permission_queue, resolve_permission, set_session_mode, set_session_security,
+    get_permission_queue,
+    resolve_permission,
+    set_session_mode,
+    set_session_security,
 )
 
 _STUB_PROVIDER = "stub-builtins-test"
@@ -423,6 +428,73 @@ def test_the_anthropic_adapter_puts_the_pictures_inside_the_tool_result():
 def test_the_openai_family_shows_no_pictures_in_tool_results():
     from core.layers.providers.openai_adapter import OpenAIAdapter
     from core.layers.providers.openai_compat_adapter import (
-        GroqAdapter, OllamaAdapter, OpenAICompatibleAdapter)
+        GroqAdapter,
+        OllamaAdapter,
+        OpenAICompatibleAdapter,
+    )
     for cls in (OpenAIAdapter, GroqAdapter, OllamaAdapter, OpenAICompatibleAdapter):
         assert cls.tool_result_images is False
+
+
+@pytest.mark.asyncio
+async def test_the_doors_fail_closed_without_an_authority(monkeypatch):
+    """Core reaches the permission authority through the door
+    ``api.hooks.permission`` installs when imported; with none installed a
+    tool call is denied and a question answered with nothing."""
+    from core.session import session_events
+    monkeypatch.setattr(session_events, "_permission_authority", None)
+    verdict = await session_events.pre_tool("s-none", "Bash", {"command": "ls"})
+    assert verdict["decision"] == "deny"
+    assert await session_events.ask_question("s-none", [{"id": "q"}]) == {}
+
+
+def test_importing_the_app_installs_the_authority(tmp_path):
+    """The suite's conftest imports ``api.hooks.permission`` itself, so the
+    door's production wiring is checked in a fresh interpreter: importing
+    ``app`` installs the authority. Without it every tool call is denied."""
+    import os
+    import subprocess
+    import sys
+
+    from tests._paths import PROXY_DIR
+    script = (
+        "import logging, os\n"
+        # A handler on the root keeps the app's log file out of the checkout.
+        "logging.getLogger().addHandler(logging.NullHandler())\n"
+        "import app\n"
+        "from core.session import session_events\n"
+        "print('installed' if session_events._permission_authority else 'missing', flush=True)\n"
+        # The import opened a database pool, whose close would hold the exit.
+        "os._exit(0)\n"
+    )
+    env = {**os.environ, "PLATFORM_CONFIG_DIR": str(tmp_path),
+           "PLATFORM_DATA_DIR": str(tmp_path / "data")}
+    out = subprocess.run([sys.executable, "-c", script], cwd=str(PROXY_DIR), env=env,
+                         capture_output=True, text=True, timeout=120)
+    assert out.stdout.strip() == "installed", out.stderr[-2000:]
+
+
+@pytest.mark.asyncio
+async def test_a_patch_of_the_authority_reaches_both_doors(monkeypatch):
+    """The installed doors look the authority's functions up at call time,
+    as the call-time import did, so a patch on the module reaches them."""
+    from api.hooks import permission
+    from core.session import session_events
+    seen = []
+
+    async def decide(session_id, tool_name, tool_input=None, live_permission_mode="", **kw):
+        seen.append(("decide", session_id, tool_name, tool_input, live_permission_mode))
+        return {"decision": "allow"}
+
+    async def ask(session_id, questions, timeout=0.0, *, tool_name=""):
+        seen.append(("ask", session_id, questions, tool_name))
+        return {"q": {"answers": ["yes"]}}
+
+    monkeypatch.setattr(permission, "decide_tool_permission", decide)
+    monkeypatch.setattr(permission, "ask_user_question", ask)
+    assert await session_events.pre_tool(
+        "s1", "Write", {"a": 1}, live_permission_mode="plan") == {"decision": "allow"}
+    assert await session_events.ask_question(
+        "s1", [{"id": "q"}], tool_name="request_user_input") == {"q": {"answers": ["yes"]}}
+    assert seen == [("decide", "s1", "Write", {"a": 1}, "plan"),
+                    ("ask", "s1", [{"id": "q"}], "request_user_input")]

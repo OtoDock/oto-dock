@@ -59,6 +59,47 @@ async def test_manager_hands_the_timeout_to_every_connection(monkeypatch, tmp_pa
     assert seen == [("local", 60)]  # http skipped, default cap
 
 
+def test_the_audience_gate_reads_the_sessions_context():
+    """The role and the scope the Direct manager's build judges a manifest's
+    audience with: the context's effective role and mount scope; an external
+    caller's session is never the agent acting as itself; no context names
+    no person."""
+    from types import SimpleNamespace
+
+    from core.layers.direct.layer import audience_gate
+    assert audience_gate(None, external=False) == ("", "user")
+    assert audience_gate(SimpleNamespace(role="viewer", session_scope="user"), external=False) == ("viewer", "user")
+    shared = SimpleNamespace(role="viewer", session_scope="agent")
+    assert audience_gate(shared, external=False) == ("viewer", "agent")
+    assert audience_gate(shared, external=True) == ("viewer", "user")
+
+
+@pytest.mark.asyncio
+async def test_create_direct_session_hands_the_gate_to_the_pool(monkeypatch):
+    from core.layers.direct import session as sess
+    seen: dict = {}
+
+    class _Mgr:
+        servers: dict = {}
+
+        def get_tools(self):
+            return []
+
+    async def fake_get_or_create(session_id, agent_name, **kw):
+        seen.update(kw)
+        return _Mgr()
+
+    monkeypatch.setattr(sess.mcp_pool, "get_or_create", fake_get_or_create)
+    try:
+        s = await sess.create_direct_session(
+            "s-gate", "ag", system_prompt="P", user_role="viewer", scope="user",
+        )
+        assert s.session_id == "s-gate"
+        assert seen["user_role"] == "viewer" and seen["scope"] == "user"
+    finally:
+        sess._direct_sessions.pop("s-gate", None)
+
+
 @pytest.mark.asyncio
 async def test_pool_passes_the_policy_to_a_new_manager(monkeypatch):
     created: list = []

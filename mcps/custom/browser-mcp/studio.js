@@ -1433,11 +1433,13 @@ const TOOL_DEFS = [
         crf: { type: "number", description: "x264 CRF (default 18 — intermediate quality for editing)" },
       },
     },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
   {
     name: "studio_stop",
     description: "Stop the capture studio: finalize any recording, close Chrome and the display, release the audio sink.",
     inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   },
   {
     name: "studio_goto",
@@ -1450,6 +1452,7 @@ const TOOL_DEFS = [
       },
       required: ["url"],
     },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
   {
     name: "studio_record_start",
@@ -1463,16 +1466,19 @@ const TOOL_DEFS = [
       },
       required: ["take_name"],
     },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   },
   {
     name: "studio_record_stop",
     description: "Finalize the current recording and report its probed duration/streams.",
     inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   },
   {
     name: "studio_glide",
     description: "Glide the pointer to a target like a human: gently curved path, minimum-jerk pacing, DPR-correct even under zoom.",
     inputSchema: { type: "object", properties: { ...TARGET_PROPS } },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
   {
     name: "studio_click",
@@ -1481,6 +1487,7 @@ const TOOL_DEFS = [
       type: "object",
       properties: { ...TARGET_PROPS, button: { type: "string", enum: ["left", "middle", "right"], description: "default left" } },
     },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
   {
     name: "studio_type",
@@ -1493,11 +1500,13 @@ const TOOL_DEFS = [
       },
       required: ["text"],
     },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
   {
     name: "studio_press",
     description: "Press a key or chord in the page (Playwright names: Enter, Tab, Control+a…).",
     inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
   {
     name: "studio_scroll",
@@ -1511,16 +1520,19 @@ const TOOL_DEFS = [
       },
       required: ["dy"],
     },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
   {
     name: "studio_set_zoom",
     description: "Set the browser UI zoom with REAL Ctrl+=/Ctrl+- keypresses (the only correct path — device-scale flags and CDP metrics emulation are known traps). Snaps to Chrome's zoom ladder (…90, 100, 110, 125, 150…). Zoom persists per-origin: navigate first.",
     inputSchema: { type: "object", properties: { percent: { type: "number" } }, required: ["percent"] },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   },
   {
     name: "studio_screenshot",
     description: "Save a true recorded frame (x11grab — exactly what a take would capture, cursor included for xtest) to the takes dir for QC.",
     inputSchema: { type: "object", properties: { name: { type: "string", description: "file name (png)" } } },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   },
   {
     name: "studio_wait_text",
@@ -1530,6 +1542,7 @@ const TOOL_DEFS = [
       properties: { text: { type: "string" }, timeout_s: { type: "number", description: "default 15" } },
       required: ["text"],
     },
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   {
     name: "studio_wait_text_gone",
@@ -1539,16 +1552,19 @@ const TOOL_DEFS = [
       properties: { text: { type: "string" }, timeout_s: { type: "number", description: "default 15" } },
       required: ["text"],
     },
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   {
     name: "studio_eval",
     description: "Evaluate a JS expression in the studio page (staging escape hatch: localStorage themes, feature flags, seeding state). Returns the JSON value.",
     inputSchema: { type: "object", properties: { expression: { type: "string" } }, required: ["expression"] },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
   {
     name: "studio_status",
     description: "Report the studio state: display, geometry, Chrome, page URL, zoom/DPR, recording, audio sink, and whether the film rig is busy.",
     inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true, openWorldHint: false },
   },
 ];
 

@@ -12,13 +12,13 @@ keep that id as a fixture; the registry retired it onto Haiku 5.5).
 import sys
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
 import config
 from storage.agents import agent_store
 from storage.billing import subscription_store
-
 
 # Direct LLM's rows as the store returns them (tier is on the row since the
 # builtin sync writes it; a custom row may have none).

@@ -10,7 +10,6 @@ this package without the platform.
 import asyncio
 import logging
 
-
 import config
 
 logger = logging.getLogger("otodock.scheduler")
@@ -77,19 +76,19 @@ async def _run_interactive_task(
         try:
             await asyncio.wait_for(done.wait(), timeout=_STEP)
             return  # turn completed (on_turn_complete fired)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             if not isess.alive:
                 raise _InteractiveSessionDied(
                     "Interactive task session ended before completing "
                     "(the CLI exited or was reaped)",
                     had_viewer=isess.had_viewer,
-                )
+                ) from exc
             waited += _STEP
             if waited >= INTERACTIVE_TASK_MAX_S:
                 raise RuntimeError(
                     f"Interactive task did not complete within "
                     f"{int(INTERACTIVE_TASK_MAX_S)}s (no turn-end signal)"
-                )
+                ) from exc
 
 
 # Per-chat terminal holds: the rounds that drive a chat's interactive
@@ -107,7 +106,7 @@ class TerminalHold:
 
     def __init__(self, chat_id: str, lock: asyncio.Lock) -> None:
         self.chat_id = chat_id
-        self._lock = lock
+        self._lock: asyncio.Lock | None = lock
 
     def release(self) -> None:
         lock, self._lock = self._lock, None
@@ -123,8 +122,9 @@ async def hold_terminal(chat_id: str) -> TerminalHold:
         await asyncio.wait_for(lock.acquire(), timeout=_TERMINAL_HOLD_CEILING_S)
     except asyncio.TimeoutError:
         logger.warning(
-            f"Terminal hold ceiling reached for chat {chat_id[:8]} "
-            f"({int(_TERMINAL_HOLD_CEILING_S)}s) — proceeding"
+            "Terminal hold ceiling reached for chat %s "
+            "(%ss) — proceeding",
+            chat_id[:8], int(_TERMINAL_HOLD_CEILING_S)
         )
         return TerminalHold(chat_id, asyncio.Lock())
     return TerminalHold(chat_id, lock)
@@ -176,18 +176,18 @@ async def _run_borrowed_terminal_turn(isess, prompt: str) -> None:
             try:
                 await asyncio.wait_for(done.wait(), timeout=_STEP)
                 return
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as exc:
                 if not isess.alive:
                     raise _InteractiveSessionDied(
                         "the terminal closed before the follow-up's turn ended",
                         had_viewer=isess.had_viewer,
-                    )
+                    ) from exc
                 waited += _STEP
                 if waited >= INTERACTIVE_TASK_MAX_S:
                     raise RuntimeError(
                         f"The follow-up's turn did not end within "
                         f"{int(INTERACTIVE_TASK_MAX_S)}s (no turn-end signal)"
-                    )
+                    ) from exc
     finally:
         if not injected.is_set():
             isess.cancel_prompt(item)

@@ -1,113 +1,98 @@
-import { lazy, Suspense } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { lazy, useEffect } from 'react'
+import { Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { useFlag } from '../hooks/useFlag'
 import { AudioPrefsSection } from '../components/audio/AudioPrefsSection'
-import { ScrollableTabs } from '../components/ScrollableTabs'
+import SettingsShell from '../components/settings/SettingsShell'
+import {
+  USER_SETTINGS_BASE, userSections, userSettingsPath, userSettingsTabTarget,
+} from '../components/settings/sections'
 import { ProfileSection, SecuritySection, AppearanceSection, MyMemorySection, WakeWordSection, NotificationsSection, AppsSection } from './UserSettings.general'
 import { IntegrationsTab } from './UserSettings.integrations'
 import { MyMachinesSection } from './UserSettings.machines'
 import { ExecutionLayersSection } from './UserSettings.aiEngines'
 
-// The usage tab carries the charts library; it loads when the tab opens.
+// The usage section carries the charts library; it loads when it opens.
 const UsageSection = lazy(() =>
   import('./UserSettings.usage').then(m => ({ default: m.UsageSection })))
 
-// ---------------------------------------------------------------------------
-// Main page with tabs (mirrors the admin Setup page layout)
-// ---------------------------------------------------------------------------
-
-type SettingsTab = 'general' | 'integrations' | 'remote-machines' | 'ai-engines' | 'audio' | 'usage'
-
-const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
-  { id: 'general', label: 'General' },
-  { id: 'integrations', label: 'Integrations' },
-  { id: 'remote-machines', label: 'Remote Machines' },
-  { id: 'ai-engines', label: 'AI Engines' },
-  { id: 'audio', label: 'Audio' },
-  { id: 'usage', label: 'Usage' },
-]
-
+/**
+ * The user settings area: the shell with the person's sections. An older
+ * `/user-settings?tab=<id>` link is sent to the section's own path with
+ * every other query parameter kept, before anything paints.
+ */
 export default function UserSettings() {
   const { user } = useAuth()
+  const location = useLocation()
   const navigate = useNavigate()
-  const [searchParams, setSearchParams] = useSearchParams()
-  // Hide the whole Remote Machines tab when this build ships without the
-  // feature (feature_flags.remote_machines_available === false). The
-  // admin-disabled case (allow_user_paired_machines) keeps the tab and
-  // shows its "disabled by admin" message instead.
   const remoteMachinesAvailable = useFlag('remote_machines_available')
-  const settingsTabs = remoteMachinesAvailable
-    ? SETTINGS_TABS
-    : SETTINGS_TABS.filter(t => t.id !== 'remote-machines')
+  const redirecting = location.pathname === USER_SETTINGS_BASE && new URLSearchParams(location.search).has('tab')
 
-  const isLocal = user?.auth_provider?.startsWith('local')
+  useEffect(() => {
+    if (redirecting) navigate(userSettingsTabTarget(location.search), { replace: true })
+  }, [redirecting, location.search, navigate])
 
-  // Tab is driven by the ?tab= query param so it's shareable and deep-linkable
-  // (e.g. the service-account "connect new" flow lands on Integrations).
-  const tabParam = searchParams.get('tab')
-  const tab: SettingsTab = settingsTabs.some(t => t.id === tabParam)
-    ? (tabParam as SettingsTab)
-    : 'general'
-  const setTab = (id: SettingsTab) =>
-    setSearchParams(prev => {
-      const next = new URLSearchParams(prev)
-      next.set('tab', id)
-      return next
-    }, { replace: true })
+  if (redirecting) return null
 
   return (
-    <div className="min-h-screen bg-p-bg">
-      <div className="max-w-2xl mx-auto px-4 py-8">
-        <div className="flex items-center gap-3 mb-6">
-          <button
-            onClick={() => navigate(-1)}
-            className="p-2 rounded-lg hover:bg-p-surface text-p-text-secondary"
-          >
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-            </svg>
-          </button>
-          <div className="min-w-0">
-            <h1 className="text-xl font-medium text-p-text truncate">
-              {user?.display_name || user?.name || 'Settings'}
-            </h1>
-            <p className="text-sm text-p-text-secondary truncate">
-              {user?.name}{user?.email ? ` \u00b7 ${user.email}` : ''}
-            </p>
-          </div>
-        </div>
-
-        {/* Horizontally scrollable tab bar — scales to any width / tab count. */}
-        <div className="mb-6">
-          <ScrollableTabs tabs={settingsTabs} active={tab} onChange={setTab} />
-        </div>
-
-        {/* Tab content */}
-        {tab === 'general' && (
-          <>
-            <ProfileSection />
-            {/* Security — only for local auth users (SSO providers manage it) */}
-            {isLocal && <SecuritySection />}
-            <AppearanceSection />
-            <NotificationsSection />
-            <AppsSection />
-            <WakeWordSection />
-            <MyMemorySection />
-          </>
-        )}
-        {tab === 'integrations' && <IntegrationsTab />}
-        {/* Render for every authenticated user — viewers can pair
-            their own laptop too; they own the hardware. */}
-        {tab === 'remote-machines' && user && <MyMachinesSection />}
-        {tab === 'ai-engines' && <ExecutionLayersSection />}
-        {tab === 'audio' && <AudioPrefsSection />}
-        {tab === 'usage' && (
-          <Suspense fallback={<div className="min-h-[40vh]" />}>
-            <UsageSection />
-          </Suspense>
-        )}
-      </div>
-    </div>
+    <SettingsShell
+      base={USER_SETTINGS_BASE}
+      title={user?.display_name || user?.name || 'Settings'}
+      subtitle="User Settings"
+      sections={userSections({ remoteMachinesAvailable })}
+      readingWidth
+    />
   )
+}
+
+export function GeneralSection() {
+  const { user } = useAuth()
+  const isLocal = user?.auth_provider?.startsWith('local')
+  return (
+    <>
+      <ProfileSection />
+      {/* Security — only for local auth users (SSO providers manage it) */}
+      {isLocal && <SecuritySection />}
+      <AppearanceSection />
+      <NotificationsSection />
+      <AppsSection />
+      <WakeWordSection />
+      <MyMemorySection />
+    </>
+  )
+}
+
+export function IntegrationsSection() {
+  return <IntegrationsTab />
+}
+
+/** Every authenticated person pairs their own laptop, viewers included; the
+ *  section exists only in a build that ships the feature. The admin's
+ *  switch (allow_user_paired_machines) keeps the section and it says so. */
+export function RemoteMachinesSection() {
+  const { user } = useAuth()
+  const location = useLocation()
+  const remoteMachinesAvailable = useFlag('remote_machines_available')
+  if (!remoteMachinesAvailable) {
+    return <Navigate to={`${userSettingsPath('general')}${location.search}`} replace />
+  }
+  return user ? <MyMachinesSection /> : null
+}
+
+export function AiEnginesSection() {
+  return <ExecutionLayersSection />
+}
+
+export function AudioSection() {
+  return <AudioPrefsSection />
+}
+
+export function UsageRoute() {
+  return <UsageSection />
+}
+
+/** A section no row names opens General, the query kept. */
+export function UnknownSection() {
+  const location = useLocation()
+  return <Navigate to={`${userSettingsPath('general')}${location.search}`} replace />
 }

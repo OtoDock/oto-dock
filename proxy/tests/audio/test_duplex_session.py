@@ -15,9 +15,9 @@ from fastapi.testclient import TestClient
 from auth.providers import UserContext, get_current_user
 from services.media import audio_service, duplex_service, ws_audio_token
 from services.phone import phone_config
-from storage.prefs import audio_provider_store
-from storage.identity import credential_store
 from storage import database as task_store
+from storage.identity import credential_store
+from storage.prefs import audio_provider_store
 
 
 def _set(key, value):
@@ -202,6 +202,7 @@ async def test_attach_resolve_refuses_a_contributor_on_a_pooled_chat(temp_db):
     contributor's pooled chat gets the sentence, an editor's proceeds to the
     session lookup."""
     from types import SimpleNamespace
+
     from core.session.visibility import shared_chat_owner
     from storage.agents import agent_store
     from ws import duplex_attach
@@ -324,6 +325,7 @@ def test_prewarm_registry_claim_by_key(temp_db):
     """claim_by_key pops only a full-key match (model included — CLI spawns
     can't swap models) and reports the entry's age."""
     import asyncio
+
     from core.session import prewarm_session_registry as reg
 
     async def run():
@@ -383,7 +385,7 @@ def test_session_config_overlays_user_voice_picks(temp_db):
     assert cfg2["tts"]["voices"] == {"en": "row-en-voice", "el": "row-el-voice"}
 
 
-def test_duplex_config_automatic_language_starts_english_and_detects(temp_db):
+def test_duplex_config_automatic_language_starts_in_the_browser_language_and_detects(temp_db):
     from storage.prefs import user_audio_prefs_store
     p = audio_provider_store.create_provider({
         "provider_type": "tts", "provider_name": "elevenlabs",
@@ -396,7 +398,16 @@ def test_duplex_config_automatic_language_starts_english_and_detects(temp_db):
     user_audio_prefs_store.upsert_prefs("user-auto", {"stt_language": "auto"})
     user_audio_prefs_store.upsert_prefs("user-el", {"stt_language": "el-GR"})
 
-    auto = phone_config.assemble_duplex_session_config("user-auto")
-    assert auto["language"] == "" and auto["language_detect"] is True
-    picked = phone_config.assemble_duplex_session_config("user-el")
+    auto = phone_config.assemble_duplex_session_config("user-auto", "el-GR")
+    assert auto["language"] == "el" and auto["language_detect"] is True
+    # No browser language, or one the platform does not speak: English.
+    assert phone_config.assemble_duplex_session_config("user-auto")["language"] == "en"
+    # The admin's list bounds the start too: a browser language it does not
+    # list starts in the first listed one.
+    task_store.set_platform_setting("audio_language_candidates", "el,de")
+    assert phone_config.assemble_duplex_session_config("user-auto", "en-US")["language"] == "el"
+    assert phone_config.assemble_duplex_session_config("user-auto", "de-DE")["language"] == "de"
+    task_store.set_platform_setting("audio_language_candidates", "")
+    assert phone_config.assemble_duplex_session_config("user-auto", "xx")["language"] == "en"
+    picked = phone_config.assemble_duplex_session_config("user-el", "de-DE")
     assert picked["language"] == "el-GR" and picked["language_detect"] is False

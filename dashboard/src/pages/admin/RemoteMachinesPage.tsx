@@ -1,25 +1,35 @@
-import { useState, useEffect } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   useRemoteMachines, usePairMachine, useDeleteMachine, useAssignAgent, useUnassignAgent,
   useSetAutoUpdate, useTriggerUpdateNow, useSetAllowFullFs, useSetDeviceGrants,
   useSetMaxSessions,
   DEVICE_CAPABILITY_INFO,
+  deviceGrantBody,
+  type DeviceCapabilityInfo,
   type RemoteMachine, type PairResult,
 } from '../../api/remoteMachines'
 import { PAIRING_SCOPE } from '../../lib/placement'
 import { MACHINE_STATE, type MachineState } from '../../lib/status/machine'
 import { useAgents, useExecutionLayers } from '../../api/agents'
-import { apiFetch } from '../../api/auth'
 import { useFlag } from '../../hooks/useFlag'
 import { hasAgentScope, modeOfAgent } from '../../lib/visibility'
 import { engineLabels, installedCliBinaries, runsRemote } from '../../lib/engines'
 import { cliChipInfo } from '../../lib/cliChip'
 import RemoteBadge from '../../components/RemoteBadge'
 import PairInstallCommand from '../../components/PairInstallCommand'
-import {
-  BrowserModeSelect, BrowserTokenField, browserModeDesc, browserModeOf,
-} from '../../components/BrowserModeControls'
+import { BrowserModeSelect, BrowserTokenField } from '../../components/BrowserModeControls'
+import { browserModeDesc, browserModeOf } from '../../lib/remote/browserMode'
+import { errorText, apiJson, toastError, withMessage } from '../../lib/http/apiJson'
+import { useDialogs } from '../../components/ui/dialogs'
+import AlertDialog from '../../components/ui/AlertDialog'
+import Dialog from '../../components/ui/Dialog'
+import Button from '../../components/ui/Button'
+import { Input, Select } from '../../components/ui/Field'
+import { BADGE_BASE, BADGE_TONE, CARD, DIALOG_PANEL } from '../../components/ui/classes'
+import InfoTip from '../../components/ui/InfoTip'
+import { CheckboxRow, SaveState } from '../../components/ui/SettingsControls'
+import { useSaveState } from '../../hooks/useSaveState'
 
 // Per-satellite live stats from /v1/admin/concurrency-stats (5s poll), the same
 // shape PlatformPage consumes. Only the per-machine `satellites[]` slice is used
@@ -43,9 +53,8 @@ function useSatelliteStats() {
   return useQuery({
     queryKey: ['concurrency-stats'],
     queryFn: async (): Promise<{ satellites?: SatelliteStat[] }> => {
-      const res = await apiFetch('/v1/admin/concurrency-stats')
-      if (!res.ok) throw new Error('Failed to fetch')
-      return res.json()
+      return apiJson<{ satellites?: SatelliteStat[] }>('/v1/admin/concurrency-stats')
+        .catch(withMessage('Failed to fetch'))
     },
     select: (data) => (data.satellites ?? []) as SatelliteStat[],
     refetchInterval: 5_000,
@@ -63,15 +72,18 @@ function MachineCapacityControls({
   stat?: SatelliteStat
 }) {
   const setMaxSessions = useSetMaxSessions()
+  const { stateOf, run } = useSaveState()
   // Local edit buffer seeded from the persisted override (null → empty).
   const [value, setValue] = useState(
     machine.max_sessions != null ? String(machine.max_sessions) : '',
   )
-  useEffect(() => {
-    setValue(machine.max_sessions != null ? String(machine.max_sessions) : '')
-  }, [machine.max_sessions])
-
   const persisted = machine.max_sessions != null ? String(machine.max_sessions) : ''
+  // A saved override replaces the buffer (in render, on the change).
+  const [seeded, setSeeded] = useState(persisted)
+  if (seeded !== persisted) {
+    setSeeded(persisted)
+    setValue(persisted)
+  }
   // The recommendation the satellite reports (the effective cap when no
   // override is set), shown as the input placeholder.
   const recommended = stat && stat.max_sessions != null ? stat.max_sessions : null
@@ -84,7 +96,8 @@ function MachineCapacityControls({
       setValue(persisted)  // reject junk, revert to persisted
       return
     }
-    setMaxSessions.mutate({ machineId: machine.id, value: parsed })
+    void run('max_sessions', () => setMaxSessions.mutateAsync({ machineId: machine.id, value: parsed }),
+      { failTitle: 'The session limit was not saved' })
   }
 
   const sessionsLabel = stat
@@ -92,29 +105,29 @@ function MachineCapacityControls({
     : '—'
 
   return (
-    <div className="pt-2 border-t border-p-border-light space-y-2">
-      <p className="text-xs font-medium text-p-text-light">Capacity</p>
+    <div className="pt-2 border-t border-subtle space-y-2">
+      <p className="text-xs font-medium text-tertiary">Capacity</p>
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex flex-col gap-0.5">
-          <p className="text-xs text-p-text">
+          <p className="text-xs text-primary">
             Active sessions: <span className="font-mono">{sessionsLabel}</span>
             {stat && (
-              <span className="ml-2 text-p-text-light">
+              <span className="ml-2 text-tertiary">
                 CPU <span className="font-mono">{Math.round(stat.cpu_pct)}%</span>
                 {' · '}
                 Mem <span className="font-mono">{Math.round(stat.mem_pct)}%</span>
               </span>
             )}
           </p>
-          <p className="text-[10px] text-p-text-light max-w-md">
-            Max concurrent sessions the proxy will route here. Blank = the
-            satellite's own recommendation{recommended != null ? ` (${recommended})` : ''}.
-            The satellite also hard-caps at its physical max.
-          </p>
+          <p className="text-3xs text-tertiary max-w-md">Blank uses the machine's own recommendation{recommended != null ? `, ${recommended}` : ''}.</p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <label className="text-xs text-p-text-light">Max sessions</label>
-          <input
+          <span>
+            <label className="text-xs text-tertiary">Max sessions</label>
+            <InfoTip label="Max sessions">The most sessions OtoDock sends to this machine at once. The machine also stops at its own hard limit.</InfoTip>
+            <SaveState state={stateOf('max_sessions')} />
+          </span>
+          <Input
             type="number"
             min={1}
             value={value}
@@ -122,7 +135,7 @@ function MachineCapacityControls({
             onChange={e => setValue(e.target.value)}
             onBlur={save}
             disabled={setMaxSessions.isPending}
-            className="w-24 px-2 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 text-right disabled:opacity-50"
+            className="max-w-24 text-right"
           />
         </div>
       </div>
@@ -134,17 +147,18 @@ function MachineCapacityControls({
 // `offline` never arrives). `paused` reads amber like `stale`: offline by
 // intent, not a fault.
 const STATUS_COLORS: Record<MachineState, string> = {
-  online: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
-  stale: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-  paused: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-  disconnected: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-  never_connected: 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400',
+  online: BADGE_TONE.success,
+  stale: BADGE_TONE.warning,
+  paused: BADGE_TONE.warning,
+  disconnected: BADGE_TONE.warning,
+  never_connected: BADGE_TONE.neutral,
 }
 
 // Per-machine update controls — version + auto-update toggle +
 // manual "Update now" button. Rendered inside the expanded machine row.
 function MachineUpdateControls({ machine }: { machine: RemoteMachine }) {
   const setAutoUpdate = useSetAutoUpdate()
+  const { stateOf, run } = useSaveState()
   const triggerUpdate = useTriggerUpdateNow()
   const autoEnabled = machine.auto_update_enabled ?? true
   const version = machine.satellite_version || 'unknown'
@@ -159,64 +173,65 @@ function MachineUpdateControls({ machine }: { machine: RemoteMachine }) {
   const autoPaused = autoEnabled && !pending && !!rollbackTarget && rollbackCount >= 2
 
   return (
-    <div className="pt-2 border-t border-p-border-light space-y-2">
-      <p className="text-xs font-medium text-p-text-light">Updates</p>
+    <div className="pt-2 border-t border-subtle space-y-2">
+      <p className="text-xs font-medium text-tertiary">Updates<SaveState state={stateOf('auto_update')} /></p>
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex flex-col gap-0.5 min-w-0">
-          <p className="text-xs text-p-text">
+          <p className="text-xs text-primary">
             Satellite version: <span className="font-mono">{version}</span>
             {pending && (
-              <span className="ml-2 px-1.5 py-0.5 rounded-sm text-[10px] bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
-                update queued for next reconnect
+              <span className={`${BADGE_BASE} ${BADGE_TONE.warning} ml-2`}>
+                Update queued for next reconnect
               </span>
             )}
           </p>
           {updateError && (
-            <p className="text-xs text-red-600 dark:text-red-400">
+            <p className="text-xs text-status-danger-fg">
               Last update failed: {updateError}
             </p>
           )}
           {autoPaused && (
-            <p className="text-xs text-amber-700 dark:text-amber-400" data-testid="auto-update-paused">
-              Automatic updates paused — the update to{' '}
+            <p className="text-xs text-status-warning-fg" data-testid="auto-update-paused">
+              Automatic updates are paused. The update to{' '}
               <span className="font-mono">{rollbackTarget}</span> rolled back{' '}
-              {rollbackCount} times. Click "Update now" to retry.
+              {rollbackCount} times. Click "Update now" to try again.
             </p>
           )}
         </div>
         <div className="flex items-center gap-2">
-          <label className="inline-flex items-center gap-1.5 text-xs text-p-text cursor-pointer">
+          <label className="inline-flex items-center gap-1.5 text-xs text-primary cursor-pointer">
             <input
               type="checkbox"
               checked={autoEnabled}
               disabled={setAutoUpdate.isPending}
-              onChange={e => setAutoUpdate.mutate({
-                machine_id: machine.id,
-                enabled: e.target.checked,
-              })}
-              className="rounded-sm"
+              onChange={e => {
+                const enabled = e.target.checked
+                void run('auto_update', () => setAutoUpdate.mutateAsync({ machine_id: machine.id, enabled }),
+                  { failTitle: 'The auto-update setting was not saved' })
+              }}
+              className="accent-action"
             />
             Auto-update
           </label>
-          <button
+          <Button
+            size="xs"
             type="button"
-            onClick={() => triggerUpdate.mutate(machine.id)}
+            onClick={() => { void triggerUpdate.mutateAsync(machine.id).catch(toastError('The update was not started')) }}
             disabled={triggerUpdate.isPending}
-            className="px-2 py-1 text-xs font-medium rounded-sm border border-p-border-light text-p-text hover:bg-p-surface disabled:opacity-50"
             title={
               machine.status === MACHINE_STATE.ONLINE
-                ? 'Push the latest satellite tarball now'
-                : 'Mark machine for forced update on next reconnect'
+                ? 'Send the latest version to this machine now'
+                : 'Update this machine the next time it connects'
             }
           >
             {triggerUpdate.isPending ? 'Triggering…' : 'Update now'}
-          </button>
+          </Button>
         </div>
       </div>
       {!autoEnabled && (
-        <p className="text-[10px] text-p-text-light">
-          Auto-update disabled — this satellite will be rejected if the proxy
-          requires a newer version. Click "Update now" to force a push.
+        <p className="text-3xs text-tertiary">
+          Auto-update is off. OtoDock refuses this machine when it needs a
+          newer version. Click "Update now" to update it.
         </p>
       )}
     </div>
@@ -230,28 +245,36 @@ function MachineUpdateControls({ machine }: { machine: RemoteMachine }) {
 // or user-paired) from this page.
 function MachineFsPolicyControls({ machine }: { machine: RemoteMachine }) {
   const setAllowFullFs = useSetAllowFullFs()
+  const { stateOf, run } = useSaveState()
   const allowFullFs = machine.allow_full_fs ?? false
   return (
-    <div className="pt-2 border-t border-p-border-light space-y-2">
-      <p className="text-xs font-medium text-p-text-light">Filesystem access</p>
+    <div className="pt-2 border-t border-subtle space-y-2">
+      <p className="text-xs font-medium text-tertiary">
+        Filesystem access
+        <InfoTip label="Filesystem access">
+          {allowFullFs ? "The machine's own OtoDock folder stays off limits." : "Agents stay in their agent folders and the OS user's home folder."}
+        </InfoTip>
+        <SaveState state={stateOf('fs')} />
+      </p>
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex flex-col gap-0.5 max-w-md">
-          <p className="text-xs text-p-text">
+          <p className="text-xs text-primary">
             {allowFullFs
-              ? "Full filesystem access. Agents can read and write any path the OS user can reach, except the machine's own OtoDock folder."
-              : "Home folder only. Agents are limited to the agent tree and the OS user's home folder, a guardrail, not a sandbox."}
+              ? 'Full filesystem access. Agents can read and write any path the OS user can reach.'
+              : 'Home folder only. This is a guardrail, not full isolation.'}
           </p>
         </div>
-        <label className="inline-flex items-center gap-1.5 text-xs text-p-text cursor-pointer">
+        <label className="inline-flex items-center gap-1.5 text-xs text-primary cursor-pointer">
           <input
             type="checkbox"
             checked={allowFullFs}
             disabled={setAllowFullFs.isPending}
-            onChange={e => setAllowFullFs.mutate({
-              machineId: machine.id,
-              enabled: e.target.checked,
-            })}
-            className="rounded-sm"
+            onChange={e => {
+              const enabled = e.target.checked
+              void run('fs', () => setAllowFullFs.mutateAsync({ machineId: machine.id, enabled }),
+                { failTitle: 'The filesystem access was not changed' })
+            }}
+            className="accent-action"
           />
           Allow full FS
         </label>
@@ -268,30 +291,35 @@ function MachineFsPolicyControls({ machine }: { machine: RemoteMachine }) {
 // enabling asks for confirmation.
 function MachineDeviceGrantsControls({ machine }: { machine: RemoteMachine }) {
   const setDeviceGrants = useSetDeviceGrants()
+  const dialogs = useDialogs()
+  const { stateOf, run } = useSaveState()
   const granted = new Set(machine.device_grants ?? [])
+  // The grants as they are now: a refresh may land while the confirm is open.
+  const grantsRef = useRef(machine.device_grants)
+  useLayoutEffect(() => { grantsRef.current = machine.device_grants })
   const noDisplay = machine.capabilities?.display?.has_display === false
-  const toggle = (key: string, label: string, on: boolean) => {
-    if (on && !window.confirm(
-      `Grant "${label}" on ${machine.name}?\n\n` +
-      'This lets assigned agents drive real input/output on this machine — it ' +
-      'can click system/sudo prompts and use a browser with saved logins. Only ' +
-      'enable on a machine you trust for this.',
-    )) return
-    const next = new Set(granted)
-    if (on) { next.add(key) } else { next.delete(key) }
-    setDeviceGrants.mutate({ machineId: machine.id, grants: [...next] })
+  const toggle = async (cap: DeviceCapabilityInfo, on: boolean) => {
+    if (on && !(await dialogs.confirm({
+      title: `Grant "${cap.label}" on ${machine.name}?`,
+      body: deviceGrantBody(cap, true),
+      confirmLabel: 'Grant',
+    }))) return
+    const next = new Set(grantsRef.current ?? [])
+    if (on) { next.add(cap.key) } else { next.delete(cap.key) }
+    void run('grants', () => setDeviceGrants.mutateAsync({ machineId: machine.id, grants: [...next] }),
+      { failTitle: `The ${cap.label} permission was not changed` })
   }
   return (
-    <div className="pt-2 border-t border-p-border-light space-y-2">
-      <p className="text-xs font-medium text-p-text-light">Device control</p>
-      <p className="text-[10px] text-p-text-light max-w-md">
-        Let assigned agents control this machine’s screen, browser or apps. Off
+    <div className="pt-2 border-t border-subtle space-y-2">
+      <p className="text-xs font-medium text-tertiary">Device control<SaveState state={stateOf('grants')} /></p>
+      <p className="text-3xs text-tertiary max-w-md">
+        Let assigned agents control this computer’s screen, browser or apps. Off
         by default.
       </p>
       {noDisplay && (
-        <p className="text-[10px] text-amber-600 max-w-md">
-          This machine reported no interactive display — computer/browser
-          control won’t work until it has a GUI session.
+        <p className="text-3xs text-status-warning-fg max-w-md">
+          This computer reported no screen. Computer and browser control work
+          once someone is signed in to its desktop.
         </p>
       )}
       <div className="flex flex-col gap-1">
@@ -303,19 +331,19 @@ function MachineDeviceGrantsControls({ machine }: { machine: RemoteMachine }) {
           const desc = isBrowser && on ? browserModeDesc(browserModeOf(machine)) : cap.desc
           return (
             <div key={cap.key} className="flex flex-col">
-              <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-p-text">
+              <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-primary">
                 <label className="inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap">
                   <input
                     type="checkbox"
                     checked={on}
                     disabled={setDeviceGrants.isPending}
-                    onChange={e => toggle(cap.key, cap.label, e.target.checked)}
-                    className="rounded-sm"
+                    onChange={e => toggle(cap, e.target.checked)}
+                    className="accent-action"
                   />
                   <span className="font-medium">{cap.label}</span>
                 </label>
+                <InfoTip label={cap.label}>{desc}</InfoTip>
                 {isBrowser && on && <BrowserModeSelect machine={machine} scope="admin" />}
-                <span className="text-p-text-light">— {desc}</span>
               </div>
               {/* Own mode's token block belongs to this row, not to the list. */}
               {isBrowser && on && <BrowserTokenField machine={machine} scope="admin" />}
@@ -366,7 +394,7 @@ export default function RemoteMachinesPage() {
   if (!featureAvailable) {
     return (
       <div className="p-6">
-        <div className="rounded-lg border border-p-border bg-p-surface p-4 text-sm text-p-text-secondary">
+        <div className="rounded-card border border-default bg-surface-muted p-4 text-sm text-secondary">
           Remote-machine support is not included in this build.
         </div>
       </div>
@@ -381,27 +409,23 @@ export default function RemoteMachinesPage() {
         allow_full_fs: pairAllowFullFs,
       })
       setPairResult(result)
-    } catch (e: any) {
-      setPairError(e.message)
+    } catch (e) {
+      setPairError(errorText(e))
     }
   }
 
-  const handleDelete = async (id: string) => {
-    await deleteMachine.mutateAsync(id)
+  // The caller shows a refusal (the Confirm button's toast).
+  const handleDelete = (id: string) => deleteMachine.mutateAsync(id).then(() => {
     setDeleteConfirm(null)
     setExpandedId(null)
-  }
+  })
 
   const handleAssign = async (machineId: string, agentSlug: string) => {
-    try {
-      await assignAgent.mutateAsync({ machineId, agentSlug })
-    } catch (e: any) {
-      alert(e.message)
-    }
+    await assignAgent.mutateAsync({ machineId, agentSlug }).catch(toastError('The agent was not assigned'))
   }
 
   const handleUnassign = async (machineId: string, agentSlug: string) => {
-    await unassignAgent.mutateAsync({ machineId, agentSlug })
+    await unassignAgent.mutateAsync({ machineId, agentSlug }).catch(toastError('The agent was not unassigned'))
   }
 
   // Agents eligible for remote assignment: their engine must run on a
@@ -416,7 +440,7 @@ export default function RemoteMachinesPage() {
     a => runsRemote(layers?.[a.execution_path]) && hasAgentScope(modeOfAgent(a))
   )
 
-  if (isLoading) return <div className="p-6 text-p-text-light">Loading...</div>
+  if (isLoading) return <div className="p-6 text-tertiary">Loading...</div>
 
   // Split admin-paired (this section is fully managed here) from
   // user-paired (read-only observability section below).
@@ -427,33 +451,34 @@ export default function RemoteMachinesPage() {
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h2 className="text-lg font-semibold text-p-text">Platform Remote Machines</h2>
-          <p className="text-sm text-p-text-light mt-0.5">
+          <h2 className="font-display text-xl font-semibold text-primary">Platform Remote Machines</h2>
+          <p className="text-sm text-tertiary mt-0.5">
             Remote Machines paired by an admin for platform-wide agent execution.
           </p>
         </div>
-        <button
+        <Button
+          variant="primary"
+          className="self-start sm:self-auto shrink-0"
           onClick={() => { setShowPairModal(true); setPairResult(null); setPairName(''); setPairAllowFullFs(false); setPairError('') }}
-          className="self-start sm:self-auto shrink-0 px-3 py-1.5 text-sm font-medium rounded-lg bg-brand text-white hover:bg-brand-hover"
         >
           Pair New Machine
-        </button>
+        </Button>
       </div>
 
       {adminMachines.length === 0 && (
-        <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-8 text-center">
-          <p className="text-p-text-light">No platform remote machines paired yet.</p>
-          <p className="text-sm text-p-text-light mt-1">
+        <div className={`${CARD} p-8 text-center`}>
+          <p className="text-tertiary">No platform remote machines paired yet.</p>
+          <p className="text-sm text-tertiary mt-1">
             Click "Pair New Machine" to connect a remote machine.
           </p>
         </div>
       )}
 
       {adminMachines.map((m: RemoteMachine) => (
-        <div key={m.id} className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface">
+        <div key={m.id} className={CARD}>
           {/* Header row */}
           <div
-            className="flex items-center justify-between gap-2 p-4 cursor-pointer hover:bg-p-surface-hover rounded-xl"
+            className="flex items-center justify-between gap-2 p-4 cursor-pointer hover:bg-surface-hover rounded-card"
             onClick={() => setExpandedId(expandedId === m.id ? null : m.id)}
           >
             <div className="flex items-center gap-3 min-w-0">
@@ -464,20 +489,20 @@ export default function RemoteMachinesPage() {
                 heartbeatAgeS={m.last_heartbeat_age_s ?? null}
               />
               <div className="min-w-0">
-                <p className="font-medium text-p-text truncate">{m.name}</p>
-                <p className="text-xs text-p-text-light truncate">{m.id.slice(0, 8)} · {m.capabilities?.os || 'unknown'}</p>
+                <p className="font-medium text-primary truncate">{m.name}</p>
+                <p className="text-xs text-tertiary truncate">{m.id.slice(0, 8)} · {m.capabilities?.os || 'unknown'}</p>
               </div>
             </div>
             <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-              <span className={`inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium ${STATUS_COLORS[m.status] ?? STATUS_COLORS.never_connected}`}>
+              <span className={`${BADGE_BASE} ${STATUS_COLORS[m.status] ?? STATUS_COLORS.never_connected}`}>
                 {m.status}
               </span>
               {m.assigned_agents.length > 0 && (
-                <span className="hidden sm:inline text-xs text-p-text-light whitespace-nowrap">
+                <span className="hidden sm:inline text-xs text-tertiary whitespace-nowrap">
                   {m.assigned_agents.length} agent{m.assigned_agents.length !== 1 ? 's' : ''}
                 </span>
               )}
-              <svg className={`w-4 h-4 text-p-text-light shrink-0 transition-transform ${expandedId === m.id ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <svg className={`w-4 h-4 text-tertiary shrink-0 transition-transform ${expandedId === m.id ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
               </svg>
             </div>
@@ -485,13 +510,13 @@ export default function RemoteMachinesPage() {
 
           {/* Expanded details */}
           {expandedId === m.id && (
-            <div className="border-t border-p-border-light p-4 space-y-4">
+            <div className="border-t border-subtle p-4 space-y-4">
               {/* Capabilities */}
               <div>
-                <p className="text-xs font-medium text-p-text-light mb-1">Capabilities</p>
+                <p className="text-xs font-medium text-tertiary mb-1">Capabilities</p>
                 <div className="flex flex-wrap gap-2">
                   {m.capabilities.os && (
-                    <span className="px-2 py-0.5 rounded-sm text-xs bg-p-surface text-p-text">
+                    <span className={`${BADGE_BASE} ${BADGE_TONE.neutral}`}>
                       {m.capabilities.os} {m.capabilities.arch}
                     </span>
                   )}
@@ -501,9 +526,7 @@ export default function RemoteMachinesPage() {
                       <span
                         key={cli}
                         title={info.title}
-                        className={`px-2 py-0.5 rounded-sm text-xs ${info.mismatch
-                          ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
-                          : 'bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'}`}
+                        className={`${BADGE_BASE} ${BADGE_TONE[info.mismatch ? 'warning' : 'info']}`}
                       >
                         {info.label}
                       </span>
@@ -516,20 +539,20 @@ export default function RemoteMachinesPage() {
                     <span
                       key={`engine:${engine}`}
                       title={`Runs ${engineNames[engine] ?? engine} sessions`}
-                      className="px-2 py-0.5 rounded-sm text-xs bg-p-surface text-p-text"
+                      className={`${BADGE_BASE} ${BADGE_TONE.neutral}`}
                     >
                       {engineNames[engine] ?? engine}
                     </span>
                   ))}
                 </div>
                 {m.capabilities.os_user && (
-                  <p className="text-xs text-p-text-light mt-1">
+                  <p className="text-xs text-tertiary mt-1">
                     Running as {m.capabilities.os_user}
                     {m.capabilities.home_dir && ` (${m.capabilities.home_dir})`}
                   </p>
                 )}
                 {m.last_seen && (
-                  <p className="text-xs text-p-text-light mt-1">
+                  <p className="text-xs text-tertiary mt-1">
                     Last seen: {new Date(m.last_seen).toLocaleString()}
                   </p>
                 )}
@@ -537,20 +560,20 @@ export default function RemoteMachinesPage() {
 
               {/* Assigned agents */}
               <div>
-                <p className="text-xs font-medium text-p-text-light mb-1">Assigned Agents</p>
+                <p className="text-xs font-medium text-tertiary mb-1">Assigned Agents</p>
                 <div className="flex flex-wrap gap-2">
                   {m.assigned_agents.map(slug => (
-                    <span key={slug} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-sm text-xs bg-p-surface text-p-text">
+                    <span key={slug} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-chip text-xs bg-surface-muted text-primary">
                       {slug}
                       <button
                         onClick={(e) => { e.stopPropagation(); handleUnassign(m.id, slug) }}
-                        className="text-p-text-light hover:text-red-500 ml-0.5"
+                        className="text-tertiary hover:text-status-danger-fg ml-0.5"
                       >x</button>
                     </span>
                   ))}
                   {/* Add agent dropdown */}
-                  <select
-                    className="px-2 py-0.5 text-xs border border-p-border-light rounded-sm bg-p-bg text-p-text"
+                  <Select compact
+                    className="max-w-48"
                     value=""
                     onChange={e => { if (e.target.value) handleAssign(m.id, e.target.value) }}
                   >
@@ -564,7 +587,7 @@ export default function RemoteMachinesPage() {
                       .map(a => (
                         <option key={a.name} value={a.name}>{a.display_name}</option>
                       ))}
-                  </select>
+                  </Select>
                 </div>
               </div>
 
@@ -581,27 +604,21 @@ export default function RemoteMachinesPage() {
               <MachineDeviceGrantsControls machine={m} />
 
               {/* Danger zone */}
-              <div className="pt-2 border-t border-p-border-light">
+              <div className="pt-2 border-t border-subtle">
                 {deleteConfirm === m.id ? (
                   <div className="flex items-center gap-2">
-                    <span className="text-xs text-red-600">Remove this machine?</span>
-                    <button
-                      onClick={() => handleDelete(m.id)}
-                      className="px-2 py-1 text-xs font-medium rounded-sm bg-red-600 text-white hover:bg-red-700"
-                    >
+                    <span className="text-xs text-status-danger-fg">Remove this machine?</span>
+                    <Button variant="danger" size="xs" onClick={() => { void handleDelete(m.id).catch(toastError('The machine was not removed')) }}>
                       Confirm
-                    </button>
-                    <button
-                      onClick={() => setDeleteConfirm(null)}
-                      className="px-2 py-1 text-xs font-medium rounded-sm border border-p-border-light text-p-text hover:bg-p-surface"
-                    >
+                    </Button>
+                    <Button size="xs" onClick={() => setDeleteConfirm(null)}>
                       Cancel
-                    </button>
+                    </Button>
                   </div>
                 ) : (
                   <button
                     onClick={() => setDeleteConfirm(m.id)}
-                    className="text-xs text-red-600 hover:text-red-700"
+                    className="text-xs text-status-danger-fg hover:underline"
                   >
                     Remove Machine
                   </button>
@@ -618,36 +635,36 @@ export default function RemoteMachinesPage() {
           self-uninstall cascade as the owner's own Remove, with a confirm
           that names the owner); assignment, filesystem scope and device
           grants stay with the registering user. */}
-      <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface">
+      <div className={CARD}>
         <button
           type="button"
           onClick={() => setShowUserPaired(v => !v)}
-          className="w-full flex items-center justify-between p-4 text-left hover:bg-p-surface-hover rounded-xl"
+          className="w-full flex items-center justify-between p-4 text-left hover:bg-surface-hover rounded-card"
         >
           <div>
-            <h3 className="text-base font-semibold text-p-text">
+            <h3 className="text-base font-semibold text-primary">
               User-Paired Remote Machines{' '}
-              <span className="text-p-text-light font-normal">({userMachines.length})</span>
+              <span className="text-tertiary font-normal">({userMachines.length})</span>
             </h3>
-            <p className="text-xs text-p-text-light mt-0.5">
-              Machines paired by individual users via User Settings → Remote Machines. An admin can remove one; everything else stays with its owner.
+            <p className="text-xs text-tertiary mt-0.5">
+              Machines that users paired themselves, in User Settings, Remote Machines. An admin can remove one. Everything else stays with its owner.
             </p>
           </div>
           <svg
-            className={`w-4 h-4 text-p-text-light transition-transform ${showUserPaired ? 'rotate-180' : ''}`}
+            className={`w-4 h-4 text-tertiary transition-transform ${showUserPaired ? 'rotate-180' : ''}`}
             fill="none" viewBox="0 0 24 24" stroke="currentColor"
           >
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
           </svg>
         </button>
         {showUserPaired && (
-          <div className="border-t border-p-border-light">
+          <div className="border-t border-subtle">
             {userMachines.length === 0 ? (
-              <p className="p-4 text-sm text-p-text-light">
+              <p className="p-4 text-sm text-tertiary">
                 No users have paired their own machines yet.
               </p>
             ) : (
-              <div className="divide-y divide-p-border-light">
+              <div className="divide-y divide-subtle">
                 {userMachines.map(m => (
                   <div key={m.id} className="flex items-center gap-3 p-3">
                     <RemoteBadge
@@ -658,18 +675,18 @@ export default function RemoteMachinesPage() {
                       size="xs"
                     />
                     <div className="min-w-0 flex-1">
-                      <p className="text-sm font-medium text-p-text truncate">{m.name}</p>
-                      <p className="text-xs text-p-text-light truncate">
-                        Owner: {m.owner_display_name || '(deleted user)'}
+                      <p className="text-sm font-medium text-primary truncate">{m.name}</p>
+                      <p className="text-xs text-tertiary truncate">
+                        Owner: {m.owner_display_name || 'Deleted user'}
                         {m.owner_email ? ` <${m.owner_email}>` : ''}
                         {' · '}
                         {m.capabilities?.os || 'unknown'}
                       </p>
                     </div>
-                    <span className={`shrink-0 inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium ${STATUS_COLORS[m.status] ?? STATUS_COLORS.never_connected}`}>
+                    <span className={`${BADGE_BASE} ${STATUS_COLORS[m.status] ?? STATUS_COLORS.never_connected} shrink-0`}>
                       {m.status}
                     </span>
-                    <span className="hidden sm:inline text-xs text-p-text-light w-44 text-right truncate">
+                    <span className="hidden sm:inline text-xs text-tertiary w-44 text-right truncate">
                       {m.last_seen
                         ? `Last seen ${new Date(m.last_seen).toLocaleString()}`
                         : 'Never connected'}
@@ -681,7 +698,7 @@ export default function RemoteMachinesPage() {
                       onClick={() => { setRemoveError(''); setRemoveUserMachine(m) }}
                       title="Remove this machine"
                       aria-label={`Remove ${m.name}`}
-                      className="shrink-0 inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-lg border border-red-200 dark:border-red-900/50 text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20"
+                      className="shrink-0 inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-control border border-status-danger-border text-status-danger-fg hover:bg-status-danger-bg"
                     >
                       <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
@@ -699,132 +716,107 @@ export default function RemoteMachinesPage() {
       {/* Remove a user-paired machine — confirm first. Stacked buttons on
           phones, a row from sm:. */}
       {removeUserMachine && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setRemoveUserMachine(null)}>
-          <div
-            role="dialog"
-            aria-labelledby="remove-user-machine-title"
-            className="bg-white dark:bg-p-surface rounded-xl p-6 w-full max-w-lg mx-4 shadow-xl space-y-4"
-            onClick={e => e.stopPropagation()}
-          >
-            <h3 id="remove-user-machine-title" className="text-lg font-semibold text-p-text">
-              Remove {removeUserMachine.name}?
-            </h3>
-            <p className="text-sm text-p-text-secondary">
-              This machine was paired by{' '}
-              <span className="font-medium text-p-text">
-                {removeUserMachine.owner_display_name || '(deleted user)'}
-                {removeUserMachine.owner_email ? ` <${removeUserMachine.owner_email}>` : ''}
-              </span>.
-              The satellite will uninstall itself from their machine (an offline
-              one the next time it connects). Their agents pinned to it run
-              where those agents run by default from their next turn — chats
-              keep their history, a resumed one starts with fresh context. The
-              owner is notified.
-            </p>
-            {removeError && <p className="text-sm text-red-600">{removeError}</p>}
-            <div className="flex flex-col-reverse sm:flex-row gap-2 sm:justify-end">
-              <button
-                onClick={() => setRemoveUserMachine(null)}
-                className="px-3 py-2 sm:py-1.5 text-sm font-medium rounded-lg border border-p-border-light text-p-text hover:bg-p-surface"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={async () => {
-                  const id = removeUserMachine.id
-                  try {
-                    await handleDelete(id)
-                    setRemoveUserMachine(null)
-                  } catch (e: any) {
-                    setRemoveError(e?.message || 'Failed to remove the machine')
-                  }
-                }}
-                disabled={deleteMachine.isPending}
-                className="px-3 py-2 sm:py-1.5 text-sm font-medium rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
-              >
-                {deleteMachine.isPending ? 'Removing…' : 'Remove machine'}
-              </button>
-            </div>
-          </div>
-        </div>
+        <AlertDialog
+          title={`Remove ${removeUserMachine.name}?`}
+          confirmLabel="Remove machine"
+          tone="danger"
+          busy={deleteMachine.isPending}
+          busyLabel="Removing…"
+          error={removeError || null}
+          onCancel={() => setRemoveUserMachine(null)}
+          onConfirm={() => {
+            const id = removeUserMachine.id
+            void handleDelete(id)
+              .then(() => setRemoveUserMachine(null))
+              .catch((e: unknown) => setRemoveError(errorText(e) || 'The machine was not removed.'))
+          }}
+        >
+          This machine was paired by{' '}
+          <span className="font-medium text-primary">
+            {removeUserMachine.owner_display_name || 'a deleted user'}
+            {removeUserMachine.owner_email ? ` <${removeUserMachine.owner_email}>` : ''}
+          </span>.
+          OtoDock on their machine uninstalls itself. An offline
+          machine does it the next time it connects. From their next turn,
+          agents pinned to it run where they run by default. Chats keep
+          their history. A resumed chat starts with fresh context. The
+          owner is notified.
+        </AlertDialog>
       )}
 
       {/* Pair Modal */}
       {showPairModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setShowPairModal(false)}>
-          <div className="bg-white dark:bg-p-surface rounded-xl p-6 w-full max-w-lg mx-4 shadow-xl" onClick={e => e.stopPropagation()}>
+        <Dialog
+          onClose={() => setShowPairModal(false)}
+          aria-label={pairResult ? 'Machine paired' : 'Pair a new machine'}
+          // The install command is shown once: a stray click must not lose it.
+          dismissible={pairResult ? 'escape' : 'any'}
+          busy={pairMachine.isPending}
+          panelClassName={`${DIALOG_PANEL} p-6 max-w-lg`}
+        >
             {pairResult ? (
               <div className="space-y-4">
-                <h3 className="text-lg font-semibold text-p-text">Machine Paired</h3>
+                <h3 className="font-display text-lg font-semibold text-primary">Machine Paired</h3>
                 <PairInstallCommand
                   pairResult={pairResult}
                   introText="Run this command on the remote machine to complete setup:"
                 />
-                <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-3">
-                  <p className="text-xs text-amber-700 dark:text-amber-400">
-                    This token expires in {pairResult.expires_in_hours} hour(s). It can only be used once.
+                <div className="bg-status-warning-bg border border-status-warning-border rounded-card p-3">
+                  <p className="text-xs text-status-warning-fg">
+                    The pairing token in this command expires in {pairResult.expires_in_hours} hour(s). It works only once.
                   </p>
                 </div>
-                <button
+                <Button
+                  variant="primary"
+                  size="md"
+                  className="w-full"
                   onClick={() => setShowPairModal(false)}
-                  className="w-full px-3 py-2 text-sm font-medium rounded-lg bg-brand text-white hover:bg-brand-hover"
                 >
                   Done
-                </button>
+                </Button>
               </div>
             ) : (
               <div className="space-y-4">
-                <h3 className="text-lg font-semibold text-p-text">Pair New Machine</h3>
+                <h3 className="font-display text-lg font-semibold text-primary">Pair New Machine</h3>
                 <div>
-                  <label className="block text-sm font-medium text-p-text mb-1">Machine Name</label>
-                  <input
+                  <label className="block text-sm font-medium text-primary mb-1">Machine Name</label>
+                  <Input
+                    autoFocus
                     value={pairName}
                     onChange={e => setPairName(e.target.value)}
-                    placeholder="e.g. dev-laptop, prod-server"
-                    className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
+                    placeholder="For example, dev-laptop or prod-server"
                   />
                 </div>
-                <label className="flex items-start gap-2 text-sm text-p-text cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={pairAllowFullFs}
-                    onChange={e => setPairAllowFullFs(e.target.checked)}
-                    className="mt-0.5 rounded-sm"
-                  />
-                  <span>
-                    <span className="font-medium">Allow full filesystem access</span>
-                    <span className="block text-xs text-p-text-light">
-                      When enabled, agents on this machine can read and write any path the
-                      OS user can reach (system files, services), except the machine's own
-                      OtoDock folder, which no session may touch. When disabled, agents stay
-                      inside the OS user's home folder. Agents run natively as the OS user
-                      either way: the home folder setting is a guardrail, not a kernel
-                      sandbox, so only pair machines you trust with the agent.
-                    </span>
-                  </span>
-                </label>
+                <CheckboxRow
+                  label="Allow full filesystem access"
+                  checked={pairAllowFullFs}
+                  onChange={setPairAllowFullFs}
+                  description="The home folder limit is a guardrail, not full isolation. Only pair machines you trust with the agent."
+                  info={<>
+                    When on, agents can read and write any path the OS user can reach.
+                    That includes system files and services. The machine's own OtoDock folder
+                    stays off limits. When off, agents stay inside the OS user's home
+                    folder. Either way, agents run as the OS user.
+                  </>}
+                />
                 {pairError && (
-                  <p className="text-sm text-red-600">{pairError}</p>
+                  <p className="text-sm text-status-danger-fg">{pairError}</p>
                 )}
                 <div className="flex gap-2 justify-end">
-                  <button
-                    onClick={() => setShowPairModal(false)}
-                    className="px-3 py-1.5 text-sm font-medium rounded-lg border border-p-border-light text-p-text hover:bg-p-surface"
-                  >
+                  <Button onClick={() => setShowPairModal(false)}>
                     Cancel
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    variant="primary"
                     onClick={handlePair}
                     disabled={!pairName.trim() || pairMachine.isPending}
-                    className="px-3 py-1.5 text-sm font-medium rounded-lg bg-brand text-white hover:bg-brand-hover disabled:opacity-50"
                   >
                     {pairMachine.isPending ? 'Pairing...' : 'Generate Pairing Token'}
-                  </button>
+                  </Button>
                 </div>
               </div>
             )}
-          </div>
-        </div>
+        </Dialog>
       )}
     </div>
   )

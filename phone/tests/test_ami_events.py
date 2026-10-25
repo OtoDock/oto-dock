@@ -15,7 +15,9 @@ import pytest_asyncio
 from telephony import ami_events
 from telephony.ami_client import AMIError
 from telephony.ami_events import (
-    FLAT_SERVER_KEY, AmiEventClient, AmiListenerManager,
+    FLAT_SERVER_KEY,
+    AmiEventClient,
+    AmiListenerManager,
 )
 from telephony.audio_socket import AudioSocketConnection
 

@@ -13,7 +13,8 @@
     "health_endpoint": "/health",
     "url_template": "http://${docker_mcp_host}:${port}",
     "source": "docker:file-tools-mcp + collabora/code",
-    "proxy_callbacks": true
+    "proxy_callbacks": true,
+    "tool_timeout_sec": 600
   },
 
   "credentials": {
@@ -26,7 +27,6 @@
     "PROXY_URL": "${platform.proxy_url_for_docker}",
     "HOST_AGENTS_DIR": "${platform.host_agents_dir}",
     "WOPI_BASE_URL": "${platform.wopi_base_url}",
-    "COLLABORA_FRAME_ANCESTORS": "${platform.collabora_frame_ancestors}",
     "COLLABORA_SERVICE_ROOT": "${platform.collabora_service_root}",
     "COLLABORA_SSL_TERMINATION": "${platform.collabora_ssl_termination}",
     "MCP_PORT": "${platform.mcp_port}"

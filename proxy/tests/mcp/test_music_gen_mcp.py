@@ -64,6 +64,7 @@ class TestManifest:
             "transport": "stdio",
             "command": "venv/bin/python",
             "args": ["server.py"],
+            "tool_timeout_sec": 600,   # a composition past Codex's 60 s default
         }
 
     def test_key_delivered_via_secret_instance_field(self, manifest):

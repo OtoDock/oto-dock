@@ -68,8 +68,8 @@ export default function WorkspaceBreadcrumb({
         disabled={atRoot}
         className={`p-1 rounded-sm transition-colors ${
           atRoot
-            ? 'text-p-text-light/40 cursor-not-allowed'
-            : 'text-p-text-secondary hover:bg-p-surface-hover'
+            ? 'text-tertiary/40 cursor-not-allowed'
+            : 'text-secondary hover:bg-surface-hover'
         }`}
         title="Back"
       >
@@ -81,16 +81,16 @@ export default function WorkspaceBreadcrumb({
         {segments.map((seg, i) => (
           <span key={seg.path} className="flex items-center gap-1 min-w-0">
             {i > 0 && (
-              <svg width={10} height={10} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="text-p-text-light/60 shrink-0">
+              <svg width={10} height={10} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="text-tertiary shrink-0">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
               </svg>
             )}
             {i === segments.length - 1 ? (
-              <span className="truncate text-p-text font-medium">{seg.label}</span>
+              <span className="truncate text-primary font-medium">{seg.label}</span>
             ) : (
               <button
                 onClick={() => onNavigate(seg.path)}
-                className="truncate text-p-text-secondary hover:text-brand transition-colors"
+                className="truncate text-secondary hover:text-link transition-colors"
               >
                 {seg.label}
               </button>
@@ -100,7 +100,7 @@ export default function WorkspaceBreadcrumb({
       </div>
       <button
         onClick={handleCopy}
-        className="shrink-0 p-1 rounded-sm text-p-text-secondary hover:bg-p-surface-hover transition-colors"
+        className="shrink-0 p-1 rounded-sm text-secondary hover:bg-surface-hover transition-colors"
         title={copied ? 'Copied!' : `Copy path: ${copyTarget}`}
       >
         {copied ? (

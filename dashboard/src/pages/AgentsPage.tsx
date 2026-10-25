@@ -5,16 +5,18 @@
  * new face, the grid stays as the fallback view (low-end devices, WebGL
  * unavailable, personal preference — the choice roams via ui-prefs).
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { isAdmin as isPlatformAdmin, isCreatorOrAbove } from '../lib/permissions'
+import { toastError } from '../lib/http/apiJson'
 import { useMyUiPrefs, useUpdateMyUiPrefs } from '../api/userUiPrefs'
 import AgentGrid from './AgentGrid'
 import AgentsMap3D from '../components/agents-map/AgentsMap3D'
 import DepartmentsEditor from '../components/departments/DepartmentsEditor'
 import AgentInstallModal from '../components/AgentInstallModal'
 import CommunityAgentsBrowser from '../components/CommunityAgentsBrowser'
+import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT, SEGMENT } from '../components/ui/classes'
 
 type View = 'map' | 'grid' | 'departments'
 
@@ -37,25 +39,24 @@ export default function AgentsPage() {
   const canEditDepts = isCreatorOrAbove(user)
 
   // Roamed stickiness: agents_view ('map' | 'grid') + the admin hide toggle.
-  useEffect(() => {
-    if (!prefs || hydrated) return
+  if (prefs && !hydrated) {
     setHydrated(true)
     if (prefs.agents_view === 'grid') setView('grid')
     if (isAdmin && prefs.agents_map_hide_non_member === false) {
       setHideNonMember(false)
     }
-  }, [prefs, hydrated, isAdmin])
+  }
 
   const pickView = useCallback((v: View) => {
     setView(v)
     if (v !== 'departments') {
-      updatePrefs.mutate({ agents_view: v })
+      void updatePrefs.mutateAsync({ agents_view: v }).catch(toastError('The view was not saved'))
     }
   }, [updatePrefs])
 
   const toggleHide = useCallback(() => {
     setHideNonMember((h) => {
-      updatePrefs.mutate({ agents_map_hide_non_member: !h })
+      void updatePrefs.mutateAsync({ agents_map_hide_non_member: !h }).catch(toastError('The map filter was not saved'))
       return !h
     })
   }, [updatePrefs])
@@ -69,32 +70,27 @@ export default function AgentsPage() {
     setView('departments')
   }, [])
 
-  const segBtn = (active: boolean) =>
-    `px-3 py-1 text-xs transition-colors ${
-      active
-        ? 'bg-brand-surface text-brand'
-        : 'text-p-text-secondary hover:bg-p-surface-hover'
-    }`
+  const segBtn = (chosen: boolean) =>
+    `${BUTTON_BASE} ${BUTTON_SIZE.sm} ${chosen ? SEGMENT.on : SEGMENT.off}`
 
   return (
     // dvh, not vh: mobile URL-bar dynamics make 100vh taller than the
     // visual viewport, which let the page scroll down with no way back.
-    <div className="h-dvh flex flex-col bg-p-bg overflow-hidden">
-      {/* The 3D scene is always dark. In map view the scoped `.dark` palette
-          makes the bar's dark: classes and p-* tokens resolve to the dark
-          look, painted over the wrapper's own dark background so the
-          translucent bar never mixes with the page's beige; the page root
-          stays light because the install and community modals render
-          inside it without a portal. */}
+    <div className="h-dvh flex flex-col bg-surface-page overflow-hidden">
+      {/* The 3D scene is always dark. In map view the scoped `.dark` class
+          gives the bar the dark theme's tokens, so it never sits light over
+          the scene; the page root stays in the person's theme because the
+          install and community modals render inside it without a portal. */}
       <div
         data-testid="agents-top-bar"
-        className={view === 'map' ? 'dark shrink-0 bg-p-bg' : 'contents'}
+        className={view === 'map' ? 'dark shrink-0 bg-surface-page' : 'contents'}
       >
       {/* Top bar — standard "Back to Chat" + view controls (workspace-buttons style) */}
-      <div className="flex items-center gap-2 h-12 px-4 bg-white/80 dark:bg-gray-900/80 backdrop-blur-sm border-b border-p-border-light shrink-0">
+      <div className="flex items-center gap-2 h-12 px-4 bg-surface-page border-b border-subtle shrink-0">
         <Link
           to="/"
-          className="flex items-center justify-center gap-1.5 px-3 sm:px-8 py-1.5 rounded-lg text-sm font-medium text-white bg-brand hover:bg-brand-hover transition-colors"
+          aria-label="Back to Chat"
+          className={`${BUTTON_BASE} ${BUTTON_VARIANT.primary} ${BUTTON_SIZE.sm} sm:px-8`}
         >
           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
@@ -105,21 +101,25 @@ export default function AgentsPage() {
         {/* The admin Mine-only/Everything toggle lives INSIDE the map
             (top-left overlay) — in the bar it overflowed mobile widths and
             pushed the Departments tab off-screen. */}
-        <div className="shrink-0 flex items-center rounded-lg border border-p-border-light overflow-hidden">
+        <div role="group" aria-label="View" className="shrink-0 flex items-center gap-1">
           <button
+            type="button"
             onClick={() => pickView('map')}
             disabled={webglDead}
+            aria-pressed={view === 'map'}
             title={webglDead ? '3D unavailable on this device' : 'Company map'}
-            className={segBtn(view === 'map') + (webglDead ? ' opacity-40' : '')}
+            className={segBtn(view === 'map')}
           >
             Map
           </button>
-          <button onClick={() => pickView('grid')} className={segBtn(view === 'grid')}>
+          <button type="button" onClick={() => pickView('grid')} aria-pressed={view === 'grid'} className={segBtn(view === 'grid')}>
             Grid
           </button>
           {canEditDepts && (
             <button
+              type="button"
               onClick={() => pickView('departments')}
+              aria-pressed={view === 'departments'}
               className={segBtn(view === 'departments')}
             >
               Departments

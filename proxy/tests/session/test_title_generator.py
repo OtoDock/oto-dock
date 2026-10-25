@@ -12,7 +12,6 @@ import asyncio
 
 from core.layers.providers.base import ProviderUsage
 
-
 # ---------------------------------------------------------------------------
 # _clean_title
 # ---------------------------------------------------------------------------
@@ -42,8 +41,8 @@ def _configure(monkeypatch, configured):
 
 
 def test_select_disabled_returns_none(temp_db, monkeypatch):
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     _configure(monkeypatch, {"groq"})
     db.set_platform_setting("title_generation_enabled", "0")
     assert tg._select_provider() is None
@@ -68,16 +67,16 @@ def test_select_auto_ladder_falls_to_anthropic(temp_db, monkeypatch):
 
 
 def test_select_admin_pin_overrides_ladder(temp_db, monkeypatch):
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     _configure(monkeypatch, {"groq", "openai"})
     db.set_platform_setting("title_generation_model", "gpt-6-luna")
     assert tg._select_provider() == ("openai", "gpt-6-luna")
 
 
 def test_select_pin_unconfigured_falls_back_to_ladder(temp_db, monkeypatch):
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     _configure(monkeypatch, {"groq"})  # openai NOT configured
     db.set_platform_setting("title_generation_model", "gpt-6-luna")
     assert tg._select_provider() == ("groq", "openai/gpt-oss-120b")
@@ -96,8 +95,8 @@ def test_status_shape(temp_db, monkeypatch):
 def test_status_lists_a_pinned_model_the_ladder_no_longer_offers(temp_db, monkeypatch):
     # An admin's pin of Sonnet 5.5 (the Anthropic title row from 1.7.1 to
     # 1.8.0) still runs, so the dropdown must offer it or it shows Auto instead.
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     _configure(monkeypatch, {"anthropic"})
     db.set_platform_setting("title_generation_model", "claude-sonnet-5-5")
     st = tg.title_generation_status()
@@ -109,8 +108,8 @@ def test_status_lists_a_pinned_model_the_ladder_no_longer_offers(temp_db, monkey
 def test_a_haiku_4_5_pin_titles_on_haiku_5_5(temp_db, monkeypatch):
     # The retired Anthropic row's pin (the title model before 1.7.1) lands on
     # its successor, which is the Anthropic title row again: one option.
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     _configure(monkeypatch, {"anthropic"})
     db.set_platform_setting("title_generation_model", "claude-haiku-4-5")
     assert tg._select_provider() == ("anthropic", "claude-haiku-5-5")
@@ -123,8 +122,8 @@ def test_status_reports_a_retired_pin_by_the_successor_that_runs(temp_db, monkey
     # A retired-id pin titles on its successor (config.successor_model), so
     # the page must select that model; the raw id matches no option and the
     # dropdown would show Auto, which here would mean Groq.
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     _configure(monkeypatch, {"groq", "openai"})
     db.set_platform_setting("title_generation_model", "gpt-5.6-luna")
     st = tg.title_generation_status()
@@ -139,8 +138,8 @@ def test_a_pin_no_model_row_lists_titles_on_auto(temp_db, monkeypatch):
     # A retired id with no successor (Haiku 4.5 once its row is dropped):
     # left as it was, every title failed at the provider while the card
     # said Active. It is skipped for Auto, and the status names it.
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     _configure(monkeypatch, {"groq", "openai"})
     db.set_platform_setting("title_generation_model", "gpt-5.4-mini")
     assert tg._select_provider() == ("groq", "openai/gpt-oss-120b")
@@ -152,8 +151,8 @@ def test_a_pin_no_model_row_lists_titles_on_auto(temp_db, monkeypatch):
 
 
 def test_a_listed_pin_names_no_unlisted_model(temp_db, monkeypatch):
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     _configure(monkeypatch, {"anthropic"})
     db.set_platform_setting("title_generation_model", "claude-haiku-4-5")
     assert tg.title_generation_status()["unlisted_pin"] == ""
@@ -164,8 +163,8 @@ def test_a_listed_pin_names_no_unlisted_model(temp_db, monkeypatch):
 def test_status_lists_a_pin_the_ladder_dropped_while_titles_are_off(temp_db, monkeypatch):
     # The disabled <select> still shows the pin; with no option for it, it
     # would show Auto, and switching titles back on titles with the pin.
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     _configure(monkeypatch, {"anthropic"})
     db.set_platform_setting("title_generation_model", "claude-sonnet-5-5")
     db.set_platform_setting("title_generation_enabled", "0")
@@ -278,8 +277,8 @@ def test_a_meeting_pump_is_disarmed_a_task_pump_armed(temp_db):
 
 
 def test_request_generates_updates_broadcasts_and_meters(temp_db, monkeypatch):
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     db.create_chat("c1", "user-1", "agent-x")
     db.add_chat_message("c1", "user", "how do I deploy the proxy with zero downtime?")
     db.add_chat_message("c1", "assistant", "Use a blue-green rollout behind the proxy...")
@@ -302,8 +301,8 @@ def test_request_generates_updates_broadcasts_and_meters(temp_db, monkeypatch):
 
 
 def test_request_is_exactly_once(temp_db, monkeypatch):
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     db.create_chat("c1", "user-1", "agent-x")
     db.add_chat_message("c1", "user", "first question here")
     db.add_chat_message("c1", "assistant", "first answer here")
@@ -320,8 +319,8 @@ def test_request_without_user_prompt_keeps_claim(temp_db, monkeypatch):
     """A fire before any user row is persisted (artifact-framed first turn /
     an early trigger racing the prompt persist) must NOT burn the claim — a
     later real turn can still title the chat."""
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     db.create_chat("c1", "user-1", "agent-x")
     cap = _patch_provider(monkeypatch, "🎯 Later Title")
 
@@ -338,8 +337,8 @@ def test_rename_landing_mid_generation_wins(temp_db, monkeypatch):
     """A manual rename between the claim and the final write must win: the
     CAS (baselined on the claim-time title) discards the generated title and
     suppresses the broadcast — never announce a title that lost."""
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     db.create_chat("c1", "user-1", "agent-x")
     db.update_chat("c1", title="deterministic")
     db.add_chat_message("c1", "user", "first question")
@@ -358,8 +357,8 @@ def test_rename_landing_mid_generation_wins(temp_db, monkeypatch):
 
 
 def test_request_disabled_keeps_deterministic_and_does_not_claim(temp_db, monkeypatch):
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     db.create_chat("c1", "user-1", "agent-x")
     db.update_chat("c1", title="my first prompt")
     db.add_chat_message("c1", "user", "my first prompt")
@@ -375,8 +374,8 @@ def test_request_disabled_keeps_deterministic_and_does_not_claim(temp_db, monkey
 def test_manual_rename_blocks_llm_upgrade(temp_db, monkeypatch):
     """A user rename sets title_generated=TRUE (api/agents/chats.py), so the LLM title
     never overwrites a manual one."""
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     db.create_chat("c1", "user-1", "agent-x")
     db.add_chat_message("c1", "user", "something")
     db.add_chat_message("c1", "assistant", "reply")
@@ -390,8 +389,8 @@ def test_manual_rename_blocks_llm_upgrade(temp_db, monkeypatch):
 
 
 def test_request_empty_title_keeps_claim_no_broadcast(temp_db, monkeypatch):
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     db.create_chat("c1", "user-1", "agent-x")
     db.add_chat_message("c1", "user", "hello there")
     db.add_chat_message("c1", "assistant", "hi")
@@ -407,8 +406,8 @@ def test_request_empty_title_keeps_claim_no_broadcast(temp_db, monkeypatch):
 def test_request_titles_task_chats(temp_db, monkeypatch):
     # Task-run chats list in the sidebar's task mode — the LLM upgrade applies
     # to every one of them (delegate workers and scheduled runs alike).
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     db.create_chat("task-run-d1", "user-1", "agent-x", origin="delegated",
                    title="Lane A")
     db.add_chat_message("task-run-d1", "user", "research the market for X")
@@ -429,7 +428,7 @@ def test_request_titles_task_chats(temp_db, monkeypatch):
 
 
 def test_deterministic_title_rule():
-    from services.title_generator import deterministic_title
+    from storage.chat.chat_titles import deterministic_title
     assert deterministic_title("check the backups and report status now please") \
         == "check the backups and report status…"
     assert deterministic_title("short prompt") == "short prompt"
@@ -499,8 +498,8 @@ def test_a_provider_whose_credentials_do_not_resolve_is_reported_not_working(tem
 def test_a_check_never_clears_the_provider_s_refusal_of_a_title(temp_db, monkeypatch):
     """A revoked key still resolves: Check calls no model, so the last
     title's refusal stands until a title is made."""
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     monkeypatch.setattr(tg, "_last_attempt", None)
     db.create_chat("c1", "user-1", "agent-x")
     db.add_chat_message("c1", "user", "plan the release")
@@ -518,8 +517,8 @@ def test_a_check_never_clears_the_provider_s_refusal_of_a_title(temp_db, monkeyp
 
 
 def test_a_provider_error_and_an_empty_title_are_noted_a_title_clears_them(temp_db, monkeypatch):
-    from storage import database as db
     from services import title_generator as tg
+    from storage import database as db
     monkeypatch.setattr(tg, "_last_attempt", None)
     db.create_chat("c1", "user-1", "agent-x")
     db.add_chat_message("c1", "user", "plan the release")
@@ -546,6 +545,7 @@ def test_a_provider_error_and_an_empty_title_are_noted_a_title_clears_them(temp_
 
 def test_the_check_route_is_an_admin_s(temp_db, monkeypatch):
     from fastapi.testclient import TestClient
+
     from app import app
     from auth.providers import UserContext, get_current_user
     from services import title_generator as tg

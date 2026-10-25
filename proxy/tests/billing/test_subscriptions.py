@@ -14,10 +14,10 @@ import base64
 import hashlib
 import json
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
+import psycopg
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # PKCE & Auth URL
@@ -56,7 +56,7 @@ class TestPKCE:
         assert c1 != c2
 
     def test_build_auth_url_contains_required_params(self):
-        from core.layers.cli.oauth import build_auth_url, CLIENT_ID
+        from core.layers.cli.oauth import CLIENT_ID, build_auth_url
 
         url = build_auth_url("test-challenge", "test-state")
         assert "platform.claude.com/oauth/authorize" in url
@@ -169,7 +169,9 @@ class TestDefaultExecutionLayerForCreator:
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_claude_when_both_connected(self, mock_store):
-        from services.engines.subscription_pool import default_execution_layer_for_creator
+        from services.engines.subscription_pool import (
+            default_execution_layer_for_creator,
+        )
         # Platform + personal both have claude.
         mock_store.list_platform_pool.side_effect = lambda layer: [{"id": "p"}] if layer == "claude-code-cli" else []
         mock_store.list_personal.side_effect = lambda layer, sub: [{"id": "u"}] if layer == "claude-code-cli" else []
@@ -177,7 +179,9 @@ class TestDefaultExecutionLayerForCreator:
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_claude_wins_when_both_engines_available(self, mock_store):
-        from services.engines.subscription_pool import default_execution_layer_for_creator
+        from services.engines.subscription_pool import (
+            default_execution_layer_for_creator,
+        )
         # claude AND codex fully available → claude (first in priority order).
         mock_store.list_platform_pool.side_effect = lambda layer: [{"id": "p"}]
         mock_store.list_personal.side_effect = lambda layer, sub: [{"id": "u"}]
@@ -185,7 +189,9 @@ class TestDefaultExecutionLayerForCreator:
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_codex_when_claude_missing_personal(self, mock_store):
-        from services.engines.subscription_pool import default_execution_layer_for_creator
+        from services.engines.subscription_pool import (
+            default_execution_layer_for_creator,
+        )
         # Platform has both; user only has codex personally → claude fails the
         # BOTH test, codex passes.
         mock_store.list_platform_pool.side_effect = lambda layer: [{"id": "p"}]
@@ -194,7 +200,9 @@ class TestDefaultExecutionLayerForCreator:
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_codex_when_claude_missing_platform(self, mock_store):
-        from services.engines.subscription_pool import default_execution_layer_for_creator
+        from services.engines.subscription_pool import (
+            default_execution_layer_for_creator,
+        )
         # User has both personally; platform only pools codex.
         mock_store.list_platform_pool.side_effect = lambda layer: [{"id": "p"}] if layer == "codex-cli" else []
         mock_store.list_personal.side_effect = lambda layer, sub: [{"id": "u"}]
@@ -202,14 +210,18 @@ class TestDefaultExecutionLayerForCreator:
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_fallback_claude_when_nothing_connected(self, mock_store):
-        from services.engines.subscription_pool import default_execution_layer_for_creator
+        from services.engines.subscription_pool import (
+            default_execution_layer_for_creator,
+        )
         mock_store.list_platform_pool.return_value = []
         mock_store.list_personal.return_value = []
         assert default_execution_layer_for_creator("user-1") == "claude-code-cli"
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_fallback_when_only_platform_connected(self, mock_store):
-        from services.engines.subscription_pool import default_execution_layer_for_creator
+        from services.engines.subscription_pool import (
+            default_execution_layer_for_creator,
+        )
         # Platform has claude+codex but the creator has NO personal sub → BOTH
         # test fails for every candidate → fall back to claude (documented edge).
         mock_store.list_platform_pool.side_effect = lambda layer: [{"id": "p"}]
@@ -218,7 +230,9 @@ class TestDefaultExecutionLayerForCreator:
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_direct_llm_is_never_queried_or_returned(self, mock_store):
-        from services.engines.subscription_pool import default_execution_layer_for_creator
+        from services.engines.subscription_pool import (
+            default_execution_layer_for_creator,
+        )
         # Even if direct-llm were "available" everywhere, it's not a candidate.
         mock_store.list_platform_pool.side_effect = lambda layer: [{"id": "p"}] if layer == "direct-llm" else []
         mock_store.list_personal.side_effect = lambda layer, sub: [{"id": "u"}] if layer == "direct-llm" else []
@@ -248,7 +262,10 @@ class TestSubscriptionPool:
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_user_subscription_takes_priority(self, mock_store):
-        from services.engines.subscription_pool import acquire_subscription, _session_subscriptions
+        from services.engines.subscription_pool import (
+            _session_subscriptions,
+            acquire_subscription,
+        )
         _session_subscriptions.clear()
 
         user_sub = self._make_sub(id="user-sub", owner_sub="user-1")
@@ -263,7 +280,10 @@ class TestSubscriptionPool:
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_platform_pool_when_no_user_sub(self, mock_store):
-        from services.engines.subscription_pool import acquire_subscription, _session_subscriptions
+        from services.engines.subscription_pool import (
+            _session_subscriptions,
+            acquire_subscription,
+        )
         _session_subscriptions.clear()
 
         # No personal subs; a borrowable (api_key) sub is in the platform pool.
@@ -279,7 +299,10 @@ class TestSubscriptionPool:
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_platform_denied_when_user_disabled(self, mock_store):
-        from services.engines.subscription_pool import acquire_subscription, _session_subscriptions
+        from services.engines.subscription_pool import (
+            _session_subscriptions,
+            acquire_subscription,
+        )
         _session_subscriptions.clear()
 
         mock_store.list_personal.return_value = []
@@ -290,7 +313,10 @@ class TestSubscriptionPool:
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_none_when_no_active_subs(self, mock_store):
-        from services.engines.subscription_pool import acquire_subscription, _session_subscriptions
+        from services.engines.subscription_pool import (
+            _session_subscriptions,
+            acquire_subscription,
+        )
         _session_subscriptions.clear()
 
         # Personal empty; platform pool empty (disabled subs aren't returned by it).
@@ -305,7 +331,10 @@ class TestSubscriptionPool:
     def test_user_cannot_borrow_admin_oauth(self, mock_store):
         """The core ToS guarantee: a user with no personal sub never receives an
         admin OAuth subscription from the pool (only borrowable API types)."""
-        from services.engines.subscription_pool import acquire_subscription, _session_subscriptions
+        from services.engines.subscription_pool import (
+            _session_subscriptions,
+            acquire_subscription,
+        )
         _session_subscriptions.clear()
 
         mock_store.list_personal.return_value = []
@@ -325,7 +354,10 @@ class TestSubscriptionPool:
     @patch("services.engines.subscription_pool.subscription_store")
     def test_agent_scope_may_use_oauth_pool(self, mock_store):
         """Agent-scope (user_sub None) uses the full pool, OAuth included."""
-        from services.engines.subscription_pool import acquire_subscription, _session_subscriptions
+        from services.engines.subscription_pool import (
+            _session_subscriptions,
+            acquire_subscription,
+        )
         _session_subscriptions.clear()
 
         future_ms = int((time.time() + 7200) * 1000)
@@ -345,7 +377,10 @@ class TestSubscriptionPool:
     @patch("services.engines.subscription_pool.subscription_store")
     def test_empty_user_sub_is_agent_scope(self, mock_store):
         """user_sub='' must be treated as agent-scope, never matching owner_sub='' infra."""
-        from services.engines.subscription_pool import acquire_subscription, _session_subscriptions
+        from services.engines.subscription_pool import (
+            _session_subscriptions,
+            acquire_subscription,
+        )
         _session_subscriptions.clear()
 
         mock_store.list_platform_pool.return_value = []
@@ -355,7 +390,11 @@ class TestSubscriptionPool:
         mock_store.list_personal.assert_not_called()
 
     def test_release_decrements(self):
-        from services.engines.subscription_pool import bind_session, release_subscription, _session_subscriptions
+        from services.engines.subscription_pool import (
+            _session_subscriptions,
+            bind_session,
+            release_subscription,
+        )
         _session_subscriptions.clear()
 
         with patch("services.engines.subscription_pool.subscription_store") as mock_store:
@@ -367,7 +406,10 @@ class TestSubscriptionPool:
             assert "sess-1" not in _session_subscriptions
 
     def test_release_noop_for_unknown_session(self):
-        from services.engines.subscription_pool import release_subscription, _session_subscriptions
+        from services.engines.subscription_pool import (
+            _session_subscriptions,
+            release_subscription,
+        )
         _session_subscriptions.clear()
 
         with patch("services.engines.subscription_pool.subscription_store") as mock_store:
@@ -637,6 +679,7 @@ class TestHeadroomRoutingAndFailover:
     @staticmethod
     def _limit(window="five_hour", in_s=7200.0):
         from datetime import datetime, timedelta, timezone
+
         from core.events import turn_ending
         at = (datetime.now(timezone.utc) + timedelta(seconds=in_s)).isoformat()
         return turn_ending.TurnEnding(reason=turn_ending.LIMIT, resets_at=at, window=window)
@@ -746,8 +789,9 @@ class TestHeadroomRoutingAndFailover:
     @patch("services.engines.subscription_pool.subscription_store")
     def test_a_fresh_reading_with_headroom_ends_the_rest_early(self, mock_store):
         from datetime import datetime, timedelta, timezone
-        from services.engines import subscription_windows as sw
+
         from core.execution_layer import Scoped, Window
+        from services.engines import subscription_windows as sw
         sp = self._rested(mock_store)
         specs = sw.window_specs("claude-code-cli")
         now = datetime.now(timezone.utc)
@@ -958,7 +1002,7 @@ class TestScopeStickyAndPersistedBindings:
         mock_store.get_session_binding.return_value = None
         assert sp.get_session_subscription("sess-unknown") is None
         # Store failure → None, never an exception on the usage path.
-        mock_store.get_session_binding.side_effect = RuntimeError("db down")
+        mock_store.get_session_binding.side_effect = psycopg.OperationalError("db down")
         assert sp.get_session_subscription("sess-err") is None
         self._reset(sp)
 
@@ -1533,7 +1577,7 @@ class TestTokenRefresh:
 
 class TestOAuthState:
     def test_create_and_consume_state(self):
-        from api.auth.claude_oauth import _create_state, _consume_state, _oauth_states
+        from api.auth.claude_oauth import _consume_state, _create_state, _oauth_states
         _oauth_states.clear()
 
         state = _create_state("user-1", "platform")
@@ -1555,7 +1599,7 @@ class TestOAuthState:
         assert _consume_state("nonexistent") is None
 
     def test_consume_returns_none_for_expired(self):
-        from api.auth.claude_oauth import _create_state, _consume_state, _oauth_states
+        from api.auth.claude_oauth import _consume_state, _create_state, _oauth_states
         _oauth_states.clear()
 
         state = _create_state("user-1", "user")
@@ -1565,7 +1609,7 @@ class TestOAuthState:
         assert _consume_state(state) is None
 
     def test_one_time_use(self):
-        from api.auth.claude_oauth import _create_state, _consume_state, _oauth_states
+        from api.auth.claude_oauth import _consume_state, _create_state, _oauth_states
         _oauth_states.clear()
 
         state = _create_state("user-1", "platform")
@@ -1595,8 +1639,9 @@ class TestOAuthState:
 
 class TestAgentConfigEnvVars:
     def test_no_subscription_credential_field(self):
-        from core.execution_layer import AgentConfig
         from dataclasses import fields as dc_fields
+
+        from core.execution_layer import AgentConfig
 
         field_names = [f.name for f in dc_fields(AgentConfig)]
         assert "subscription_credential" not in field_names
@@ -1640,8 +1685,7 @@ class TestSelectionRebind:
     proxy restart."""
 
     def _reset(self):
-        from services.engines import subscription_pool as pool
-        from services.engines import token_fanout as tf
+        from services.engines import subscription_pool as pool, token_fanout as tf
         pool._session_subscriptions.clear()
         pool._session_binding_ctx.clear()
         pool._session_token_expiry.clear()
@@ -1683,8 +1727,7 @@ class TestSelectionRebind:
         }
 
     def _bind_claude_session(self, sid, sub_id, scope_sub, host_dir):
-        from services.engines import subscription_pool as pool
-        from services.engines import token_fanout as tf
+        from services.engines import subscription_pool as pool, token_fanout as tf
         pool.bind_session(sid, sub_id, layer="claude-code-cli", user_sub=scope_sub)
         tf.register_session_target(
             sid, tf.CredentialFileTarget(layer="claude-code-cli", host_dir=str(host_dir)))
@@ -1837,8 +1880,7 @@ class TestSelectionRebind:
     def test_rebind_skips_unstamped_bindings(self, store, tmp_path):
         """No acquisition context recorded — never guess the scope (a wrong
         guess could re-home a user-scope session onto an admin OAuth sub)."""
-        from services.engines import subscription_pool as pool
-        from services.engines import token_fanout as tf
+        from services.engines import subscription_pool as pool, token_fanout as tf
         store.list_personal.return_value = []
         pool.bind_session("s1", "A")  # legacy bind, no ctx
         tf.register_session_target(
@@ -1870,8 +1912,7 @@ class TestSelectionRebind:
 
     @patch("services.engines.subscription_pool.subscription_store")
     def test_rebind_codex_session_rewrites_auth_json(self, store, tmp_path):
-        from services.engines import subscription_pool as pool
-        from services.engines import token_fanout as tf
+        from services.engines import subscription_pool as pool, token_fanout as tf
         b = self._row("B", layer="codex-cli", provider="openai")
         cred = self._fresh_oauth_cred("tok-codex")
         cred["codex_auth_blob"] = {
@@ -1899,8 +1940,7 @@ class TestSelectionRebind:
     def test_on_written_guard_ignores_released_sessions(self, store, tmp_path, monkeypatch):
         """A session that closes between the snapshot and the file write must
         not be re-inserted into the binding maps (that would leak a seat)."""
-        from services.engines import subscription_pool as pool
-        from services.engines import token_fanout as tf
+        from services.engines import subscription_pool as pool, token_fanout as tf
         store.list_personal.return_value = [self._row("B")]
         store.get_user_allow_platform_auth.return_value = False
         store.get_subscription.return_value = self._row("A")
@@ -2031,6 +2071,7 @@ class TestSelectionRebindHooks:
 
     def test_admin_delete_refuses_live_sessions_without_force(self):
         from fastapi import HTTPException
+
         import api.admin.execution_layers as api_mod
         with patch.object(api_mod, "subscription_store") as store, \
              patch.object(api_mod, "subscription_pool") as pool_mock:
@@ -2178,6 +2219,7 @@ class TestUnboundSeatAndLiveCount:
         # abandoned spawn's id belongs to the dead session it was re-warming:
         # release_config_seat returns that seat AND the new one.
         from types import SimpleNamespace
+
         from core.config import config_builder
         from services.engines import subscription_pool as sp
         self._reset(sp)
@@ -2197,6 +2239,7 @@ class TestUnboundSeatAndLiveCount:
         # A task round riding a warm session / a phone reconnect reusing its
         # pre-warmed session: the id is a LIVE session's — its binding stays.
         from types import SimpleNamespace
+
         from core.config import config_builder
         from services.engines import subscription_pool as sp
         self._reset(sp)
@@ -2276,6 +2319,7 @@ class TestUnboundSeatAndLiveCount:
 
     def test_release_config_seat_uses_the_layers_scope_key(self):
         from types import SimpleNamespace
+
         from core.config import config_builder
         with patch.object(config_builder, "subscription_pool") as pool:
             pool.credential_scope_key.side_effect = (
@@ -2375,7 +2419,7 @@ class TestPoolCapEnforcement:
                 sp.acquire_subscription("claude-code-cli", "u")
         assert ei.value.reason == "pool_cap"
         assert str(ei.value).startswith("Your Claude subscription cap is reached: the week is at 52%")
-        assert "User Settings → Usage" in str(ei.value)
+        assert "User Settings, Usage" in str(ei.value)
         mock_store.list_platform_pool.assert_not_called()
         mock_store.increment_active_sessions.assert_not_called()
 
@@ -2385,7 +2429,7 @@ class TestPoolCapEnforcement:
                 sp.acquire_subscription("claude-code-cli", None)
         ev.assert_called_once_with("platform", "", "claude-code-cli")
         assert "The agent pool's Claude subscription cap is reached" in str(ei.value)
-        assert "Setup → Usage" in str(ei.value)
+        assert "Admin, Usage" in str(ei.value)
         mock_store.increment_active_sessions.assert_not_called()
 
     @patch("services.engines.subscription_pool.subscription_store")
@@ -2441,7 +2485,7 @@ class TestPoolCapEnforcement:
                                                     on_reached="continue")):
             with pytest.raises(sp.NoSubscriptionError) as ei:
                 sp.acquire_subscription("claude-code-cli", None)
-        assert "Setup → AI Engines" in str(ei.value)
+        assert "Setup, AI Engines" in str(ei.value)
         mock_store.increment_active_sessions.assert_not_called()
 
     @patch("services.engines.subscription_pool.subscription_store")

@@ -42,6 +42,7 @@ def apply_goal_events_oob(session_id: str, events: list[CommonEvent]) -> None:
         from services.notifications import notification_manager
         notification_manager.broadcast_goal_update(chat.get("user_sub", ""), chat_id, goal)
         logger.info(
-            f"Codex [{session_id[:8]}] out-of-band goal update applied "
-            f"(status={ (goal or {}).get('status', 'cleared') })"
+            "Codex [%s] out-of-band goal update applied "
+            "(status=%s)",
+            session_id[:8], (goal or {}).get('status', 'cleared')
         )

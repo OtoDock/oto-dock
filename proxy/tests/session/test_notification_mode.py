@@ -14,6 +14,7 @@ import sys
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -27,6 +28,7 @@ if _proxy_root not in sys.path:
 class TestRequestModelValidation:
     def test_create_scheduled_missing_notification_mode_fails(self):
         from pydantic import ValidationError
+
         from api.tasks.tasks import CreateScheduledTaskRequest
 
         with pytest.raises(ValidationError) as exc:
@@ -37,6 +39,7 @@ class TestRequestModelValidation:
 
     def test_create_one_time_missing_notification_mode_fails(self):
         from pydantic import ValidationError
+
         from api.tasks.tasks import CreateOneTimeTaskRequest
 
         with pytest.raises(ValidationError) as exc:
@@ -47,6 +50,7 @@ class TestRequestModelValidation:
 
     def test_create_scheduled_invalid_notification_mode_fails(self):
         from pydantic import ValidationError
+
         from api.tasks.tasks import CreateScheduledTaskRequest
 
         with pytest.raises(ValidationError):
@@ -76,6 +80,7 @@ class TestRequestModelValidation:
 
     def test_edit_task_invalid_notification_mode_fails(self):
         from pydantic import ValidationError
+
         from api.tasks.tasks import EditTaskRequest
 
         with pytest.raises(ValidationError):
@@ -159,6 +164,7 @@ class TestPersistenceRoundTrip:
     def test_invalid_mode_rejected_by_check_constraint(self, temp_db):
         """The CHECK constraint on dynamic_tasks should refuse anything outside the enum."""
         import psycopg
+
         from storage.pg import get_conn
 
         with pytest.raises(psycopg.errors.CheckViolation):

@@ -1,5 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { getVapidPublicKey, subscribePush } from '../api/notifications'
+import { debugWarn } from '../lib/debug/log'
+import { isNativePlatform } from '../audio/types'
 
 /**
  * Registers the Service Worker and subscribes to Web Push notifications.
@@ -14,7 +16,7 @@ export function usePushSubscription() {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) return
 
     // Skip on native Capacitor — FCM handles push there
-    if ((window as any).Capacitor?.isNativePlatform?.()) return
+    if (isNativePlatform()) return
 
     subscribed.current = true
 
@@ -62,7 +64,7 @@ export function usePushSubscription() {
         // Send to backend
         await subscribePush('web', JSON.stringify(subscription.toJSON()))
       } catch (err) {
-        console.warn('Push subscription failed:', err)
+        debugWarn('Push subscription failed:', err)
       }
     }
 

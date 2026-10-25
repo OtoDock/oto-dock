@@ -243,6 +243,7 @@ class TestTheCatalogOnlyReads:
 
     def test_the_catalog_reads_off_the_loop(self, temp_db, loop_db_guard):
         import asyncio
+
         from api.agents.discovery import list_execution_layers
         from auth.providers import UserContext
         u = UserContext(sub=MEMBER, email="viewer@test.com", name="T", role="member")
@@ -256,7 +257,7 @@ class TestTheCatalogOnlyReads:
         assert data["claude-code-cli"]["auto_model"] == _declared("claude-code-cli")
 
 
-import contextlib  # noqa: E402
+import contextlib
 
 
 @contextlib.contextmanager

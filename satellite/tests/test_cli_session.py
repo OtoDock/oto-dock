@@ -43,6 +43,7 @@ def cli_config():
         "env": {
             "PROXY_URL": "http://100.1.2.3:8400",
             "PROXY_API_KEY": "test-key",
+            "OTO_CLI_TOKEN": "cli-test-token",
             "ANTHROPIC_API_KEY": "sk-test",
         },
     }
@@ -206,6 +207,9 @@ class TestCLISessionStart:
         assert captured_env["OTO_SESSION_ID"] == "sess-1"
         assert captured_env["PROXY_URL"] == "http://100.1.2.3:8400"
         assert captured_env["ANTHROPIC_API_KEY"] == "sk-test"
+        # The shell's command-line token rides the payload env as it is: the
+        # platform mints it, every satellite only passes it on.
+        assert captured_env["OTO_CLI_TOKEN"] == "cli-test-token"
         assert "CLAUDECODE" not in captured_env
         # The credential helper's variables and the wrappers' dir first on
         # PATH, set after the path translation (a machine path as it is).
@@ -245,7 +249,7 @@ class TestCLISessionStart:
         assert (claude_dir / "bin" / "gh.cmd").read_bytes() == b"@echo off\r\nx %*\r\n"
         assert not (claude_dir / "bin" / "empty").exists()
         assert not (tmp_agent_dir / "users" / "alice" / "evil").exists()
-        assert not Path("/abs/evil").exists()
+        assert not Path("/abs/evil").exists()  # noqa: ASYNC240  # a test's own temporary files
 
     @pytest.mark.asyncio
     async def test_resume_uses_resume_flag(self, tmp_agent_dir, sat_config):
@@ -335,6 +339,45 @@ class TestCLISessionFlagParity:
         assert cmd[cmd.index("--permission-prompt-tool") + 1] == "stdio"
 
     @pytest.mark.asyncio
+    async def test_auto_runs_the_clis_own_auto_mode(self, tmp_agent_dir, cli_config, sat_config):
+        """A 1.9 proxy ships the CLI's own word: Auto starts its auto mode
+        (a call the hook leaves undecided goes to the CLI's classifier), the
+        stdio prompt tool kept for the decline limit."""
+        cfg = {**cli_config, "permission_mode": "autoReview", "cli_permission_mode": "auto"}
+        cmd = await _capture_start_cmd(CLISession("sess-a", tmp_agent_dir, cfg, sat_config))
+        assert cmd[cmd.index("--permission-mode") + 1] == "auto"
+        assert "--dangerously-skip-permissions" not in cmd
+        assert cmd[cmd.index("--permission-prompt-tool") + 1] == "stdio"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cfg", [
+        {"permission_mode": "ask", "cli_permission_mode": "default"},
+        {"permission_mode": "dontAsk", "cli_permission_mode": "dontAsk"},
+        {"permission_mode": "acceptEdits"},  # a proxy before 1.9
+    ])
+    async def test_every_other_mode_leaves_the_hook_to_decide(
+            self, tmp_agent_dir, cli_config, sat_config, cfg):
+        cmd = await _capture_start_cmd(
+            CLISession("sess-o", tmp_agent_dir, {**cli_config, **cfg}, sat_config))
+        assert "--dangerously-skip-permissions" in cmd
+        assert "--permission-mode" not in cmd
+
+    def test_the_terminal_starts_in_auto_and_plan_by_itself(self):
+        from satellite.terminal.pty_session import terminal_permission_mode
+        for cli_word, start in [("auto", "auto"), ("plan", "plan"), ("default", "default"),
+                                ("dontAsk", "default")]:
+            assert terminal_permission_mode({"cli_permission_mode": cli_word}) == start
+        # A proxy before 1.9 ships the platform word alone.
+        assert terminal_permission_mode({"permission_mode": "acceptEdits"}) == "acceptEdits"
+        assert terminal_permission_mode({"permission_mode": "dontAsk"}) == "default"
+
+    def test_the_otodock_command_sends_the_platforms_word(self):
+        from satellite.terminal.otodock_cli import _MODES
+        assert {w: _MODES[w] for w in ("ask", "auto", "dontAsk", "plan")} == {
+            "ask": "ask", "auto": "autoReview", "dontAsk": "dontAsk", "plan": "plan"}
+        assert (_MODES["default"], _MODES["acceptEdits"]) == ("ask", "autoReview")
+
+    @pytest.mark.asyncio
     async def test_max_thinking_tokens_from_config(self, tmp_agent_dir, cli_config, sat_config):
         cfg = {**cli_config, "max_thinking_tokens": 42000}
         cmd = await _capture_start_cmd(CLISession("sess-t", tmp_agent_dir, cfg, sat_config))
@@ -355,7 +398,7 @@ class TestCLISessionFlagParity:
         cmd = await _capture_start_cmd(CLISession("sess-r", tmp_agent_dir, cfg, sat_config))
         assert "--append-system-prompt-file" in cmd
         prompt_file = Path(cmd[cmd.index("--append-system-prompt-file") + 1])
-        assert prompt_file.read_text() == "test"
+        assert prompt_file.read_text() == "test"  # noqa: ASYNC240  # a test's own temporary files
         assert "--resume" in cmd
         # Claude Code ≥ 2.1.267 would re-send the prompt recorded on the
         # conversation's first request instead of this file — recording off.

@@ -10,11 +10,12 @@ Each test inserts under a unique ``mcp_name`` so rows don't collide.
 """
 
 import uuid
+
 import pytest
 
-from storage.identity import credential_store
-from storage.pg import get_conn
 from services.oauth import credential_resolver
+from storage.identity import credential_store, oauth_app_kinds
+from storage.pg import get_conn
 
 
 @pytest.fixture
@@ -212,7 +213,7 @@ class TestSetServiceAgentBindingUniquePerAgent:
             mcp_name, "agent", account_label="acct-b", owner_sub=user_sub2,
         )
         binding = credential_store.get_service_agent_binding(mcp_name, "agent")
-        assert binding == ("acct-b", user_sub2)
+        assert binding[:3] == ("acct-b", user_sub2, "")
 
 
 class TestCleanupServiceAgentBindingsForOwner:
@@ -243,7 +244,7 @@ class TestCleanupServiceAgentBindingsForOwner:
         assert credential_store.get_service_agent_binding(mcp_name, "agent-1") is None
         assert credential_store.get_service_agent_binding(
             mcp_name, "agent-2",
-        ) == ("b", user_sub2)
+        )[:3] == ("b", user_sub2, "")
 
     def test_cleanup_empty_owner_is_noop(self):
         assert credential_store.cleanup_service_agent_bindings_for_owner("") == []
@@ -256,8 +257,8 @@ class TestCleanupServiceAgentBindingsForOwner:
 
 class TestTokenMapServiceBinding:
     def test_agent_scope_resolves_bound_user_account(self, mcp_name, user_sub):
-        from storage.agents import agent_store
         from services.mcp import dynamic_context
+        from storage.agents import agent_store
 
         slug = f"svc-agent-{uuid.uuid4().hex[:6]}"
         with get_conn() as conn:
@@ -296,8 +297,8 @@ class TestTokenMapServiceBinding:
             agent_store._invalidate_cache()
 
     def test_agent_scope_no_binding_yields_no_account(self, mcp_name):
-        from storage.agents import agent_store
         from services.mcp import dynamic_context
+        from storage.agents import agent_store
 
         slug = f"svc-agent-{uuid.uuid4().hex[:6]}"
         with get_conn() as conn:
@@ -321,3 +322,112 @@ class TestTokenMapServiceBinding:
                 conn.execute("DELETE FROM agents WHERE slug=%s", (slug,))
                 conn.commit()
             agent_store._invalidate_cache()
+
+
+# ---------------------------------------------------------------------------
+# An installation of a GitHub-App account as the identity
+# ---------------------------------------------------------------------------
+
+
+def _github_app_meta(*installations: dict) -> dict:
+    return {"kind": oauth_app_kinds.KIND_GITHUB_APP, "login": "alice", "user_id": 1,
+            "installations": list(installations)}
+
+
+def _installation(iid: int, *, admin: bool = True, suspended: bool = False) -> dict:
+    return {"id": iid, "account": "octo", "account_id": 9, "target_type": "Organization",
+            "repository_selection": "selected", "repositories": ["octo/a"], "permissions": {},
+            "suspended_at": "2026-10-15T00:00:00Z" if suspended else None, "admin": admin}
+
+
+class TestInstallationBinding:
+    def test_the_meta_round_trips(self, mcp_name, user_sub):
+        credential_store.set_user_credentials(user_sub, mcp_name, {"k": "v"}, account_label="gh")
+        assert credential_store.get_account_meta(user_sub, mcp_name, "gh") == {}
+        assert credential_store.list_user_accounts(user_sub, mcp_name)[0]["meta"] == {}
+        meta = _github_app_meta(_installation(77))
+        assert credential_store.set_account_meta(user_sub, mcp_name, "gh", meta) is True
+        assert credential_store.get_account_meta(user_sub, mcp_name, "gh") == meta
+        assert credential_store.list_user_accounts(user_sub, mcp_name)[0]["meta"] == meta
+        assert credential_store.accounts_holding_installation([mcp_name], 77)[0]["account_label"] == "gh"
+        assert credential_store.accounts_holding_installation([mcp_name], 78) == []
+        assert credential_store.accounts_by_github_user([mcp_name], 1)[0]["user_sub"] == user_sub
+        assert credential_store.accounts_by_github_user([mcp_name], 2) == []
+        written = credential_store.update_account_meta(
+            user_sub, mcp_name, "gh", lambda m: {**m, "installations": []},
+        )
+        assert written == {**meta, "installations": []}
+        assert credential_store.update_account_meta(user_sub, mcp_name, "gh", lambda m: None) == written
+        assert credential_store.set_account_meta(user_sub, mcp_name, "gh", None) is True
+        assert credential_store.get_account_meta(user_sub, mcp_name, "gh") == {}
+        assert credential_store.set_account_meta(user_sub, mcp_name, "ghost", meta) is False
+        assert credential_store.update_account_meta(user_sub, mcp_name, "ghost", lambda m: m) is None
+
+    def test_any_hosted_app_account(self, mcp_name, user_sub):
+        credential_store.set_user_credentials(user_sub, mcp_name, {"k": "v"}, account_label="gh")
+        assert credential_store.any_hosted_app_account([mcp_name]) is False
+        credential_store.set_account_meta(user_sub, mcp_name, "gh", _github_app_meta(_installation(77)))
+        assert credential_store.any_hosted_app_account([mcp_name]) is False     # self-managed
+        credential_store.set_account_meta(user_sub, mcp_name, "gh", {**_github_app_meta(), "hosted": True})
+        assert credential_store.any_hosted_app_account([mcp_name]) is True     # no installation needed
+        assert credential_store.any_hosted_app_account(["another-mcp"]) is False
+        assert credential_store.any_hosted_app_account([]) is False
+        credential_store.set_account_meta(user_sub, mcp_name, "gh", {"kind": oauth_app_kinds.KIND_OAUTH_APP,
+                                                                     "hosted": True})
+        assert credential_store.any_hosted_app_account([mcp_name]) is False     # not a GitHub-App one
+
+    def test_an_installation_binds_only_while_it_stands(self, mcp_name, user_sub):
+        credential_store.set_user_credentials(user_sub, mcp_name, {"k": "v"}, account_label="gh")
+        _manages(user_sub, "agent")
+        bind = lambda iid: credential_store.set_service_agent_binding(
+            mcp_name, "agent", account_label="gh", owner_sub=user_sub, installation_id=iid,
+        )
+        # Not a GitHub-App account yet: no installation stands.
+        assert bind("77") is False
+        credential_store.set_account_meta(user_sub, mcp_name, "gh", _github_app_meta(
+            _installation(77), _installation(78, admin=False), _installation(79, suspended=True),
+        ))
+        assert bind("77") is True
+        assert credential_store.get_service_agent_binding(mcp_name, "agent")[:3] == ("gh", user_sub, "77")
+        ref = credential_resolver.pick_account(mcp_name, "agent")
+        assert ref is not None and ref.installation_id == "77"
+        assert bind("78") is False     # reachable, not owned
+        assert bind("79") is False     # suspended
+        assert bind("80") is False     # not among the person's
+        assert credential_store.get_service_agent_binding(mcp_name, "agent").installation_id == "77"
+        assert credential_store.bindings_naming_installation([mcp_name], 77)[0]["agent_name"] == "agent"
+        assert credential_store.bindings_naming_installation([mcp_name], 78) == []
+
+    def test_a_put_without_the_id_keeps_it_and_an_empty_one_clears_it(self, mcp_name, user_sub, user_sub2):
+        credential_store.set_user_credentials(user_sub, mcp_name, {"k": "v"}, account_label="gh")
+        credential_store.set_user_credentials(user_sub2, mcp_name, {"k": "v"}, account_label="other")
+        credential_store.set_account_meta(user_sub, mcp_name, "gh", _github_app_meta(_installation(77)))
+        _manages(user_sub, "agent")
+        _manages(user_sub2, "agent")
+        assert credential_store.set_service_agent_binding(
+            mcp_name, "agent", account_label="gh", owner_sub=user_sub, installation_id="77")
+        # An older dashboard re-selects the label: the installation stays.
+        assert credential_store.set_service_agent_binding(mcp_name, "agent", account_label="gh", owner_sub=user_sub)
+        assert credential_store.get_service_agent_binding(mcp_name, "agent").installation_id == "77"
+        # Another lender's account: a stored id never carries over.
+        assert credential_store.set_service_agent_binding(mcp_name, "agent", account_label="other", owner_sub=user_sub2)
+        assert credential_store.get_service_agent_binding(mcp_name, "agent")[:3] == ("other", user_sub2, "")
+        assert credential_store.set_service_agent_binding(
+            mcp_name, "agent", account_label="gh", owner_sub=user_sub, installation_id="77")
+        assert credential_store.set_service_agent_binding(
+            mcp_name, "agent", account_label="gh", owner_sub=user_sub, installation_id="")
+        assert credential_store.get_service_agent_binding(mcp_name, "agent")[:3] == ("gh", user_sub, "")
+
+    def test_remove_matches_the_installation_too(self, mcp_name, user_sub):
+        credential_store.set_user_credentials(user_sub, mcp_name, {"k": "v"}, account_label="gh")
+        credential_store.set_account_meta(user_sub, mcp_name, "gh", _github_app_meta(_installation(77)))
+        _manages(user_sub, "agent")
+        assert credential_store.set_service_agent_binding(
+            mcp_name, "agent", account_label="gh", owner_sub=user_sub, installation_id="77")
+        assert credential_store.remove_service_agent_binding(
+            mcp_name, "agent", owner_sub=user_sub, account_label="gh", installation_id="78") is False
+        assert credential_store.remove_service_agent_binding(
+            mcp_name, "agent", owner_sub=user_sub, account_label="gh", installation_id="77") is True
+        assert credential_store.get_service_agent_binding(mcp_name, "agent") is None
+        rows = credential_store.list_service_agent_bindings_for_owner(user_sub)
+        assert all("installation_id" in r for r in rows)

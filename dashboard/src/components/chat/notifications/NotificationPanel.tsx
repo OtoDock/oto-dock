@@ -1,4 +1,5 @@
-import { useRef, useEffect, useState, useCallback } from 'react'
+import { useRef, useEffect, useId, useLayoutEffect } from 'react'
+import { createPortal } from 'react-dom'
 import type { NotificationDelivery } from '../../../api/notifications'
 import type { AgentSummary } from '../../../api/agents'
 import type { ShareInboxItem } from '../../../api/shares'
@@ -6,6 +7,11 @@ import NotificationBody from './NotificationBody'
 import NotificationAgentHeader from './NotificationAgentHeader'
 import ShareInboxSection from '../../sharing/ShareInboxSection'
 import SwipeableRow from './SwipeableRow'
+import { POPOVER } from '../../ui/classes'
+import { usePortalRoot } from '../../ui/portalRoot'
+import { captureFocusOrigin, restoreFocus, type FocusOrigin } from '../../ui/focusReturn'
+import { primaryPointerCoarse } from '../../common/useInvokedForm'
+import { pushEscHandler } from '../../../lib/escStack'
 
 interface Props {
   deliveries: NotificationDelivery[]
@@ -29,24 +35,28 @@ interface Props {
   onOpenShare?: (item: ShareInboxItem) => void
 }
 
+// A severity's edge is its solid, its word the foreground.
 const SEVERITY_BORDER: Record<string, string> = {
-  info: 'border-l-brand',
-  success: 'border-l-p-accent-teal',
-  warning: 'border-l-p-accent-yellow',
-  danger: 'border-l-p-accent-red',
+  info: 'border-l-status-info-solid',
+  success: 'border-l-status-success-solid',
+  warning: 'border-l-status-warning-solid',
+  danger: 'border-l-status-danger-solid',
 }
 
 const SEVERITY_ICON: Record<string, string> = {
-  info: 'text-brand',
-  success: 'text-p-accent-teal',
-  warning: 'text-p-accent-yellow',
-  danger: 'text-p-accent-red',
+  info: 'text-status-info-fg',
+  success: 'text-status-success-fg',
+  warning: 'text-status-warning-fg',
+  danger: 'text-status-danger-fg',
 }
 
-// The dark brand surface sits one step above the dark panel, so dark mode
-// tints unread rows from the brand colour itself. Unread rows keep a tint on
-// hover: the read rows' hover would make them look read under the pointer.
-const UNREAD_ROW = 'bg-brand-surface/60 hover:bg-brand-surface dark:bg-brand/15 dark:hover:bg-brand/20'
+// Between the bell's bottom edge and the panel: `top-12` under the bar's
+// 36 px controls, 6 px from the top.
+const PANEL_GAP = 6
+
+// Unread rows keep a tint on hover: the read rows' hover would make them
+// look read under the pointer.
+const UNREAD_ROW = 'bg-action-subtle hover:bg-action-subtle-hover'
 
 function relativeTime(iso: string): string {
   const ms = Date.now() - new Date(iso).getTime()
@@ -84,10 +94,18 @@ export default function NotificationPanel({
   inbox, inboxBusyId, inboxError, onAcceptShare, onDeclineShare, onHideShare, onOpenShare,
 }: Props) {
   const ref = useRef<HTMLDivElement>(null)
+  const originRef = useRef<FocusOrigin | null>(null)
+  const headingId = useId()
+  const portalRoot = usePortalRoot()
 
   useEffect(() => {
+    // A press on the bell is the bell's: closing here would let its click
+    // open the panel again. A press on the scrim closes on its click, so a
+    // tap does not fall through to the page once the scrim is gone.
     const handler = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
+      const target = e.target as Node
+      if (target instanceof Element && target.closest('[data-notification-bell], [data-notification-scrim]')) return
+      if (ref.current && !ref.current.contains(target)) {
         onClose()
       }
     }
@@ -95,21 +113,49 @@ export default function NotificationPanel({
     return () => document.removeEventListener('mousedown', handler)
   }, [onClose])
 
+  // The panel sits in the body, out of the bell's order: on a desktop the
+  // focus moves into it, and Escape closes it and gives the focus back to
+  // the bell. A press elsewhere closes it and leaves the focus there.
+  useLayoutEffect(() => {
+    if (!originRef.current) originRef.current = captureFocusOrigin()
+    // The panel opens under the bell: a banner above the chat pushes the bar
+    // down, and `top-12` alone would put the panel over it.
+    const bell = document.querySelector('[data-notification-bell]')
+    if (bell && ref.current) ref.current.style.top = `${bell.getBoundingClientRect().bottom + PANEL_GAP}px`
+    if (!primaryPointerCoarse()) ref.current?.focus({ preventScroll: true })
+  }, [])
+  useEffect(() => pushEscHandler(() => {
+    onClose()
+    if (originRef.current) restoreFocus(originRef.current)
+  }, ref.current), [onClose])
+
   const groups = groupByDate(deliveries)
   const inboxItems = inbox ?? []
 
-  return (
+  // Above the composer, below the toast region (ui/Toast.tsx, z-50), so an
+  // arriving toast is never covered.
+  return createPortal(
+    <>
+    <div
+      data-notification-scrim
+      className="fixed inset-0 z-[45] bg-surface-scrim sm:hidden"
+      onClick={onClose}
+      aria-hidden="true"
+    />
     <div
       ref={ref}
-      className="fixed right-3 left-3 sm:left-auto sm:right-4 sm:w-80 top-12 max-h-[28rem] bg-white dark:bg-p-surface rounded-xl shadow-lg border border-p-border-light z-50 flex flex-col overflow-hidden"
+      role="dialog"
+      aria-labelledby={headingId}
+      tabIndex={-1}
+      className={`fixed right-3 left-3 sm:left-auto sm:right-4 sm:w-80 top-12 max-h-[28rem] z-[45] flex flex-col overflow-hidden outline-none ${POPOVER}`}
     >
       {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2.5 border-b border-p-border-light">
-        <span className="text-sm font-medium text-p-text">Notifications</span>
+      <div className="flex items-center justify-between px-3 py-2.5 border-b border-subtle">
+        <span id={headingId} className="text-sm font-medium text-primary">Notifications</span>
         {deliveries.some(d => !d.read) && (
           <button
             onClick={onMarkAllRead}
-            className="text-xs text-brand hover:text-brand-hover transition-colors"
+            className="text-xs text-link hover:text-link-hover transition-colors"
           >
             Mark all read
           </button>
@@ -132,27 +178,27 @@ export default function NotificationPanel({
           />
         )}
         {loading ? (
-          <div className="flex items-center justify-center py-8 text-p-text-light text-sm">
+          <div className="flex items-center justify-center py-8 text-tertiary text-sm">
             Loading...
           </div>
         ) : groups.length === 0 ? (
           inboxItems.length === 0 && (
-            <div className="flex items-center justify-center py-8 text-p-text-light text-sm">
+            <div className="flex items-center justify-center py-8 text-tertiary text-sm">
               No notifications
             </div>
           )
         ) : (
           groups.map(group => (
             <div key={group.label}>
-              <div className="px-3 py-1.5 text-[11px] font-medium text-p-text-light uppercase tracking-wider bg-p-surface/50">
+              <div className="px-3 py-1.5 text-2xs font-medium text-tertiary uppercase tracking-wider bg-surface-muted">
                 {group.label}
               </div>
               {group.items.map(d => (
                 <SwipeableRow key={d.id} onSwipeDismiss={() => onDismiss(d.id)}>
                   <div
                     className={`flex items-start gap-2 px-3 py-2.5 border-l-[3px] transition-colors cursor-pointer
-                                ${SEVERITY_BORDER[d.severity] || 'border-l-p-border'}
-                                ${!d.read ? UNREAD_ROW : 'hover:bg-p-surface/50'}`}
+                                ${SEVERITY_BORDER[d.severity] || 'border-l-default'}
+                                ${!d.read ? UNREAD_ROW : 'hover:bg-surface-hover'}`}
                     onClick={() => { onAcknowledge(d.id); if (!d.read) onMarkRead(d.id) }}
                   >
                     <div className="flex-1 min-w-0">
@@ -162,23 +208,23 @@ export default function NotificationPanel({
                         <NotificationAgentHeader agentSlug={d.agent_slug} agents={agents} />
                       </div>
                       <div className="flex items-center gap-1.5">
-                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${!d.read ? 'bg-brand' : 'bg-transparent'}`} />
-                        <span className="text-sm font-medium text-p-text truncate">{d.title}</span>
+                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${!d.read ? 'bg-action' : 'bg-transparent'}`} />
+                        <span className="text-sm font-medium text-primary truncate">{d.title}</span>
                       </div>
                       <div className="ml-3">
                         <NotificationBody body={d.body} clampClass="line-clamp-2" />
                       </div>
                       <div className="flex items-center gap-2 mt-1 ml-3">
-                        <span className={`text-[10px] font-medium uppercase ${SEVERITY_ICON[d.severity] || 'text-p-text-light'}`}>
+                        <span className={`text-3xs font-medium uppercase ${SEVERITY_ICON[d.severity] || 'text-tertiary'}`}>
                           {d.severity}
                         </span>
-                        <span className="text-[10px] text-p-text-light">{relativeTime(d.delivered_at)}</span>
+                        <span className="text-3xs text-tertiary">{relativeTime(d.delivered_at)}</span>
                       </div>
                     </div>
                     <div className="flex flex-col items-center gap-1 shrink-0 mt-0.5">
                       <button
                         onClick={(e) => { e.stopPropagation(); onDismiss(d.id) }}
-                        className="w-5 h-5 flex items-center justify-center text-p-text-light hover:text-p-text-secondary transition-colors"
+                        className="w-5 h-5 flex items-center justify-center text-tertiary hover:text-secondary transition-colors"
                         title="Dismiss"
                       >
                         <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -188,7 +234,7 @@ export default function NotificationPanel({
                       {onNavigate && (d.href || (d.agent_slug && (d.chat_id || d.source === 'file_conflict'))) && (
                         <button
                           onClick={(e) => { e.stopPropagation(); if (!d.read) onMarkRead(d.id); onNavigate(d.agent_slug || '', d.chat_id || '', d.href || undefined) }}
-                          className="w-5 h-5 flex items-center justify-center text-p-text-light hover:text-brand transition-colors"
+                          className="w-5 h-5 flex items-center justify-center text-tertiary hover:text-link transition-colors"
                           title={d.href ? 'Open' : d.source === 'file_conflict' ? 'Open Recover bin' : 'Open chat'}
                         >
                           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -205,5 +251,7 @@ export default function NotificationPanel({
         )}
       </div>
     </div>
+    </>,
+    portalRoot,
   )
 }

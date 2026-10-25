@@ -6,17 +6,12 @@
  */
 
 import IconDropdown from './ui/IconDropdown'
-
-export type McpCategoryFilterValue = 'all' | 'core' | 'custom' | 'community'
+import type { McpCategoryFilterValue } from '../lib/mcp/categories'
 
 const CATEGORY_LABEL: Record<Exclude<McpCategoryFilterValue, 'all'>, string> = {
   core: 'Core',
   custom: 'Custom',
   community: 'Community',
-}
-
-export function matchesMcpCategory(category: string, filter: McpCategoryFilterValue): boolean {
-  return filter === 'all' || category === filter
 }
 
 export default function McpCategoryFilter({ value, onChange, counts }: {
@@ -42,10 +37,10 @@ export default function McpCategoryFilter({ value, onChange, counts }: {
       onChange={v => onChange(v as McpCategoryFilterValue)}
       trigger={
         <span
-          className={`relative flex items-center justify-center w-7 h-7 rounded-lg border transition-colors cursor-pointer ${
+          className={`relative flex items-center justify-center w-7 h-7 rounded-control border transition-colors cursor-pointer ${
             active
-              ? 'bg-brand/10 border-brand/40 text-brand'
-              : 'bg-white dark:bg-p-surface border-p-border-light text-p-text-secondary hover:bg-p-surface-hover'
+              ? 'bg-action-subtle border-action text-link'
+              : 'bg-surface-card border-default text-secondary hover:bg-surface-hover'
           }`}
           title={active ? `Showing ${CATEGORY_LABEL[value as keyof typeof CATEGORY_LABEL]} MCPs` : 'Filter by category'}
           aria-label="Filter MCPs by category"
@@ -53,7 +48,7 @@ export default function McpCategoryFilter({ value, onChange, counts }: {
           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z" />
           </svg>
-          {active && <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-brand" />}
+          {active && <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-action" />}
         </span>
       }
     />

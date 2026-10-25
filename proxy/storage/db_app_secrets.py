@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from cryptography.fernet import InvalidToken
+
 from storage.identity.credential_store import decrypt_secret, encrypt_secret
 from storage.pg import get_conn
 
@@ -78,6 +80,6 @@ def values(app_id: str, names: list[str]) -> dict[str, str]:
     for r in rows:
         try:
             out[r["name"]] = decrypt_secret(r["value_enc"])
-        except Exception:
+        except (InvalidToken, UnicodeDecodeError):
             logger.warning("App %s: the secret %s did not decrypt (key mismatch?)", app_id, r["name"])
     return out

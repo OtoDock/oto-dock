@@ -7,11 +7,13 @@ for syncing agent directories between the platform and satellite.
 import base64
 import errno
 import fnmatch
+import functools
 import hashlib
 import logging
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from stat import S_ISREG
@@ -433,6 +435,12 @@ def _walk_sync_tree(agent_dir: Path, skipped_dirs: list[tuple[str, str]] | None 
             and (not d.startswith(".") or d in INCLUDE_DOTTED_DIRS)
             and not _is_cli_runtime_child(root_path.name, d)
         ]
+        synced_children = _engine_home_children(rel_posix)
+        if synced_children is not None:
+            # Only the person's own folders sync under an engine home (the
+            # allowlist above).
+            dirs[:] = [d for d in dirs if d in synced_children]
+            files[:] = []
         if link_like is not None:
             links = [d for d in dirs if link_like(root_path / d)]
             if links:
@@ -467,7 +475,8 @@ INCLUDE_DOTTED_DIRS = {".claude", ".codex"}
 # local session transcripts (``projects``/``sessions``), temp, caches, shell
 # snapshots, backups — pruned from the manifest/snapshot so they never sync.
 # MUST stay identical to ``proxy/core/remote/file_sync.py::_CLI_RUNTIME_CHILD_DIRS`` or
-# the two manifests disagree and the diff churns. Real config + ``skills/`` sync.
+# the two manifests disagree and the diff churns. Under an engine home only a
+# person's own folders sync (``_ENGINE_HOME_SYNCED_CHILDREN``).
 _CLI_RUNTIME_CHILD_DIRS = frozenset({
     "projects", "sessions",
     # Claude Code task store — per-machine runtime state keyed by the
@@ -490,6 +499,50 @@ def _is_cli_runtime_child(parent_name: str, child_name: str) -> bool:
     """True for a runtime-cruft dir that is an immediate child of an engine
     config dir (``INCLUDE_DOTTED_DIRS``)."""
     return parent_name in INCLUDE_DOTTED_DIRS and child_name in _CLI_RUNTIME_CHILD_DIRS
+
+
+# Under an ENGINE HOME (the ``.claude``/``.codex`` directly under a scope
+# root: ``workspace/.claude``, ``users/<u>/.codex``) only the folders a
+# person authors sync (the skills, the CLI's user-level commands, agents,
+# output styles and prompts); every other child there is the CLI's own
+# (runtime dirs, the ``bin`` wrappers, ``history.jsonl``, the model catalog
+# cache), this machine's and never listed. A ``.claude``/``.codex`` nested
+# deeper keeps the general rules. MUST stay identical to
+# ``proxy/core/remote/file_sync.py``.
+_ENGINE_HOME_SYNCED_CHILDREN = {
+    ".claude": frozenset({"skills", "commands", "agents", "output-styles"}),
+    ".codex": frozenset({"prompts", "skills"}),
+}
+
+
+def _engine_home_children(rel_dir: str) -> frozenset[str] | None:
+    """The synced children of ``rel_dir`` when it is an engine home
+    (``workspace/.claude``, ``workspace/.codex``, ``users/<u>/.claude``,
+    ``users/<u>/.codex``, agent-relative with forward slashes), else None."""
+    parts = rel_dir.split("/")
+    if len(parts) == 2 and parts[0] == layout.WORKSPACE:
+        return _ENGINE_HOME_SYNCED_CHILDREN.get(parts[1])
+    if len(parts) == 3 and parts[0] == layout.USERS:
+        return _ENGINE_HOME_SYNCED_CHILDREN.get(parts[2])
+    return None
+
+
+def _is_engine_home(rel_dir: str) -> bool:
+    return _engine_home_children(rel_dir) is not None
+
+
+def is_unsynced_engine_home_path(rel_path: str) -> bool:
+    """True for a path under an engine home the allowlist leaves to this
+    machine: a direct file there, or anything under a child other than its
+    ``_ENGINE_HOME_SYNCED_CHILDREN`` (the child itself included). A platform
+    before 1.9.0 still pushes such files; the handler refuses them."""
+    parts = rel_path.replace("\\", "/").split("/")
+    for i in (2, 3):
+        if len(parts) > i:
+            allowed = _engine_home_children("/".join(parts[:i]))
+            if allowed is not None:
+                return parts[i] not in allowed
+    return False
 
 
 def _is_cli_runtime_cruft_file(parent_name: str, file_name: str) -> bool:
@@ -944,13 +997,80 @@ def _prune_empty_parents_beneath(root, rel: str) -> None:
         parts.pop()
 
 
+# A push never replaces a file this machine changed since the platform last
+# saw it. The frame's ``expect`` is the stat the platform knows of the copy
+# here (``{size, mtime_ns}``) or ``"live"`` when it knows none; a file
+# written within this window, by this machine's clock, is being written.
+LIVE_WRITE_WINDOW_S = 5.0
+# The manifest carries the mtime as a float of seconds: the platform's ns
+# value is off by that rounding.
+_EXPECT_MTIME_SLACK_NS = 1_000
+
+
+class StalePush(Exception):
+    """The copy here is not the one the platform knows (``changed``) or is
+    being written (``live``): the push leaves it alone. Carries the copy's
+    stat for the ack."""
+
+    def __init__(self, reason: str, size: int, mtime_ns: int, rel_path: str) -> None:
+        super().__init__(f"{rel_path} {reason} on this machine; not replaced")
+        self.reason = reason
+        self.size = size
+        self.mtime_ns = mtime_ns
+
+
+def _refuse_if_stale(root, rel: str, expect, rel_path: str) -> None:
+    """Raise ``StalePush`` when the regular file at ``rel`` is not what
+    ``expect`` says: a stat that differs, or (``"live"``, or any expectation
+    without a stat) one written within ``LIVE_WRITE_WINDOW_S``. A missing
+    name, a link or a directory there is never stale: the write replaces it
+    as before. ``None`` is no expectation (a platform before 1.9.0)."""
+    if expect is None:
+        return
+    from ..host import safe_fs
+
+    try:
+        st = safe_fs.lstat_beneath(root, rel)
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    if not S_ISREG(st.st_mode):
+        return
+    if isinstance(expect, dict):
+        size, mtime_ns = expect.get("size"), expect.get("mtime_ns")
+        if isinstance(size, int) and isinstance(mtime_ns, int):
+            if st.st_size == size and abs(st.st_mtime_ns - mtime_ns) <= _EXPECT_MTIME_SLACK_NS:
+                return
+            raise StalePush("changed", st.st_size, st.st_mtime_ns, rel_path)
+    age = time.time() - st.st_mtime
+    if 0 <= age < LIVE_WRITE_WINDOW_S:
+        raise StalePush("live", st.st_size, st.st_mtime_ns, rel_path)
+
+
+def _committed_stat(root, rel: str) -> dict[str, int] | None:
+    """The committed file's ``{size, mtime_ns}`` for the ack: the stat the
+    platform expects at its next push of the path."""
+    from ..host import safe_fs
+
+    try:
+        st = safe_fs.lstat_beneath(root, rel)
+    except OSError:
+        return None
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
 def apply_file_push(
     agent_dir: Path,
     msg: dict,
     snapshot: dict[str, str] | None = None,
     snapshots: list[dict[str, str]] | None = None,
-) -> None:
-    """Write a file pushed from the platform.
+) -> dict[str, int] | None:
+    """Write a file pushed from the platform. Returns the committed file's
+    ``{size, mtime_ns}`` for a completed write (the ack carries it), None for
+    a delete, a mkdir or a chunk before the last.
+
+    A write frame's ``expect`` is what the platform knows of this machine's
+    copy: a file it does not match, or one still being written, is left alone
+    and ``StalePush`` carries its stat (``_refuse_if_stale``).
 
     Validates that the path stays within agent_dir (no traversal). Writes
     are atomic: `write` uses a .partial staging file + fsync + rename so
@@ -982,20 +1102,21 @@ def apply_file_push(
     try:
         parts = safe_fs._components(rel_path)
     except safe_fs.UnsafePathError:
-        logger.warning(f"Rejected file push outside agent dir: {rel_path}")
+        logger.warning("Rejected file push outside agent dir: %s", rel_path)
         return
     rel = "/".join(parts)
     partial_rel = rel + ".partial"
     new_hash: str | None = None
+    committed: dict[str, int] | None = None
 
     with safe_fs.open_root(Path(agent_dir).parent, Path(agent_dir).name) as root:
         if action == "delete":
             safe_fs.unlink_beneath(root, rel, missing_ok=True)
             _prune_empty_parents_beneath(root, rel)
-            logger.debug(f"Deleted: {rel_path}")
+            logger.debug("Deleted: %s", rel_path)
         elif action == "mkdir":
             safe_fs.mkdirs_beneath(root, rel)
-            logger.debug(f"Created dir: {rel_path}")
+            logger.debug("Created dir: %s", rel_path)
         elif action == "write":
             # Key-present gate, NOT truthiness: "" is a real ZERO-BYTE write
             # (every platform write sender includes the key). A truthy gate
@@ -1019,10 +1140,12 @@ def apply_file_push(
                             f"hash mismatch on write: got {actual} "
                             f"expected {expected_hash}: {rel_path}"
                         )
+                _refuse_if_stale(root, rel, msg.get("expect"), rel_path)
                 # The temp is created O_EXCL beside the name and renamed onto
                 # it within the parent; the Windows AV retry sits in the commit.
                 safe_fs.atomic_write_beneath(root, rel, data, mkdirs=True)
-                logger.debug(f"Wrote: {rel_path} ({len(data)} bytes)")
+                committed = _committed_stat(root, rel)
+                logger.debug("Wrote: %s (%s bytes)", rel_path, len(data))
                 # Snapshot refresh must not depend on the sender attaching a hash:
                 # a stale snapshot echoes the push back as a phantom file_changed
                 # (PTY sessions scan too now). Compute it from the payload if absent.
@@ -1033,15 +1156,36 @@ def apply_file_push(
             content_b64 = msg.get("content_b64", "")
             chunk_index = int(msg.get("chunk_index", 0) or 0)
             if content_b64:
-                # The FIRST chunk truncates; later chunks append. A stale .partial
-                # from an aborted prior transfer must never be appended to: it
-                # would prepend garbage and silently corrupt the file. A link
-                # planted at the staging name goes first (its target stays).
+                # The FIRST chunk truncates; later chunks append to the partial
+                # the first one staged and never create one: the platform
+                # pipelines chunks, so after a refused first chunk the ones
+                # already on the wire would otherwise leave a tail of the file
+                # beside the person's. A stale .partial from an aborted prior
+                # transfer must never be appended to either: it would prepend
+                # garbage and silently corrupt the file. A link planted at the
+                # staging name goes first (its target stays).
+                if chunk_index == 0:
+                    # Refused before any byte is staged: a doomed transfer
+                    # stops at its first frame, and an older partial goes.
+                    try:
+                        _refuse_if_stale(root, rel, msg.get("expect"), rel_path)
+                    except StalePush:
+                        safe_fs.unlink_beneath(root, partial_rel, missing_ok=True)
+                        raise
+                    opener = functools.partial(safe_fs.open_append_beneath, root, partial_rel,
+                                               truncate=True)
+                else:
+                    opener = functools.partial(safe_fs.open_append_beneath, root, partial_rel,
+                                               mkdirs=False, create=False)
                 try:
-                    fd = safe_fs.open_append_beneath(root, partial_rel, truncate=chunk_index == 0)
+                    fd = opener()
                 except safe_fs.SymlinkRefused:
                     safe_fs.unlink_beneath(root, partial_rel, missing_ok=True)
-                    fd = safe_fs.open_append_beneath(root, partial_rel, truncate=chunk_index == 0)
+                    if chunk_index != 0:
+                        raise ValueError(f"no transfer in progress: {rel_path}") from None
+                    fd = opener()
+                except FileNotFoundError:
+                    raise ValueError(f"no transfer in progress: {rel_path}") from None
                 with os.fdopen(fd, "ab") as f:
                     f.write(base64.b64decode(content_b64))
                     f.flush()
@@ -1074,7 +1218,14 @@ def apply_file_push(
                             f"chunked hash mismatch: got {actual} "
                             f"expected {expected_hash}: {rel_path}"
                         )
+                    # The file may have changed while the chunks arrived.
+                    try:
+                        _refuse_if_stale(root, rel, msg.get("expect"), rel_path)
+                    except StalePush:
+                        safe_fs.unlink_beneath(root, partial_rel, missing_ok=True)
+                        raise
                     safe_fs.commit_partial(root, partial_rel, rel)
+                    committed = _committed_stat(root, rel)
                     new_hash = expected_hash
     target = Path(agent_dir) / rel
 
@@ -1097,6 +1248,7 @@ def apply_file_push(
         # The committed bytes' sha256 was just verified — prime the hash cache
         # so the next snapshot pass never re-hashes a big pushed file.
         prime_hash_cache(target, new_hash)
+    return committed
 
 
 def compute_manifest(agent_dir: Path, *, report_skipped: bool = False) -> list[dict]:

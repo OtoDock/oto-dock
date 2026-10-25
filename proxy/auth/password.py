@@ -11,6 +11,7 @@ import contextlib
 import secrets
 
 import bcrypt
+import psycopg
 from zxcvbn import zxcvbn
 
 import config
@@ -35,7 +36,7 @@ def _get_min_score() -> int:
             score = int(val)
             if 0 <= score <= 4:
                 return score
-    except Exception:
+    except (ImportError, psycopg.Error, ValueError):
         pass
     return _DEFAULT_MIN_SCORE
 
@@ -49,7 +50,7 @@ def _get_min_length() -> int:
             length = int(val)
             if length >= 4:
                 return length
-    except Exception:
+    except (ImportError, psycopg.Error, ValueError):
         pass
     return _DEFAULT_MIN_LENGTH
 
@@ -66,7 +67,7 @@ def verify_password(plain: str, hashed: str) -> bool:
     """Verify a password against a bcrypt hash."""
     try:
         return bcrypt.checkpw(plain.encode("utf-8")[:MAX_PASSWORD_BYTES], hashed.encode("utf-8"))
-    except Exception:
+    except ValueError:
         return False
 
 

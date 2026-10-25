@@ -45,6 +45,8 @@ export function useLongPress(onLongPress: () => void) {
   }, [cancel])
 
   const onTouchEnd = useCallback(() => cancel(), [cancel])
+  // The browser took the touch over (a scroll, a system gesture).
+  const onTouchCancel = onTouchEnd
 
   // Capture-phase: swallow the synthetic click that follows an activated
   // long-press before it reaches the row's onClick.
@@ -56,6 +58,13 @@ export function useLongPress(onLongPress: () => void) {
     }
   }, [])
 
+  // A mouse press is a new gesture: Android sends no click after a long
+  // press whose contextmenu was prevented, so the flag would otherwise
+  // swallow the next mouse click on a touch laptop.
+  const onPointerDown = useCallback((e: React.PointerEvent) => {
+    if (e.pointerType === 'mouse') firedRef.current = false
+  }, [])
+
   // Android fires contextmenu on long-press; iOS shows the callout. Both
   // would fight the tooltip — the CSS side (`touch-callout: none`) rides on
   // the consumer's element.
@@ -63,5 +72,5 @@ export function useLongPress(onLongPress: () => void) {
     if (firedRef.current || timerRef.current !== null) e.preventDefault()
   }, [])
 
-  return { onTouchStart, onTouchMove, onTouchEnd, onClickCapture, onContextMenu }
+  return { onTouchStart, onTouchMove, onTouchEnd, onTouchCancel, onPointerDown, onClickCapture, onContextMenu }
 }

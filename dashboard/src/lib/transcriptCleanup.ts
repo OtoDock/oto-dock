@@ -28,7 +28,7 @@
 // a launch-argument prompt, so a prelude may end in spaces instead of a line
 // break. Repeats fold (stacked re-warm stamps).
 const TIME_PRELUDE_RE =
-  /^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}|Parallel activity — [^\n]{0,2000}?\(peek_session \/ get_task_result\)\.)\](?:[ \t]*(?:\r?\n+|$)|[ \t]+)/
+  /^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}|Parallel activity — [^\n]{0,2000}?\(peek_session \/ get_task_result\)\.|Meeting "[^\n]{0,4000}? you have only this note\.)\](?:[ \t]*(?:\r?\n+|$)|[ \t]+)/
 
 // One wrapped slash-command segment (opening tag first, matching close tag).
 const COMMAND_TAG_RE =
@@ -56,7 +56,7 @@ export function stripInjectedPreludes(text: string): string {
  * `null` when nothing user-authored remains (pure command noise / bare stamp)
  * and the row should be hidden entirely.
  */
-export function cleanUserMessageText(text: string): string | null {
+export function cleanUserMessageText(text: string | null | undefined): string | null {
   let stripped = stripInjectedPreludes(text ?? '')
   // Injected <system-reminder> blocks: stripped only when the message STARTS
   // with one (the injected shape — the block is prepended to the user's

@@ -22,10 +22,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import config
+from core import layout
 from services.checks import patterns
 from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
 from storage.checks import db_checks
-from core import layout
 
 logger = logging.getLogger("checks")
 
@@ -231,7 +231,7 @@ def validate_condition(cond) -> dict:
             try:
                 patterns.check_glob(g)
             except patterns.PatternError as e:
-                raise CheckError(f"condition.globs: {g[:80]!r} is not a glob a check takes ({e})")
+                raise CheckError(f"condition.globs: {g[:80]!r} is not a glob a check takes ({e})") from e
         out["globs"] = globs
     commands = _str_list(cond, "commands", allowed=None, max_items=MAX_COMMANDS)
     if commands:
@@ -240,7 +240,7 @@ def validate_condition(cond) -> dict:
                 patterns.check(c)
             except patterns.PatternError as e:
                 raise CheckError(f"condition.commands: {c[:80]!r} is not a valid pattern ({e}); "
-                                 "a check's patterns are RE2 — no backreferences, no lookaround")
+                                 "a check's patterns are RE2 — no backreferences, no lookaround") from e
         out["commands"] = commands
     return out
 
@@ -278,13 +278,13 @@ def validate_check_doc(doc, *, owner: str = "") -> dict:
         try:
             import jsonschema
             jsonschema.Draft202012Validator.check_schema(schema)
-        except Exception as e:  # noqa: BLE001 — the library's own message is the user's
-            raise CheckError(f"schema: {str(e).splitlines()[0][:200]}")
+        except Exception as e:  # the library's own message is the user's
+            raise CheckError(f"schema: {str(e).splitlines()[0][:200]}") from e
         try:
             patterns.check_schema(schema)
         except patterns.PatternError as e:
             raise CheckError(f"schema: {e}; a check's patterns are RE2 — no backreferences, "
-                             "no lookaround")
+                             "no lookaround") from e
         out["schema"] = schema
     script = doc.get("script")
     if script is not None:
@@ -519,7 +519,7 @@ def load_checks(agent: str, owner: str = "", *, sync_index: bool = True) -> list
     if sync_index:
         try:
             items.extend(_sync_index(items, agent, owner))
-        except Exception:
+        except Exception:  # noqa: BLE001  # the index is a cache: the checks still load from their files
             logger.warning("checks: index sync failed for %s/%s", agent, owner or "config",
                            exc_info=True)
     return items
@@ -531,7 +531,7 @@ def load_check(agent: str, owner: str, name: str) -> CheckDoc | None:
     if it is not None:
         try:
             _sync_index([it], agent, owner, whole=False)
-        except Exception:
+        except Exception:  # noqa: BLE001  # the index is a cache: the check still loads from its file
             logger.warning("checks: index sync failed for %s", folder, exc_info=True)
     return it
 
@@ -574,6 +574,7 @@ def judge_envelope_problem(agent: str, judge: dict) -> str | None:
     if not (engine or model):
         return None
     from fastapi import HTTPException
+
     from services.delegation.spawn_authz import validate_spawn_overrides
     try:
         validate_spawn_overrides(agent, engine, model)
@@ -645,7 +646,7 @@ def _commit(agent: str, owner: str, paths: list[Path], message: str) -> None:
         from services.infra import git_writer
         repo = _agent_dir(agent) / "config"
         git_writer.commit_paths(repo, paths, message)
-    except Exception:
+    except (ImportError, ValueError):
         logger.warning("checks: git commit failed for %s", agent, exc_info=True)
 
 
@@ -660,7 +661,7 @@ async def fan_out(agent: str, owner: str, name: str) -> None:
             if p.is_file():
                 rel = p.resolve().relative_to(agent_dir).as_posix()
                 await file_bookkeeping.push_file_write(agent, rel, p, writer=None)
-    except Exception:
+    except Exception:  # noqa: BLE001  # the fan-out to machines is best effort, the files are written
         logger.debug("checks: fan-out skipped for %s", folder, exc_info=True)
 
 

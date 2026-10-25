@@ -38,6 +38,7 @@ import { setPageFocus } from '../../../lib/focus'
 import { planOpenApp } from '../../../lib/openApp'
 import { buildAppActionText, substituteArgs } from '../../../lib/artifactInteraction'
 import { pushEscHandler } from '../../../lib/escStack'
+import { blockedByModal } from '../../../lib/ui/modalLayers'
 import { onIdle as speechIdle } from '../../../audio/speechActivity'
 
 type Stream = ReturnType<typeof useChatStream>
@@ -100,23 +101,20 @@ export function useOverlayPanels({
   useEffect(() => {
     setPageFocus(chatId ? { surface: 'chat', chat_id: chatId } : { surface: 'home' })
   }, [chatId])
-  // Agent HOME live-sessions strip (operator call 2026-07-11): on the front
-  // page (no chat open) the cross-agent "Active now" rows show permanently
-  // on top — dashboards/landing render below. Hook is enabled only there;
-  // it returns [] otherwise, so nothing extra runs inside chats.
+  // The cross-agent "Active now" rows on the empty chat page (no chat open,
+  // the apps and the workspace closed): the one page with room for them. The
+  // hook is enabled only there; it returns [] otherwise, so nothing extra
+  // runs inside chats or above the apps.
   const homeActiveRows = useActiveChats(!chatId && !!agentName)
   const showHomeActive =
-    !chatId && !!agentName && homeActiveRows.length > 0 && !workspace.state.open
-  // Deep-link wake (?wake=1 on a concrete chat URL) must arm the keep at
-  // RENDER time: on a fresh mount the hook's close runs before ANY effect
-  // of this component, so an effect-set ref is always too late. The param
-  // is stripped by the consume effect in the same commit.
-  if (searchParams.get('wake') === '1') keepAppsOnChatEntryRef.current = true
+    !chatId && !!agentName && homeActiveRows.length > 0 && !workspace.state.open && !appsActive
   // Apps-UI open/close rules — arrival on HOME opens (incl. agent switch),
   // entering any chat closes / never auto-opens (except a kept phone-mode
-  // entry). Extracted for direct unit coverage; the rules live in the
-  // hook's header comment.
-  useAppsAutoOpen(agentName, urlChatId, pinnedApps, setAppsOpen, keepAppsOnChatEntryRef)
+  // entry; a deep-link wake arms the keep inside the hook's own effect,
+  // before its close reads it). Extracted for direct unit coverage; the
+  // rules live in the hook's header comment.
+  useAppsAutoOpen(agentName, urlChatId, pinnedApps, setAppsOpen, keepAppsOnChatEntryRef,
+    searchParams.get('wake') === '1')
   useEffect(() => {
     if (!appsActive) return
     return pushEscHandler(() => setAppsOpen(false))
@@ -155,7 +153,12 @@ export function useOverlayPanels({
   const { data: chatPins } = useChatPins(chatId ?? undefined)
   const hasChatPin = !!chatPins?.chat || (chatPins?.files?.length ?? 0) > 0
   const dockAvailable = isProjectChat || hasChatPin
-  useEffect(() => { setProjectsOpen(false) }, [chatId])
+  // A chat change closes the Dock (in render, on the change).
+  const [projectsFor, setProjectsFor] = useState(chatId)
+  if (projectsFor !== chatId) {
+    setProjectsFor(chatId)
+    setProjectsOpen(false)
+  }
   const projectsActive = projectsOpen && dockAvailable && !workspace.state.open && !appsOpen
   // An agent pin/re-pin broadcasts file_updated for its apps/*.html — that's
   // the signal a Dock pin appeared/changed (the toggle may need to show up
@@ -197,6 +200,7 @@ export function useOverlayPanels({
   // Ctrl/Cmd+E toggles the workspace overlay.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (blockedByModal(e)) return
       if ((e.metaKey || e.ctrlKey) && (e.key === 'e' || e.key === 'E')) {
         const tag = (e.target as HTMLElement | null)?.tagName
         // Don't hijack the shortcut while the user is typing into the
@@ -214,10 +218,15 @@ export function useOverlayPanels({
   // Deep-link from a file-conflict notification: ?recover=1 opens the workspace
   // overlay + the Recover bin modal, then clears the param.
   const [recoverRequested, setRecoverRequested] = useState(false)
+  const recoverParam = searchParams.get('recover') === '1'
+  const [recoverSeen, setRecoverSeen] = useState(false)
+  if (recoverSeen !== recoverParam) {
+    setRecoverSeen(recoverParam)
+    if (recoverParam) setRecoverRequested(true)
+  }
   useEffect(() => {
     if (searchParams.get('recover') === '1') {
       if (!workspace.state.open) workspace.toggleWorkspace()
-      setRecoverRequested(true)
       setSearchParams(prev => { prev.delete('recover'); return prev }, { replace: true })
     }
   }, [searchParams, setSearchParams, workspace])
@@ -257,6 +266,8 @@ export function useAppSendPrompt({
   // app_action WS frame (server-gated); front page → create a chat, view it,
   // then deliver (retrying past the resume race). fire_task never comes here
   // (AppFrame routes it over REST).
+  // The members the router calls (the bundle is rebuilt every render).
+  const { sessionInteractive, interactiveMode, routeSend, setShowRichView } = interactive
   const handleAppSendPrompt = useCallback(
     async (
       app: PinnedApp,
@@ -264,7 +275,7 @@ export function useAppSendPrompt({
       args: unknown,
     ): Promise<{ status: string; reason?: string }> => {
       const substituted = substituteArgs(action.prompt, args)
-      if (interactive.sessionInteractive && chatId) {
+      if (sessionInteractive && chatId) {
         const built = buildAppActionText(app.title || app.slug, action.label, substituted)
         if ('error' in built) return { status: 'denied', reason: built.error }
         ws.sendPtyInput(chatId, ptyPasteB64(withInteractiveTime(built.framed)), true)
@@ -277,10 +288,10 @@ export function useAppSendPrompt({
       // server-kicks it as a -p turn on a decline — arm the adoption ref so
       // that turn engages the streaming UI, like the composer path).
       // Without this, the fresh terminal opened and the prompt never landed.
-      if (interactive.interactiveMode && agentName) {
+      if (interactiveMode && agentName) {
         const built = buildAppActionText(app.title || app.slug, action.label, substituted)
         if ('error' in built) return { status: 'denied', reason: built.error }
-        const routed = interactive.routeSend(built.framed, {
+        const routed = routeSend(built.framed, {
           chatId, sessionId, warmingUp,
           warmupParams: { agentName, chatId: chatId || undefined, mode, model, layer: chatActiveLayer ?? selectedLayer ?? undefined },
           onColdStart: () => {
@@ -290,7 +301,7 @@ export function useAppSendPrompt({
           },
         })
         if (routed) {
-          interactive.setShowRichView(false)
+          setShowRichView(false)
           return { status: 'sent' }
         }
       }
@@ -317,9 +328,9 @@ export function useAppSendPrompt({
         return { status: 'denied', reason: 'could not start a chat' }
       }
     },
-    [interactive.sessionInteractive, interactive.interactiveMode, interactive.routeSend,
-     interactive.setShowRichView, chatId, sessionId, warmingUp, mode, model,
-     chatActiveLayer, selectedLayer, ws, sendAppAction, agentName, handleSelectChat],
+    [sessionInteractive, interactiveMode, routeSend, setShowRichView, chatId, sessionId, warmingUp, mode, model,
+     chatActiveLayer, selectedLayer, ws, sendAppAction, agentName, handleSelectChat,
+     keepAppsOnChatEntryRef, serverKickPendingRef, setAppsOpen, setWarmingUp],
   )
 
   return { handleAppSendPrompt }

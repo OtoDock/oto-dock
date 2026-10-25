@@ -13,9 +13,9 @@ import json
 
 import pytest
 
-from core.events.common_events import CommonEvent, TEXT, PRODUCER_DONE
 import ws.phone as ws_phone
-
+from core.events.common_events import PRODUCER_DONE, TEXT, CommonEvent
+from core.execution_layer import ResumeVerdict
 
 _DISCONNECT = object()
 
@@ -97,9 +97,9 @@ class FakeLayer:
         return self.process_dead
 
     async def can_resume_session(self, session_id: str, *, agent_name="",
-                                 username="", external_home="") -> bool:
+                                 username="", external_home="") -> ResumeVerdict:
         self.resume_checked.append(session_id)
-        return True
+        return ResumeVerdict.RESUMABLE
 
     async def prepare_resume(self, session_id: str) -> None:
         self.prepared.append(session_id)

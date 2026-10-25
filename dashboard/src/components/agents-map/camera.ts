@@ -1,7 +1,7 @@
 /**
  * Camera-pose math for the 3D company map — pure functions over the
  * viewport, the camera's FOV/aspect and a layout cluster; no DOM, no
- * renderer. AgentsMap3D reads the live window/camera and calls these; the
+ * renderer. The map reads the live window/camera and calls these; the
  * tests feed fixed numbers.
  *
  * ONE pose function serves both the paged whole-map view (paging between
@@ -13,6 +13,7 @@
  */
 import * as THREE from 'three'
 import type { MapCluster } from './layout'
+import { STAGE_CAM_MAX } from './mapConstants'
 
 /** Resolution-aware framing factor (operator ask, 2026-08-25): every fit
  * frames by FOV fraction, which draws the scene at the same RELATIVE size
@@ -36,6 +37,21 @@ export function viewScaleFor(width: number, height: number): number {
 export function horizontalFov(fovDeg: number, aspect: number): number {
   const vfov = (fovDeg * Math.PI) / 180
   return 2 * Math.atan(Math.tan(vfov / 2) * Math.max(0.4, aspect))
+}
+
+/** Seats per amphitheater row for a viewport: how many 16-unit stage cards
+ * fit the horizontal FOV of the map camera (48° vertical) at the far stage
+ * framing clamp — 2 on a portrait phone, up to 8 on desktop — so no card
+ * ever leaves the screen. The stage camera may sit `scale` (viewScale)
+ * farther back on big screens, so the same screens fit WIDER rows — more
+ * seats, like 2D shows more content, instead of bigger cards. */
+export const ROW_CAP_MIN = 2
+export const ROW_CAP_MAX = 8
+
+export function rowCapFor(aspect: number, scale: number): number {
+  const hfov = horizontalFov(48, aspect)
+  const maxHalf = (Math.tan(hfov / 2) * STAGE_CAM_MAX * scale) / 1.04 - 5
+  return Math.max(ROW_CAP_MIN, Math.min(ROW_CAP_MAX, Math.floor((maxHalf * 2) / 16) + 1))
 }
 
 /** The whole-map camera distance: from the horizontal FOV (portrait phones

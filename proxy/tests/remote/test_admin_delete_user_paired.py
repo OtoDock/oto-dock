@@ -43,8 +43,8 @@ def _machine(scope: str, owner: str) -> dict:
 @pytest.fixture
 def stubs(monkeypatch):
     from api.remote import remote_machines as rm
-    from storage import remote_store as rs
     from services.notifications import notification_manager as nm
+    from storage import remote_store as rs
 
     deleted: list[str] = []
     uninstalled: list[str] = []
@@ -114,9 +114,10 @@ def test_an_admins_session_token_is_refused(stubs, monkeypatch):
     """The router takes the framework's require_admin: an agent session
     token resolves to its owner's role with is_api_key set, and is refused
     on every admin machine route (the remote-machines guard finding)."""
+    from fastapi import FastAPI
+
     from api.remote import remote_machines
     from auth.providers import UserContext, get_current_user
-    from fastapi import FastAPI
     monkeypatch.setattr(stubs["rs"], "get_remote_machine", lambda mid: _machine("user", "owner-sub"))
     app = FastAPI()
     app.include_router(remote_machines.router)

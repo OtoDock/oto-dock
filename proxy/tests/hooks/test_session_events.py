@@ -151,7 +151,10 @@ def test_tool_records_are_a_bounded_ring():
 # --- subagent_stop -----------------------------------------------------------
 
 def test_subagent_stop_marks_the_registry_and_dedups():
-    from core.session.session_state import get_subagent_registry, cleanup_session_permission_state
+    from core.session.session_state import (
+        cleanup_session_permission_state,
+        get_subagent_registry,
+    )
     sid = "s-sub"
     try:
         reg = get_subagent_registry(sid)

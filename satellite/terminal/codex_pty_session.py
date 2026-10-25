@@ -30,15 +30,18 @@ import sys
 import time
 from pathlib import Path
 
-from ..host import path_translator
-from .._vendored.codex_approvals import approval_for_sandbox
-from ..sessions.codex_session import (
-    _validate_config_toml, _write_codex_hook_scripts, _write_codex_hooks,
-)
-from ..config import otodock_dir, session_tools_env, write_command_wrappers
 from .._vendored import layout
+from .._vendored.codex_approvals import approval_for_sandbox, tui_reviewer_flags
+from ..config import otodock_dir, session_tools_env, write_command_wrappers
+from ..host import path_translator
 from ..sessions.codex_session import (
-    CODEX_TOOLS_TABLE, chmod_private, local_provider_toml, write_or_drop_auth_json,
+    CODEX_TOOLS_TABLE,
+    _validate_config_toml,
+    _write_codex_hook_scripts,
+    _write_codex_hooks,
+    chmod_private,
+    local_provider_toml,
+    write_or_drop_auth_json,
     write_or_drop_model_catalog,
 )
 from .pty_session_base import BasePtySession
@@ -60,7 +63,7 @@ _pinned_rollouts: set[str] = set()
 def _read_session_meta(path: str) -> dict | None:
     """Parse the first line (session_meta payload) of a rollout, or None."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             first = fh.readline()
         obj = json.loads(first)
     except (OSError, json.JSONDecodeError, ValueError):
@@ -71,8 +74,8 @@ def _read_session_meta(path: str) -> dict | None:
 
 
 def _build_codex_config_toml(
-    trusted_cwd: str, mcp_toml: str, local_provider: "dict | None" = None,
-    codex_dir: "Path | None" = None,
+    trusted_cwd: str, mcp_toml: str, local_provider: dict | None = None,
+    codex_dir: Path | None = None,
 ) -> str:
     """Build the interactive `codex` config.toml — satellite twin of the proxy's
     ``core.layers.codex.layer._write_config_toml(interactive=True, trusted_cwd=…)``.
@@ -319,6 +322,9 @@ class CodexPtySession(BasePtySession):
         model = self.config.get("model", "")
         if model:
             flags += ["-m", model]
+        # Auto (a 1.9 proxy's ``autoReview``) starts the terminal with
+        # Codex's own reviewer; every other mode keeps its own prompt.
+        flags += tui_reviewer_flags(self.config.get("permission_mode") or "")
         effort = self.config.get("effort", "")  # already codex-mapped by the proxy
         if effort:
             flags += ["-c", f'model_reasoning_effort="{effort}"']
@@ -413,7 +419,7 @@ class CodexPtySession(BasePtySession):
         except OSError:
             return False
 
-    def _locate_transcript_file(self) -> "Path | None":
+    def _locate_transcript_file(self) -> Path | None:
         """Discover THIS session's rollout JSONL under ``CODEX_HOME`` — satellite
         twin of ``codex_rollout_tailer.resolve_rollout_path``. The rollout is named
         ``rollout-<ts>-<thread_uuid>.jsonl`` (NOT by our session id), and CODEX_HOME

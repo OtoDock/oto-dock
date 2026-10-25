@@ -21,6 +21,10 @@ documented at [docs.otodock.io](https://docs.otodock.io).
   `dashboard/src/main.tsx`. It calls the proxy's REST API under `/v1/`. One
   websocket, `/ws/dashboard`, carries the chat and the live state. Voice uses
   three more: `/ws/audio/stt`, `/ws/audio/tts` and `/ws/duplex`.
+- **The Android app** is a Capacitor shell around the built dashboard, in
+  `dashboard/android/`. It adds native push, alarms and a location bridge. It
+  runs the same dashboard over the same sockets, against the server address
+  the person enters.
 - **The satellite** is a daemon for remote Linux, macOS and Windows
   machines, in `satellite/`. It runs agent sessions on those machines, on
   Python 3.10 and newer. It starts with `python -m satellite`. It keeps one
@@ -45,6 +49,10 @@ documented at [docs.otodock.io](https://docs.otodock.io).
   `mcps/_shared/`. An MCP runs inside a session's sandbox over stdio, or as a
   container. It calls back to the proxy over HTTP with the session's token.
 - **The catalogs** install at run time, through `proxy/services/community/`.
+  Each kind has its schema beside the manifest one:
+  `mcps/agent-template.schema.json` (an agent template's folder, read as one
+  document) and `mcps/skill.schema.json` (a skill's front matter), read
+  through `proxy/storage/catalog_schema.py`.
   Their sources are the OtoDock/community-mcps, community-skills and
   community-agents repositories. Community MCPs install into
   `mcps/community/`. Skills install into `mcps/skills/`.
@@ -110,7 +118,8 @@ happens, then where it happens in the code.
    then the platform itself. A remote placement returns the remote layer. An
    unknown engine id is refused. `get_execution_layer` does this, in
    `proxy/core/session/session_manager.py`. The placement order is decided
-   in `proxy/storage/remote_store.py`, which also holds the paired machines.
+   in `proxy/services/remote/remote_status.py` (`resolve_execution_target`),
+   and `proxy/storage/remote_store.py` holds the paired machines.
 6. **Start the engine in a sandbox.** For Claude Code, the CLI layer
    resolves the sandbox, and a persistent session spawns the CLI inside it.
    The sandbox is bubblewrap in its own network namespace. That namespace
@@ -215,11 +224,15 @@ the same. The remote layer is `RemoteExecutionLayer`, in
   - `stop_tracker.py` tells the proxy the turn ended and asks whether it may
     end.
   - `credential_helper.py` hands `git` and `gh` the account token for each
-    command, so no environment or file holds it.
+    command, so no environment or file holds it. It asks with the session's
+    command-line token, which the shell holds and no MCP server is given.
 - **The decision.** The gate posts to `/v1/hooks/permission`. There,
   `decide_tool_permission` is the single authority. It checks the path
   policy and the revocations first. Then it applies the session's permission
-  mode: default, accept edits, plan, don't ask or auto. The route lives in
+  mode: ask, auto, don't ask or plan, or the unattended mode of a task or a
+  call. In auto it allows reads, edits and the safe tools, and leaves the rest
+  to the engine's own reviewer. The modes live in
+  `proxy/core/permission_modes.py`, the route in
   `proxy/api/hooks/permission.py`.
 - **The path policy.** `proxy/auth/path_policy.py` decides what a session may
   read and write, by role, scope and placement.
@@ -227,10 +240,29 @@ the same. The remote layer is `RemoteExecutionLayer`, in
   every role on every host, an admin included. It holds on every engine,
   mode and placement:
   - On Claude Code, the hook enforces it.
-  - On Codex, the approval bridge and the hook enforce it. The bridge is
+  - On Codex, the hook enforces it on every call, and the approval bridge
+    on what crosses Codex's sandbox. The bridge is
     `proxy/core/layers/codex/codex_approvals.py`.
   - On the direct engine, its built-in tools enforce it.
   - On a satellite, the hooks the satellite runs enforce it.
+
+### Callers, tokens and agent folders
+
+- **Role guards.** `proxy/auth/providers/__init__.py` resolves the caller
+  and holds the base guards, such as `require_auth`, `require_admin` and
+  `require_human`. `proxy/api/_guards.py` holds the two checks the API
+  modules share beyond those, `require_manager` and
+  `require_creator_or_admin`. Each route passes its own refusal sentence,
+  and both answer 401 when there is no caller.
+- **Tokens.** `proxy/auth/tokens.py` signs and checks every token the
+  platform issues for itself. Each purpose is its own kind, with a key
+  derived from the platform secret and an audience of its own, so a token
+  of one kind never passes as another. A test keeps every read of the
+  signing secrets inside this module and the few key holders.
+- **Agent folders.** `get_agent_dir` in `proxy/config.py` names an agent's
+  folder. It joins the name under the agents directory and refuses a name
+  that is empty, absolute, holds a path separator or would leave that
+  directory.
 
 ### MCP servers and credentials
 
@@ -279,6 +311,8 @@ the same. The remote layer is `RemoteExecutionLayer`, in
   modules are these:
   - `scheduler.py` is the facade that starts, stops and registers tasks.
   - `runner.py` runs a task from its fire to its end.
+  - `task_run.py` holds the steps of one admitted run, from its start to
+    its result.
   - `trigger_manager.py` registers, validates and fires triggers.
 - **Apps.** `proxy/services/apps/` runs each app's server in its own
   sandbox, from a hash-checked release copy. `proxy/api/apps/app_proxy.py`
@@ -305,9 +339,12 @@ The host OS table is a twin instead. The proxy defines it in
 ## Rules the code enforces
 
 - **Layers point down.** `storage` imports nothing from the layers above it.
-  `core` and `services` never import `api` or `ws`. A few shared vocabulary
+  `core`, `services` and `configuration` never import `api` or `ws`. A few shared vocabulary
   modules may be imported from anywhere.
   `proxy/tests/core/test_import_layers.py` enforces these rules.
+  No upward import is left since 1.9.0. A lower layer that needs a higher
+  one's work takes a value passed in, or calls a function the higher layer
+  registers at startup.
   `proxy/core/execution_layer.py` is a leaf that every side may import.
   `proxy/tests/execution/test_import_direction.py` keeps it a leaf.
 - **No dropped tasks.** A task the proxy starts and does not keep goes
@@ -317,11 +354,19 @@ The host OS table is a twin instead. The proxy defines it in
 - **One authority per vocabulary.** Engine ids, placements, session kinds,
   roles, folder names, statuses and frame names are each defined once. The
   surface tests in `proxy/tests/` refuse a bare comparison anywhere else.
+- **Colours come from the tokens.** The dashboard's colours, type, radii,
+  shadows and motion are defined once, in `dashboard/design/tokens.json`.
+  `npm run tokens:build` writes the stylesheets and constants that read
+  them, and a test fails while a written file is stale. The ESLint rule
+  `otodock/no-raw-palette` refuses a palette class or a literal colour in
+  `dashboard/src/`. Palettes that are not the interface's, such as the
+  terminal's colours, are left out.
 - **No database on the event loop in periodic loops.** A periodic loop runs
   its store calls on the database executor.
   `proxy/tests/core/test_periodic_loops_offload.py` checks three such loops.
-- **Lint and types ratchet.** Ruff, ESLint and mypy froze the findings they
-  were adopted with. A new finding fails. "Code style" in
+- **Lint and types ratchet.** Ruff froze the findings it was adopted
+  with. ESLint's are all fixed, and mypy checks the whole proxy. A new
+  finding fails. "Code style" in
   [`CONTRIBUTING.md`](CONTRIBUTING.md) explains the ratchet.
 
 ## Where things live
@@ -338,7 +383,7 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `.github/` | GitHub workflows, issue templates and README media |
 | `LICENSES/` | the licence texts REUSE.toml points at (the FSL and the third-party ones) |
 | `audio/` | shared editable package: cloud STT/TTS core used by proxy and phone |
-| `dashboard/` | React + Vite + TypeScript frontend |
+| `dashboard/` | React + Vite + TypeScript frontend (and the Android wrapper) |
 | `mcps/` | first-party MCP servers, shared helpers, the catalog's installed skill packages |
 | `phone/` | phone-call service: telephony, STT/TTS pipeline, proxy client |
 | `proxy/` | FastAPI backend, the platform core |
@@ -352,6 +397,17 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `audio/models/` | local model wrappers |
 | `audio/providers/` | cloud STT/TTS providers |
 | `audio/streaming/` | streaming helpers |
+
+### `dashboard/`
+
+| Directory | What it holds |
+|---|---|
+| `dashboard/android/` | the Capacitor Android app that wraps the dashboard |
+| `dashboard/build/` | build helpers vite.config.ts imports (precompression, the build id) |
+| `dashboard/design/` | the design tokens (tokens.json), their generator, the colour lint, the codemod, the reference page, the Figma variables and the mark's masters with their export (brand/) |
+| `dashboard/public/` | static files served as they are (the favicons and logos, the setup page, the boot screen's script) |
+| `dashboard/src/` | the React app |
+| `dashboard/ui-kit/` | the UI kit served to artifacts and app pages (tokens CSS, licences) |
 
 ### `dashboard/src/`
 
@@ -384,11 +440,13 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `dashboard/src/components/common/` | shared widgets |
 | `dashboard/src/components/departments/` | departments editor |
 | `dashboard/src/components/engines/` | AI engine accounts: the API-key form and the subscription windows |
+| `dashboard/src/components/icons/` | inline outline icons shared by the settings shell and the avatar menu |
 | `dashboard/src/components/phone/` | phone call log and settings |
 | `dashboard/src/components/projects/` | delegation projects |
+| `dashboard/src/components/settings/` | the settings shell of User Settings, Agent Settings and Admin: the sidebar, the phone's section list, the section configs and the history trail behind back |
 | `dashboard/src/components/sharing/` | the share popover and the shared-with-me surfaces |
 | `dashboard/src/components/ui/` | primitives |
-| `dashboard/src/components/usage/` | usage caps: the subscription pool cap section |
+| `dashboard/src/components/usage/` | usage: the subscription pool cap section and the charts' colours |
 | `dashboard/src/components/workspace/` | workspace file browser and previews |
 
 ### `mcps/`
@@ -422,6 +480,7 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `proxy/api/` | HTTP endpoint routers, one subpackage per surface |
 | `proxy/assets/` | static assets the proxy serves |
 | `proxy/auth/` | authentication, path policy, OAuth and webhook providers |
+| `proxy/configuration/` | the parts of config.py behind its facade: the model registry, the system prompt's rendering, the value parsers and the key registry |
 | `proxy/core/` | sessions, sandbox, execution layers, remote execution, events |
 | `proxy/hooks/` | the scripts run inside agent sessions: the permission gate, the tool-result forwarder, the sub-agent and stop trackers, the command-line credential helper |
 | `proxy/scripts/` | proxy-side maintenance scripts |
@@ -453,7 +512,7 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 | `proxy/api/notifications/` | notifications |
 | `proxy/api/phone/` | phone servers, routes, call log, caller data, the call relay, the Twilio relay, the call tools' endpoint |
 | `proxy/api/remote/` | remote machines and targets |
-| `proxy/api/sessions/` | session control, warmup, plans, health |
+| `proxy/api/sessions/` | session control, plans, models, health |
 | `proxy/api/sharing/` | shares of apps and chats: internal grants, external links, the grantee surfaces |
 | `proxy/api/tasks/` | scheduled tasks and runs |
 
@@ -490,11 +549,11 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 
 | Directory | What it holds |
 |---|---|
-| `proxy/services/agents/` | agent state: the setup state, the offboarding event and its subscribers, Shared-only membership, the repository instruction files lifted into the prompt |
-| `proxy/services/apps/` | app storage and rendering |
+| `proxy/services/agents/` | agent state: the setup state, the offboarding event and its subscribers, Shared-only membership, the repository instruction files lifted into the prompt, the provisioning steps after an agent or a membership commits |
+| `proxy/services/apps/` | app storage and rendering, the actions manifest and the platform catalog |
 | `proxy/services/billing/` | licensing, usage accounting |
 | `proxy/services/checks/` | checks: documents and their index, the changed set, the evaluator and the four kinds, the judge's spend |
-| `proxy/services/community/` | community catalogs: MCPs, agents, skills |
+| `proxy/services/community/` | community catalogs: MCPs, agents (the template loader and its signatures), skills |
 | `proxy/services/delegation/` | agent-to-agent delegation |
 | `proxy/services/departments/` | the department-to-delegation-edge compiler |
 | `proxy/services/engines/` | engine subscriptions, the pool, local endpoints |
@@ -517,7 +576,7 @@ checks keep. A pull request that adds a directory leaves the tables to them.
 
 | Directory | What it holds |
 |---|---|
-| `proxy/storage/agents/` | agents, community agent templates, agent memory, departments |
+| `proxy/storage/agents/` | agents, agent memory, departments |
 | `proxy/storage/automation/` | tasks, triggers, notifications, webhook subscriptions |
 | `proxy/storage/billing/` | subscriptions and usage |
 | `proxy/storage/chat/` | chats and meetings |

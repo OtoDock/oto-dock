@@ -1,6 +1,6 @@
 ---
 name: delegation-guide
-description: Reference for the delegation-mcp tools — the delegate signature and surfaces, callbacks, monitoring with list_sessions/peek_session, project mode with the board file and staged flow, send_files, attach_result_files (a worker's deliverables), and reading other agents' sessions. Load before delegating work or running a multi-lane project.
+description: Reference for the delegation-mcp tools — the delegate signature and surfaces, callbacks, monitoring with list_sessions/peek_session, project mode with the board file and staged flow, send_files, attach_result_files (a worker's deliverables), moving a chat with move_chat, and reading other agents' sessions. Load before delegating work or running a multi-lane project.
 ---
 
 # Delegation — the guide
@@ -11,7 +11,7 @@ lightweight). This guide is the reference behind them.
 
 ## The `delegate` tool
 
-`delegate(name, prompt, surface, agent?, continue_id?, output_dir?, project_id?, model?, layer?, mode?, checks?)`
+`delegate(name, prompt, surface, agent?, continue_id?, output_dir?, project_id?, model?, layer?, mode?, machine?, checks?)`
 returns immediately; the worker runs in parallel and its result is delivered
 back into this session automatically when its turn completes. Never wait or
 poll — continue your own work.
@@ -39,6 +39,13 @@ or `non-interactive` (headless). Omit all three to inherit the target agent's
 defaults. With `continue_id`, `layer` and `mode` are ignored and `model`
 moves the continued worker to that model (below).
 
+`machine` picks where the worker's runs go: one of your person's own paired
+machines, or an admin machine when they are a platform admin, by its name or
+id. Leave it out (the agent's default) unless the person asks. A machine that
+is offline when the worker starts does not stop it: the run uses the default
+and its record says so. With `continue_id` it is ignored, because the
+worker's chat keeps its own machine.
+
 **Choosing `surface` (required, no default):**
 
 - **`chat`** — the worker is a real chat in the user's sidebar. Pick this for anything the user might want to peek into, collaborate on, or steer: coding lanes, drafts, research they care about mid-flight. The user talking to the worker is a feature, not an error.
@@ -60,6 +67,11 @@ synthesized. When the user interrupts a lane, the worker serves THEM directly
 in its own chat first — your callback is deferred until the lane settles and
 carries the full round: their `[User interjected]` lines AND the worker's
 replies. Fold that into your plan; don't re-delegate or assume the lane died.
+A result whose first line says **the worker ended without a report** did not
+finish: its turn was cut short (a usage limit, a refusal, the program
+stopping) before it attached a file or wrote a `Blocked on:` line. Its last
+message is not the outcome: continue the lane with the `continue_id` that
+line names (on another model after a limit or a refusal) to get the report.
 
 **When YOU are the worker** (your prompt starts with `[DELEGATED_WORK]`),
 attach the files you produced with `attach_result_files(paths, dest_dir?)`
@@ -112,6 +124,19 @@ for it (a lane's model is their spend).
   process restarts for it, so background work it still ran ends. Refused
   while the worker is mid-turn — wait for its result, or continue without a
   model — and when its chat has a live terminal open.
+
+## Moving a chat: `move_chat`
+
+`move_chat(machine?, chat_id?)` moves this chat to another place: the
+OtoDock platform, one of the person's own paired machines, or an admin machine
+for an admin.
+
+- **Listing the places.** Without `machine` it lists where this chat can run, each place with its id. A `*` marks where it runs now, `(default)` the person's default and `(offline)` a machine that is not connected. A place you cannot pick says why. Pass the id when two places share a name.
+- **Moving it.** When the person asks "run this on my laptop", call `move_chat(machine="laptop")`, then end your turn. The move happens when your turn ends. The chat takes its memory along when both places are online. When its current place is offline it continues there from a summary of the chat.
+- **You continue there.** After the move the platform starts your next turn on the new place by itself, with "You now run on <place>. Continue the work." Carry on with the task from where you stopped. A message the person sent meanwhile comes first instead. After ten moves in a row with no message from the person the chat stops and waits for them. A move of another chat (`chat_id`) does not continue it.
+- `machine="default"` moves it back to the person's default.
+- `chat_id` names another chat of the same person (from `list_sessions`). A session without a person can only name `default`.
+- A refusal is one sentence that says why. A scheduled move whose turn does not end within 30 minutes does not happen, and the chat says so. A scheduled move does not survive a restart of the platform.
 
 ## Monitoring — `list_sessions` / `peek_session`
 

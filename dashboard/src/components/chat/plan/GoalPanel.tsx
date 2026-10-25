@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
 import { pushEscHandler } from '../../../lib/escStack'
 import type { ThreadGoal } from '../../../hooks/useDashboardWs.types'
+import { GLASS, GLASS_HOVER } from '../../ui/glass'
+import { POPOVER } from '../../ui/classes'
 
 interface Props {
   goal: ThreadGoal | null
@@ -69,7 +71,7 @@ export default function GoalPanel({ goal }: Props) {
   const budget = typeof goal.token_budget === 'number' && goal.token_budget > 0
     ? goal.token_budget : null
   const pct = budget ? Math.min(100, Math.round((tokensUsed / budget) * 100)) : 0
-  const barColor = pct >= 100 ? 'bg-p-accent-red' : pct >= 80 ? 'bg-[#f4b206]' : 'bg-brand'
+  const barColor = pct >= 100 ? 'bg-status-danger-solid' : pct >= 80 ? 'bg-status-warning-solid' : 'bg-status-info-solid'
   const timeUsed = Number(goal.time_used_seconds) || 0
 
   return (
@@ -78,18 +80,18 @@ export default function GoalPanel({ goal }: Props) {
       <button
         onClick={() => setOpen(!open)}
         title={`Goal: ${goal.objective}`}
-        className={`relative w-10 h-10 rounded-xl bg-white/80 dark:bg-gray-900/80 backdrop-blur-xs border border-p-border-light shadow-xs
-                   hover:shadow-md hover:bg-white dark:hover:bg-p-surface transition-all flex items-center justify-center`}
+        className={`relative flex size-control-md items-center justify-center rounded-xl ${GLASS} ${GLASS_HOVER}
+                   transition-colors duration-fast`}
       >
         {/* Target icon */}
-        <svg className="w-5 h-5 text-p-text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+        <svg className="w-5 h-5 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor">
           <circle cx="12" cy="12" r="8" strokeWidth={1.5} />
           <circle cx="12" cy="12" r="4.5" strokeWidth={1.4} />
           <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" />
         </svg>
         {/* Budget badge — bottom-right */}
         {budget !== null && (
-          <span className="absolute -bottom-1 -right-1 min-w-[18px] h-[18px] rounded-full bg-brand text-white text-[9px] font-bold flex items-center justify-center px-1 border-2 border-white dark:border-gray-900">
+          <span className="absolute -bottom-1 -right-1 min-w-[18px] h-[18px] rounded-full bg-action text-action-fg text-3xs font-bold flex items-center justify-center px-1 border-2 border-surface-card">
             {pct}%
           </span>
         )}
@@ -97,22 +99,22 @@ export default function GoalPanel({ goal }: Props) {
 
       {/* Dropdown panel */}
       {open && (
-        <div className="mt-2 bg-white/95 dark:bg-gray-900/95 backdrop-blur-xs border border-p-border-light shadow-lg rounded-xl overflow-hidden
-                        w-64 sm:w-72 max-w-[calc(100vw-2rem)]">
+        <div className={`mt-2 ${POPOVER} overflow-hidden
+                        w-64 sm:w-72 max-w-[calc(100vw-2rem)]`}>
           {/* Header */}
-          <div className="flex items-center justify-between px-3 py-2 border-b border-p-border-light bg-p-bg/50">
-            <span className="text-xs font-medium text-p-text-secondary">
+          <div className="flex items-center justify-between px-3 py-2 border-b border-subtle">
+            <span className="text-xs font-medium text-secondary">
               Goal
               {statusLabel && (
-                <span className="ml-1.5 text-[10px] font-normal text-[#b8860b]">({statusLabel})</span>
+                <span className="ml-1.5 text-3xs font-normal text-status-warning-fg">({statusLabel})</span>
               )}
             </span>
-            <span className="text-xs text-p-text-light font-mono">
+            <span className="text-xs text-tertiary font-mono">
               {fmtDuration(timeUsed)}
             </span>
           </div>
           {/* Objective */}
-          <div className="px-3 py-2 text-xs text-p-text whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
+          <div className="px-3 py-2 text-xs text-primary whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
             {goal.objective}
           </div>
           {/* Budget */}
@@ -120,19 +122,19 @@ export default function GoalPanel({ goal }: Props) {
             {budget !== null ? (
               <>
                 <div className="flex items-center justify-between mb-1">
-                  <span className="text-[10px] text-p-text-light">Token budget</span>
-                  <span className="text-[10px] text-p-text-light font-mono">
+                  <span className="text-3xs text-tertiary">Token budget</span>
+                  <span className="text-3xs text-tertiary font-mono">
                     {fmtTokens(tokensUsed)} / {fmtTokens(budget)}
                   </span>
                 </div>
-                <div className="h-1.5 rounded-full bg-p-border/60 overflow-hidden">
+                <div className="h-1.5 rounded-full bg-surface-muted overflow-hidden">
                   <div className={`h-full rounded-full ${barColor} transition-all`} style={{ width: `${pct}%` }} />
                 </div>
               </>
             ) : tokensUsed > 0 ? (
               <div className="flex items-center justify-between">
-                <span className="text-[10px] text-p-text-light">Tokens used</span>
-                <span className="text-[10px] text-p-text-light font-mono">{fmtTokens(tokensUsed)}</span>
+                <span className="text-3xs text-tertiary">Tokens used</span>
+                <span className="text-3xs text-tertiary font-mono">{fmtTokens(tokensUsed)}</span>
               </div>
             ) : null}
           </div>

@@ -27,14 +27,16 @@ from typing import Any
 
 import httpx
 from mcp.server import Server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
 
+from _tool_args import ToolArgs
 
 AGENT_NAME = os.environ.get("OTO_AGENT_NAME", "")
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
 API_KEY = os.environ.get("PROXY_API_KEY", "")
 
 server = Server("ssh-hosts")
+TOOL_ARGS = ToolArgs()
 _client = httpx.AsyncClient(timeout=10.0)
 
 
@@ -76,12 +78,13 @@ _LIST_TOOL = Tool(
         "and this tool return the same data, but this is always fresh."
     ),
     inputSchema={"type": "object", "properties": {}, "required": []},
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
 )
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [_LIST_TOOL]
+    return TOOL_ARGS.listed([_LIST_TOOL])
 
 
 async def _handle_list_ssh_hosts(_args: dict) -> str:
@@ -108,15 +111,18 @@ async def _handle_list_ssh_hosts(_args: dict) -> str:
     return "\n".join(lines)
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     if name != "list_ssh_hosts":
         return [TextContent(type="text", text=f"❌ Unknown tool: {name}")]
     try:
         text = await _handle_list_ssh_hosts(arguments or {})
     except _ApiError as exc:
         text = f"❌ Error: {exc}"
-    except Exception as exc:  # noqa: BLE001 — last-resort guard
+    except Exception as exc:  # noqa: BLE001  # last-resort guard
         text = f"❌ Unexpected error: {type(exc).__name__}: {exc}"
     return [TextContent(type="text", text=text)]
 

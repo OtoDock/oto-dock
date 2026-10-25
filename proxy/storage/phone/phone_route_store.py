@@ -7,8 +7,8 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from storage.pg import get_conn
 from auth import roles
+from storage.pg import get_conn
 
 
 def _now() -> str:

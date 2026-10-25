@@ -20,7 +20,7 @@ pytest.importorskip("matplotlib")
 # Make the parent dir importable as a top-level module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from charts import _validate_series, handle_create_chart  # noqa: E402
+from charts import _validate_series, handle_create_chart
 
 
 @pytest.fixture(autouse=True)
@@ -37,7 +37,7 @@ def _capture_push(monkeypatch):
 
 
 def _run(args: dict) -> str:
-    return asyncio.get_event_loop().run_until_complete(handle_create_chart(args))
+    return asyncio.run(handle_create_chart(args))
 
 
 # ───────────────────────── wrong shapes error loudly ────────────────────────

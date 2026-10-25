@@ -46,7 +46,7 @@ def routing(monkeypatch):
     """Fresh connection/origin state + a captured FCM leg."""
     sent_fcm = []
 
-    async def fake_send_fcm(token, payload):
+    async def fake_send_fcm(token, payload, platform="android"):
         sent_fcm.append(payload)
 
     import services.notifications.push_sender as ps
@@ -171,6 +171,27 @@ async def test_pump_no_origin_no_active_pushes(routing):
     await nm.fire_ephemeral("u", "T", "B", chat_id="chat-1")
     assert len(routing["fcm"]) == 1
     assert routing["fcm"][0]["ephemeral"] is True
+
+
+async def test_an_iphone_token_gets_the_push_as_an_ios_one(monkeypatch):
+    sent = []
+
+    async def fake_send_fcm(token, payload, platform="android"):
+        sent.append((token, platform))
+
+    import services.notifications.push_sender as ps
+    from storage.automation import notification_store as ns
+    monkeypatch.setattr(ps, "send_fcm", fake_send_fcm)
+    monkeypatch.setattr(ns, "get_push_subscriptions", lambda u: [
+        {"platform": "android", "subscription_data": "tok-a"},
+        {"platform": "ios", "subscription_data": "tok-i"},
+        {"platform": "web", "subscription_data": "{}"},
+    ])
+    monkeypatch.setattr(nm, "_install_id", lambda: "INST")
+    monkeypatch.setattr(nm, "_user_connections", {})
+    monkeypatch.setattr(nm, "_chat_turn_origin", {})
+    await nm.fire_ephemeral("u", "T", "B", chat_id="chat-1")
+    assert sorted(sent) == [("tok-a", "android"), ("tok-i", "ios")]
 
 
 # --- interactive presence overlay --------------------------------------------
@@ -379,8 +400,8 @@ async def test_a_file_change_is_one_catalog_delta_whoever_watches(monkeypatch):
     catalog's ``file_changes`` delta (app servers, handlers) is emitted
     once per change: not once per watching member, and not skipped when
     nobody watches."""
-    from api.apps import catalog
     from core.remote import file_sync
+    from services.apps import catalog
     from storage import database as task_store
     deltas: list[list[str]] = []
     monkeypatch.setattr(catalog, "file_changed",

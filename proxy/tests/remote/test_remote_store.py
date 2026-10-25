@@ -1,7 +1,10 @@
 """Tests for remote machine storage layer."""
-import pytest
 from contextlib import contextmanager
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
 @pytest.fixture(autouse=True)
 def mock_db():
     """Mock get_conn for all tests in this module."""
@@ -60,8 +63,9 @@ class TestCreateRemoteMachine:
             )
 class TestExchangePairingToken:
     def test_valid_exchange(self, mock_db):
-        from storage.remote_store import exchange_pairing_token, _sha256
         from datetime import datetime, timezone
+
+        from storage.remote_store import _sha256, exchange_pairing_token
         token = "test-token-abc123"
         token_hash = _sha256(token)
         now = datetime.now(timezone.utc).isoformat()
@@ -75,8 +79,9 @@ class TestExchangePairingToken:
         secret = exchange_pairing_token("machine-1", token)
         assert len(secret) > 0
     def test_invalid_token_raises(self, mock_db):
-        from storage.remote_store import exchange_pairing_token, _sha256
         from datetime import datetime, timezone
+
+        from storage.remote_store import _sha256, exchange_pairing_token
         now = datetime.now(timezone.utc).isoformat()
         mock_db.execute.return_value.fetchone.return_value = {
             "pairing_token_hash": _sha256("correct-token"),
@@ -94,14 +99,14 @@ class TestExchangePairingToken:
             exchange_pairing_token("machine-1", "any-token")
 class TestVerifyMachineSecret:
     def test_valid_secret(self, mock_db):
-        from storage.remote_store import verify_machine_secret, _sha256
+        from storage.remote_store import _sha256, verify_machine_secret
         secret = "my-secret"
         mock_db.execute.return_value.fetchone.return_value = {
             "machine_secret_hash": _sha256(secret),
         }
         assert verify_machine_secret("machine-1", secret) is True
     def test_invalid_secret(self, mock_db):
-        from storage.remote_store import verify_machine_secret, _sha256
+        from storage.remote_store import _sha256, verify_machine_secret
         mock_db.execute.return_value.fetchone.return_value = {
             "machine_secret_hash": _sha256("correct-secret"),
         }
@@ -131,20 +136,20 @@ class TestResolveExecutionTarget:
     is queried via services.remote.remote_status.is_reachable, mocked per-test.
     """
     def test_no_user_returns_agent_default(self, mock_db):
-        from storage.remote_store import resolve_execution_target
+        from services.remote.remote_status import resolve_execution_target
         with patch("storage.agents.agent_store.get_agent") as mock_agent, \
              patch("services.remote.remote_status.is_reachable", return_value=True):
             mock_agent.return_value = {"execution_target": "machine-agent"}
             result = resolve_execution_target("test-agent", user_sub=None)
             assert result == ("machine-agent", None)
     def test_no_user_no_agent_returns_local(self, mock_db):
-        from storage.remote_store import resolve_execution_target
+        from services.remote.remote_status import resolve_execution_target
         with patch("storage.agents.agent_store.get_agent") as mock_agent:
             mock_agent.return_value = {"execution_target": "local"}
             result = resolve_execution_target("test-agent", user_sub=None)
             assert result == ("local", None)
     def test_user_override_online_takes_priority(self, mock_db):
-        from storage.remote_store import resolve_execution_target
+        from services.remote.remote_status import resolve_execution_target
         # Only one query — the per-agent row.
         mock_db.execute.return_value.fetchone.return_value = {
             "machine_id": "machine-user",
@@ -160,7 +165,7 @@ class TestResolveExecutionTarget:
             result = resolve_execution_target("test-agent", user_sub="user-1")
             assert result == ("machine-user", None)
     def test_user_offline_falls_back_to_agent(self, mock_db):
-        from storage.remote_store import resolve_execution_target
+        from services.remote.remote_status import resolve_execution_target
         # Only the per-agent query runs. Legacy global fallback gone.
         mock_db.execute.return_value.fetchone.return_value = {
             "machine_id": "machine-user",
@@ -178,7 +183,7 @@ class TestResolveExecutionTarget:
             result = resolve_execution_target("test-agent", user_sub="user-1")
             assert result == ("machine-agent", "user-override-offline")
     def test_user_no_target_uses_agent_default(self, mock_db):
-        from storage.remote_store import resolve_execution_target
+        from services.remote.remote_status import resolve_execution_target
         # Only one query — per-agent — returns None.
         mock_db.execute.return_value.fetchone.return_value = None
         with patch("storage.agents.agent_store.get_agent") as mock_agent, \
@@ -187,7 +192,7 @@ class TestResolveExecutionTarget:
             result = resolve_execution_target("test-agent", user_sub="user-1")
             assert result == ("machine-agent", None)
     def test_agent_specific_target_overrides_global(self, mock_db):
-        from storage.remote_store import resolve_execution_target
+        from services.remote.remote_status import resolve_execution_target
         # Agent-specific target found (first query)
         mock_db.execute.return_value.fetchone.return_value = {
             "machine_id": "machine-specific",

@@ -7,11 +7,11 @@ import asyncio
 import json
 
 import pytest
+from pipeline_fakes import FakeLLM, make_route
 
 from calls.call_manager import CallManager, CallStatus
 from config_manager import ConfigManager
 from duplex import capabilities_frame
-from pipeline_fakes import FakeLLM, make_route
 from proxy.client import ProxyClient
 from validation import ValidationError, validate_outbound_call
 

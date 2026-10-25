@@ -86,7 +86,7 @@ class AMIClient:
         banner = await asyncio.wait_for(
             self._reader.readline(), timeout=5.0,
         )
-        logger.info(f"AMI connected: {banner.decode().strip()}")
+        logger.info("AMI connected: %s", banner.decode().strip())
 
     async def login(self) -> None:
         """Authenticate with AMI."""
@@ -131,7 +131,7 @@ class AMIClient:
             "Async": "true",
         }
         response = await self._send_action(action)
-        logger.info(f"Originate response: {response}")
+        logger.info("Originate response: %s", response)
         return response
 
     async def _read_packet(self) -> dict:
@@ -166,7 +166,7 @@ class AMIClient:
             if not action_id and "Response" in packet:
                 return packet
 
-            logger.debug(f"Skipping AMI event: {packet.get('Event', packet)}")
+            logger.debug("Skipping AMI event: %s", packet.get('Event', packet))
 
         raise AMIError("No matching AMI response received")
 
@@ -178,7 +178,7 @@ class AMIClient:
             try:
                 self._writer.close()
                 await self._writer.wait_closed()
-            except Exception:
+            except Exception:  # noqa: BLE001  # closing a socket that is already going away
                 pass
             self._writer = None
             self._reader = None

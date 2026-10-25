@@ -351,7 +351,7 @@ class TestFenceWhitespaceIsTheCliClass:
         cli = json.loads(res.stdout)
         ours = [split_frontmatter("---" + chr(c) + "\nname: n\n---\n")[0] is not None
                 for c in cands]
-        mismatches = [hex(c) for c, a, b in zip(cands, cli, ours) if a != b]
+        mismatches = [hex(c) for c, a, b in zip(cands, cli, ours, strict=True) if a != b]
         assert mismatches == []
 
 

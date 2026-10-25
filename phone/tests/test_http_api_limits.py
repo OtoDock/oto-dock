@@ -41,11 +41,20 @@ def test_a_pin_cooldown_refuses_the_dial(monkeypatch):
     assert not store.route_locked("r-1")
 
 
+class _BadCharsetReq:
+    async def json(self):
+        # aiohttp decodes the body with the header's charset before parsing;
+        # an unknown charset raises LookupError, not ValueError.
+        raise LookupError("unknown encoding: bogus")
+
+
 def test_invalid_bodies_do_not_consume_the_limiter():
     api = _api(1)
     for _ in range(3):
         resp = asyncio.run(api._create_call(_Req({"phone_number": "not-a-number"})))
         assert resp.status == 400
+    resp = asyncio.run(api._create_call(_BadCharsetReq()))
+    assert resp.status == 400 and b"invalid JSON" in resp.body
     # The first valid body is admitted (and stops at the route lookup: the
     # stub config has no routes); the second is what the window refuses.
     valid = {"phone_number": "+302101234567", "task_description": "t", "route_id": "r-1"}

@@ -18,13 +18,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 import config as app_config
 from auth.providers import UserContext, get_current_user, require_auth
-from services.infra import git_writer
-from services.infra.path_confinement import PathOutsideRoot, resolve_under, safe_agent_dir
-from storage.agents import agent_store
-from storage import database as task_store
-from core.session import visibility as _vis
 from core import layout
-
+from core.session import visibility as _vis
+from services.infra import git_writer
+from services.infra.path_confinement import (
+    PathOutsideRoot,
+    resolve_under,
+)
+from storage import database as task_store
+from storage.agents import agent_store
 
 logger = logging.getLogger("otodock.git-history-api")
 router = APIRouter(prefix="/v1/internal/git")
@@ -41,8 +43,8 @@ def _authz_user_scope(u: UserContext, scope: str, user_sub: str | None) -> None:
 
 def _resolve_repo(scope: str, agent: str, user_sub: str | None) -> Path:
     if not agent_store.agent_exists(agent):
-        raise HTTPException(404, f"agent not found: {agent}")
-    agent_dir = safe_agent_dir(agent)
+        raise HTTPException(404, "This agent no longer exists.")
+    agent_dir = app_config.get_agent_dir(agent)
     if scope == _vis.SCOPE_AGENT:
         return agent_dir / layout.CONFIG
     if scope == layout.KNOWLEDGE:
@@ -51,12 +53,12 @@ def _resolve_repo(scope: str, agent: str, user_sub: str | None) -> Path:
         return agent_dir / layout.KNOWLEDGE
     if scope == _vis.SCOPE_USER:
         if not user_sub:
-            raise HTTPException(400, "user-scope git requires user_sub")
+            raise HTTPException(400, "Choose whose history to show.")
         username = task_store.get_username_by_sub(user_sub)
         if not username:
-            raise HTTPException(404, f"username not found for {user_sub}")
+            raise HTTPException(404, "That person's account no longer exists.")
         return layout.context_dir(agent_dir, username)
-    raise HTTPException(400, f"unknown scope: {scope!r}")
+    raise HTTPException(400, "That history does not exist.")
 
 
 @router.get("/log")
@@ -122,8 +124,8 @@ async def git_revert(
     repo = _resolve_repo(scope, agent, user_sub)
     try:
         target = resolve_under(repo / path, repo)
-    except PathOutsideRoot:
-        raise HTTPException(400, "path escapes repo")
+    except PathOutsideRoot as exc:
+        raise HTTPException(400, "path escapes repo") from exc
     new_sha = await asyncio.to_thread(
         git_writer.revert_file_to, repo, commit, target,
         message=f"revert {path} to {commit[:8]} (admin)",

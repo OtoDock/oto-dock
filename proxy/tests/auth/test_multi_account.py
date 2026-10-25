@@ -11,11 +11,13 @@ collide with other tests' data and don't need teardown.
 """
 
 import uuid
+from unittest.mock import ANY
+
 import pytest
 
+from services.oauth import credential_resolver
 from storage.identity import credential_store
 from storage.pg import get_conn
-from services.oauth import credential_resolver
 
 
 def _fresh_user_sub() -> str:
@@ -187,6 +189,24 @@ class TestAgentBinding:
         )
         assert len(bindings) == 1
         assert bindings[0]["account_label"] == "B"
+
+    def test_a_binding_carries_the_persons_reach_and_a_rebind_keeps_it(self, user_sub, mcp_name):
+        for label in ("A", "B"):
+            credential_store.set_user_credentials(user_sub, mcp_name, {"k": "v"}, account_label=label)
+        assert credential_store.set_account_agent_binding(
+            user_sub, mcp_name, "agent", "A", repositories=[" octo/a ", "octo/a", "octo/b"], read_only=True)
+        row = credential_store.get_account_agent_binding(user_sub, mcp_name, "agent")
+        assert row == ("A", ("octo/a", "octo/b"), True)
+        # A client that sends no reach never widens it, on any account.
+        assert credential_store.set_account_agent_binding(user_sub, mcp_name, "agent", "B")
+        assert credential_store.get_account_agent_binding(user_sub, mcp_name, "agent") == (
+            "B", ("octo/a", "octo/b"), True)
+        assert credential_store.list_agent_account_bindings(user_sub, mcp_name) == [{
+            "agent_name": "agent", "account_label": "B", "set_at": ANY,
+            "repositories": ["octo/a", "octo/b"], "read_only": True}]
+        assert credential_store.set_account_agent_binding(
+            user_sub, mcp_name, "agent", "B", repositories=[], read_only=False)
+        assert credential_store.get_account_agent_binding(user_sub, mcp_name, "agent") == ("B", (), False)
 
     def test_remove_binding_reverts_to_default(self, user_sub, mcp_name):
         credential_store.set_user_credentials(

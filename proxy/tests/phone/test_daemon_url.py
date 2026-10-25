@@ -34,11 +34,21 @@ def _resolver(*addresses):
 
 
 @pytest.mark.parametrize("url", [
-    "https://phone.example.com", "http://127.0.0.1:9093", "http://otodock-phone:9093",
+    "https://phone.example.com", "http://127.0.0.1:9093",
     "http://192.168.1.20:9093", "http://100.100.1.2:9093", "http://[fd12::1]:9093",
 ])
 def test_allowed(url):
     assert daemon_url.judge(url, resolve=_resolver("8.8.8.8")) is None
+
+
+def test_a_single_label_name_is_resolved_like_any_other():
+    """The Docker service's name resolves to its private address and
+    passes; the same name answering only a public address is refused with
+    the sentence (the dial refuses it too, ``client``)."""
+    url = "http://otodock-phone:9093"
+    assert daemon_url.judge(url, resolve=_resolver("172.18.0.5")) is None
+    assert "PHONE_SERVER_URL" in daemon_url.judge(url, resolve=_resolver("8.8.8.8"))
+    assert daemon_url.judge(url, resolve=_resolver()) is None
 
 
 def test_a_public_address_or_name_over_http_is_refused():
@@ -84,6 +94,7 @@ def test_the_relay_sends_nothing_on_a_refused_url(monkeypatch):
 def test_the_twilio_relay_forwards_nothing_on_a_refused_url(monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
+
     from api.phone import twilio_relay
 
     monkeypatch.setattr(config, "PHONE_SERVER_URL", "http://8.8.8.8:9093")

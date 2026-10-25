@@ -1,34 +1,31 @@
 import { Chat } from '../../api/chats'
 
-// Sidebar linkage accents for delegation participants. Role-based, always on
-// (operator decision, 2026-07-12 — replaced the per-project hues and the
-// >2-chats gating): every delegated worker gets a violet left border, every
-// orchestrator (any session that used delegate) an amber one. When a chat has
-// been quiet for a day the accent fades toward normal ("finish-fade") instead
-// of staying loud forever.
+// Sidebar linkage accents for delegation participants, role-based and
+// always on: one purple family (the agent accent, what delegation reads as
+// inside a chat too), ranked by strength. An orchestrator, any session that
+// used delegate, gets the full accent on a wider edge, so it is the row to
+// spot; a delegated worker gets the same accent at half strength. The edge
+// only: a purple row background is the live state (generating, active), so
+// the role never paints the row. Age is not encoded here: the row's time
+// says it.
 
-const WORKER_HUE = 'border-l-violet-500 dark:border-l-violet-400'
-const WORKER_HUE_FADED = 'border-l-violet-500/40 dark:border-l-violet-400/40'
-const ORCHESTRATOR_HUE = 'border-l-amber-500 dark:border-l-amber-400'
-const ORCHESTRATOR_HUE_FADED = 'border-l-amber-500/40 dark:border-l-amber-400/40'
+const WORKER_EDGE = 'border-l-2 border-l-accent-agent-solid/50'
+const ORCHESTRATOR_EDGE = 'border-l-[3px] border-l-accent-agent-solid'
+const NO_EDGE = 'border-l-2 border-l-transparent'
 
-const FADE_AFTER_MS = 24 * 3_600_000
+function role(chat: Chat): 'orchestrator' | 'worker' | null {
+  if (chat.delegate_role === 'orchestrator') return 'orchestrator'
+  if (chat.origin === 'delegated' || chat.delegate_role === 'worker') return 'worker'
+  return null
+}
 
-/** Border classes for one sidebar row ('' = no accent). The ACTIVE chat is
- * always '' — the sidebar draws its own brand selection bar there, and an
- * accent beside it reads as a double border. Pass `now` in tests. */
-export function rowAccentClass(
-  chat: Chat, opts: { now?: number; active?: boolean } = {},
-): string {
-  if (opts.active) return ''
-  const isOrchestrator = chat.delegate_role === 'orchestrator'
-  const isWorker =
-    chat.origin === 'delegated' || chat.delegate_role === 'worker'
-  if (!isOrchestrator && !isWorker) return ''
-  const updated = Date.parse(chat.updated_at) || 0
-  const faded = (opts.now ?? Date.now()) - updated > FADE_AFTER_MS
-  if (isOrchestrator) {
-    return faded ? ORCHESTRATOR_HUE_FADED : ORCHESTRATOR_HUE
-  }
-  return faded ? WORKER_HUE_FADED : WORKER_HUE
+/** The left-edge classes for one sidebar row. The ACTIVE chat gets the
+ * transparent edge: the sidebar draws its own selection bar there, and an
+ * accent beside it reads as a double border. */
+export function rowAccentClass(chat: Chat, opts: { active?: boolean } = {}): string {
+  if (opts.active) return NO_EDGE
+  const r = role(chat)
+  if (r === 'orchestrator') return ORCHESTRATOR_EDGE
+  if (r === 'worker') return WORKER_EDGE
+  return NO_EDGE
 }

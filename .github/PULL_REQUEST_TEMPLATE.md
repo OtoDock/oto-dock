@@ -6,12 +6,12 @@
 
 ## How it was tested
 
-<!-- The suites you ran (proxy pytest, audio, phone, satellite, dashboard build / vitest / lint) and any check on a running install. -->
+<!-- The suites you ran (proxy pytest, audio, phone, satellite, dashboard build / vitest / lint, the Android build and unit tests) and any check on a running install. -->
 
 ## Checklist
 
 - [ ] Tests cover the behaviour change and ride in this PR.
-- [ ] CI is green (proxy, audio, phone and satellite suites, dashboard type-check, build and tests, lint and types).
+- [ ] CI is green (proxy, audio, phone and satellite suites, dashboard type-check, build and tests, lint and types, and the Android build and unit tests when `dashboard/android/` changed).
 - [ ] A user-visible change has a line under `[Unreleased]` in `CHANGELOG.md`.
 - [ ] The READMEs and `ARCHITECTURE.md` match the change; a docs.otodock.io page that describes the old behaviour is named here (the docs site is maintained separately).
 - [ ] No secrets, no `config.env`, no personal data in the diff.

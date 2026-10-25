@@ -80,7 +80,7 @@ def latex_to_mathml(latex: str, display: bool = True) -> str:
         mathml = latex2mathml.converter.convert(
             tex, display="block" if display else "inline"
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  # latex2mathml raises anything on the caller's LaTeX
         raise EquationError(latex, f"LaTeX parse failed ({exc})") from None
     try:
         tree = etree.fromstring(mathml.encode())
@@ -105,7 +105,7 @@ def latex_to_omml_element(latex: str, display: bool = True):
     try:
         omml = mathml2omml.convert(mathml)
         wrapper = etree.fromstring(f'<w xmlns:m="{OMML_NS}">{omml}</w>'.encode())
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  # mathml2omml and lxml raise anything on a converted formula
         raise EquationError(latex, f"MathML→OMML conversion failed ({exc})") from None
     omath = wrapper[0]
     _inject_word_props(omath)
@@ -142,7 +142,7 @@ def omml_to_latex(omath_element) -> str | None:
             from dwml.omml import oMath2Latex
 
         return str(oMath2Latex(omath_element))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  # dwml raises anything on a document's OMML
         logger.debug(f"omml_to_latex failed: {exc}")
         return None
 
@@ -160,7 +160,7 @@ def latex_to_svg(latex: str, display: bool = True, size: float = 14) -> tuple[st
     try:
         expr = zm.Latex(tex, size=size)
         return expr.svg(), expr.getyofst()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  # ziamath raises anything on the caller's LaTeX
         raise EquationError(latex, f"SVG rendering failed ({exc})") from None
 
 

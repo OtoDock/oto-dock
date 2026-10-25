@@ -41,9 +41,14 @@ from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIO
 import config
 from auth import lan_check
 from core import log_queue
-from startup import lifespan
 from middleware import register_middlewares
-from static_assets import PrecompressedStaticFiles, is_hashed_asset, negotiated_file_response
+from services.infra.path_confinement import PathOutsideRoot
+from startup import lifespan
+from static_assets import (
+    PrecompressedStaticFiles,
+    is_hashed_asset,
+    negotiated_file_response,
+)
 
 # --- Logging ---
 
@@ -109,7 +114,16 @@ async def _validation_error(request: Request, exc: RequestValidationError):
     return JSONResponse(body, status_code=422)
 
 
-app.add_exception_handler(RequestValidationError, _validation_error)
+app.add_exception_handler(RequestValidationError, _validation_error)  # type: ignore[arg-type]  # Starlette types an exception handler as taking Exception; the handler registered for RequestValidationError receives one
+
+
+async def _no_such_agent(request: Request, exc: PathOutsideRoot):
+    """A name that cannot be an agent folder (``config.get_agent_dir``'s
+    barrier, before any existence check of the route's) names no agent."""
+    return JSONResponse({"detail": "Agent not found"}, status_code=404)
+
+
+app.add_exception_handler(PathOutsideRoot, _no_such_agent)  # type: ignore[arg-type]  # Starlette types an exception handler as taking Exception; the handler registered for PathOutsideRoot receives one
 
 
 # The ASGI scope types a request arrives as (a lifespan scope is neither).
@@ -323,7 +337,8 @@ class _BoundedWebSocketProtocol(WebSocketsSansIOProtocol):
             return
         logger.warning(
             "WebSocket %s read nothing for %.0fs with %d bytes waiting; dropping it",
-            "%s:%s" % self.client if self.client else "?", config.WS_WRITE_STALL_S, size,
+            f"{self.client[0]}:{self.client[1]}" if self.client else "?",
+            config.WS_WRITE_STALL_S, size,
         )
         self.transport.abort()
 
@@ -441,65 +456,85 @@ class _EveryFewSeconds(logging.Filter):
 
 # --- Include routers ---
 
-from api.auth import auth as auth_router
-from api.sessions import sessions as sessions_router
-from api.hooks import hooks as hooks_router
-from api.tasks import tasks as tasks_router
-from api.tasks import delegation as delegation_router
-from api.tasks import continuations as continuations_router
-from api.events import triggers as triggers_router
-from api.agents import agents as agents_router
-from api.agents import chats as chats_router
-from api.departments import departments as departments_router
-from api.notifications import notifications as notifications_router
-from api.mcp import credentials as credentials_router
-from api.mcp import gateway as mcp_gateway_router
-from api.auth import oauth as oauth_router
-from api.mcp import mcps as mcps_router
-from api.mcp import community as community_router
-from api.mcp import icons as mcp_icons_router
-from api.mcp import local_templates as local_templates_router
-from api.media import uploads as uploads_router
-from api.media import images as images_router
-from api.media import media as media_router
-from api.media import ui as ui_router
-from api.apps import apps as apps_router
-from api.apps import app_actions as app_actions_router
-from api.apps import app_proxy as app_proxy_router
-from api.apps import app_bindings as app_bindings_router
-from api.apps import app_secrets as app_secrets_router
-from api.apps import app_egress as app_egress_router
-from api.apps import app_inbound as app_inbound_router
-from api.sharing import shares as shares_router
-from api.sharing import external as external_shares_router
-from api.media import wopi as wopi_router
-from api.billing import usage as usage_router
-from api.admin import admin_storage as admin_storage_router
-from api.meetings import meetings as meetings_router
-from api.admin import execution_layers as execution_layers_router
-from api.auth import claude_oauth as claude_oauth_router
-from api.auth import openai_oauth as openai_oauth_router
-from api.auth import setup as setup_router
-from api.phone import phone as phone_router
-from api.phone import phone_relay as phone_relay_router
-from api.phone import call_control as call_control_router
-from api.phone import phone_usage as phone_usage_router
-from api.phone import twilio_relay as twilio_relay_router
+from api.admin import (
+    admin_storage as admin_storage_router,
+    execution_layers as execution_layers_router,
+    title_generation as title_generation_router,
+)
+from api.agent_data import git_history as git_history_router, memory as memory_router
+from api.agents import (
+    agents as agents_router,
+    chats as chats_router,
+    reply_reports as reply_reports_router,
+)
+from api.apps import (
+    app_actions as app_actions_router,
+    app_bindings as app_bindings_router,
+    app_egress as app_egress_router,
+    app_inbound as app_inbound_router,
+    app_proxy as app_proxy_router,
+    app_secrets as app_secrets_router,
+    apps as apps_router,
+)
 from api.audio import audio as audio_router
-from api.duplex import duplex as duplex_router
-from api.admin import title_generation as title_generation_router
-from api.internal import internal as internal_router
-from api.agent_data import memory as memory_router
-from api.agent_data import git_history as git_history_router
-from api.remote import remote_machines as remote_machines_router
-from api.media import collabora_proxy as collabora_proxy_router
-from api.auth import agent_api_keys as agent_api_keys_router
-from api.auth import user_api_keys as user_api_keys_router
-from api.events import webhooks as webhooks_router
-from api.events import subscriptions as subscriptions_router
-from api.billing import billing as billing_router
-from api.billing import account as account_router
+from api.auth import (
+    agent_api_keys as agent_api_keys_router,
+    auth as auth_router,
+    claude_oauth as claude_oauth_router,
+    oauth as oauth_router,
+    oauth_app as oauth_app_router,
+    openai_oauth as openai_oauth_router,
+    setup as setup_router,
+    user_api_keys as user_api_keys_router,
+)
+from api.billing import (
+    account as account_router,
+    billing as billing_router,
+    usage as usage_router,
+)
 from api.checks import checks as checks_router
+from api.departments import departments as departments_router
+from api.duplex import duplex as duplex_router
+from api.events import (
+    subscriptions as subscriptions_router,
+    triggers as triggers_router,
+    webhooks as webhooks_router,
+)
+from api.hooks import hooks as hooks_router
+from api.internal import internal as internal_router
+from api.mcp import (
+    community as community_router,
+    credentials as credentials_router,
+    gateway as mcp_gateway_router,
+    icons as mcp_icons_router,
+    local_templates as local_templates_router,
+    mcps as mcps_router,
+)
+from api.media import (
+    collabora_proxy as collabora_proxy_router,
+    images as images_router,
+    media as media_router,
+    ui as ui_router,
+    uploads as uploads_router,
+    wopi as wopi_router,
+)
+from api.meetings import meetings as meetings_router
+from api.notifications import notifications as notifications_router
+from api.phone import (
+    call_control as call_control_router,
+    phone as phone_router,
+    phone_relay as phone_relay_router,
+    phone_usage as phone_usage_router,
+    twilio_relay as twilio_relay_router,
+)
+from api.remote import remote_machines as remote_machines_router
+from api.sessions import sessions as sessions_router
+from api.sharing import external as external_shares_router, shares as shares_router
+from api.tasks import (
+    continuations as continuations_router,
+    delegation as delegation_router,
+    tasks as tasks_router,
+)
 
 app.include_router(auth_router.router)
 app.include_router(setup_router.router)
@@ -517,6 +552,7 @@ app.include_router(billing_router.router)
 app.include_router(account_router.router)
 app.include_router(agents_router.router)
 app.include_router(chats_router.router)
+app.include_router(reply_reports_router.router)
 app.include_router(departments_router.router)
 app.include_router(notifications_router.router)
 app.include_router(credentials_router.router)
@@ -528,6 +564,7 @@ app.include_router(mcp_gateway_router.router)
 app.include_router(claude_oauth_router.router)
 app.include_router(openai_oauth_router.router)
 app.include_router(oauth_router.router)
+app.include_router(oauth_app_router.router)
 app.include_router(mcps_router.router)
 app.include_router(community_router.router)
 app.include_router(mcp_icons_router.router)
@@ -568,12 +605,12 @@ app.include_router(collabora_proxy_router.router)
 
 # --- WebSocket endpoints ---
 
-from ws.phone import ws_phone_handler
+from ws.audio import ws_audio_stt_handler, ws_audio_tts_handler
 from ws.dashboard import ws_dashboard_handler
+from ws.duplex import ws_duplex_engine_handler, ws_duplex_handler
+from ws.phone import ws_phone_handler
 from ws.phone_management import ws_phone_management_handler
 from ws.satellite import ws_satellite_handler
-from ws.audio import ws_audio_stt_handler, ws_audio_tts_handler
-from ws.duplex import ws_duplex_handler, ws_duplex_engine_handler
 
 app.add_api_websocket_route("/ws/phone", ws_phone_handler)
 app.add_api_websocket_route("/ws/dashboard", ws_dashboard_handler)
@@ -703,16 +740,16 @@ async def spa_catchall(path: str, request: Request):
 
 
 if __name__ == "__main__":
-    logger.info(f"Starting OtoDock proxy on {config.HOST}:{config.PORT}")
+    logger.info("Starting OtoDock proxy on %s:%s", config.HOST, config.PORT)
     from storage.agents import agent_store as _as
     try:
-        logger.info(f"Agents: {', '.join(_as.get_agent_slugs())}")
-    except Exception as e:
+        logger.info("Agents: %s", ', '.join(_as.get_agent_slugs()))
+    except psycopg.Error as e:
         # Fresh DB: the schema (init_schema / run_migrations) is
         # created by the lifespan startup AFTER this banner runs. Don't crash
         # the boot just to log agent slugs — they exist once the app serves.
-        logger.info(f"Agents: (schema not yet initialized — {type(e).__name__})")
-    logger.info(f"Working dir: {config.AGENTS_DIR}")
+        logger.info("Agents: (schema not yet initialized — %s)", type(e).__name__)
+    logger.info("Working dir: %s", config.AGENTS_DIR)
     logger.info("MCP configs: per-agent (in agents/<name>/mcp-config.json)")
     # uvicorn re-raises the SIGTERM/SIGINT it served once its graceful
     # shutdown is done (the process exits by the signal, so atexit never
@@ -724,7 +761,7 @@ if __name__ == "__main__":
     logging.getLogger("uvicorn.error").addFilter(
         _EveryFewSeconds("Exceeded concurrency limit.", 10.0))
     server, sockets = _build_server(app)
-    logger.info(f"Internal listener on 127.0.0.1:{config.INTERNAL_LISTENER_PORT}")
+    logger.info("Internal listener on 127.0.0.1:%s", config.INTERNAL_LISTENER_PORT)
     server.run(sockets=sockets)
     if not server.started:
         # The startup failed (uvicorn.run exits with the same code).

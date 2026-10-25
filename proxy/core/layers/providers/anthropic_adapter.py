@@ -6,14 +6,21 @@ prompt and tools, content_block streaming events, server_tool_use blocks
 """
 
 import logging
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING, Any, cast
 
 import anthropic
 
 import config as app_config
 from core.layers.providers.base import (
-    ProviderAdapter, ProviderStreamEvent, ProviderUsage, ProviderError,
+    ProviderAdapter,
+    ProviderError,
+    ProviderStreamEvent,
+    ProviderUsage,
 )
+
+if TYPE_CHECKING:
+    from anthropic.types import ThinkingDelta
 
 logger = logging.getLogger("direct-runner")
 
@@ -137,7 +144,7 @@ class AnthropicAdapter(ProviderAdapter):
 
         try:
             # Build API kwargs
-            api_kwargs = {
+            api_kwargs: dict[str, Any] = {
                 "model": model,
                 "max_tokens": max_tokens,
                 "messages": _with_history_breakpoint(messages),
@@ -247,7 +254,7 @@ class AnthropicAdapter(ProviderAdapter):
                                 # opaque and stays ignored).
                                 yield ProviderStreamEvent(
                                     type="thinking_delta",
-                                    text=event.delta.thinking,
+                                    text=cast("ThinkingDelta", event.delta).thinking,
                                 )
 
                         elif event.type == "content_block_stop":
@@ -289,7 +296,7 @@ class AnthropicAdapter(ProviderAdapter):
                     message=str(e),
                     status_code=getattr(e, "status_code", 0),
                     retryable=getattr(e, "status_code", 0) in (429, 500, 502, 503),
-                )
+                ) from e
 
             # Extract usage
             if final_message and final_message.usage:

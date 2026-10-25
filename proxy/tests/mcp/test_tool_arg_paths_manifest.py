@@ -12,16 +12,16 @@ from pathlib import Path
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
-from services.mcp.mcp_registry import (  # noqa: E402
+from services.mcp.mcp_registry import (
     ToolArgPathDeclaration,
     _parse_manifest,
     _parse_tool_arg_paths,
     _validate_tool_arg_json_path,
 )
-
 
 # ---------------------------------------------------------------------------
 # JSONPath validator

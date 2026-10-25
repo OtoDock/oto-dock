@@ -11,9 +11,11 @@ import asyncio
 import contextlib
 import json
 import logging
-from typing import Callable
+from collections.abc import Callable
 
 import websockets
+
+from background import spawn
 
 logger = logging.getLogger("management_ws")
 
@@ -65,12 +67,12 @@ class ManagementWSClient:
 
             except asyncio.CancelledError:
                 break
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # the management link's reconnect loop must outlive any error
                 if not self._running:
                     break
                 logger.warning(
-                    f"Management WebSocket disconnected: {e}. "
-                    f"Reconnecting in {backoff:.0f}s..."
+                    "Management WebSocket disconnected: %s. "
+                    "Reconnecting in %.0fs...", e, backoff
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
@@ -94,26 +96,26 @@ class ManagementWSClient:
 
                 if not self._config_ready.is_set():
                     self._config_ready.set()
-                    logger.info(f"Initial config received (version={version})")
+                    logger.info("Initial config received (version=%s)", version)
                 else:
-                    logger.info(f"Config updated (version={version})")
+                    logger.info("Config updated (version=%s)", version)
 
                 if self.on_config_changed:
                     try:
                         self.on_config_changed(data)
-                    except Exception as e:
-                        logger.error(f"Config change handler error: {e}")
+                    except Exception as e:  # noqa: BLE001  # the config handler is the daemon's callback, the link goes on
+                        logger.error("Config change handler error: %s", e)
 
             elif msg_type == "ping":
                 try:
                     await ws.send(json.dumps({"type": "pong"}))
-                except Exception:
+                except Exception:  # noqa: BLE001  # the websocket's send raises by its state and transport
                     break
 
             elif msg_type == "duplex_open":
                 handler = self.on_duplex_open
                 if handler is not None:
-                    asyncio.create_task(handler(msg, ws))
+                    spawn(handler(msg, ws), name="duplex_open", owner="management")
 
     async def wait_for_config(self) -> dict:
         """Block until the first config is received from the proxy."""

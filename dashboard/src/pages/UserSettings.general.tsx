@@ -1,10 +1,10 @@
-import { useState, useEffect, useSyncExternalStore } from 'react'
+import { Fragment, useState, useEffect, useSyncExternalStore } from 'react'
 import QRCode from 'qrcode'
 import { isWakeDiagOn, setWakeDiag, subscribeWakeDiag } from '../audio/wakeDiag'
 import { useAuth } from '../contexts/AuthContext'
-import { apiFetch, fetchCurrentUser } from '../api/auth'
+import { fetchCurrentUser } from '../api/auth'
 import { deletePasskey, listPasskeys, passkeySupported, registerPasskey, renamePasskey, type PasskeyInfo } from '../api/webauthn'
-import { useTheme } from '../contexts/ThemeContext'
+
 import { useActivityDisplay, setActivityDisplay, type ActivityDisplayMode } from '../hooks/useActivityDisplay'
 import { useClearMyMemory } from '../api/memory'
 import { useMyAudioPrefs, useUpdateMyAudioPrefs } from '../api/userAudio'
@@ -12,6 +12,15 @@ import { useMyUiPrefs, useUpdateMyUiPrefs } from '../api/userUiPrefs'
 import { useWakeKeywords } from '../api/wakeWord'
 import { useChatAudioCapability } from '../hooks/useChatAudioCapability'
 import StrongConfirmModal from '../components/StrongConfirmModal'
+import InvokedForm from '../components/common/InvokedForm'
+import { useTheme } from '../contexts/useTheme'
+import { errorText, errorName, apiOk, apiJson, withMessage, toastError } from '../lib/http/apiJson'
+import Button from '../components/ui/Button'
+import { Input } from '../components/ui/Field'
+import { BUTTON_BASE, BUTTON_SIZE, CARD, CARD_BORDERED, SEGMENT } from '../components/ui/classes'
+import InfoTip from '../components/ui/InfoTip'
+import { CheckboxRow, SaveState } from '../components/ui/SettingsControls'
+import { useSaveState } from '../hooks/useSaveState'
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -28,27 +37,27 @@ export function ProfileSection() {
   const [saving, setSaving] = useState('')
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
+  const { stateOf, run } = useSaveState()
 
-  useEffect(() => {
+  // A profile change elsewhere replaces the drafts (in render, on the change).
+  const [profile, setProfile] = useState({ name: user?.display_name, email: user?.email })
+  if (profile.name !== user?.display_name || profile.email !== user?.email) {
+    setProfile({ name: user?.display_name, email: user?.email })
     setDisplayName(user?.display_name || '')
     setEmail(user?.email || '')
-  }, [user?.display_name, user?.email])
+  }
 
-  async function saveDisplayName() {
+  // A failure keeps what was typed.
+  function saveDisplayName() {
     if (!displayName.trim() || displayName === user?.display_name) return
-    setSaving('name'); setError(''); setSuccess('')
-    try {
-      const res = await apiFetch('/v1/users/me/profile', {
+    void run('name', async () => {
+      await apiOk('/v1/users/me/profile', {
         method: 'PUT',
         body: JSON.stringify({ display_name: displayName.trim() }),
-      })
-      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || 'Failed') }
+      }, 'Failed')
       const u = await fetchCurrentUser()
       if (u) setUser(u)
-      setSuccess('name')
-      setTimeout(() => setSuccess(''), 2000)
-    } catch (err: any) { setError(err.message) }
-    finally { setSaving('') }
+    }, { failTitle: 'The name was not saved' })
   }
 
   async function saveEmail() {
@@ -56,65 +65,63 @@ export function ProfileSection() {
     if (!emailPassword) { setError('Password required to change email'); return }
     setSaving('email'); setError(''); setSuccess('')
     try {
-      const res = await apiFetch('/v1/users/me/email', {
+      await apiOk('/v1/users/me/email', {
         method: 'PUT',
         body: JSON.stringify({ new_email: email.trim(), password: emailPassword }),
-      })
-      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || 'Failed') }
+      }, 'Failed')
       const u = await fetchCurrentUser()
       if (u) setUser(u)
       setEmailPassword('')
       setSuccess('email')
       setTimeout(() => setSuccess(''), 2000)
-    } catch (err: any) { setError(err.message) }
+    } catch (err) { setError(errorText(err)) }
     finally { setSaving('') }
   }
 
   return (
     <div className="mb-8">
-      <h2 className="text-lg font-medium text-p-text mb-3">Profile</h2>
-      {error && <div className="text-sm text-p-accent-red mb-3">{error}<button onClick={() => setError('')} className="ml-2 underline">dismiss</button></div>}
-      <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4 space-y-4">
+      <h2 className="font-display text-lg font-semibold text-primary mb-3">Profile</h2>
+      {error && <div className="text-sm text-status-danger-fg mb-3">{error}<button onClick={() => setError('')} className="ml-2 underline">dismiss</button></div>}
+      <div className={`${CARD} p-4 space-y-4`}>
         <div>
-          <label className="block text-xs font-medium text-p-text-secondary mb-1">Display Name</label>
+          <div className="mb-1">
+            <label className="text-xs font-medium text-secondary">Display Name</label>
+            <SaveState state={stateOf('name')} />
+          </div>
           <div className="flex gap-2">
-            <input type="text" value={displayName} onChange={e => setDisplayName(e.target.value)}
+            <Input type="text" value={displayName} onChange={e => setDisplayName(e.target.value)}
               onBlur={saveDisplayName}
-              className="flex-1 px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
-            {success === 'name' && <span className="text-xs text-green-600 dark:text-green-400 self-center animate-pulse">Saved</span>}
-            {saving === 'name' && <span className="text-xs text-p-text-secondary self-center">Saving...</span>}
+              className="flex-1" />
           </div>
         </div>
 
         <div>
-          <label className="block text-xs font-medium text-p-text-secondary mb-1">
-            Email {!isLocal && <span className="text-p-text-light">(managed by SSO provider)</span>}
+          <label className="block text-xs font-medium text-secondary mb-1">
+            Email{!isLocal && <span className="text-tertiary">, managed by your SSO provider</span>}
           </label>
           {isLocal ? (
             <div className="space-y-2">
-              <input type="email" value={email} onChange={e => setEmail(e.target.value)}
-                className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+              <Input type="email" value={email} onChange={e => setEmail(e.target.value)} />
               {email !== user?.email && (
                 <div className="flex gap-2">
-                  <input type="password" value={emailPassword} onChange={e => setEmailPassword(e.target.value)}
+                  <Input type="password" value={emailPassword} onChange={e => setEmailPassword(e.target.value)}
                     placeholder="Confirm password to change email"
-                    className="flex-1 px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
-                  <button onClick={saveEmail} disabled={saving === 'email'}
-                    className="px-3 py-2 text-xs font-medium text-white bg-brand hover:bg-brand-hover rounded-lg disabled:opacity-50">
+                    className="flex-1" />
+                  <Button variant="primary" size="xs" onClick={saveEmail} disabled={saving === 'email'}>
                     {saving === 'email' ? 'Saving...' : 'Update Email'}
-                  </button>
+                  </Button>
                 </div>
               )}
-              {success === 'email' && <span className="text-xs text-green-600 dark:text-green-400 animate-pulse">Email updated</span>}
+              {success === 'email' && <span className="text-xs text-status-success-fg">Email updated</span>}
             </div>
           ) : (
-            <p className="text-sm text-p-text px-3 py-2 bg-p-bg rounded-lg">{user?.email}</p>
+            <p className="text-sm text-primary px-3 py-2 bg-surface-sunken rounded-control">{user?.email}</p>
           )}
         </div>
 
         <div>
-          <label className="block text-xs font-medium text-p-text-secondary mb-1">Role</label>
-          <p className="text-sm text-p-text px-3 py-2 bg-p-bg rounded-lg capitalize">{user?.role}</p>
+          <label className="block text-xs font-medium text-secondary mb-1">Role</label>
+          <p className="text-sm text-primary px-3 py-2 bg-surface-sunken rounded-control capitalize">{user?.role}</p>
         </div>
       </div>
     </div>
@@ -140,44 +147,39 @@ export function SecuritySection() {
     if (newPw !== confirmPw) { setPwError('Passwords do not match'); return }
     setPwLoading(true)
     try {
-      const res = await apiFetch('/v1/users/me/password', {
+      await apiOk('/v1/users/me/password', {
         method: 'PUT',
         body: JSON.stringify({ current_password: currentPw, new_password: newPw }),
-      })
-      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || 'Failed') }
+      }, 'Failed')
       setPwSuccess(true); setCurrentPw(''); setNewPw(''); setConfirmPw('')
-    } catch (err: any) { setPwError(err.message) }
+    } catch (err) { setPwError(errorText(err)) }
     finally { setPwLoading(false) }
   }
 
   return (
     <div className="mb-8">
-      <h2 className="text-lg font-medium text-p-text mb-3">Security</h2>
+      <h2 className="font-display text-lg font-semibold text-primary mb-3">Security</h2>
 
       {/* Change Password */}
-      <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4 mb-4">
-        <h3 className="text-sm font-semibold text-p-text mb-3">Change Password</h3>
-        {pwError && <div className="text-sm text-p-accent-red mb-3">{pwError}</div>}
-        {pwSuccess && <div className="text-sm text-green-600 dark:text-green-400 mb-3">Password changed successfully.</div>}
+      <div className={`${CARD} p-4 mb-4`}>
+        <h3 className="text-sm font-semibold text-primary mb-3">Change Password</h3>
+        {pwError && <div className="text-sm text-status-danger-fg mb-3">{pwError}</div>}
+        {pwSuccess && <div className="text-sm text-status-success-fg mb-3">Password changed successfully.</div>}
         <form onSubmit={handleChangePassword} className="space-y-3">
           {/* Hidden username field: silences the browser's "password form should
               have a username field" a11y warning and lets password managers
               associate the change with this account. */}
           <input type="text" name="username" autoComplete="username"
             value={user?.email || ''} readOnly hidden aria-hidden="true" tabIndex={-1} />
-          <input type="password" value={currentPw} onChange={e => setCurrentPw(e.target.value)}
-            placeholder="Current password" required autoComplete="current-password"
-            className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
-          <input type="password" value={newPw} onChange={e => setNewPw(e.target.value)}
-            placeholder="New password" required autoComplete="new-password"
-            className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
-          <input type="password" value={confirmPw} onChange={e => setConfirmPw(e.target.value)}
-            placeholder="Confirm new password" required autoComplete="new-password"
-            className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
-          <button type="submit" disabled={pwLoading}
-            className="px-4 py-2 text-sm font-medium text-white bg-brand hover:bg-brand-hover rounded-lg disabled:opacity-50">
+          <Input type="password" value={currentPw} onChange={e => setCurrentPw(e.target.value)}
+            placeholder="Current password" required autoComplete="current-password" />
+          <Input type="password" value={newPw} onChange={e => setNewPw(e.target.value)}
+            placeholder="New password" required autoComplete="new-password" />
+          <Input type="password" value={confirmPw} onChange={e => setConfirmPw(e.target.value)}
+            placeholder="Confirm new password" required autoComplete="new-password" />
+          <Button variant="primary" size="md" type="submit" disabled={pwLoading}>
             {pwLoading ? 'Changing...' : 'Change Password'}
-          </button>
+          </Button>
         </form>
       </div>
 
@@ -190,8 +192,6 @@ export function SecuritySection() {
 // ---------------------------------------------------------------------------
 // Two-Factor Section — passkeys + authenticator app, one card (local users)
 // ---------------------------------------------------------------------------
-
-const TF_INPUT = 'px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30'
 
 export function TwoFactorSection() {
   const { user, setUser } = useAuth()
@@ -214,15 +214,18 @@ export function TwoFactorSection() {
   const [totpCode, setTotpCode] = useState('')
   // Render the TOTP QR locally — the otpauth:// URI embeds the shared 2FA
   // secret, so it must never be sent to a third-party QR image service.
-  const [qrDataUrl, setQrDataUrl] = useState('')
+  // The QR image of the current secret (another secret shows none).
+  const [qr, setQr] = useState<{ uri: string; url: string } | null>(null)
+  const qrUri = totpSetup?.qr_uri
+  const qrDataUrl = qr && qr.uri === qrUri ? qr.url : ''
   useEffect(() => {
-    if (!totpSetup?.qr_uri) { setQrDataUrl(''); return }
+    if (!qrUri) return
     let cancelled = false
-    QRCode.toDataURL(totpSetup.qr_uri, { width: 200, margin: 1 })
-      .then((url) => { if (!cancelled) setQrDataUrl(url) })
-      .catch(() => { if (!cancelled) setQrDataUrl('') })
+    QRCode.toDataURL(qrUri, { width: 200, margin: 1 })
+      .then((url) => { if (!cancelled) setQr({ uri: qrUri, url }) })
+      .catch(() => { /* no image: the secret is shown as text */ })
     return () => { cancelled = true }
-  }, [totpSetup?.qr_uri])
+  }, [qrUri])
 
   async function refresh() {
     try {
@@ -233,7 +236,19 @@ export function TwoFactorSection() {
     } catch { /* list stays empty */ }
     finally { setLoaded(true) }
   }
-  useEffect(() => { refresh() }, [])
+  useEffect(() => {
+    let alive = true
+    listPasskeys()
+      .then((data) => {
+        if (!alive) return
+        setPasskeys(data.passkeys)
+        setPkFeature(data.enabled)
+        setPkRpHost(data.rp_host || '')
+      })
+      .catch(() => { /* list stays empty */ })
+      .finally(() => { if (alive) setLoaded(true) })
+    return () => { alive = false }
+  }, [])
 
   function openFlow(f: typeof flow) {
     setFlow(f); setAction(null); setError(''); setPassword(''); setAddName('')
@@ -248,61 +263,61 @@ export function TwoFactorSection() {
       await registerPasskey(password, addName.trim())
       closeAll()
       await refresh()
-    } catch (err: any) {
-      if (err?.name !== 'NotAllowedError') setError(err.message || 'Failed to add passkey')
+    } catch (err) {
+      if (errorName(err) !== 'NotAllowedError') setError(errorText(err) || 'Failed to add passkey')
     } finally { setBusy(false) }
   }
 
-  async function handlePasskeyAction() {
+  // `close` is the open box's own close, which gives the focus back (after a
+  // removal, to the next passkey).
+  async function handlePasskeyAction(close: (setClosed: () => void) => void) {
     if (!action) return
     setBusy(true); setError('')
     try {
       if (action.type === 'rename') await renamePasskey(action.id, actionName.trim(), password)
       else await deletePasskey(action.id, password)
-      closeAll()
+      close(closeAll)
       await refresh()
-    } catch (err: any) { setError(err.message || 'Failed') }
+    } catch (err) { setError(errorText(err) || 'Failed') }
     finally { setBusy(false) }
   }
 
   async function startTotpSetup() {
     setBusy(true); setError('')
     try {
-      const res = await apiFetch('/v1/users/me/totp/setup', { method: 'POST' })
-      if (!res.ok) throw new Error('Failed to start setup')
-      setTotpSetup(await res.json())
+      setTotpSetup(await apiJson<{ secret: string; qr_uri: string; recovery_codes: string[] }>(
+        '/v1/users/me/totp/setup', { method: 'POST' },
+      ).catch(withMessage('Failed to start setup')))
       setFlow('add-totp')
-    } catch (err: any) { setError(err.message || 'Failed to start setup') }
+    } catch (err) { setError(errorText(err) || 'Failed to start setup') }
     finally { setBusy(false) }
   }
 
   async function verifyTotp() {
     setBusy(true); setError('')
     try {
-      const res = await apiFetch('/v1/users/me/totp/verify', {
+      await apiOk('/v1/users/me/totp/verify', {
         method: 'POST',
         body: JSON.stringify({ code: totpCode }),
-      })
-      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || 'Invalid code') }
+      }, 'Invalid code')
       const u = await fetchCurrentUser()
       if (u) setUser(u)
       closeAll()
-    } catch (err: any) { setError(err.message) }
+    } catch (err) { setError(errorText(err)) }
     finally { setBusy(false) }
   }
 
   async function disableTotp() {
     setBusy(true); setError('')
     try {
-      const res = await apiFetch('/v1/users/me/totp', {
+      await apiOk('/v1/users/me/totp', {
         method: 'DELETE',
         body: JSON.stringify({ password }),
-      })
-      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.detail || 'Failed') }
+      }, 'Failed')
       const u = await fetchCurrentUser()
       if (u) setUser(u)
       closeAll()
-    } catch (err: any) { setError(err.message) }
+    } catch (err) { setError(errorText(err)) }
     finally { setBusy(false) }
   }
 
@@ -313,17 +328,46 @@ export function TwoFactorSection() {
 
   if (!loaded) return null
 
-  const boxError = error && <div className="text-sm text-p-accent-red">{error}</div>
+  const boxError = error && <div className="text-sm text-status-danger-fg">{error}</div>
   const nothingEnrolled = passkeys.length === 0 && !user?.totp_enabled
   // RP-bound: enrolling from an origin other than the configured public host
   // would fail in the browser — hide the button and explain instead.
   const pkRpMismatch = !!pkRpHost && window.location.hostname !== pkRpHost
   const canAddPasskey = pkFeature && passkeySupported() && !pkRpMismatch
 
+  // The passkey rename or remove box (password-confirmed, its error shown
+  // here) opens under the passkey it acts on.
+  const passkeyBox = action && (
+    <InvokedForm key={`${action.type}:${action.id}`} onCancel={closeAll} className="p-3 bg-surface-raised shadow-elevation-2 rounded-card space-y-2">
+      {(close) => (
+        <>
+          <p className="text-xs text-secondary">
+            {action.type === 'rename' ? 'Rename passkey' : 'Remove passkey'}. Confirm with your password.
+          </p>
+          {boxError}
+          {action.type === 'rename' && (
+            <Input type="text" value={actionName} onChange={e => setActionName(e.target.value)}
+              placeholder="Passkey name" />
+          )}
+          <div className="flex gap-2">
+            <Input type="password" value={password} onChange={e => setPassword(e.target.value)}
+              placeholder="Password" autoComplete="current-password" className="flex-1" />
+            <Button variant={action.type === 'delete' ? 'danger' : 'primary'} size="xs"
+              onClick={() => { void handlePasskeyAction(close) }}
+              disabled={busy || !password || (action.type === 'rename' && !actionName.trim())}>
+              {busy ? 'Working...' : action.type === 'rename' ? 'Rename' : 'Remove'}
+            </Button>
+            <Button variant="ghost" size="xs" onClick={() => close(closeAll)}>Cancel</Button>
+          </div>
+        </>
+      )}
+    </InvokedForm>
+  )
+
   return (
-    <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4">
-      <h3 className="text-sm font-semibold text-p-text mb-1">Two-Factor Authentication</h3>
-      <p className="text-xs text-p-text-secondary mb-3">
+    <div className={`${CARD} p-4`}>
+      <h3 className="text-sm font-semibold text-primary mb-1">Two-Factor Authentication</h3>
+      <p className="text-xs text-secondary mb-3">
         {nothingEnrolled
           ? 'Add an extra layer of security with a passkey or an authenticator app.'
           : 'Your account is protected by a second factor.'}
@@ -332,138 +376,111 @@ export function TwoFactorSection() {
       <div className="space-y-3">
         {/* Enrolled factors — passkeys first, authenticator after */}
         {passkeys.map(pk => (
-          <div key={pk.credential_id} className="flex items-center justify-between gap-3 px-3 py-2 border border-p-border-light rounded-lg">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <svg className="w-4 h-4 text-brand shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
-              </svg>
-              <div className="min-w-0">
-                <p className="text-sm text-p-text truncate">{pk.name}</p>
-                <p className="text-[10px] text-p-text-light">
-                  Passkey · Added {formatWhen(pk.created_at)} · Last used {formatWhen(pk.last_used)}
-                </p>
+          <Fragment key={pk.credential_id}>
+            <div className={`${CARD_BORDERED} flex items-center justify-between gap-3 px-3 py-2`}>
+              <div className="flex items-center gap-2.5 min-w-0">
+                <svg className="w-4 h-4 text-secondary shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                    d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+                </svg>
+                <div className="min-w-0">
+                  <p className="text-sm text-primary truncate">{pk.name}</p>
+                  <p className="text-3xs text-tertiary">
+                    Passkey · Added {formatWhen(pk.created_at)} · Last used {formatWhen(pk.last_used)}
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-2 shrink-0">
+                <button onClick={() => { setAction({ type: 'rename', id: pk.credential_id }); setActionName(pk.name); setFlow(null); setPassword(''); setError('') }}
+                  className="text-xs text-link hover:text-link-hover font-medium">Rename</button>
+                <button onClick={() => { setAction({ type: 'delete', id: pk.credential_id }); setFlow(null); setPassword(''); setError('') }}
+                  className="text-xs text-status-danger-fg hover:underline font-medium">Remove</button>
               </div>
             </div>
-            <div className="flex gap-2 shrink-0">
-              <button onClick={() => { setAction({ type: 'rename', id: pk.credential_id }); setActionName(pk.name); setFlow(null); setPassword(''); setError('') }}
-                className="text-xs text-brand hover:text-brand-hover font-medium">Rename</button>
-              <button onClick={() => { setAction({ type: 'delete', id: pk.credential_id }); setFlow(null); setPassword(''); setError('') }}
-                className="text-xs text-p-accent-red hover:underline font-medium">Remove</button>
-            </div>
-          </div>
+            {action?.id === pk.credential_id && passkeyBox}
+          </Fragment>
         ))}
         {!!user?.totp_enabled && (
-          <div className="flex items-center justify-between gap-3 px-3 py-2 border border-p-border-light rounded-lg">
+          <div className={`${CARD_BORDERED} flex items-center justify-between gap-3 px-3 py-2`}>
             <div className="flex items-center gap-2.5">
-              <svg className="w-4 h-4 text-brand shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg className="w-4 h-4 text-secondary shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                   d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" />
               </svg>
               <div>
-                <p className="text-sm text-p-text">Authenticator app</p>
-                <p className="text-[10px] text-p-text-light">Time-based codes · recovery codes issued at setup</p>
+                <p className="text-sm text-primary">Authenticator app</p>
+                <p className="text-3xs text-tertiary">Time-based codes · recovery codes issued at setup</p>
               </div>
             </div>
             <button onClick={() => openFlow('disable-totp')}
-              className="text-xs text-p-accent-red hover:underline font-medium shrink-0">Remove</button>
-          </div>
-        )}
-
-        {/* Passkey rename/remove box (password-confirmed; error shown HERE) */}
-        {action && (
-          <div className="p-3 bg-p-bg rounded-lg space-y-2">
-            <p className="text-xs text-p-text-secondary">
-              {action.type === 'rename' ? 'Rename passkey' : 'Remove passkey'} — confirm with your password.
-            </p>
-            {boxError}
-            {action.type === 'rename' && (
-              <input type="text" value={actionName} onChange={e => setActionName(e.target.value)}
-                placeholder="Passkey name" className={`w-full ${TF_INPUT}`} />
-            )}
-            <div className="flex gap-2">
-              <input type="password" value={password} onChange={e => setPassword(e.target.value)}
-                placeholder="Password" autoComplete="current-password" className={`flex-1 ${TF_INPUT}`} />
-              <button onClick={handlePasskeyAction}
-                disabled={busy || !password || (action.type === 'rename' && !actionName.trim())}
-                className={`px-3 py-2 text-xs font-medium rounded-lg disabled:opacity-50 ${
-                  action.type === 'delete'
-                    ? 'border border-p-accent-red text-p-accent-red hover:bg-red-50 dark:hover:bg-red-900/20'
-                    : 'text-white bg-brand hover:bg-brand-hover'
-                }`}>
-                {busy ? 'Working...' : action.type === 'rename' ? 'Rename' : 'Remove'}
-              </button>
-              <button onClick={closeAll} className="px-3 py-2 text-xs text-p-text-secondary hover:text-p-text">Cancel</button>
-            </div>
+              className="text-xs text-status-danger-fg hover:underline font-medium shrink-0">Remove</button>
           </div>
         )}
 
         {/* Add-passkey box */}
         {flow === 'add-passkey' && (
-          <div className="p-3 bg-p-bg rounded-lg space-y-2">
-            <p className="text-xs text-p-text-secondary">Confirm your password, then follow your browser's passkey prompt.</p>
+          <div className="p-3 bg-surface-raised shadow-elevation-2 rounded-card space-y-2">
+            <p className="text-xs text-secondary">Confirm your password, then follow your browser's passkey prompt.</p>
             {boxError}
-            <input type="text" value={addName} onChange={e => setAddName(e.target.value)}
-              placeholder="Name (e.g. This laptop)" className={`w-full ${TF_INPUT}`} />
+            <Input type="text" value={addName} onChange={e => setAddName(e.target.value)}
+              placeholder="Name, e.g. This laptop" />
             <div className="flex gap-2">
-              <input type="password" value={password} onChange={e => setPassword(e.target.value)}
-                placeholder="Password" autoComplete="current-password" className={`flex-1 ${TF_INPUT}`} />
-              <button onClick={handleAddPasskey} disabled={busy || !password}
-                className="px-3 py-2 text-xs font-medium text-white bg-brand hover:bg-brand-hover rounded-lg disabled:opacity-50">
+              <Input type="password" value={password} onChange={e => setPassword(e.target.value)}
+                placeholder="Password" autoComplete="current-password" className="flex-1" />
+              <Button variant="primary" size="xs" onClick={handleAddPasskey} disabled={busy || !password}>
                 {busy ? 'Waiting...' : 'Create passkey'}
-              </button>
-              <button onClick={closeAll} className="px-3 py-2 text-xs text-p-text-secondary hover:text-p-text">Cancel</button>
+              </Button>
+              <Button variant="ghost" size="xs" onClick={closeAll}>Cancel</Button>
             </div>
           </div>
         )}
 
         {/* Authenticator setup box (QR → verify) */}
         {flow === 'add-totp' && totpSetup && (
-          <div className="p-3 bg-p-bg rounded-lg space-y-3">
+          <div className="p-3 bg-surface-raised shadow-elevation-2 rounded-card space-y-3">
             {boxError}
-            <p className="text-sm text-p-text">Scan this QR code with your authenticator app:</p>
-            <div className="bg-white p-4 rounded-lg inline-block border border-p-border-light">
+            <p className="text-sm text-primary">Scan this QR code with your authenticator app:</p>
+            {/* eslint-disable-next-line otodock/no-raw-palette -- a QR code keeps its light quiet zone in both themes */}
+            <div className="bg-white p-4 rounded-card inline-block">
               {qrDataUrl ? <img src={qrDataUrl} alt="TOTP QR Code" className="w-48 h-48" /> : <div className="w-48 h-48" />}
             </div>
             <div>
-              <p className="text-xs text-p-text-secondary mb-1">Or enter this key manually:</p>
-              <code className="text-xs font-mono bg-white dark:bg-p-surface px-2 py-1 rounded-sm select-all">{totpSetup.secret}</code>
+              <p className="text-xs text-secondary mb-1">Or enter this key manually:</p>
+              <code className="text-xs font-mono bg-surface-sunken px-2 py-1 rounded-sm select-all">{totpSetup.secret}</code>
             </div>
-            <div className="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg">
-              <p className="text-xs font-medium text-amber-800 dark:text-amber-300 mb-1">Recovery Codes</p>
-              <p className="text-xs text-amber-700 dark:text-amber-400 mb-2">Save these codes in a safe place. Each can only be used once.</p>
+            <div className="p-3 bg-status-warning-bg border border-status-warning-border rounded-card">
+              <p className="text-xs font-medium text-status-warning-fg mb-1">Recovery Codes</p>
+              <p className="text-xs text-status-warning-fg mb-2">Save these codes in a safe place. Each can only be used once.</p>
               <div className="grid grid-cols-2 gap-1">
                 {totpSetup.recovery_codes.map((code, i) => (
-                  <code key={i} className="text-xs font-mono bg-white dark:bg-p-surface px-2 py-1 rounded-sm">{code}</code>
+                  <code key={i} className="text-xs font-mono bg-surface-card px-2 py-1 rounded-sm">{code}</code>
                 ))}
               </div>
             </div>
             <div className="flex gap-2">
-              <input type="text" value={totpCode} onChange={e => setTotpCode(e.target.value)}
+              <Input type="text" value={totpCode} onChange={e => setTotpCode(e.target.value)}
                 placeholder="000000" maxLength={6} autoComplete="one-time-code"
-                className={`w-32 text-center font-mono ${TF_INPUT}`} />
-              <button onClick={verifyTotp} disabled={busy || totpCode.length !== 6}
-                className="px-4 py-2 text-sm font-medium text-white bg-brand hover:bg-brand-hover rounded-lg disabled:opacity-50">
-                {busy ? 'Verifying...' : 'Verify & enable'}
-              </button>
-              <button onClick={closeAll} className="px-3 py-2 text-xs text-p-text-secondary hover:text-p-text">Cancel</button>
+                className="max-w-32 text-center font-mono" />
+              <Button variant="primary" size="md" onClick={verifyTotp} disabled={busy || totpCode.length !== 6}>
+                {busy ? 'Verifying...' : 'Verify and enable'}
+              </Button>
+              <Button variant="ghost" size="xs" onClick={closeAll}>Cancel</Button>
             </div>
           </div>
         )}
 
         {/* Disable-authenticator box */}
         {flow === 'disable-totp' && (
-          <div className="p-3 bg-p-bg rounded-lg space-y-2">
-            <p className="text-xs text-p-text-secondary">Remove the authenticator app — confirm with your password.</p>
+          <div className="p-3 bg-surface-raised shadow-elevation-2 rounded-card space-y-2">
+            <p className="text-xs text-secondary">Remove the authenticator app. Confirm with your password.</p>
             {boxError}
             <div className="flex gap-2">
-              <input type="password" value={password} onChange={e => setPassword(e.target.value)}
-                placeholder="Password" autoComplete="current-password" className={`flex-1 ${TF_INPUT}`} />
-              <button onClick={disableTotp} disabled={busy || !password}
-                className="px-3 py-2 text-xs font-medium border border-p-accent-red text-p-accent-red rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50">
+              <Input type="password" value={password} onChange={e => setPassword(e.target.value)}
+                placeholder="Password" autoComplete="current-password" className="flex-1" />
+              <Button variant="danger" size="xs" onClick={disableTotp} disabled={busy || !password}>
                 {busy ? 'Removing...' : 'Remove'}
-              </button>
-              <button onClick={closeAll} className="px-3 py-2 text-xs text-p-text-secondary hover:text-p-text">Cancel</button>
+              </Button>
+              <Button variant="ghost" size="xs" onClick={closeAll}>Cancel</Button>
             </div>
           </div>
         )}
@@ -472,50 +489,46 @@ export function TwoFactorSection() {
         {flow === null && !action && (
           nothingEnrolled ? (
             <div className="space-y-2">
-              {error && <div className="text-sm text-p-accent-red">{error}</div>}
+              {error && <div className="text-sm text-status-danger-fg">{error}</div>}
               {canAddPasskey && (
-                <button onClick={() => openFlow('add-passkey')}
-                  className="w-full flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-brand hover:bg-brand-hover rounded-lg">
+                <Button variant="primary" size="md" onClick={() => openFlow('add-passkey')}
+                  className="w-full">
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                       d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
                   </svg>
                   Add a passkey
-                </button>
+                </Button>
               )}
-              <button onClick={startTotpSetup} disabled={busy}
-                className={`w-full px-4 py-2 text-sm font-medium rounded-lg disabled:opacity-50 ${
-                  canAddPasskey
-                    ? 'border border-p-border-light text-p-text hover:bg-p-surface-hover'
-                    : 'text-white bg-brand hover:bg-brand-hover'
-                }`}>
+              <Button variant={canAddPasskey ? 'secondary' : 'primary'} size="md" onClick={startTotpSetup} disabled={busy}
+                className="w-full">
                 {busy ? 'Setting up...' : 'Use an authenticator app'}
-              </button>
+              </Button>
               {!pkFeature && (
-                <p className="text-[10px] text-p-text-light">
-                  Passkeys need this platform to be served from an HTTPS address — ask your administrator.
+                <p className="text-3xs text-tertiary">
+                  Passkeys need OtoDock on a secure https:// address. Ask your administrator.
                 </p>
               )}
               {pkRpMismatch && (
-                <p className="text-[10px] text-p-text-light">
-                  Passkeys can only be added and used at https://{pkRpHost} — open OtoDock there.
+                <p className="text-3xs text-tertiary">
+                  Passkeys can only be added and used at https://{pkRpHost}. Open OtoDock there.
                 </p>
               )}
             </div>
           ) : (
             <div className="flex flex-wrap items-center gap-3">
-              {error && <div className="w-full text-sm text-p-accent-red">{error}</div>}
+              {error && <div className="w-full text-sm text-status-danger-fg">{error}</div>}
               {canAddPasskey && (
                 <button onClick={() => openFlow('add-passkey')}
-                  className="text-xs font-medium text-brand hover:text-brand-hover">+ Add another passkey</button>
+                  className="text-xs font-medium text-link hover:text-link-hover">+ Add another passkey</button>
               )}
               {!user?.totp_enabled && (
                 <button onClick={startTotpSetup} disabled={busy}
-                  className="text-xs font-medium text-brand hover:text-brand-hover disabled:opacity-50">+ Set up an authenticator app</button>
+                  className="text-xs font-medium text-link hover:text-link-hover disabled:opacity-50">+ Set up an authenticator app</button>
               )}
               {pkRpMismatch && (
-                <p className="w-full text-[10px] text-p-text-light">
-                  Passkeys can only be added and used at https://{pkRpHost} — open OtoDock there.
+                <p className="w-full text-3xs text-tertiary">
+                  Passkeys can only be added and used at https://{pkRpHost}. Open OtoDock there.
                 </p>
               )}
             </div>
@@ -587,20 +600,18 @@ export function AppearanceSection() {
 
   return (
     <div className="mb-8">
-      <h2 className="text-lg font-medium text-p-text mb-3">Appearance</h2>
-      <p className="text-sm text-p-text-secondary mb-4">
+      <h2 className="font-display text-lg font-semibold text-primary mb-3">Appearance</h2>
+      <p className="text-sm text-secondary mb-4">
         Choose how the dashboard looks.
       </p>
-      <div className="flex gap-2">
+      <div role="group" aria-label="Theme" className="flex flex-wrap gap-2">
         {themeOptions.map(opt => (
           <button
             key={opt.value}
+            type="button"
             onClick={() => setTheme(opt.value)}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-              theme === opt.value
-                ? 'bg-brand text-white'
-                : 'bg-white dark:bg-p-surface border border-p-border-light text-p-text-secondary hover:text-p-text'
-            }`}
+            aria-pressed={theme === opt.value}
+            className={`${BUTTON_BASE} ${BUTTON_SIZE['md']} ${theme === opt.value ? SEGMENT.on : SEGMENT.off}`}
           >
             {opt.icon}
             {opt.label}
@@ -608,20 +619,18 @@ export function AppearanceSection() {
         ))}
       </div>
       <div className="mt-6">
-        <h3 className="text-sm font-medium text-p-text mb-1">Chat activity</h3>
-        <p className="text-sm text-p-text-secondary mb-3">
-          Compact folds tool activity into expandable summaries.
-        </p>
-        <div className="flex gap-2">
+        <div className="mb-3">
+          <h3 className="inline text-sm font-medium text-primary">Chat activity</h3>
+          <InfoTip label="Chat activity">Compact folds tool activity into expandable summaries.</InfoTip>
+        </div>
+        <div role="group" aria-label="Chat activity" className="flex flex-wrap gap-2">
           {activityOptions.map(opt => (
             <button
               key={opt.value}
+              type="button"
               onClick={() => setActivityDisplay(opt.value)}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                activityDisplay === opt.value
-                  ? 'bg-brand text-white'
-                  : 'bg-white dark:bg-p-surface border border-p-border-light text-p-text-secondary hover:text-p-text'
-              }`}
+              aria-pressed={activityDisplay === opt.value}
+              className={`${BUTTON_BASE} ${BUTTON_SIZE['md']} ${activityDisplay === opt.value ? SEGMENT.on : SEGMENT.off}`}
             >
               {opt.icon}
               {opt.label}
@@ -643,49 +652,54 @@ function WakeWordSection() {
 
   const wakeable = (kw?.agents ?? []).filter((a) => a.wakeable)
   const platformTarget = kw?.agents?.find((a) => a.slug === kw?.platform_target)
+  const { stateOf, run } = useSaveState()
 
   return (
     <div className="mb-8">
-      <h2 className="text-lg font-medium text-p-text mb-3">Wake word</h2>
-      <p className="text-sm text-p-text-secondary mb-3">
-        Say “Hey OtoDock” — or “Hey” plus an agent’s name — on any dashboard
-        page to start a voice conversation. Detection runs entirely on this
-        device: audio never leaves it until a conversation actually starts,
-        and the microphone is only active while the dashboard is open.
+      <div className="mb-3">
+        <h2 className="inline font-display text-lg font-semibold text-primary">Wake word</h2>
+        <InfoTip label="Wake word">
+          To start a voice conversation, say “Hey OtoDock” on any dashboard
+          page. You can also say “Hey” plus an agent’s name. Detection runs
+          only on this device. Audio never leaves it until a conversation
+          starts.
+        </InfoTip>
+        <SaveState state={stateOf('wake_word')} />
+      </div>
+      <p className="text-sm text-secondary mb-3">
+        The microphone is only on while the dashboard is open.
       </p>
-      <div className="flex gap-2">
+      <div role="group" aria-label="Wake word" className="flex gap-2">
         {([false, true] as const).map((value) => (
           <button
             key={String(value)}
-            onClick={() => update.mutate({ wake_word_enabled: value })}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-              enabled === value
-                ? 'bg-brand text-white'
-                : 'bg-white dark:bg-p-surface border border-p-border-light text-p-text-secondary hover:text-p-text'
-            }`}
+            type="button"
+            onClick={() => { void run('wake_word', () => update.mutateAsync({ wake_word_enabled: value }), { failTitle: 'The wake word setting was not saved' }) }}
+            aria-pressed={enabled === value}
+            className={`${BUTTON_BASE} ${BUTTON_SIZE['md']} ${enabled === value ? SEGMENT.on : SEGMENT.off}`}
           >
             {value ? 'On' : 'Off'}
           </button>
         ))}
       </div>
       {enabled && !duplexOk && (
-        <p className="text-xs text-p-text-light mt-2">
+        <p className="text-xs text-tertiary mt-2">
           Voice conversations are currently unavailable
-          {capability?.duplex?.reason ? ` (${capability.duplex.reason})` : ''} —
-          the wake word will activate once they are.
+          {capability?.duplex?.reason ? `: ${capability.duplex.reason}` : ''}.
+          The wake word will turn on once they are back.
         </p>
       )}
       {enabled && duplexOk && kw?.enabled === false && (
-        <p className="text-xs text-p-text-light mt-2">
+        <p className="text-xs text-tertiary mt-2">
           Wake word is not active
-          {kw?.reason ? ` (${kw.reason})` : ''} — add an agent to your
+          {kw?.reason ? ` (${kw.reason})` : ''}. Add an agent to your
           account and it will start listening.
         </p>
       )}
       {enabled && kw?.enabled && (
-        <p className="text-xs text-p-text-light mt-2">
+        <p className="text-xs text-tertiary mt-2">
           {platformTarget
-            ? <>“Hey OtoDock” opens {platformTarget.display_name} (your favorite agent). </>
+            ? <>“Hey OtoDock” opens your favorite agent, {platformTarget.display_name}. </>
             : null}
           {wakeable.length > 0 && (
             <>Also listening for: {wakeable.map((a) => `“Hey ${a.display_name}”`).join(', ')}.</>
@@ -714,7 +728,7 @@ function WakeDiagControl() {
         type="button"
         aria-expanded={expanded}
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1 text-xs text-p-text-light hover:text-p-text transition-colors"
+        className="flex items-center gap-1 text-xs text-tertiary hover:text-primary transition-colors"
       >
         <svg
           viewBox="0 0 16 16"
@@ -727,17 +741,16 @@ function WakeDiagControl() {
       </button>
       {expanded && (
         <div className="mt-2">
-          <button
+          <Button variant="secondary" size="sm"
             type="button"
             onClick={() => setWakeDiag(!on)}
-            className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:text-p-text transition-colors"
           >
             {on ? 'Stop recording diagnostics' : 'Record diagnostics'}
-          </button>
-          <p className="text-xs text-p-text-light mt-2">
+          </Button>
+          <p className="text-xs text-tertiary mt-2">
             {on
-              ? 'Recording: a small badge at the bottom right shows the listener state. Say the wake phrase once, wait a few seconds, then use Save on the badge to store the last 30 seconds and the event log as one local file. Nothing is uploaded.'
-              : 'For troubleshooting a missed wake phrase: keeps the last 30 seconds the listener hears in memory, on this device only, until you save it to a file or stop.'}
+              ? 'Recording. A small badge at the bottom right shows what the listener is doing. Say the wake phrase once and wait a few seconds. Then press Save on the badge. It saves the last 30 seconds and the event log in one local file. Nothing is uploaded.'
+              : 'Helps when the wake phrase is missed. It keeps the last 30 seconds the listener hears, on this device only. It holds them until you save them to a file or stop.'}
           </p>
         </div>
       )}
@@ -751,19 +764,18 @@ function MyMemorySection() {
   const [lastResult, setLastResult] = useState<{ files: number; agents: number } | null>(null)
   return (
     <div className="mb-8">
-      <h2 className="text-lg font-medium text-p-text mb-3">Memory</h2>
-      <p className="text-sm text-p-text-secondary mb-3">
-        Personal memories agents have captured about you (preferences, patterns).
+      <h2 className="font-display text-lg font-semibold text-primary mb-3">Memory</h2>
+      <p className="text-sm text-secondary mb-3">
+        Personal memories agents have captured about you, like your preferences and patterns.
         Clearing deletes your memory topic files across every agent.
       </p>
-      <button
+      <Button variant="danger" size="sm"
         onClick={() => setConfirming(true)}
-        className="px-3 py-1.5 text-sm rounded-lg border border-red-300 text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
       >
         Clear my memory across all agents
-      </button>
+      </Button>
       {lastResult !== null && (
-        <p className="text-xs text-p-text-light mt-2">
+        <p className="text-xs text-tertiary mt-2">
           Cleared {lastResult.files} memory {lastResult.files === 1 ? 'file' : 'files'}
           {' '}across {lastResult.agents} {lastResult.agents === 1 ? 'agent' : 'agents'}.
         </p>
@@ -773,9 +785,8 @@ function MyMemorySection() {
           title="Clear my memory"
           description={
             <>
-              Delete your memory topic files across every agent. Git history is
-              preserved — an admin can recover the file via the per-agent
-              Git History tab.
+              Delete your memory topic files across every agent. An admin can
+              still recover them from the agent's Git history.
             </>
           }
           confirmWord="CLEAR-MY-MEMORY"
@@ -784,12 +795,12 @@ function MyMemorySection() {
           isPending={clear.isPending}
           onCancel={() => setConfirming(false)}
           onConfirm={() => {
-            clear.mutate(undefined, {
-              onSuccess: (r) => {
+            clear.mutateAsync(undefined)
+              .then((r) => {
                 setLastResult({ files: r.files_unlinked, agents: r.agents_affected })
                 setConfirming(false)
-              },
-            })
+              })
+              .catch(toastError('The memory was not cleared'))
           }}
         />
       )}
@@ -809,25 +820,21 @@ export function NotificationsSection() {
   const update = useUpdateMyUiPrefs()
   // Absent means on: the alerts ship enabled and the bag only stores an opt-out.
   const alertsOn = prefs?.subscription_usage_alerts !== false
+  const { stateOf, run } = useSaveState()
 
   return (
     <div className="mb-8">
-      <h2 className="text-lg font-medium text-p-text mb-3">Notifications</h2>
-      <label className="flex items-start gap-3 cursor-pointer">
-        <input
-          type="checkbox"
-          checked={alertsOn}
-          onChange={(e) => update.mutate({ subscription_usage_alerts: e.target.checked })}
-          className="mt-0.5 h-4 w-4 text-brand rounded-sm focus:ring-2 focus:ring-brand/30"
-        />
-        <span>
-          <span className="block text-sm font-medium text-p-text">Subscription usage alerts</span>
-          <span className="block text-sm text-p-text-secondary">
-            A notification when one of your connected Claude or ChatGPT accounts passes 90% of its
-            weekly limit, and another when the limit is reached.
-          </span>
-        </span>
-      </label>
+      <h2 className="font-display text-lg font-semibold text-primary mb-3">Notifications</h2>
+      <CheckboxRow
+        label="Subscription usage alerts"
+        checked={alertsOn}
+        save={stateOf('alerts')}
+        onChange={(on) => { void run('alerts', () => update.mutateAsync({ subscription_usage_alerts: on }), { failTitle: 'The alert setting was not saved' }) }}
+        info={<>
+          This watches your connected Claude and ChatGPT accounts. You get a notification when
+          one passes 90% of its weekly limit. You get another when it reaches the limit.
+        </>}
+      />
     </div>
   )
 }
@@ -843,42 +850,33 @@ export function AppsSection() {
   // Absent means on for both: the bag only stores an opt-out.
   const focusOn = prefs?.share_focus_with_agents !== false
   const openOn = prefs?.agents_may_open_apps !== false
+  const { stateOf, run } = useSaveState()
 
   return (
     <div className="mb-8" data-testid="settings-apps">
-      <h2 className="text-lg font-medium text-p-text mb-3">Apps</h2>
+      <h2 className="font-display text-lg font-semibold text-primary mb-3">Apps</h2>
       <div className="space-y-3">
-        <label className="flex items-start gap-3 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={focusOn}
-            onChange={(e) => update.mutate({ share_focus_with_agents: e.target.checked })}
-            className="mt-0.5 h-4 w-4 text-brand rounded-sm focus:ring-2 focus:ring-brand/30"
-          />
-          <span>
-            <span className="block text-sm font-medium text-p-text">Agents know which app I am looking at</span>
-            <span className="block text-sm text-p-text-secondary">
-              While an app is open on your screen, the agent you are talking to is told its name, so
-              "update this" needs no explanation. Nobody else learns what you are looking at.
-            </span>
-          </span>
-        </label>
-        <label className="flex items-start gap-3 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={openOn}
-            onChange={(e) => update.mutate({ agents_may_open_apps: e.target.checked })}
-            className="mt-0.5 h-4 w-4 text-brand rounded-sm focus:ring-2 focus:ring-brand/30"
-          />
-          <span>
-            <span className="block text-sm font-medium text-p-text">Agents may open apps on my screen</span>
-            <span className="block text-sm text-p-text-secondary">
-              An agent can bring up one of its apps for you: in the chat you are in it opens right
-              away, anywhere else you get a notice with an Open button. Only on a screen you are
-              using, a few times a minute at most.
-            </span>
-          </span>
-        </label>
+        <CheckboxRow
+          label="Agents know which app I am looking at"
+          checked={focusOn}
+          save={stateOf('focus')}
+          onChange={(on) => { void run('focus', () => update.mutateAsync({ share_focus_with_agents: on }), { failTitle: 'The app setting was not saved' }) }}
+          description="Nobody else learns what you are looking at."
+          info={<>
+            While an app is on your screen, the agent you talk to learns its name. So
+            "update this" needs no explanation.
+          </>}
+        />
+        <CheckboxRow
+          label="Agents may open apps on my screen"
+          checked={openOn}
+          save={stateOf('open')}
+          onChange={(on) => { void run('open', () => update.mutateAsync({ agents_may_open_apps: on }), { failTitle: 'The app setting was not saved' }) }}
+          info={<>
+            An agent can bring up one of its apps for you. In the chat you are in, it opens right
+            away. Anywhere else, you get a notice with an Open button.
+          </>}
+        />
       </div>
     </div>
   )

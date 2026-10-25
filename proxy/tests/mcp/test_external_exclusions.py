@@ -18,8 +18,9 @@ _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from tests.mcp.test_mcp_broker_activation import (  # noqa: E402
-    _FakeManifest, _stub_assembly,
+from tests.mcp.test_mcp_broker_activation import (
+    _FakeManifest,
+    _stub_assembly,
 )
 
 
@@ -204,7 +205,7 @@ class TestUnavailableTools:
 
 
 # ---------------------------------------------------------------------------
-# Direct manager + shipped manifests + HTTP warmup
+# Direct manager + shipped manifests + the retired HTTP warmup
 # ---------------------------------------------------------------------------
 
 class TestDirectManager:
@@ -237,10 +238,6 @@ SHIPPED_EXTERNAL_OPT_OUTS = [
 @pytest.mark.parametrize("name", SHIPPED_EXTERNAL_OPT_OUTS)
 def test_shipped_manifest_declares_the_external_opt_out(name):
     path = PROXY_DIR.parent / "mcps" / "custom" / name / "manifest.json"
-    if not path.exists():
-        # Not every MCP is in every cut (the public snapshot leaves out the
-        # ones staged with the mobile apps); the hard set below still binds.
-        pytest.skip(f"{name} is not part of this tree")
     manifest = json.loads(path.read_text())
     assert "external" in manifest.get("exclude_from", []), name
 
@@ -250,45 +247,25 @@ def test_hard_set_is_a_subset_of_the_shipped_opt_outs():
     assert EXTERNAL_DENIED_MCPS <= set(SHIPPED_EXTERNAL_OPT_OUTS)
 
 
-class TestHttpWarmup:
-    def test_phone_mode_is_refused(self, monkeypatch, temp_db):
-        import config
-        from fastapi.testclient import TestClient
-        from app import app
-        monkeypatch.setattr(config, "is_master_key", lambda k: k == "master")
-        client = TestClient(app)
-        r = client.post("/v1/sessions/warmup",
-                        json={"model": "x", "phone_mode": True, "call_type": "inbound"},
-                        headers={"Authorization": "Bearer master"})
-        assert r.status_code == 410
-        # A session token cannot warm sessions at all.
-        from tests.conftest import live_session_token
-        tok = live_session_token("00000000-0000-4000-8000-000000000000", "x")
-        r = client.post("/v1/sessions/warmup", json={"model": "x"},
-                        headers={"Authorization": f"Bearer {tok}"})
-        assert r.status_code == 403
+def test_the_http_warmup_route_is_gone(monkeypatch, temp_db):
+    """``POST /v1/sessions/warmup`` is retired: it is off the master key's
+    allowlist, so the key is refused there like on any other path, and a
+    session token never could warm a session."""
+    from fastapi.testclient import TestClient
 
-    @pytest.mark.asyncio
-    async def test_a_cli_warmup_builds_its_mcp_config_for_its_session(self, monkeypatch):
-        import config
-        from api.sessions import sessions
-        from services.mcp import mcp_registry as reg
-        monkeypatch.setattr(config, "is_master_key", lambda k: k == "master")
-        monkeypatch.setattr(config, "build_agent_prompt", lambda *a, **kw: "")
-        seen = {}
-
-        def _fake_build(agent, user_sub, **kw):
-            seen.update(kw)
-            return None, {}, {}, {}, set()
-
-        async def _fake_session(**kw):
-            seen["warmed"] = kw["session_id"]
-
-        monkeypatch.setattr(reg, "build_session_mcp_config", _fake_build)
-        monkeypatch.setattr(sessions, "get_or_create_persistent_session", _fake_session)
-        out = await sessions.warmup_session_endpoint(
-            sessions.WarmupRequest(model="x", session_id="s-warm"),
-            authorization="Bearer master",
-        )
-        assert out["session_id"] == "s-warm"
-        assert seen["session_id"] == "s-warm" and seen["warmed"] == "s-warm"
+    import config
+    from app import app
+    from auth.service_endpoints import is_service_endpoint_allowed
+    assert not is_service_endpoint_allowed("POST", "/v1/sessions/warmup")
+    monkeypatch.setattr(config, "API_KEY", "master")
+    client = TestClient(app)
+    r = client.post("/v1/sessions/warmup", json={"model": "x"},
+                    headers={"Authorization": "Bearer master"})
+    assert r.status_code == 403 and "service key" in r.json()["detail"]
+    from tests.conftest import live_session_token
+    tok = live_session_token("00000000-0000-4000-8000-000000000000", "x")
+    r = client.post("/v1/sessions/warmup", json={"model": "x"},
+                    headers={"Authorization": f"Bearer {tok}"})
+    # No POST route under that path: the DELETE of ``/v1/sessions/{id}``
+    # answers the method refusal.
+    assert r.status_code == 405

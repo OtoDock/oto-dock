@@ -1,0 +1,665 @@
+{
+ "chat": {
+  "cache_read": 66591,
+  "cache_write": 8618,
+  "codex_thread_id": null,
+  "context_max": 1000000,
+  "context_used": 19599,
+  "engine_cost_session_id": "sid-pr-tools",
+  "engine_cost_total": 0.046387,
+  "last_abort_graceful": false,
+  "last_response_at": true,
+  "last_turn_aborted": false,
+  "output_tokens": 524,
+  "permission_mode": "ask",
+  "thread_goal": null,
+  "title_generated": false,
+  "total_cost": 0.046387
+ },
+ "frames": [
+  {
+   "event": {
+    "description": "",
+    "title": "Example",
+    "type": "url",
+    "url": "https://example.com"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "Order: the",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "images": [
+     {
+      "attribution": "",
+      "caption": "A chart",
+      "image_data": "iVBORw0KGgo=",
+      "link_url": "",
+      "url": ""
+     }
+    ],
+    "type": "images"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " ls com",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "es first, and",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " the Write com",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "es before",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " the Read and",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " Edit. The Read has",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " to fin",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "ish before the Edit, because",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " the Edit needs a pr",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "ior",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " Read.",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " The ls and",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " the Write don",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "'t depend on each other, so",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " I'll run them together.",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "",
+    "note": true,
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Bash",
+    "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+    "type": "tool_start"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Bash",
+    "summary": "List files in current directory",
+    "tool_input": {
+     "command": "ls -la",
+     "description": "List files in current directory"
+    },
+    "type": "tool_info"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Bash",
+    "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+    "type": "tool_end"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Write",
+    "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+    "type": "tool_start"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Write",
+    "summary": "note.txt",
+    "tool_input": {
+     "content": "first line\nsecond line\n",
+     "file_path": "/users/dev-admin/workspace/note.txt"
+    },
+    "type": "tool_info"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Write",
+    "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+    "type": "tool_end"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Read",
+    "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+    "type": "tool_start"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Read",
+    "summary": "note.txt",
+    "tool_input": {
+     "file_path": "/users/dev-admin/workspace/note.txt"
+    },
+    "type": "tool_info"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Read",
+    "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+    "type": "tool_end"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Edit",
+    "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+    "type": "tool_start"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Edit",
+    "summary": "note.txt",
+    "tool_input": {
+     "file_path": "/users/dev-admin/workspace/note.txt",
+     "new_string": "edited",
+     "old_string": "second line"
+    },
+    "type": "tool_info"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "name": "Edit",
+    "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+    "type": "tool_end"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "\n\n",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "I list",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "ed the emp",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "ty folder, created `note.",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "txt` with two lines,",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " read it back, and edited the",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " second line to",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " \"",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "edited\".",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " All four",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": " t",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "ool calls succ",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "content": "eeded.",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "cache_read": 66591,
+    "cache_write": 8618,
+    "context_max": 1000000,
+    "context_used": 19599,
+    "cost_billed": true,
+    "cost_usd": 0.046387099999999994,
+    "duration_ms": 10038,
+    "input_tokens": 8,
+    "output_tokens": 524,
+    "type": "metadata"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "pump_type": "is_done"
+  },
+  {
+   "pump_type": "all_done"
+  },
+  {
+   "pump_type": "pump_ended"
+  }
+ ],
+ "live_after": null,
+ "queue_seq": 0,
+ "registered_after": false,
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "description": "",
+    "title": "Example",
+    "type": "url",
+    "url": "https://example.com"
+   },
+   "event_type": "url",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "Order: the",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "images": [
+     {
+      "attribution": "",
+      "caption": "A chart",
+      "image_data": "iVBORw0KGgo=",
+      "link_url": "",
+      "url": ""
+     }
+    ],
+    "type": "images"
+   },
+   "event_type": "images",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": " ls comes first, and the Write comes before the Read and Edit. The Read has to finish before the Edit, because the Edit needs a prior Read. The ls and the Write don't depend on each other, so I'll run them together.",
+   "event_data": {
+    "note": true
+   },
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "active": false,
+    "name": "Bash",
+    "summary": "List files in current directory",
+    "tool_id": "toolu_01Q4q2uBR5u8erpcgAypmteP",
+    "tool_input": {
+     "command": "ls -la",
+     "description": "List files in current directory"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "active": false,
+    "name": "Write",
+    "summary": "note.txt",
+    "tool_id": "toolu_01UkWQqvo6wBVXuKwbjFaSoh",
+    "tool_input": {
+     "content": "first line\nsecond line\n",
+     "file_path": "/users/dev-admin/workspace/note.txt"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "active": false,
+    "name": "Read",
+    "summary": "note.txt",
+    "tool_id": "toolu_01BFzFPi89o4c8TT8WqS2AkA",
+    "tool_input": {
+     "file_path": "/users/dev-admin/workspace/note.txt"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "active": false,
+    "name": "Edit",
+    "summary": "note.txt",
+    "tool_id": "toolu_01UuhRLfyNozR2M3dzbe65FH",
+    "tool_input": {
+     "file_path": "/users/dev-admin/workspace/note.txt",
+     "new_string": "edited",
+     "old_string": "second line"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "\n\nI listed the empty folder, created `note.txt` with two lines, read it back, and edited the second line to \"edited\". All four tool calls succeeded.",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cache_read": 66591,
+    "cache_write": 8618,
+    "context_max": 1000000,
+    "context_used": 19599,
+    "cost_billed": true,
+    "cost_usd": 0.046387099999999994,
+    "duration_ms": 10038,
+    "input_tokens": 8,
+    "output_tokens": 524,
+    "type": "metadata"
+   },
+   "event_type": "metadata",
+   "role": "event"
+  }
+ ],
+ "seams": {
+  "ephemeral": [
+   [
+    [
+     "user-admin"
+    ],
+    {
+     "body": "Response ready",
+     "chat_id": "chat-pr-tools",
+     "title": "a1 finished"
+    }
+   ]
+  ],
+  "kept": [],
+  "reconciles": [
+   "a1"
+  ],
+  "relocated": [],
+  "replays": [],
+  "rests": [],
+  "status": [
+   [
+    [
+     "user-admin",
+     "chat-pr-tools",
+     "streaming"
+    ],
+    {
+     "agent": "a1"
+    }
+   ],
+   [
+    [
+     "user-admin",
+     "chat-pr-tools",
+     "ready"
+    ],
+    {
+     "agent": "a1"
+    }
+   ]
+  ],
+  "titles": [
+   [
+    "chat-pr-tools",
+    ""
+   ]
+  ],
+  "tool_starts": []
+ },
+ "state": {
+  "abort_requested": false,
+  "accepts_in_flight": 0,
+  "active_tools": [],
+  "cache": [
+   66591,
+   8618
+  ],
+  "completed": true,
+  "context": [
+   19599,
+   1000000
+  ],
+  "cost_delta": 0.046387,
+  "cumulative_cost": 0.046387099999999994,
+  "done": true,
+  "engine_prompts": [],
+  "gc_snapshots_pending": false,
+  "goal": null,
+  "has_pending_prompt": false,
+  "last_ending": null,
+  "last_error": "",
+  "last_session_cost": 0.046387099999999994,
+  "leftover": [],
+  "llm_cost_delta": 0.046387,
+  "mcp_cost_by_key": {},
+  "meeting_agent": null,
+  "pending_permission": null,
+  "pending_previews": [],
+  "pending_text": [],
+  "permission_active": null,
+  "permission_buffer": [],
+  "pinged": [],
+  "plan_filename": "",
+  "queue_closed": true,
+  "recovery_eligible": null,
+  "registry": {
+   "completed": [],
+   "has_pending": false,
+   "spawned": []
+  },
+  "retried": [],
+  "session_mode": "auto",
+  "steer_saved_ranges": [],
+  "thinking_text": "",
+  "title_armed": false,
+  "todos": [],
+  "tokens": [
+   8,
+   524
+  ],
+  "tool_seen": 4,
+  "viewers": [
+   [
+    true,
+    false,
+    48
+   ]
+  ],
+  "workflows_forwarded": []
+ },
+ "usage": [
+  {
+   "agent": "a1",
+   "cache_read": 66591,
+   "cache_write": 8618,
+   "cost_usd": 0.046387,
+   "input_tokens": 8,
+   "message_count": 1,
+   "model": "",
+   "output_tokens": 524,
+   "provider": "anthropic",
+   "scope": "user",
+   "source_id": "chat-pr-tools",
+   "source_key": "default",
+   "source_type": "chat",
+   "user_sub": "user-admin"
+  }
+ ]
+}

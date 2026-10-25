@@ -79,12 +79,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { useAgents, useSetDefaultAgent, useUpdateAgent } from '../../api/agents'
+import {
+  useAgents, useSetDefaultAgent, useUpdateAgent, type AgentSummary,
+} from '../../api/agents'
 import {
   useAgentsActivity,
   useDelegationEdges,
   useDepartments,
   useAdminAddUserAgent,
+  type AgentActivity,
+  type Department,
+  type DelegationEdge,
 } from '../../api/departments'
 import { useAuth } from '../../contexts/AuthContext'
 import { isAdmin as isPlatformAdmin, isCreatorOrAbove } from '../../lib/permissions'
@@ -94,8 +99,9 @@ import {
   computeStageLayout,
   type MapNode,
 } from './layout'
-import { DEFAULT_TINT, STAGE_CAM_MAX } from './mapConstants'
+import { DEFAULT_TINT } from './mapConstants'
 import type { MenuState, PopupState } from './mapConstants'
+import { rowCapFor } from './camera'
 import { viewScale, type SceneBag } from './sceneBag'
 import { buildEnvironment } from './buildEnvironment'
 import { buildScene } from './buildScene'
@@ -105,6 +111,14 @@ import { useMapRenderer } from './useMapRenderer'
 import { useStageMachine } from './useStageMachine'
 import { useMapPointers } from './useMapPointers'
 import { useSnapshotHeal } from './useSnapshotHeal'
+
+// One identity per empty feed: a pending or failed query must not hand the
+// memos (layout, heat, edges) a fresh [] on every render — each one would
+// rebuild the whole scene.
+const EMPTY_AGENTS: AgentSummary[] = []
+const EMPTY_DEPARTMENTS: Department[] = []
+const EMPTY_ACTIVITY: AgentActivity[] = []
+const EMPTY_EDGES: DelegationEdge[] = []
 
 export interface AgentsMap3DProps {
   /** WebGL missing / renderer creation failed → parent falls back to grid. */
@@ -136,14 +150,15 @@ export default function AgentsMap3D({
   // land — without placeholder data the list drops to [] for a beat and
   // every chip is torn down and rebuilt a second time on load.
   const {
-    data: agents = [], isSuccess: agentsReady, isPending: agentsPending,
+    data: agents = EMPTY_AGENTS, isSuccess: agentsReady, isPending: agentsPending,
     isPlaceholderData: agentsPlaceholder,
   } = useAgents({ all: isAdmin && !hideNonMember, keepPrevious: true })
   const {
-    data: departments = [], isSuccess: deptsReady, isPending: deptsPending,
+    data: departments = EMPTY_DEPARTMENTS, isSuccess: deptsReady,
+    isPending: deptsPending,
   } = useDepartments()
-  const { data: activity = [] } = useAgentsActivity()
-  const { data: edges = [] } = useDelegationEdges()
+  const { data: activity = EMPTY_ACTIVITY } = useAgentsActivity()
+  const { data: edges = EMPTY_EDGES } = useDelegationEdges()
   const setDefault = useSetDefaultAgent()
   const addMe = useAdminAddUserAgent()
   const updateAgent = useUpdateAgent()
@@ -169,7 +184,19 @@ export default function AgentsMap3D({
 
   const containerRef = useRef<HTMLDivElement>(null)
   const bagRef = useRef<SceneBag | null>(null)
-  const centeredOnce = useRef(false)
+  /** The opening placement ran (once per mount — see the opener below). */
+  const [opened, setOpened] = useState(false)
+  /** The user grabbed the controls (published by the renderer's controls
+   * listener): the map never repositions the camera on its own after it. */
+  const [userMoved, setUserMoved] = useState(false)
+  /** Seats per stage row for the viewport (camera.ts rowCapFor), published
+   * by the renderer's ResizeObserver; the window aspect until it fires. */
+  const [rowCap, setRowCap] = useState(() => rowCapFor(
+    typeof window !== 'undefined'
+      ? window.innerWidth / Math.max(1, window.innerHeight)
+      : 1.6,
+    viewScale(),
+  ))
   // Bumped when the grass texture lands, so the ENVIRONMENT effect rebuilds
   // the terrain with it. Deliberately not read by the dynamic effect: its
   // one late asset (wood) is patched onto the standing slabs instead, so a
@@ -182,6 +209,7 @@ export default function AgentsMap3D({
   // unchanged snapshot, and a new Set here would recompute the layout and
   // rebuild every chip and the terrain for nothing.
   const memberKey = (user?.agents ?? []).join('\0')
+  const defaultAgent = user?.default_agent
   const memberOf = useMemo(
     () => (isAdmin ? new Set(memberKey ? memberKey.split('\0') : []) : undefined),
     [isAdmin, memberKey],
@@ -216,9 +244,8 @@ export default function AgentsMap3D({
   )
   /** The staged cluster's amphitheater (null at overview or if the staged
    * cluster vanished from the layout — the stage effect exits then).
-   * The seat count per row adapts to the screen: how many cards fit the
-   * horizontal FOV at the far framing clamp — 2 on a portrait phone,
-   * up to 8 on desktop — so no card ever leaves the screen. */
+   * The seat count per row adapts to the screen (`rowCap`: 2 on a portrait
+   * phone, up to 8 on desktop) so no card ever leaves the screen. */
   const stageData = useMemo(() => {
     if (!stage) return null
     const cluster = layout.clusters.find(
@@ -228,19 +255,8 @@ export default function AgentsMap3D({
     const members = layout.nodes.filter(
       (n) => n.departmentId === stage.deptId,
     )
-    const aspect = bagRef.current?.camera.aspect
-      ?? (typeof window !== 'undefined'
-        ? window.innerWidth / Math.max(1, window.innerHeight)
-        : 1.6)
-    const vfov = (48 * Math.PI) / 180
-    const hfov = 2 * Math.atan(Math.tan(vfov / 2) * Math.max(0.4, aspect))
-    // The stage camera may sit viewScale farther back on big screens, so
-    // the same screens fit WIDER rows — more seats, like 2D shows more
-    // content, instead of bigger cards.
-    const maxHalf = (Math.tan(hfov / 2) * STAGE_CAM_MAX * viewScale()) / 1.04 - 5
-    const rowCap = Math.max(2, Math.min(8, Math.floor((maxHalf * 2) / 16) + 1))
     return { cluster, arc: computeStageLayout(cluster, members, { rowCap }) }
-  }, [stage, layout])
+  }, [stage, layout, rowCap])
 
   // The map OPENS directly ON the favorite agent's department stage
   // (operator round 7) — decided in RENDER on purpose (2026-08-15): the old
@@ -248,15 +264,15 @@ export default function AgentsMap3D({
   // and only then rebuild into the amphitheater — the ~1s load jump. A
   // render-phase setState is the legal derived-state pattern (React
   // re-invokes before commit; no effect ever sees the undecided render), so
-  // the FIRST data-bearing chip build is already staged. bag mutations stay
-  // out of render — bag.firstFocus (armed at construction) makes the pose
+  // the FIRST data-bearing chip build is already staged. The bag stays out
+  // of render — bag.firstFocus (armed at construction) makes the pose
   // effects SNAP instead of fly. Round-15 rule intact: wait for BOTH
   // queries (agents alone files everyone under Independent). Round-3 rule
   // intact: a user who grabbed the controls is never repositioned.
-  if (!centeredOnce.current && agentsReady && deptsReady
-      && layout.nodes.length > 0 && !bagRef.current?.userMoved) {
-    centeredOnce.current = true
-    const fav = user?.default_agent ? nodeBySlug.get(user.default_agent) : undefined
+  if (!opened && agentsReady && deptsReady
+      && layout.nodes.length > 0 && !userMoved) {
+    setOpened(true)
+    const fav = defaultAgent ? nodeBySlug.get(defaultAgent) : undefined
     if (fav) {
       setStage({ deptId: fav.departmentId })
     } else if (layout.clusters[0]) {
@@ -271,10 +287,10 @@ export default function AgentsMap3D({
   // 2026-08-15: "map opens rotated to Engineering").
   const favDeptRef = useRef<string | null>(null)
   useEffect(() => {
-    favDeptRef.current = user?.default_agent
-      ? nodeBySlug.get(user.default_agent)?.departmentId ?? null
+    favDeptRef.current = defaultAgent
+      ? nodeBySlug.get(defaultAgent)?.departmentId ?? null
       : null
-  }, [nodeBySlug, user?.default_agent])
+  }, [nodeBySlug, defaultAgent])
 
   // Stable refs for handlers built inside the scene effect / rAF loop.
   const openAgent = useCallback((node: MapNode, x: number, y: number) => {
@@ -292,12 +308,13 @@ export default function AgentsMap3D({
   useEffect(() => { moveFromRef.current = moveFrom }, [moveFrom])
 
   // --- renderer lifecycle (useMapRenderer.ts) ------------------------------
-  // Runs once; the stage-machine refs are handed over lazily because that
-  // hook is called below (hook order unchanged from the single-file map).
+  // Runs once, and FIRST: its effect builds the bag every effect below
+  // expects. The stage-machine refs are handed over lazily because that
+  // hook is called below.
   useMapRenderer({
     containerRef, bagRef,
     stageRefs: () => ({ enterStageRef, findClusterRef, exitStageRef }),
-    onUnavailable, setAssetsTick, user,
+    onUnavailable, setAssetsTick, setRowCap, setUserMoved, user,
   })
 
   // --- the living environment (terrain + lake) ---------------------------
@@ -316,21 +333,7 @@ export default function AgentsMap3D({
     // and keepPrevious keeps it false across the admin scope key flip.
     if (agentsPending || deptsPending) return
     buildEnvironment(bag, layout)
-
-  }, [layout, assetsTick])
-
-  // --- scene contents (rebuilt on any structural/heat/level change) -------
-  useEffect(() => {
-    const bag = bagRef.current
-    if (!bag || bag.disposed) return
-    if (agentsPending || deptsPending) return // settle gate — see env effect
-    buildScene({
-      bag, layout, stage, stageData, heat, liveSet, streamingSet, edges,
-      nodeBySlug, user, activePointers, gestureOwnedIds, moveFromRef,
-      linkFromRef, attemptLinkRef, openAgentRef, onDeptTapRef, setPopup,
-    })
-  }, [layout, heat, liveSet, streamingSet, edges, stage, stageData,
-    user?.default_agent, nodeBySlug])
+  }, [layout, assetsTick, agentsPending, deptsPending])
 
   // --- the semantic-zoom state machine (useStageMachine.ts) ---------------
   const {
@@ -357,7 +360,7 @@ export default function AgentsMap3D({
   const onDepartmentCreated = useCallback((id: string) => {
     setNewDeptName(null)
     pendingDeptRef.current = id
-    setNotice('Department created — move an agent here from its menu')
+    setNotice('Department created. Move an agent here from its menu.')
   }, [])
 
   // --- pointer interaction (useMapPointers.ts) ----------------------------
@@ -370,6 +373,23 @@ export default function AgentsMap3D({
     setLevelPick, updateAgent, departments, moveFromRef, enterStage,
     exitStageRef, pageDeltaRef, setMenu, setPopup,
   })
+
+  // --- scene contents (rebuilt on any structural/heat/level change) -------
+  // Below the stage machine and the pointer hook: it hands their refs to
+  // the builders. The builders read none of the bag fields the pose
+  // effects write, so running after them is safe.
+  useEffect(() => {
+    const bag = bagRef.current
+    if (!bag || bag.disposed) return
+    if (agentsPending || deptsPending) return // settle gate — see env effect
+    buildScene({
+      bag, layout, stage, stageData, heat, liveSet, streamingSet, edges,
+      nodeBySlug, defaultAgent, activePointers, gestureOwnedIds, moveFromRef,
+      linkFromRef, attemptLinkRef, openAgentRef, onDeptTapRef, setPopup,
+    })
+  }, [layout, heat, liveSet, streamingSet, edges, stage, stageData,
+    defaultAgent, nodeBySlug, agentsPending, deptsPending, activePointers,
+    gestureOwnedIds, attemptLinkRef, onDeptTapRef])
 
   const canCreateDepartments = isCreatorOrAbove(user)
   const popupDept = popup
@@ -422,6 +442,7 @@ export default function AgentsMap3D({
       data-testid="agents-map-3d"
       style={{
         background:
+          // eslint-disable-next-line otodock/no-raw-palette -- the scene's backdrop, dark in both themes
           'radial-gradient(120% 90% at 50% 30%, #20313c 0%, #101c24 55%, #070d12 100%)',
       }}
     >
@@ -446,7 +467,7 @@ export default function AgentsMap3D({
             title={hideNonMember
               ? 'Showing only agents and departments you are a member of'
               : 'Showing everything on this installation'}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-white/8 text-slate-200 border border-white/12 backdrop-blur-sm hover:bg-white/15 transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-control bg-hero-surface text-hero-text border border-hero-border hover:bg-hero-border transition-colors"
           >
             {hideNonMember ? (
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -472,7 +493,7 @@ export default function AgentsMap3D({
           )}
           name={nodeBySlug.get(linkFrom)?.displayName ?? linkFrom}
           color={nodeBySlug.get(linkFrom)?.color || DEFAULT_TINT}
-          hint="tap an agent it can delegate to"
+          hint="Tap an agent it can delegate to"
           onCancel={() => setLinkFrom(null)}
         />
       )}
@@ -486,15 +507,15 @@ export default function AgentsMap3D({
           )}
           name={nodeBySlug.get(moveFrom)?.displayName ?? moveFrom}
           color={nodeBySlug.get(moveFrom)?.color || DEFAULT_TINT}
-          hint="tap a department"
+          hint="Tap a department"
           onCancel={() => setMoveFrom(null)}
         />
       )}
 
       {notice && (
-        <div className={`absolute ${stage || mapDept !== null ? 'bottom-16' : 'bottom-3'} left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 text-xs rounded-lg bg-white/8 text-slate-200 border border-white/12 backdrop-blur-sm flex items-center gap-2`}>
+        <div className={`absolute ${stage || mapDept !== null ? 'bottom-16' : 'bottom-3'} left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 text-xs rounded-control bg-hero-surface text-hero-text border border-hero-border shadow-elevation-3 flex items-center gap-2`}>
           {notice}
-          <button onClick={() => setNotice(null)} className="text-slate-400">✕</button>
+          <button onClick={() => setNotice(null)} className="text-hero-text-muted hover:text-hero-text">✕</button>
         </div>
       )}
 
@@ -502,8 +523,8 @@ export default function AgentsMap3D({
           and say how to fill it (the empty department exists on the map so
           it CAN be filled from here). */}
       {stage && stageData && !layout.nodes.some((n) => n.departmentId === stage.deptId) && (
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-10 px-4 py-2 text-sm text-center rounded-xl bg-[#171b30]/80 text-slate-300 border border-white/10 backdrop-blur-md pointer-events-none max-w-[80%]">
-          No agents yet — move one here from its menu
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-10 px-4 py-2 text-sm text-center rounded-card bg-hero-surface text-hero-text-muted border border-hero-border pointer-events-none max-w-[80%]">
+          No agents yet. Move one here from its menu.
         </div>
       )}
 
@@ -513,14 +534,14 @@ export default function AgentsMap3D({
           the camera behind that department. In move mode a tap targets
           the department instead. */}
       {(stage !== null || mapDept !== null) && layout.clusters.length > 1 && (
-        /* Desktop: one glass strip. Phones: a full-bleed center-locked
-           carousel — each chip carries its own glass and the huge side
+        /* Desktop: one strip on the hero surface. Phones: a full-bleed
+           center-locked carousel — each chip carries its own fill and the huge side
            padding lets EVERY chip (first and last included) reach the
            exact center when scrollIntoView centers it. */
         <div className="absolute bottom-3 inset-x-0 z-10 flex justify-center pointer-events-none">
           <div
             ref={pagerRef}
-            className="pointer-events-auto flex items-center overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden max-sm:w-full max-sm:gap-1.5 max-sm:px-[38vw] max-sm:snap-x max-sm:snap-proximity max-sm:[mask-image:linear-gradient(to_right,transparent,black_24px,black_calc(100%-24px),transparent)] sm:gap-0.5 sm:px-1.5 sm:py-1 sm:rounded-xl sm:bg-[#12152a]/80 sm:border sm:border-white/10 sm:backdrop-blur-md sm:max-w-[94%]"
+            className="pointer-events-auto flex items-center overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden max-sm:w-full max-sm:gap-1.5 max-sm:px-[38vw] max-sm:snap-x max-sm:snap-proximity max-sm:[mask-image:linear-gradient(to_right,transparent,black_24px,black_calc(100%-24px),transparent)] sm:gap-0.5 sm:px-1.5 sm:py-1 sm:rounded-popover sm:bg-hero-bg sm:border sm:border-hero-border sm:max-w-[94%]"
           >
             {layout.clusters.map((c) => {
               const label = c.name || 'Independent'
@@ -540,10 +561,10 @@ export default function AgentsMap3D({
                     if (stage) setStage({ deptId: c.departmentId })
                     else setMapDept(c.departmentId)
                   }}
-                  className={`px-2.5 py-1 text-[11px] rounded-lg whitespace-nowrap transition-colors max-sm:shrink-0 max-sm:snap-center max-sm:px-3.5 max-sm:py-1.5 max-sm:rounded-xl max-sm:border max-sm:backdrop-blur-md ${
+                  className={`px-2.5 py-1 text-2xs rounded-control whitespace-nowrap transition-colors max-sm:shrink-0 max-sm:snap-center max-sm:px-3.5 max-sm:py-1.5 max-sm:border ${
                     active
-                      ? 'bg-white/14 text-slate-100 max-sm:bg-[#1a2040]/90 max-sm:border-white/25'
-                      : 'text-slate-400 hover:text-slate-200 max-sm:bg-[#12152a]/70 max-sm:border-white/10'
+                      ? 'bg-hero-border text-hero-text max-sm:bg-hero-surface max-sm:border-hero-text-muted'
+                      : 'text-hero-text-muted hover:text-hero-text max-sm:bg-hero-bg max-sm:border-hero-border'
                   }`}
                 >
                   {label}

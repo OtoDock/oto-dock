@@ -10,6 +10,7 @@
 import { useEffect } from 'react'
 import { useParams, useNavigate, Navigate } from 'react-router-dom'
 import { useChatDetail, ForbiddenError } from '../api/chats'
+import Button from '../components/ui/Button'
 
 export default function ConversationView() {
   const { chatId } = useParams<{ chatId: string }>()
@@ -28,17 +29,14 @@ export default function ConversationView() {
 
   if (error) {
     return (
-      <div className="h-screen-safe flex items-center justify-center bg-p-bg">
+      <div className="h-screen-safe flex items-center justify-center bg-surface-page">
         <div className="text-center">
-          <p className="text-sm text-p-error mb-4">
+          <p className="text-sm text-status-danger-fg mb-4">
             {error instanceof Error ? error.message : 'Conversation not found.'}
           </p>
-          <button
-            onClick={() => navigate(-1)}
-            className="px-4 py-2 text-sm bg-brand text-white rounded-lg hover:bg-brand-hover"
-          >
+          <Button variant="primary" size="md" onClick={() => navigate(-1)}>
             Go back
-          </button>
+          </Button>
         </div>
       </div>
     )
@@ -46,8 +44,8 @@ export default function ConversationView() {
 
   if (isLoading || !chat) {
     return (
-      <div className="h-screen-safe flex items-center justify-center bg-p-bg">
-        <div className="text-p-text-light text-sm">Loading conversation...</div>
+      <div className="h-screen-safe flex items-center justify-center bg-surface-page">
+        <div className="text-tertiary text-sm">Loading conversation...</div>
       </div>
     )
   }

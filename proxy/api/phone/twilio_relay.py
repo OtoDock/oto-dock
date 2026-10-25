@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from typing import Any
 
 import httpx
 import websockets
@@ -38,6 +39,7 @@ router = APIRouter()
 
 _FORWARD_TIMEOUT_S = 15.0
 _WS_MAX_MSG = 1024 * 1024
+_MEDIA_CONNECT_TIMEOUT_S = 10.0
 # Real Twilio webhooks are a few KB of form fields. A Twilio POST carries no
 # platform credential, so the HTTP middleware cuts its body first, at the
 # unauthenticated tier (``middleware.body_cap``: ``MAX_UNAUTH_BODY_BYTES``,
@@ -82,10 +84,10 @@ async def _forward_post(request: Request, path: str) -> Response:
         ) if v
     }
     try:
-        async with httpx.AsyncClient(timeout=_FORWARD_TIMEOUT_S) as client:
+        async with daemon_url.client(url, timeout=_FORWARD_TIMEOUT_S) as client:
             upstream = await client.post(url, content=body, headers=headers)
     except httpx.HTTPError as e:
-        logger.warning(f"twilio relay: daemon unreachable ({e})")
+        logger.warning("twilio relay: daemon unreachable (%s)", e)
         return Response(status_code=502, content="phone service unavailable")
     return Response(
         status_code=upstream.status_code,
@@ -134,16 +136,22 @@ async def ws_twilio_media_relay(websocket: WebSocket) -> None:
         await websocket.close(code=1011)
         return
     await websocket.accept()
+    media_url = f"{_daemon_ws_base()}/v1/twilio/media/{server_id}"
     try:
+        # Plain ws dials only a private address of the daemon's host, the
+        # rule of every send to it (``daemon_url``).
+        sock = await daemon_url.ws_socket(media_url, _MEDIA_CONNECT_TIMEOUT_S)
+        sock_kwargs: dict[str, Any] = {"sock": sock} if sock is not None else {}
         daemon_ws = await websockets.connect(
-            f"{_daemon_ws_base()}/v1/twilio/media/{server_id}",
+            media_url,
             additional_headers=(
                 {"X-Twilio-Signature": signature} if signature else {}),
             max_size=_WS_MAX_MSG,
             close_timeout=5,
+            **sock_kwargs,
         )
-    except Exception as e:
-        logger.warning(f"twilio relay: media dial to daemon failed ({e})")
+    except (OSError, TimeoutError, websockets.WebSocketException) as e:
+        logger.warning("twilio relay: media dial to daemon failed (%s)", e)
         await websocket.close(code=1011)
         return
 

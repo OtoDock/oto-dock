@@ -11,16 +11,15 @@ The complementary worker / API / dashboard tests live in the license API tests.
 
 import base64
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-import config
 import auth.license as L
-from services.billing import relay_client
-from services.billing import license_check_worker
+import config
+from services.billing import license_check_worker, relay_client
 
 
 def _b64u(b: bytes) -> str:

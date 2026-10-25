@@ -18,7 +18,6 @@ import pytest
 from storage import database as task_store
 from storage.automation import db_result_files, run_status
 
-
 RUN = "run-rf0000000001"
 OTHER_RUN = "run-rf0000000002"
 
@@ -95,19 +94,24 @@ class TestStore:
 # The attach: the route, the destination, the copy
 # ───────────────────────────────────────────────────────────────────────────
 
-import os  # noqa: E402
-from datetime import datetime, timezone  # noqa: E402
-from pathlib import Path  # noqa: E402
+import os
+from datetime import datetime, timezone
+from pathlib import Path
 
-import config  # noqa: E402
-from auth.path_policy import SecurityContext  # noqa: E402
-from auth.providers import UserContext  # noqa: E402
-from core.session import session_state  # noqa: E402
-from services.delegation import file_transfer, result_files  # noqa: E402
-from storage.agents import agent_store  # noqa: E402
-from storage.identity import db_users  # noqa: E402
-from storage.mcp import mcp_store  # noqa: E402
-from tests.tasks.test_send_files import _FakeSatellite, _endpoint_client, _remote, flow_reset  # noqa: E402,F401
+import config
+from auth.path_policy import SecurityContext
+from auth.providers import UserContext
+from core.session import session_state
+from services.delegation import file_transfer, result_files
+from storage.agents import agent_store
+from storage.identity import db_users
+from storage.mcp import mcp_store
+from tests.tasks.test_send_files import (  # noqa: F401
+    _endpoint_client,
+    _FakeSatellite,
+    _remote,
+    flow_reset,
+)
 
 WORKER = "rf-worker"
 HEAD = "rf-head"
@@ -584,6 +588,7 @@ class TestCopyEdges:
 
     def test_a_full_bucket_ends_the_batch(self, rig, monkeypatch):
         import errno
+
         from services.infra import safe_fs
         _delegation()
         _ctx(monkeypatch)
@@ -599,6 +604,7 @@ class TestCopyEdges:
 
     def test_a_landed_rel_is_pushed_under_the_upload_barrier(self, rig, monkeypatch):
         import asyncio as _asyncio
+
         from core.remote import upload_inflight
         from services.remote import workspace_fanout
         _delegation()

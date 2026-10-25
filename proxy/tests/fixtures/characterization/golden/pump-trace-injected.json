@@ -1,0 +1,7092 @@
+{
+ "chat": {
+  "cache_read": 0,
+  "cache_write": 0,
+  "codex_thread_id": "01a146c3-2376-7940-8aac-dfb3c9d4e4dd",
+  "context_max": 0,
+  "context_used": 8123,
+  "engine_cost_session_id": "sid-pc-injected",
+  "engine_cost_total": 0.01,
+  "last_abort_graceful": false,
+  "last_response_at": false,
+  "last_turn_aborted": false,
+  "output_tokens": 0,
+  "permission_mode": "plan",
+  "thread_goal": null,
+  "title_generated": false,
+  "total_cost": 0.0
+ },
+ "events": [
+  [
+   "delegate_spawn",
+   {
+    "agent": "personal-assistant-lite",
+    "chat_id": "task-run-c9p1-0001",
+    "prompt": "Count the files in the workspace folder and report the number.",
+    "prompt_preview": "Count the files in the workspace folder and report the number.",
+    "surface": "task",
+    "task_id": "dyn-c9p1-0001",
+    "task_name": "count-files",
+    "type": "delegate_spawn"
+   }
+  ],
+  [
+   "check_verdict",
+   {
+    "check": "style",
+    "cost_usd": 0.0123,
+    "duration_ms": 8120,
+    "findings": [
+     {
+      "severity": "error",
+      "text": "Sentence 3 runs 41 words."
+     }
+    ],
+    "findings_total": 1,
+    "pass": false,
+    "ran_on": "claude-sonnet-5-5",
+    "ref": "chk-1",
+    "round": 1,
+    "rounds": 2,
+    "score": 0.4,
+    "section": "",
+    "status": "fail",
+    "summary": "Two sentences run long.",
+    "type": "check_verdict",
+    "verdict_id": "v-1"
+   }
+  ],
+  [
+   "permission_request",
+   {
+    "description": "Push the branch",
+    "request_id": "engine-req-0001",
+    "session_id": "",
+    "tool_input": {
+     "command": "git push"
+    },
+    "tool_name": "Bash",
+    "tool_use_id": "toolu_engine_0001"
+   }
+  ],
+  [
+   "goal_update",
+   {
+    "cleared": false,
+    "objective": "Ship the note",
+    "status": "active",
+    "time_used_seconds": 40,
+    "token_budget": 50000,
+    "tokens_used": 1200
+   }
+  ],
+  [
+   "goal_update",
+   {
+    "cleared": false,
+    "objective": "Ship the note",
+    "status": "active",
+    "time_used_seconds": 40,
+    "token_budget": 50000,
+    "tokens_used": 1200
+   }
+  ],
+  [
+   "goal_update",
+   {
+    "cleared": true
+   }
+  ],
+  [
+   "context_compact",
+   {
+    "phase": "started",
+    "trigger": "auto"
+   }
+  ],
+  [
+   "context_compact",
+   {
+    "phase": "completed",
+    "post_tokens": null,
+    "pre_tokens": 120000,
+    "trigger": "manual"
+   }
+  ],
+  [
+   "context_compact",
+   {
+    "context_max": 258400,
+    "phase": "usage",
+    "post_tokens": 8123
+   }
+  ],
+  [
+   "metadata",
+   {
+    "codex_thread_id": "01a146c3-2376-7940-8aac-dfb3c9d4e4dd"
+   }
+  ],
+  [
+   "metadata",
+   {
+    "cache_read": 20000,
+    "cache_write": 1200,
+    "context_max": 200000,
+    "context_used": 24000,
+    "cost_usd": 0.0412,
+    "duration_ms": 9112,
+    "input_tokens": 1800,
+    "output_tokens": 400
+   }
+  ],
+  [
+   "metadata",
+   {
+    "cache_read": 24000,
+    "cache_write": 800,
+    "context_max": 200000,
+    "context_used": 26500,
+    "cost_usd": 0.0633,
+    "duration_ms": 4120,
+    "input_tokens": 900,
+    "output_tokens": 310
+   }
+  ],
+  [
+   "metadata",
+   {
+    "cache_read": 0,
+    "cache_write": 0,
+    "cost_usd": 0.01,
+    "duration_ms": 2000,
+    "input_tokens": 100,
+    "output_tokens": 50
+   }
+  ],
+  [
+   "metadata",
+   {
+    "cache_read": 7000,
+    "cache_write": 0,
+    "context_max": 258400,
+    "context_used": 9000,
+    "cost_is_delta": true,
+    "cost_usd": 0.0071,
+    "duration_ms": 3300,
+    "input_tokens": 2000,
+    "output_tokens": 300
+   }
+  ],
+  [
+   "todo_update",
+   {
+    "panel_only": true,
+    "persist_block": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "pending"
+     }
+    ]
+   }
+  ],
+  [
+   "todo_update",
+   {
+    "panel_only": true,
+    "persist_block": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "pending"
+     }
+    ]
+   }
+  ],
+  [
+   "todo_update",
+   {
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ]
+   }
+  ],
+  [
+   "workflow_start",
+   {
+    "tool_use_id": "toolu_wf_0001",
+    "workflow_name": "review-changes"
+   }
+  ],
+  [
+   "workflow_progress",
+   {
+    "tool_use_id": "toolu_wf_0001",
+    "workflow_progress": [
+     {
+      "agents": [
+       {
+        "label": "review:bugs",
+        "status": "running"
+       }
+      ],
+      "phase": "Review"
+     }
+    ]
+   }
+  ],
+  [
+   "workflow_progress",
+   {
+    "tool_use_id": "toolu_wf_0001",
+    "workflow_progress": [
+     {
+      "agents": [
+       {
+        "label": "review:bugs",
+        "status": "running"
+       }
+      ],
+      "phase": "Review"
+     }
+    ]
+   }
+  ],
+  [
+   "workflow_end",
+   {
+    "tool_use_id": "toolu_wf_0001"
+   }
+  ],
+  [
+   "plan_mode",
+   {
+    "action": "enter"
+   }
+  ],
+  [
+   "plan_mode",
+   {
+    "action": "exit"
+   }
+  ],
+  [
+   "system",
+   {
+    "subtype": "task_started",
+    "task_type": "local_bash"
+   }
+  ],
+  [
+   "system",
+   {
+    "reason": "queued",
+    "subtype": "undelivered_input",
+    "text": "lost words"
+   }
+  ],
+  [
+   "done",
+   {}
+  ]
+ ],
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "agent": "personal-assistant-lite",
+    "chat_id": "task-run-c9p1-0001",
+    "prompt": "Count the files in the workspace folder and report the number.",
+    "prompt_preview": "Count the files in the workspace folder and report the number.",
+    "surface": "task",
+    "task_id": "dyn-c9p1-0001",
+    "task_name": "count-files",
+    "type": "delegate_spawn"
+   },
+   "event_type": "delegate_spawn",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "check": "style",
+    "cost_usd": 0.0123,
+    "duration_ms": 8120,
+    "findings": [
+     {
+      "severity": "error",
+      "text": "Sentence 3 runs 41 words."
+     }
+    ],
+    "findings_total": 1,
+    "pass": false,
+    "ran_on": "claude-sonnet-5-5",
+    "ref": "chk-1",
+    "round": 1,
+    "rounds": 2,
+    "score": 0.4,
+    "section": "",
+    "status": "fail",
+    "summary": "Two sentences run long.",
+    "type": "check_verdict",
+    "verdict_id": "v-1"
+   },
+   "event_type": "check_verdict",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "description": "Push the branch",
+    "request_id": "engine-req-0001",
+    "session_id": "",
+    "tool_input": {
+     "command": "git push"
+    },
+    "tool_name": "Bash",
+    "tool_use_id": "toolu_engine_0001",
+    "type": "permission_prompt"
+   },
+   "event_type": "permission_prompt",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "phase": "completed",
+    "post_tokens": null,
+    "pre_tokens": 120000,
+    "trigger": "manual",
+    "type": "context_compact"
+   },
+   "event_type": "context_compact",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cache_read": 20000,
+    "cache_write": 1200,
+    "context_max": 200000,
+    "context_used": 24000,
+    "cost_billed": true,
+    "cost_usd": 0.0412,
+    "duration_ms": 9112,
+    "input_tokens": 1800,
+    "output_tokens": 400,
+    "type": "metadata"
+   },
+   "event_type": "metadata",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cache_read": 24000,
+    "cache_write": 800,
+    "context_max": 200000,
+    "context_used": 26500,
+    "cost_billed": true,
+    "cost_usd": 0.022099999999999995,
+    "duration_ms": 4120,
+    "input_tokens": 900,
+    "output_tokens": 310,
+    "type": "metadata"
+   },
+   "event_type": "metadata",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cache_read": 0,
+    "cache_write": 0,
+    "cost_billed": true,
+    "cost_usd": 0.01,
+    "duration_ms": 2000,
+    "input_tokens": 100,
+    "output_tokens": 50,
+    "type": "metadata"
+   },
+   "event_type": "metadata",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cache_read": 7000,
+    "cache_write": 0,
+    "context_max": 258400,
+    "context_used": 9000,
+    "cost_billed": true,
+    "cost_usd": 0.0071,
+    "duration_ms": 3300,
+    "input_tokens": 2000,
+    "output_tokens": 300,
+    "type": "metadata"
+   },
+   "event_type": "metadata",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "name": "TodoWrite",
+    "panel_only": true,
+    "tool_input": {
+     "todos": [
+      {
+       "content": "alpha",
+       "status": "completed"
+      },
+      {
+       "content": "beta",
+       "status": "pending"
+      }
+     ]
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "action": "enter",
+    "type": "plan_mode"
+   },
+   "event_type": "plan_mode",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "action": "exit",
+    "type": "plan_mode"
+   },
+   "event_type": "plan_mode",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "reason": "queued",
+    "subtype": "undelivered_input",
+    "text": "lost words",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  }
+ ],
+ "seams": {
+  "ephemeral": [
+   [
+    [
+     "user-admin"
+    ],
+    {
+     "body": "Allow Bash?",
+     "chat_id": "chat-pc-injected",
+     "mid_turn": true,
+     "title": "a1 needs your input"
+    }
+   ]
+  ],
+  "kept": [],
+  "reconciles": [],
+  "relocated": [],
+  "replays": [],
+  "rests": [],
+  "status": [],
+  "titles": [],
+  "tool_starts": []
+ },
+ "trace": [
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "agent": "personal-assistant-lite",
+      "chat_id": "task-run-c9p1-0001",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "prompt_preview": "Count the files in the workspace folder and report the number.",
+      "surface": "task",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate_spawn"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:delegate_spawn"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:check_verdict"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    }
+   ],
+   "frames": [
+    {
+     "perm_data": {
+      "description": "Push the branch",
+      "event_type": "permission_prompt",
+      "request_id": "engine-req-0001",
+      "session_id": "",
+      "tool_input": {
+       "command": "git push"
+      },
+      "tool_name": "Bash",
+      "tool_use_id": "toolu_engine_0001"
+     },
+     "pump_type": "perm_permission_prompt"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:permission_request"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "goal": {
+       "objective": "Ship the note",
+       "status": "active",
+       "time_used_seconds": 40,
+       "token_budget": 50000,
+       "tokens_used": 1200
+      },
+      "type": "goal_update"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": {
+     "objective": "Ship the note",
+     "status": "active",
+     "time_used_seconds": 40,
+     "token_budget": 50000,
+     "tokens_used": 1200
+    },
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": {
+     "objective": "Ship the note",
+     "status": "active",
+     "time_used_seconds": 40,
+     "token_budget": 50000,
+     "tokens_used": 1200
+    },
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:goal_update"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "goal": {
+       "objective": "Ship the note",
+       "status": "active",
+       "time_used_seconds": 40,
+       "token_budget": 50000,
+       "tokens_used": 1200
+      },
+      "type": "goal_update"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": {
+     "objective": "Ship the note",
+     "status": "active",
+     "time_used_seconds": 40,
+     "token_budget": 50000,
+     "tokens_used": 1200
+    },
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": {
+     "objective": "Ship the note",
+     "status": "active",
+     "time_used_seconds": 40,
+     "token_budget": 50000,
+     "tokens_used": 1200
+    },
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:goal_update"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "goal": null,
+      "type": "goal_update"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:goal_update"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "phase": "started",
+      "trigger": "auto",
+      "type": "context_compact"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:context_compact/started"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:context_compact/completed"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "context_max": 258400,
+      "phase": "usage",
+      "post_tokens": 8123,
+      "type": "context_compact"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     8123,
+     258400
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:context_compact/usage"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    }
+   ],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     8123,
+     258400
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:metadata"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "cache_read": 20000,
+      "cache_write": 1200,
+      "context_max": 200000,
+      "context_used": 24000,
+      "cost_billed": true,
+      "cost_usd": 0.0412,
+      "duration_ms": 9112,
+      "input_tokens": 1800,
+      "output_tokens": 400,
+      "type": "metadata"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     20000,
+     1200
+    ],
+    "completed": false,
+    "context": [
+     24000,
+     200000
+    ],
+    "cost_delta": 0.0412,
+    "cumulative_cost": 0.0412,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0412,
+    "leftover": [],
+    "llm_cost_delta": 0.0412,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     1800,
+     400
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:metadata"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "cache_read": 24000,
+      "cache_write": 800,
+      "context_max": 200000,
+      "context_used": 26500,
+      "cost_billed": true,
+      "cost_usd": 0.022099999999999995,
+      "duration_ms": 4120,
+      "input_tokens": 900,
+      "output_tokens": 310,
+      "type": "metadata"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     24000,
+     800
+    ],
+    "completed": false,
+    "context": [
+     26500,
+     200000
+    ],
+    "cost_delta": 0.0633,
+    "cumulative_cost": 0.0633,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0633,
+    "leftover": [],
+    "llm_cost_delta": 0.0633,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     900,
+     310
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:metadata"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "cache_read": 0,
+      "cache_write": 0,
+      "cost_billed": true,
+      "cost_usd": 0.01,
+      "duration_ms": 2000,
+      "input_tokens": 100,
+      "output_tokens": 50,
+      "type": "metadata"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     24000,
+     800
+    ],
+    "completed": false,
+    "context": [
+     26500,
+     200000
+    ],
+    "cost_delta": 0.0733,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0733,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     100,
+     50
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:metadata"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "cache_read": 7000,
+      "cache_write": 0,
+      "context_max": 258400,
+      "context_used": 9000,
+      "cost_billed": true,
+      "cost_usd": 0.0071,
+      "duration_ms": 3300,
+      "input_tokens": 2000,
+      "output_tokens": 300,
+      "type": "metadata"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:metadata"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    },
+    {
+     "name": "TodoWrite",
+     "panel_only": true,
+     "tool_input": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ]
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ],
+      "type": "todo_update"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "pending"
+     }
+    ],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "pending"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:todo_update"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    },
+    {
+     "name": "TodoWrite",
+     "panel_only": true,
+     "tool_input": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ]
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ],
+      "type": "todo_update"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "pending"
+     }
+    ],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "pending"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:todo_update"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    },
+    {
+     "name": "TodoWrite",
+     "panel_only": true,
+     "tool_input": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ]
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "in_progress"
+       }
+      ],
+      "type": "todo_update"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:todo_update"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    },
+    {
+     "name": "TodoWrite",
+     "panel_only": true,
+     "tool_input": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ]
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "tool_use_id": "toolu_wf_0001",
+      "type": "workflow_start",
+      "workflow_name": "review-changes"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "workflows": {
+     "toolu_wf_0001": {
+      "active": true,
+      "progress": [],
+      "tool_use_id": "toolu_wf_0001",
+      "workflow_name": "review-changes"
+     }
+    }
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:workflow_start"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    },
+    {
+     "name": "TodoWrite",
+     "panel_only": true,
+     "tool_input": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ]
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "tool_use_id": "toolu_wf_0001",
+      "type": "workflow_progress",
+      "workflow_progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ]
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "workflows": {
+     "toolu_wf_0001": {
+      "active": true,
+      "progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ],
+      "tool_use_id": "toolu_wf_0001",
+      "workflow_name": "review-changes"
+     }
+    }
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": [
+     "toolu_wf_0001"
+    ]
+   },
+   "step": "event:workflow_progress"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    },
+    {
+     "name": "TodoWrite",
+     "panel_only": true,
+     "tool_input": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ]
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "tool_use_id": "toolu_wf_0001",
+      "type": "workflow_progress",
+      "workflow_progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ]
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "workflows": {
+     "toolu_wf_0001": {
+      "active": true,
+      "progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ],
+      "tool_use_id": "toolu_wf_0001",
+      "workflow_name": "review-changes"
+     }
+    }
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": [
+     "toolu_wf_0001"
+    ]
+   },
+   "step": "event:workflow_progress"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    },
+    {
+     "name": "TodoWrite",
+     "panel_only": true,
+     "tool_input": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ]
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "tool_use_id": "toolu_wf_0001",
+      "type": "workflow_end"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "workflows": {
+     "toolu_wf_0001": {
+      "active": false,
+      "progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ],
+      "tool_use_id": "toolu_wf_0001",
+      "workflow_name": "review-changes"
+     }
+    }
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:workflow_end"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    },
+    {
+     "name": "TodoWrite",
+     "panel_only": true,
+     "tool_input": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ]
+     },
+     "type": "tool"
+    },
+    {
+     "action": "enter",
+     "type": "plan_mode"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "action": "enter",
+      "type": "plan_mode"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     },
+     {
+      "action": "enter",
+      "type": "plan_mode"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "workflows": {
+     "toolu_wf_0001": {
+      "active": false,
+      "progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ],
+      "tool_use_id": "toolu_wf_0001",
+      "workflow_name": "review-changes"
+     }
+    }
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "plan",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:plan_mode/enter"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    },
+    {
+     "name": "TodoWrite",
+     "panel_only": true,
+     "tool_input": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ]
+     },
+     "type": "tool"
+    },
+    {
+     "action": "enter",
+     "type": "plan_mode"
+    },
+    {
+     "action": "exit",
+     "type": "plan_mode"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "action": "exit",
+      "type": "plan_mode"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     },
+     {
+      "action": "enter",
+      "type": "plan_mode"
+     },
+     {
+      "action": "exit",
+      "type": "plan_mode"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "workflows": {
+     "toolu_wf_0001": {
+      "active": false,
+      "progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ],
+      "tool_use_id": "toolu_wf_0001",
+      "workflow_name": "review-changes"
+     }
+    }
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "plan",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:plan_mode/exit"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    },
+    {
+     "name": "TodoWrite",
+     "panel_only": true,
+     "tool_input": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ]
+     },
+     "type": "tool"
+    },
+    {
+     "action": "enter",
+     "type": "plan_mode"
+    },
+    {
+     "action": "exit",
+     "type": "plan_mode"
+    }
+   ],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     },
+     {
+      "action": "enter",
+      "type": "plan_mode"
+     },
+     {
+      "action": "exit",
+      "type": "plan_mode"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "workflows": {
+     "toolu_wf_0001": {
+      "active": false,
+      "progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ],
+      "tool_use_id": "toolu_wf_0001",
+      "workflow_name": "review-changes"
+     }
+    }
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "plan",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:system/task_started"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "personal-assistant-lite",
+     "chat_id": "task-run-c9p1-0001",
+     "prompt": "Count the files in the workspace folder and report the number.",
+     "prompt_preview": "Count the files in the workspace folder and report the number.",
+     "surface": "task",
+     "task_id": "dyn-c9p1-0001",
+     "task_name": "count-files",
+     "type": "delegate_spawn"
+    },
+    {
+     "check": "style",
+     "cost_usd": 0.0123,
+     "duration_ms": 8120,
+     "findings": [
+      {
+       "severity": "error",
+       "text": "Sentence 3 runs 41 words."
+      }
+     ],
+     "findings_total": 1,
+     "pass": false,
+     "ran_on": "claude-sonnet-5-5",
+     "ref": "chk-1",
+     "round": 1,
+     "rounds": 2,
+     "score": 0.4,
+     "section": "",
+     "status": "fail",
+     "summary": "Two sentences run long.",
+     "type": "check_verdict",
+     "verdict_id": "v-1"
+    },
+    {
+     "description": "Push the branch",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001",
+     "type": "permission_prompt"
+    },
+    {
+     "phase": "completed",
+     "post_tokens": null,
+     "pre_tokens": 120000,
+     "trigger": "manual",
+     "type": "context_compact"
+    },
+    {
+     "cache_read": 20000,
+     "cache_write": 1200,
+     "context_max": 200000,
+     "context_used": 24000,
+     "cost_billed": true,
+     "cost_usd": 0.0412,
+     "duration_ms": 9112,
+     "input_tokens": 1800,
+     "output_tokens": 400,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 24000,
+     "cache_write": 800,
+     "context_max": 200000,
+     "context_used": 26500,
+     "cost_billed": true,
+     "cost_usd": 0.022099999999999995,
+     "duration_ms": 4120,
+     "input_tokens": 900,
+     "output_tokens": 310,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 0,
+     "cache_write": 0,
+     "cost_billed": true,
+     "cost_usd": 0.01,
+     "duration_ms": 2000,
+     "input_tokens": 100,
+     "output_tokens": 50,
+     "type": "metadata"
+    },
+    {
+     "cache_read": 7000,
+     "cache_write": 0,
+     "context_max": 258400,
+     "context_used": 9000,
+     "cost_billed": true,
+     "cost_usd": 0.0071,
+     "duration_ms": 3300,
+     "input_tokens": 2000,
+     "output_tokens": 300,
+     "type": "metadata"
+    },
+    {
+     "name": "TodoWrite",
+     "panel_only": true,
+     "tool_input": {
+      "todos": [
+       {
+        "content": "alpha",
+        "status": "completed"
+       },
+       {
+        "content": "beta",
+        "status": "pending"
+       }
+      ]
+     },
+     "type": "tool"
+    },
+    {
+     "action": "enter",
+     "type": "plan_mode"
+    },
+    {
+     "action": "exit",
+     "type": "plan_mode"
+    },
+    {
+     "reason": "queued",
+     "subtype": "undelivered_input",
+     "text": "lost words",
+     "type": "system"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "reason": "queued",
+      "subtype": "undelivered_input",
+      "text": "lost words",
+      "type": "system"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     },
+     {
+      "action": "enter",
+      "type": "plan_mode"
+     },
+     {
+      "action": "exit",
+      "type": "plan_mode"
+     },
+     {
+      "reason": "queued",
+      "subtype": "undelivered_input",
+      "text": "lost words",
+      "type": "system"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "workflows": {
+     "toolu_wf_0001": {
+      "active": false,
+      "progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ],
+      "tool_use_id": "toolu_wf_0001",
+      "workflow_name": "review-changes"
+     }
+    }
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "plan",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:system/undelivered_input"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "pump_type": "is_done"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     }
+    ],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "agent": "personal-assistant-lite",
+      "prompt": "Count the files in the workspace folder and report the number.",
+      "status": "running",
+      "task_id": "dyn-c9p1-0001",
+      "task_name": "count-files",
+      "type": "delegate"
+     },
+     {
+      "check": "style",
+      "cost_usd": 0.0123,
+      "duration_ms": 8120,
+      "findings": [
+       {
+        "severity": "error",
+        "text": "Sentence 3 runs 41 words."
+       }
+      ],
+      "findings_total": 1,
+      "pass": false,
+      "ran_on": "claude-sonnet-5-5",
+      "ref": "chk-1",
+      "round": 1,
+      "rounds": 2,
+      "score": 0.4,
+      "section": "",
+      "status": "fail",
+      "summary": "Two sentences run long.",
+      "type": "check_verdict",
+      "verdict_id": "v-1"
+     },
+     {
+      "phase": "completed",
+      "post_tokens": null,
+      "pre_tokens": 120000,
+      "trigger": "manual",
+      "type": "context_compact"
+     },
+     {
+      "action": "enter",
+      "type": "plan_mode"
+     },
+     {
+      "action": "exit",
+      "type": "plan_mode"
+     },
+     {
+      "reason": "queued",
+      "subtype": "undelivered_input",
+      "text": "lost words",
+      "type": "system"
+     },
+     {
+      "content": "\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "description": "Push the branch",
+     "event_type": "permission_prompt",
+     "request_id": "engine-req-0001",
+     "session_id": "",
+     "tool_input": {
+      "command": "git push"
+     },
+     "tool_name": "Bash",
+     "tool_use_id": "toolu_engine_0001"
+    },
+    "session_id": "sid-pc-injected",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "workflows": {
+     "toolu_wf_0001": {
+      "active": false,
+      "progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ],
+      "tool_use_id": "toolu_wf_0001",
+      "workflow_name": "review-changes"
+     }
+    }
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     7000,
+     0
+    ],
+    "completed": false,
+    "context": [
+     9000,
+     258400
+    ],
+    "cost_delta": 0.0804,
+    "cumulative_cost": 0.01,
+    "done": false,
+    "engine_prompts": [
+     "engine-req-0001"
+    ],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.01,
+    "leftover": [],
+    "llm_cost_delta": 0.0804,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "engine-req-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "engine-req-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "engine-req-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "plan",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [
+     {
+      "content": "alpha",
+      "status": "completed"
+     },
+     {
+      "content": "beta",
+      "status": "in_progress"
+     }
+    ],
+    "tokens": [
+     2000,
+     300
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:done"
+  }
+ ]
+}

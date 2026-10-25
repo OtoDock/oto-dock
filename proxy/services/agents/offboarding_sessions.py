@@ -78,11 +78,16 @@ def _keep(task: asyncio.Task) -> asyncio.Task:
 def _live_sessions() -> list[_Live]:
     """Every live chat session with a person behind it. On the loop, with no
     await (the registries are loop-owned; the snapshot is atomic)."""
-    from core.session import interactive_session, session_kind
-    from core.session import prewarm_session_registry as prewarm
+    from core.session import (
+        interactive_session,
+        prewarm_session_registry as prewarm,
+        session_kind,
+    )
     from core.session.session_manager import _iter_session_holders
     from core.session.session_state import (
-        _meeting_session_info, get_session_client_type, get_session_security,
+        _meeting_session_info,
+        get_session_client_type,
+        get_session_security,
     )
 
     out: dict[str, _Live] = {}
@@ -201,7 +206,7 @@ async def _close(victims: list[_Live], why: str) -> None:
         async with gate:
             try:
                 await _close_one(v)
-            except Exception:
+            except Exception:  # noqa: BLE001  # offboarding closes each session: one failure must not stop the rest
                 logger.warning("offboarding: closing %s session %s on %s failed",
                                v.kind, v.session_id[:8], v.agent, exc_info=True)
 

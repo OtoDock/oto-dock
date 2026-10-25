@@ -8,14 +8,64 @@ import asyncio
 import contextlib
 import logging
 import time
-import numpy as np
 
-from audio.providers.vad.base import VadState
+import numpy as np
 from audio.providers.tts.base import TTSProvider
+from audio.providers.vad.base import VadState
 from audio.streaming.lang import base_lang
+
+from background import spawn
 from fillers import filler_cache
 
 logger = logging.getLogger("pipeline")
+
+#: No audio for this long after the last chunk played, with the context
+#: still open (a flushed sentence while the engine pauses or runs a tool):
+#: playback is marked idle, the caller's words are a turn and not a
+#: barge-in, until the next chunk marks it playing again.
+_PLAYBACK_IDLE_S = 0.3
+
+_CHUNK, _GAP, _END = "chunk", "gap", "end"
+
+
+class _AudioFeed:
+    """A provider's audio stream read with at most one pending next-chunk
+    task. An unbounded read with no task pending awaits the stream inline
+    (the segment's start keeps the provider's first chunk synchronous with
+    the task); a bounded read parks a task that survives the timeout, never
+    cancelled on a gap (a cancel thrown into the provider's receiver ends
+    the utterance). ``close()`` settles a pending task once, at the exit."""
+
+    def __init__(self, stream):
+        self._it = stream.__aiter__()
+        self._task: asyncio.Future | None = None
+
+    async def next(self, timeout: float | None):
+        if self._task is None and timeout is None:
+            try:
+                return _CHUNK, await self._it.__anext__()
+            except StopAsyncIteration:
+                return _END, None
+        if self._task is None:
+            self._task = asyncio.ensure_future(self._it.__anext__())
+        done, _ = await asyncio.wait({self._task}, timeout=timeout)
+        if not done:
+            return _GAP, None
+        task, self._task = self._task, None
+        try:
+            return _CHUNK, task.result()
+        except StopAsyncIteration:
+            return _END, None
+
+    def close(self) -> None:
+        task, self._task = self._task, None
+        if task is None:
+            return
+        if task.done():
+            if not task.cancelled():
+                task.exception()       # retrieved: a stream end nobody read
+            return
+        task.cancel()
 
 
 class PlaybackMixin:
@@ -119,12 +169,12 @@ class PlaybackMixin:
                         await self.conn.drain()
                     except asyncio.CancelledError:
                         raise
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001  # the ambience bed's tick: a failed frame must not stop the bed
                         if now - last_warn >= 5.0:
                             last_warn = now
                             logger.warning(
-                                f"[{self.conn.peer_addr}] Ambience bed send "
-                                f"failed (continuing): {e}"
+                                "[%s] Ambience bed send "
+                                "failed (continuing): %s", self.conn.peer_addr, e
                             )
                 next_t += frame_s
                 if time.monotonic() - next_t > 0.1:
@@ -301,8 +351,8 @@ class PlaybackMixin:
                 return
 
             logger.info(
-                f"[{self.conn.peer_addr}] Backchannel: playing '{clip.text}' "
-                f"({clip.duration_s:.2f}s)"
+                "[%s] Backchannel: playing '%s' "
+                "(%.2fs)", self.conn.peer_addr, clip.text, clip.duration_s
             )
             await self._play_filler_audio(clip.pcm_audio)
         except asyncio.CancelledError:
@@ -330,8 +380,8 @@ class PlaybackMixin:
                 return
 
             logger.info(
-                f"[{self.conn.peer_addr}] Thinking filler: playing '{clip.text}' "
-                f"({clip.duration_s:.2f}s)"
+                "[%s] Thinking filler: playing '%s' "
+                "(%.2fs)", self.conn.peer_addr, clip.text, clip.duration_s
             )
             self.state._filler_playing = True
             self.state._filler_played_this_turn = True
@@ -355,6 +405,86 @@ class PlaybackMixin:
         is live again — including between segments of one turn (pre-tool
         speech → silent tool run). Hook for UI state ('listening').
         Base: no-op."""
+
+    def _playback_idle(self) -> None:
+        """The flushed audio drained while the context stays open: the line
+        is the caller's (barge-in off, their words are a turn), the UI hears
+        'listening'."""
+        self.state._tts_playing = False
+        self.state._tts_idle = True
+        self.vad.set_bargein_mode(False)
+        self._on_tts_playback_end()
+        logger.info(
+            "[%s] TTS playback idle: the flushed audio "
+            "drained, the context stays open", self.conn.peer_addr
+        )
+
+    async def _playback_resume(self) -> None:
+        """The next chunk after an idle gap. The caller may have started
+        speaking over the gap (nothing was playing, so no pause): the chunk
+        waits for their silence as a segment's first chunk does, the STT
+        stays on the live feed meanwhile, and a talker still going at the
+        release keeps it unmuted."""
+        await self._hold_for_caller_silence()
+        if self.vad.state == VadState.SPEAKING and self.stt.supports_early_unmute:
+            self.state._stt_early_unmuted = True
+        self.state._tts_idle = False
+        self.state._tts_playing = True
+        self.vad.set_bargein_mode(True)
+        self._on_tts_playback_start()
+        logger.info("[%s] TTS playback resumes after the gap", self.conn.peer_addr)
+
+    async def _hold_for_caller_silence(self) -> tuple[float, bool]:
+        """Before a segment's first frame and before the first chunk after an
+        idle gap: wait for the caller to stop speaking, with a settle period
+        for mid-sentence pauses (VAD fires SPEECH_END after 350 ms of
+        silence, a pause between sentences is longer). Returns the hold's
+        seconds and whether the cap released it.
+
+        Phantom-hold cap: line noise can hold VAD in "speech" with no
+        transcript at all; past ``tts_hold_max_s`` with NO transcript
+        evidence (no interim, no queued segment) the "speech" is phantom as
+        far as STT is concerned and playback starts, a real talker still
+        barges in. Evidence disables the cap entirely: a transcribing speaker
+        deserves the full wait."""
+        if self.state._user_silent.is_set():
+            return 0.0, False
+        logger.info("[%s] TTS ready but user speaking — waiting", self.conn.peer_addr)
+        hold_start = time.monotonic()
+        hold_capped = False
+        while True:
+            cap_s = self.cfg.tts_hold_max_s
+            remaining = cap_s - (time.monotonic() - hold_start)
+            evidence = self._speech_evidence()
+            if remaining <= 0 and not evidence:
+                hold_capped = True
+                logger.warning(
+                    "[%s] TTS hold cap "
+                    "(%.1fs) — no transcript evidence, "
+                    "starting playback", self.conn.peer_addr, cap_s
+                )
+                break
+            try:
+                if evidence:
+                    await self.state._user_silent.wait()
+                else:
+                    await asyncio.wait_for(
+                        self.state._user_silent.wait(),
+                        timeout=max(0.1, remaining),
+                    )
+            except asyncio.TimeoutError:
+                continue  # cap window elapsed — re-evaluate
+            await asyncio.sleep(0.5)
+            if self.state._user_silent.is_set():
+                break
+            logger.info("[%s] User resumed speaking — waiting again", self.conn.peer_addr)
+        hold_s = time.monotonic() - hold_start
+        if not hold_capped:
+            # Reset cooldown so trailing energy doesn't trigger
+            # immediate false barge-in after we start playing
+            self.state._speech_end_time = time.monotonic()
+            logger.info("[%s] User silent — starting TTS playback", self.conn.peer_addr)
+        return hold_s, hold_capped
 
     async def _stream_tts_audio(self) -> None:
         """Receive audio from TTS and play at real-time rate.
@@ -394,11 +524,43 @@ class PlaybackMixin:
         gap_count = 0
         gap_total_s = 0.0
         t_stream_end = 0.0
+        # After a mid-utterance flush (text with the TTS, nothing sent
+        # since) the wait for the next chunk is bounded once playback
+        # started: a gap marks playback idle while the context stays open,
+        # the next chunk marks it playing again. An engine stall with text
+        # under the provider's threshold never goes idle: nothing was flushed.
+        feed = _AudioFeed(self.tts.receive_audio())
+        idle = False
         try:
-            async for audio_chunk in self.tts.receive_audio():
-                if not self.state._tts_playing and chunk_count > 0:
+            while True:
+                timeout = None
+                if (chunk_count > 0 and not idle and self.state._tts_playing
+                        and self.state._tts_flushed_open):
+                    timeout = _PLAYBACK_IDLE_S
+                    if prebuffering and pending:
+                        timeout = max(timeout, prebuffer_bytes / self._byte_rate_out)
+                kind, audio_chunk = await feed.next(timeout)
+                if kind is _END:
+                    break
+                if kind is _GAP:
+                    if prebuffering and pending:
+                        # A piece under the pre-buffer floor is all there
+                        # is for now: it plays rather than waits.
+                        prebuffering = False
+                        for c in pending:
+                            await self._paced_playback(c)
+                            t_chunk_end = time.monotonic()
+                        pending, pending_bytes = [], 0
+                        continue
+                    idle = True
+                    self._playback_idle()
+                    continue
+                if not self.state._tts_playing and chunk_count > 0 and not idle:
                     # Cancelled after playback started
                     break
+                if idle:
+                    await self._playback_resume()
+                    idle = False
                 if t_chunk_end > 0:
                     gap_s = time.monotonic() - t_chunk_end
                     if gap_s > 0.1:
@@ -413,68 +575,10 @@ class PlaybackMixin:
                     turn_first = not self.state._t_audio_first
                     if turn_first:
                         self.state._t_audio_first = time.monotonic()
-                    hold_s = filler_wait_s = breath_s = 0.0
+                    filler_wait_s = breath_s = 0.0
                     # Wait for user to finish speaking before starting playback.
                     # TTS audio buffers in the async generator while we wait.
-                    hold_capped = False
-                    if not self.state._user_silent.is_set():
-                        logger.info(
-                            f"[{self.conn.peer_addr}] TTS ready but user speaking — waiting"
-                        )
-                        # Loop with settle period to catch mid-sentence pauses.
-                        # VAD fires SPEECH_END after 350ms silence, but the user
-                        # might just be pausing between sentences.
-                        #
-                        # Phantom-hold cap (live-hit 2026-08-14: line noise kept
-                        # VAD in "speech" for 39 s with zero transcripts and the
-                        # ready reply never played — the caller gave up): past
-                        # ``tts_hold_max_s`` with NO transcript evidence (no
-                        # interim, no queued segment) the "speech" is phantom as
-                        # far as STT is concerned — start playback; a real talker
-                        # still barges in. Evidence disables the cap entirely: a
-                        # transcribing speaker deserves the full wait.
-                        hold_start = time.monotonic()
-                        while True:
-                            cap_s = self.cfg.tts_hold_max_s
-                            remaining = cap_s - (time.monotonic() - hold_start)
-                            evidence = self._speech_evidence()
-                            if remaining <= 0 and not evidence:
-                                hold_capped = True
-                                logger.warning(
-                                    f"[{self.conn.peer_addr}] TTS hold cap "
-                                    f"({cap_s:.1f}s) — no transcript evidence, "
-                                    f"starting playback"
-                                )
-                                break
-                            try:
-                                if evidence:
-                                    await self.state._user_silent.wait()
-                                else:
-                                    await asyncio.wait_for(
-                                        self.state._user_silent.wait(),
-                                        timeout=max(0.1, remaining),
-                                    )
-                            except asyncio.TimeoutError:
-                                continue  # cap window elapsed — re-evaluate
-                            except asyncio.CancelledError:
-                                return
-                            try:
-                                await asyncio.sleep(0.5)
-                            except asyncio.CancelledError:
-                                return
-                            if self.state._user_silent.is_set():
-                                break
-                            logger.info(
-                                f"[{self.conn.peer_addr}] User resumed speaking — waiting again"
-                            )
-                        hold_s = time.monotonic() - hold_start
-                        if not hold_capped:
-                            # Reset cooldown so trailing energy doesn't trigger
-                            # immediate false barge-in after we start playing
-                            self.state._speech_end_time = time.monotonic()
-                            logger.info(
-                                f"[{self.conn.peer_addr}] User silent — starting TTS playback"
-                            )
+                    hold_s, hold_capped = await self._hold_for_caller_silence()
 
                     # Thinking filler: if still in sleep phase, cancel it
                     # (LLM responded faster than the delay — no filler needed).
@@ -489,8 +593,8 @@ class PlaybackMixin:
                                 await self.state._thinking_filler_task
                             self.state._thinking_filler_task = None
                             logger.info(
-                                f"[{self.conn.peer_addr}] Thinking filler cancelled "
-                                f"(LLM responded fast)"
+                                "[%s] Thinking filler cancelled "
+                                "(LLM responded fast)", self.conn.peer_addr
                             )
                         else:
                             # Filler is playing — wait for it to finish
@@ -500,7 +604,8 @@ class PlaybackMixin:
                                 )
                             except asyncio.TimeoutError:
                                 logger.warning(
-                                    f"[{self.conn.peer_addr}] Thinking filler wait timed out"
+                                    "[%s] Thinking filler wait timed out",
+                                    self.conn.peer_addr
                                 )
                     filler_wait_s = time.monotonic() - t_filler
 
@@ -513,7 +618,7 @@ class PlaybackMixin:
                             and time.monotonic() - self.state._last_voice_sent
                             >= self.cfg.breath_min_gap_s):
                         logger.info(
-                            f"[{self.conn.peer_addr}] Breath: playing inhale"
+                            "[%s] Breath: playing inhale", self.conn.peer_addr
                         )
                         t_breath = time.monotonic()
                         await self._play_filler_audio(self._breath_pcm)
@@ -528,8 +633,8 @@ class PlaybackMixin:
                     if self.vad.state == VadState.SPEAKING and self.stt.supports_early_unmute:
                         self.state._stt_early_unmuted = True
                         logger.info(
-                            f"[{self.conn.peer_addr}] User already speaking when "
-                            f"TTS starts — keeping STT unmuted"
+                            "[%s] User already speaking when "
+                            "TTS starts — keeping STT unmuted", self.conn.peer_addr
                         )
                     self.vad.set_bargein_mode(True)
                     # Cap-triggered start with VAD still in SPEAKING: the
@@ -539,7 +644,7 @@ class PlaybackMixin:
                     # VAD-only evidence). A real talker's finals still commit
                     # through the transcript paths.
                     self._on_tts_playback_start()
-                    logger.debug(f"[{self.conn.peer_addr}] First TTS audio arrived, barge-in enabled")
+                    logger.debug("[%s] First TTS audio arrived, barge-in enabled", self.conn.peer_addr)
                     # Segment active: the ambience bed must not decorate this
                     # sender's stalls with overlapping frames (audit F12).
                     self._voice_senders += 1
@@ -556,30 +661,39 @@ class PlaybackMixin:
                         t_text = self.state._t_text_first or now
                         t_audio = self.state._t_audio_first or now
                         logger.info(
-                            f"[{self.conn.peer_addr}] First-audio latency: "
-                            f"dispatch→text {(t_text - self.state._t_dispatch) * 1000:.0f}ms, "
-                            f"text→audio {(t_audio - t_text) * 1000:.0f}ms, "
-                            f"audio→frame {(now - t_audio) * 1000:.0f}ms "
-                            f"(gate: hold {hold_s * 1000:.0f}, "
-                            f"filler-wait {filler_wait_s * 1000:.0f}, "
-                            f"breath {breath_s * 1000:.0f})"
+                            "[%s] First-audio latency: "
+                            "dispatch→text %.0fms, "
+                            "text→audio %.0fms, "
+                            "audio→frame %.0fms "
+                            "(gate: hold %.0f, "
+                            "filler-wait %.0f, "
+                            "breath %.0f)",
+                            self.conn.peer_addr, (t_text - self.state._t_dispatch) * 1000,
+                            (t_audio - t_text) * 1000, (now - t_audio) * 1000, hold_s * 1000,
+                            filler_wait_s * 1000, breath_s * 1000
                         )
                         if self.state._t_turn_speech_end:
                             logger.info(
-                                f"[{self.conn.peer_addr}] Turn first-frame: "
-                                f"speech_end→dispatch "
-                                f"{(self.state._t_dispatch - self.state._t_turn_speech_end) * 1000:.0f}ms, "
-                                f"dispatch→frame "
-                                f"{(now - self.state._t_dispatch) * 1000:.0f}ms, "
-                                f"total "
-                                f"{(now - self.state._t_turn_speech_end) * 1000:.0f}ms"
+                                "[%s] Turn first-frame: "
+                                "speech_end→dispatch "
+                                "%.0fms, "
+                                "dispatch→frame "
+                                "%.0fms, "
+                                "total "
+                                "%.0fms",
+                                self.conn.peer_addr,
+                                (self.state._t_dispatch - self.state._t_turn_speech_end) * 1000,
+                                (now - self.state._t_dispatch) * 1000,
+                                (now - self.state._t_turn_speech_end) * 1000
                             )
                     elif self.state._t_dispatch:
                         logger.info(
-                            f"[{self.conn.peer_addr}] Segment first frame: "
-                            f"+{(now - seg_start) * 1000:.0f}ms after segment "
-                            f"start (gate: hold {hold_s * 1000:.0f}, "
-                            f"filler-wait {filler_wait_s * 1000:.0f})"
+                            "[%s] Segment first frame: "
+                            "+%.0fms after segment "
+                            "start (gate: hold %.0f, "
+                            "filler-wait %.0f)",
+                            self.conn.peer_addr, (now - seg_start) * 1000, hold_s * 1000,
+                            filler_wait_s * 1000
                         )
                     t_gate_done = time.monotonic()
 
@@ -608,34 +722,35 @@ class PlaybackMixin:
             # the floor) — flush what was banked, unless cancelled (the fade
             # path owns a cancelled exit).
             for c in pending:
-                if not self.state._tts_playing and chunk_count > 0:
+                if not self.state._tts_playing and chunk_count > 0 and not idle:
                     break
                 await self._paced_playback(c)
                 t_chunk_end = time.monotonic()
         except asyncio.CancelledError:
             return
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the TTS stream's last line: an error ends this utterance only
             if self.state._tts_playing:
-                logger.error(f"[{self.conn.peer_addr}] TTS stream error: {e}")
+                logger.error("[%s] TTS stream error: %s", self.conn.peer_addr, e)
         finally:
+            feed.close()
+            self.state._tts_idle = False
             if segment_marked:
                 self._voice_senders -= 1
             duration_s = total_bytes / self._byte_rate_out if total_bytes else 0
             tail_s = (max(0.0, t_stream_end - t_chunk_end)
                       if t_stream_end and t_chunk_end else 0.0)
             logger.info(
-                f"[{self.conn.peer_addr}] TTS playback done: "
-                f"{chunk_count} chunks, {total_bytes} bytes, {duration_s:.1f}s audio"
-                + (f", pacing max-behind {self._pace_max_behind_s * 1000:.0f}ms, "
-                   f"{self._pace_stalls} stalls" if chunk_count else "")
-                + (f" (drain {self._pace_stall_drain} / loop "
-                   f"{self._pace_stall_loop})" if self._pace_stalls else "")
-                + (f", gaps {gap_count}/{gap_total_s * 1000:.0f}ms" if chunk_count else "")
-                + (f", tail {tail_s * 1000:.0f}ms" if t_stream_end and chunk_count else "")
-                + (f", prebuffer {prebuffer_wait_ms:.0f}ms"
-                   if prebuffer_wait_ms >= 0 else "")
+                "[%s] TTS playback done: %s chunks, %s bytes, %.1fs audio%s%s%s%s%s",
+                self.conn.peer_addr, chunk_count, total_bytes, duration_s,
+                (f", pacing max-behind {self._pace_max_behind_s * 1000:.0f}ms, "
+                 f"{self._pace_stalls} stalls" if chunk_count else ""),
+                (f" (drain {self._pace_stall_drain} / loop "
+                 f"{self._pace_stall_loop})" if self._pace_stalls else ""),
+                f", gaps {gap_count}/{gap_total_s * 1000:.0f}ms" if chunk_count else "",
+                f", tail {tail_s * 1000:.0f}ms" if t_stream_end and chunk_count else "",
+                f", prebuffer {prebuffer_wait_ms:.0f}ms" if prebuffer_wait_ms >= 0 else "",
             )
-            if chunk_count > 0:  # zero-chunk segments never left 'thinking'
+            if chunk_count > 0 and not idle:  # zero-chunk segments never left 'thinking'
                 self._on_tts_playback_end()
             # Post-playback STT probe: playback mute is the longest send-
             # starvation window — probe (and reconnect if dead) right away
@@ -644,7 +759,7 @@ class PlaybackMixin:
             # (audit F6: after barge-in it holds the interrupter's finals).
             if (chunk_count > 0 and self.state._running
                     and self.state._stt_active and not self.conn.is_closed):
-                asyncio.create_task(self._stt_reconnect())
+                spawn(self._stt_reconnect(), name="stt_reconnect", owner="call")
 
     # -- barge-in pause/confirm/commit ---------------------------------------
     #
@@ -665,8 +780,7 @@ class PlaybackMixin:
         return (
             bool(self.state._queued_speech)
             or bool(self.state._turn_segments)
-            or bool(self.stt.latest_interim)
-            or self.stt.has_pending_finals
+            or self.stt.speech_evidence
         )
 
     def _pause_playback(self) -> None:
@@ -690,8 +804,8 @@ class PlaybackMixin:
             self._pause_confirm_expire()
         )
         logger.info(
-            f"[{self.conn.peer_addr}] Barge-in: playback paused (speech "
-            f"start) — awaiting transcript"
+            "[%s] Barge-in: playback paused (speech "
+            "start) — awaiting transcript", self.conn.peer_addr
         )
 
     def _handle_pause_speech_end(self) -> bool:
@@ -718,15 +832,16 @@ class PlaybackMixin:
                 # over playback is ignored even when its final beat the
                 # gate.
                 logger.info(
-                    f"[{self.conn.peer_addr}] Barge-in: short episode "
-                    f"({episode_s:.2f}s) but a long episode's final is "
-                    f"pending — processing instead of ignoring"
+                    "[%s] Barge-in: short episode "
+                    "(%.2fs) but a long episode's final is "
+                    "pending — processing instead of ignoring", self.conn.peer_addr, episode_s
                 )
             else:
                 logger.info(
-                    f"[{self.conn.peer_addr}] Barge-in: short episode "
-                    f"({episode_s:.2f}s < {self.cfg.bargein_timer_s}s) — "
-                    f"ignoring speech, resuming playback"
+                    "[%s] Barge-in: short episode "
+                    "(%.2fs < %ss) — "
+                    "ignoring speech, resuming playback",
+                    self.conn.peer_addr, episode_s, self.cfg.bargein_timer_s
                 )
                 if self.state._stt_active:
                     self.stt.clear_queue()
@@ -750,7 +865,8 @@ class PlaybackMixin:
         self.conn.resume_playback()
         self.state._playback_resume.set()
         logger.info(
-            f"[{self.conn.peer_addr}] Barge-in: playback resumed ({reason})"
+            "[%s] Barge-in: playback resumed (%s)",
+            self.conn.peer_addr, reason
         )
 
     def _cancel_pause_timers(self) -> None:
@@ -781,8 +897,10 @@ class PlaybackMixin:
           choke points.
         - Evidence static for ``2 × bargein_confirm_timeout_s`` (VAD
           wedged mid-"speech", or idle with the delayed retries spent):
-          a pending FINAL runs the synthetic speech-end — the user said
-          real words, so the commit wins over a resume; interim-only or
+          a final the next drain returns (``has_drainable_finals``: on a
+          detecting route the active stream's) runs the synthetic
+          speech-end — the user said real words, so the commit wins over a
+          resume; interim-only or
           consumer-less static evidence resumes with a warning (the
           bounded escape the old backstop existed for).
 
@@ -800,12 +918,12 @@ class PlaybackMixin:
                     return
                 now = time.monotonic()
                 cur = (
-                    self.stt.latest_interim,
-                    self.stt.has_pending_finals,
+                    self.stt.interim_evidence,
+                    self.stt.speech_evidence,
                     len(self.state._queued_speech),
                     len(self.state._turn_segments),
                 )
-                evidence = bool(cur[0]) or cur[1] or cur[2] > 0 or cur[3] > 0
+                evidence = cur[1] or cur[2] > 0 or cur[3] > 0
                 if cur != snapshot:
                     snapshot = cur
                     last_delta = now
@@ -820,17 +938,18 @@ class PlaybackMixin:
                         # each pay the hold cap (the 4 s first-audio tax).
                         self.state._user_silent.set()
                         logger.warning(
-                            f"[{self.conn.peer_addr}] Barge-in: confirm "
-                            f"timeout ({self.cfg.bargein_confirm_timeout_s:.1f}s) "
-                            f"with VAD stuck in speech and no transcript — "
-                            f"treating as phantom"
+                            "[%s] Barge-in: confirm "
+                            "timeout (%.1fs) "
+                            "with VAD stuck in speech and no transcript — "
+                            "treating as phantom",
+                            self.conn.peer_addr, self.cfg.bargein_confirm_timeout_s
                         )
                     self.state._pause_confirm_timer = None
                     self._resume_playback("confirm-timeout, no transcript")
                     return
                 if now - last_delta < 2 * self.cfg.bargein_confirm_timeout_s:
                     continue
-                if (self.stt.has_pending_finals
+                if (self.stt.has_drainable_finals
                         and now - self.state._pause_speech_start
                         >= 2 * self.cfg.bargein_confirm_timeout_s):
                     # Stuck episode with real words waiting (VAD never fired
@@ -839,13 +958,13 @@ class PlaybackMixin:
                     # recent-episode check keeps a fresh restart owning its
                     # own endpointing.
                     logger.warning(
-                        f"[{self.conn.peer_addr}] Barge-in: stuck pause with "
-                        f"a pending final — synthetic speech end"
+                        "[%s] Barge-in: stuck pause with "
+                        "a pending final — synthetic speech end", self.conn.peer_addr
                     )
                     self.state._pause_confirm_timer = None
                     await self._process_speech_end(synthetic=True)
                     return
-                if not self.stt.has_pending_finals:
+                if not self.stt.has_drainable_finals:
                     # Static interim/segments with nothing consuming them —
                     # bounded escape so dead air can't run unbounded.
                     self.state._user_silent.set()
@@ -876,7 +995,7 @@ class PlaybackMixin:
 
     async def _cancel_tts(self) -> None:
         """Cancel current TTS playback and parallel LLM (barge-in commit)."""
-        logger.info(f"[{self.conn.peer_addr}] Barge-in: cancelling TTS")
+        logger.info("[%s] Barge-in: cancelling TTS", self.conn.peer_addr)
         was_paused = self.state._playback_paused
         self.state._tts_playing = False
         self.state._utterance_cancelled = True
@@ -928,9 +1047,10 @@ class PlaybackMixin:
             if getattr(self.llm, "supports_abort", False):
                 try:
                     await self.llm.abort_turn()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001  # aborting a turn that the barge-in already cut
                     logger.warning(
-                        f"[{self.conn.peer_addr}] Parallel abort failed: {e}"
+                        "[%s] Parallel abort failed: %s",
+                        self.conn.peer_addr, e
                     )
                 if (self.state._parallel_llm_text
                         and getattr(self.llm, "abort_erases_turn", True)):

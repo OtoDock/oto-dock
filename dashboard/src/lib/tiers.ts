@@ -36,13 +36,13 @@ export function tierText(tier: number | null | undefined, label?: string): strin
   return `tier ${tier} ${label || TIER_LABELS[tier] || ''}`.trim()
 }
 
-/** The tooltip behind a mark: "Strong (tier 2 of 4): complex coding and
+/** The tooltip behind a mark: "Strong, tier 2 of 4: complex coding and
  * analysis" or "Untiered: no capability rating yet". */
 export function tierTitle(
   tier: number | null | undefined, label?: string, goodAt?: string,
 ): string {
   if (!isTier(tier)) return 'Untiered: no capability rating yet'
   const word = label || TIER_LABELS[tier] || `tier ${tier}`
-  const head = `${word.charAt(0).toUpperCase()}${word.slice(1)} (tier ${tier} of ${TIER_COUNT})`
+  const head = `${word.charAt(0).toUpperCase()}${word.slice(1)}, tier ${tier} of ${TIER_COUNT}`
   return goodAt ? `${head}: ${goodAt}` : head
 }

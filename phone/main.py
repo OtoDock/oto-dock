@@ -21,19 +21,24 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from telephony.ami_events import CHANNEL_RE, UNIQUEID_RE, AmiListenerManager
-from telephony.audio_socket import AudioSocketConnection, AudioSocketError
-from telephony.transfer import AmiTransfer, dial_outcome
+import config
+from background import spawn
 from calls import pin_failures
 from calls.call_manager import CallManager, CallStatus
 from calls.call_registry import registry as call_registry
-from config_manager import ConfigManager
 from calls.http_api import OutboundCallAPI
+from config_manager import ConfigManager
+from pipeline import CallPipeline
+from pipeline.providers import (
+    prewarm_fillers,
+    prewarm_language_identifier_for,
+    prewarm_turn_classifier,
+)
 from proxy.client import fetch_pin_failures, report_call
 from proxy.management_ws import ManagementWSClient
-from pipeline import CallPipeline
-from pipeline.providers import prewarm_fillers, prewarm_turn_classifier
-import config
+from telephony.ami_events import CHANNEL_RE, UNIQUEID_RE, AmiListenerManager
+from telephony.audio_socket import AudioSocketConnection, AudioSocketError
+from telephony.transfer import AmiTransfer, dial_outcome
 
 # Track active calls
 _active_calls: dict[str, asyncio.Task] = {}
@@ -103,8 +108,8 @@ class _PbxPeers:
                     if host not in self._failing:
                         self._failing.add(host)
                         logger.warning(
-                            f"PBX host {host} did not resolve, its last addresses "
-                            f"keep the accept reserve: {e!r}")
+                            "PBX host %s did not resolve, its last addresses "
+                            "keep the accept reserve: %r", host, e)
                     if host in self._by_host:
                         by_host[host] = self._by_host[host]
                     continue
@@ -125,7 +130,7 @@ def _pbx_refresh_done(task: asyncio.Task) -> None:
     _pbx_refresh_tasks.discard(task)
     if not task.cancelled() and task.exception() is not None:
         logging.getLogger("phone-server").warning(
-            f"PBX address refresh failed: {task.exception()!r}")
+            "PBX address refresh failed: %r", task.exception())
 
 
 def _schedule_pbx_refresh(cfg: ConfigManager, logger: logging.Logger) -> None:
@@ -182,9 +187,9 @@ def _raise_nofile_limit(log: logging.Logger) -> None:
         target = 65536 if hard == resource.RLIM_INFINITY else min(hard, 65536)
         if target > soft:
             resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
-            log.info(f"RLIMIT_NOFILE soft limit raised {soft} -> {target}")
+            log.info("RLIMIT_NOFILE soft limit raised %s -> %s", soft, target)
     except (ValueError, OSError) as e:
-        log.warning(f"RLIMIT_NOFILE soft limit not raised: {e}")
+        log.warning("RLIMIT_NOFILE soft limit not raised: %s", e)
 
 # Shared call manager for outbound calls
 _call_manager = CallManager()
@@ -226,7 +231,7 @@ async def _seed_pin_lockout(logger: logging.Logger) -> None:
     if calls is None or pin_failures.store.seeded:
         return
     replayed = pin_failures.store.seed(calls)
-    logger.info(f"PIN lockout windows restored ({replayed} recent failures)")
+    logger.info("PIN lockout windows restored (%s recent failures)", replayed)
 
 
 def _start_pin_seed(logger: logging.Logger) -> asyncio.Task | None:
@@ -293,8 +298,9 @@ async def _run_call(
     started_at = datetime.now(timezone.utc).isoformat()
     if len(_active_calls) >= cfg.max_live_calls:
         logger.warning(
-            f"Rejecting {conn.peer_addr} — at capacity "
-            f"({len(_active_calls)}/{cfg.max_live_calls} active calls)"
+            "Rejecting %s — at capacity "
+            "(%s/%s active calls)",
+            conn.peer_addr, len(_active_calls), cfg.max_live_calls
         )
         # The operator wants rejected callers visible in the route's call
         # log (outbound rejects surface via the CallManager watchdog).
@@ -311,7 +317,7 @@ async def _run_call(
         outbound_call = _call_manager.get_call_by_uuid(resolution_uuid)
         if outbound_call is None:
             logger.warning(
-                f"Call {resolution_uuid}: outbound record vanished — rejecting"
+                "Call %s: outbound record vanished — rejecting", resolution_uuid
             )
             await conn.close()
             return
@@ -360,9 +366,15 @@ async def _run_call(
             timeout=cfg.call_max_duration_s,
         )
     except asyncio.TimeoutError:
-        logger.warning(f"Call {resolution_uuid} exceeded max duration ({cfg.call_max_duration_s}s)")
+        logger.warning("Call %s exceeded max duration (%ss)", resolution_uuid, cfg.call_max_duration_s)
+        if is_outbound and outbound_call.status not in (CallStatus.COMPLETED, CallStatus.FAILED):
+            # The cap cancelled the pipeline before its own terminal edge:
+            # the record ends here, so the call log gets its row.
+            _call_manager.update_status(
+                outbound_call.call_id, CallStatus.FAILED,
+                error="ended at the call's maximum duration")
     except Exception as e:
-        logger.error(f"Call {resolution_uuid} error: {e}", exc_info=True)
+        logger.exception("Call %s error: %s", resolution_uuid, e)
         outcome_override = "error"
     finally:
         _active_calls.pop(resolution_uuid, None)
@@ -387,7 +399,7 @@ async def _run_call(
                 duration_s=int(time.monotonic() - t0),
                 session_id=getattr(pipeline.llm, "session_id", "") or "",
             ))
-        logger.info(f"Call {resolution_uuid} ended ({len(_active_calls)} active calls)")
+        logger.info("Call %s ended (%s active calls)", resolution_uuid, len(_active_calls))
 
 
 async def _handle_connection(
@@ -417,12 +429,13 @@ async def _handle_connection(
     conn = AudioSocketConnection(reader, writer)
     if len(_active_calls) >= cfg.max_live_calls:
         logger.warning(
-            f"Rejecting {conn.peer_addr} — at capacity "
-            f"({len(_active_calls)}/{cfg.max_live_calls} active calls)"
+            "Rejecting %s — at capacity "
+            "(%s/%s active calls)",
+            conn.peer_addr, len(_active_calls), cfg.max_live_calls
         )
         await conn.close()
         return
-    logger.info(f"New connection from {conn.peer_addr}")
+    logger.info("New connection from %s", conn.peer_addr)
 
     _pending_total += 1
     _pending_by_peer[peer_key] = _pending_by_peer.get(peer_key, 0) + 1
@@ -453,8 +466,9 @@ async def _handle_connection(
         return
 
     logger.info(
-        f"Call {call_uuid} from {conn.peer_addr} → "
-        f"agent={route.agent}, mode={route.llm_mode}, outbound={is_outbound}"
+        "Call %s from %s → "
+        "agent=%s, mode=%s, outbound=%s",
+        call_uuid, conn.peer_addr, route.agent, route.llm_mode, is_outbound
     )
 
     caller_info = None
@@ -469,15 +483,17 @@ async def _handle_connection(
         caller_info = call_registry.pop_for_uuid(call_uuid)
         if caller_info:
             logger.info(
-                f"Call {call_uuid}: caller phone={caller_info.get('phone', '')!r}, "
-                f"did={caller_info.get('did', '')!r} "
-                f"(from call_registry, source={caller_info.get('source', '')!r})"
+                "Call %s: caller phone=%r, "
+                "did=%r "
+                "(from call_registry, source=%r)",
+                call_uuid, caller_info.get('phone', ''), caller_info.get('did', ''),
+                caller_info.get('source', '')
             )
         else:
             logger.warning(
-                f"Call {call_uuid}: no call_registry entry. The phone driver "
-                f"must POST to /v1/calls/register before AudioSocket() — e.g. "
-                f"a System(curl ...) dialplan line right before AudioSocket()."
+                "Call %s: no call_registry entry. The phone driver "
+                "must POST to /v1/calls/register before AudioSocket() — e.g. "
+                "a System(curl ...) dialplan line right before AudioSocket().", call_uuid
             )
 
     # Bind the call to its server's AMI event listener so signalled DTMF
@@ -504,9 +520,9 @@ async def _handle_connection(
             transfer = AmiTransfer(ami_manager, server_key, uniqueid, channel)
         elif route.pin:
             logger.info(
-                f"Call {call_uuid}: AMI DTMF unavailable (no listener for the "
-                f"server, or the dialplan register curl predates the "
-                f"dial_event uniqueid field) — in-band digit detection only."
+                "Call %s: AMI DTMF unavailable (no listener for the "
+                "server, or the dialplan register curl predates the "
+                "dial_event uniqueid field) — in-band digit detection only.", call_uuid
             )
     # An outbound call's channel comes from the PBX's OriginateResponse (the
     # listener keeps it under the call's audio uuid); the media leg and the
@@ -517,11 +533,11 @@ async def _handle_connection(
         if server_key is not None:
             outbound_bind = (server_key, call_uuid)
             if ami_manager.bind_outbound(server_key, call_uuid, conn):
-                logger.info(f"Call {call_uuid}: signalled DTMF bound from the PBX's OriginateResponse")
+                logger.info("Call %s: signalled DTMF bound from the PBX's OriginateResponse", call_uuid)
             else:
                 logger.info(
-                    f"Call {call_uuid}: waits for the PBX's OriginateResponse to bind "
-                    f"signalled DTMF (in-band detection meanwhile)"
+                    "Call %s: waits for the PBX's OriginateResponse to bind "
+                    "signalled DTMF (in-band detection meanwhile)", call_uuid
                 )
 
     try:
@@ -534,9 +550,9 @@ async def _handle_connection(
         if outbound_bind is not None and ami_manager is not None:
             if route.pin and not ami_manager.outbound_bound(*outbound_bind):
                 logger.warning(
-                    f"Call {call_uuid}: no OriginateResponse arrived for this outbound "
-                    f"call; the PIN gate heard in-band tones only (the AMI user needs "
-                    f"read=call)"
+                    "Call %s: no OriginateResponse arrived for this outbound "
+                    "call; the PIN gate heard in-band tones only (the AMI user needs "
+                    "read=call)", call_uuid
                 )
             ami_manager.unbind_outbound(*outbound_bind)
 
@@ -554,16 +570,28 @@ def _wire_config(mgmt: ManagementWSClient, cfg: ConfigManager,
     PIN lockout windows (one seed at a time), refreshes the filler clips
     (content-keyed: only changed combos re-synth, unused ones are pruned),
     loads the Smart Turn model off the loop (the call that paid the load lost
-    its first two seconds of audio), reconciles the AMI listeners (``apply``
-    is Lock-serialized: tasks from the sync callback never interleave) and
-    refreshes the PBX addresses. None of it blocks the start: the call path
-    self-heals if a call lands first."""
+    its first two seconds of audio), loads the language identifier off the
+    loop while detection is on and a route or live voice can use it (a call
+    that lands before it runs without detection), reconciles the AMI
+    listeners (``apply`` is Lock-serialized: tasks from the sync callback
+    never interleave) and refreshes the PBX addresses. None of it blocks the
+    start: the call path self-heals if a call lands first."""
+    from duplex import duplex_supported
+    live_voice = duplex_supported()
+
     def _on_config_changed(data: dict) -> None:
         cfg.load(data)
         _start_pin_seed(logger)
-        asyncio.create_task(prewarm_fillers(cfg))
-        asyncio.create_task(asyncio.to_thread(prewarm_turn_classifier, cfg))
-        asyncio.create_task(ami_manager.apply(cfg))
+        spawn(prewarm_fillers(cfg), name="prewarm_fillers", owner="config")
+        spawn(
+            asyncio.to_thread(prewarm_turn_classifier, cfg),
+            name="prewarm_turn_classifier", owner="config",
+        )
+        spawn(
+            asyncio.to_thread(prewarm_language_identifier_for, cfg, live_voice=live_voice),
+            name="prewarm_language_identifier", owner="config",
+        )
+        spawn(ami_manager.apply(cfg), name="ami_apply", owner="config")
         _schedule_pbx_refresh(cfg, logger)
 
     mgmt.on_config_changed = _on_config_changed
@@ -589,7 +617,7 @@ async def _run_server() -> None:
     _raise_nofile_limit(logger)
 
     logger.info("Starting Phone Server")
-    logger.info(f"  Proxy: {config.PROXY_URL}")
+    logger.info("  Proxy: %s", config.PROXY_URL)
 
     # 1. Connect to proxy management WebSocket
     mgmt = ManagementWSClient(config.PROXY_URL, config.PROXY_API_KEY)
@@ -653,9 +681,9 @@ async def _run_server() -> None:
     )
 
     addrs = [str(s.getsockname()) for s in server.sockets]
-    logger.info(f"Phone Server listening on {', '.join(addrs)}")
-    logger.info(f"  HTTP API: port {cfg.http_api_port}")
-    logger.info(f"  Idle timeout: {cfg.idle_timeout_s}s")
+    logger.info("Phone Server listening on %s", ', '.join(addrs))
+    logger.info("  HTTP API: port %s", cfg.http_api_port)
+    logger.info("  Idle timeout: %ss", cfg.idle_timeout_s)
 
     # Periodically reclaim terminal outbound-call records (phone-mcp polls
     # with wait=False, so they're never cleaned up on the request path).
@@ -664,10 +692,10 @@ async def _run_server() -> None:
             await asyncio.sleep(60)
             try:
                 _call_manager.gc_terminal()
-            except Exception as e:
-                logger.warning(f"call GC error: {e}")
+            except Exception as e:  # noqa: BLE001  # the GC loop's tick: one failure must not end the loop
+                logger.warning("call GC error: %s", e)
 
-    asyncio.create_task(_gc_loop())
+    spawn(_gc_loop(), name="call_gc", owner="main")
 
     # Handle graceful shutdown
     loop = asyncio.get_running_loop()
@@ -691,8 +719,8 @@ async def _run_server() -> None:
     await api.stop()
 
     # Cancel active calls
-    logger.info(f"Shutting down {len(_active_calls)} active call(s)...")
-    for uuid, task in _active_calls.items():
+    logger.info("Shutting down %s active call(s)...", len(_active_calls))
+    for _uuid, task in _active_calls.items():
         task.cancel()
     if _active_calls:
         await asyncio.gather(*_active_calls.values(), return_exceptions=True)

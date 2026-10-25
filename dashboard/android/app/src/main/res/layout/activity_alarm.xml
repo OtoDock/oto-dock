@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#DA3536"
+    android:gravity="center"
+    android:padding="32dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="🚨"
+        android:textSize="72sp" />
+
+    <TextView
+        android:id="@+id/alarm_install"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:gravity="center"
+        android:textColor="#CCFFFFFF"
+        android:textSize="14sp"
+        android:letterSpacing="0.05"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/alarm_title"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:gravity="center"
+        android:textColor="#FFFFFF"
+        android:textSize="28sp"
+        android:textStyle="bold"
+        android:text="Critical Alert" />
+
+    <TextView
+        android:id="@+id/alarm_body"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:gravity="center"
+        android:textColor="#FFFFFF"
+        android:textSize="18sp" />
+
+    <Button
+        android:id="@+id/alarm_dismiss"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="48dp"
+        android:paddingTop="16dp"
+        android:paddingBottom="16dp"
+        android:text="Dismiss Alarm"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:textColor="#DA3536"
+        android:background="#FFFFFF" />
+
+    <Button
+        android:id="@+id/alarm_open"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="Open OtoDock"
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        android:background="@android:color/transparent" />
+
+</LinearLayout>

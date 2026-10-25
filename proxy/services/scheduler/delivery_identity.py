@@ -15,9 +15,9 @@ without the platform.
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from storage import database as task_store
-from core.session.visibility import is_synthetic_owner
 from auth import roles
+from core.session.visibility import is_synthetic_owner
+from storage import database as task_store
 
 if TYPE_CHECKING:
     from core.session.visibility import VisibilityResolution

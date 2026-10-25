@@ -28,6 +28,8 @@ EXPECTED_ORDER = [
     "init_audio_telephony",
     "init_phone_call_log",
     "init_remote_machines",
+    "init_chat_moves",
+    "init_engine_switch_leftovers",
     "init_meetings",
     "init_execution_layers",
     "init_notifications",
@@ -48,6 +50,7 @@ EXPECTED_ORDER = [
     "init_file_transfers",
     "init_knowledge_libraries",
     "init_checks",
+    "init_reply_reports",
     "init_schema_meta",
 ]
 
@@ -55,7 +58,7 @@ HOMES = {
     "storage.identity.schema": ["init_identity"],
     "storage.agents.schema": ["init_agents", "init_departments", "init_memory"],
     "storage.knowledge.schema": ["init_knowledge_libraries"],
-    "storage.chat.schema": ["init_chats", "init_meetings"],
+    "storage.chat.schema": ["init_chats", "init_meetings", "init_reply_reports"],
     "storage.automation.schema": [
         "init_tasks", "init_notifications", "init_push", "init_webhooks", "init_triggers",
     ],
@@ -67,6 +70,7 @@ HOMES = {
     "storage.billing.schema": ["init_usage", "init_execution_layers"],
     "storage.sharing.schema": ["init_shares"],
     "storage.checks.schema": ["init_checks"],
+    "storage.move_schema": ["init_chat_moves", "init_engine_switch_leftovers"],
     "storage.schema": [
         "init_storage_quotas", "init_remote_machines", "init_pinned_apps",
         "init_pinned_app_user_hides", "init_app_state", "init_app_handler_deliveries",

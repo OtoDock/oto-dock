@@ -3,6 +3,7 @@ import {
 } from 'react'
 
 import { anchorBoxOf, usePopoverPlacement, type AnchorBox } from '../components/ui/popoverPosition'
+import { usePortalRoot } from '../components/ui/portalRoot'
 import { pushEscHandler } from '../lib/escStack'
 
 const ITEMS = '[role="menuitem"]:not([disabled])'
@@ -13,6 +14,8 @@ export interface PortalMenu {
   panelRef: RefObject<HTMLDivElement | null>
   /** The portaled panel's fixed position: hidden until it is measured. */
   style: CSSProperties
+  /** Where to portal the panel: the body, or the dialog the menu is in. */
+  portalRoot: HTMLElement
   toggle: () => void
   /** Close; `refocus` gives the focus back to the button (a keyboard close). */
   close: (refocus?: boolean) => void
@@ -36,6 +39,7 @@ export function usePortalMenu({ align = 'left' }: { align?: 'left' | 'right' } =
   const buttonRef = useRef<HTMLButtonElement | null>(null)
   const panelRef = useRef<HTMLDivElement | null>(null)
   const placement = usePopoverPlacement(anchor, panelRef, { align })
+  const portalRoot = usePortalRoot()
 
   const close = (refocus = true) => {
     setAnchor(null)
@@ -57,7 +61,7 @@ export function usePortalMenu({ align = 'left' }: { align?: 'left' | 'right' } =
     const popEsc = pushEscHandler(() => {
       setAnchor(null)
       buttonRef.current?.focus()
-    })
+    }, () => panelRef.current)
     return () => {
       document.removeEventListener('mousedown', onDown)
       popEsc()
@@ -88,5 +92,5 @@ export function usePortalMenu({ align = 'left' }: { align?: 'left' | 'right' } =
     zIndex: 60,
   }
 
-  return { open, buttonRef, panelRef, style, toggle, close, onKeyDown }
+  return { open, buttonRef, panelRef, style, portalRoot, toggle, close, onKeyDown }
 }

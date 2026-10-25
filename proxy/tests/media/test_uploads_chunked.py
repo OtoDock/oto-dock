@@ -40,8 +40,8 @@ def app_with_router(tmp_path, monkeypatch):
     async def _stub_user():
         return user
 
-    from storage.agents import agent_store
     from storage import database as task_store
+    from storage.agents import agent_store
     monkeypatch.setattr(agent_store, "agent_exists", lambda name: name == "test-agent")
     monkeypatch.setattr(
         task_store, "get_username_by_sub",
@@ -127,6 +127,7 @@ def test_chunked_complete_refreshes_the_open_trees_once(app_with_router, monkeyp
     """The landed file is announced like a single-shot upload: one
     ``file_updated`` for the landed path, none for the chunks."""
     from unittest.mock import AsyncMock
+
     import config
     from services.notifications import notification_manager
     told = AsyncMock()
@@ -368,6 +369,7 @@ def test_init_never_sweeps(app_with_router, monkeypatch):
 
 def test_sweep_reaps_stale_pairs_and_pops_only_idle_locks(app_with_router, monkeypatch):
     import asyncio
+
     import config
     from api.media import uploads
     app, _agents, staging_dir, user = app_with_router
@@ -396,7 +398,7 @@ def test_sweep_reaps_stale_pairs_and_pops_only_idle_locks(app_with_router, monke
     _age(staging_dir / "oldflat01.partial", 25 * 3600)
     _age(staging_dir / "oldflat01.json", 25 * 3600)
     # (f) a swept id whose lock is held keeps the lock (the holder answers 410)
-    uploads._chunk_locks[old].locked() is False
+    assert uploads._chunk_locks[old].locked() is False
     held = asyncio.Lock()
     asyncio.run(held.acquire())
     uploads._chunk_locks[empty] = held
@@ -563,8 +565,9 @@ def test_the_global_open_cap_answers_503(app_with_router, monkeypatch):
 
 def _no_disk(monkeypatch):
     import shutil
-    import config
     from collections import namedtuple
+
+    import config
     usage = namedtuple("usage", "total used free")
     monkeypatch.setattr(config, "MIN_FREE_DISK_MB", 5)
     monkeypatch.setattr(config, "MIN_FREE_DISK_PCT", 0)
@@ -597,6 +600,7 @@ def test_the_free_disk_floor_refuses_every_write(app_with_router, monkeypatch):
 def test_a_same_filesystem_complete_ignores_the_floor_and_the_copy_path_honours_it(
         app_with_router, monkeypatch):
     import errno
+
     import config
     from services.infra import safe_fs
     app, agents_dir, _staging, _user = app_with_router
@@ -687,6 +691,7 @@ def test_writes_fsync_and_finalize_run_off_the_loop(app_with_router, monkeypatch
     import os
     import threading
     from pathlib import Path
+
     import config
     from api.media import uploads
     app, _agents, staging_dir, user = app_with_router
@@ -807,15 +812,15 @@ def test_staged_bytes_for_one_user(app_with_router, monkeypatch):
     """The quota monitor reads one user's staged bytes without walking the
     other users' staging directories."""
     import config
-    from api.media import uploads
+    from services.media import upload_staging
     app, _agents, _staging, user = app_with_router
     chunk = 64 * 1024
     monkeypatch.setattr(config, "UPLOAD_CHUNK_BYTES", chunk, raising=False)
     monkeypatch.setattr(config, "UPLOAD_MAX_OPEN", 0)
     client = TestClient(app)
-    assert uploads.staged_bytes_for(user.sub) == 0
+    assert upload_staging.staged_bytes_for(user.sub) == 0
     up = _init(client, 4 * chunk).json()["upload_id"]
     assert client.put(f"/v1/upload/chunked/{up}/0", content=b"A" * chunk).status_code == 200
-    assert uploads.staged_bytes_for(user.sub) == chunk
-    assert uploads.staged_bytes_for("local:someone-else") == 0
-    assert uploads.staged_bytes_total() == chunk
+    assert upload_staging.staged_bytes_for(user.sub) == chunk
+    assert upload_staging.staged_bytes_for("local:someone-else") == 0
+    assert upload_staging.staged_bytes_total() == chunk

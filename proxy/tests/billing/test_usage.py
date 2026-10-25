@@ -6,12 +6,11 @@ period calculations, and database CRUD.
 Run: cd proxy && python -m pytest tests/billing/test_usage.py -v
 """
 
-from datetime import datetime, timezone, timedelta
 from calendar import monthrange
+from datetime import datetime, timedelta, timezone
 
-from storage import database as task_store
 from services.billing import usage_service
-
+from storage import database as task_store
 
 # ---------------------------------------------------------------------------
 # Helper: record user-scoped usage PAID BY A BORROWED PLATFORM CREDENTIAL.

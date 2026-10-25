@@ -114,6 +114,8 @@ export interface ConcurrencyStats {
 export interface StorageUsage {
   agents_bytes: number
   session_files_bytes: number
+  /** What the machines held at the last sweep; null until a sweep reached one. */
+  remote_session_files_bytes: number | null
   codex_junk_bytes: number
   recover_bin_bytes: number
   sessions_dir_bytes: number
@@ -121,6 +123,6 @@ export interface StorageUsage {
   retention: {
     enabled: boolean
     days: number
-    last_sweep: Record<string, number | string | boolean> | null
+    last_sweep: Record<string, unknown> | null
   }
 }

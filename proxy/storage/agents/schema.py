@@ -7,6 +7,16 @@ statement is idempotent (``CREATE ... IF NOT EXISTS``); see
 """
 
 
+#: The engine an agent runs on when nothing says otherwise — a missing
+#: ``agents.execution_path``, a chat row from before the column existed, a
+#: caller with no opinion. ONE constant: it used to be typed inline at a dozen
+#: sites, so "the platform's default engine" could be neither read nor changed
+#: in one place. Lives beside the ``agents`` column whose DDL default spells
+#: the same id (a test pins the two equal), in a module with no imports, so
+#: storage and every config builder above it read it without an import cycle.
+DEFAULT_EXECUTION_PATH = "claude-code-cli"
+
+
 def init_agents(conn) -> None:
     """Agent definitions, delegation / browser scoping, platform settings."""
     # --- Agent configuration ---

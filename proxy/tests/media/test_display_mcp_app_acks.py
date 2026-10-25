@@ -9,18 +9,19 @@ The hook is patched: these are the MCP's words, not the proxy's job.
 from __future__ import annotations
 
 import base64
+import re
 import sys
 
 import pytest
 from mcp.types import ImageContent, TextContent
 
-from tests._paths import CUSTOM_MCPS
+from tests._paths import CUSTOM_MCPS, REPO_ROOT
 
 MCP_DIR = CUSTOM_MCPS / "display-mcp"
 if str(MCP_DIR) not in sys.path:
     sys.path.insert(0, str(MCP_DIR))
 
-import app_tools  # noqa: E402
+import app_tools
 
 JPEG = base64.b64encode(b"\xff\xd8\xff\xe0 not really a jpeg").decode()
 
@@ -261,7 +262,6 @@ def test_the_skills_the_always_loaded_skill_names_are_shipped():
     id; an id the manifest no longer ships fails the Skill call (the
     miniapp-authoring skill was renamed app-authoring)."""
     import json
-    import re
     manifest = json.loads((MCP_DIR / "manifest.json").read_text())
     shipped = {s["id"] for s in manifest["skills"]}
     text = (MCP_DIR / "skills" / "display-tools.md").read_text()
@@ -332,3 +332,279 @@ async def test_open_app_sends_the_home_agent_of_a_placed_app(monkeypatch):
     assert "agent" not in calls[-1][1]
     schema = next(t for t in app_tools.APP_TOOLS if t.name == "open_app").inputSchema
     assert "agent" in schema["properties"]
+
+
+def _tool(name: str):
+    return next(t for t in app_tools.APP_TOOLS if t.name == name)
+
+
+def test_pin_app_offers_a_deliverable_and_lists_every_feed():
+    """An offer or a comparison someone opens from a link is an app too,
+    and the feed list names every feed the catalog serves: an agent
+    declares only the feeds the tool text names."""
+    tool = _tool("pin_app")
+    assert "a deliverable someone opens from a link" in tool.description
+    feeds = tool.inputSchema["properties"]["actions"]["description"]
+    for feed in ("'sessions'", "'file_changes'", "'checks'", "'check_verdicts'"):
+        assert feed in feeds, feed
+
+
+def test_check_app_says_what_it_returns():
+    """It returns the refusals, the warnings and the pictures, not a bare
+    ok: an agent that reads "returns ok" skips the pictures."""
+    text = _tool("check_app").description
+    assert "Worth fixing" in text and "four pictures of the page" in text
+    assert "Returns ok" not in text
+
+
+def test_display_ui_sends_agents_to_the_vars_and_names_the_kit():
+    """A component on the vars needs no ``dark:`` class, and the wrapper's
+    variant makes one follow the frame's theme class. The primitives and
+    the badge tones are the ones the kit ships, and a full document links
+    the kit before Tailwind."""
+    text = (MCP_DIR / "display_server.py").read_text()
+    assert "no dark: class is needed" in text
+    assert "A dark: class " in text and "follows the same theme" in text
+    for name in (".quiet-danger", ".info/.agent/.media/.action, grey when", ".label above a field"):
+        assert name in text, name
+    assert "/ui-kit/otodock-tokens.css itself, before /ui-kit/tailwind.js" in text
+    named = set(_PAGE_RE.findall(text)) - _OPENABLE
+    assert not named, named
+
+
+# A page name an agent is pointed at but can never open: the maintainers'
+# pages are outside the public cut and outside every agent's folders.
+_PAGE_RE = re.compile(r"\b[A-Z][A-Z0-9_-]*\.md\b")
+_OPENABLE = {"SKILL.md", "README.md"}
+
+
+def _descriptions(node) -> list[str]:
+    if isinstance(node, dict):
+        own = [node["description"]] if isinstance(node.get("description"), str) else []
+        return own + [d for v in node.values() for d in _descriptions(v)]
+    if isinstance(node, list):
+        return [d for v in node for d in _descriptions(v)]
+    return []
+
+
+@pytest.mark.asyncio
+async def test_the_tool_texts_name_no_page_an_agent_cannot_open(monkeypatch):
+    texts = [t.description for t in app_tools.APP_TOOLS]
+    texts += [d for t in app_tools.APP_TOOLS for d in _descriptions(t.inputSchema)]
+    _patch(monkeypatch, {"server": "up", "sockets_refused": 3, "log": ""})
+    logs = _texts(await app_tools._handle_deploy_hook("logs", {"slug": "board"}))
+    assert "reconnects by itself" in logs
+    texts.append(logs)
+    named = {m for t in texts for m in _PAGE_RE.findall(t)} - _OPENABLE
+    assert not named, named
+
+
+SKILL = MCP_DIR / "skills" / "app-authoring" / "SKILL.md"
+
+
+def test_the_skill_fills_nothing_with_the_link_colour():
+    """``--p-primary`` is link-coloured text: white on it measures 2.81 to 1
+    in the dark theme, so a chart series or a 3D material reads the info
+    solid instead, the way the dashboard draws a series."""
+    text = SKILL.read_text()
+    assert "cssVar('--p-primary')" not in text
+    assert "cssVar('--p-status-info-solid')" in text
+
+
+def test_the_skill_brand_sample_sets_both_themes_and_no_meaning():
+    """Agents copy the sample: a variable set in one theme only shows its
+    light value in the dark one, and a status or accent colour must keep
+    its meaning in every app a person opens."""
+    css = SKILL.read_text().split("/* The client's brand.", 1)[1].split("```", 1)[0]
+    light = css.split(":root {", 1)[1].split("}", 1)[0]
+    dark = css.split(":root.dark {", 1)[1].split("}", 1)[0]
+    names = lambda block: set(re.findall(r"(--p-[a-z0-9-]+)\s*:", block))
+    assert names(light) and names(light) == names(dark)
+    for name in names(light):
+        assert not name.startswith(("--p-status-", "--p-accent-", "--p-code-")), name
+        assert name not in {"--p-success", "--p-error", "--p-on-solid", "--p-mono"}, name
+    assert "color-scheme" not in css
+
+
+def test_the_skill_and_the_card_name_no_page_an_agent_cannot_open():
+    for path in (SKILL, MCP_DIR / "skills" / "display-tools.md"):
+        named = set(_PAGE_RE.findall(path.read_text())) - _OPENABLE
+        assert not named, (path.name, named)
+
+
+def test_the_server_review_check_the_skill_offers_ships_and_validates():
+    """The skill hands a manager's chat the judge check to add with
+    ``set_check``, and the checks MCP ships the same document as an
+    example: agents read only the skill, people read the example, so the
+    two must never drift. The name is the folder's, or a template that
+    copies it is refused."""
+    import json
+
+    from services.checks import documents
+
+    folder = CUSTOM_MCPS / "checks-mcp" / "examples" / "app-server-review"
+    doc = json.loads((folder / "check.json").read_text())
+    clean = documents.validate_check_doc(doc, owner="")
+    assert clean["name"] == folder.name
+    assert clean["condition"]["globs"] == ["**/apps/*/server/**", "**/user-apps/*/server/**"]
+    text = SKILL.read_text()
+    guard = text.split("- **Guard what the server does.**", 1)[1]
+    block = guard.split("```json\n", 1)[1].split("\n```", 1)[0]
+    assert json.loads(block) == doc
+    readme = (folder / "README.md").read_text()
+    assert not set(_PAGE_RE.findall(readme)) - _OPENABLE
+    # Template authors are told to ship it, and where its document is.
+    authoring = (CUSTOM_MCPS / "agent-creator-mcp" / "skills" / "agent-creation" / "SKILL.md").read_text()
+    assert "`checks/app-server-review/check.json`" in authoring and "Guard what the server does" in authoring
+
+
+def test_the_card_offers_an_app_as_the_deliverable():
+    """An offer, a comparison or a form someone else opens is an app shared
+    by link, never a document, and only a person makes the link: the card
+    rides every prompt, and the section it sends the agent to exists."""
+    card = (MCP_DIR / "skills" / "display-tools.md").read_text()
+    assert "the deliverable is an **app**, not a document" in card
+    assert "You cannot make a link yourself" in card
+    assert "in OtoDock's look" in card and "carry their brand" in card
+    assert '"An app as the deliverable"' in card
+    assert "\n## An app as the deliverable\n" in SKILL.read_text()
+
+
+def _guard_rules(start: str, end: str) -> set[str]:
+    """The rule ids "Guard what the server does" names between two of its
+    sentences."""
+    guard = SKILL.read_text().split("- **Guard what the server does.**", 1)[1].split("\n", 1)[0]
+    part = guard.split(start, 1)[1].split(end, 1)[0]
+    return set(re.findall(r"`((?:server|client|app)\.[a-z-]+)`", part))
+
+
+def test_every_rule_the_skill_names_answers_at_the_grade_it_gives(tmp_path):
+    """The skill tells an agent which of check_app's rules refuse a deploy
+    and which only warn. A server with every mistake in it, linted the way
+    a deploy lints it, answers each named rule at that grade."""
+    from services.apps import app_lint, releases
+
+    refused = _guard_rules("It refuses", "It warns on")
+    warned = _guard_rules("It warns on", "A manager can add")
+    assert {"server.secret", "client.secret", "app.secret", "server.dev-mode"} <= refused
+    assert {"server.eval", "server.sql-concat", "server.spawn", "server.error-leak",
+            "server.file-path", "server.write-without-role"} <= warned
+    key = "sk" + "_live_" + "Ab1" * 8
+    server = (
+        'import { Database } from "bun:sqlite";\n'
+        f'const key = "{key}";\n'
+        'const db = new Database(`${process.env.OTODOCK_DATA_DIR}/app.db`);\n'
+        'Bun.serve({ port: Number(process.env.PORT || 3000), hostname: "0.0.0.0", development: true,\n'
+        '  async fetch(req) {\n'
+        '    const url = new URL(req.url);\n'
+        '    if (url.pathname === "/_health") return new Response("ok");\n'
+        '    const body = await req.json();\n'
+        '    if (req.method === "POST" && url.pathname === "/run") {\n'
+        '      eval(body.code);\n'
+        '      db.query(`SELECT * FROM t WHERE id = ${url.searchParams.get("id")}`);\n'
+        '      Bun.spawn(["ls", body.dir]);\n'
+        '      const f = Bun.file(url.searchParams.get("path"));\n'
+        '      try { f.size; } catch (err) { return new Response(String(err), { status: 500 }); }\n'
+        '    }\n'
+        '    return new Response("hi");\n'
+        '  },\n'
+        '});\n')
+    root = tmp_path / "app"
+    for rel, text in {"server/index.ts": server, "client/index.html": f'<p>{key}</p>\n',
+                      "notes.txt": f"the key is {key}\n"}.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)
+    findings = app_lint.lint_tree(root, releases.walk_tree(root), app_lint.Declared())
+    grades: dict[str, set[str]] = {}
+    for f in findings:
+        grades.setdefault(f.rule, set()).add(f.severity)
+    for rule in refused:
+        assert app_lint.FAIL in grades.get(rule, set()), (rule, grades)
+    for rule in warned:
+        assert grades.get(rule) == {app_lint.WARN}, (rule, grades)
+
+
+def test_the_skill_brand_lists_hold_kit_names_and_never_a_kept_one():
+    """Every name a brand may set exists in the kit, and none of them is a
+    name the brand check keeps for status, accents or the code slab."""
+    from services.apps import app_lint_brand
+
+    kit = (REPO_ROOT / "dashboard" / "ui-kit" / "otodock-tokens.css").read_text()
+    names = set(re.findall(r"(--p-[a-z0-9-]+)\s*:", kit))
+    line = next(x for x in SKILL.read_text().splitlines() if x.startswith("- You may set the surfaces"))
+    may = set(re.findall(r"--p-[a-z0-9-]+", line))
+    assert may and may <= names, may - names
+    for name in may:
+        assert not name.startswith((*app_lint_brand._RESERVED_PREFIXES, "--p-code-")), name
+        assert name not in app_lint_brand._RESERVED_NAMES, name
+
+
+FOLDERS_MADE = {"created": ["workspace/videos/projects"], "kept": ["workspace/notes"],
+                "skipped": [{"path": "workspace/clips", "reason": "a file is in the way"}]}
+
+
+@pytest.mark.asyncio
+async def test_a_deploy_and_a_rollback_say_which_folders_were_made(monkeypatch):
+    _patch(monkeypatch, {"status": "ok", "release": 4, "app_id": "a1", "screens": 1,
+                         "folders": FOLDERS_MADE})
+    text = _texts(await app_tools._handle_deploy_hook("deploy", {"slug": "timeline"}))
+    assert ("Folders: Made workspace/videos/projects. workspace/notes was already there. "
+            "Not made workspace/clips, because a file is in the way.") in text
+    _patch(monkeypatch, {"status": "ok", "release": 3, "screens": 0, "db_restored": False,
+                         "folders": FOLDERS_MADE})
+    text = _texts(await app_tools._handle_app_hook("rollback", {"slug": "timeline"}))
+    assert "now serves release 3 again" in text and "Folders: Made workspace/videos/projects" in text
+    _patch(monkeypatch, {"status": "ok", "release": 5, "app_id": "a1", "screens": 1,
+                         "folders": {"created": [], "kept": ["workspace/a", "workspace/b"], "skipped": []}})
+    text = _texts(await app_tools._handle_deploy_hook("deploy", {"slug": "timeline"}))
+    assert "Folders: workspace/a, workspace/b were already there." in text
+    # An app that declares no folder says nothing about folders.
+    _patch(monkeypatch, {"status": "ok", "release": 4, "app_id": "a1", "screens": 1})
+    assert "Folders" not in _texts(await app_tools._handle_deploy_hook("deploy", {"slug": "board"}))
+
+
+@pytest.mark.asyncio
+async def test_deploy_status_says_how_each_declared_folder_stands(monkeypatch):
+    _patch(monkeypatch, {"release": 2, "deploy_state": "live", "server": "up", "manifest_approved": True,
+                         "folders": [{"path": "workspace/videos/projects", "state": "present"},
+                                     {"path": "workspace/clips", "state": "missing"},
+                                     {"path": "workspace/raw", "state": "blocked"}]})
+    text = _texts(await app_tools._handle_deploy_hook("status", {"slug": "timeline"}))
+    assert ("Folders: workspace/videos/projects is there. workspace/clips is missing, and the next "
+            "approved release makes it again. workspace/raw is blocked by a file or a link in the way.") in text
+
+
+@pytest.mark.asyncio
+async def test_a_missing_secret_is_named_in_words_with_who_sets_it(monkeypatch):
+    """The agent relays this line to a person, so it names the missing
+    secret and who sets it in plain sentences, never the value."""
+    _patch(monkeypatch, {"status": "pending approval", "release": 1, "app_id": "a1", "live_release": 0,
+                         "manifest_changed": True, "waiting": "STRIPE_SECRET_KEY is not set"})
+    text = _texts(await app_tools._handle_deploy_hook("deploy", {"slug": "booking"}))
+    said = ("Waiting: STRIPE_SECRET_KEY is not set. A manager sets it in the app's Settings, from the "
+            "app's menu, or with the card's Set button. On a personal app the owner does. Then they "
+            "approve the release. Never ask for the value in the chat.")
+    assert said in text
+    # The agent relays it to a person: one idea a sentence.
+    for sentence in said.split(". "):
+        assert len(sentence.split()) <= 20, sentence
+    _patch(monkeypatch, {"release": 0, "deploy_state": "pending", "server": "static",
+                         "waiting": "STRIPE_SECRET_KEY is not set"})
+    text = _texts(await app_tools._handle_deploy_hook("status", {"slug": "booking"}))
+    assert "Waiting: STRIPE_SECRET_KEY is not set. Ask a manager" in text
+    for line in text.splitlines():
+        if line.startswith("Waiting:"):
+            assert "—" not in line and ";" not in line and "→" not in line, line
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_secret_reads_as_a_sentence_in_the_list_and_the_status_text(monkeypatch):
+    """Both lines reach a person through the agent: no dash joins them."""
+    description = _tool("deploy_status").description
+    assert "never the value. Ask a manager or the owner" in description and "—" not in description
+    _patch(monkeypatch, {"apps": [{"id": "a", "slug": "shop", "title": "Shop", "scope": "shared",
+                                   "path": "/workspace/apps/shop", "actions": [],
+                                   "actions_approved": False, "waiting": "STRIPE_SECRET_KEY is not set"}],
+                         "placed": []})
+    text = _texts(await app_tools._handle_app_hook("list", {}))
+    assert ". Waiting: STRIPE_SECRET_KEY is not set" in text and "— waiting" not in text

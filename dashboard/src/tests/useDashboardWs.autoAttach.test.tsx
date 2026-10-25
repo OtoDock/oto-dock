@@ -7,26 +7,10 @@
  * that and every repeated turn frame).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { renderHook, act } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act } from '@testing-library/react'
 import { useDashboardWs } from '@/hooks/useDashboardWs'
-
-class FakeWebSocket {
-  static OPEN = 1
-  static CONNECTING = 0
-  static instances: FakeWebSocket[] = []
-  readyState = FakeWebSocket.OPEN
-  sent: string[] = []
-  onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
-  onmessage: ((e: { data: string }) => void) | null = null
-  constructor(public url: string) {
-    FakeWebSocket.instances.push(this)
-  }
-  send(data: string) { this.sent.push(data) }
-  close() { /* keep reconnect logic out of the test */ }
-}
+import { FakeWebSocket } from './fakeWebSocket'
+import { connectDashboardWs } from './dashboardWsHarness'
 
 function resumes(ws: FakeWebSocket, chatId: string): number {
   return ws.sent
@@ -46,18 +30,7 @@ describe('useDashboardWs auto-attach on chat_status streaming', () => {
   })
 
   function connect(viewedChatId: string | null, ptyLive = false) {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    const wrapper = ({ children }: { children: React.ReactNode }) => (
-      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
-    )
-    const hook = renderHook(
-      () => useDashboardWs({ viewedChatId, isViewedChatPtyLive: () => ptyLive }),
-      { wrapper },
-    )
-    act(() => { hook.result.current.connect() })
-    const ws = FakeWebSocket.instances[0]
-    act(() => { ws.onopen?.() })
-    return { hook, ws }
+    return connectDashboardWs(() => ({ viewedChatId, isViewedChatPtyLive: () => ptyLive }))
   }
 
   function frame(ws: FakeWebSocket, msg: Record<string, unknown>) {

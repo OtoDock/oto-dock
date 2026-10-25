@@ -21,20 +21,21 @@ Run individually (conftest DB-pool gotcha):
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 from core import placement
-
-from types import SimpleNamespace
-
 from core.config.task_config_builder import (
-    TaskIdentity, resolve_task_identity, run_allows_knowledge_rw, task_allows_knowledge_rw,
+    TaskIdentity,
+    resolve_task_identity,
+    run_allows_knowledge_rw,
+    task_allows_knowledge_rw,
 )
-from ws.dashboard import _rewarm_chat_allowed, _task_continue_allowed
-from storage.agents import agent_store
+from core.session.visibility import _task_continue_allowed
 from storage import database as task_store
-
+from storage.agents import agent_store
+from ws.dashboard import _rewarm_chat_allowed
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -400,7 +401,7 @@ def tmp_agents(tmp_path):
 
 
 def _sandbox_for(agents_dir, mcps_dir, *, username: str, role: str):
-    from core.sandbox.sandbox import SandboxConfig, SandboxBuilder
+    from core.sandbox.sandbox import SandboxBuilder, SandboxConfig
     claude_dir = (
         agents_dir / "pa" / "users" / username / ".claude" if username
         else agents_dir / "pa" / "workspace" / ".claude"
@@ -436,7 +437,7 @@ class TestIdentityDrivesMounts:
         assert f"{agent_dir}/config" not in cmd_str
         # Knowledge is read-only in agent scope.
         bind_pairs = list(zip(sb.build_command_prefix(["claude"]),
-                             sb.build_command_prefix(["claude"])[1:]))
+                             sb.build_command_prefix(["claude"])[1:], strict=False))
         assert any(
             a == "--ro-bind" and b == f"{agent_dir}/knowledge"
             for a, b in bind_pairs
@@ -479,7 +480,7 @@ def _stub_heavy(monkeypatch, tmp_path):
         lambda *a, **k: ("test-sub", {}),
     )
     monkeypatch.setattr(
-        cb.remote_store, "resolve_execution_target", lambda *a, **k: ("local", None),
+        cb.remote_status, "resolve_execution_target", lambda *a, **k: ("local", None),
     )
     monkeypatch.setattr(
         cb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT,
@@ -587,8 +588,8 @@ class TestSharedOnlyBelowEditorRefused:
             task_store.add_user_agent(sub, "voicebot", role, "admin")
 
     def test_a_chat_below_the_editor_tier_is_refused_before_a_seat(self, temp_db, monkeypatch, tmp_path):
-        from core.config.config_builder import build_agent_config
         from core.config import config_builder as cb
+        from core.config.config_builder import build_agent_config
         from core.sandbox.session_config_dir import AgentStateRefused
         self._shared_only()
         _stub_heavy(monkeypatch, tmp_path)
@@ -628,10 +629,11 @@ class TestSharedOnlyBelowEditorRefused:
 
     def test_a_scheduled_fire_below_the_editor_tier_is_refused_before_a_seat(self, temp_db, monkeypatch):
         from types import SimpleNamespace
+
         from core.config import task_config_builder as tcb
         from core.sandbox.session_config_dir import AgentStateRefused
         self._shared_only()
-        monkeypatch.setattr(tcb.remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
+        monkeypatch.setattr(tcb.remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
         monkeypatch.setattr(tcb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT)
         monkeypatch.setattr(tcb.remote_store, "get_target_browser_settings", lambda *a, **k: None)
         monkeypatch.setattr(tcb.mcp_registry, "build_session_mcp_config",

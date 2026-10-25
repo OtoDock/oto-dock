@@ -6,11 +6,11 @@
 
 import base64
 
-import config
 import pytest
+
+import config
 from core.remote import file_sync
 from storage.files import recover_bin_store
-
 
 # --- .partial cleanup on a failed write -----------------------------------
 

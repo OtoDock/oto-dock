@@ -1,4 +1,6 @@
 import { useState } from 'react'
+import { isRecord } from '../../lib/json/guards'
+import Button from '../ui/Button'
 
 interface QuestionOption {
   label: string
@@ -22,7 +24,7 @@ interface QuestionItem {
 }
 
 interface Props {
-  toolInput: any
+  toolInput: unknown
   answered?: boolean
   onAnswer: (response: string) => void
   // Codex path: a request-id-correlated question whose held turn resumes only
@@ -36,19 +38,20 @@ interface Props {
   readOnly?: boolean
 }
 
-function parseQuestions(toolInput: any): QuestionItem[] {
+function parseQuestions(toolInput: unknown): QuestionItem[] {
   if (!toolInput) return []
-  if (toolInput.questions && Array.isArray(toolInput.questions)) return toolInput.questions
-  if (toolInput.question) {
+  if (typeof toolInput === 'string') return [{ question: toolInput }]
+  const input = isRecord(toolInput) ? toolInput : {}
+  if (input.questions && Array.isArray(input.questions)) return input.questions
+  if (input.question) {
     return [{
-      question: toolInput.question,
-      header: toolInput.header,
-      options: toolInput.options,
-      multiSelect: toolInput.multiSelect,
+      question: String(input.question),
+      header: typeof input.header === 'string' ? input.header : undefined,
+      options: Array.isArray(input.options) ? input.options : undefined,
+      multiSelect: input.multiSelect === true,
     }]
   }
-  if (typeof toolInput === 'string') return [{ question: toolInput }]
-  if (toolInput.text) return [{ question: toolInput.text }]
+  if (input.text) return [{ question: String(input.text) }]
   return [{ question: JSON.stringify(toolInput, null, 2) }]
 }
 
@@ -61,7 +64,7 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
 
   if (answered) {
     return (
-      <div className="my-2 p-3 rounded-lg border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/20 text-sm text-green-800 dark:text-green-300">
+      <div className="my-2 p-3 rounded-card border border-status-success-border bg-status-success-bg text-sm text-status-success-fg">
         <div className="flex items-center gap-2">
           <span>&#10003;</span>
           <span>Questions answered</span>
@@ -74,24 +77,24 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
     return (
       <div
         data-testid="question-readonly"
-        className="my-2 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 overflow-hidden"
+        className="my-2 rounded-card bg-surface-card shadow-elevation-1 overflow-hidden"
       >
         <div className="p-4 space-y-3">
           {questions.map((qi, idx) => (
             <div key={idx}>
               {qi.header && (
-                <p className="text-xs font-semibold text-blue-600 dark:text-blue-400 uppercase tracking-wide mb-1">
+                <p className="text-xs font-semibold text-secondary uppercase tracking-wide mb-1">
                   {qi.header}
                 </p>
               )}
-              <p className="text-sm font-medium text-gray-900 dark:text-gray-100">{qi.question}</p>
+              <p className="text-sm font-medium text-primary">{qi.question}</p>
               {Array.isArray(qi.options) && qi.options.length > 0 && (
                 <ul className="mt-1.5 space-y-1">
                   {qi.options.map((opt, oi) => (
-                    <li key={oi} className="text-sm text-gray-700 dark:text-gray-300">
+                    <li key={oi} className="text-sm text-secondary">
                       <span className="font-medium">{opt.label}</span>
                       {opt.description && (
-                        <span className="text-xs text-gray-500 dark:text-gray-400"> · {opt.description}</span>
+                        <span className="text-xs text-tertiary"> · {opt.description}</span>
                       )}
                     </li>
                   ))}
@@ -99,7 +102,7 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
               )}
             </div>
           ))}
-          <p className="text-xs text-gray-500 dark:text-gray-400">
+          <p className="text-xs text-tertiary">
             Answer in the terminal. The agent is waiting there.
           </p>
         </div>
@@ -165,23 +168,23 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
   const isLast = activeTab === questions.length - 1
 
   return (
-    <div className="my-2 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 overflow-hidden">
+    <div className="my-2 rounded-card bg-surface-card shadow-elevation-1 overflow-hidden">
       {/* Tab bar — only for multiple questions */}
       {isMulti && (
-        <div className="flex border-b border-blue-200 dark:border-blue-800">
+        <div className="flex border-b border-subtle">
           {questions.map((qi, idx) => (
             <button
               key={idx}
               onClick={() => setActiveTab(idx)}
               className={`flex-1 px-3 py-2 text-xs font-medium transition-colors relative ${
                 idx === activeTab
-                  ? 'bg-white dark:bg-p-surface text-blue-700 dark:text-blue-400 border-b-2 border-blue-600'
-                  : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-blue-100/50 dark:hover:bg-blue-900/30'
+                  ? 'text-link border-b-2 border-action'
+                  : 'text-tertiary hover:text-secondary hover:bg-surface-hover'
               }`}
             >
               <span className="flex items-center justify-center gap-1.5">
                 {hasAnswerFor(idx) && (
-                  <span className="text-green-500 text-[10px]">&#10003;</span>
+                  <span className="text-status-success-fg text-3xs">&#10003;</span>
                 )}
                 {qi.header || `Q${idx + 1}`}
               </span>
@@ -193,13 +196,13 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
       {/* Active question content */}
       <div className="p-4">
         {q.header && !isMulti && (
-          <p className="text-xs font-semibold text-blue-600 dark:text-blue-400 uppercase tracking-wide mb-1">
+          <p className="text-xs font-semibold text-secondary uppercase tracking-wide mb-1">
             {q.header}
           </p>
         )}
-        <p className="text-sm font-medium text-gray-900 dark:text-gray-100 mb-3">{q.question}</p>
+        <p className="text-sm font-medium text-primary mb-3">{q.question}</p>
         {q.multiSelect && (
-          <p className="text-xs text-gray-400 mb-2">Select multiple</p>
+          <p className="text-xs text-tertiary mb-2">Select multiple</p>
         )}
 
         {Array.isArray(q.options) && q.options.length > 0 && (
@@ -210,20 +213,20 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
                 <button
                   key={optIdx}
                   onClick={() => toggleOption(activeTab, optIdx, q.multiSelect || false)}
-                  className={`w-full text-left px-3 py-2 rounded-md border text-sm transition-colors ${
+                  className={`w-full text-left px-3 py-2 rounded-control border text-sm transition-colors ${
                     isSelected
-                      ? 'border-blue-500 bg-blue-100 dark:bg-blue-900/30 text-blue-900 dark:text-blue-200'
-                      : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-p-surface text-gray-700 dark:text-gray-300 hover:border-blue-300 hover:bg-blue-50 dark:hover:bg-blue-900/20'
+                      ? 'border-action-subtle-hover bg-action-subtle text-primary'
+                      : 'border-subtle bg-surface-card text-secondary hover:bg-surface-hover'
                   }`}
                 >
                   <div className="flex items-start gap-2">
                     <span className="mt-0.5 shrink-0">
                       {q.multiSelect ? (
                         <span
-                          className={`inline-flex items-center justify-center w-4 h-4 border-2 rounded-sm text-[10px] ${
+                          className={`inline-flex items-center justify-center w-4 h-4 border-2 rounded-sm text-3xs ${
                             isSelected
-                              ? 'border-blue-500 bg-blue-500 text-white'
-                              : 'border-gray-300 dark:border-gray-600'
+                              ? 'border-action bg-action text-action-fg'
+                              : 'border-strong'
                           }`}
                         >
                           {isSelected ? '\u2713' : ''}
@@ -231,11 +234,11 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
                       ) : (
                         <span
                           className={`inline-flex items-center justify-center w-4 h-4 border-2 rounded-full ${
-                            isSelected ? 'border-blue-500' : 'border-gray-300 dark:border-gray-600'
+                            isSelected ? 'border-action' : 'border-strong'
                           }`}
                         >
                           {isSelected && (
-                            <span className="block w-2 h-2 rounded-full bg-blue-500" />
+                            <span className="block w-2 h-2 rounded-full bg-action" />
                           )}
                         </span>
                       )}
@@ -243,10 +246,10 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
                     <div className="min-w-0 flex-1">
                       <span className="font-medium">{opt.label}</span>
                       {opt.description && (
-                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{opt.description}</p>
+                        <p className="text-xs text-tertiary mt-0.5">{opt.description}</p>
                       )}
                       {opt.preview && (
-                        <pre className="mt-1.5 px-2.5 py-2 rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-p-surface-hover text-xs text-gray-700 dark:text-gray-300 whitespace-pre-wrap break-words font-mono">
+                        <pre className="mt-1.5 px-2.5 py-2 rounded-sm bg-surface-sunken text-xs text-secondary whitespace-pre-wrap break-words font-mono">
                           {opt.preview}
                         </pre>
                       )}
@@ -265,46 +268,42 @@ export default function QuestionDialog({ toolInput, answered, onAnswer, requestI
             setCustomTexts((prev) => ({ ...prev, [activeTab]: e.target.value }))
           }
           placeholder={q.options ? 'Or type a custom response...' : 'Type your answer...'}
-          className="mt-2 w-full px-3 py-1.5 rounded-md border border-gray-200 dark:border-gray-700 text-sm
-                     focus:outline-hidden focus:ring-2 focus:ring-blue-400 focus:border-transparent
-                     bg-white dark:bg-p-surface text-p-text placeholder:text-p-text-light"
+          className="mt-2 w-full px-3 py-1.5 rounded-control border border-strong text-sm
+                     focus:outline-hidden focus:ring-2 focus:ring-focus-ring focus:border-transparent
+                     bg-surface-card text-primary placeholder:text-tertiary"
         />
 
         {/* Navigation + submit */}
         <div className="flex items-center justify-between mt-3">
           {isMulti && (
-            <div className="text-xs text-gray-400">
+            <div className="text-xs text-tertiary">
               {activeTab + 1} of {questions.length}
             </div>
           )}
           <div className={`flex gap-2 ${isMulti ? '' : 'ml-auto'}`}>
             {isMulti && activeTab > 0 && (
-              <button
+              <Button
+                size="sm"
                 onClick={() => setActiveTab(activeTab - 1)}
-                className="px-3 py-1.5 rounded-lg text-sm font-medium text-gray-600 dark:text-gray-300
-                           border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-p-surface-hover transition-colors"
               >
                 Back
-              </button>
+              </Button>
             )}
             {isMulti && !isLast ? (
-              <button
+              <Button
+                size="sm" variant="primary"
                 onClick={() => setActiveTab(activeTab + 1)}
-                className="px-4 py-1.5 rounded-lg text-sm font-medium text-white
-                           bg-brand hover:bg-brand-hover transition-colors"
               >
                 Next
-              </button>
+              </Button>
             ) : (
-              <button
+              <Button
+                size="sm" variant="primary"
                 onClick={handleSubmit}
                 disabled={!allAnswered && isMulti}
-                className="px-4 py-1.5 rounded-lg text-sm font-medium text-white
-                           bg-brand hover:bg-brand-hover disabled:bg-gray-300 dark:disabled:bg-gray-700
-                           disabled:cursor-not-allowed transition-colors"
               >
                 Submit
-              </button>
+              </Button>
             )}
           </div>
         </div>

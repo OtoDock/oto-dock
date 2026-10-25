@@ -20,6 +20,7 @@ loopback service, so it is a clean no-op.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import urllib.request
@@ -92,9 +93,9 @@ def network_selfcheck() -> None:
         "/containers/json?all=true"
     )
     try:
-        with urllib.request.urlopen(url, timeout=_TIMEOUT_S) as resp:  # noqa: S310 (fixed internal host)
+        with urllib.request.urlopen(url, timeout=_TIMEOUT_S) as resp:
             containers = json.load(resp)
-    except Exception as e:
+    except (OSError, http.client.HTTPException, ValueError) as e:
         # Inconclusive (socket proxy not ready yet, API error, timeout): the
         # split is the guarantee, so a transient hiccup must never brick boot.
         logger.warning(

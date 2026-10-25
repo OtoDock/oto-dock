@@ -832,6 +832,7 @@ def test_concurrent_tails_do_not_duplicate_rows(tmp_path, _capture, monkeypatch)
     # duplicate user rows). The first thread is held mid-persist; the second
     # must block on the lock and then find the cursor already advanced.
     import threading
+
     import storage.database as db
 
     entered = threading.Event()
@@ -1018,10 +1019,10 @@ def _usage_env(monkeypatch):
     """Pin every external the usage path touches: captured rows instead of DB
     writes, a fixed pool binding, deterministic pricing, no agent-config reads."""
     rows: list[dict] = []
+    import config
+    from core.session import visibility
     from services.billing import usage_service
     from services.engines import subscription_pool
-    from core.session import visibility
-    import config
 
     def _record(batch):
         rows.extend(batch)
@@ -1032,7 +1033,7 @@ def _usage_env(monkeypatch):
                         lambda sid: "sub-abc")
     monkeypatch.setattr(visibility, "is_shared_only",
                         lambda agent: agent == "shared-bot")
-    monkeypatch.setattr(config, "get_model_pricing",
+    monkeypatch.setattr("configuration.models.get_model_pricing",
                         lambda m, p="": (10.0, 50.0, 12.5, 1.0))
     monkeypatch.setattr(config, "get_model_provider", lambda m: "anthropic")
     return rows
@@ -1087,8 +1088,7 @@ def test_usage_zero_priced_model_row_still_written(tmp_path, _capture, _usage_en
                                                    monkeypatch):
     # Unknown/local model resolving to $0 pricing: the row still lands (tokens
     # + message_count survive — pump parity), just with cost 0.
-    import config
-    monkeypatch.setattr(config, "get_model_pricing", lambda m, p="": (0, 0, 0, 0))
+    monkeypatch.setattr("configuration.models.get_model_pricing", lambda m, p="": (0, 0, 0, 0))
     path = _write(tmp_path, _assistant_usage(
         "msg_z", {"type": "text", "text": "hi"}, model="local-llama"))
     assert T.tail_transcript("su3", "cu3", path)["usage_rows"] == 1

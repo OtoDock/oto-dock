@@ -25,7 +25,21 @@ only ``GET /v1/admin/health`` shows either (never the public ``GET /health``).
 
 Cost: one 50 ms timer on the loop, a daemon thread that reads one float every
 25 ms, and a directory count every 10 s. Disabled entirely with a threshold
-``<= 0`` (``LOOP_WATCHDOG_THRESHOLD_S``).
+``<= 0`` (``LOOP_WATCHDOG_THRESHOLD_S``). ``start()`` takes the two cadences:
+the satellite (this module is vendored there byte for byte, hash-pinned by
+``scripts/sync-satellite-code.sh``) runs a 250 ms tick and a 100 ms watch, so
+a laptop on battery wakes 14 times a second instead of 60.
+
+The watcher also measures its own overshoot: a wait that returns
+``_FROZEN_S`` or more late while the process burned no CPU meanwhile means
+the whole PROCESS did not run (the host was paused, the daemon starved, a
+SIGSTOP), so the line says that and shows no stack, instead of "event loop
+stalled" over a loop that was never blocked. The CPU tells the two apart: a
+call on the loop thread that holds the GIL (a huge ``json.dumps``, a large
+regex) stops the watcher too, but the process is busy all through it, so it
+is judged as the stall it is. After a freeze the loop is judged from the
+moment the process ran again, never from the tick the freeze interrupted: a
+loop still blocked ``threshold_s`` after the thaw is a stall with its stack.
 
 Ordering (load-bearing, see startup.py): ``start()`` runs as the LAST boot
 step, after the synchronous schema init / preflight / manifest scan, so a
@@ -33,8 +47,9 @@ long boot never logs a fake stall; ``stop()`` flags the thread BEFORE the
 tick task is cancelled, so shutdown never logs one either.
 
 Known limit: a C-level call that holds the GIL (a huge ``json.loads``) hides
-the Python stack until it returns; blocking waits such as psycopg's release
-the GIL, so the stall class this was built for is observable.
+the Python stack until it returns (the stall is counted and the stack shows
+the caller once the call ends); blocking waits such as psycopg's release the
+GIL, so the stall class this was built for is observable.
 """
 
 from __future__ import annotations
@@ -42,16 +57,27 @@ from __future__ import annotations
 import asyncio
 import bisect
 import collections
+import hashlib
 import logging
 import os
 import sys
 import threading
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger("otodock.loop-watchdog")
 
 _TICK_S = 0.05
 _WATCH_S = 0.025
+# A watcher wake this late past its own wait is a frozen process, not a
+# blocked loop (the proxy's threads share the freeze), unless the process
+# burned at least this share of the overshoot as CPU meanwhile: then a
+# call that holds the GIL kept the watcher out, and the loop was blocked.
+_FROZEN_S = 0.5
+_FROZEN_CPU_FRACTION = 0.5
 _REPEAT_S = 10.0
 _STACK_FRAMES = 25
 _REPORT_BURST = 5
@@ -74,7 +100,9 @@ _last_tick: float = 0.0
 _loop_thread_ident: int | None = None
 _threshold_s: float = 0.0
 _report_s: float = 0.0
-_executors: dict[str, object] = {}
+_tick_s: float = _TICK_S
+_watch_s: float = _WATCH_S
+_executors: dict[str, ThreadPoolExecutor] = {}
 
 # Counters (read by stats(); written by the watchdog thread only, except the
 # lateness minutes, written by the tick).
@@ -83,6 +111,7 @@ _stall_seconds_total = 0.0
 _last_stall_s = 0.0
 _max_stall_s = 0.0
 _slow = 0
+_frozen = 0
 _stall_hist = dict.fromkeys(_STALL_BOUNDS_MS, 0)
 # (minute, counts per lateness bucket incl. the overflow one, max ms)
 _late_minutes: collections.deque = collections.deque(maxlen=_LATE_MINUTES)
@@ -93,7 +122,7 @@ def is_running() -> bool:
     return _thread is not None and _thread.is_alive()
 
 
-def watch_executor(name: str, executor) -> None:
+def watch_executor(name: str, executor: ThreadPoolExecutor) -> None:
     """Report a thread pool's queue depth in ``stats()["executors"]``."""
     _executors[name] = executor
 
@@ -129,7 +158,7 @@ def stats() -> dict:
         try:
             executors[name] = {"workers": ex._max_workers, "threads": len(ex._threads),
                                "queued": ex._work_queue.qsize()}
-        except Exception:
+        except AttributeError:
             continue
     return {
         "enabled": is_running(),
@@ -140,6 +169,7 @@ def stats() -> dict:
         "max_stall_s": round(_max_stall_s, 3),
         "report_s": _report_s,
         "slow": _slow,
+        "frozen": _frozen,
         "histogram_ms": {str(b): n for b, n in _stall_hist.items()},
         "lateness_ms": {"1m": _lateness(1), "1h": _lateness(_LATE_MINUTES)},
         "executors": executors,
@@ -153,12 +183,13 @@ def fd_stats() -> dict:
 
 
 def reset_stats() -> None:
-    global _stalls, _stall_seconds_total, _last_stall_s, _max_stall_s, _slow
+    global _stalls, _stall_seconds_total, _last_stall_s, _max_stall_s, _slow, _frozen
     _stalls = 0
     _stall_seconds_total = 0.0
     _last_stall_s = 0.0
     _max_stall_s = 0.0
     _slow = 0
+    _frozen = 0
     for b in _stall_hist:
         _stall_hist[b] = 0
     _late_minutes.clear()
@@ -184,9 +215,9 @@ async def _tick_loop() -> None:
     _last_tick = time.monotonic()
     try:
         while not _stop.is_set():
-            await asyncio.sleep(_TICK_S)
+            await asyncio.sleep(_tick_s)
             now = time.monotonic()
-            _record_lateness(now - _last_tick - _TICK_S)
+            _record_lateness(now - _last_tick - _tick_s)
             _last_tick = now
     except asyncio.CancelledError:
         return
@@ -201,7 +232,7 @@ def _loop_stack() -> str:
     frame = sys._current_frames().get(ident)
     if frame is None:
         return "<loop thread frame unavailable>"
-    lines = []
+    lines: list[str] = []
     while frame is not None and len(lines) < _STACK_FRAMES:
         code = frame.f_code
         lines.append(f'  File "{code.co_filename}", line {frame.f_lineno}, in {code.co_name}')
@@ -231,28 +262,98 @@ def _sample_fds() -> None:
         _fds["warned"] = False
 
 
+class _Burst:
+    """At most ``_REPORT_BURST`` lines a window; the rest are counted into
+    the next line's "(N more)"."""
+
+    def __init__(self) -> None:
+        self.at: float | None = None
+        self.n = 0
+        self.held = 0
+
+    def take(self, now: float) -> str | None:
+        """The suffix for a line that may go out now, None for one held."""
+        if self.at is None or now - self.at >= _REPORT_WINDOW_S:
+            self.at, self.n = now, 0
+        if self.n >= _REPORT_BURST:
+            self.held += 1
+            return None
+        self.n += 1
+        more = f" ({self.held} more since the last line)" if self.held else ""
+        self.held = 0
+        return more
+
+
 def _watch() -> None:
-    global _stalls, _stall_seconds_total, _last_stall_s, _max_stall_s, _slow
+    global _stalls, _stall_seconds_total, _last_stall_s, _max_stall_s, _slow, _frozen
     stalled_since: float | None = None
     stall_stack = ""
     escalated = False
     last_report = 0.0
-    burst_at: float | None = None
-    burst = 0
-    held = 0
+    slow_lines = _Burst()
+    frozen_lines = _Burst()
     next_fd_sample = 0.0
-    while not _stop.wait(_WATCH_S):
+    last_wake = time.monotonic()
+    last_cpu = time.process_time()
+    # When the process last ran again after a freeze: until the loop has
+    # ticked since, its lag is measured from here, not from the tick the
+    # freeze interrupted (that tick is old by the freeze, which was no stall;
+    # a loop still blocked after the thaw is one).
+    thaw = 0.0
+
+    def _end_stall(duration: float, now: float) -> None:
+        global _stalls, _stall_seconds_total, _last_stall_s, _max_stall_s, _slow
+        nonlocal stalled_since
+        stalled_since = None
+        ms = duration * 1000.0
+        i = bisect.bisect_right(_STALL_BOUNDS_MS, ms) - 1
+        if i >= 0:
+            _stall_hist[_STALL_BOUNDS_MS[i]] += 1
+        if _report_s > 0 and duration >= _report_s:
+            _slow += 1
+        if escalated:
+            _stalls += 1
+            _stall_seconds_total += duration
+            _last_stall_s = duration
+            _max_stall_s = max(_max_stall_s, duration)
+            logger.info("event loop recovered after %.1fs stall", duration)
+        elif _report_s > 0 and duration >= _report_s:
+            more = slow_lines.take(now)
+            if more is not None:
+                logger.info("slow event loop: stalled %.2fs%s; loop thread stack:\n%s",
+                            duration, more, stall_stack)
+
+    while not _stop.wait(_watch_s):
         now = time.monotonic()
+        cpu = time.process_time()
+        overshoot = now - last_wake - _watch_s
+        busy = cpu - last_cpu
+        last_wake, last_cpu = now, cpu
+        if overshoot >= _FROZEN_S and busy < overshoot * _FROZEN_CPU_FRACTION:
+            # The watcher woke late and the process burned no CPU meanwhile:
+            # nothing ran. A stall under way ended when the freeze began.
+            _frozen += 1
+            if stalled_since is not None:
+                _end_stall(max(0.0, now - overshoot - stalled_since), now)
+            thaw = now
+            more = frozen_lines.take(now)
+            if more is not None:
+                logger.info(
+                    "the process did not run for %.1fs%s (the host was paused or the "
+                    "daemon starved); the loop was not blocked", overshoot, more,
+                )
+            continue
         if now >= next_fd_sample:
             next_fd_sample = now + _FD_SAMPLE_S
             _sample_fds()
         if _last_tick <= 0.0:
             continue  # tick task not started yet
-        lag = now - _last_tick - _TICK_S
+        baseline = max(_last_tick, thaw)
+        lag = now - baseline - _tick_s
         entry = _report_s if _report_s > 0 else _threshold_s
         if lag >= entry:
             if stalled_since is None:
-                stalled_since = _last_tick + _TICK_S
+                stalled_since = baseline + _tick_s
                 stall_stack = _loop_stack()
                 escalated = False
             if lag >= _threshold_s:
@@ -270,39 +371,18 @@ def _watch() -> None:
                         now - stalled_since, _loop_stack(),
                     )
         elif stalled_since is not None:
-            duration = _last_tick - stalled_since
-            stalled_since = None
-            ms = duration * 1000.0
-            i = bisect.bisect_right(_STALL_BOUNDS_MS, ms) - 1
-            if i >= 0:
-                _stall_hist[_STALL_BOUNDS_MS[i]] += 1
-            if _report_s > 0 and duration >= _report_s:
-                _slow += 1
-            if escalated:
-                _stalls += 1
-                _stall_seconds_total += duration
-                _last_stall_s = duration
-                _max_stall_s = max(_max_stall_s, duration)
-                logger.info("event loop recovered after %.1fs stall", duration)
-            elif _report_s > 0 and duration >= _report_s:
-                if burst_at is None or now - burst_at >= _REPORT_WINDOW_S:
-                    burst_at, burst = now, 0
-                if burst < _REPORT_BURST:
-                    burst += 1
-                    more = f" ({held} more since the last report)" if held else ""
-                    held = 0
-                    logger.info("slow event loop: stalled %.2fs%s; loop thread stack:\n%s",
-                                duration, more, stall_stack)
-                else:
-                    held += 1
+            _end_stall(_last_tick - stalled_since, now)
 
 
-def start(threshold_s: float, report_s: float = 0.0) -> bool:
+def start(threshold_s: float, report_s: float = 0.0, *,
+          tick_s: float = _TICK_S, watch_s: float = _WATCH_S) -> bool:
     """Start the watchdog on the running loop. Returns False when disabled
     (``threshold_s <= 0``) or already running. ``report_s`` > 0 also reports
-    shorter stalls (at INFO, rate-limited). Must be called from the loop
+    shorter stalls (at INFO, rate-limited). ``tick_s`` and ``watch_s`` are
+    the loop tick and the watcher's wait (the module defaults for the
+    proxy; a coarser pair for a laptop). Must be called from the loop
     thread (it creates the tick task)."""
-    global _thread, _tick_task, _threshold_s, _report_s, _last_tick
+    global _thread, _tick_task, _threshold_s, _report_s, _last_tick, _tick_s, _watch_s
     if threshold_s is None or threshold_s <= 0:
         return False
     with _lock:
@@ -311,6 +391,8 @@ def start(threshold_s: float, report_s: float = 0.0) -> bool:
         _stop.clear()
         _threshold_s = float(threshold_s)
         _report_s = float(report_s) if report_s and 0 < report_s < threshold_s else 0.0
+        _tick_s = float(tick_s) if tick_s and tick_s > 0 else _TICK_S
+        _watch_s = float(watch_s) if watch_s and watch_s > 0 else _WATCH_S
         _last_tick = 0.0
         _tick_task = asyncio.get_running_loop().create_task(
             _tick_loop(), name="loop-watchdog-tick",
@@ -332,3 +414,12 @@ def stop(join_timeout: float = 2.0) -> None:
         task.cancel()
     if thread is not None and thread.is_alive():
         thread.join(timeout=join_timeout)
+
+
+def self_hash() -> str:
+    """SHA256 of this module's source — used by the satellite drift check."""
+    try:
+        with open(__file__, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""

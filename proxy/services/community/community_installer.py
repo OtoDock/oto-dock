@@ -26,18 +26,20 @@ import shutil
 import tarfile
 import tempfile
 from pathlib import Path
-
 from urllib.parse import urlsplit
 
 import httpx
+import psycopg
 from fastapi import HTTPException
 
 import config
 from services.infra import path_confinement
-from services.mcp import manifest_floor
-from services.mcp import mcp_manifest_parse as _mmp
-from services.mcp import mcp_manifest_types as _mt
-from services.mcp import mcp_registry, mcp_installer
+from services.mcp import (
+    mcp_installer,
+    mcp_manifest_parse as _mmp,
+    mcp_manifest_types as _mt,
+    mcp_registry,
+)
 
 logger = logging.getLogger("otodock.community-installer")
 
@@ -399,7 +401,7 @@ def _check_incoming_tree(mcp_root: Path) -> dict:
     try:
         manifest_data = json.loads(manifest_path.read_text())
     except json.JSONDecodeError as e:
-        raise HTTPException(400, f"Invalid manifest.json: {e}")
+        raise HTTPException(400, f"Invalid manifest.json: {e}") from e
 
     # A catalog Python MCP installs from its ``server.source``, wheels only.
     # A requirements file in its folder would be built outside that rule (by
@@ -429,7 +431,7 @@ def _check_incoming_compose(mcp_root: Path, mcp_name: str) -> None:
     except ValueError as exc:
         raise HTTPException(
             400, f"'{mcp_name}' cannot be installed in Docker-Compose mode: {exc}",
-        )
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -552,219 +554,6 @@ def _validate_manifest(data: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# The package check — what the installer will say, without installing
-# ---------------------------------------------------------------------------
-
-_MASTER_KEY_TOKENS = ("${platform.api_key}", "${proxy_api_key}")
-_ICON_SIZE = 256
-_ICON_MAX_BYTES = 256 * 1024
-
-
-def _icon_problem(path: Path) -> str | None:
-    """Why ``icon.png`` is not the 256×256 PNG the catalog asks for; ``None``
-    when it is (the signature and the IHDR chunk, no imaging library)."""
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as fh:
-            head = fh.read(24)
-    except OSError as exc:
-        return f"cannot be read ({exc})"
-    if size > _ICON_MAX_BYTES:
-        return f"is {size} bytes (limit {_ICON_MAX_BYTES})"
-    if head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
-        return "is not a PNG"
-    width = int.from_bytes(head[16:20], "big")
-    height = int.from_bytes(head[20:24], "big")
-    if (width, height) != (_ICON_SIZE, _ICON_SIZE):
-        return f"is {width}x{height}, must be {_ICON_SIZE}x{_ICON_SIZE}"
-    return None
-
-
-def check_package(mcp_root: Path, *, skipped: list[str] | tuple[str, ...] = ()) -> dict:
-    """What ``install_from_extracted_folder`` would refuse, drop or accept in
-    ``mcp_root``, plus the catalog's conventions, without installing
-    anything: ``{ok, errors, warnings, summary}``. The authoring check tool
-    (``validate_mcp_package`` in mcps-mcp) runs it on a snapshot of the
-    author's folder; ``skipped`` names the entries the snapshot left out
-    (dotfiles, ``node_modules``, ``venv``), judged here since the copy never
-    holds them. Synchronous: run it through ``asyncio.to_thread``."""
-    from urllib.parse import urlsplit
-    errors: list[str] = []
-    warnings: list[str] = []
-
-    for name in skipped:
-        base = name.rsplit("/", 1)[-1]
-        if base == ".env":
-            errors.append(
-                f"{name}: a .env file is refused at install; declare environment "
-                "values in the manifest and keep secrets in instances or credentials",
-            )
-        elif base in _REFUSED_INCOMING_DIRS:
-            errors.append(
-                f"{name}: a {base} entry is refused at install; the platform "
-                "installs dependencies itself from server.source",
-            )
-    for p in sorted(mcp_root.rglob("*")):
-        rel = str(p.relative_to(mcp_root))
-        if p.name == ".env" and p.is_file():
-            errors.append(f"{rel}: a .env file is refused at install")
-        elif p.name in _REFUSED_INCOMING_DIRS:
-            errors.append(f"{rel}: a {p.name} entry is refused at install")
-    for name in sorted(_DROPPED_INCOMING_FILES):
-        if (mcp_root / name).exists():
-            warnings.append(f"{name} is dropped at install (the platform resolves its own lock)")
-
-    manifest_path = mcp_root / "manifest.json"
-    if not manifest_path.is_file():
-        errors.append("manifest.json not found at the package root")
-        return {"ok": False, "errors": errors, "warnings": warnings, "summary": {}}
-    try:
-        raw = manifest_path.read_text()
-        data = json.loads(raw)
-    except (OSError, ValueError) as exc:
-        errors.append(f"manifest.json is not valid JSON: {exc}")
-        return {"ok": False, "errors": errors, "warnings": warnings, "summary": {}}
-    if not isinstance(data, dict):
-        errors.append("manifest.json must hold an object")
-        return {"ok": False, "errors": errors, "warnings": warnings, "summary": {}}
-
-    errors.extend(_validate_manifest(data))
-    named = _mmp.agent_context_credential_tokens(data.get("agent_context"))
-    if named:
-        warnings.append(
-            f"agent_context names {', '.join(named)}: no credential value enters "
-            "a prompt, so each renders empty and a requires on one skips its block")
-    server = data.get("server") if isinstance(data.get("server"), dict) else {}
-    source = server.get("source", "") if isinstance(server.get("source", ""), str) else ""
-    runtime = server.get("runtime", "")
-    rt = _mt.runtime_of(runtime) if isinstance(runtime, str) else None
-    remote = source.startswith("remote:")
-    name = data.get("name", "")
-    if isinstance(name, str) and name and not _is_safe_name(name):
-        errors.append(f"name {name!r} must be lowercase letters, digits, dashes and underscores")
-    if data.get("category") not in (None, "community"):
-        errors.append("category must be \"community\" (core and custom ship with the platform)")
-    if source and not remote and mcp_installer.parse_source(source) is None:
-        errors.append(
-            f"server.source {source!r} is not an accepted source (npm:<package>, "
-            "pypi:<package>, git+<url>@<ref>, docker:<image>, remote:<host>)",
-        )
-    skills = data.get("skills") if isinstance(data.get("skills"), list) else []
-    for sk in skills:
-        if isinstance(sk, dict) and isinstance(sk.get("file"), str) and \
-                _mmp.skill_file_error(sk["file"]) is None and \
-                _mmp.resolve_skill_file(mcp_root, sk["file"]) is None:
-            errors.append(f"skill {sk.get('id')}: file {sk['file']!r} is not a regular file inside the package")
-    compose_file = server.get("docker_compose") or ""
-    if rt is not None and rt.container:
-        if not compose_file:
-            errors.append("server.docker_compose must name the compose file of a docker MCP")
-        elif isinstance(compose_file, str) and _mmp.skill_file_error(compose_file) is None and \
-                _mmp.resolve_skill_file(mcp_root, compose_file) is None:
-            errors.append(f"server.docker_compose {compose_file!r} is not a regular file inside the package")
-        if not server.get("image"):
-            warnings.append(
-                "server.image is absent: the containerised deployment cannot build "
-                "an image, so the package installs on bare metal only",
-            )
-        url_template = str(server.get("url_template") or "")
-        if "${docker_mcp_host}" not in url_template:
-            warnings.append(
-                "server.url_template should be http://${docker_mcp_host}:${port}: a fixed "
-                "host breaks the containerised deployment",
-            )
-        if not str(data.get("version") or ""):
-            errors.append("version must be set for a docker MCP (the image tag)")
-    if source.startswith("git+") and not str(data.get("version") or ""):
-        errors.append("version must be set for a git+ source (the pinned ref)")
-    if source.startswith("git+") and not git_ref_is_commit(source):
-        warnings.append(
-            "server.source pins a tag or a branch: the community catalog takes a git+ "
-            "source only at a full 40-character commit (a tag can move upstream), "
-            "while an admin may still install this package from a ZIP",
-        )
-    if rt is not None and rt.installed and source and not source.startswith("git+"):
-        parsed = mcp_installer.parse_source(source)
-        if parsed is not None and parsed.version:
-            warnings.append(
-                f"server.source pins {parsed.version}: the catalog leaves node and "
-                "python packages unpinned and the platform pins the installed version",
-            )
-    if rt is not None and rt.installed and runtime == _mt.RUNTIME_PYTHON and (mcp_root / "requirements.txt").is_file():
-        warnings.append("requirements.txt is dropped at install: a python package installs from server.source")
-    for block in ("env", "agent_env"):
-        values = data.get(block)
-        if isinstance(values, dict):
-            for key in values:
-                if str(key).startswith("OTO_") or str(key) in ("PROXY_URL", "PROXY_API_KEY"):
-                    warnings.append(
-                        f"{block}.{key}: the OTO_* set, PROXY_URL and PROXY_API_KEY are "
-                        "injected by the platform and must not be declared",
-                    )
-    for token in _MASTER_KEY_TOKENS:
-        if token in raw:
-            errors.append(f"the manifest references the master key ({token}), which is never given to an MCP")
-    if not (mcp_root / "README.md").is_file():
-        warnings.append("README.md is missing: the catalog shows it in the install dialog")
-    icon = mcp_root / "icon.png"
-    if icon.is_file():
-        problem = _icon_problem(icon)
-        if problem:
-            warnings.append(f"icon.png {problem}")
-    if not str(data.get("author") or "").strip():
-        warnings.append("author is missing: name the project whose server code the package wraps")
-    author_url = str(data.get("author_url") or "")
-    author_parts = urlsplit(author_url)
-    if author_parts.scheme != "https" or not author_parts.netloc:
-        warnings.append("author_url should be the https:// repository of the upstream project")
-    if not errors:
-        try:
-            parsed_manifest = _mmp._parse_manifest(manifest_path)
-        except ValueError as exc:
-            errors.append(f"manifest block rejected: {exc}")
-            parsed_manifest = None
-        if parsed_manifest is None and not errors:
-            errors.append("the manifest could not be parsed")
-    if not errors and rt is not None and rt.container:
-        try:
-            _check_incoming_compose(mcp_root, str(name))
-        except HTTPException as exc:
-            errors.append(str(exc.detail))
-
-    floor, floor_reasons = "", []
-    try:
-        schema = manifest_floor.load_schema()
-        floor, floor_reasons = manifest_floor.platform_floor(data, schema)
-        for problem in manifest_floor.schema_errors(data, schema):
-            # The git+ ref has its own, plainer warning above.
-            if not (problem.startswith("/server/source:") and source.startswith("git+")):
-                warnings.append(f"catalog schema: {problem}")
-    except (OSError, ValueError, ImportError) as exc:
-        warnings.append(f"the catalog schema could not be read ({exc}): fields not checked against it")
-    if floor and manifest_floor.version_key(manifest_floor.declared_floor(data)) < manifest_floor.version_key(floor):
-        warnings.append(
-            f"platform_min_version should be at least {floor}: older platforms refuse or "
-            f"ignore {', '.join(floor_reasons)}",
-        )
-
-    skills = [sk.get("id") for sk in skills if isinstance(sk, dict)]
-    creds = data.get("credentials") if isinstance(data.get("credentials"), dict) else {}
-    summary = {
-        "name": name, "label": data.get("label", ""),
-        "runtime": "remote" if remote and not runtime else runtime,
-        "transport": server.get("transport", ""),
-        "source": source, "version": data.get("version", ""),
-        "credentials": creds.get("type", "none"),
-        "instances": isinstance(data.get("instances"), dict),
-        "skills": [s for s in skills if isinstance(s, str)],
-        "host": urlsplit(str(server.get("url_template") or "")).hostname or "" if remote else "",
-        "files": sum(1 for p in mcp_root.rglob("*") if p.is_file()),
-        "platform_floor": floor,
-    }
-    return {"ok": not errors, "errors": errors, "warnings": warnings, "summary": summary}
-
-
-# ---------------------------------------------------------------------------
 # Folder install — shared between zip-upload and tarball-fetch
 # ---------------------------------------------------------------------------
 
@@ -811,26 +600,7 @@ async def install_from_extracted_folder(
     """
     manifest_data = await asyncio.to_thread(_check_incoming_tree, mcp_root)
 
-    errors = _validate_manifest(manifest_data)
-    incoming_source = (manifest_data.get("server") or {}).get("source") \
-        if isinstance(manifest_data.get("server"), dict) else ""
-    if from_catalog and isinstance(incoming_source, str) and incoming_source.startswith("git+") \
-            and not git_ref_is_commit(incoming_source):
-        errors.append(
-            "a catalog git+ source must pin a full 40-character commit (a tag or a "
-            "branch can move upstream without the catalog changing)",
-        )
-    if errors:
-        raise HTTPException(400, f"Invalid manifest: {'; '.join(errors)}")
-    # The lexical rule passed above; the file must also exist inside THIS
-    # folder as a regular file (a link is judged by its target).
-    for sk in manifest_data.get("skills") or []:
-        if _mmp.resolve_skill_file(mcp_root, sk["file"]) is None:
-            raise HTTPException(
-                400,
-                f"Invalid manifest: skill {sk['id']}: file {sk['file']!r} is "
-                "not a regular file inside the MCP folder",
-            )
+    _vet_incoming(mcp_root, manifest_data, from_catalog)
     compose_file = manifest_data["server"].get("docker_compose") or ""
     rt = _mt.runtime_of(manifest_data["server"].get("runtime"))
     if rt is not None and rt.container and compose_file:
@@ -870,6 +640,69 @@ async def install_from_extracted_folder(
             f"Name {mcp_name!r} is already an installed skill package — "
             "MCPs and skill packages share the flat registry namespace",
         )
+    switching = _guard_existing(
+        mcp_name, existing, manifest_data, accepted_source, accepted_manifest_hash)
+    for _sk in manifest_data.get("skills") or []:
+        _provider = mcp_registry.find_skill_provider(_sk.get("id", ""))
+        if _provider is not None and _provider.name != mcp_name:
+            raise HTTPException(
+                409,
+                f"Skill id {_sk.get('id')!r} is already provided by "
+                f"{_provider.name!r}",
+            )
+    if rt is not None and rt.container:
+        await asyncio.to_thread(_check_incoming_compose, mcp_root, mcp_name)
+    stopped_container, old_version, prior_enabled, target_dir = await _place_folder(
+        mcp_name, existing, is_update, switching, rt, target_parent)
+    backup_dir, install_log, resolved_version, container_started = await _install_files(
+        mcp_root, target_dir, is_update, switching, source, runtime, manifest_data,
+        install_version, progress_cb, mcp_name, stopped_container, prior_enabled)
+    version = await _settle_version(
+        source, resolved_version, target_dir, backup_dir, mcp_name, version)
+    container_started = await _register_and_start(
+        mcp_name, is_update, prior_enabled, progress_cb, container_started)
+    await _emit(progress_cb, "finalize", 95, "Finalizing")
+    return {
+        "status": "updated" if is_update else "installed",
+        "name": mcp_name,
+        "version": version,
+        "old_version": old_version,
+        "runtime": runtime,
+        "install_log": install_log,
+        "container_started": container_started,
+    }
+
+
+def _vet_incoming(mcp_root: Path, manifest_data: dict, from_catalog: bool) -> None:
+    """The manifest's validation and its skill files, before anything is
+    read from it (raises 400)."""
+    errors = _validate_manifest(manifest_data)
+    incoming_source = (manifest_data.get("server") or {}).get("source") \
+        if isinstance(manifest_data.get("server"), dict) else ""
+    if from_catalog and isinstance(incoming_source, str) and incoming_source.startswith("git+") \
+            and not git_ref_is_commit(incoming_source):
+        errors.append(
+            "a catalog git+ source must pin a full 40-character commit (a tag or a "
+            "branch can move upstream without the catalog changing)",
+        )
+    if errors:
+        raise HTTPException(400, f"Invalid manifest: {'; '.join(errors)}")
+    # The lexical rule passed above; the file must also exist inside THIS
+    # folder as a regular file (a link is judged by its target).
+    for sk in manifest_data.get("skills") or []:
+        if _mmp.resolve_skill_file(mcp_root, sk["file"]) is None:
+            raise HTTPException(
+                400,
+                f"Invalid manifest: skill {sk['id']}: file {sk['file']!r} is "
+                "not a regular file inside the MCP folder",
+            )
+
+
+def _guard_existing(mcp_name: str, existing, manifest_data: dict,
+                    accepted_source: tuple[str, str] | None, accepted_manifest_hash: str) -> bool:
+    """An installed MCP of the same name: a shipped one refuses (409), a
+    source change needs the admin's switch, and the switch must still see
+    the manifest the admin saw. Answers whether this install is that switch."""
     if existing is not None and existing.category != "community":
         raise HTTPException(
             409,
@@ -889,16 +722,15 @@ async def install_from_extracted_folder(
                 f"The catalog entry of `{mcp_name}` changed since the check. Run "
                 "Check updates and look at the change again.",
             )
-    for _sk in manifest_data.get("skills") or []:
-        _provider = mcp_registry.find_skill_provider(_sk.get("id", ""))
-        if _provider is not None and _provider.name != mcp_name:
-            raise HTTPException(
-                409,
-                f"Skill id {_sk.get('id')!r} is already provided by "
-                f"{_provider.name!r}",
-            )
-    if rt is not None and rt.container:
-        await asyncio.to_thread(_check_incoming_compose, mcp_root, mcp_name)
+    return switching
+
+
+async def _place_folder(mcp_name: str, existing, is_update: bool, switching: bool, rt,
+                        target_parent: Path):
+    """Stop the container a switch away from a container runtime leaves, read
+    the prior version and enabled state, and name the target folder (a
+    folder that holds another MCP refuses, 409). Answers
+    ``(stopped_container, old_version, prior_enabled, target_dir)``."""
     # A switch away from a container runtime stops the container now, while
     # its compose file is still in place; a container-to-container switch is
     # replaced by the force-recreate start below. Nothing is torn down before
@@ -912,7 +744,7 @@ async def install_from_extracted_folder(
     # Snapshot the prior enabled state. On update we'll restore it post-scan;
     # on new install we'll force enabled=True so the admin doesn't have to
     # flip the platform-enable toggle after an explicit "install" action.
-    prior_enabled = _existing_enabled_state(mcp_name) if is_update else None
+    prior_enabled = await _existing_enabled_state(mcp_name) if is_update else None
 
     folder_name = existing.mcp_dir.name if is_update else re.sub(
         r"[^a-zA-Z0-9_-]", "-", mcp_name,
@@ -928,7 +760,17 @@ async def install_from_extracted_folder(
                 f"The folder {target_dir.name!r} already holds the MCP {owner!r}. "
                 "Uninstall it first, or install this MCP under another name.",
             )
+    return stopped_container, old_version, prior_enabled, target_dir
 
+
+async def _install_files(mcp_root: Path, target_dir: Path, is_update: bool, switching: bool,
+                         source: str, runtime: str, manifest_data: dict,
+                         install_version: str | None, progress_cb: ProgressCb, mcp_name: str,
+                         stopped_container, prior_enabled: bool | None):
+    """Copy the folder in (a sibling backup first when one exists) and run
+    the package install; any failure rolls the folder back and restarts what
+    a switch stopped. Answers ``(backup_dir, install_log, resolved_version,
+    container_started)``."""
     # An existing folder (an update, or a remnant): take a sibling backup for
     # rollback, then replace only the non-preserved files. On a new folder:
     # just copy. All synchronous FS work runs off the event loop (this
@@ -936,7 +778,7 @@ async def install_from_extracted_folder(
     # copytree/rmtree can't stall the loop.
     await _emit(progress_cb, "prepare", 15, "Preparing files")
     backup_dir: Path | None = None
-    if target_dir.exists():
+    if target_dir.exists():  # noqa: ASYNC240  # a stat of the local MCP folder
         backup_dir = target_dir.with_suffix(".bak")
     async def _undo_teardown() -> None:
         # After a rollback the old compose file is back: the container a
@@ -947,7 +789,7 @@ async def install_from_extracted_folder(
         from services.mcp import docker_manager
         try:
             await asyncio.to_thread(docker_manager.start_container, stopped_container)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # restarting the old container on a rollback that already failed
             logger.warning("Restart of %s after a failed switch failed: %s", mcp_name, exc)
 
     try:
@@ -1032,7 +874,7 @@ async def install_from_extracted_folder(
             await _undo_teardown()
             raise HTTPException(
                 500,
-                f"Install failed — rolled back.\n\n{install_log}",
+                f"The install failed and nothing was changed.\n\n{install_log}",
             )
     except HTTPException:
         raise
@@ -1044,8 +886,14 @@ async def install_from_extracted_folder(
             await asyncio.to_thread(_rollback_extracted_files, target_dir, backup_dir)
         await _undo_teardown()
         raise
+    return backup_dir, install_log, resolved_version, container_started
 
-    if backup_dir and backup_dir.exists():
+
+async def _settle_version(source: str, resolved_version: str, target_dir: Path,
+                          backup_dir: Path | None, mcp_name: str, version: str) -> str:
+    """Drop the backup, pin the local manifest to the version an unpinned
+    node or python install resolved, and answer the version to report."""
+    if backup_dir and backup_dir.exists():  # noqa: ASYNC240  # a stat of the local backup folder
         await asyncio.to_thread(shutil.rmtree, backup_dir, ignore_errors=True)
 
     # Pin the LOCAL manifest for unpinned node/python installs (the catalog
@@ -1062,16 +910,24 @@ async def install_from_extracted_folder(
                 extras=parsed.extras,
             )
             version = resolved_version
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("Failed to pin local manifest for %s: %s", mcp_name, exc)
     # Never surface an empty version (unpinned catalog manifest reports "");
     # a readback miss leaves it unpinned but the UI should still show something.
     version = version or "latest"
+    return version
 
-    # Pick up the new manifest in the in-process registry, then regenerate
-    # the Docker .env so the container picks up current platform values
-    # without waiting for a proxy restart or enable-toggle.
-    mcp_registry.scan_manifests()
+
+async def _register_and_start(mcp_name: str, is_update: bool, prior_enabled: bool | None,
+                              progress_cb: ProgressCb, container_started: bool | None):
+    """Pick the new manifest up, restore or set its enabled state, default a
+    relay-capable OAuth MCP to the hosted relay, and start a container
+    runtime. Answers ``container_started``."""
+    # Pick up the new manifest in the in-process registry (a worker thread,
+    # under the rescan lock the admin routes share), then regenerate the
+    # Docker .env so the container picks up current platform values without
+    # waiting for a proxy restart or enable-toggle.
+    await mcp_registry.rescan()
 
     # Auto-enable on new install. On update, restore whatever the admin had
     # previously chosen (scan_manifests defaults community→disabled, which
@@ -1114,7 +970,7 @@ async def install_from_extracted_folder(
         try:
             from services.mcp import docker_manager
             await asyncio.to_thread(docker_manager._inject_mcp_env, refreshed)
-        except Exception as exc:
+        except (OSError, ValueError, psycopg.Error) as exc:
             logger.warning("Failed to populate .env after install for %s: %s", mcp_name, exc)
         # T2: write the pull-form rewrite now. Its refusals were already
         # judged on the incoming folder, before any file moved
@@ -1126,8 +982,8 @@ async def install_from_extracted_folder(
             raise HTTPException(
                 400,
                 f"'{mcp_name}' cannot be installed in Docker-Compose mode: {exc}",
-            )
-        except Exception as exc:
+            ) from exc
+        except OSError as exc:
             logger.warning("Compose pre-rewrite skipped for %s: %s", mcp_name, exc)
         # T2 only: the boot-time startup_docker_mcps skips community Docker MCPs,
         # so a runtime install has no other trigger to actually start the pulled
@@ -1157,27 +1013,18 @@ async def install_from_extracted_folder(
                 )
                 logger.info("Auto-start %s after install: ok=%s", mcp_name, started)
                 container_started = bool(started)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  # the install stands when its container start fails, admin restarts it
                 logger.warning("Auto-start of %s after install failed: %s", mcp_name, exc)
                 container_started = False
             await _emit(progress_cb, "start", 90, "Starting container")
-
-    await _emit(progress_cb, "finalize", 95, "Finalizing")
-    return {
-        "status": "updated" if is_update else "installed",
-        "name": mcp_name,
-        "version": version,
-        "old_version": old_version,
-        "runtime": runtime,
-        "install_log": install_log,
-        "container_started": container_started,
-    }
+    return container_started
 
 
-def _existing_enabled_state(mcp_name: str) -> bool | None:
-    """Return the current ``mcp_state.enabled`` for an MCP, or ``None`` if no row exists."""
+async def _existing_enabled_state(mcp_name: str) -> bool | None:
+    """Return the current ``mcp_state.enabled`` for an MCP, or ``None`` if no
+    row exists; read off the loop."""
     from storage.mcp import mcp_store
-    state = mcp_store.get_mcp_state(mcp_name)
+    state = await asyncio.to_thread(mcp_store.get_mcp_state, mcp_name)
     return state.get("enabled") if state else None
 
 
@@ -1216,7 +1063,7 @@ async def install_from_catalog(
             (e for e in registry.get("mcps", []) if e.get("name") == name),
             None,
         )
-    except Exception:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError):
         _entry = None
     if _entry is not None:
         community_catalog.require_platform_compat(
@@ -1257,6 +1104,10 @@ def _is_safe_name(name: str) -> bool:
     return bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name))
 
 
+# GitHub's answers when it rate-limits an address (unauthenticated calls).
+_GITHUB_LIMITED = (403, 429)
+
+
 async def _fetch_catalog_tarball(url: str = CATALOG_TARBALL_URL) -> bytes:
     """GET a catalog repo tarball as raw bytes (community-mcps by default;
     the skills installer passes its own catalog URL)."""
@@ -1273,11 +1124,21 @@ async def _fetch_catalog_tarball(url: str = CATALOG_TARBALL_URL) -> bytes:
         resp.raise_for_status()
         return resp.content
     except httpx.HTTPError as exc:
+        logger.warning("Download of the catalog %s failed: %s", url, exc)
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else 0
+        if status in _GITHUB_LIMITED:
+            raise HTTPException(
+                502, "GitHub is limiting downloads from this server. Try again in an hour.",
+            ) from exc
+        if status == 404:
+            raise HTTPException(
+                502, "The community list's files were not found. Run Check updates and try again.",
+            ) from exc
         raise HTTPException(
             502,
-            f"Could not fetch community catalog tarball: {exc}. "
-            "Check network access to api.github.com / codeload.github.com.",
-        )
+            "Could not download from the community list. "
+            "This server must reach api.github.com and codeload.github.com.",
+        ) from exc
 
 
 def _extract_mcp_subfolder(tarball: bytes, mcp_name: str, dest: Path) -> Path | None:
@@ -1298,6 +1159,7 @@ def _extract_mcp_subfolder(tarball: bytes, mcp_name: str, dest: Path) -> Path | 
         if not members:
             return None
         prefix = members[0].name.split("/", 1)[0]
+        folder: str | None
         folder = mcp_name
         if not any(
             m.name == f"{prefix}/{folder}" or m.name.startswith(f"{prefix}/{folder}/")
@@ -1323,8 +1185,8 @@ def _extract_mcp_subfolder(tarball: bytes, mcp_name: str, dest: Path) -> Path | 
                 try:
                     stripped = path_confinement.normalize_rel_path(stripped)
                     target_path = path_confinement.join_under(dest, stripped)
-                except path_confinement.PathOutsideRoot:
-                    raise HTTPException(400, f"Invalid tarball entry: {m.name}")
+                except path_confinement.PathOutsideRoot as exc:
+                    raise HTTPException(400, f"Invalid tarball entry: {m.name}") from exc
                 m_copy = tarfile.TarInfo(name=stripped)
                 m_copy.type = m.type
                 m_copy.mode = m.mode
@@ -1401,7 +1263,7 @@ async def ensure_enabled_and_running(mcp_name: str) -> str:
     from storage.mcp import mcp_store
 
     notes: list[str] = []
-    prior = _existing_enabled_state(mcp_name)
+    prior = await _existing_enabled_state(mcp_name)
     if prior is not True:
         await asyncio.to_thread(mcp_store.set_mcp_enabled, mcp_name, True)
         if prior is False:
@@ -1417,7 +1279,7 @@ async def ensure_enabled_and_running(mcp_name: str) -> str:
         from services.mcp import docker_manager
         try:
             await asyncio.to_thread(docker_manager._inject_mcp_env, manifest)
-        except Exception as exc:
+        except (OSError, ValueError, psycopg.Error) as exc:
             logger.warning(".env refresh failed for %s: %s", mcp_name, exc)
         try:
             from services.mcp import compose_rewrite
@@ -1426,7 +1288,7 @@ async def ensure_enabled_and_running(mcp_name: str) -> str:
             # Approval context records the problem instead of failing the
             # request; the direct-install route keeps its hard 400.
             notes.append(f"Compose rewrite failed: {exc}")
-        except Exception as exc:
+        except OSError as exc:
             logger.warning("Compose pre-rewrite skipped for %s: %s", mcp_name, exc)
         status = await asyncio.to_thread(
             docker_manager.get_container_status, manifest,
@@ -1443,12 +1305,33 @@ async def ensure_enabled_and_running(mcp_name: str) -> str:
                     notes.append(
                         "Container did not start — check Admin → MCP Servers.",
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001  # the approval stands when its container start fails, a note says so
                 logger.warning(
                     "Auto-start of %s after approval failed: %s", mcp_name, exc,
                 )
                 notes.append(f"Container start failed: {exc}")
     return "\n".join(notes)
+
+
+_REQUEST_GONE = "This request no longer exists."
+_FAILED_REJECT = "This request was approved, but its install failed. Retry the install instead."
+_FAILED_CANCEL = "This request was already approved, so it can no longer be cancelled."
+
+
+def _request_state_sentence(status: str, *, failed: str = "") -> str:
+    """Why a request in ``status`` cannot take the action asked: one sentence
+    per state, never the state's own word. ``failed`` is the action's
+    sentence for a request whose install failed (only an admin retries it)."""
+    from storage.mcp import mcp_request_store as rs
+    sentences = {
+        rs.INSTALLED: "This request was already approved.",
+        rs.APPROVED: "This request is being installed right now.",
+        rs.INSTALLING: "This request is being installed right now.",
+        rs.REJECTED: "This request was already rejected.",
+        rs.CANCELLED: "This request was cancelled.",
+        rs.INSTALL_FAILED: failed,
+    }
+    return sentences.get(status) or "This request was already handled."
 
 
 async def approve_request(
@@ -1478,26 +1361,19 @@ async def approve_request(
     explicit-mode; for a not-yet-installed MCP the admin approves without it
     and the needs-instance retry offers the selector.
     """
-    from storage.mcp import mcp_request_store
-    from storage.mcp import mcp_store
+    from storage.mcp import mcp_request_store, mcp_store
 
     req = await asyncio.to_thread(mcp_request_store.get_request, request_id)
     if req is None:
-        raise HTTPException(404, f"Request {request_id} not found")
+        raise HTTPException(404, _REQUEST_GONE)
     if req["status"] not in mcp_request_store.APPROVABLE:
-        raise HTTPException(
-            409,
-            f"Cannot approve request in status {req['status']!r}",
-        )
+        raise HTTPException(409, _request_state_sentence(req["status"]))
 
     if instance_id is not None:
         manifest = mcp_registry.get_manifest(req["mcp_name"])
         if manifest is None or getattr(manifest, "assignment_mode", "auto") != "explicit":
             raise HTTPException(
-                400,
-                "instance_id only applies to installed explicit-mode MCPs "
-                f"('{req['mcp_name']}' is "
-                f"{'not installed' if manifest is None else 'auto-mode'})",
+                400, "An instance can be chosen only for an installed MCP that asks for one.",
             )
         _instances = await asyncio.to_thread(
             mcp_store.get_mcp_instances, req["mcp_name"],
@@ -1505,8 +1381,7 @@ async def approve_request(
         if not any(int(i["id"]) == instance_id for i in _instances):
             raise HTTPException(
                 400,
-                f"Instance {instance_id} does not belong to MCP "
-                f"'{req['mcp_name']}'",
+                f"That instance belongs to another MCP. Pick one of {req['mcp_name']}'s instances.",
             )
 
     # pending → approved → installing in one shot (avoid two notifications).
@@ -1706,9 +1581,10 @@ async def reject_request(request_id: int, admin_sub: str, admin_note: str = "") 
     from storage.mcp import mcp_request_store
     req = await asyncio.to_thread(mcp_request_store.get_request, request_id)
     if req is None:
-        raise HTTPException(404, f"Request {request_id} not found")
+        raise HTTPException(404, _REQUEST_GONE)
     if req["status"] != mcp_request_store.PENDING:
-        raise HTTPException(409, f"Cannot reject request in status {req['status']!r}")
+        raise HTTPException(409, _request_state_sentence(
+            req["status"], failed=_FAILED_REJECT))
 
     updated = await asyncio.to_thread(
         mcp_request_store.update_status,
@@ -1727,11 +1603,12 @@ async def cancel_request(request_id: int, user_sub: str) -> dict:
     from storage.mcp import mcp_request_store
     req = await asyncio.to_thread(mcp_request_store.get_request, request_id)
     if req is None:
-        raise HTTPException(404, f"Request {request_id} not found")
+        raise HTTPException(404, _REQUEST_GONE)
     if req["requested_by"] != user_sub:
-        raise HTTPException(403, "Only the original requester can cancel")
+        raise HTTPException(403, "Only the person who asked can cancel this request.")
     if req["status"] != mcp_request_store.PENDING:
-        raise HTTPException(409, f"Cannot cancel request in status {req['status']!r}")
+        raise HTTPException(409, _request_state_sentence(
+            req["status"], failed=_FAILED_CANCEL))
 
     updated = await asyncio.to_thread(
         mcp_request_store.update_status,
@@ -1993,3 +1870,8 @@ def _list_admin_subs() -> list[str]:
             "SELECT sub FROM users WHERE role='admin'",
         ).fetchall()
         return [r["sub"] for r in rows]
+
+
+# The package check lives in its own module and binds this module's rules at
+# its end; this import comes last, after every name it reads.
+from services.community.package_check import check_package  # noqa: F401

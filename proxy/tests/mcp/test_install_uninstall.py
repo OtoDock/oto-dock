@@ -16,10 +16,9 @@ Covers (self-uninstall cascade):
 """
 
 import base64
-
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -76,8 +75,8 @@ def test_bootstrap_invalid_token_returns_401(monkeypatch):
 
 def test_bootstrap_returns_self_extracting_script(monkeypatch):
     """Happy path: valid token → script body with embedded payloads."""
-    from storage import remote_store as _rs
     import config as _cfg
+    from storage import remote_store as _rs
 
     app = _make_app()
     client = TestClient(app)
@@ -125,8 +124,8 @@ def test_bootstrap_returns_self_extracting_script(monkeypatch):
 def test_bootstrap_windows_returns_powershell(monkeypatch):
     """``?os=windows`` returns a PowerShell-flavored bootstrap (install.ps1
     template body + $env: variable assignments instead of bash export)."""
-    from storage import remote_store as _rs
     import config as _cfg
+    from storage import remote_store as _rs
 
     app = _make_app()
     client = TestClient(app)
@@ -184,8 +183,9 @@ def test_bootstrap_windows_hardens_python_store_stub(monkeypatch):
          SilentlyContinue + a guard that rejects the stub's redirect banner.
     """
     import base64 as _b64
-    from storage import remote_store as _rs
+
     import config as _cfg
+    from storage import remote_store as _rs
 
     app = _make_app()
     client = TestClient(app)
@@ -242,8 +242,8 @@ def test_bootstrap_invalid_os_returns_400(monkeypatch):
 
 def test_bootstrap_no_public_url_returns_400(monkeypatch):
     """If platform_public_url isn't configured, bootstrap fails fast."""
-    from storage import remote_store as _rs
     import config as _cfg
+    from storage import remote_store as _rs
 
     app = _make_app()
     client = TestClient(app)
@@ -272,8 +272,9 @@ def test_bootstrap_embeds_valid_tarball():
     containing the expected satellite files."""
     import io
     import tarfile
-    from storage import remote_store as _rs
+
     import config as _cfg
+    from storage import remote_store as _rs
 
     app = _make_app()
     client = TestClient(app)
@@ -345,8 +346,9 @@ async def test_trigger_self_uninstall_sends_uninstall_then_closes(monkeypatch):
     waits a grace period, then closes with 4006, then deregisters. Bypassing
     the queue is critical — enqueue + immediate close races the close ahead
     of the send and the satellite never receives the uninstall message."""
-    from api.remote.remote_machines import _trigger_self_uninstall
     import json
+
+    from api.remote.remote_machines import _trigger_self_uninstall
 
     fake_ws = MagicMock()
     fake_ws.send_text = AsyncMock()
@@ -510,8 +512,8 @@ def test_bootstrap_os_words_pick_the_script(monkeypatch, word, media, head):
     """Every ``?os=`` spelling the route accepts folds to a family through
     the host OS table (core-seams phase 10): the bash bootstrap for linux and
     macOS, the PowerShell one for Windows; the media type follows."""
-    from storage import remote_store as _rs
     import config as _cfg
+    from storage import remote_store as _rs
 
     app = _make_app()
     client = TestClient(app)
@@ -546,7 +548,9 @@ def test_upload_zip_takes_dot_slash_members_and_refuses_escapes(tmp_path, names,
     import io
     import zipfile
     from types import SimpleNamespace
+
     from fastapi import HTTPException
+
     from api.mcp.mcps import _extract_upload_zip
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:

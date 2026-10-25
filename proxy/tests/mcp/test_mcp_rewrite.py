@@ -10,7 +10,6 @@ on-disk layout — including the OS-aware bits (Windows uses
 
 from unittest.mock import patch
 
-
 SAT_PORT = 49152  # arbitrary tunnel port for tests
 
 
@@ -176,9 +175,9 @@ class TestRewriteMcpToml:
 
     def test_startup_timeout_raised_to_remote_floor(self):
         from core.remote.remote_execution import (
-            _rewrite_mcp_toml_for_remote,
             _REMOTE_MCP_STARTUP_FLOOR,
             _REMOTE_MCP_STARTUP_OVERRIDES,
+            _rewrite_mcp_toml_for_remote,
         )
 
         toml = (
@@ -212,6 +211,21 @@ class TestRewriteMcpToml:
         result = _rewrite_mcp_toml_for_remote(toml, SAT_PORT)
         assert "startup_timeout_sec = 300" in result
 
+    def test_tool_timeout_line_passes_through(self):
+        """A manifest's per-call limit is the same on a machine: the rewrite
+        raises the startup line and leaves the tool line as written."""
+        from core.remote.remote_execution import _rewrite_mcp_toml_for_remote
+
+        toml = (
+            '[mcp_servers.video-gen-mcp]\n'
+            'startup_timeout_sec = 10\n'
+            'tool_timeout_sec = 600\n'
+            'command = "venv/bin/python"\n'
+        )
+        result = _rewrite_mcp_toml_for_remote(toml, SAT_PORT)
+        assert "tool_timeout_sec = 600\n" in result
+        assert "startup_timeout_sec = 10" not in result
+
     def test_toml_rewrite_uses_manifest_category_not_on_disk_dir(self):
         """REGRESSION: the Codex TOML rewrite must resolve the satellite path
         via the manifest category — NOT a naive ``mcps/<on-disk-dir>`` swap.
@@ -221,8 +235,8 @@ class TestRewriteMcpToml:
         A naive prefix swap produced ``mcps/custom/schedules-mcp`` → a path that
         doesn't exist on the satellite → the MCP failed to start under Codex
         (Claude's JSON twin was immune; it always resolved via the manifest)."""
-        from core.remote.remote_execution import _rewrite_mcp_toml_for_remote
         import config as app_config
+        from core.remote.remote_execution import _rewrite_mcp_toml_for_remote
 
         plat = str(app_config.MCPS_DIR.resolve())
         toml = (
@@ -241,8 +255,8 @@ class TestRewriteMcpToml:
         assert "mcps/custom/schedules-mcp" not in result
 
     def test_toml_rewrite_windows_category_aware_venv_layout(self):
-        from core.remote.remote_execution import _rewrite_mcp_toml_for_remote
         import config as app_config
+        from core.remote.remote_execution import _rewrite_mcp_toml_for_remote
 
         plat = str(app_config.MCPS_DIR.resolve())
         toml = (
@@ -265,8 +279,8 @@ class TestRewriteMcpToml:
     def test_toml_rewrite_name_differs_from_dir(self):
         """workspace-mcp dir / google-workspace manifest name → the satellite
         path must use the manifest NAME (google-workspace)."""
-        from core.remote.remote_execution import _rewrite_mcp_toml_for_remote
         import config as app_config
+        from core.remote.remote_execution import _rewrite_mcp_toml_for_remote
 
         plat = str(app_config.MCPS_DIR.resolve())
         toml = (
@@ -342,8 +356,8 @@ class TestRewriteMcpToml:
 
 class TestRewriteStdioPaths:
     def test_linux_default_keeps_unix_layout(self):
-        from core.remote.remote_execution import _rewrite_stdio_paths
         import config as app_config
+        from core.remote.remote_execution import _rewrite_stdio_paths
 
         plat = str(app_config.MCPS_DIR.resolve())
         cmd, args = _rewrite_stdio_paths(
@@ -357,8 +371,8 @@ class TestRewriteStdioPaths:
         assert args == ["~/.oto-dock/mcps/core/notifications-mcp/server.py"]
 
     def test_windows_swaps_dir_name_and_venv_layout(self):
-        from core.remote.remote_execution import _rewrite_stdio_paths
         import config as app_config
+        from core.remote.remote_execution import _rewrite_stdio_paths
 
         plat = str(app_config.MCPS_DIR.resolve())
         cmd, args = _rewrite_stdio_paths(
@@ -375,8 +389,8 @@ class TestRewriteStdioPaths:
         assert args == ["~/OtoDock/mcps/core/notifications-mcp/server.py"]
 
     def test_windows_collapses_python3_to_python(self):
-        from core.remote.remote_execution import _rewrite_stdio_paths
         import config as app_config
+        from core.remote.remote_execution import _rewrite_stdio_paths
 
         plat = str(app_config.MCPS_DIR.resolve())
         cmd, _ = _rewrite_stdio_paths(
@@ -393,8 +407,8 @@ class TestRewriteStdioPaths:
         )
 
     def test_windows_handles_pip_installed_entrypoints(self):
-        from core.remote.remote_execution import _rewrite_stdio_paths
         import config as app_config
+        from core.remote.remote_execution import _rewrite_stdio_paths
 
         plat = str(app_config.MCPS_DIR.resolve())
         cmd, args = _rewrite_stdio_paths(
@@ -420,8 +434,8 @@ class TestRewriteStdioPaths:
         causing the CLI to fail to spawn the MCP. The exact-prefix substitution
         with ``platform_dir`` fixes this.
         """
-        from core.remote.remote_execution import _rewrite_stdio_paths
         import config as app_config
+        from core.remote.remote_execution import _rewrite_stdio_paths
 
         plat = str(app_config.MCPS_DIR.resolve())
         cmd, args = _rewrite_stdio_paths(
@@ -440,8 +454,8 @@ class TestRewriteStdioPaths:
 
     def test_windows_leaves_bare_commands_alone(self):
         """`node`, `npx`, plain commands resolved via PATH on both OSes."""
-        from core.remote.remote_execution import _rewrite_stdio_paths
         import config as app_config
+        from core.remote.remote_execution import _rewrite_stdio_paths
 
         plat = str(app_config.MCPS_DIR.resolve())
         cmd, args = _rewrite_stdio_paths(
@@ -460,8 +474,8 @@ class TestRewriteStdioPaths:
 
     def test_fallback_prefix_swap_when_no_manifest_info(self):
         """Without manifest info, we do a plain prefix swap."""
-        from core.remote.remote_execution import _rewrite_stdio_paths
         import config as app_config
+        from core.remote.remote_execution import _rewrite_stdio_paths
 
         plat = str(app_config.MCPS_DIR.resolve())
         cmd, _ = _rewrite_stdio_paths(

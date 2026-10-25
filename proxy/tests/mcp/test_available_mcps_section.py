@@ -3,7 +3,6 @@ top-down MCP catalog injected near the top of every agent prompt.
 
 Generated content rules:
 - Each enabled MCP renders as ``- **{label}** (`{slug}`) — {first sentence}``.
-- ``mcps-mcp`` is omitted (meta MCP; self-reference is noise).
 - Manifests matching the session ``context`` via ``exclude_from`` are filtered.
 - Sorted alphabetically by label for deterministic output.
 - Empty result → empty string (caller skips the section header).
@@ -65,8 +64,8 @@ def test_first_sentence_trims_noise(temp_db):
     assert "Permission-aware" not in text
 
 
-def test_skips_mcps_mcp(temp_db):
-    """The meta MCP doesn't advertise itself in the catalog."""
+def test_lists_mcps_mcp(temp_db):
+    """The meta MCP is listed like any other enabled MCP."""
     manifests = [
         _fake_manifest("mcps-mcp", "MCPs Manager", "Lets agents browse the catalog"),
         _fake_manifest("schedules-mcp", "Tasks", "Task scheduling"),
@@ -74,8 +73,7 @@ def test_skips_mcps_mcp(temp_db):
     with patch.object(mcp_registry, "get_agent_mcps", return_value=manifests):
         text = mcp_registry.build_available_mcps_section("pa")
     assert "schedules-mcp" in text
-    assert "MCPs Manager" not in text
-    assert "mcps-mcp" not in text
+    assert "**MCPs Manager** (`mcps-mcp`)" in text
 
 
 def test_filters_by_exclude_from(temp_db):
@@ -100,14 +98,15 @@ def test_empty_when_no_mcps(temp_db):
     assert text == ""
 
 
-def test_empty_when_only_meta_mcp(temp_db):
-    """If only mcps-mcp is enabled, the catalog is empty (skipped → no header)."""
+def test_lists_mcps_mcp_alone(temp_db):
+    """If only mcps-mcp is enabled, the catalog lists it."""
     manifests = [
         _fake_manifest("mcps-mcp", "MCPs Manager", "Meta MCP"),
     ]
     with patch.object(mcp_registry, "get_agent_mcps", return_value=manifests):
         text = mcp_registry.build_available_mcps_section("pa")
-    assert text == ""
+    assert text != ""
+    assert "mcps-mcp" in text
 
 
 def test_sorted_alphabetically_by_label(temp_db):

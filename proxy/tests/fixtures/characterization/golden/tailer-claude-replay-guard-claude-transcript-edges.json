@@ -1,0 +1,136 @@
+{
+ "offsets": {
+  "sid-char-cg": 28
+ },
+ "pending": [],
+ "rebuilds": [
+  "chat-char-1"
+ ],
+ "registry": {
+  "completed": [],
+  "has_pending": false,
+  "spawned": []
+ },
+ "results": [
+  {
+   "assistant_chars": 61,
+   "compact_trigger": "manual",
+   "compacted": true,
+   "from_line": 0,
+   "last_message": "",
+   "last_signal": "end_turn",
+   "last_signal_at": 1792189824.0,
+   "persisted": 7,
+   "question_pending": false,
+   "title_set": true,
+   "to_line": 28,
+   "tool_rows": 0,
+   "turn_complete": true,
+   "usage_rows": 1
+  }
+ ],
+ "rows": [
+  {
+   "event_data": {
+    "action": "enter",
+    "type": "plan_mode"
+   },
+   "event_type": "plan_mode",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "tool_input": {
+     "questions": [
+      {
+       "header": "Folder",
+       "options": [
+        {
+         "label": "a"
+        },
+        {
+         "label": "b"
+        }
+       ],
+       "question": "Which folder?"
+      }
+     ]
+    },
+    "tool_name": "AskUserQuestion",
+    "type": "question"
+   },
+   "event_type": "question",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "API Error: 429 rate_limit_error: rate limit reached",
+   "role": "assistant",
+   "sync_search": false
+  },
+  {
+   "event_data": {
+    "message": "Conversation compacted (112,000 tokens freed)",
+    "subtype": "context_compressed",
+    "trigger": "manual",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "and now?",
+   "role": "user",
+   "sync_search": false
+  },
+  {
+   "author_sub": "",
+   "content": "Done.",
+   "role": "assistant",
+   "sync_search": false
+  },
+  {
+   "author_sub": "",
+   "content": "Done.",
+   "role": "assistant",
+   "sync_search": false
+  }
+ ],
+ "snapshots": [],
+ "throttles": [
+  "API Error: 429 rate_limit_error: rate limit reached"
+ ],
+ "titles": [
+  [
+   "u-person",
+   "chat-char-1",
+   "and now?",
+   "lite"
+  ]
+ ],
+ "tool_records": [],
+ "updates": [
+  {
+   "title": "and now?"
+  }
+ ],
+ "usage": [
+  {
+   "agent": "lite",
+   "cache_read": 4000,
+   "cache_write": 0,
+   "cost_usd": 0.014,
+   "input_tokens": 6600,
+   "message_count": 1,
+   "model": "claude-sonnet-5-5",
+   "output_tokens": 40,
+   "provider": "anthropic",
+   "scope": "user",
+   "source_id": "chat-char-1",
+   "source_key": "default",
+   "source_type": "chat",
+   "user_sub": "u-person"
+  }
+ ]
+}

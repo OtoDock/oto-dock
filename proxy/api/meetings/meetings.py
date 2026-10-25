@@ -18,12 +18,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from auth.providers import UserContext, get_current_user, require_auth, require_user
+from core.background import spawn
 from core.session.visibility import SCOPE_AGENT, SCOPE_USER, nouser_read_targets
 from storage import database as task_store
 from storage.agents import agent_store
 from storage.chat import meeting_status
 from storage.pg import run_db
-from core.background import spawn
 
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
@@ -194,7 +194,8 @@ def _check_participants(u: UserContext, req: CreateMeetingRequest) -> None:
                 if shared_only:
                     # The sentence the participant's session would be refused with.
                     from core.sandbox.session_config_dir import (
-                        AgentStateRefused, refuse_agent_state_below_editor,
+                        AgentStateRefused,
+                        refuse_agent_state_below_editor,
                     )
                     try:
                         refuse_agent_state_below_editor(SCOPE_AGENT, u.acting_role(slug))
@@ -209,7 +210,7 @@ def _check_participants(u: UserContext, req: CreateMeetingRequest) -> None:
             raise HTTPException(403, f"No access to agent '{slug}'")
 
 
-def _moderator_scopes(moderator: str) -> list[str]:
+def _moderator_scopes(moderator: str) -> tuple[str, ...]:
     """The meeting scopes the moderator agent's visibility mode offers.
     Synchronous: call it on the DB executor."""
     from core.session.visibility import available_scopes_for
@@ -242,6 +243,20 @@ def _host(u: UserContext, chat_id: str) -> str | None:
         if refusal is not None:
             raise HTTPException(403, refusal)
     return chat.get("session_id") or None
+
+
+# The admin's per-creator participant limit when it is empty, negative or
+# not a number. 0 allows no meeting, as the delegation MCP's limit allows no
+# worker: the limit is a number, ``mcp_state`` is what turns the MCP off.
+DEFAULT_MAX_MEETING_PARTICIPANTS = 4
+
+
+def _max_meeting_participants(raw) -> int:
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_MEETING_PARTICIPANTS
+    return value if value >= 0 else DEFAULT_MAX_MEETING_PARTICIPANTS
 
 
 @router.post("/v1/meetings")
@@ -326,14 +341,14 @@ async def create_meeting(
     if state is not None and not state.get("enabled"):
         raise HTTPException(
             403, "Meetings are disabled on this platform (meetings-mcp is turned off).")
-    cap_raw = (await run_db(
-        mcp_store.get_mcp_config_values, "meetings-mcp")).get("MAX_PARALLEL_SPAWNS")
-    try:
-        cap = int(cap_raw)
-    except (TypeError, ValueError):
-        cap = 4
-    if cap <= 0:
-        cap = 4
+    cap = _max_meeting_participants((await run_db(
+        mcp_store.get_mcp_config_values, "meetings-mcp")).get("MAX_PARALLEL_SPAWNS"))
+    if cap == 0:
+        raise HTTPException(
+            403,
+            "Meetings are limited to 0 participants on this platform "
+            "(MAX_PARALLEL_SPAWNS for meetings-mcp).",
+        )
     active = await run_db(
         task_store.count_active_meeting_participants, created_by)
     if active + len(req.agents) > cap:
@@ -423,6 +438,9 @@ class LeaveMeetingRequest(BaseModel):
     reason: str = ""
 
 
+_NO_LEAVE_REASON = LeaveMeetingRequest()
+
+
 def _participant_named(meeting: dict, u: UserContext, acting: str,
                        x_agent_name: str | None) -> str:
     """The participant a leave or a pause request is about: a session's own
@@ -445,7 +463,7 @@ def _participant_named(meeting: dict, u: UserContext, acting: str,
 @router.post("/v1/meetings/{meeting_id}/leave")
 async def leave_meeting_endpoint(
     meeting_id: str,
-    req: LeaveMeetingRequest = LeaveMeetingRequest(),
+    req: LeaveMeetingRequest = _NO_LEAVE_REASON,
     user: UserContext | None = Depends(get_current_user),
     x_agent_name: str | None = Header(None, alias="x-agent-name"),
 ):

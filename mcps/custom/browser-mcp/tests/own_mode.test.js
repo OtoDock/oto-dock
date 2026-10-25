@@ -125,6 +125,7 @@ const {
   const rpcErr = JSON.stringify({ jsonrpc: "2.0", id: 6, error: { code: -32000, message: "Extension not connected" } });
   assert.strictEqual(toolErrorText(rpcErr), "Extension not connected");
   assert.ok(isClosedBrowserError("Extension disconnected: User disconnected"));
+  assert.ok(isClosedBrowserError("Error: async initializeServer: connect ECONNREFUSED 127.0.0.1:40263"));
   assert.ok(!isClosedBrowserError("Timeout 5000ms exceeded"));
   assert.ok(!isClosedBrowserError(null));
   assert.strictEqual(toolErrorText("not json"), null);

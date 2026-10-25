@@ -17,6 +17,10 @@ import {
 import { safeHref } from '../lib/safeUrl'
 import AgentInstallModal from './AgentInstallModal'
 import AgentUpdateModal from './AgentUpdateModal'
+import Dialog from './ui/Dialog'
+import Button from './ui/Button'
+import { Input, Select } from './ui/Field'
+import { DIALOG_PANEL, BADGE_TONE } from './ui/classes'
 
 interface Props {
   open: boolean
@@ -24,7 +28,7 @@ interface Props {
 }
 
 export default function CommunityAgentsBrowser({ open, onClose }: Props) {
-  const { data, isLoading, isError, error } = useCommunityAgents(open)
+  const { data, isLoading, isError } = useCommunityAgents(open)
   const [search, setSearch] = useState('')
   const [categoryFilter, setCategoryFilter] = useState<string>('all')
   const [statusFilter, setStatusFilter] = useState<string>('all')
@@ -56,28 +60,26 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
 
   return (
     <>
-      <div
-        className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-8 pb-8"
-        onClick={onClose}
+      <Dialog
+        onClose={onClose}
+        placement="top"
+        aria-label="Browse Community Agents"
+        panelClassName={`${DIALOG_PANEL} max-w-6xl max-h-[calc(100vh-4rem)] flex flex-col overflow-hidden`}
       >
-        <div
-          className="bg-white dark:bg-gray-800 rounded-xl shadow-xl border border-p-border-light w-full max-w-6xl mx-4 max-h-[calc(100vh-4rem)] flex flex-col overflow-hidden"
-          onClick={e => e.stopPropagation()}
-        >
           {/* Header */}
-          <div className="flex items-center justify-between px-5 py-4 border-b border-p-border-light">
+          <div className="flex items-center justify-between px-5 py-4 border-b border-subtle">
             <div>
-              <h3 className="text-base font-semibold text-p-text">Browse Community Agents</h3>
-              <p className="text-xs text-p-text-light mt-0.5">
-                Pre-built agent templates with their MCP requirements + setup guides.
+              <h3 className="text-base font-semibold text-primary">Browse Community Agents</h3>
+              <p className="text-xs text-tertiary mt-0.5">
+                Pre-built agent templates, with the MCPs they need and their setup guides.
                 {data?.updated_at && (
-                  <> Catalog updated {new Date(data.updated_at).toLocaleString()}.</>
+                  <> Community list updated {new Date(data.updated_at).toLocaleString()}.</>
                 )}
               </p>
             </div>
             <button
               onClick={onClose}
-              className="text-p-text-light hover:text-p-text text-lg leading-none"
+              className="text-tertiary hover:text-primary text-lg leading-none"
             >
               &times;
             </button>
@@ -85,49 +87,49 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
 
           {/* Filters — mobile: search on its own line, the two dropdowns share
               the line below; desktop: all three in one row. */}
-          <div className="flex flex-wrap items-center gap-2 px-5 py-3 border-b border-p-border-light bg-gray-50/50 dark:bg-gray-900/30">
-            <input
+          <div className="flex flex-wrap items-center gap-2 px-5 py-3 border-b border-subtle">
+            <Input
               type="text"
               value={search}
               onChange={e => setSearch(e.target.value)}
               placeholder="Search by name, description, tag, author..."
-              className="w-full sm:flex-1 sm:min-w-[200px] text-sm px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-gray-800 text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/50"
+              className="sm:flex-1 sm:min-w-[200px]"
             />
             <div className="flex gap-2 w-full sm:w-auto">
-              <select
+              <Select
                 value={categoryFilter}
                 onChange={e => setCategoryFilter(e.target.value)}
-                className="flex-1 sm:flex-none text-sm px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-gray-800 text-p-text"
+                className="flex-1 sm:flex-none sm:w-auto"
               >
                 <option value="all">All categories</option>
                 {categories.map(c => (
                   <option key={c} value={c}>{c}</option>
                 ))}
-              </select>
-              <select
+              </Select>
+              <Select
                 value={statusFilter}
                 onChange={e => setStatusFilter(e.target.value)}
-                className="flex-1 sm:flex-none text-sm px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-gray-800 text-p-text"
+                className="flex-1 sm:flex-none sm:w-auto"
               >
                 <option value="all">All statuses</option>
                 <option value="installed">Installed</option>
                 <option value="not_installed">Not installed</option>
-              </select>
+              </Select>
             </div>
           </div>
 
           {/* Body */}
           <div className="flex-1 overflow-y-auto px-5 py-4">
             {isLoading && (
-              <div className="text-sm text-p-text-light">Loading catalog...</div>
+              <div className="text-sm text-tertiary">Loading the community list...</div>
             )}
             {isError && (
-              <div className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 p-3 text-sm text-red-700 dark:text-red-400">
-                Failed to load catalog: {(error as Error)?.message || 'unknown error'}
+              <div className="rounded-card border border-status-danger-border bg-status-danger-bg p-3 text-sm text-status-danger-fg">
+                Could not load the community list. Try again in a minute.
               </div>
             )}
             {data && filtered.length === 0 && (
-              <div className="text-sm text-p-text-light">No agents match the current filters.</div>
+              <div className="text-sm text-tertiary">No agents match the current filters.</div>
             )}
 
             {/* items-start: an expanded card grows on its own — its row-mates
@@ -145,8 +147,8 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
           </div>
 
           {/* Footer */}
-          <div className="flex items-center justify-between px-5 py-3 border-t border-p-border-light bg-gray-50/50 dark:bg-gray-900/30">
-            <p className="text-[11px] text-p-text-light">
+          <div className="flex items-center justify-between px-5 py-3 border-t border-subtle">
+            <p className="text-2xs text-tertiary">
               {data ? `${filtered.length} of ${data.agents.length} agents` : ''}
               {data?.fetched_from && (
                 <>
@@ -155,20 +157,16 @@ export default function CommunityAgentsBrowser({ open, onClose }: Props) {
                     href="https://github.com/OtoDock/community-agents"
                     target="_blank" rel="noreferrer"
                   >
-                    catalog source
+                    community list on GitHub
                   </a>
                 </>
               )}
             </p>
-            <button
-              onClick={onClose}
-              className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors"
-            >
+            <Button onClick={onClose}>
               Close
-            </button>
+            </Button>
           </div>
-        </div>
-      </div>
+      </Dialog>
 
       <AgentInstallModal
         open={!!selectedTemplate}
@@ -209,17 +207,18 @@ function AgentCard({
     agent.description.length > 140 || agent.required_mcps.length >= 3 || agent.has_setup
 
   return (
-    <div className="rounded-xl border border-p-border-light bg-white dark:bg-gray-900/40 p-4 flex flex-col gap-3 hover:border-brand/40 transition-colors">
+    <div className="rounded-card border border-subtle p-4 flex flex-col gap-3 hover:border-default transition-colors">
       <div className="flex items-start gap-3">
         <div
-          className="w-11 h-11 rounded-lg shrink-0 flex items-center justify-center text-white text-base font-semibold"
+          // eslint-disable-next-line otodock/no-raw-palette -- white initial on the template's own colour
+          className="w-11 h-11 rounded-card shrink-0 flex items-center justify-center text-white text-base font-semibold"
           style={{ background: agent.color }}
         >
           {agent.display_name.charAt(0)}
         </div>
         <div className="min-w-0 flex-1">
-          <div className="text-sm font-semibold text-p-text truncate">{agent.display_name}</div>
-          <div className="text-[11px] text-p-text-light">
+          <div className="text-sm font-semibold text-primary truncate">{agent.display_name}</div>
+          <div className="text-2xs text-tertiary">
             v{agent.version} ·{' '}
             {safeHref(agent.author_url) ? (
               <a href={safeHref(agent.author_url)} target="_blank" rel="noreferrer" className="hover:underline" title="Template author">
@@ -228,7 +227,7 @@ function AgentCard({
             ) : agent.author}
           </div>
           {agent.deprecated && (
-            <div className="text-[11px] text-red-500 mt-1">⚠ Deprecated</div>
+            <div className="text-2xs text-status-danger-fg mt-1">⚠ Deprecated</div>
           )}
         </div>
       </div>
@@ -236,7 +235,7 @@ function AgentCard({
       {/* Description — clamped to 3 lines until expanded */}
       <p
         className={
-          'text-xs text-p-text-secondary ' +
+          'text-xs text-secondary ' +
           (expanded ? '' : 'line-clamp-3')
         }
       >
@@ -249,7 +248,7 @@ function AgentCard({
           {agent.tags.slice(0, 6).map(tag => (
             <span
               key={tag}
-              className="px-1.5 py-0.5 rounded-sm text-[10px] bg-p-surface text-p-text-secondary"
+              className="px-1.5 py-0.5 rounded-sm text-3xs bg-surface-muted text-secondary"
             >
               {tag}
             </span>
@@ -258,9 +257,9 @@ function AgentCard({
       )}
 
       {/* Quick stats line */}
-      <div className="text-[11px] text-p-text-secondary flex flex-wrap items-center gap-x-3 gap-y-1">
+      <div className="text-2xs text-secondary flex flex-wrap items-center gap-x-3 gap-y-1">
         <span>
-          <span className="font-medium text-p-text">{agent.required_mcps.length}</span>{' '}
+          <span className="font-medium text-primary">{agent.required_mcps.length}</span>{' '}
           MCP{agent.required_mcps.length !== 1 ? 's' : ''} required
         </span>
         {agent.has_setup && <span>· setup guide</span>}
@@ -275,25 +274,25 @@ function AgentCard({
 
       {/* Expanded section */}
       {expanded && (
-        <div className="rounded-lg border border-p-border-light bg-gray-50/50 dark:bg-gray-900/40 p-3 text-xs">
-          <div className="text-[10px] uppercase tracking-wider text-p-text-light mb-1.5 font-medium">
+        <div className="rounded-card bg-surface-muted p-3 text-xs">
+          <div className="text-3xs uppercase tracking-wider text-tertiary mb-1.5 font-medium">
             Bundled MCPs
           </div>
           <ul className="space-y-1">
             {agent.required_mcps.map(mcp => (
               <li key={mcp.name} className="flex items-start gap-2">
-                <span className="text-brand">•</span>
+                <span className="text-tertiary">•</span>
                 <div className="flex-1 min-w-0">
                   <span className="font-mono">{mcp.name}</span>
                   {mcp.min_version && (
-                    <span className="text-p-text-light"> ≥{mcp.min_version}</span>
+                    <span className="text-tertiary"> ≥{mcp.min_version}</span>
                   )}
                   {mcp.skills && mcp.skills.length > 0 && (
                     <div className="flex flex-wrap gap-1 mt-0.5">
                       {mcp.skills.map(skill => (
                         <span
                           key={skill}
-                          className="px-1 py-px rounded-sm text-[9px] bg-brand/10 text-brand"
+                          className={`rounded-chip px-1.5 py-px text-3xs ${BADGE_TONE.info}`}
                         >
                           {skill}
                         </span>
@@ -305,7 +304,7 @@ function AgentCard({
             ))}
           </ul>
           {agent.category && (
-            <div className="mt-2 pt-2 border-t border-p-border-light/50 text-[10px] text-p-text-light">
+            <div className="mt-2 pt-2 border-t border-subtle text-3xs text-tertiary">
               Category: {agent.category}
             </div>
           )}
@@ -313,39 +312,30 @@ function AgentCard({
       )}
 
       {installed && (
-        <div className="text-[11px] text-green-600 dark:text-green-400 truncate">
+        <div className="text-2xs text-status-success-fg truncate">
           ✓ Installed as: {installedAs.join(', ')}
         </div>
       )}
       {updatable.map(i => (
-        <div key={i.agent_slug} className="flex items-center justify-between gap-2 text-[11px]" data-testid={`update-row-${i.agent_slug}`}>
-          <span className="text-p-text-secondary truncate">
+        <div key={i.agent_slug} className="flex items-center justify-between gap-2 text-2xs" data-testid={`update-row-${i.agent_slug}`}>
+          <span className="text-secondary truncate">
             <span className="font-mono">{i.agent_slug}</span>: {i.version || 'unknown'} → {agent.version}
           </span>
-          <button
-            onClick={() => onUpdate(i.agent_slug)}
-            className="px-2 py-1 rounded-sm border border-brand/40 text-brand hover:bg-brand/10 transition-colors whitespace-nowrap"
-          >
+          <Button variant="secondary" size="xs" onClick={() => onUpdate(i.agent_slug)} className="whitespace-nowrap">
             Update
-          </button>
+          </Button>
         </div>
       ))}
 
       <div className="flex items-center gap-2 mt-auto">
         {hasMoreContent && (
-          <button
-            onClick={() => setExpanded(e => !e)}
-            className="text-[11px] px-2 py-1 rounded-sm border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors"
-          >
+          <Button onClick={() => setExpanded(e => !e)}>
             {expanded ? 'Hide details' : 'Show details'}
-          </button>
+          </Button>
         )}
-        <button
-          onClick={onInstall}
-          className="flex-1 px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-brand hover:bg-brand-hover transition-colors"
-        >
+        <Button variant="primary" size="xs" className="flex-1" onClick={onInstall}>
           Install
-        </button>
+        </Button>
       </div>
     </div>
   )

@@ -13,7 +13,6 @@ from typing import Any
 from storage.chat import meeting_status
 from storage.pg import get_conn
 
-
 # ---------------------------------------------------------------------------
 # Meetings — the status vocabulary is storage/chat/meeting_status.py
 # ---------------------------------------------------------------------------

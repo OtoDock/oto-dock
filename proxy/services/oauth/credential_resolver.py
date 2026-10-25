@@ -25,20 +25,33 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from storage.identity import credential_store
-from storage.mcp import mcp_store
 import config
-from storage import database as task_store
-from services.mcp import mcp_manifest_types as _mt
+from auth import github_reach
+from auth.github_reach import Reach
 from core import layout
+from services.mcp import mcp_manifest_types as _mt
+from storage import database as task_store
+from storage.identity import credential_store, oauth_app_kinds
+from storage.mcp import mcp_store
 
 if TYPE_CHECKING:  # the broker's type only; services import core lazily
     from core.credentials.mcp_gateway import CliCredential
 
 logger = logging.getLogger("otodock")
+
+# The installation token's life margins (services/oauth/github_apps.py).
+MIN_REMAINING_S = 300
+STEP_MIN_REMAINING_S = 1800
+
+
+class CredentialUnavailable(Exception):
+    """A passing failure of a credential (GitHub or the relay unreachable
+    for an installation token): the MCP is left out of THIS session with
+    the message, nothing is marked, the next session tries again."""
 
 
 @dataclass
@@ -66,7 +79,7 @@ class ResolvedCredentials:
     # Per-MCP command-line credentials (``git_credential_helper`` manifests):
     # the token by reference, fetched per command through the broker; the
     # config builder puts each on its MCP's bundle.
-    cli_credentials: dict[str, "CliCredential"] = field(default_factory=dict)
+    cli_credentials: dict[str, CliCredential] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -77,29 +90,40 @@ class AccountRef:
     both scopes). For user scope it's the acting user; for agent (service)
     scope it's the user whose account a manager bound as the agent's service
     identity. Callers read from ``user_credential_accounts`` + the owner's
-    ``{username}/`` token dir.
+    ``{username}/`` token dir. ``installation_id`` names a GitHub App
+    installation of the account bound as the identity (``""`` = the account
+    itself): its own token then serves the session's command-line tools.
     """
 
     label: str
     owner_sub: str
+    installation_id: str = ""
 
 
 class AccountNeedsReconnect(Exception):
     """The bound account's token file can no longer serve a session; the
     message is the reason (``expired``, ``revoked``, ``mechanism_changed``,
-    ``registration_unavailable`` or ``issuer_changed``)."""
+    ``registration_unavailable``, ``issuer_changed``, or an installation
+    binding's: ``storage/identity/oauth_app_kinds.INSTALLATION_REASONS``)."""
 
 
 def account_unusable_reason(raw: dict, manifest) -> str:
     """Why a token file cannot serve a session on this manifest, or ``""``:
-    the file's own verdict (``oauth_account_store.token_dead_reason``) and
-    the token-origin invariant of a manifest that names its own
-    authorization server (``mcp_authorization.token_origin_problem``)."""
+    the file's own verdict (``oauth_account_store.token_dead_reason``), an
+    installation token past its hour (the worker re-mints it; a session
+    never carries an expired one), and the token-origin invariant of a
+    manifest that names its own authorization server
+    (``mcp_authorization.token_origin_problem``)."""
     from services.oauth import mcp_authorization, oauth_account_store
-    return (
-        oauth_account_store.token_dead_reason(raw)
-        or mcp_authorization.token_origin_problem(raw, manifest)
-    )
+    dead = oauth_account_store.token_dead_reason(raw)
+    if dead:
+        return dead
+    extra = raw.get("extra") or {}
+    if isinstance(extra, dict) and str(extra.get("flow") or "") == oauth_app_kinds.INSTALLATION_FLOW:
+        expiry = oauth_account_store._parse_expiry(str(raw.get("expires_at") or ""))
+        if expiry is None or expiry <= datetime.now(timezone.utc):
+            return oauth_app_kinds.INSTALLATION_EXPIRED
+    return mcp_authorization.token_origin_problem(raw, manifest)
 
 
 _RECONNECT_WORDING = {
@@ -109,14 +133,55 @@ _RECONNECT_WORDING = {
     "registration_unavailable": "the install's client registration at the vendor is gone",
     "issuer_changed": "the vendor's authorization server moved",
 }
+# An installation binding's reasons carry their own remedy.
+_INSTALLATION_WORDING = {
+    oauth_app_kinds.APP_KEY_REJECTED: (
+        "GitHub refused this install's GitHub App credentials; an admin updates them "
+        "in MCP Servers"),
+    oauth_app_kinds.INSTALLATION_GONE: (
+        "the app is no longer installed where the agent's GitHub identity pointed; "
+        "a manager binds another installation in Agent Settings > MCPs"),
+    oauth_app_kinds.INSTALLATION_SUSPENDED: (
+        "GitHub suspended the installation the agent's GitHub identity uses"),
+    oauth_app_kinds.INSTALLATION_EXPIRED: (
+        "the agent's GitHub access lapsed; a new session renews it"),
+    oauth_app_kinds.APP_CHANGED: (
+        "this install's GitHub credentials are no longer the GitHub App the account "
+        "signed in through; reconnect the account in Settings > Integrations"),
+    oauth_app_kinds.INSTALLATION_NOT_OWNED: (
+        "the account's owner no longer owns the installation the agent's GitHub "
+        "identity uses; a manager binds another in Agent Settings > MCPs"),
+    oauth_app_kinds.INSTALLATION_HOSTED: (
+        "hosted sign-in gives an agent no app identity; a manager binds the account "
+        "itself in Agent Settings, MCPs"),
+    oauth_app_kinds.INSTALLATION_REACH_OUTDATED: (
+        "a repository the agent may reach is no longer in the installation; a manager "
+        "picks the repositories again in Agent Settings, MCPs"),
+}
+
+
+# The same reasons at the moment of choosing an installation (a bind, a
+# subscription): nothing "pointed" anywhere yet.
+_CHOICE_WORDING = {
+    oauth_app_kinds.INSTALLATION_GONE: "the app is not installed there any more",
+    oauth_app_kinds.INSTALLATION_SUSPENDED: "GitHub suspended this installation",
+    oauth_app_kinds.INSTALLATION_NOT_OWNED: "this installation is not one you own on GitHub",
+}
 
 
 def reconnect_wording(reason: str) -> str:
     """The sentence a session reads for an account that needs a reconnect."""
+    if reason in _INSTALLATION_WORDING:
+        return _INSTALLATION_WORDING[reason]
     return (
         _RECONNECT_WORDING.get(reason, "the account can no longer be refreshed")
         + "; reconnect it in Settings > Integrations"
     )
+
+
+def bind_wording(reason: str) -> str:
+    """The sentence for an installation a person picks and cannot have."""
+    return _CHOICE_WORDING.get(reason) or reconnect_wording(reason)
 
 
 def pick_account(
@@ -150,9 +215,10 @@ def pick_account(
     to load / persist.
     """
     if user_sub:
-        label = credential_store.get_account_agent_binding(
+        row = credential_store.get_account_agent_binding(
             user_sub, mcp_name, agent_name,
         )
+        label = row.account_label if row is not None else None
         if not label:
             label = credential_store.get_default_account(user_sub, mcp_name)
         if not label:
@@ -164,9 +230,34 @@ def pick_account(
     # default fallback.
     binding = credential_store.get_service_agent_binding(mcp_name, agent_name)
     if binding is not None:
-        label, owner_sub = binding
-        return AccountRef(label=label, owner_sub=owner_sub)
+        return AccountRef(
+            label=binding.account_label, owner_sub=binding.account_owner_sub,
+            installation_id=binding.installation_id,
+        )
     return None
+
+
+def binding_reach(
+    mcp_name: str, agent_name: str, *, user_sub: str | None, task_scope: str,
+) -> Reach | None:
+    """The GitHub reach a session's credential for ``mcp_name`` carries,
+    when it narrows (``None`` otherwise), by the scope the session resolves
+    in (the same rule as ``_bound_token_source``): in user scope the
+    person's own choice of account for the agent (a session on their
+    default account, with no choice for the agent, reaches what the account
+    reaches), else the agent's service binding."""
+    from core.session.visibility import SCOPE_USER
+    if user_sub and task_scope == SCOPE_USER:
+        own = credential_store.get_account_agent_binding(user_sub, mcp_name, agent_name)
+        if own is None:
+            return None
+        mine = github_reach.reach_of(own.repositories, own.read_only, personal=True)
+        return mine if mine.narrows else None
+    binding = credential_store.get_service_agent_binding(mcp_name, agent_name)
+    if binding is None:
+        return None
+    reach = github_reach.reach_of(binding.repositories, binding.read_only)
+    return reach if reach.narrows else None
 
 
 def resolve_credentials(
@@ -242,6 +333,10 @@ def resolve_credentials(
                     result.exclusion_reasons[mcp_name] = (
                         f"{label}: {reconnect_wording(str(needs))}."
                     )
+                    continue
+                except CredentialUnavailable as why:
+                    result.excluded_mcps.add(mcp_name)
+                    result.exclusion_reasons[mcp_name] = f"{label}: {why}."
                     continue
                 if oauth_env is not None:
                     result.env_vars.update(oauth_env)
@@ -557,14 +652,22 @@ def _resolve_oauth_mcp(
             for env_name in mcp_env_names:
                 mcp_env_vars[env_name] = access_token
         if git_host and access_token:
-            env_injection_vars.update(git_helper_env(git_host))
+            reach = binding_reach(mcp_name, agent_name, user_sub=user_sub, task_scope=task_scope)
+            env_injection_vars.update(git_helper_env(git_host, reach=reach))
             if cli_credentials is not None:
                 from core.credentials.mcp_gateway import CliCredential, TokenRef
+                # The command-line tools of an installation binding get the
+                # installation's own token whatever the MCP server gets.
+                cli_dir, cli_label, _ = _bound_token_source(
+                    mcp_name, provider_id, user_sub=user_sub, task_scope=task_scope,
+                    agent_name=agent_name, purpose=PURPOSE_CLI,
+                ) or (source_dir, account_label, username)
                 cli_credentials[mcp_name] = CliCredential(
                     host=git_host,
-                    token_ref=TokenRef(str(source_dir), account_label),
+                    token_ref=TokenRef(str(cli_dir), cli_label),
                     env_names=tuple(injection_names),
                     manifest=mcp_name,
+                    reach=reach.to_dict() if reach is not None else None,
                 )
 
     # Bearer-injected MCPs (slack, github, linear, notion) have no
@@ -662,17 +765,28 @@ def purge_agent_tree_credentials() -> int:
 PLATFORM_GIT_HELPER = '!"$OTO_HOOK_PY" -I "$OTO_HOOKS_DIR/credential_helper.py" git'
 
 
-def git_helper_env(host: str, helper: str = PLATFORM_GIT_HELPER) -> dict[str, str]:
+def git_helper_env(
+    host: str, helper: str = PLATFORM_GIT_HELPER, *, reach: Reach | None = None,
+) -> dict[str, str]:
     """Git's env-config entries that make ``helper`` the only credential
     helper for ``https://<host>``: an empty value first resets the list
     read from every config file (Git Credential Manager on a Windows
-    satellite, which would prompt; the host's own helper), then ours."""
+    satellite, which would prompt; the host's own helper), then ours. A
+    narrowed GitHub reach adds that git names the repository in each
+    request (``useHttpPath``) and, under read-only, that a push asks for
+    the marker path the broker refuses (``auth/github_reach.PUSH_MARKER``)."""
     key = f"credential.https://{host}.helper"
-    return {
-        "GIT_CONFIG_COUNT": "2",
-        "GIT_CONFIG_KEY_0": key, "GIT_CONFIG_VALUE_0": "",
-        "GIT_CONFIG_KEY_1": key, "GIT_CONFIG_VALUE_1": helper,
-    }
+    pairs = [(key, ""), (key, helper)]
+    if reach is not None and reach.narrows:
+        pairs.append((f"credential.https://{host}.useHttpPath", "true"))
+        if reach.read_only:
+            base = f"https://{host}/"
+            pairs.append((f"url.{base}{github_reach.PUSH_MARKER}/.pushInsteadOf", base))
+    env = {"GIT_CONFIG_COUNT": str(len(pairs))}
+    for i, (k, v) in enumerate(pairs):
+        env[f"GIT_CONFIG_KEY_{i}"] = k
+        env[f"GIT_CONFIG_VALUE_{i}"] = v
+    return env
 
 
 def cli_token_env(
@@ -699,10 +813,25 @@ def cli_token_env(
         helper = oauth.get("git_credential_helper") or {}
         if not names and not helper:
             continue
-        picked = _bound_token_source(
-            m.name, provider_id, user_sub=user_sub, task_scope=task_scope,
-            agent_name=agent_name,
-        )
+        reach = binding_reach(m.name, agent_name, user_sub=user_sub, task_scope=task_scope)
+        if reach is not None:
+            # A person's own account is never an installation: their reach
+            # leaves a step nothing, whatever the agent's service binding is.
+            binding = None if reach.personal else credential_store.get_service_agent_binding(m.name, agent_name)
+            if binding is None or not binding.installation_id:
+                # A step holds its token for the whole run, unjudged: only an
+                # installation's token, narrowed by GitHub itself, may go.
+                logger.warning("app step: no %s credential (the agent's GitHub reach is narrowed and "
+                               "a user token cannot be)", provider_id)
+                continue
+        try:
+            picked = _bound_token_source(
+                m.name, provider_id, user_sub=user_sub, task_scope=task_scope,
+                agent_name=agent_name, purpose=PURPOSE_CLI, min_remaining_s=STEP_MIN_REMAINING_S,
+            )
+        except (AccountNeedsReconnect, CredentialUnavailable) as why:
+            logger.warning("app step: no %s credential (%s)", provider_id, why)
+            continue
         if picked is None:
             continue
         source_dir, label, _username = picked
@@ -719,6 +848,13 @@ def cli_token_env(
     return out
 
 
+# What a token source is asked for: the MCP server's bearer, or the
+# session's command-line tools (git, gh, an app step's script). An
+# installation binding answers the two differently.
+PURPOSE_MCP = "mcp"
+PURPOSE_CLI = "cli"
+
+
 def _bound_token_source(
     mcp_name: str,
     provider_id: str,
@@ -726,7 +862,9 @@ def _bound_token_source(
     user_sub: str | None,
     task_scope: str,
     agent_name: str,
-) -> "tuple[Path, str, str] | None":
+    purpose: str = PURPOSE_MCP,
+    min_remaining_s: float = MIN_REMAINING_S,
+) -> tuple[Path, str, str] | None:
     """Resolve which central token file backs this ``(mcp, agent, scope)``.
 
     Returns ``(source_dir, account_label, username)`` — the central
@@ -735,8 +873,16 @@ def _bound_token_source(
     binding's owner otherwise; callers gate the user-vs-agent destination on
     ``task_scope`` exactly as before this was extracted). ``None`` when
     there is no usable binding or the user record is gone.
+
+    An installation binding (``AccountRef.installation_id``): the
+    command-line purpose always gets the installation's own token file
+    (``_app/<id>.json``, minted or renewed on the way:
+    ``github_apps.ensure_installation_token``, which raises
+    ``AccountNeedsReconnect`` or ``CredentialUnavailable``); the MCP purpose
+    gets it only when the kind's ``mcp_token`` says so, else the owner's
+    user file.
     """
-    from services.oauth import oauth_account_store
+    from services.oauth import github_apps, oauth_account_store
 
     if user_sub and task_scope == "user":
         username = task_store.get_username_by_sub(user_sub)
@@ -758,6 +904,23 @@ def _bound_token_source(
     username = task_store.get_username_by_sub(ref.owner_sub) or ""
     if not username:
         return None
+    if ref.installation_id and (
+        purpose == PURPOSE_CLI or github_apps.mcp_gets_installation_token(mcp_name)
+    ):
+        path = github_apps.ensure_installation_token(
+            mcp_name, ref.owner_sub, ref.label, ref.installation_id,
+            min_remaining_s=min_remaining_s,
+            reach=binding_reach(mcp_name, agent_name, user_sub=user_sub, task_scope=task_scope),
+        )
+        return path.parent, path.stem, username
+    if ref.installation_id:
+        # The owner's user token serves the MCP server: the owner's standing
+        # over the installation is still the binding's condition.
+        standing = oauth_app_kinds.installation_standing(
+            credential_store.get_account_meta(ref.owner_sub, mcp_name, ref.label), ref.installation_id,
+        )
+        if standing:
+            raise AccountNeedsReconnect(standing)
     source_dir = oauth_account_store.get_token_dir(
         username, provider_id=provider_id,
     )
@@ -789,8 +952,8 @@ def collect_oauth_token_files_by_manifest(
     travels via the tunnel bearer swap, no file) and docker/none-runtime
     MCPs (never spawned on a satellite).
     """
-    from services.mcp import mcp_registry
     from services import path_roles
+    from services.mcp import mcp_registry
 
     by_manifest: dict[str, dict[str, bytes]] = {}
     for manifest in mcp_registry.get_agent_mcps(agent_name):

@@ -1,0 +1,240 @@
+{
+ "calls": [
+  {
+   "args": [
+    "char-agent",
+    null
+   ],
+   "call": "build_session_mcp_config",
+   "kwargs": {
+    "delegation_targets": [
+     "char-agent",
+     "char-peer"
+    ],
+    "mcp_config_format": "json",
+    "only_mcps": null,
+    "placement": {},
+    "session_id": "s-task",
+    "target_browser": {},
+    "task_mode": true,
+    "task_owner": "",
+    "task_scope": "agent",
+    "task_username": "",
+    "user_role": "manager",
+    "username": ""
+   }
+  },
+  {
+   "args": [],
+   "call": "build_oto_env",
+   "kwargs": {
+    "agent_name": "char-agent",
+    "available_scopes": [
+     "user",
+     "agent"
+    ],
+    "default_scope": "agent",
+    "force_config": false,
+    "memory_agent_enabled": true,
+    "memory_user_enabled": true,
+    "platform_role": "",
+    "session_id": "s-task",
+    "task_type": "scheduled",
+    "user_role": "manager",
+    "user_sub": "",
+    "username": ""
+   }
+  },
+  {
+   "args": [
+    "char-agent",
+    [
+     "char-files",
+     "phone-mcp"
+    ]
+   ],
+   "call": "get_dynamic_contexts",
+   "kwargs": {
+    "delegation_roster": {
+     "char-agent": [
+      {
+       "catalog": [
+        {
+         "good_at": "",
+         "model_id": "claude-char-1",
+         "tier": 2,
+         "tier_label": "strong"
+        }
+       ],
+       "default_model": "claude-char-1",
+       "is_default": true,
+       "local_only": false,
+       "models": [
+        "claude-char-1"
+       ],
+       "more": 0,
+       "path": "claude-code-cli",
+       "tiers": {
+        "claude-char-1": 2
+       }
+      }
+     ],
+     "char-peer": [
+      {
+       "catalog": [
+        {
+         "good_at": "",
+         "model_id": "claude-char-1",
+         "tier": 2,
+         "tier_label": "strong"
+        }
+       ],
+       "default_model": "claude-char-1",
+       "is_default": true,
+       "local_only": false,
+       "models": [
+        "claude-char-1"
+       ],
+       "more": 0,
+       "path": "claude-code-cli",
+       "tiers": {
+        "claude-char-1": 2
+       }
+      }
+     ]
+    },
+    "delegation_targets": [
+     "char-agent",
+     "char-peer"
+    ],
+    "meetings_access": [],
+    "nouser_reads": true,
+    "placement": {},
+    "trigger_payload": null,
+    "user_role": "manager",
+    "user_sub": ""
+   }
+  },
+  {
+   "args": [
+    "char-agent"
+   ],
+   "call": "build_agent_prompt",
+   "kwargs": {
+    "client_type": "task",
+    "dynamic_contexts": null,
+    "excluded_mcps": null,
+    "execution_path": "claude-code-cli",
+    "mount_shared": true,
+    "placement": {},
+    "role": "manager",
+    "sandboxed": true,
+    "username": ""
+   }
+  },
+  {
+   "args": [
+    {
+     "agent": "char-agent",
+     "config_visible": false,
+     "is_admin_agent": false,
+     "knowledge_rw": true,
+     "role": "manager",
+     "session_scope": "agent",
+     "username": ""
+    }
+   ],
+   "call": "build_permission_context",
+   "kwargs": {
+    "assigned_mcp_names": [
+     "char-files",
+     "phone-mcp"
+    ],
+    "execution_path": "claude-code-cli"
+   }
+  },
+  {
+   "args": [
+    "char-agent"
+   ],
+   "call": "ensure_persistent_agent_dir",
+   "kwargs": {
+    "execution_path": "claude-code-cli",
+    "read_only": false,
+    "scope": "agent",
+    "username": ""
+   }
+  },
+  {
+   "args": [
+    "claude-code-cli",
+    null
+   ],
+   "call": "resolve_subscription_env",
+   "kwargs": {
+    "agent_info": {
+     "admin_only": false,
+     "collaborative": true,
+     "color": "",
+     "community_template": null,
+     "community_template_data": {},
+     "community_template_version": null,
+     "created_at": "<stamp>",
+     "created_by": "",
+     "default_effort": "",
+     "default_execution_mode": "",
+     "default_for_new_users_role": "",
+     "default_model": "",
+     "default_scope": "user",
+     "department_id": "",
+     "department_level_id": "",
+     "description": "",
+     "display_name": "Char Agent",
+     "execution_path": "claude-code-cli",
+     "execution_paths": "",
+     "execution_target": "local",
+     "setup_completed_at": null,
+     "slug": "char-agent",
+     "updated_at": "<stamp>"
+    },
+    "model": "claude-char-1",
+    "sticky_scope": "local:/char/.claude"
+   }
+  }
+ ],
+ "config": {
+  "agent_name": "char-agent",
+  "client_type": "task",
+  "credential_env": {
+   "CHAR_FILES_DIR": "/workspace/files",
+   "MCP_CRED": "1",
+   "OTO_STUB": "1",
+   "PROXY_API_KEY": "<session-token>"
+  },
+  "effort": "high",
+  "execution_path": "claude-code-cli",
+  "extra_env": {
+   "SUB_ENV": "1"
+  },
+  "model": "claude-char-1",
+  "multi_value_envs": {
+   "OTO_STUB_ROOTS": ":"
+  },
+  "permission_mode": "auto",
+  "sandbox_host_claude_dir": "/char/.claude",
+  "security_context": {
+   "agent": "char-agent",
+   "config_visible": false,
+   "is_admin_agent": false,
+   "knowledge_rw": true,
+   "role": "manager",
+   "session_scope": "agent",
+   "username": ""
+  },
+  "subscription_id": "sub-char",
+  "subscription_user_sub": "",
+  "system_prompt": "PROMPT\n\nPERMISSIONS\n\n---\n\n## Background Task Agent Rules\n\nYou are running as a background task agent (no interactive user).\n\n### Subagent Rules\n- For complex tasks, you SHOULD use the Agent tool to spawn subagents for parallel research/work.\n- You can spawn multiple foreground agents in a single message — they run concurrently in parallel.\n- You MAY use background agents (`run_in_background: true`) when you want to continue working while agents run. The system automatically detects when they finish and prompts you to review their results — just end your turn normally when you've done what you can; no completion marker is needed.\n\n\n## Notification Policy\nWhen you finish your work, call `mcp__notifications-mcp__create_notification` with a title and body summarizing what you did. Pick a severity matching the outcome (`info` / `success` / `warning` / `danger`). Send exactly **one** final notification — the system handles failure notifications for you if you crash, so don't notify on errors yourself.",
+  "token_minted_at": "<now>",
+  "user_sub": "user-admin"
+ }
+}

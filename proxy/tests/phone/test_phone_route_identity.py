@@ -17,10 +17,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from auth.providers import UserContext, get_current_user
-from storage.phone import phone_route_store
 from storage import schema as pg_schema
 from storage.pg import get_conn
-
+from storage.phone import phone_route_store
 
 # ---------------------------------------------------------------------------
 # Fixtures

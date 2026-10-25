@@ -14,20 +14,20 @@ import logging
 import time
 from contextlib import contextmanager
 
-from storage import database as task_store
-from storage.pg import run_db
-from core.session.session_state import (
-    _dashboard_notify_queues,
-    push_pump_event,
-    queue_pump_prompt,
-    mark_bg_agents_completed,
-    get_subagent_registry,
-)
+from core.background import spawn
 from core.events import chat_writer
 from core.events.bg_command_state import get_bg_command_registry
-from ws import wire_events as wire
 from core.events.common_events import TEXT
-from core.background import spawn
+from core.session.session_state import (
+    _dashboard_notify_queues,
+    get_subagent_registry,
+    mark_bg_agents_completed,
+    push_pump_event,
+    queue_pump_prompt,
+)
+from storage import database as task_store
+from storage.pg import run_db
+from ws import wire_events as wire
 
 logger = logging.getLogger("otodock")
 
@@ -95,7 +95,7 @@ async def _self_wakes(layer, session_id: str) -> bool:
     try:
         wakes = getattr(layer, "session_self_wakes", None)
         return wakes is not None and bool(await wakes(session_id))
-    except Exception:
+    except ValueError:
         return False
 
 
@@ -115,7 +115,7 @@ async def _wake_grace_covers(layer, session_id: str) -> bool:
     while time.monotonic() < deadline:
         try:
             await layer.drain_bg_commands(session_id, budget=1.0)
-        except Exception:
+        except Exception:  # noqa: BLE001  # the drain reads stdout or a satellite: a failure fires the nudge
             logger.debug("wake grace: drain failed for %s", session_id[:8],
                          exc_info=True)
             return False
@@ -141,7 +141,7 @@ async def ride_out_grace(layer, session_id: str) -> bool:
         return True
     if not layer.is_session_grace_held(session_id):
         return False
-    while layer.is_session_grace_held(session_id):
+    while layer.is_session_grace_held(session_id):  # noqa: ASYNC110  # the grace ends in several owners of the link: a poll misses none
         await asyncio.sleep(GRACE_POLL_S)
     if not await layer.is_session_alive(session_id):
         return False
@@ -149,9 +149,9 @@ async def ride_out_grace(layer, session_id: str) -> bool:
         return False
     try:
         await layer.drain_bg_commands(session_id, budget=2.0)
-    except Exception:
+    except Exception:  # noqa: BLE001  # the drain reads stdout or a satellite: the session is back anyway
         logger.debug("grace ride-out: drain failed for %s", session_id[:8], exc_info=True)
-    logger.info(f"BG wait: session {session_id[:8]} is back after its machine's reconnect")
+    logger.info("BG wait: session %s is back after its machine's reconnect", session_id[:8])
     return True
 
 
@@ -212,7 +212,7 @@ async def _bg_agent_monitor_impl(
     reg = get_subagent_registry(session_id)
     reg.chat_id = chat_id
     start = time.monotonic()
-    logger.info(f"BG agent monitor started: session={session_id[:8]}, chat={chat_id[:8]}, count={count}")
+    logger.info("BG agent monitor started: session=%s, chat=%s, count=%s", session_id[:8], chat_id[:8], count)
 
     settled = False
     while (time.monotonic() - start) < MAX_WAIT:
@@ -226,34 +226,50 @@ async def _bg_agent_monitor_impl(
             pass
 
         if not await ride_out_grace(layer, session_id):
-            logger.info(f"BG agent monitor: session {session_id[:8]} gone, exiting")
-            return
+            logger.info("BG agent monitor: session %s gone, exiting", session_id[:8])
+            return None
         # Keep waiting — do NOT bail just because the session lock is held (a
         # concurrent user turn): the cohort's completion still needs its nudge,
         # which the turn-start gate defers behind the user's in-flight turn.
         # The bg work is independent of the user's turn. No hook-silence inference.
 
     if not settled:
-        logger.warning(f"BG agent monitor: no SubagentStop all-done within {MAX_WAIT}s (lost hook?), session={session_id[:8]}")
-        return
+        logger.warning("BG agent monitor: no SubagentStop all-done within %ss (lost hook?), session=%s", MAX_WAIT, session_id[:8])
+        return None
 
     # Re-check liveness right before delivering. The nudge itself is deferred by
     # the turn-start gate if a user turn is in flight — we never drop it.
     if not await ride_out_grace(layer, session_id):
-        return
+        return None
 
     # A run on this chat or session owes its report: its producer reviews the
     # agents it inherits. After that window only what no review named is owed,
     # and an engine that wakes itself gave its own turn the rest.
     waited = await _wait_report_window(layer, session_id, chat_id)
     if waited is None:
-        return
+        return None
     owed = sorted(reg.owed)
     if not owed or (waited and await _engine_self_wakes(chat_id)):
         mark_bg_agents_completed(chat_id)
         push_pump_event(chat_id, {"type": wire.BG_AGENTS_COMPLETE, "count": count})
-        logger.info(f"BG agent monitor: no agent review owed (session={session_id[:8]})")
-        return
+        logger.info("BG agent monitor: no agent review owed (session=%s)", session_id[:8])
+        return None
+
+    # The person STOPPED this chat's last turn (a graceful abort keeps the
+    # CLI, and its background agents, alive): a nudge would run a turn the
+    # person just refused. The badges clear and the agents count as
+    # reviewed, so a later cohort's monitor nudges for its own alone; the
+    # CLI's own tracking hands the results to the model on the next real
+    # turn. The command monitor's rule.
+    if chat_id and ((await run_db(task_store.get_chat, chat_id)) or {}).get("last_turn_aborted"):
+        mark_bg_agents_completed(chat_id)
+        push_pump_event(chat_id, {"type": wire.BG_AGENTS_COMPLETE, "count": count})
+        reg.mark_reviewed(owed)
+        logger.info(
+            "BG agent monitor: last turn aborted by the user — skipping "
+            "nudge for chat=%s", chat_id[:8]
+        )
+        return None
 
     # The CLI's own self-wake review turn (≥2.1.243) supersedes the nudge —
     # firing ours too would run a second, redundant review at double cost.
@@ -263,10 +279,10 @@ async def _bg_agent_monitor_impl(
         mark_bg_agents_completed(chat_id)
         push_pump_event(chat_id, {"type": wire.BG_AGENTS_COMPLETE, "count": count})
         logger.info(
-            f"BG agent monitor: self-wake turn covered the cohort — nudge "
-            f"stands down (session={session_id[:8]})"
+            "BG agent monitor: self-wake turn covered the cohort — nudge "
+            "stands down (session=%s)", session_id[:8]
         )
-        return
+        return None
 
     # Which agents finished — so the model can tell each completion apart
     # (dogfooding find 2026-08-27: the count-only nudge made an agent read a
@@ -290,7 +306,7 @@ async def _bg_agent_monitor_impl(
             "labels": labels,
         })
         reg.mark_reviewed(owed)
-        logger.info(f"BG agent monitor: nudge queued for session={session_id[:8]}")
+        logger.info("BG agent monitor: nudge queued for session=%s", session_id[:8])
         return None
 
     # Path 2: Pump running (background drain) — queue on pump for in-context delivery
@@ -300,7 +316,7 @@ async def _bg_agent_monitor_impl(
     if queue_pump_prompt(chat_id, nudge, system=True):
         push_pump_event(chat_id, {"type": wire.BG_AGENTS_COMPLETE, "count": count})
         reg.mark_reviewed(owed)
-        logger.info(f"BG agent monitor: nudge queued on pump for chat={chat_id[:8]}")
+        logger.info("BG agent monitor: nudge queued on pump for chat=%s", chat_id[:8])
         return None
 
     # Path 3: no socket, no consumer pump — the wrapper's review turn.
@@ -315,7 +331,7 @@ def bg_command_monitor_running(session_id: str) -> bool:
     return session_id in _bg_command_monitors_running
 
 
-def arm_bg_monitors(layer, session_id: str, chat_id: str) -> None:
+def arm_bg_monitors(layer, session_id: str | None, chat_id: str | None) -> None:
     """Start the monitor for each cohort a turn left running: background
     subagents and background commands, each only when its registry has
     pending work and no monitor of that kind watches the session (the
@@ -397,16 +413,16 @@ async def _bg_command_monitor_impl(
     bgreg.chat_id = chat_id
     start = time.monotonic()
     logger.info(
-        f"BG command monitor started: session={session_id[:8]}, "
-        f"chat={chat_id[:8]}, count={count}"
+        "BG command monitor started: session=%s, "
+        "chat=%s, count=%s", session_id[:8], chat_id[:8], count
     )
 
     while (time.monotonic() - start) < MAX_WAIT:
         if not bgreg.has_pending:
             break
         if not await ride_out_grace(layer, session_id):
-            logger.info(f"BG command monitor: session {session_id[:8]} gone, exiting")
-            return
+            logger.info("BG command monitor: session %s gone, exiting", session_id[:8])
+            return None
         # No hook — actively read stdout (briefly, under the session lock) to
         # catch task_updated{completed}. If a user turn holds the lock,
         # drain_bg_commands backs off and returns False (the turn's own
@@ -424,33 +440,34 @@ async def _bg_command_monitor_impl(
         SLOW_POLL = 15.0
         ceiling = background_leash.background_work_ceiling()
         logger.info(
-            f"BG command monitor: {bgreg.pending_count} command(s) still "
-            f"running after {MAX_WAIT:.0f}s — polling every {SLOW_POLL:.0f}s "
-            f"up to the {ceiling:.0f}s ceiling (session={session_id[:8]})"
+            "BG command monitor: %s command(s) still "
+            "running after %.0fs — polling every %.0fs "
+            "up to the %.0fs ceiling (session=%s)",
+            bgreg.pending_count, MAX_WAIT, SLOW_POLL, ceiling, session_id[:8]
         )
         while bgreg.has_pending and (time.monotonic() - start) < ceiling:
             if not await ride_out_grace(layer, session_id):
-                logger.info(f"BG command monitor: session {session_id[:8]} gone, exiting")
-                return
+                logger.info("BG command monitor: session %s gone, exiting", session_id[:8])
+                return None
             progressed = await layer.drain_bg_commands(session_id, budget=POLL_INTERVAL)
             if bgreg.has_pending and not progressed:
                 await asyncio.sleep(SLOW_POLL)
 
     if bgreg.has_pending:
         logger.warning(
-            f"BG command monitor: {bgreg.pending_count} command(s) still pending "
-            f"at the background-work ceiling — giving up (no nudge)"
+            "BG command monitor: %s command(s) still pending "
+            "at the background-work ceiling — giving up (no nudge)", bgreg.pending_count
         )
-        return
+        return None
 
     if not await ride_out_grace(layer, session_id):
-        return
+        return None
 
     # A run on this chat or session owes its report: its producer reviews the
     # commands it inherits (pending plus unseen); the checks below then read
     # what is left once that window closes.
     if await _wait_report_window(layer, session_id, chat_id) is None:
-        return
+        return None
 
     # The user STOPPED this chat's last turn (graceful abort keeps the CLI —
     # and its backgrounded commands — alive, so this monitor now survives an
@@ -458,20 +475,20 @@ async def _bg_command_monitor_impl(
     # own bg tracking hands the results to the model on the next REAL turn.
     if chat_id and ((await run_db(task_store.get_chat, chat_id)) or {}).get("last_turn_aborted"):
         logger.info(
-            f"BG command monitor: last turn aborted by the user — skipping "
-            f"nudge for chat={chat_id[:8]}"
+            "BG command monitor: last turn aborted by the user — skipping "
+            "nudge for chat=%s", chat_id[:8]
         )
-        return
+        return None
 
     # Self-wake supersession — mirror of the subagent monitor: the CLI's own
     # review turn (captured by the drain above or during this grace) makes
     # our nudge redundant. Per-command badges are already cleared.
     if await _wake_grace_covers(layer, session_id):
         logger.info(
-            f"BG command monitor: self-wake turn covered the cohort — nudge "
-            f"stands down (session={session_id[:8]})"
+            "BG command monitor: self-wake turn covered the cohort — nudge "
+            "stands down (session=%s)", session_id[:8]
         )
-        return
+        return None
 
     # Every completion landed inside a later turn (the turn-start reset keeps
     # a still-running command pending, so this monitor outlives that turn),
@@ -479,10 +496,10 @@ async def _bg_command_monitor_impl(
     # review turn (the task producer's rule).
     if not bgreg.unsurfaced_count:
         logger.info(
-            f"BG command monitor: every completion was surfaced in a later "
-            f"turn — no nudge (session={session_id[:8]})"
+            "BG command monitor: every completion was surfaced in a later "
+            "turn — no nudge (session=%s)", session_id[:8]
         )
-        return
+        return None
 
     # Which commands finished — labels captured at spawn (claude: shell id +
     # command; codex: command text). See compose_command_nudge.
@@ -504,15 +521,15 @@ async def _bg_command_monitor_impl(
             "count": count,
             "labels": labels,
         })
-        logger.info(f"BG command monitor: nudge queued for session={session_id[:8]}")
-        return
+        logger.info("BG command monitor: nudge queued for session=%s", session_id[:8])
+        return None
 
     # Path 2: Pump running (background drain) — queue on pump for in-context delivery.
     _persist_row(chat_id, "event", "", event_type=wire.PERSISTED_BG_COMMAND_NUDGE,
                  event_data=json.dumps({"count": count, "labels": labels}),
                  label="bg_command_nudge")
     if queue_pump_prompt(chat_id, nudge, system=True):
-        logger.info(f"BG command monitor: nudge queued on pump for chat={chat_id[:8]}")
+        logger.info("BG command monitor: nudge queued on pump for chat=%s", chat_id[:8])
         return None
 
     # Path 3: no socket, no consumer pump — the wrapper's review turn.
@@ -538,12 +555,12 @@ async def _wait_report_window(layer, session_id: str, chat_id: str) -> bool | No
     from services.scheduler import lanes
     if not lanes.report_pending(chat_id, session_id):
         return False
-    logger.info(f"BG review: chat={chat_id[:8]} owes a run's report — the review waits for it")
+    logger.info("BG review: chat=%s owes a run's report — the review waits for it", chat_id[:8])
     deadline = time.monotonic() + background_leash.background_work_ceiling()
     while lanes.report_pending(chat_id, session_id):
         if time.monotonic() >= deadline:
-            logger.warning(f"BG review: chat={chat_id[:8]} still owed a report at the "
-                           f"background-work ceiling — the review was not run")
+            logger.warning("BG review: chat=%s still owed a report at the "
+                           "background-work ceiling — the review was not run", chat_id[:8])
             return None
         await asyncio.sleep(REPORT_POLL_S)
     if not await ride_out_grace(layer, session_id):
@@ -555,7 +572,10 @@ async def _engine_self_wakes(chat_id: str) -> bool:
     """Whether the chat's engine reviews finished background agents by
     itself (``runtime.self_wakes``), read from the engine, not from a session
     this process holds: a session closed meanwhile still answers."""
-    from core.session.session_manager import get_layer_capabilities, resolve_execution_path
+    from core.session.session_manager import (
+        get_layer_capabilities,
+        resolve_execution_path,
+    )
     chat = await run_db(task_store.get_chat, chat_id) or {}
     path = await run_db(resolve_execution_path, chat.get("agent") or "",
                         chat.get("execution_path") or "")
@@ -595,8 +615,8 @@ async def _review_turn(layer, session_id: str, chat_id: str, nudge: str, *,
             return
         if (waited or round_no) and not await _review_still_owed(
                 session_id, chat_id, commands=commands, agent_ids=agent_ids):
-            logger.info(f"BG review: the turn that held chat={chat_id[:8]} took "
-                        f"the completions — no review")
+            logger.info("BG review: the turn that held chat=%s took "
+                        "the completions — no review", chat_id[:8])
             return
         if await delivery._run_echo_turn_pumped(
                 layer, session_id, chat_id, chat.get("agent") or "", nudge,
@@ -605,13 +625,13 @@ async def _review_turn(layer, session_id: str, chat_id: str, nudge: str, *,
             return
         if queue_pump_prompt(chat_id, nudge, system=True):
             _mark_reviewed(session_id, agent_ids)
-            logger.info(f"BG review: nudge queued on pump for chat={chat_id[:8]}")
+            logger.info("BG review: nudge queued on pump for chat=%s", chat_id[:8])
             return
         task = getattr(_active_pumps.get(chat_id), "_task", None)
         if task is not None:
             await asyncio.wait([task], timeout=REVIEW_WAIT_S)
-    logger.warning(f"BG review: chat={chat_id[:8]} stayed busy for "
-                   f"{REVIEW_ROUNDS} rounds — the review was not run")
+    logger.warning("BG review: chat=%s stayed busy for "
+                   "%s rounds — the review was not run", chat_id[:8], REVIEW_ROUNDS)
 
 
 async def _review_still_owed(session_id: str, chat_id: str, *, commands: bool,
@@ -634,7 +654,7 @@ async def _direct_review(layer, session_id: str, chat_id: str, nudge: str, *,
                          agent_ids=()) -> None:
     """The review sent straight to the session, outside any pump: the joined
     text is persisted as one assistant row."""
-    logger.info(f"BG review: delivering directly for session={session_id[:8]}")
+    logger.info("BG review: delivering directly for session=%s", session_id[:8])
     try:
         parts: list[str] = []
         async with layer.session_lock(session_id):
@@ -646,4 +666,4 @@ async def _direct_review(layer, session_id: str, chat_id: str, nudge: str, *,
         if response:
             await _persist_row(chat_id, "assistant", response, label="bg_direct_reply")
     except Exception as e:
-        logger.error(f"BG review direct delivery failed: {e}", exc_info=True)
+        logger.exception("BG review direct delivery failed: %s", e)

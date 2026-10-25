@@ -41,7 +41,6 @@ from collections import Counter
 from pathlib import Path
 
 from tests._paths import REPO_ROOT
-
 from ws import wire_events as wire
 
 EXCLUDED = ("/tests/", "/venv/", "/.venv/", "/node_modules/", "/_vendored/", "/skills/",
@@ -58,8 +57,11 @@ def _tracked(prefix: str, suffixes: tuple[str, ...]) -> list[Path]:
         # A tree without .git (the exported public cut): walk the same root.
         out = [str(p.relative_to(REPO_ROOT)).replace("\\", "/")
                for s in suffixes for p in (REPO_ROOT / prefix).rglob(f"*{s}")]
+    # A dashboard test beside the hook it pins (`x.test.tsx`) is a test
+    # wherever it sits, like one under a tests directory.
     return [REPO_ROOT / p for p in out
-            if p.endswith(suffixes) and not any(x in f"/{p}" for x in EXCLUDED)]
+            if p.endswith(suffixes) and not any(x in f"/{p}" for x in EXCLUDED)
+            and ".test." not in p.rsplit("/", 1)[-1]]
 
 
 def _rel(p: Path) -> str:
@@ -77,7 +79,7 @@ FRAME_NAMES = frozenset(wire.FRAMES)
 KNOWN_SENDER_LITERALS: dict[str, dict[str, int]] = {
     # The Direct layer's native chunk dicts (``{"type": "text", "data": …}``),
     # translated into CommonEvents at the layer's edge — not wire frames.
-    "proxy/core/layers/direct/session.py": {"text": 2, "thinking": 5, "tool_start": 1, "tool_end": 2,
+    "proxy/core/layers/direct/session.py": {"text": 3, "thinking": 5, "tool_start": 1, "tool_end": 2,
                                             "done": 1, "error": 4, "metadata": 1, "context_compact": 1},
     # The task-run SSE stream (``api/tasks/tasks.py``): an HTTP stream read by
     # schedules-mcp's ``run_task(wait=true)`` (nothing in the dashboard reads
@@ -87,8 +89,9 @@ KNOWN_SENDER_LITERALS: dict[str, dict[str, int]] = {
     "proxy/api/tasks/run_stream.py": {"text": 1, "done": 1},
     "proxy/core/events/task_producer.py": {"text": 1, "tool_start": 1, "tool_end": 1, "task_spawn": 1},
     "proxy/services/scheduler/runner.py": {"done": 1},
-    # The STT socket (``ws/audio.py``): its own protocol shares ``error``.
-    "proxy/ws/audio.py": {"error": 7},
+    # The TTS socket (``ws/audio.py``): its own protocol shares ``error``
+    # (the STT socket's errors spell ``wire.ERROR``).
+    "proxy/ws/audio.py": {"error": 3},
     # The satellite protocol's own ``error`` (the reconnect grace) and its
     # own ``pong`` (``core/remote/satellite_connection.py``).
     "proxy/core/remote/satellite_grace.py": {"error": 1},
@@ -107,7 +110,7 @@ def _typed_dict_literals(path: Path) -> Counter:
     counts: Counter = Counter()
     for node in ast.walk(tree):
         if isinstance(node, ast.Dict):
-            for k, v in zip(node.keys, node.values):
+            for k, v in zip(node.keys, node.values, strict=True):
                 if (isinstance(k, ast.Constant) and k.value == "type"
                         and isinstance(v, ast.Constant) and isinstance(v.value, str)):
                     counts[v.value] += 1
@@ -167,7 +170,7 @@ def _compare_operands(path: Path) -> Counter:
             for c in node.comparators:
                 add(c)
         elif isinstance(node, ast.Dict):
-            for k, v in zip(node.keys, node.values):
+            for k, v in zip(node.keys, node.values, strict=True):
                 if isinstance(k, ast.Constant) and k.value in ("type", "pump_type", "event_type"):
                     add(v)
     return counts
@@ -218,14 +221,20 @@ DASH_WORDS = (FRAME_NAMES - ARTIFACT_KINDS) | {
 KNOWN_TS_SITES: dict[str, dict[str, int]] = {
     # The render block kinds (``components/chat/types.ts``) share these words
     # with the wire; each file compares a MessageBlock's kind.
-    "dashboard/src/hooks/useChatStream.ts": {"text": 3, "thinking": 3, "system": 2, "question": 4,
-                                             "plan_review": 6, "tool": 2},
+    "dashboard/src/hooks/useChatStream.ts": {"question": 2, "plan_review": 3, "tool": 2},
+    # The chat stream's concern hooks (split from useChatStream.ts).
+    "dashboard/src/hooks/chatStream/useMeetingIdentity.ts": {"system": 1},
+    "dashboard/src/hooks/chatStream/useChatHistory.ts": {"text": 2, "system": 1},
+    "dashboard/src/hooks/chatStream/useTurnEnd.ts": {"text": 1},
+    "dashboard/src/hooks/chatStream/useStreamBlocks.ts": {"thinking": 1, "plan_review": 3, "question": 2},
     "dashboard/src/components/chat/ChatBlockRenderer.tsx": {"text": 1, "thinking": 1, "tool": 1, "question": 1,
                                                             "plan_review": 1, "system": 1,
                                                             "artifact_interaction": 1, "app_action": 1,
                                                             "metadata": 1},
     "dashboard/src/components/chat/ChatMessages.tsx": {"text": 2, "metadata": 4},
     "dashboard/src/components/chat/ActivityGroup.tsx": {"thinking": 1},
+    # The render kind `permission` (a waiting card's key there) has no
+    # mirror: its frame is `permission_prompt`, so no word here counts it.
     "dashboard/src/lib/activityGroups.ts": {"tool": 1, "thinking": 1},
     "dashboard/src/hooks/useChatMessages.ts": {"text": 1, "tool": 3},
     "dashboard/src/components/workspace/FilePreviewBody.tsx": {"text": 1},
@@ -241,7 +250,7 @@ KNOWN_TS_SITES: dict[str, dict[str, int]] = {
     "dashboard/src/audio/backends/platformStt.ts": {"error": 1},
     "dashboard/src/audio/backends/platformTts.ts": {"error": 1},
     # ``system`` as a theme and as an MCP instance scope.
-    "dashboard/src/contexts/ThemeContext.tsx": {"system": 3},
+    "dashboard/src/contexts/ThemeContext.tsx": {"system": 2},
     "dashboard/src/components/admin/McpInstanceManager.tsx": {"system": 7},
     "dashboard/src/pages/admin/PlatformPage.tsx": {"system": 1},
     # ``done`` / ``queued`` as an install, transfer, workflow or step state.
@@ -265,6 +274,9 @@ KNOWN_TS_SITES: dict[str, dict[str, int]] = {
 _TS_CASE = re.compile(r"\bcase\s+'([a-z_]+)'")
 _TS_EQ = re.compile(r"[!=]==?\s*'([a-z_]+)'|'([a-z_]+)'\s*[!=]==?")
 _TS_INCL = re.compile(r"\.(?:includes|has)\(\s*'([a-z_]+)'")
+# A quoted object key (a lookup keyed by kind): the same compare, out of the
+# other patterns' sight.
+_TS_KEY = re.compile(r"(?:^|[{,])\s*'([a-z_]+)'\s*:", re.M)
 
 
 def _ts_compares(path: Path) -> Counter:
@@ -277,7 +289,16 @@ def _ts_compares(path: Path) -> Counter:
         counts[m.group(1) or m.group(2)] += 1
     for m in _TS_INCL.finditer(text):
         counts[m.group(1)] += 1
+    for m in _TS_KEY.finditer(text):
+        counts[m.group(1)] += 1
     return counts
+
+
+def test_the_scan_counts_a_compare_by_lookup_key_too(tmp_path):
+    src = tmp_path / "lookup.ts"
+    src.write_text("const T = {\n  'question': f,\n  [WIRE.PLAN_REVIEW]: g, 'tool': h,\n}\n"
+                   "const x = ok ? 'thinking' : 'text'\n", encoding="utf-8")
+    assert _ts_compares(src) == {"question": 1, "tool": 1}
 
 
 def test_the_dashboard_compares_frame_names_only_through_the_mirror():

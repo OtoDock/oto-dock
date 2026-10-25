@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
@@ -35,8 +36,8 @@ class _FakeLayer:
 
 
 def _setup(monkeypatch, *, sessions, identities, connected, agents_by_machine):
-    import core.session.session_manager as sm
     import core.remote.satellite_connection as sc
+    import core.session.session_manager as sm
     import storage.files.sync_state_store as ss
     layer = _FakeLayer(sessions, identities)
     monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)

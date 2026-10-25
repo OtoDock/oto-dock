@@ -4,7 +4,7 @@
 // posts /v1/admin/release-check and replaces the cached answer.
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from '../../api/auth'
+import { apiJson, withMessage } from '../../lib/http/apiJson'
 
 export interface ReleaseNotice {
   enabled: boolean
@@ -29,9 +29,7 @@ export function useReleaseNotice(enabled: boolean) {
   return useQuery({
     queryKey: RELEASE_NOTICE_KEY,
     queryFn: async (): Promise<ReleaseNotice> => {
-      const res = await apiFetch('/v1/admin/release-notice')
-      if (!res.ok) throw new Error('Failed to fetch')
-      return res.json()
+      return apiJson<ReleaseNotice>('/v1/admin/release-notice').catch(withMessage('Failed to fetch'))
     },
     enabled,
     staleTime: 30 * 60_000,
@@ -43,9 +41,7 @@ export function useReleaseCheck() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (): Promise<ReleaseNotice> => {
-      const res = await apiFetch('/v1/admin/release-check', { method: 'POST' })
-      if (!res.ok) throw new Error('Failed')
-      return res.json()
+      return apiJson<ReleaseNotice>('/v1/admin/release-check', { method: 'POST' }).catch(withMessage('Failed'))
     },
     onSuccess: (data) => { qc.setQueryData(RELEASE_NOTICE_KEY, data) },
   })

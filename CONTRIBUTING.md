@@ -5,7 +5,7 @@ green tests, and explains where different kinds of contributions live.
 
 ## Where things go
 
-- **Platform code** (proxy, dashboard, satellite, phone
+- **Platform code** (proxy, dashboard, Android app, satellite, phone
   service, first-party MCPs, audio): this repo. [ARCHITECTURE.md](ARCHITECTURE.md)
   maps it, and [AGENTS.md](AGENTS.md) holds the instructions for coding agents
   (`CLAUDE.md` loads it).
@@ -111,13 +111,22 @@ cd dashboard && npm ci                            # once
 cd dashboard && npm run build && npx vitest run   # type-check + production build, then the unit tests
 ```
 
+**Android app** (the Capacitor shell in `dashboard/android/`, around the
+built dashboard). It needs JDK 21 and the Android SDK with `ANDROID_HOME`
+set. It needs no Firebase file and no signing values (the debug build runs
+without push notifications, and only release packaging is signed):
+
+```bash
+cd dashboard && npm run build && npx cap sync android && cd android && ./gradlew assembleDebug testDebugUnitTest
+```
+
 **Lint and types** (CI runs all three, and the required `proxy` check runs
 only ruff's import and dead-code rules):
 
 ```bash
 proxy/venv/bin/python -m pip install "ruff==0.15.22" "mypy==2.4.0"   # once, into the proxy's environment
 proxy/venv/bin/ruff check .   # the whole tree
-cd proxy && venv/bin/mypy     # the packages listed in proxy/mypy.ini
+cd proxy && venv/bin/mypy     # the whole proxy (proxy/mypy.ini)
 cd dashboard && npm run lint  # ESLint
 ```
 
@@ -136,16 +145,50 @@ cd dashboard && npm run lint  # ESLint
   release).
 - Behavior changes come with tests in the same PR. The proxy suite is fast
   and parallel, so there's no reason to skip it.
-- Lint and types ratchet. ruff, ESLint and mypy each froze the findings the
-  code had when they were adopted (`ruff-baseline.toml`,
-  `dashboard/eslint-suppressions.json`, the `files` list in
-  `proxy/mypy.ini`), so a NEW finding fails. Fix it rather than suppress it,
-  and never add to those files by hand. When you fix an old ESLint finding,
-  run `npx eslint src --prune-suppressions` in `dashboard/`. A package whose
-  mypy errors are all fixed may join the list.
-- A task the proxy starts without keeping a reference goes through
-  `core.background.spawn(coro, name=..., owner=...)`, never a bare
-  `asyncio.create_task(...)` (a test refuses one).
+- Lint and types ratchet. ruff froze the findings the code had when it
+  was adopted (`ruff-baseline.toml`). ESLint's frozen findings are all fixed
+  (`dashboard/eslint-suppressions.json` is empty), and mypy checks the whole
+  proxy with none left (`proxy/mypy.ini`), so a NEW finding fails. Fix it
+  rather than suppress it, and never add to those files by hand. A
+  `# type: ignore[<code>]  # <reason>` is only for a library's typing gap.
+- The dashboard writes to the console only through `src/lib/debug/log.ts`:
+  `debugLog` / `debugWarn` for a breadcrumb (printed in a development build
+  or with `?debug=1`), `logError` for a failure that must never pass unseen.
+  ESLint refuses `console.*` anywhere else.
+- Dashboard hooks pass the React compiler's lint rules without a new
+  `eslint-disable`: a latest-value ref is written in `useLayoutEffect`,
+  never in render or inside a state updater; a callback an effect
+  registers once is a `useEffectEvent`; state derived from a prop or reset
+  on a key change is adjusted in render (keep the source in state and set
+  both when it changes), not in an effect; a value from outside React (an
+  element's box, a media query) is a `useSyncExternalStore` store; and a
+  hook's unstable return object is destructured, its members listed in
+  dependency arrays, never the object.
+- A dashboard API call goes through `apiJson` / `apiOk`
+  (`src/lib/http/apiJson.ts`): the body, or an `ApiError` whose message is
+  the server's sentence; `withMessage` / `withFallback` word a refusal,
+  `errorText(e)` reads a caught value. Raw `apiFetch` with `if (!res.ok)`
+  stays only where the refusal is read another way (a raw body, a custom
+  error class, a status branch) or before a session exists.
+- Python logs with lazy arguments (`logger.info("Saved %s", path)`, never an
+  f-string) and `logger.exception(...)` inside an `except`; a `raise` inside
+  an `except` names its cause (`raise X(...) from exc`); `zip()` states
+  `strict=`. ruff's import sort keeps `from x import a as b, c` on one
+  statement; an import block whose order matters is held with
+  `# isort: split` and a one-line reason.
+- A task the proxy, the satellite or the phone daemon starts without
+  keeping a reference goes through that tree's
+  `background.spawn(coro, name=..., owner=...)` (`proxy/core/background.py`,
+  `satellite/background.py`, `phone/background.py`), never a bare
+  `asyncio.create_task(...)` (ruff's `RUF006` and a proxy test refuse one).
+- An `except` names what its body raises. A broad `except Exception`
+  stays only at a boundary (a task's last line, a handler that must
+  answer, a cleanup, a best-effort step, an SDK with no error set, a
+  thread target) and says why on its line:
+  `except Exception:  # noqa: BLE001  # <reason>`. In an `async def`, a
+  call that blocks goes through `asyncio.to_thread`, a cheap or bounded
+  one keeps `# noqa: ASYNC2xx  # <reason>`, and a sleep loop that
+  something can wake waits on an `asyncio.Event`.
 - The proxy's layers point down: `storage` imports nothing above it, and
   `core` and `services` never import `api` or `ws`
   (`proxy/tests/core/test_import_layers.py`).
@@ -164,8 +207,8 @@ cd dashboard && npm run lint  # ESLint
 - Keep PRs focused: one concern per PR reviews quickly.
 - CI runs automatically on every PR. The `proxy` (with the audio suite),
   `dashboard`, `satellite` and `phone` checks must be green: merging is
-  blocked until they are. Lint and types and the security scans report
-  on the PR without blocking it, and a maintainer
+  blocked until they are. Lint and types, the Android build and the
+  security scans report on the PR without blocking it, and a maintainer
   reads them too.
 - If you're planning something large, open an issue first so we can agree on
   the shape before you invest the time.

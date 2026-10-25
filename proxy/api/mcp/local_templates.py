@@ -32,11 +32,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import UserContext, get_current_user, require_user
+from api._guards import require_creator_or_admin
 from auth import roles
+from auth.providers import UserContext, get_current_user, require_auth, require_user
 
 logger = logging.getLogger("otodock.local-templates")
 router = APIRouter(dependencies=[Depends(require_user)])
@@ -57,14 +59,7 @@ class InstallLocalTemplateBody(BaseModel):
     target_slug: str | None = None
 
 
-def _require_creator_or_admin(user: UserContext | None) -> UserContext:
-    if not user:
-        raise HTTPException(403, "Authentication required")
-    if not roles.is_creator_or_above(user.role):
-        raise HTTPException(
-            403, "Creating agents requires a platform creator or admin account",
-        )
-    return user
+_CREATOR_DETAIL = "Creating agents requires a platform creator or admin account"
 
 
 @dataclass(frozen=True)
@@ -96,9 +91,9 @@ def _resolve_template_dir(user: UserContext, raw_path: str) -> _Folder:
             "signed-in user",
         )
 
+    from auth.path_policy import check_host_path_access, enforce_agent_tree_rbac
     from core.session import session_state
     from services import path_policy_v2
-    from auth.path_policy import check_host_path_access, enforce_agent_tree_rbac
 
     ctx = session_state.get_session_security(user.session_id)
     if ctx is None:
@@ -201,8 +196,8 @@ def _plan_remote_snapshot(
             continue
         try:
             name_bytes = [len(part.encode()) for part in parts]
-        except UnicodeEncodeError:
-            raise _MachineRefused(path)
+        except UnicodeEncodeError as exc:
+            raise _MachineRefused(path) from exc
         if max(name_bytes) > _MAX_NAME_BYTES:
             raise HTTPException(
                 400,
@@ -317,9 +312,10 @@ async def _pull_remote_snapshot(
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                raise HTTPException(
-                    400, f"{_clip(inner)} cannot be stored here: {exc.strerror or exc}",
-                )
+                logger.warning("A template file could not be stored: %s", exc)
+                reason = ("The name is too long." if exc.errno == errno.ENAMETOOLONG
+                          else "The server log has the details.")
+                raise HTTPException(400, f"{_clip(inner)} cannot be stored here. {reason}") from exc
             if not await remote_file_flow.pull_into(
                     session_id, path, target, agent=folder.agent, max_bytes=cap):
                 raise await _failed_pull(session_id, folder, path, inner, cap, what)
@@ -341,7 +337,7 @@ async def _pull_remote_snapshot(
             if task.done():
                 task.result()
         return dest
-    except BaseException:
+    except BaseException as err:
         for task in tasks:
             task.cancel()
         # Every worker ends before the rmtree, even when the caller is
@@ -357,7 +353,7 @@ async def _pull_remote_snapshot(
                 task.exception()
         shutil.rmtree(dest, ignore_errors=True)
         if interrupted:
-            raise asyncio.CancelledError
+            raise asyncio.CancelledError from err
         raise
 
 
@@ -395,15 +391,15 @@ async def _snapshot_folder(
                             400,
                             f"The machine listed an invalid path in the {what} folder: "
                             f"{_clip(repr(inner))}",
-                        )
+                        ) from exc
                     return await _pull_remote_snapshot(session_id, folder, files, what)
-        except TimeoutError:
+        except TimeoutError as err:
             machine = await remote_source_label(session_id)
             raise HTTPException(
                 503,
                 f"Reading the {what} folder from {machine} took too long, "
                 "retry in a moment",
-            )
+            ) from err
         machine = await remote_source_label(session_id)
         if entries is None:
             raise _held_elsewhere(session_id, folder, machine) or HTTPException(
@@ -484,8 +480,8 @@ def _snapshot_template_dir(
                         raise HTTPException(
                             400,
                             f"Symlinks are not allowed in a {what} folder: {rel}",
-                        )
-                    raise HTTPException(400, f"{rel} cannot be read")
+                        ) from e
+                    raise HTTPException(400, f"{rel} cannot be read") from e
                 try:
                     st = os.fstat(fd)
                     if not stat.S_ISREG(st.st_mode):
@@ -535,8 +531,7 @@ def _require_package_author(user: UserContext | None) -> UserContext:
     session's agent: the audience of the authoring skill (``mcps-mcp``
     lists its check tool for the same tier). The path resolver below needs
     the session either way."""
-    if not user:
-        raise HTTPException(403, "Authentication required")
+    user = require_auth(user)
     if not user.session_id or not user.acting_sub or not user.agent:
         raise HTTPException(
             403,
@@ -623,7 +618,7 @@ async def _load_snapshot(user: UserContext, raw_path: str):
 
     The caller owns the snapshot dir and must delete it.
     """
-    from storage.agents.community_agent_template_store import (
+    from services.community.community_agent_template_store import (
         TemplateValidationError,
         load_template_from_dir,
     )
@@ -636,8 +631,9 @@ async def _load_snapshot(user: UserContext, raw_path: str):
         shutil.rmtree(snapshot, ignore_errors=True)
         # The parser names files by their snapshot path; the author knows
         # them by their place in the folder.
-        message = str(exc).replace(f"{snapshot}{os.sep}", "")
-        raise HTTPException(400, detail={"error": "invalid_template", "message": message})
+        problems = [p.replace(f"{snapshot}{os.sep}", "") for p in exc.problems]
+        raise HTTPException(400, detail={"error": "invalid_template", "message": "; ".join(problems),
+                                         "problems": problems}) from exc
     except Exception:
         shutil.rmtree(snapshot, ignore_errors=True)
         raise
@@ -658,10 +654,10 @@ async def local_template_building_blocks(
     definitions and env templates that have no business in an agent's
     context.
     """
-    _require_creator_or_admin(user)
+    require_creator_or_admin(user, detail=_CREATOR_DETAIL)
+    from services.community import community_catalog
     from services.mcp import mcp_registry
     from services.mcp.mcp_registry import _first_sentence
-    from services.community import community_catalog
     from storage.agents import agent_store
 
     mcps: list[dict] = []
@@ -697,7 +693,7 @@ async def local_template_building_blocks(
                 "installed": False,
                 "skills": [],
             })
-    except Exception as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError) as exc:
         # Detail goes to the log only — exception text can carry paths/URLs
         # the response has no business echoing.
         catalog_error = "community MCP catalog unreachable"
@@ -705,6 +701,10 @@ async def local_template_building_blocks(
 
     try:
         skills_registry = await community_catalog.fetch_skills_registry()
+        # The fetch answers an empty catalog flagged unreachable rather than
+        # raising when it has no cached copy either.
+        if skills_registry.get("catalog_unreachable") and not catalog_error:
+            catalog_error = "community skills catalog unreachable"
         for entry in skills_registry.get("skills", []):
             name = entry.get("name") or ""
             if not name or name in installed_names:
@@ -717,7 +717,7 @@ async def local_template_building_blocks(
                 "installed": False,
                 "skills": [],
             })
-    except Exception as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError) as exc:
         if not catalog_error:
             catalog_error = "community skills catalog unreachable"
         logger.warning("building-blocks: skills catalog unreachable: %s", exc)
@@ -728,7 +728,8 @@ async def local_template_building_blocks(
         "skill_packages": sorted(
             skill_packages, key=lambda s: (not s["installed"], s["name"]),
         ),
-        "agent_slugs": sorted(slugs),
+        # The reserved ones too: a template naming one cannot be installed.
+        "agent_slugs": sorted({*slugs, *agent_store.RESERVED_AGENT_SLUGS}),
         "check_examples": await asyncio.to_thread(_check_examples),
         "catalog_error": catalog_error,
     }
@@ -773,7 +774,7 @@ async def validate_local_template(
     self-corrects from them); 4xx is reserved for authorization and path
     problems, which the agent cannot fix by editing files.
     """
-    u = _require_creator_or_admin(user)
+    u = require_creator_or_admin(user, detail=_CREATOR_DETAIL)
     from services.community import community_agent_installer as installer
     from storage.agents import agent_store
 
@@ -782,19 +783,19 @@ async def validate_local_template(
     except HTTPException as exc:
         detail = exc.detail
         if isinstance(detail, dict) and detail.get("error") == "invalid_template":
-            return {"ok": False, "errors": [detail["message"]]}
+            return {"ok": False, "errors": detail.get("problems") or [detail["message"]]}
         raise
 
     try:
         errors: list[str] = []
-        mcp_plan = {"ready": [], "needs_install": [], "needs_admin_request": []}
-        skill_plan = {"ready": [], "missing": [], "admin_required": []}
+        mcp_plan: dict[str, list[str]] = {"ready": [], "needs_install": [], "needs_admin_request": []}
+        skill_plan: dict[str, list[str]] = {"ready": [], "missing": [], "admin_required": []}
 
         try:
             await installer._preflight_check_mcps(template.mcps)
         except HTTPException as exc:
             detail = exc.detail
-            missing = detail.get("missing", []) if isinstance(detail, dict) else []
+            missing: list = detail.get("missing", []) if isinstance(detail, dict) else []
             errors.append(
                 "These MCPs are not installed and not in any catalog: "
                 + ", ".join(str(m) for m in missing),
@@ -817,7 +818,7 @@ async def validate_local_template(
         except HTTPException as exc:
             detail = exc.detail
             kind = detail.get("error") if isinstance(detail, dict) else ""
-            names = detail.get("missing", []) if isinstance(detail, dict) else []
+            names: list = detail.get("missing", []) if isinstance(detail, dict) else []
             if kind == "skills_require_admin":
                 skill_plan["admin_required"] = [str(n) for n in names]
                 errors.append(
@@ -836,9 +837,8 @@ async def validate_local_template(
         errors.extend(await asyncio.to_thread(_validate_apps, template))
 
         slug = agent_store.sanitize_slug(template.slug)
-        slug_available = bool(slug) and not await asyncio.to_thread(
-            agent_store.agent_exists, slug,
-        )
+        slug_available = bool(slug) and agent_store.reserved_slug_refusal(slug) is None \
+            and not await asyncio.to_thread(agent_store.agent_exists, slug)
         suggested = ""
         if slug and not slug_available:
             suggested = await asyncio.to_thread(installer._propose_free_slug, slug)
@@ -888,7 +888,7 @@ async def install_from_local_template(
     installed inline; creators get the admin-approval request queue — the
     same split the catalog install path uses.
     """
-    u = _require_creator_or_admin(user)
+    u = require_creator_or_admin(user, detail=_CREATOR_DETAIL)
     from services.community import community_agent_installer
 
     template, snapshot = await _load_snapshot(u, body.path)

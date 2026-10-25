@@ -132,7 +132,7 @@ async def handle_render(request: Request) -> JSONResponse:
         except asyncio.TimeoutError:
             return JSONResponse({"reason": f"the render did not finish in {timeout_s + 20}s"},
                                 status_code=504)
-        except Exception as e:  # noqa: BLE001 — the reason is the answer
+        except Exception as e:  # noqa: BLE001  # the reason is the answer
             logger.warning("render of %s failed: %s", path, e)
             return JSONResponse({"reason": f"the browser failed: {type(e).__name__}"},
                                 status_code=500)
@@ -157,7 +157,7 @@ async def _state(page, frame) -> tuple[bool, str]:
         banner = await page.evaluate(
             "() => { const b = document.querySelector('[data-testid=\"app-server-banner\"]');"
             " return b ? b.textContent : ''; }")
-    except Exception:  # noqa: BLE001 — a navigating frame throws mid-evaluate
+    except Exception:  # noqa: BLE001  # a navigating frame throws mid-evaluate
         return False, ""
     return tok == 1, (banner or "").strip()
 
@@ -173,7 +173,7 @@ async def _capture(page, width: int, height: int, tag: str, frame=None) -> dict:
     box = None
     try:
         box = await frame_el.bounding_box()
-    except Exception:  # noqa: BLE001 — no frame yet
+    except Exception:  # noqa: BLE001  # no frame yet
         box = None
     clip = None
     if box and box["width"] > 0 and box["height"] > 0:
@@ -210,7 +210,7 @@ async def _render(url: str, cookie: str, widths: list[int], timeout_s: int, sett
     def in_app(frame) -> bool:
         try:
             return "/v1/apps/" in frame.url
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001  # a frame playwright has detached raises its own errors
             return False
 
     async with async_playwright() as p:
@@ -288,7 +288,7 @@ async def _render(url: str, cookie: str, widths: list[int], timeout_s: int, sett
                         second)
                     await asyncio.sleep(0.6)
                     pages.append(await _capture(page, widths[-1], HEIGHT_BY_WIDTH.get(widths[-1], DEFAULT_HEIGHT), second, frame))
-                except Exception:  # noqa: BLE001 — a second theme is a bonus
+                except Exception:  # noqa: BLE001  # a second theme is a bonus
                     pass
             return {"ready": ready, "frame": frame is not None, "banner": banner,
                     "console": console[:50], "errors": errors[:20], "failed_requests": failed[:50],

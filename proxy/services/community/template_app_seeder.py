@@ -29,20 +29,22 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import config
-from services.apps import app_deploy
-from storage import database as task_store
-from storage.agents import agent_store, template_sig
-from storage.agents.community_agent_template_store import (
+from auth import roles
+from core import layout
+from services.apps import app_deploy, app_lint
+from services.community import template_sig
+from services.community.community_agent_template_store import (
     AppItem,
     CommunityAgentTemplate,
     TemplateValidationError,
     available_visibilities,
     load_template_from_dict,
 )
-from auth import roles
-from core import layout
+from storage import database as task_store
+from storage.agents import agent_store
 
 logger = logging.getLogger("otodock.community-agent-installer")
 
@@ -144,6 +146,13 @@ def _blueprint(folder: Path) -> dict:
     return doc if isinstance(doc, dict) else {}
 
 
+def _refusal_reason(res: dict) -> str:
+    """The sentences that refused the seed: the fail rows only, since the
+    warnings (words, colours, a brand) would bury the one key that did."""
+    return "; ".join(f.get("message", "") for f in res.get("findings") or []
+                     if f.get("severity") == app_lint.FAIL) or "refused"
+
+
 def _blueprint_tasks(folder: Path) -> list[dict]:
     return list(_blueprint(folder).get("tasks") or [])
 
@@ -190,7 +199,7 @@ def preview_shape(app_json: dict, visibility: str, blueprint: dict | None) -> di
     manifest's blocks through the same parsers a stored row goes through,
     a ``fire_task`` button's task named from the blueprint. Nothing is
     approved, nothing is stored."""
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     from storage.db_apps import MANIFEST_BLOCKS
     pseudo = {name: (json.dumps(app_json.get(name)) if app_json.get(name) not in (None, "", [], {}) else "")
               for name in (*MANIFEST_BLOCKS, "requires")}
@@ -285,7 +294,7 @@ def admits(item: AppItem, entry: dict | None, agent: str, username: str,
     """Whose consent approves this copy: ``(sub, "")``, or ``("", why
     not)``. A per-user copy that does things only its owner may approve
     is admitted only when the consenting person IS the owner."""
-    from api.apps.manifest import sub_can_approve_surface
+    from services.apps.manifest import sub_can_approve_surface
     if entry is None:
         return "", "no consent was given for this app"
     by = str(entry.get("by") or "")
@@ -313,7 +322,7 @@ def copy_matches(item: AppItem, folder: Path) -> bool:
             blueprint = {}
         tree = template_sig.tree_sha(folder, [rel for rel, _path in releases.walk_tree(folder)])
         sig = template_sig.template_app_sig(doc, blueprint or None, tree)
-    except Exception:  # noqa: BLE001 — anything unreadable is not the consented copy
+    except Exception:  # noqa: BLE001  # anything unreadable is not the consented copy
         return False
     return bool(item.sig) and sig == item.sig
 
@@ -348,8 +357,7 @@ async def seed_shared(agent: str, template: CommunityAgentTemplate, data: dict) 
                 continue
             status = str(res.get("status") or "")
             if status == app_deploy.RESULT_REFUSED:
-                out["failed"].append({"slug": item.slug, "reason": "; ".join(
-                    f.get("message", "") for f in res.get("findings") or []) or "refused"})
+                out["failed"].append({"slug": item.slug, "reason": _refusal_reason(res)})
             elif status == app_deploy.RESULT_PENDING_APPROVAL:
                 out["pending"].append({"slug": item.slug,
                                        "reason": why or res.get("consent_refused") or res.get("waiting") or ""})
@@ -492,7 +500,7 @@ async def seed_user_copy(agent: str, owner_sub: str, slug: str, *,
             return "failed", reason
     status = str(res.get("status") or "")
     if status == app_deploy.RESULT_REFUSED:
-        reason = "; ".join(f.get("message", "") for f in res.get("findings") or []) or "refused"
+        reason = _refusal_reason(res)
         await _notify_failed(agent, owner_sub, item, reason)
         return "failed", reason
     _failure_told.pop((agent, owner_sub, slug), None)
@@ -524,9 +532,9 @@ async def restore(row: dict) -> dict:
         # The import's upsert clears the state and unhides the row itself;
         # an import that fails leaves the opt-out as it was.
         res = await app_blueprints.import_folder(
-            agent, username, row.get("owner_sub"), slug, source, template_slug=template.slug,
+            agent, username, row.get("owner_sub"), slug, source, template_slug=cast("CommunityAgentTemplate", template).slug,
             tasks=_blueprint_tasks(source), cold=True, approve_as=by,
-            template_ref=row.get("template_ref") or template_ref(template.slug, slug),
+            template_ref=row.get("template_ref") or template_ref(cast("CommunityAgentTemplate", template).slug, slug),
             triggers=_blueprint_triggers(source))
     if res.get("app_id"):
         await asyncio.to_thread(resume_copy_triggers, str(res["app_id"]))

@@ -32,7 +32,7 @@ export default function NotificationBody({ body, clampClass = 'line-clamp-2' }: 
     <div>
       <p
         ref={ref}
-        className={`text-xs text-p-text-secondary mt-0.5 break-words ${expanded ? '' : clampClass}`}
+        className={`text-xs text-secondary mt-0.5 break-words ${expanded ? '' : clampClass}`}
       >
         {parts.map((p, i) =>
           'url' in p ? (
@@ -42,7 +42,7 @@ export default function NotificationBody({ body, clampClass = 'line-clamp-2' }: 
               target="_blank"
               rel="noopener noreferrer"
               onClick={(e) => e.stopPropagation()}
-              className="text-brand underline break-all hover:text-brand-hover"
+              className="text-link underline break-all hover:text-link-hover"
             >
               {p.url}
             </a>
@@ -54,7 +54,7 @@ export default function NotificationBody({ body, clampClass = 'line-clamp-2' }: 
       {(overflowing || expanded) && (
         <button
           onClick={(e) => { e.stopPropagation(); setExpanded((v) => !v) }}
-          className="mt-0.5 text-[10px] font-medium text-brand hover:text-brand-hover"
+          className="mt-0.5 text-3xs font-medium text-link hover:text-link-hover"
         >
           {expanded ? 'Show less' : 'Show more'}
         </button>

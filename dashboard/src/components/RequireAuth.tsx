@@ -7,6 +7,7 @@ import { useOpenAppToast } from '../hooks/useOpenAppToast'
 import WakeDiagBadge from './WakeDiagBadge'
 import LoginPage from '../pages/LoginPage'
 import SetupWizard from '../pages/SetupWizard'
+import Button from './ui/Button'
 
 export default function RequireAuth() {
   const { user, loading, authConfig, loginError, login } = useAuth()
@@ -30,10 +31,13 @@ export default function RequireAuth() {
   // not handle itself becomes a notice with an Open button, route-independent.
   const openAppToast = useOpenAppToast(navigate, !!user)
 
+  // The boot screen stays over the placeholders (data-boot-wait) and leaves
+  // at the first real screen: the wizard, the login page, the redirect
+  // notice or the page itself (lib/device/boot.ts watches the root).
   if (loading) {
     return (
-      <div className="flex items-center justify-center min-h-screen bg-p-bg">
-        <p className="text-sm text-p-text-secondary">Loading...</p>
+      <div className="flex items-center justify-center min-h-screen bg-surface-page" data-boot-wait="">
+        <p className="text-sm text-secondary">Loading...</p>
       </div>
     )
   }
@@ -50,22 +54,16 @@ export default function RequireAuth() {
     if (authConfig?.auth_provider_bypass && authConfig?.oidc_enabled) {
       if (loginError) {
         return (
-          <div className="flex flex-col items-center justify-center gap-3 min-h-screen bg-p-bg px-4 text-center">
-            <p role="alert" className="text-sm text-p-accent-red max-w-md">{loginError}</p>
-            <button
-              type="button"
-              onClick={() => window.location.reload()}
-              className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text hover:bg-p-surface"
-            >
-              Try again
-            </button>
+          <div className="flex flex-col items-center justify-center gap-3 min-h-screen bg-surface-page px-4 text-center">
+            <p role="alert" className="text-sm text-status-danger-fg max-w-md">{loginError}</p>
+            <Button size="sm" onClick={() => window.location.reload()}>Try again</Button>
           </div>
         )
       }
       login()
       return (
-        <div className="flex items-center justify-center min-h-screen bg-p-bg">
-          <p className="text-sm text-p-text-secondary">Redirecting to login...</p>
+        <div className="flex items-center justify-center min-h-screen bg-surface-page">
+          <p className="text-sm text-secondary">Redirecting to login...</p>
         </div>
       )
     }
@@ -77,8 +75,8 @@ export default function RequireAuth() {
 
     // Fallback while config loads
     return (
-      <div className="flex items-center justify-center min-h-screen bg-p-bg">
-        <p className="text-sm text-p-text-secondary">Loading...</p>
+      <div className="flex items-center justify-center min-h-screen bg-surface-page" data-boot-wait="">
+        <p className="text-sm text-secondary">Loading...</p>
       </div>
     )
   }

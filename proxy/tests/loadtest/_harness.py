@@ -337,9 +337,10 @@ def summary_line(rec: dict) -> str:
 def run_info() -> dict:
     """What a run measured: the code, the runtime, the knobs, the database's
     durability settings."""
-    import config
     import uvicorn
     import uvloop
+
+    import config
 
     try:
         commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=HERE,
@@ -412,8 +413,8 @@ async def production_loop(log_dir: Path):
     import startup
     from adapters import register_adapter
     from adapters.dashboard import DashboardAdapter
-    from api.apps import catalog
     from core import concurrency, loop_watchdog
+    from services.apps import catalog
     from services.checks import evaluator
     from services.mcp import mcp_registry
     from storage import pg
@@ -598,9 +599,9 @@ def calibrate() -> dict:
         await asyncio.sleep(0.2)
         blocked = Ticker().start()
         await asyncio.sleep(0.3)
-        time.sleep(0.03)
+        time.sleep(0.03)  # noqa: ASYNC251  # the deliberate loop block the watchdog calibration measures
         await asyncio.sleep(0.3)
-        time.sleep(0.4)
+        time.sleep(0.4)  # noqa: ASYNC251  # the deliberate loop block the watchdog calibration measures
         await asyncio.sleep(0.3)
         await blocked.stop()
         await asyncio.sleep(0.1)

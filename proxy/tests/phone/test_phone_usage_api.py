@@ -83,3 +83,48 @@ def test_empty_model_defaults_to_gpt_oss(client):
     )
     assert r.status_code == 200 and r.json()["recorded"] is True
     assert _rows()[0]["model"] == "openai/gpt-oss-120b"
+
+
+# ── A call's second listen (POST /v1/phone/usage/relisten) ──────────
+
+def _relisten_rows():
+    from storage.pg import get_conn
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT user_sub, agent, scope, source_type, source_id, provider, audio_seconds, cost_usd "
+            "FROM usage_records WHERE source_type = 'phone-stt-relisten'"
+        ).fetchall()
+
+
+def test_a_calls_second_listen_is_a_usage_row_of_its_own(client):
+    r = client.post(
+        "/v1/phone/usage/relisten", headers=_auth(),
+        json={"agent": "personal-assistant", "provider": "deepgram", "seconds": 12.5, "session_id": "sess-2"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["recorded"] is True
+    rows = _relisten_rows()
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["user_sub"], row["agent"], row["scope"]) == ("phone", "personal-assistant", "agent")
+    assert row["provider"] == "deepgram" and row["source_id"] == "sess-2"
+    assert row["audio_seconds"] == pytest.approx(12.5) and row["cost_usd"] > 0
+
+
+def test_a_second_listen_report_needs_the_key_and_a_known_provider(client):
+    assert client.post("/v1/phone/usage/relisten",
+                       json={"provider": "deepgram", "seconds": 3}).status_code == 401
+    r = client.post("/v1/phone/usage/relisten", headers=_auth(),
+                    json={"provider": "no-such-stt", "seconds": 3})
+    assert r.status_code == 200 and r.json()["recorded"] is False
+    r = client.post("/v1/phone/usage/relisten", headers=_auth(), json={"provider": "deepgram", "seconds": 0})
+    assert r.json()["recorded"] is False
+    assert _relisten_rows() == []
+
+
+def test_the_second_listen_report_is_on_the_service_key_allowlist():
+    """The daemon calls it with the master key: the service-key confinement
+    lets only listed paths through, method-scoped."""
+    from auth.service_endpoints import is_service_endpoint_allowed
+    assert is_service_endpoint_allowed("POST", "/v1/phone/usage/relisten")
+    assert not is_service_endpoint_allowed("GET", "/v1/phone/usage/relisten")

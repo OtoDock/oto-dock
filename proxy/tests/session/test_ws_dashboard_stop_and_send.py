@@ -16,9 +16,10 @@ button and phone barge-in exercise daily) runs exactly as deployed.
 import asyncio
 import json
 
-import pytest  # noqa: F401  (temp_db / monkeypatch fixtures)
+import pytest
 
-from core.events.common_events import CommonEvent, TEXT, DONE
+import ws.dashboard  # noqa: F401  (resolves the dashboard↔dashboard_chat cycle)
+from core.events.common_events import DONE, TEXT, CommonEvent
 from storage import database as task_store
 from tests.fixtures.ws_dashboard_harness import (
     ANY,
@@ -32,8 +33,6 @@ from tests.fixtures.ws_dashboard_harness import (
     stub_dashboard_seams,
     warm_new_chat,
 )
-
-import ws.dashboard  # noqa: F401  (resolves the dashboard↔dashboard_chat cycle)
 from ws.dashboard_chat import _STOP_AND_SEND_NOTE
 
 
@@ -190,12 +189,12 @@ class TestStopAndSend:
 # The viewer loop is event-driven (no fixed receive wait per frame)
 # ---------------------------------------------------------------------------
 
-import collections  # noqa: E402
-import time  # noqa: E402
+import collections
+import time
 
-from core.events import stream_pump  # noqa: E402
-from core.events.common_events import PRODUCER_DONE  # noqa: E402
-from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket  # noqa: E402
+from core.events import stream_pump
+from core.events.common_events import PRODUCER_DONE
+from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket
 
 
 class _TimedWebSocket(FakeDashboardWebSocket):
@@ -209,7 +208,7 @@ class _TimedWebSocket(FakeDashboardWebSocket):
 
 
 def _viewer(ws, chat_id: str, sid: str):
-    from services.notifications.notification_manager import LiveQueue
+    from services.notifications.notification_manager import LiveQueue, NotifyQueue
     from ws.dashboard import DashboardConnection
     conn = DashboardConnection.__new__(DashboardConnection)
     conn.websocket = ws
@@ -217,6 +216,7 @@ def _viewer(ws, chat_id: str, sid: str):
     conn.session_id = sid
     conn.streaming = False
     conn.live_queue = LiveQueue()
+    conn.notify_queue = NotifyQueue()
     conn._send_lock = asyncio.Lock()
     conn._client_pushback = collections.deque()
     conn._ended = asyncio.Event()
@@ -288,7 +288,7 @@ async def test_a_client_message_is_read_while_a_backlog_is_pending(temp_db):
     conn = _viewer(ws, "vw2", pump.session_id)
     try:
         loop_task = asyncio.create_task(conn._stream_via_pump(pump))
-        while not pump._ws_queues:
+        while not pump._ws_queues:  # noqa: ASYNC110  # the pump's viewer queues: the pump has no attach event
             await asyncio.sleep(0)
         for i in range(1000):
             pump.push_ws_event({"type": "system", "subtype": f"n{i}"})
@@ -303,18 +303,22 @@ async def test_a_client_message_is_read_while_a_backlog_is_pending(temp_db):
 
 
 @pytest.mark.asyncio
-async def test_a_pushed_documents_token_reaches_only_the_pushing_persons_sockets(temp_db):
+@pytest.mark.parametrize("turn_person", ["user-a", "user-b"])
+async def test_a_pushed_documents_token_reaches_only_its_own_persons_sockets(temp_db, turn_person):
     """One pump, two people viewing the chat: the live document_preview
     frame (and the live_state snapshot a mid-turn attach gets) carries the
-    WOPI token to the connection of the person the turn runs as only."""
+    WOPI token to the connection of the person it was minted for only,
+    whoever the pump's turn runs as now (a push queued for A that the
+    chat's next turn, B's, forwards stays A's). The person field reaches
+    no connection."""
     from core.session.session_state import _chat_streaming_state
     doc = {"type": "document_preview", "wopi_url": "https://c/x", "access_token": "tok",
-           "access_token_ttl": 123, "filename": "x.docx", "file_id": "fid",
-           "download_url": "/v1/media/d"}
+           "access_token_ttl": 123, "token_person": "user-a", "filename": "x.docx",
+           "file_id": "fid", "download_url": "/v1/media/d"}
     pump = _pump("vw-doc", [])
     pump.producer.cancel()
     pump.producer = asyncio.get_event_loop().create_task(asyncio.sleep(3600))
-    pump.wake_person = "user-a"
+    pump.wake_person = turn_person
     _chat_streaming_state["vw-doc"] = {"streaming": True, "live_blocks": [dict(doc)]}
     viewers = {}
     for person in ("user-a", "user-b"):
@@ -324,11 +328,11 @@ async def test_a_pushed_documents_token_reaches_only_the_pushing_persons_sockets
         viewers[person] = (ws, conn)
     try:
         loops = [asyncio.create_task(conn._stream_via_pump(pump)) for _ws, conn in viewers.values()]
-        while len(pump._ws_queues) < 2:
+        while len(pump._ws_queues) < 2:  # noqa: ASYNC110  # the pump's viewer queues: the pump has no attach event
             await asyncio.sleep(0)
         assert pump.push_ws_event(dict(doc))
         for ws, _conn in viewers.values():
-            while not any(d.get("type") == "document_preview" for d in ws.sent):
+            while not any(d.get("type") == "document_preview" for d in ws.sent):  # noqa: ASYNC110  # a fake socket's sent frames: the fake has no event
                 await asyncio.sleep(0)
             ws.client_send({"type": "resume_chat", "chat_id": "elsewhere"})
         await asyncio.wait_for(asyncio.gather(*loops), timeout=5)
@@ -338,6 +342,7 @@ async def test_a_pushed_documents_token_reaches_only_the_pushing_persons_sockets
             snapshot = next(d for d in frames if d.get("type") == "live_state")["live_blocks"][0]
             for frame in (pushed, snapshot):
                 assert frame["file_id"] == "fid" and frame["wopi_url"] == "https://c/x"
+                assert "token_person" not in frame
                 if person == "user-a":
                     assert (frame["access_token"], frame["access_token_ttl"]) == ("tok", 123)
                 else:
@@ -350,13 +355,16 @@ async def test_a_pushed_documents_token_reaches_only_the_pushing_persons_sockets
         pump.producer.cancel()
 
 
-def test_no_known_pusher_keeps_the_token_from_every_viewer():
+def test_a_token_with_no_person_reaches_no_viewer():
     from core.events import artifact_events
     frame = {"type": "document_preview", "access_token": "tok", "access_token_ttl": 1}
-    assert artifact_events.for_viewer(frame, "", "") == {"type": "document_preview"}
-    assert artifact_events.for_viewer(frame, "user-a", "user-a") is frame
+    assert artifact_events.for_viewer(frame, "") == {"type": "document_preview"}
+    assert artifact_events.for_viewer(frame, "user-a") == {"type": "document_preview"}
+    named = {**frame, "token_person": "user-a"}
+    assert artifact_events.for_viewer(named, "user-a") == frame
+    assert artifact_events.for_viewer(named, "user-b") == {"type": "document_preview"}
     plain = {"type": "text", "content": "hi"}
-    assert artifact_events.for_viewer(plain, "", "user-b") is plain
+    assert artifact_events.for_viewer(plain, "user-b") is plain
 
 
 @pytest.mark.asyncio
@@ -368,7 +376,7 @@ async def test_a_resync_marker_becomes_a_same_chat_resume(temp_db):
     conn = _viewer(ws, "vw3", pump.session_id)
     try:
         loop_task = asyncio.create_task(conn._stream_via_pump(pump))
-        while not pump._ws_queues:
+        while not pump._ws_queues:  # noqa: ASYNC110  # the pump's viewer queues: the pump has no attach event
             await asyncio.sleep(0)
         pump._ws_queues[0].put_nowait({"pump_type": stream_pump.PUMP_RESYNC})
         result = await asyncio.wait_for(loop_task, timeout=5)
@@ -458,7 +466,7 @@ async def test_the_attach_snapshot_is_encoded_once_and_sent_as_text(temp_db, mon
     conn = _viewer(ws, "vw7", pump.session_id)
     try:
         loop_task = asyncio.create_task(conn._stream_via_pump(pump))
-        while not any(t == "live_state" for t, _how in ws.via):
+        while not any(t == "live_state" for t, _how in ws.via):  # noqa: ASYNC110  # a fake socket's sent frames: the fake has no event
             await asyncio.sleep(0)
         live["live_blocks"].append({"type": "text", "content": "after the attach"})
         pump._ws_queues[0].put_nowait({"pump_type": "all_done"})

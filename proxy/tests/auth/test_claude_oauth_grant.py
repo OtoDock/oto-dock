@@ -19,7 +19,6 @@ from api.auth import claude_oauth as claude_api
 from api.auth.claude_oauth import OAuthExchangeRequest
 from core.layers.cli.oauth import INFERENCE_SCOPE, grant_refusal
 
-
 # The exact grant from the issue report.
 _CONSOLE_SCOPES = ["org:create_api_key", "user:file_upload", "user:profile"]
 _SUBSCRIPTION_SCOPES = [

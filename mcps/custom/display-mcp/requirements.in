@@ -1,4 +1,4 @@
-mcp>=1.28.1,<2.0
+mcp>=1.30.0,<2.0
 httpx>=0.27,<1.0
-Pillow>=12.2
+Pillow>=13.0
 pillow-heif>=0.16

@@ -24,6 +24,7 @@ import logging
 import re
 import time
 
+import httpx
 
 from auth.webhook_providers.base import NormalizedEvent
 from services.webhooks import vendor_http
@@ -55,7 +56,7 @@ async def enrich_event(
         await asyncio.wait_for(
             _enrich(event, row=row, lookups=lookups), _EVENT_BUDGET_SECONDS,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001  # enrichment is optional, the event fires without it
         logger.debug("event enrichment failed (ignored)", exc_info=True)
 
 
@@ -96,7 +97,9 @@ async def _enrich(event: NormalizedEvent, *, row: dict, lookups: list[dict]) -> 
         if needs_token and not token_loaded:
             token_loaded = True
             try:
-                from services.webhooks.subscription_manager import _resolve_token_or_raise
+                from services.webhooks.subscription_manager import (
+                    _resolve_token_or_raise,
+                )
                 token = _resolve_token_or_raise(
                     provider_id=row.get("provider_id", ""),
                     scope=row.get("scope", "user"),
@@ -105,7 +108,7 @@ async def _enrich(event: NormalizedEvent, *, row: dict, lookups: list[dict]) -> 
                     mcp_name=row.get("mcp_name", ""),
                     account_label=row.get("account_label", ""),
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001  # a lookup's token is optional, the event goes out unenriched
                 token = ""
         if needs_token and not token:
             continue  # no credential — skip this lookup, never block the fire
@@ -119,13 +122,13 @@ async def _enrich(event: NormalizedEvent, *, row: dict, lookups: list[dict]) -> 
         try:
             async with vendor_http.client(url, timeout=_LOOKUP_TIMEOUT_SECONDS) as client:
                 resp = await client.request(method, url, headers=headers)
-        except Exception:
+        except (httpx.HTTPError, httpx.InvalidURL, OSError):
             continue
         if resp.status_code not in expected:
             continue
         try:
             body = resp.json()
-        except Exception:
+        except ValueError:
             continue
 
         outputs: dict[str, str] = {}

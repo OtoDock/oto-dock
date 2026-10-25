@@ -61,7 +61,7 @@ class PinGateMixin:
         peer = self.conn.peer_addr
 
         if store.route_locked(self.route.id) or store.number_locked(caller):
-            logger.warning(f"[{peer}] PIN gate: cooldown active, refusing call")
+            logger.warning("[%s] PIN gate: cooldown active, refusing call", peer)
             self.state.call_outcome = "pin_cooldown"
             await self._pin_say("pin_lockout")
             await self._pin_hangup()
@@ -81,8 +81,8 @@ class PinGateMixin:
                 store.record_failure(caller, self.route.id)
                 self.state.pin_failures += 1
             logger.info(
-                f"[{peer}] PIN gate: entry timed out "
-                f"({self._pin_counts_note()})"
+                "[%s] PIN gate: entry timed out "
+                "(%s)", peer, self._pin_counts_note()
             )
             self.state.call_outcome = "pin_timeout"
             await self._pin_say("pin_fail_goodbye")
@@ -92,16 +92,17 @@ class PinGateMixin:
         if ok:
             self.state.pin_verified = True
             logger.info(
-                f"[{peer}] PIN gate: passed "
-                f"(attempt {self.state.pin_attempts}; "
-                f"{self._pin_counts_note()})"
+                "[%s] PIN gate: passed "
+                "(attempt %s; "
+                "%s)",
+                peer, self.state.pin_attempts, self._pin_counts_note()
             )
             return True
 
         logger.warning(
-            f"[{peer}] PIN gate: failed after "
-            f"{self.state.pin_attempts} attempts "
-            f"({self._pin_counts_note()})"
+            "[%s] PIN gate: failed after "
+            "%s attempts "
+            "(%s)", peer, self.state.pin_attempts, self._pin_counts_note()
         )
         # An outbound line that never entered a digit is a voicemail or a
         # wrong pickup, not a wrong code: the record says so, and the
@@ -139,8 +140,8 @@ class PinGateMixin:
                 store.record_failure(caller, self.route.id)
                 self.state.pin_failures += 1
             logger.info(
-                f"[{self.conn.peer_addr}] PIN gate: wrong code "
-                f"(attempt {attempt}/{max_attempts})"
+                "[%s] PIN gate: wrong code "
+                "(attempt %s/%s)", self.conn.peer_addr, attempt, max_attempts
             )
         return False
 
@@ -292,10 +293,10 @@ class PinGateMixin:
             await self._play_filler_audio(pcm)
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # a TTS provider raises whatever its SDK and socket do
             logger.warning(
-                f"[{self.conn.peer_addr}] PIN gate: prompt synthesis "
-                f"failed: {e}"
+                "[%s] PIN gate: prompt synthesis "
+                "failed: %s", self.conn.peer_addr, e
             )
 
     async def _pin_hangup(self) -> None:

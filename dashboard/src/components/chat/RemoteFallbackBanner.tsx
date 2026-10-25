@@ -19,15 +19,18 @@ interface Props {
 export default function RemoteFallbackBanner({
   fallbackReason, machineName, durationMs = 8000,
 }: Props) {
-  const [show, setShow] = useState(false)
+  // Shown for the window after each new override reason; the timer hides it.
+  const [seenReason, setSeenReason] = useState(fallbackReason)
+  const [hidden, setHidden] = useState(false)
+  if (seenReason !== fallbackReason) {
+    setSeenReason(fallbackReason)
+    setHidden(false)
+  }
+  const show = fallbackReason === 'user-override-offline' && !hidden
 
   useEffect(() => {
-    if (fallbackReason !== 'user-override-offline') {
-      setShow(false)
-      return
-    }
-    setShow(true)
-    const t = setTimeout(() => setShow(false), durationMs)
+    if (fallbackReason !== 'user-override-offline') return
+    const t = setTimeout(() => setHidden(true), durationMs)
     return () => clearTimeout(t)
   }, [fallbackReason, durationMs])
 
@@ -37,9 +40,9 @@ export default function RemoteFallbackBanner({
   return (
     <div
       role="status"
-      className="mb-2 w-full max-w-4xl mx-auto px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-900/40 text-xs text-amber-800 dark:text-amber-300"
+      className="mb-2 w-full max-w-4xl mx-auto px-3 py-2 rounded-card bg-status-warning-bg border border-status-warning-border text-xs text-status-warning-fg"
     >
-      {name} is offline — running on the agent's default target instead.
+      {name} is offline, so this chat runs where the agent usually runs.
     </div>
   )
 }

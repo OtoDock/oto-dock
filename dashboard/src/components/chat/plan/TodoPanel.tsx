@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { pushEscHandler } from '../../../lib/escStack'
+import { GLASS, GLASS_HOVER } from '../../ui/glass'
+import { POPOVER } from '../../ui/classes'
 
 interface TodoItem {
   content: string
@@ -49,11 +51,11 @@ export default function TodoPanel({ todos }: Props) {
       <button
         onClick={() => setOpen(!open)}
         title={`Checklist: ${completed}/${total} done`}
-        className={`relative w-10 h-10 rounded-xl bg-white/80 dark:bg-gray-900/80 backdrop-blur-xs border border-p-border-light shadow-xs
-                   hover:shadow-md hover:bg-white dark:hover:bg-p-surface transition-all flex items-center justify-center`}
+        className={`relative flex size-control-md items-center justify-center rounded-xl ${GLASS} ${GLASS_HOVER}
+                   transition-colors duration-fast`}
       >
         {/* Checklist icon */}
-        <svg className="w-5 h-5 text-p-text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+        <svg className="w-5 h-5 text-secondary" viewBox="0 0 24 24" fill="none" stroke="currentColor">
           <rect x="4" y="3" width="16" height="18" rx="2" strokeWidth={1.5} />
           <path d="M8 9l1.5 1.5L12 8" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round" />
           <path d="M14 9.5h3" strokeWidth={1.3} strokeLinecap="round" />
@@ -62,19 +64,19 @@ export default function TodoPanel({ todos }: Props) {
           <path d="M14 14h3" strokeWidth={1.3} strokeLinecap="round" />
         </svg>
         {/* Progress badge — bottom-right */}
-        <span className="absolute -bottom-1 -right-1 min-w-[18px] h-[18px] rounded-full bg-brand text-white text-[9px] font-bold flex items-center justify-center px-1 border-2 border-white dark:border-gray-900">
+        <span className="absolute -bottom-1 -right-1 min-w-[18px] h-[18px] rounded-full bg-action text-action-fg text-3xs font-bold flex items-center justify-center px-1 border-2 border-surface-card">
           {completed}/{total}
         </span>
       </button>
 
       {/* Dropdown panel */}
       {open && (
-        <div className="mt-2 bg-white/95 dark:bg-gray-900/95 backdrop-blur-xs border border-p-border-light shadow-lg rounded-xl overflow-hidden
-                        w-64 sm:w-72 max-w-[calc(100vw-2rem)]">
+        <div className={`mt-2 ${POPOVER} overflow-hidden
+                        w-64 sm:w-72 max-w-[calc(100vw-2rem)]`}>
           {/* Header */}
-          <div className="flex items-center justify-between px-3 py-2 border-b border-p-border-light bg-p-bg/50">
-            <span className="text-xs font-medium text-p-text-secondary">Checklist</span>
-            <span className="text-xs text-p-text-light font-mono">
+          <div className="flex items-center justify-between px-3 py-2 border-b border-subtle">
+            <span className="text-xs font-medium text-secondary">Checklist</span>
+            <span className="text-xs text-tertiary font-mono">
               {completed}/{total}
             </span>
           </div>
@@ -89,12 +91,12 @@ export default function TodoPanel({ todos }: Props) {
                 >
                   <span className="mt-0.5 shrink-0">
                     {done ? (
-                      <span className="text-p-success text-[11px]">&#10003;</span>
+                      <span className="text-status-success-fg text-2xs">&#10003;</span>
                     ) : (
-                      <span className="inline-block w-3 h-3 rounded-full border-2 border-p-text-light" />
+                      <span className="inline-block w-3 h-3 rounded-full border-2 border-strong" />
                     )}
                   </span>
-                  <span className={done ? 'line-through text-p-text-light' : 'text-p-text'}>
+                  <span className={done ? 'line-through text-tertiary' : 'text-primary'}>
                     {todo.content}
                   </span>
                 </div>

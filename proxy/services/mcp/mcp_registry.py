@@ -4,36 +4,44 @@ Scans mcps/ on startup, loads manifest.json files, and provides the core engine
 for generating per-session mcp-config.json from manifests + DB state + credentials.
 """
 
+import asyncio
 import contextlib
 import hashlib
 import json
 import logging
 import os
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
+
+import psycopg
 
 import config
+from auth.session_token import CLI_TOKEN_ENV, SESSION_JWT_SENTINEL_BEARER
 from core.config import deployment
 from core.placement import LOCAL_PLACEMENT, PlacementCapabilities
-from storage.mcp import mcp_store
-from auth.session_token import SESSION_JWT_SENTINEL_BEARER
+from services.mcp import (
+    mcp_manifest_parse as _mmp,
+    mcp_manifest_types as _mt,
+    mcp_validate_oauth as _mvo,
+    mcp_validate_webhooks as _mvw,
+)
+
 # The manifest schema (data classes + validation enums), template resolution,
 # the oauth/webhook validators, and manifest parsing now live in sibling
 # modules. Names the registry engine uses directly are imported here; the rest
 # are re-exported below so the public surface (mcp_registry.X) is unchanged.
 from services.mcp.mcp_manifest_types import (
-    AgentContextBlock,
-    McpManifest,
-    NetworkTargetDecl,
     _BUILDER_TOOL_RE,
     _HTTP_TRANSPORTS,
     _VALID_DEVICE_CAPABILITIES,
+    AgentContextBlock,
+    McpManifest,
+    NetworkTargetDecl,
 )
 from services.mcp.mcp_templating import _SECRET_TEMPLATE_TOKENS, _resolve_template
-from services.mcp import mcp_manifest_types as _mt
-from services.mcp import mcp_manifest_parse as _mmp
-from services.mcp import mcp_validate_oauth as _mvo
-from services.mcp import mcp_validate_webhooks as _mvw
+from storage.mcp import mcp_store
 
 if TYPE_CHECKING:  # the gateway's types; the module is reached at call time
     from core.credentials.mcp_gateway import GatewayCredential, TokenRef
@@ -155,6 +163,22 @@ def _validate_builder_block_transports() -> None:
 # ---------------------------------------------------------------------------
 # Scanning & Loading
 # ---------------------------------------------------------------------------
+
+# The rescans run one at a time per loop: two scans never finish out of
+# order, so an older scan never replaces the registry a newer one built.
+_rescan_lock: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
+
+
+async def rescan() -> dict[str, McpManifest]:
+    """``scan_manifests`` in a worker thread, under the loop's rescan lock:
+    what the install, the delete and the update routes call after they
+    changed the tree (the boot scan is synchronous, before the loop serves)."""
+    global _rescan_lock
+    loop = asyncio.get_running_loop()
+    if _rescan_lock is None or _rescan_lock[0] is not loop:
+        _rescan_lock = (loop, asyncio.Lock())
+    async with _rescan_lock[1]:
+        return await asyncio.to_thread(scan_manifests)
 
 
 def scan_manifests() -> dict[str, McpManifest]:
@@ -504,7 +528,10 @@ def _agent_base_manifests(agent_name: str) -> list[McpManifest]:
     visible_explicit = mcp_store.get_visible_explicit_mcps(agent_name)
 
     result: list[McpManifest] = []
-    for name in enabled_by_manager:
+    # By name: a set's order follows the process's hash seed, and this order
+    # reaches the prompt's skills and the session's MCP config, which must
+    # read the same after every restart.
+    for name in sorted(enabled_by_manager):
         if not state_enabled.get(name, False):
             continue
         manifest = _manifests.get(name)
@@ -585,7 +612,7 @@ def _resolve_to_ips(host: str) -> list[str]:
         infos = socket.getaddrinfo(host, None)
     except OSError:
         return []
-    return sorted({i[4][0] for i in infos})
+    return sorted({i[4][0] for i in infos})  # type: ignore[misc]  # typeshed types getaddrinfo()[4][0] as str | int; it is a str for AF_INET and AF_INET6
 
 
 def _is_carveable_ip(ip: str) -> bool:
@@ -699,7 +726,7 @@ def _platform_targets() -> _PlatformTargets:
     try:
         from psycopg.conninfo import conninfo_to_dict
         db = conninfo_to_dict(config.DATABASE_URL)
-    except Exception:
+    except (ImportError, psycopg.Error):
         db = {}
     db_hosts = [h.strip() for h in str(db.get("host") or "localhost").split(",") if h.strip()]
     try:
@@ -1066,21 +1093,6 @@ def device_capability_for_server(server_name: str) -> str | None:
     return None
 
 
-def is_high_risk_device_tool(server_name: str, tool_name: str) -> bool:
-    """True if ``tool_name`` (bare, e.g. "execute_blender_code") is declared
-    high-risk by the device MCP whose server_name matches — EXCLUDED from the
-    device auto-approve so it still prompts even when the capability is granted.
-    RCE-class app-connector tools bypass the bash-tier system, so they must
-    never be silently auto-approved.
-    """
-    if not server_name or not tool_name:
-        return False
-    for manifest in _manifests.values():
-        if (manifest.server_name or manifest.name) == server_name:
-            return tool_name in manifest.device_high_risk_tools
-    return False
-
-
 def manifest_capability_available(manifest: McpManifest) -> bool:
     """Whether the platform feature an MCP requires is currently configured.
 
@@ -1093,7 +1105,8 @@ def manifest_capability_available(manifest: McpManifest) -> bool:
     cap = manifest.requires_capability
     if not cap:
         return True
-    from services.media import audio_service  # lazy — avoid an import cycle at module load
+    # lazy — avoid an import cycle at module load
+    from services.media import audio_service
     if cap == "audio_transcribe":
         return audio_service.transcribe_capability_available()
     if cap == "audio_tts":
@@ -1200,7 +1213,7 @@ def enumerate_mcp_network_targets(
                         ), decl)
             elif decl.source == "infra_credential":
                 _add(credential_store.get_infra_credentials(manifest.name), decl)
-        except Exception as e:  # noqa: BLE001 — a bad target must never break spawn
+        except Exception as e:  # noqa: BLE001  # a bad target must never break spawn
             logger.warning(
                 "network_targets: resolving %s for MCP %s failed: %s",
                 decl.host_key, manifest.name, e,
@@ -1210,7 +1223,7 @@ def enumerate_mcp_network_targets(
 
 def _rewrite_host_self_targets_to_loopback(
     manifest: McpManifest, env: dict, agent_name: str,
-    *, user_sub: str = "", task_scope: str = "user",
+    *, user_sub: str | None = "", task_scope: str = "user",
 ) -> None:
     """Rewrite a homelab MCP's configured target host → 127.0.0.1 (in place) when
     it points at one of the proxy HOST's own IPs — a service co-located with the
@@ -1243,7 +1256,7 @@ def _rewrite_host_self_targets_to_loopback(
             ips = _resolve_to_ips(host)
             if ips and any(_is_local_host_ip(ip) for ip in ips):
                 env[decl.host_key] = val.replace(host, "127.0.0.1", 1)
-        except Exception as e:  # noqa: BLE001 — never break spawn on a bad target
+        except Exception as e:  # noqa: BLE001  # never break spawn on a bad target
             logger.warning(
                 "network_targets: host-self rewrite of %s for MCP %s failed: %s",
                 decl.host_key, manifest.name, e,
@@ -1425,6 +1438,8 @@ def get_credential_schema(name: str) -> dict | None:
         if cred.app_credential_fields:
             result["app_credential"] = cred.oauth.get("app_credential", "")
             result["app_credential_fields"] = cred.app_credential_fields
+            if cred.app_kinds:
+                result["app_kinds"] = cred.app_kinds
     if cred.ui_type:
         result["ui_type"] = cred.ui_type
     h = _hosted_schema(m)
@@ -1436,7 +1451,7 @@ def get_credential_schema(name: str) -> dict | None:
 def get_all_credential_schemas() -> dict[str, dict]:
     """Return all credential schemas keyed by MCP name."""
     result = {}
-    for name, m in _manifests.items():
+    for name, _m in _manifests.items():
         schema = get_credential_schema(name)
         if schema:
             result[name] = schema
@@ -1502,13 +1517,6 @@ def get_credentials_dirs(mcp_name: str) -> list[tuple[str, str]]:
     return out
 
 
-# Manifests where the agent-facing description is operational metadata that
-# would just be noise inside the agent's MCP catalog. mcps-mcp is meta (it
-# talks about other MCPs and shouldn't self-advertise); add to this set if
-# more emerge.
-_SUPPRESS_FROM_CATALOG: set[str] = {"mcps-mcp"}
-
-
 def _first_sentence(text: str) -> str:
     """Return the first sentence of a description (period-delimited).
 
@@ -1547,7 +1555,6 @@ def build_available_mcps_section(
     Lists each enabled MCP as one bullet — ``**{label}** (`{slug}`) — {desc}``.
     Sourced from ``get_agent_mcps`` (visible + manager-enabled + platform-
     enabled), filtered to skip:
-      - ``mcps-mcp`` (meta MCP — self-reference adds no value).
       - Manifests whose ``exclude_from`` matches the current session
         context (e.g. ``display-mcp`` is phone-excluded).
 
@@ -1582,8 +1589,6 @@ def build_available_mcps_section(
     )
     rows: list[str] = []
     for m in manifests_sorted:
-        if m.name in _SUPPRESS_FROM_CATALOG:
-            continue
         # Standalone skill packages are context-only carriers of skills —
         # advertising them as "MCP servers ... tools you can call" would put
         # a tool-less server in front of the agent. Their skills surface via
@@ -1696,7 +1701,7 @@ def get_skills_for_agent(
         try:
             content = strip_frontmatter(skill_path.read_text())
             result.append((skill_def.id, content, skill_def.loading))
-        except Exception as e:
+        except (OSError, ValueError) as e:
             logger.warning("Failed to read skill %s: %s", skill_path, e)
 
     return result
@@ -2046,6 +2051,11 @@ def resolve_server_config(
         if env:
             entry["env"] = env
 
+    # Codex reads the per-call limit from its own config; Claude Code has
+    # its own and its JSON knows no such key.
+    if mcp_config_format == "toml" and srv.tool_timeout_sec:
+        entry["tool_timeout_sec"] = srv.tool_timeout_sec
+
     return entry
 
 
@@ -2082,19 +2092,21 @@ def _gateway_bearer_source(
     re-reads it per request."""
     from core.credentials.mcp_gateway import TokenRef
     from services.oauth import credential_resolver, oauth_account_store
-    from storage import database as _db
 
     provider_id = (manifest.credentials.oauth or {}).get("provider_id", "")
-    if user_sub and task_scope == "user":
-        ref = credential_resolver.pick_account(manifest.name, agent_name, user_sub=user_sub)
-        owner_sub = user_sub
-    else:
-        ref = credential_resolver.pick_account(manifest.name, agent_name)
-        owner_sub = ref.owner_sub if ref else ""
-    username = _db.get_username_by_sub(owner_sub) if owner_sub else ""
-    if ref is None or not username:
+    try:
+        picked = credential_resolver._bound_token_source(
+            manifest.name, provider_id, user_sub=user_sub, task_scope=task_scope,
+            agent_name=agent_name, purpose=credential_resolver.PURPOSE_MCP,
+        )
+    except credential_resolver.AccountNeedsReconnect as needs:
+        return None, f"{manifest.label}: {credential_resolver.reconnect_wording(str(needs))}"
+    except credential_resolver.CredentialUnavailable as why:
+        return None, f"{manifest.label}: {why}"
+    if picked is None:
         return None, f"{manifest.label}: no account is connected for this session"
-    token_dir = oauth_account_store.get_token_dir(username, provider_id=provider_id)
+    token_dir, label, _username = picked
+    ref = credential_resolver.AccountRef(label=label, owner_sub="")
     raw = oauth_account_store.read_account_token(token_dir, ref.label)
     if not raw:
         return None, f"{manifest.label}: the connected account has no token file"
@@ -2137,6 +2149,7 @@ def gateway_entry(
     unapproved MCP out of the session with an actionable sentence.
     """
     from urllib.parse import urlsplit
+
     from core.credentials.mcp_gateway import GatewayCredential, entry_url
     from storage.identity import bearer_allowlist
 
@@ -2165,13 +2178,16 @@ def gateway_entry(
         token_ref, reason = _gateway_bearer_source(manifest, user_sub, agent_name, task_scope)
         if reason:
             return None, reason
+        from services.oauth.credential_resolver import binding_reach
+        reach = binding_reach(manifest.name, agent_name, user_sub=user_sub, task_scope=task_scope)
         cred = GatewayCredential(
             upstream=origin, path=path, allowlist_key=allowlist_key,
             token_ref=token_ref, proxy_local=proxy_local, manifest=manifest.name,
+            reach=reach.to_dict() if reach is not None else None,
         )
     else:
         allowlist_key = manifest.name
-        key = str(header_block.get("value_from") or "")
+        key = str(cast("dict", header_block).get("value_from") or "")
         value = bundle_env.get(key, "")
         if not value:
             return None, (
@@ -2180,7 +2196,7 @@ def gateway_entry(
             )
         cred = GatewayCredential(
             upstream=origin, path=path, allowlist_key=allowlist_key,
-            header=str(header_block.get("name") or ""), prefix="", value=value,
+            header=str(cast("dict", header_block).get("name") or ""), prefix="", value=value,
             proxy_local=False, manifest=manifest.name, value_from=key,
         )
 
@@ -2418,32 +2434,11 @@ def build_session_mcp_config(
     the returned flat env + the per-server config env here (see below); the
     interceptor re-injects identical values at spawn.
     """
-    from services.oauth import credential_resolver
     from core.credentials.mcp_broker import SecretBundle
+    from services.oauth import credential_resolver
 
-    # Determine context for exclusion checks
-    context = "dashboard"
-    if phone_mode:
-        context = "phone"
-    elif task_mode:
-        context = "task"
-    elif interactive_local:
-        # Interactive terminal: a local CLI session (Claude Code / Codex on the
-        # user's own machine) — exclude device/UI MCPs that make no sense there
-        # (location GPS, display image-viewer; see their manifests' exclude_from).
-        context = "terminal"
-    # Meeting sessions match "meeting" IN ADDITION to their base context
-    # ("task" — meetings ride the task lane), so a manifest can opt out of
-    # meetings alone. Kept as a union, never a replacement: manifests that
-    # exclude only "task" have always been absent from meetings, and swapping
-    # the context would silently re-admit them all.
-    exclusion_contexts = {context, "meeting"} if meeting_mode else {context}
-    # External sessions (a phone caller who is not a platform user) add the
-    # "external" context AND the hard-denied management set — see
-    # ``session_exclusion_reason``; the prompt builders apply the same rule.
-    if external:
-        exclusion_contexts.add(EXTERNAL_CONTEXT)
-
+    exclusion_contexts = _exclusion_contexts(
+        phone_mode, task_mode, interactive_local, meeting_mode, external)
     # Get assigned + enabled MCPs for this agent. Device-local placement /
     # consent / display filtering happens here; the dropped device MCPs
     # come back as exclusion reasons so the prompt can surface them.
@@ -2451,29 +2446,7 @@ def build_session_mcp_config(
         agent_name, placement=placement,
     )
     is_remote = placement.is_remote
-
-    # Force-include extra MCPs (e.g. meetings-mcp for meeting participants).
-    # NOTE: extra_mcps is an engine-level escape hatch — it BYPASSES both
-    # visibility (admin authorization) AND enablement (manager toggle). Only
-    # use it for system-essential MCPs that must always be available regardless
-    # of agent config (currently: meetings-mcp during a meeting). Adding new
-    # entries here amounts to giving an MCP "always-on" status. It does NOT,
-    # however, bypass the device-local placement gate — a satellite_only MCP
-    # must never be force-injected onto a local session.
-    if extra_mcps:
-        assigned_names = {m.name for m in assigned}
-        for mcp_name in extra_mcps:
-            if mcp_name in assigned_names:
-                continue
-            manifest = get_manifest(mcp_name)
-            if not manifest:
-                continue
-            reason = _device_placement_reason(manifest, placement=placement)
-            if reason:
-                exclusion_reasons[mcp_name] = reason
-                continue
-            assigned.append(manifest)
-
+    _force_include(assigned, extra_mcps, exclusion_reasons, placement)
     if only_mcps is not None:
         keep = {str(n) for n in only_mcps}
         assigned = [m for m in assigned if m.name in keep]
@@ -2504,60 +2477,133 @@ def build_session_mcp_config(
     servers: dict[str, dict] = {}
     # Credential broker: per-MCP secret bundles, keyed by srv_key.
     secret_bundles: dict[str, SecretBundle] = {}
-
+    build = _SessionMcpBuild(
+        agent_name=agent_name,
+        user_sub=user_sub,
+        task_mode=task_mode,
+        task_scope=task_scope,
+        mcp_config_format=mcp_config_format,
+        username=username,
+        user_role=user_role,
+        chat_id=chat_id,
+        task_owner=task_owner,
+        task_username=task_username,
+        placement=placement,
+        external=external,
+        call_ask_back=call_ask_back,
+        exclusion_contexts=exclusion_contexts,
+        exclusion_reasons=exclusion_reasons,
+        cred_result=cred_result,
+        is_remote=is_remote,
+        servers=servers,
+        secret_bundles=secret_bundles,
+    )
     for manifest in assigned:
+        build.add(manifest)
+    if not servers:
+        return None, flat_env, exclusion_reasons, {}, cred_result.bash_env_keys
+    _finish_session_servers(
+        servers, secret_bundles, cred_result, agent_name, delegation_targets, target_browser,
+        task_mode=task_mode, phone_mode=phone_mode, meeting_mode=meeting_mode)
+    config_path = _write_session_mcp_config(
+        servers, agent_name, user_sub, session_id, mcp_config_format)
+    return config_path, flat_env, exclusion_reasons, secret_bundles, cred_result.bash_env_keys
+
+
+def _exclusion_contexts(phone_mode: bool, task_mode: bool, interactive_local: bool,
+                        meeting_mode: bool, external: bool) -> set[str]:
+    """The ``exclude_from`` contexts a session matches (its kind, ``meeting``
+    besides it for a participant, ``external`` for a caller)."""
+    # Determine context for exclusion checks
+    context = "dashboard"
+    if phone_mode:
+        context = "phone"
+    elif task_mode:
+        context = "task"
+    elif interactive_local:
+        # Interactive terminal: a local CLI session (Claude Code / Codex on the
+        # user's own machine) — exclude device/UI MCPs that make no sense there
+        # (location GPS, display image-viewer; see their manifests' exclude_from).
+        context = "terminal"
+    # Meeting sessions match "meeting" IN ADDITION to their base context
+    # ("task" — meetings ride the task lane), so a manifest can opt out of
+    # meetings alone. Kept as a union, never a replacement: manifests that
+    # exclude only "task" have always been absent from meetings, and swapping
+    # the context would silently re-admit them all.
+    exclusion_contexts = {context, "meeting"} if meeting_mode else {context}
+    # External sessions (a phone caller who is not a platform user) add the
+    # "external" context AND the hard-denied management set — see
+    # ``session_exclusion_reason``; the prompt builders apply the same rule.
+    if external:
+        exclusion_contexts.add(EXTERNAL_CONTEXT)
+    return exclusion_contexts
+
+
+def _force_include(assigned: list[McpManifest], extra_mcps: list[str] | None,
+                   exclusion_reasons: dict[str, str], placement: PlacementCapabilities) -> None:
+    """Add the MCPs a session forces in (``extra_mcps``) to ``assigned``."""
+    # Force-include extra MCPs (e.g. meetings-mcp for meeting participants).
+    # NOTE: extra_mcps is an engine-level escape hatch — it BYPASSES both
+    # visibility (admin authorization) AND enablement (manager toggle). Only
+    # use it for system-essential MCPs that must always be available regardless
+    # of agent config (currently: meetings-mcp during a meeting). Adding new
+    # entries here amounts to giving an MCP "always-on" status. It does NOT,
+    # however, bypass the device-local placement gate — a satellite_only MCP
+    # must never be force-injected onto a local session.
+    if extra_mcps:
+        assigned_names = {m.name for m in assigned}
+        for mcp_name in extra_mcps:
+            if mcp_name in assigned_names:
+                continue
+            manifest = get_manifest(mcp_name)
+            if not manifest:
+                continue
+            reason = _device_placement_reason(manifest, placement=placement)
+            if reason:
+                exclusion_reasons[mcp_name] = reason
+                continue
+            assigned.append(manifest)
+
+
+@dataclass
+class _SessionMcpBuild:
+    """One session's MCP config build: what every entry is built from, and
+    what the build collects (the entries, their secret bundles, the reason
+    each MCP left out was left out)."""
+
+    agent_name: str
+    user_sub: str | None
+    task_mode: bool
+    task_scope: str
+    mcp_config_format: str | None
+    username: str
+    user_role: str
+    chat_id: str
+    task_owner: str
+    task_username: str
+    placement: PlacementCapabilities
+    external: bool
+    call_ask_back: bool
+    exclusion_contexts: set[str]
+    exclusion_reasons: dict[str, str]
+    cred_result: Any
+    is_remote: bool
+    servers: dict[str, dict]
+    secret_bundles: dict[str, Any]
+
+    def add(self, manifest: McpManifest) -> None:
+        """One assigned MCP: its entry and secret bundle, or the reason it
+        is left out."""
+        from core.credentials.mcp_broker import SecretBundle
+        (agent_name, user_sub, task_mode, task_scope, mcp_config_format, chat_id, task_owner,
+         task_username, call_ask_back, exclusion_reasons, cred_result, servers, secret_bundles) = (
+            self.agent_name, self.user_sub, self.task_mode, self.task_scope,
+            self.mcp_config_format, self.chat_id, self.task_owner, self.task_username,
+            self.call_ask_back, self.exclusion_reasons, self.cred_result, self.servers,
+            self.secret_bundles)
         mcp_name = manifest.name
-
-        # Context exclusion (manifest exclude_from + the external hard set) —
-        # the ONE rule shared with the prompt builders and the route preview.
-        context_reason = session_exclusion_reason(
-            manifest, contexts=exclusion_contexts, external=external,
-        )
-        if context_reason:
-            exclusion_reasons[mcp_name] = context_reason
-            continue
-
-        # The manifest's audience: a person below the tier it names is not
-        # handed the MCP (the prompt, the egress carve and the sandbox agree).
-        audience_reason = audience_refusal(manifest, user_role=user_role, task_scope=task_scope)
-        if audience_reason:
-            exclusion_reasons[mcp_name] = audience_reason
-            continue
-
-        # Check credential exclusion
-        if mcp_name in cred_result.excluded_mcps:
-            exclusion_reasons[mcp_name] = cred_result.exclusion_reasons.get(
-                mcp_name, "Credentials not configured"
-            )
-            continue
-
-        # Admin-paired-only MCPs (ssh-hosts): the tool surface exists exactly
-        # where the MCP's session data (SSH keys) is delivered — locally and
-        # on admin-paired satellites. A user-paired machine gets a visible
-        # exclusion instead (mirrors the agent-scope-credentials rule).
-        if (manifest.remote_policy == "admin_paired_only"
-                and is_remote and not placement.admin_paired):
-            exclusion_reasons[mcp_name] = (
-                f"{manifest.label} is unavailable on this machine — "
-                "it is delivered only to admin-paired machines"
-            )
-            continue
-
-        # Context-only MCPs (transport "none"): no server process, so nothing
-        # to emit into mcpServers. Skills, dynamic prompt context, instance
-        # authorization and network_targets all apply through their own
-        # paths. On REMOTE sessions they are allowed only on ADMIN-PAIRED
-        # targets — their session data rides the session-file broker there;
-        # key material never reaches a user-paired satellite.
-        if manifest.server.transport == "none":
-            if is_remote and not placement.admin_paired:
-                exclusion_reasons[mcp_name] = (
-                    f"{manifest.label} is unavailable on this machine — "
-                    "its key material is delivered only to admin-paired "
-                    "machines"
-                )
-            continue
-
+        if self._excluded(manifest, mcp_name):
+            return
         # Build server config (session ctx populated for ${session.*} token
         # resolution in manifest agent_env declarations)
         session_ctx = {
@@ -2602,7 +2648,146 @@ def build_session_mcp_config(
         # (manifest ``server.proxy_callbacks``; today only file-tools). See
         # _inject_session_jwt_sentinel.
         server_entry = _inject_session_jwt_sentinel(server_entry, manifest)
+        if self._instance_delivery(manifest, mcp_name, server_entry, bundle_env):
+            return
+        # Use server_name (backward-compatible key) for the mcpServers dict
+        srv_key = manifest.server_name or mcp_name
 
+        # The credential gateway: a remote-HTTP MCP with a credential dials
+        # the gateway route with the session token; the credential rides the
+        # bundle and is added per request on the way out. After the instance
+        # block, so an env-delivered key is in ``bundle_env``.
+        gateway_cred, gateway_reason = gateway_entry(
+            server_entry, manifest, srv_key=srv_key, user_sub=user_sub,
+            agent_name=agent_name, task_scope=task_scope, bundle_env=bundle_env,
+        )
+        if gateway_reason:
+            exclusion_reasons[mcp_name] = gateway_reason
+            return
+        if gateway_cred is not None:
+            # An HTTP MCP has no process to fetch an env: the key's value
+            # lives in the credential alone.
+            bundle_env = {}
+
+        # Host-self target rewrite (T1): a homelab MCP configured with one of the
+        # proxy host's OWN IPs (a co-located service, e.g. Prometheus on the
+        # bare-metal box) must dial 127.0.0.1 — that IP is local inside the
+        # agent's netns; resolve_sandbox_egress forwards the port to the host
+        # loopback. Applied to both the broker bundle (instance/cred secrets) and
+        # the plain env (config source).
+        _rewrite_host_self_targets_to_loopback(
+            manifest, bundle_env, agent_name, user_sub=user_sub, task_scope=task_scope,
+        )
+        if server_entry.get("env"):
+            _rewrite_host_self_targets_to_loopback(
+                manifest, server_entry["env"], agent_name,
+                user_sub=user_sub, task_scope=task_scope,
+            )
+
+        # Claude expands ``${VAR}`` in an entry's values from its own env, so
+        # an entry that names the shell's command-line token would be handed
+        # it: no such MCP joins the session.
+        if _names_cli_token(server_entry):
+            logger.warning("MCP %s names %s in its configuration: left out of the session",
+                           mcp_name, CLI_TOKEN_ENV)
+            exclusion_reasons[mcp_name] = (
+                f"its configuration names {CLI_TOKEN_ENV}, the session's command-line "
+                "token, which no MCP server may hold")
+            return
+
+        servers[srv_key] = server_entry
+        # The command-line credential (a ``git_credential_helper`` manifest):
+        # by reference on the bundle, fetched per command through the broker.
+        cli_cred = cred_result.cli_credentials.get(mcp_name)
+        if bundle_env or gateway_cred is not None or cli_cred is not None:
+            secret_bundles[srv_key] = SecretBundle(
+                env=bundle_env, gateway=gateway_cred, cli=cli_cred,
+            )
+            # A credentialed (wrapped) stdio MCP drops the shell-only keys it
+            # would inherit from the CLI env (the git helper entries and the
+            # command-line token): the interceptor strips OTO_STRIP_KEYS-named
+            # vars at spawn. (No-op on HTTP MCPs — they aren't stdio-wrapped.)
+            if "command" in server_entry:
+                server_entry.setdefault("env", {})["OTO_STRIP_KEYS"] = _strip_keys(
+                    cred_result.bash_env_keys)
+
+    def _excluded(self, manifest: McpManifest, mcp_name: str) -> bool:
+        """The checks before the entry is built; True when the MCP is left
+        out (the reason recorded, or none for a context-only MCP)."""
+        (task_scope, user_role, placement, external, exclusion_contexts, exclusion_reasons,
+         cred_result, is_remote) = (
+            self.task_scope, self.user_role, self.placement, self.external,
+            self.exclusion_contexts, self.exclusion_reasons, self.cred_result, self.is_remote)
+        # Context exclusion (manifest exclude_from + the external hard set) —
+        # the ONE rule shared with the prompt builders and the route preview.
+        context_reason = session_exclusion_reason(
+            manifest, contexts=exclusion_contexts, external=external,
+        )
+        if context_reason:
+            exclusion_reasons[mcp_name] = context_reason
+            return True
+
+        # The manifest's audience: a person below the tier it names is not
+        # handed the MCP (the prompt, the egress carve and the sandbox agree).
+        audience_reason = audience_refusal(manifest, user_role=user_role, task_scope=task_scope)
+        if audience_reason:
+            exclusion_reasons[mcp_name] = audience_reason
+            return True
+
+        # Check credential exclusion
+        if mcp_name in cred_result.excluded_mcps:
+            exclusion_reasons[mcp_name] = cred_result.exclusion_reasons.get(
+                mcp_name, "Credentials not configured"
+            )
+            return True
+
+        # An agent-scope session (a Shared-only chat) on a person's own
+        # machine: the agent's own accounts stay on the platform (the config
+        # builder withholds their secret files there too).
+        from core.session.visibility import SCOPE_AGENT
+        if (task_scope == SCOPE_AGENT and is_remote and placement.user_paired
+                and cred_result.env_by_mcp.get(mcp_name)):
+            exclusion_reasons[mcp_name] = (
+                f"{manifest.label} uses the agent's own account, which stays "
+                "on the platform"
+            )
+            return True
+
+        # Admin-paired-only MCPs (ssh-hosts): the tool surface exists exactly
+        # where the MCP's session data (SSH keys) is delivered — locally and
+        # on admin-paired satellites. A user-paired machine gets a visible
+        # exclusion instead (mirrors the agent-scope-credentials rule).
+        if (manifest.remote_policy == "admin_paired_only"
+                and is_remote and not placement.admin_paired):
+            exclusion_reasons[mcp_name] = (
+                f"{manifest.label} is unavailable on this machine — "
+                "it is delivered only to admin-paired machines"
+            )
+            return True
+
+        # Context-only MCPs (transport "none"): no server process, so nothing
+        # to emit into mcpServers. Skills, dynamic prompt context, instance
+        # authorization and network_targets all apply through their own
+        # paths. On REMOTE sessions they are allowed only on ADMIN-PAIRED
+        # targets — their session data rides the session-file broker there;
+        # key material never reaches a user-paired satellite.
+        if manifest.server.transport == "none":
+            if is_remote and not placement.admin_paired:
+                exclusion_reasons[mcp_name] = (
+                    f"{manifest.label} is unavailable on this machine — "
+                    "its key material is delivered only to admin-paired "
+                    "machines"
+                )
+            return True
+        return False
+
+    def _instance_delivery(self, manifest: McpManifest, mcp_name: str, server_entry: dict,
+                           bundle_env: dict[str, str]) -> bool:
+        """An instance-based MCP's config file or env delivery; True when the
+        MCP is left out (its reason recorded)."""
+        agent_name, user_sub, username, user_role, exclusion_reasons, is_remote = (
+            self.agent_name, self.user_sub, self.username, self.user_role,
+            self.exclusion_reasons, self.is_remote)
         # Instance-based MCP config (generalized — replaces SSH-specific block)
         if manifest.instances:
             inst_cfg = manifest.instances
@@ -2622,7 +2807,7 @@ def build_session_mcp_config(
                         "its instance config and key files stay on the "
                         "platform host"
                     )
-                    continue
+                    return True
                 inst_config_dir = config.SESSIONS_DIR / "user-mcp-configs"
                 inst_config_dir.mkdir(parents=True, exist_ok=True)
                 inst_path = _generate_instance_config_file(
@@ -2633,7 +2818,7 @@ def build_session_mcp_config(
                     exclusion_reasons[mcp_name] = (
                         f"No {manifest.label} instances assigned to this agent"
                     )
-                    continue
+                    return True
                 # Override config file arg if declared in manifest
                 if inst_cfg.config_file_arg and "args" in server_entry:
                     new_args = []
@@ -2660,7 +2845,7 @@ def build_session_mcp_config(
                     exclusion_reasons[mcp_name] = (
                         f"No {manifest.label} instance authorized for this agent"
                     )
-                    continue
+                    return True
                 akr = manifest.hosted.api_key_relay if manifest.hosted else None
                 if chosen.get("hosted_mode") == "hosted" and akr and akr.available:
                     # HOSTED api_key_relay: point the MCP at the relay (NOT the
@@ -2683,71 +2868,25 @@ def build_session_mcp_config(
                         except relay_client.RelayNotConfigured as e:
                             env["OTODOCK_RELAY_ERROR"] = str(e)
                     else:
+                        # A member can meet it in a chat: no outside address
+                        # (the store apps' payment rules); the admin finds billing.
                         env["OTODOCK_RELAY_ERROR"] = (
-                            "OtoDock hosted relay not available yet — set up "
-                            f"billing at {akr.billing_setup_url}"
-                            if akr.billing_setup_url
-                            else "OtoDock hosted relay not available yet."
+                            "OtoDock hosted relay not available yet. "
+                            "An admin can set up billing in Setup, OtoDock."
                         )
                 else:
                     # Instance field_values are secret → broker bundle only,
                     # never the config file.
                     bundle_env.update(chosen["field_values"])
+        return False
 
-        # Use server_name (backward-compatible key) for the mcpServers dict
-        srv_key = manifest.server_name or mcp_name
 
-        # The credential gateway: a remote-HTTP MCP with a credential dials
-        # the gateway route with the session token; the credential rides the
-        # bundle and is added per request on the way out. After the instance
-        # block, so an env-delivered key is in ``bundle_env``.
-        gateway_cred, gateway_reason = gateway_entry(
-            server_entry, manifest, srv_key=srv_key, user_sub=user_sub,
-            agent_name=agent_name, task_scope=task_scope, bundle_env=bundle_env,
-        )
-        if gateway_reason:
-            exclusion_reasons[mcp_name] = gateway_reason
-            continue
-        if gateway_cred is not None:
-            # An HTTP MCP has no process to fetch an env: the key's value
-            # lives in the credential alone.
-            bundle_env = {}
-
-        # Host-self target rewrite (T1): a homelab MCP configured with one of the
-        # proxy host's OWN IPs (a co-located service, e.g. Prometheus on the
-        # bare-metal box) must dial 127.0.0.1 — that IP is local inside the
-        # agent's netns; resolve_sandbox_egress forwards the port to the host
-        # loopback. Applied to both the broker bundle (instance/cred secrets) and
-        # the plain env (config source).
-        _rewrite_host_self_targets_to_loopback(
-            manifest, bundle_env, agent_name, user_sub=user_sub, task_scope=task_scope,
-        )
-        if server_entry.get("env"):
-            _rewrite_host_self_targets_to_loopback(
-                manifest, server_entry["env"], agent_name,
-                user_sub=user_sub, task_scope=task_scope,
-            )
-
-        servers[srv_key] = server_entry
-        # The command-line credential (a ``git_credential_helper`` manifest):
-        # by reference on the bundle, fetched per command through the broker.
-        cli_cred = cred_result.cli_credentials.get(mcp_name)
-        if bundle_env or gateway_cred is not None or cli_cred is not None:
-            secret_bundles[srv_key] = SecretBundle(
-                env=bundle_env, gateway=gateway_cred, cli=cli_cred,
-            )
-            # A credentialed (wrapped) stdio MCP drops the bash-only git
-            # entries (GIT_CONFIG_*) it would inherit from the CLI env — the
-            # interceptor strips OTO_STRIP_KEYS-named vars at spawn. (No-op
-            # on HTTP MCPs — they aren't stdio-wrapped.)
-            if cred_result.bash_env_keys and "command" in server_entry:
-                server_entry.setdefault("env", {})["OTO_STRIP_KEYS"] = ",".join(
-                    sorted(cred_result.bash_env_keys)
-                )
-
-    if not servers:
-        return None, flat_env, exclusion_reasons, {}, cred_result.bash_env_keys
-
+def _finish_session_servers(servers: dict[str, dict], secret_bundles: dict, cred_result,
+                            agent_name: str, delegation_targets: list[str] | None,
+                            target_browser, *, task_mode: bool, phone_mode: bool,
+                            meeting_mode: bool) -> None:
+    """The entries' session-wide settings: the delegation targets, the
+    browser entry's origins and mode, the command-line token blanked."""
     # Inject delegation targets into delegation-mcp env
     if delegation_targets is not None and "delegation-mcp" in servers:
         servers["delegation-mcp"].setdefault("env", {})["DELEGATION_MCP_TARGETS"] = ",".join(delegation_targets)
@@ -2765,13 +2904,24 @@ def build_session_mcp_config(
             servers["local"], secret_bundles, target_browser,
             unattended=bool(task_mode or phone_mode or meeting_mode),
         )
-        # A bundle created here (token) gets the same bash-cred stripping the
+        # A bundle created here (token) gets the same shell-key stripping the
         # loop applies to credentialed stdio MCPs.
-        if "local" in secret_bundles and cred_result.bash_env_keys:
-            servers["local"].setdefault("env", {})["OTO_STRIP_KEYS"] = ",".join(
-                sorted(cred_result.bash_env_keys)
-            )
+        if "local" in secret_bundles and "command" in servers["local"]:
+            servers["local"].setdefault("env", {})["OTO_STRIP_KEYS"] = _strip_keys(
+                cred_result.bash_env_keys)
 
+    # The shell's command-line token never reaches an MCP: Claude starts a
+    # stdio MCP with its own env and the entry's on top, so every stdio entry
+    # names the key empty (a wrapped one also strips it, above).
+    for entry in servers.values():
+        if isinstance(entry, dict) and "command" in entry:
+            entry.setdefault("env", {})[CLI_TOKEN_ENV] = ""
+
+
+def _write_session_mcp_config(servers: dict[str, dict], agent_name: str, user_sub: str | None,
+                              session_id: str, mcp_config_format: str | None) -> Path:
+    """Write the session's config file (TOML for Codex, JSON otherwise) and
+    answer its path."""
     # Write config file
     sub_hash = hashlib.sha256((user_sub or "agent").encode()).hexdigest()[:12]
     config_out_dir = config.SESSIONS_DIR / "user-mcp-configs"
@@ -2786,23 +2936,38 @@ def build_session_mcp_config(
         # Note: credential env injection happens separately via
         # inject_credential_env_into_toml() after sandbox path rewriting.
         config_path = config_out_dir / f"{agent_name}-{sub_hash}-mcp.toml"
-        config_path.write_text(_servers_to_toml(servers))
+        _write_whole(config_path, _servers_to_toml(servers))
         # Save servers dict as JSON for re-generation after credential injection
-        config_path.with_suffix(".servers.json").write_text(
-            json.dumps(servers, indent=2)
-        )
+        _write_whole(config_path.with_suffix(".servers.json"), json.dumps(servers, indent=2))
     else:
         # Claude CLI: generate mcp-config.json with mcpServers dict
         mcp_config = {"mcpServers": servers}
         config_path = config_out_dir / f"{agent_name}-{sub_hash}.json"
-        config_path.write_text(json.dumps(mcp_config, indent=2))
+        _write_whole(config_path, json.dumps(mcp_config, indent=2))
     if session_id:
         # A rewrite in place leaves the directory's time alone: touched, so
         # the day-old sweep never takes a resumed session's fresh build.
         with contextlib.suppress(OSError):
             os.utime(config_out_dir)
+    return config_path
 
-    return config_path, flat_env, exclusion_reasons, secret_bundles, cred_result.bash_env_keys
+
+def _write_whole(path: Path, text: str) -> None:
+    """Write ``text`` so a reader meets the old file or the new one, never
+    a partial one: the Direct manager reads a config back right after the
+    session's own builder wrote the same path. A temp file of its own per
+    writer, beside the target (so the rename stays on one filesystem and two
+    writers of one path never share a temp name), then one rename; a write
+    that fails leaves no temp file behind."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 # The per-session build directories under ``user-mcp-configs/``: one per
@@ -2811,6 +2976,26 @@ _SESSION_BUILDS = "sessions"
 _SESSION_BUILD_TTL_S = 24 * 3600
 _BUILD_SWEEP_EVERY_S = 3600.0
 _build_sweep_at: float | None = None
+
+
+def _names_cli_token(value: Any) -> bool:
+    """Whether a string inside an entry's values names the shell's
+    command-line token (Claude would expand ``${OTO_CLI_TOKEN}`` there).
+    Keys are not values: the platform's own blank under that name is fine."""
+    if isinstance(value, str):
+        return CLI_TOKEN_ENV in value
+    if isinstance(value, dict):
+        return any(_names_cli_token(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_names_cli_token(v) for v in value)
+    return False
+
+
+def _strip_keys(bash_env_keys: set[str]) -> str:
+    """A wrapped stdio MCP's ``OTO_STRIP_KEYS``: the shell's git helper
+    entries and its command-line token, which the CLI's env carries and no
+    MCP may hold."""
+    return ",".join(sorted({*bash_env_keys, CLI_TOKEN_ENV}))
 
 
 def _sweep_session_builds(root: Path) -> None:
@@ -2876,7 +3061,7 @@ def inject_credential_env_into_toml(
 
     try:
         servers = json.loads(json_sidecar.read_text())
-    except Exception:
+    except (OSError, ValueError):
         return toml_path
 
     _exclude = exclude_keys or set()
@@ -2913,6 +3098,12 @@ def _servers_to_toml(servers: dict[str, dict]) -> str:
         # per-MCP overrides) because remote cold starts pay the tunnel broker
         # fetch + on-satellite import.
         lines.append("startup_timeout_sec = 10")
+        # The per-call limit a manifest asks for (``server.tool_timeout_sec``;
+        # Codex's own default is 60 s). In the server's own table, ahead of
+        # any ``http_headers`` sub-table a key after would belong to.
+        tool_timeout = entry.get("tool_timeout_sec")
+        if tool_timeout:
+            lines.append(f"tool_timeout_sec = {int(tool_timeout)}")
         srv_type = entry.get("type", "stdio")
 
         if srv_type == "stdio":

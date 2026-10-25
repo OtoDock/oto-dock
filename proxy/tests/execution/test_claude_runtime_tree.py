@@ -16,6 +16,7 @@ import dataclasses
 import pytest
 
 from auth.path_policy import SecurityContext, _check_remote_bash_path
+from core import placement
 from core.session import session_state
 from services.path_policy_v2 import (
     PathPolicyContext,
@@ -23,7 +24,6 @@ from services.path_policy_v2 import (
     context_from_security,
     resolve_path_for_session,
 )
-from core import placement
 
 SID = "76fe15d2-9b5b-495c-9c6c-42e6626f88f6"
 OTHER_SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"

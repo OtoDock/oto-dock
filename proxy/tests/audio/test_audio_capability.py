@@ -6,11 +6,10 @@ Exercises the policy × native-support × provider-config matrix + the
 
 from __future__ import annotations
 
-
 from services.media import audio_service
-from storage.prefs import audio_provider_store
-from storage.identity import credential_store
 from storage import database as task_store
+from storage.identity import credential_store
+from storage.prefs import audio_provider_store
 
 
 def _set(key, value):
@@ -24,6 +23,37 @@ def _usable_tts_default():
     credential_store.set_infra_credentials("audio-cartesia", {"API_KEY": "sk-x"})
     audio_provider_store.set_default(p["id"], "chat")
     return p
+
+
+def test_language_identify_reports_the_identifier_state(temp_db, monkeypatch):
+    from audio.providers.lid import ecapa
+    monkeypatch.setattr(ecapa, "identifier_available", lambda model_path=None: True)
+    cap = audio_service.resolve_chat_audio_capability(has_native_tts=True, has_native_stt=True)
+    assert cap.language_identify is True
+    _set("audio_language_identify_enabled", "false")
+    cap = audio_service.resolve_chat_audio_capability(has_native_tts=True, has_native_stt=True)
+    assert cap.language_identify is False
+    _set("audio_language_identify_enabled", "true")
+    monkeypatch.setattr(ecapa, "identifier_available", lambda model_path=None: False)
+    cap = audio_service.resolve_chat_audio_capability(has_native_tts=True, has_native_stt=True)
+    assert cap.language_identify is False
+
+
+def test_the_proxy_prewarms_the_identifier_only_with_a_chat_stt_provider(temp_db, monkeypatch):
+    from audio.providers.lid import ecapa
+
+    from storage.identity import credential_store
+    from storage.prefs import audio_provider_store
+    monkeypatch.setattr(ecapa, "identifier_available", lambda model_path=None: True)
+    assert audio_service.language_identify_prewarm_wanted() is False
+    p = audio_provider_store.create_provider({
+        "provider_type": "stt", "provider_name": "deepgram", "credential_key": "audio-deepgram",
+    })
+    credential_store.set_infra_credentials("audio-deepgram", {"API_KEY": "dg-x"})
+    audio_provider_store.set_default(p["id"], "chat")
+    assert audio_service.language_identify_prewarm_wanted() is True
+    _set("audio_language_identify_enabled", "false")
+    assert audio_service.language_identify_prewarm_wanted() is False
 
 
 def test_kill_switch_disabled_short_circuits(temp_db):

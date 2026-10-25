@@ -37,29 +37,30 @@ import uuid
 from dataclasses import dataclass
 
 import config
-from core.config.config_builder import (
-    build_agent_config, release_config_seat,
-)
+from auth.providers import acting_role_of
 from core import placement
-from core.config.task_config_builder import (
-    resolve_task_identity, run_allows_knowledge_rw,
+from core.config.config_builder import (
+    build_agent_config,
+    release_config_seat,
 )
-from core.execution_layer import ExecutionLayer
-from core.session import interactive_session
-from core.session.session_manager import get_execution_layer
+from core.config.task_config_builder import rewarm_task_identity
+from core.execution_layer import ASK_MODE, ExecutionLayer, ResumeVerdict
+from core.session import interactive_session, session_kind
+from core.session.resume_probe import RESUME_PROBE_BUDGET_INLINE_S, settle_resume
+from core.session.session_manager import get_execution_layer, resolve_execution_path
 from core.session.session_state import (
     clear_session_liveness,
     get_user_tz,
     set_session_user_tz,
 )
 from storage import database as task_store
+
 # Module-level pure helpers of ws/dashboard.py (an intra-unit import).
 from ws.dashboard import (
     _resolve_session_interactive,
     _resume_username_for_chat,
 )
-from core.session import session_kind
-from auth.providers import acting_role_of
+from ws.dashboard_chat_support import coerce_chat_mode
 
 logger = logging.getLogger("otodock")
 
@@ -106,9 +107,12 @@ async def resume_dead_session_headless(
     if live_isess is not None and live_isess.alive:
         raise ResumeUnavailable("live_interactive_session")
 
-    perm_mode = chat.get("permission_mode", "default")
     chat_model = chat.get("model") or ""
     exec_path = chat.get("execution_path") or ""
+    # The stored mode as the chat's engine offers it (a Direct LLM chat
+    # stored in Auto resumes in Ask, the row written), as the warm-up reads it.
+    perm_mode = await coerce_chat_mode(
+        chat_id, chat.get("permission_mode") or ASK_MODE, resolve_execution_path(agent, exec_path))
     pinned = chat.get("execution_target") or ""
     exec_mode = chat.get("execution_mode") or ""
 
@@ -122,18 +126,34 @@ async def resume_dead_session_headless(
             await asyncio.wait_for(inflight.wait(), timeout=120)
         except asyncio.TimeoutError:
             logger.warning(
-                f"headless resume: one-shot still running after 120s on "
-                f"chat={chat_id}: resuming anyway"
+                "headless resume: one-shot still running after 120s on "
+                "chat=%s: resuming anyway", chat_id
             )
 
+    # A chat on a place this person may not use (a shared chat another person
+    # moved to their computer) is never healed here: the person's own send
+    # hands it over first (ws/dashboard_chat_move.py).
+    from services.remote import chat_move
+    _role = await asyncio.to_thread(acting_role_of, user_sub, agent, fallback_user=user)
+    if await asyncio.to_thread(chat_move.placement_blocked, chat, user_sub, _role):
+        raise ResumeUnavailable("placement")
+
     # ORDER IS LOAD-BEARING: can_resume_session BEFORE prepare_resume (see
-    # module doc). Same rule as the dashboard helper.
-    can_resume = await layer_for_chat.can_resume_session(
-        dead_sid, agent_name=agent,
-        username=_resume_username_for_chat(
-            chat_id, agent, user.get("username", "") or "",
+    # module doc). Same rule as the dashboard helper. A person is on the
+    # line (the duplex voice heal), so the probe waits the inline budget and
+    # a machine that did not answer refuses the heal with nothing mutated:
+    # the caller reads the sentinel as a failed heal, like the offline one.
+    from storage.pg import run_db
+    verdict = await settle_resume(
+        layer_for_chat, dead_sid, agent_name=agent,
+        username=await run_db(
+            _resume_username_for_chat, chat_id, agent, user.get("username", "") or "",
         ),
+        budget_s=RESUME_PROBE_BUDGET_INLINE_S,
     )
+    if verdict is ResumeVerdict.UNKNOWN:
+        raise RuntimeError("session_machine_busy")
+    can_resume = verdict is ResumeVerdict.RESUMABLE
     await layer_for_chat.prepare_resume(dead_sid)
 
     sid = dead_sid
@@ -150,19 +170,9 @@ async def resume_dead_session_headless(
         clear_session_liveness(dead_sid, reason="resume_failed")
         sid = str(uuid.uuid4())
 
-    from storage.pg import run_db
     effective_role = await run_db(acting_role_of, user_sub, agent, fallback_user=user)
-    task_identity = None
-    if session_kind.is_task_chat_id(chat_id):
-        run = task_store.get_run(session_kind.run_id_of_chat(chat_id))
-        if run:
-            # Same fire, same provenance: the knowledge-RW opt-in follows
-            # the run row's kind (task_kinds.RUN_KINDS: scheduled and
-            # delegate opt in).
-            task_identity = resolve_task_identity(
-                agent, run.get("scope") or "agent", run.get("created_by"),
-                allow_knowledge_rw=run_allows_knowledge_rw(run.get("task_type")),
-            )
+    task_identity = (await run_db(rewarm_task_identity, chat_id, agent)
+                     if session_kind.is_task_chat_id(chat_id) else None)
     agent_cfg = await build_agent_config(
         agent_name=agent, user=user, user_sub=user_sub,
         user_role=effective_role, permission_mode=perm_mode,
@@ -177,7 +187,7 @@ async def resume_dead_session_headless(
         # migrating the session off its workspace would be worse.
         release_config_seat(sid, agent_cfg)
         raise RuntimeError("session_machine_offline")
-    if _resolve_session_interactive(agent_cfg, exec_mode):
+    if await run_db(_resolve_session_interactive, agent_cfg, exec_mode):
         # v1 scope guard — nothing mutated yet beyond prepare_resume, which
         # is what a refused dashboard resume does too.
         release_config_seat(sid, agent_cfg)

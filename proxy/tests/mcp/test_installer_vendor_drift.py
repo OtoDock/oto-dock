@@ -32,6 +32,8 @@ _VENDORED = [
      "satellite/_vendored/terminal_queries.py", "SHARED_TERMINAL_QUERIES_HASH"),
     ("proxy/core/layout.py",
      "satellite/_vendored/layout.py", "SHARED_LAYOUT_HASH"),
+    ("proxy/core/loop_watchdog.py",
+     "satellite/_vendored/loop_watchdog.py", "SHARED_LOOP_WATCHDOG_HASH"),
 ]
 
 _IDS = [src.rsplit("/", 1)[-1] for src, _, _ in _VENDORED]

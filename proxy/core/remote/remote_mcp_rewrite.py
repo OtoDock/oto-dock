@@ -11,6 +11,8 @@ must be monkeypatched HERE (core.remote.remote_mcp_rewrite), not on remote_execu
 
 import json
 import re
+from typing import cast
+
 from core import host_os
 from core.credentials.mcp_gateway import GATEWAY_PATH_PREFIX, gateway_key_of
 
@@ -87,7 +89,7 @@ def _resolve_satellite_mcp_path_info(slug: str):
         if manifest is not None:
             sat_category = manifest.category or ""
             platform_dir = str(manifest.mcp_dir.resolve())
-    except Exception:
+    except OSError:
         pass
     return sat_category, sat_name, platform_dir, manifest
 
@@ -105,7 +107,7 @@ def _gateway_json_entry(
     removed where it does not: no vendor ever receives a session token."""
     path = facts.get("path") or "/"
     headers = dict(server.get("headers") or {})
-    if facts.get("proxy_local"):
+    if facts.get("proxy_local") or facts.get("tunneled"):
         sess = f"?session_id={session_id}" if session_id else ""
         server["url"] = f"http://127.0.0.1:{sat_port}/mcp/{name}{path}{sess}"
     elif gateway_mode:
@@ -123,7 +125,7 @@ def _gateway_json_entry(
 
 def _rewrite_mcp_json_for_remote(
     mcp_config: dict, sat_port: int, *, target_os: str = "linux",
-    session_id: str = "", secret_bundle_keys: set = frozenset(),
+    session_id: str = "", secret_bundle_keys: set | frozenset = frozenset(),
     proxy_api_key: str = "", gateway: dict | None = None, gateway_mode: bool = False,
 ) -> dict:
     """Rewrite JSON MCP config (CLI format) for remote execution.
@@ -153,8 +155,9 @@ def _rewrite_mcp_json_for_remote(
         # in the tunnel allowlist `/mcp/<slug>/...`.
         elif "url" in server and sat_port:
             from urllib.parse import urlparse
-            from services.mcp import mcp_registry
+
             from core.config import deployment
+            from services.mcp import mcp_registry
             parsed = urlparse(server["url"])
             # Only tunnel proxy-local Docker MCPs. External hosted MCPs
             # (Linear/Slack/Notion/Zoom) carry a real public host and must reach
@@ -273,7 +276,7 @@ _REMOTE_MCP_STARTUP_OVERRIDES = {
 def _rewrite_mcp_toml_for_remote(
     toml_content: str, sat_port: int, *, target_os: str = "linux",
     session_id: str = "", proxy_api_key: str = "",
-    secret_bundle_keys: set = frozenset(),
+    secret_bundle_keys: set | frozenset = frozenset(),
     gateway: dict | None = None, gateway_mode: bool = False,
 ) -> str:
     """Rewrite TOML MCP config (Codex format) for remote execution.
@@ -306,9 +309,10 @@ def _rewrite_mcp_toml_for_remote(
       so a plain append before the closing brace is duplicate-key-safe.
     """
     import re
+
     from auth.session_token import SESSION_JWT_SENTINEL_BEARER
-    from services.mcp import mcp_registry
     from core.config import deployment
+    from services.mcp import mcp_registry
 
     section_re = re.compile(r"^\[mcp_servers\.([a-zA-Z0-9_-]+)\]")
     env_re = re.compile(r'^(\s*env\s*=\s*\{)(.*)\}(\s*)$')
@@ -334,7 +338,7 @@ def _rewrite_mcp_toml_for_remote(
     inline_headers: dict[str, tuple[str, str]] = {
         slug: (str(f.get("header") or "Authorization"), str(f.get("value") or ""))
         for slug, f in (gateway or {}).items()
-        if not f.get("proxy_local") and not gateway_mode
+        if not f.get("proxy_local") and not f.get("tunneled") and not gateway_mode
     }
 
     out_lines: list[str] = []
@@ -365,8 +369,8 @@ def _rewrite_mcp_toml_for_remote(
             floor = _REMOTE_MCP_STARTUP_OVERRIDES.get(
                 current_slug or "", _REMOTE_MCP_STARTUP_FLOOR
             )
-            value = max(int(sm2.group(2)), floor)
-            out_lines.append(f"{sm2.group(1)}{value}{sm2.group(3)}{nl}")
+            timeout_s = max(int(sm2.group(2)), floor)
+            out_lines.append(f"{sm2.group(1)}{timeout_s}{sm2.group(3)}{nl}")
             continue
 
         # url → satellite loopback tunnel (proxy-local Docker MCPs only),
@@ -376,7 +380,7 @@ def _rewrite_mcp_toml_for_remote(
         if um and facts is not None and gateway_key_of(
                 f"{um.group(2)}{um.group(3)}{um.group(4) or ''}{um.group(5) or ''}") == current_slug:
             entry = _gateway_json_entry(
-                {"url": "", "headers": {}}, current_slug, facts, sat_port, session_id, gateway_mode,
+                {"url": "", "headers": {}}, cast("str", current_slug), facts, sat_port, session_id, gateway_mode,
             )
             out_lines.append(f'{um.group(1)}{_esc(entry["url"])}{um.group(6)}{nl}')
             continue
@@ -468,7 +472,7 @@ def _rewrite_mcp_toml_for_remote(
                 from core.credentials import mcp_broker
                 pairs.append((
                     "OTO_MCP_FETCH_TOKEN",
-                    mcp_broker.mint_token(session_id, current_slug),
+                    mcp_broker.mint_token(session_id, cast("str", current_slug)),
                 ))
             if not pairs:
                 out_lines.append(line)

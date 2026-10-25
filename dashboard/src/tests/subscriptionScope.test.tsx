@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
-import { render, screen, waitFor, fireEvent, within } from '@testing-library/react'
+import { act, render, screen, waitFor, fireEvent, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 
@@ -16,6 +16,9 @@ import { SubscribeToEventsModal } from '@/components/accounts/SubscribeToEventsM
 import { SubscriptionsPanel } from '@/components/accounts/SubscriptionsPanel'
 import { ServiceAccountBindingDropdown } from '@/components/ServiceAccountBindingDropdown'
 import { CreateTriggerModal, EditTriggerModal } from '@/pages/agent/AgentTriggers.modals'
+import DialogsHost from '@/components/ui/DialogsHost'
+import { answerDialog, findAlertDialog } from './dialogsHarness'
+import { REGISTRATION_MODE_APP } from '@/lib/kinds/oauthApp'
 
 const fetchSpy = vi.spyOn(authApi, 'apiFetch')
 
@@ -110,10 +113,15 @@ describe('SubscribeToEventsModal — subscribe as', () => {
     const select = screen.getByLabelText('Subscribe as') as HTMLSelectElement
     const options = within(select).getAllByRole('option') as HTMLOptionElement[]
     expect(options.map((o) => o.textContent)).toEqual([
-      'Me (personal)', 'Agent Developer', 'Agent Ops (managers only)',
+      'Me, personal', 'Agent Developer', 'Agent Ops, managers only',
     ])
     expect(options[2].disabled).toBe(true)
     expect(select.value).toBe('__me__')
+    expect(screen.getByText(
+      'A personal subscription fires only your own triggers and apps. Pick an agent when a shared trigger or app should react.',
+    )).toBeInTheDocument()
+    fireEvent.change(select, { target: { value: 'dev' } })
+    expect(screen.getByText("An agent's subscription fires the agent's shared triggers and apps.")).toBeInTheDocument()
   })
 
   it('sends scope=service and the agent when an agent is chosen', async () => {
@@ -163,20 +171,41 @@ describe('SubscribeToEventsModal — subscribe as', () => {
     wrap(<SubscribeToEventsModal {...modalProps} scope="service" agent="dev" serviceOptions={BINDINGS} />)
     expect(screen.queryByLabelText('Subscribe as')).toBeNull()
     expect(screen.getByText('dev')).toBeInTheDocument()
+    expect(screen.getByText(/with the account set as its service account\. The agent's shared triggers and apps fire on these events\./))
+      .toBeInTheDocument()
   })
 
   it('a missing-scopes refusal in service scope says the bound owner must reconnect', async () => {
     fetchSpy.mockImplementation(async () =>
       fail(400, { error: 'missing_scopes', message: 'm', required: ['repo'], action: 'reconnect' }))
-    wrap(<SubscribeToEventsModal {...modalProps} scope="service" agent="dev" />)
+    wrap(<SubscribeToEventsModal {...modalProps} scope="service" agent="dev" scopeServices={{ repo: 'Repositories' }} />)
     fireEvent.change(screen.getByPlaceholderText('owner/repo'), { target: { value: 'o/r' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create subscription' }))
-    expect(await screen.findByText(/The bound account acct is missing the scopes repo/)).toBeInTheDocument()
+    // The refusal reads in the scope line's words.
+    expect(await screen.findByText(
+      "These events need the repo permission. The account's owner must reconnect it and tick Repositories.",
+    )).toBeInTheDocument()
   })
 })
 
 describe('SubscriptionsPanel — both scopes with a pill', () => {
   beforeEach(() => { fetchSpy.mockReset() })
+
+  it('tells the dialog when the account subscribes to an installation', async () => {
+    const installation = {
+      ...CATALOG, target_kind: 'installation', registration: { mode: 'relay' },
+      vendor_target_spec: { kind: 'static_list', label: 'Installation', static_options: [{ value: '10', label: 'me (1 repository)' }] },
+    }
+    fetchSpy.mockImplementation(async (path: string) => {
+      if (path.includes('/webhook-event-catalog')) return ok(installation)
+      if (path.startsWith('/v1/subscriptions')) return ok({ subscriptions: [] })
+      return ok({})
+    })
+    wrap(<SubscriptionsPanel mcpName="github-mcp" accountLabel="acct" />)
+    fireEvent.click(await screen.findByRole('button', { name: '+ Subscribe to events' }))
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    expect(screen.queryByText(/Events come/)).toBeNull()
+  })
 
   it('lists my personal rows and the rows of agents this account serves', async () => {
     fetchSpy.mockImplementation(async (path: string) => {
@@ -218,14 +247,15 @@ describe('SubscriptionsPanel — both scopes with a pill', () => {
       if (path.startsWith('/v1/subscriptions')) return ok({ subscriptions: [row({})] })
       return ok({})
     })
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
-    wrap(<SubscriptionsPanel mcpName="github-mcp" accountLabel="acct" />)
+    wrap(<><SubscriptionsPanel mcpName="github-mcp" accountLabel="acct" /><DialogsHost /></>)
     fireEvent.click(await screen.findByRole('button', { name: 'Delete' }))
+    await act(async () => { await answerDialog('Delete') })
+    await waitFor(() => expect(deletes).toHaveLength(1))
+    const second = await findAlertDialog('Delete it anyway?')
+    expect(second.textContent).toContain('On push')
+    await act(async () => { await answerDialog('Delete anyway') })
     await waitFor(() => expect(deletes).toHaveLength(2))
     expect(deletes[1]).toBe('/v1/subscriptions/sub-1?force=true')
-    expect(confirmSpy).toHaveBeenCalledTimes(2)
-    expect(String(confirmSpy.mock.calls[1][0])).toContain('On push')
-    confirmSpy.mockRestore()
   })
 })
 
@@ -262,12 +292,12 @@ describe('Agent MCPs tab — subscribe for this agent', () => {
   it('shows nothing without a binding or without agent scope', async () => {
     fetchSpy.mockImplementation(routes(null))
     wrap(<ServiceAccountBindingDropdown agentName="dev" mcpName="github-mcp" callerSub="me" agentScopeAvailable />)
-    await screen.findByText('(no service account)')
+    await screen.findByText('No service account')
     expect(screen.queryByTestId('agent-service-subscriptions')).toBeNull()
 
     fetchSpy.mockImplementation(routes(bound))
     wrap(<ServiceAccountBindingDropdown agentName="dev" mcpName="github-mcp" callerSub="me" agentScopeAvailable={false} />)
-    await waitFor(() => expect(screen.getAllByText('(no service account)').length).toBe(2))
+    await waitFor(() => expect(screen.getAllByText('No service account').length).toBe(2))
     expect(screen.queryByTestId('agent-service-subscriptions')).toBeNull()
   })
 })
@@ -295,11 +325,11 @@ describe('Create trigger — subscription picker follows the scope', () => {
     fireEvent.change(source, { target: { value: 'vendor' } })
     const picker = await screen.findByTestId('trigger-subscription')
     await waitFor(() => expect(within(picker).getAllByRole('option').map((o) => o.textContent))
-      .toEqual(['— Choose —', 'github/mine/repo · push', 'Paste a subscription id…']))
+      .toEqual(['Choose…', 'github/mine/repo · push', 'Paste a subscription id…']))
 
-    fireEvent.change(screen.getByDisplayValue('User (personal automation)'), { target: { value: 'agent' } })
+    fireEvent.change(screen.getByDisplayValue('User: a personal automation'), { target: { value: 'agent' } })
     await waitFor(() => expect(within(picker).getAllByRole('option').map((o) => o.textContent))
-      .toEqual(['— Choose —', 'github/dev/repo · push', 'Paste a subscription id…']))
+      .toEqual(['Choose…', 'github/dev/repo · push', 'Paste a subscription id…']))
     expect(asked.some((p) => p.includes('scope=service') && p.includes('agent=dev'))).toBe(true)
   })
 
@@ -318,23 +348,22 @@ describe('Create trigger — subscription picker follows the scope', () => {
       if (path.startsWith('/v1/apps')) return ok({ apps: [] })
       return ok({})
     })
-    const alertSpy = vi.spyOn(window, 'alert').mockImplementation(() => {})
     wrap(<CreateTriggerModal agent="dev" onClose={() => {}} canCreateAgentScope />)
     fireEvent.change(await screen.findByDisplayValue('Generic webhook URL'), { target: { value: 'vendor' } })
     const picker = await screen.findByTestId('trigger-subscription')
     await waitFor(() => expect(within(picker).getAllByRole('option')).toHaveLength(3))
     fireEvent.change(picker, { target: { value: 's-me' } })
 
-    fireEvent.change(screen.getByDisplayValue('User (personal automation)'), { target: { value: 'agent' } })
+    fireEvent.change(screen.getByDisplayValue('User: a personal automation'), { target: { value: 'agent' } })
     fireEvent.change(screen.getByPlaceholderText('e.g. GitHub PR opened'), { target: { value: 'On push' } })
     fireEvent.change(screen.getByPlaceholderText('e.g. PR merged: {{title}}'), { target: { value: 't' } })
     fireEvent.change(screen.getByPlaceholderText('e.g. {{author}} merged #{{number}}'), { target: { value: 'b' } })
     fireEvent.submit(screen.getByPlaceholderText('e.g. GitHub PR opened').closest('form')!)
 
-    await waitFor(() => expect(alertSpy).toHaveBeenCalled())
-    expect(String(alertSpy.mock.calls[0][0])).toContain("this agent's subscriptions")
+    // The refusal is the form's own line, read out as it appears.
+    const refusal = await screen.findByRole('alert')
+    expect(refusal.textContent).toContain("this agent's subscriptions")
     expect(posts).toEqual([])
-    alertSpy.mockRestore()
   })
 
   it('says where to create one when the scope has none', async () => {
@@ -348,7 +377,7 @@ describe('Create trigger — subscription picker follows the scope', () => {
     wrap(<CreateTriggerModal agent="dev" onClose={() => {}} canCreateAgentScope />)
     const source = await screen.findByDisplayValue('Generic webhook URL')
     fireEvent.change(source, { target: { value: 'vendor' } })
-    expect(await screen.findByText(/No agent subscriptions yet: Agent Settings → MCPs/)).toBeInTheDocument()
+    expect(await screen.findByText(/No agent subscriptions yet\. Add one in the agent's MCPs/)).toBeInTheDocument()
   })
 })
 
@@ -379,7 +408,7 @@ describe('Edit trigger — the subscription can be bound later', () => {
     wrap(<EditTriggerModal trigger={trigger} onClose={() => {}} />)
     const picker = await screen.findByTestId('edit-trigger-subscription')
     await waitFor(() => expect(within(picker).getAllByRole('option').map((o) => o.textContent))
-      .toEqual(['— None —', 'github/dev/repo · push']))
+      .toEqual(['None', 'github/dev/repo · push']))
     fireEvent.change(picker, { target: { value: 's-dev' } })
     fireEvent.click(screen.getByRole('button', { name: /Save/i }))
     await waitFor(() => expect(posted).toHaveLength(1))
@@ -396,7 +425,7 @@ describe('Edit trigger — the subscription can be bound later', () => {
     })
     wrap(<EditTriggerModal trigger={{ ...trigger, subscription_id: 's-old' }} onClose={() => {}} />)
     const picker = await screen.findByTestId('edit-trigger-subscription')
-    expect(within(picker).getAllByRole('option').map((o) => o.textContent)).toEqual(['— None —', 's-old (current)'])
+    expect(within(picker).getAllByRole('option').map((o) => o.textContent)).toEqual(['None', 's-old, current'])
     fireEvent.click(screen.getByRole('button', { name: /Save/i }))
     await waitFor(() => expect(posted).toHaveLength(1))
     expect('subscription_id' in posted[0]).toBe(false)
@@ -472,5 +501,99 @@ describe('SubscribeToEventsModal — target kinds', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create subscription' }))
     await waitFor(() => expect(posts).toHaveLength(1))
     expect(posts[0]).toMatchObject({ vendor_target: 'o/r', vendor_target_kind: '' })
+  })
+})
+
+// ─── The scope line: one sentence above the events, only when the account
+//     lacks a scope they need, never under each event ───
+
+const SCOPED_EVENTS = [
+  { key: 'push', label: 'Push', required_scopes: ['repo'] },
+  { key: 'workflow_run', label: 'Workflow runs', required_scopes: ['repo', 'workflow'] },
+]
+const SERVICES = { repo: 'Repositories', workflow: 'GitHub Actions', 'admin:org_hook': 'Organization webhooks' }
+
+describe('SubscribeToEventsModal — the scope line', () => {
+  const scoped = { ...modalProps, eventCatalog: SCOPED_EVENTS, scopeServices: SERVICES }
+
+  it('names the permission and the service to tick when the account lacks it', () => {
+    wrap(<SubscribeToEventsModal {...scoped} grantedScopes={['read:user']} />)
+    // Before a tick: the scopes every listed event needs.
+    expect(screen.getByTestId('scope-notice').textContent).toBe(
+      'These events need the repo permission. Reconnect the account and tick Repositories.',
+    )
+    fireEvent.click(screen.getByRole('checkbox', { name: /Workflow runs/ }))
+    expect(screen.getByTestId('scope-notice').textContent).toBe(
+      'These events need the repo and workflow permissions. Reconnect the account and tick Repositories and GitHub Actions.',
+    )
+    expect(screen.queryByText(/Required scopes/)).toBeNull()
+  })
+
+  it('says nothing when the account has the scopes, or when they are not known', () => {
+    const { unmount } = wrap(<SubscribeToEventsModal {...scoped} grantedScopes={['repo', 'workflow']} />)
+    expect(screen.queryByTestId('scope-notice')).toBeNull()
+    unmount()
+    // A token or a GitHub App installation: the catalog answers null.
+    wrap(<SubscribeToEventsModal {...scoped} grantedScopes={null} registrationMode={REGISTRATION_MODE_APP} />)
+    expect(screen.queryByTestId('scope-notice')).toBeNull()
+    expect(screen.queryByText(/Required scopes/)).toBeNull()
+  })
+
+  it('adds the chosen kind and words the bound owner on a fixed agent', () => {
+    wrap(<SubscribeToEventsModal {...scoped} grantedScopes={['repo']} vendorTargetSpec={KINDS_SPEC as any}
+      scope="service" agent="dev" />)
+    expect(screen.queryByTestId('scope-notice')).toBeNull()
+    fireEvent.click(within(screen.getByRole('radiogroup', { name: 'Subscribe to' })).getAllByRole('radio')[1])
+    expect(screen.getByTestId('scope-notice').textContent).toBe(
+      "This subscription needs the admin:org_hook permission. The account's owner must reconnect it and tick Organization webhooks.",
+    )
+  })
+
+  it('words a refusal for the organization kind as the line does', async () => {
+    fetchSpy.mockImplementation(async () =>
+      fail(400, { error: 'missing_scopes', message: 'm', required: ['admin:org_hook'], action: 'reconnect' }))
+    wrap(<SubscribeToEventsModal {...scoped} vendorTargetSpec={KINDS_SPEC as any} />)
+    fireEvent.click(within(screen.getByRole('radiogroup', { name: 'Subscribe to' })).getAllByRole('radio')[1])
+    fireEvent.click(screen.getByRole('checkbox', { name: /Push/ }))
+    fireEvent.change(screen.getByPlaceholderText('octocat-org'), { target: { value: 'OtoDock' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create subscription' }))
+    expect(await screen.findByText(
+      'This subscription needs the admin:org_hook permission. Reconnect the account and tick Organization webhooks.',
+    )).toBeInTheDocument()
+  })
+
+  it('names a URL-shaped scope by its last part and a scope no service asks for as a fault', () => {
+    const graph = [{ key: 'mail', label: 'Mail', required_scopes: ['https://graph.microsoft.com/Mail.Read'] }]
+    const { unmount } = wrap(<SubscribeToEventsModal {...modalProps} eventCatalog={graph} grantedScopes={[]}
+      scopeServices={{ 'https://graph.microsoft.com/Mail.Read': 'Mail' }} />)
+    expect(screen.getByTestId('scope-notice').textContent).toBe(
+      'These events need the Mail.Read permission. Reconnect the account and tick Mail.',
+    )
+    unmount()
+    wrap(<SubscribeToEventsModal {...modalProps} eventCatalog={graph} grantedScopes={[]} scopeServices={{ other: 'Other' }} />)
+    expect(screen.getByTestId('scope-notice').textContent).toBe(
+      'These events need the Mail.Read permission. No service of this MCP grants Mail.Read, so its author needs to fix this.',
+    )
+  })
+
+  it('names the scopes in one order on the line and in the refusal', async () => {
+    fetchSpy.mockImplementation(async () =>
+      fail(400, { error: 'missing_scopes', message: 'm', required: ['admin:org_hook', 'repo'], action: 'reconnect' }))
+    wrap(<SubscribeToEventsModal {...scoped} grantedScopes={[]} vendorTargetSpec={KINDS_SPEC as any} />)
+    fireEvent.click(within(screen.getByRole('radiogroup', { name: 'Subscribe to' })).getAllByRole('radio')[1])
+    const line = 'These events need the admin:org_hook and repo permissions. Reconnect the account and tick Organization webhooks and Repositories.'
+    expect(screen.getByTestId('scope-notice').textContent).toBe(line)
+    fireEvent.click(screen.getByRole('checkbox', { name: /Push/ }))
+    fireEvent.change(screen.getByPlaceholderText('octocat-org'), { target: { value: 'OtoDock' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create subscription' }))
+    await waitFor(() => expect(screen.getAllByText(line)).toHaveLength(2))
+  })
+
+  it('names the scopes no service grants beside the ones a service does', () => {
+    const mixed = [{ key: 'x', label: 'X', required_scopes: ['repo', 'secret:scope'] }]
+    wrap(<SubscribeToEventsModal {...modalProps} eventCatalog={mixed} grantedScopes={[]} scopeServices={SERVICES} />)
+    expect(screen.getByTestId('scope-notice').textContent).toBe(
+      'These events need the repo and secret:scope permissions. No service of this MCP grants secret:scope, so its author needs to fix this.',
+    )
   })
 })

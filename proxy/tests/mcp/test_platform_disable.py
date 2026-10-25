@@ -23,7 +23,9 @@ def _admin() -> UserContext:
 
 def _make_manifest(name, category="core"):
     from services.mcp.mcp_registry import (
-        McpManifest, ServerConfig, CredentialConfig,
+        CredentialConfig,
+        McpManifest,
+        ServerConfig,
     )
     return McpManifest(
         name=name,

@@ -9,10 +9,10 @@ import io
 import wave
 
 import pytest
+from audio.providers.tts.base import UnsupportedProviderOperation, VoiceInfo
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from audio.providers.tts.base import UnsupportedProviderOperation, VoiceInfo
 from auth.providers import UserContext, get_current_user
 from services.media import audio_service
 from storage import database as task_store
@@ -226,10 +226,10 @@ def test_a_missing_provider_says_where_to_pick_one(monkeypatch, builder, kind):
     with pytest.raises(audio_service.AudioUnavailableError) as stale:
         getattr(audio_service, builder)(*args, provider_id=1)
     assert str(stale.value) == (
-        f"No {kind.upper()} provider with id 1 is configured: select one in Admin, Audio.")
+        f"No {kind.upper()} provider with id 1 is configured: select one in Setup, Audio.")
     with pytest.raises(audio_service.AudioUnavailableError) as none:
         getattr(audio_service, builder)(*args)
-    assert str(none.value) == f"No {kind.upper()} provider configured: select one in Admin, Audio."
+    assert str(none.value) == f"No {kind.upper()} provider configured: select one in Setup, Audio."
 
 
 def test_generate_empty_audio_is_502(client, harness):
@@ -372,3 +372,24 @@ def test_build_generate_provider_default_falls_back_to_calls(temp_db, monkeypatc
     table.clear()
     with pytest.raises(audio_service.AudioUnavailableError):
         audio_service.build_generate_provider()
+
+
+def test_a_stale_provider_id_is_its_own_error_class(harness):
+    """The 404 is decided by the class, never by the wording."""
+    assert isinstance(audio_service._no_provider("tts", 99), audio_service.ProviderNotFoundError)
+    assert not isinstance(audio_service._no_provider("tts"), audio_service.ProviderNotFoundError)
+    client = _make_client(harness)
+    harness_build = harness.build
+
+    def reworded(**kwargs):
+        raise audio_service.ProviderNotFoundError("that provider is gone")
+
+    def plain(**kwargs):
+        raise audio_service.AudioUnavailableError("No TTS provider with id 7 is configured")
+    try:
+        audio_service.build_generate_provider = reworded
+        assert client.post("/v1/audio/tts/generate", json={"text": "hi", "provider_id": 99}).status_code == 404
+        audio_service.build_generate_provider = plain
+        assert client.post("/v1/audio/tts/generate", json={"text": "hi"}).status_code == 503
+    finally:
+        audio_service.build_generate_provider = harness_build

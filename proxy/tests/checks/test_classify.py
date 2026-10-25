@@ -96,6 +96,7 @@ def test_a_local_write_inside_a_checkout_is_in_a_git_place(tmp_path, monkeypatch
     # A local session names its files by the sandbox-virtual form; the
     # checkout walk runs over the platform's copy of the tree.
     import asyncio
+
     import config
     from auth.path_policy import SecurityContext
     from core.session import session_events as se
@@ -123,6 +124,7 @@ def test_a_persons_patterns_never_backtrack():
     # answer at once, and with the same meaning.
     import asyncio
     import time
+
     from services.checks import documents
     from services.checks.kinds import schema_kind
     evil = "a" * 2000 + "!"
@@ -135,7 +137,8 @@ def test_a_persons_patterns_never_backtrack():
         "type": "object", "properties": {"id": {"type": "string", "pattern": r"^(a|aa)+$"}},
         "patternProperties": {r"^(x+x+)+y$": {"type": "integer"}}, "additionalProperties": False}})
     check = documents.CheckDoc(agent="a", owner="", name="shape", doc=doc, folder=None, doc_sha256="")
-    answer = '```json\n{"id": "%s", "%s": 1}\n```' % ("a" * 3000 + "!", "x" * 3000)
+    value, key = "a" * 3000 + "!", "x" * 3000
+    answer = f'```json\n{{"id": "{value}", "{key}": 1}}\n```'
     v = asyncio.run(schema_kind.run(check, None, {"result": answer}, round_no=1))
     assert time.monotonic() - started < 2.0
     assert v.status == "fail" and len(v.findings) == 2

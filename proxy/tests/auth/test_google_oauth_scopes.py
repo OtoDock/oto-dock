@@ -18,7 +18,10 @@ import pytest
 
 from services.mcp import mcp_registry
 from services.mcp.mcp_registry import (
-    McpManifest, ServerConfig, CredentialConfig, build_oauth_scopes as _build,
+    CredentialConfig,
+    McpManifest,
+    ServerConfig,
+    build_oauth_scopes as _build,
 )
 
 

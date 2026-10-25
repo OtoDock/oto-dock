@@ -4,15 +4,17 @@ import { useStats, useSchedules } from '../api/tasks'
 import { useRuns } from '../api/runs'
 import GroupedRunsTable from '../components/GroupedRunsTable'
 import { formatRelativeTime, formatNextRun } from '../lib/format'
+import { CARD } from '../components/ui/classes'
+import { PAGE_TITLE } from '../components/ui/classes'
 
-function StatCard({ label, value, color = 'text-p-text' }: {
+function StatCard({ label, value, color = 'text-primary' }: {
   label: string
   value: number | string
   color?: string
 }) {
   return (
-    <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4">
-      <p className="text-xs text-p-text-secondary uppercase tracking-wide">{label}</p>
+    <div className={`${CARD} p-4`}>
+      <p className="text-xs text-secondary uppercase tracking-wide">{label}</p>
       <p className={`text-2xl font-bold mt-1 ${color}`}>{value}</p>
     </div>
   )
@@ -47,7 +49,7 @@ export default function Overview() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-xl font-bold text-p-text">Overview</h1>
+      <h1 className={PAGE_TITLE}>Overview</h1>
 
       {/* Stat cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -57,17 +59,17 @@ export default function Overview() {
         <StatCard
           label="Running Now"
           value={stats?.running ?? '—'}
-          color={stats?.running ? 'text-brand' : 'text-p-text'}
+          color={stats?.running ? 'text-status-info-fg' : 'text-primary'}
         />
       </div>
 
       {/* Running tasks */}
       {(runningData?.runs?.length ?? 0) > 0 && (
-        <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4">
-          <h2 className="text-sm font-semibold text-p-text mb-3">Running Now</h2>
+        <div className={`${CARD} p-4`}>
+          <h2 className="text-sm font-semibold text-primary mb-3">Running Now</h2>
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-xs text-p-text-secondary uppercase border-b border-p-border-light">
+              <tr className="text-left text-xs text-secondary uppercase border-b border-subtle">
                 <th className="pb-2 pr-4">Task</th>
                 <th className="pb-2 pr-4">Agent</th>
                 <th className="pb-2 pr-4">Started</th>
@@ -78,17 +80,17 @@ export default function Overview() {
               {runningData?.runs.map((run) => (
                 <tr
                   key={run.id}
-                  className="hover:bg-p-surface-hover cursor-pointer"
+                  className="hover:bg-surface-hover cursor-pointer"
                   onClick={() => {
                     navigate(`/runs/${run.id}`)
                   }}
                 >
                   <td className="py-2 pr-4 font-medium">{run.task_id}</td>
-                  <td className="py-2 pr-4 text-p-text-secondary">{run.agent}</td>
-                  <td className="py-2 pr-4 text-p-text-secondary">
+                  <td className="py-2 pr-4 text-secondary">{run.agent}</td>
+                  <td className="py-2 pr-4 text-secondary">
                     {run.started_at ? formatRelativeTime(run.started_at) : '—'}
                   </td>
-                  <td className="py-2 text-brand font-mono text-xs">
+                  <td className="py-2 text-status-info-fg font-mono text-xs">
                     <LiveDuration startedAt={run.started_at} />
                   </td>
                 </tr>
@@ -100,22 +102,22 @@ export default function Overview() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {/* Recent runs */}
-        <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4">
-          <h2 className="text-sm font-semibold text-p-text mb-3">Recent Runs</h2>
+        <div className={`${CARD} p-4`}>
+          <h2 className="text-sm font-semibold text-primary mb-3">Recent Runs</h2>
           <GroupedRunsTable runs={recentData?.runs ?? []} maxGroups={10} />
         </div>
 
         {/* Upcoming */}
-        <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4">
-          <h2 className="text-sm font-semibold text-p-text mb-3">Upcoming</h2>
+        <div className={`${CARD} p-4`}>
+          <h2 className="text-sm font-semibold text-primary mb-3">Upcoming</h2>
           {upcoming.length === 0 ? (
-            <p className="text-sm text-p-text-secondary">No scheduled jobs.</p>
+            <p className="text-sm text-secondary">No scheduled jobs.</p>
           ) : (
             <ul className="space-y-2">
               {upcoming.map((job) => (
                 <li key={job.id} className="flex justify-between text-sm">
-                  <span className="font-medium text-p-text">{job.name}</span>
-                  <span className="text-p-text-secondary text-xs">
+                  <span className="font-medium text-primary">{job.name}</span>
+                  <span className="text-secondary text-xs">
                     {formatNextRun(job.next_run_time)}
                   </span>
                 </li>

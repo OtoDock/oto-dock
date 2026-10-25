@@ -1,0 +1,163 @@
+{
+ "calls": [
+  {
+   "args": [
+    "char-agent",
+    null
+   ],
+   "call": "build_session_mcp_config",
+   "kwargs": {
+    "call_ask_back": true,
+    "external": true,
+    "extra_mcps": [
+     "call-control-mcp"
+    ],
+    "mcp_config_format": "json",
+    "phone_mode": true,
+    "placement": {},
+    "session_id": "s-phone",
+    "target_browser": {},
+    "user_role": "viewer"
+   }
+  },
+  {
+   "args": [
+    "char-agent",
+    [
+     "char-files",
+     "phone-mcp"
+    ]
+   ],
+   "call": "get_dynamic_contexts",
+   "kwargs": {
+    "trigger_payload": null,
+    "user_role": "viewer",
+    "user_sub": ""
+   }
+  },
+  {
+   "args": [
+    "char-agent"
+   ],
+   "call": "build_agent_prompt",
+   "kwargs": {
+    "client_type": "phone",
+    "dynamic_contexts": null,
+    "excluded_mcps": null,
+    "execution_path": "claude-code-cli",
+    "external": true,
+    "external_home": "",
+    "placement": {},
+    "role": "viewer",
+    "sandboxed": true,
+    "skip_http_mcps": false,
+    "user_role": "viewer",
+    "username": null
+   }
+  },
+  {
+   "args": [
+    {
+     "agent": "char-agent",
+     "config_visible": false,
+     "external_channel": "phone",
+     "external_claim": "phone:",
+     "is_admin_agent": false,
+     "principal": "external",
+     "role": "viewer",
+     "session_scope": "agent",
+     "username": ""
+    }
+   ],
+   "call": "build_permission_context",
+   "kwargs": {
+    "assigned_mcp_names": [
+     "char-files",
+     "phone-mcp"
+    ],
+    "execution_path": "claude-code-cli"
+   }
+  },
+  {
+   "args": [
+    "char-agent"
+   ],
+   "call": "ensure_persistent_agent_dir",
+   "kwargs": {
+    "execution_path": "claude-code-cli",
+    "external_home": null,
+    "no_shell": true,
+    "scope": "agent",
+    "username": ""
+   }
+  },
+  {
+   "args": [
+    "claude-code-cli",
+    null
+   ],
+   "call": "resolve_subscription_env",
+   "kwargs": {
+    "agent_info": {
+     "admin_only": false,
+     "collaborative": true,
+     "color": "",
+     "community_template": null,
+     "community_template_data": {},
+     "community_template_version": null,
+     "created_at": "<stamp>",
+     "created_by": "",
+     "default_effort": "",
+     "default_execution_mode": "",
+     "default_for_new_users_role": "",
+     "default_model": "",
+     "default_scope": "user",
+     "department_id": "",
+     "department_level_id": "",
+     "description": "",
+     "display_name": "Char Agent",
+     "execution_path": "claude-code-cli",
+     "execution_paths": "",
+     "execution_target": "local",
+     "setup_completed_at": null,
+     "slug": "char-agent",
+     "updated_at": "<stamp>"
+    },
+    "model": "claude-char-1"
+   }
+  }
+ ],
+ "config": {
+  "agent_name": "char-agent",
+  "client_type": "phone",
+  "credential_env": {
+   "MCP_CRED": "1",
+   "PROXY_API_KEY": "<session-token>"
+  },
+  "effort": "high",
+  "execution_path": "claude-code-cli",
+  "extra_env": {
+   "OTO_CALL_ASK_BACK": "1",
+   "OTO_CALL_TOOLS": "1",
+   "SUB_ENV": "1"
+  },
+  "model": "claude-char-1",
+  "permission_mode": "auto",
+  "sandbox_host_claude_dir": "/char/.claude",
+  "security_context": {
+   "agent": "char-agent",
+   "config_visible": false,
+   "external_channel": "phone",
+   "external_claim": "phone:",
+   "is_admin_agent": false,
+   "principal": "external",
+   "role": "viewer",
+   "session_scope": "agent",
+   "username": ""
+  },
+  "subscription_id": "sub-char",
+  "subscription_user_sub": "",
+  "system_prompt": "PROMPT\n\nPERMISSIONS\n\nYou are on a live phone call that YOU placed to complete a task. This is voice — not chat.\nRULES:\n- ALWAYS respond in the SAME LANGUAGE the other person speaks.\n- Keep responses SHORT: 1-3 sentences maximum. Summarize instead of listing details.\n- Talk naturally like a real person on the phone — use casual, conversational language.\n- Avoid stiff/formal phrasing. Say things the way you'd say them out loud.\n- NEVER read tables, lists, JSON, code, or formatted output aloud. Describe results naturally in plain speech.\n- If there are many items (services, devices, etc.), give a high-level summary, NOT individual details.\n- Don't spell out URLs, paths, or IPs unless asked.\n- Before ANY tool call, FIRST write one short spoken line saying what you're doing (e.g. 'Let me check that for you'). NEVER go silent into a tool — on a call, silence feels broken. During multi-step tool work, add a brief spoken progress line between steps, then summarize the result in 1-2 short sentences.\n- Complete the task you were given, politely and professionally.\n- If you need information from the agent that placed this call, call the ask_initiating_agent tool if you have it; without that tool, emit [QUESTION: your question here] in your response. The system relays the question while the call stays active.\n- When the task is complete or clearly cannot be completed: say your goodbye first, then call the end_call tool if you have it; without that tool, end your final message with [CALL_COMPLETE].\n- The [CALL_COMPLETE] and [QUESTION:] markers are stripped before speaking — they're signals for the system. Nothing you write after an end_call or a marker is heard.\n\n\nCALL CONTROLS (tools):\n- end_call(reason): say your goodbye in one short sentence FIRST, then call it; the line closes right after. Nothing you write after the call is heard.\n- transfer_call: this line has no transfer targets; if asked, say you cannot transfer.\n- ask_initiating_agent(question): relays a question to the agent that placed this call. Say that you are checking (one short sentence) and stop; the answer arrives as your next message within about 40 seconds.\nThe text markers [CALL_COMPLETE] and [QUESTION: ...] still work as a fallback.\n",
+  "token_minted_at": "<now>"
+ }
+}

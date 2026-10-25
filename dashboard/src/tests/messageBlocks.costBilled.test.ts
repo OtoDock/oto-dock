@@ -72,7 +72,7 @@ describe('latestCostBilled (gauge rule)', () => {
       row('event', '', 'metadata', { type: 'metadata', cost_usd: 0.1 }),
     ])).toBe(true)
     expect(latestCostBilled([
-      { id: 1, role: 'event', event_type: 'metadata', event_data: '{not json' },
+      { id: 1, role: 'event', event_type: 'metadata', event_data: '{not json', created_at: '' },
     ])).toBe(true)
   })
 })

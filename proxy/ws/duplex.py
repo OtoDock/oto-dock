@@ -30,6 +30,8 @@ Browser-visible JSON frames:
   → ``{"type":"state","state":"listening|thinking|speaking"}``
   → ``{"type":"interim","text"}`` overlay partial /
     ``{"type":"interim_final","text"}`` accumulate chunk /
+    ``{"type":"replace","text"}`` the language switched: the accumulated
+    caption is this text now /
     ``{"type":"final","text"}`` dispatched utterance
   → ``{"type":"flush"}`` barge-in: drop scheduled playback NOW (the client
     buffers 250 ms–1 s of lead — without this it talks over the user)
@@ -49,6 +51,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
+from typing import cast
 
 from fastapi import WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
@@ -92,7 +95,7 @@ _pending: dict[str, DuplexBridge] = {}
 _active: dict[str, DuplexBridge] = {}
 
 
-def live_for_chat(chat_id: str) -> "DuplexBridge | None":
+def live_for_chat(chat_id: str) -> DuplexBridge | None:
     """The spoken conversation holding ``chat_id``, pending or live."""
     for bridge in (*_active.values(), *_pending.values()):
         if bridge.chat_id == chat_id and not bridge.closed:
@@ -148,8 +151,8 @@ async def _teardown(bridge: DuplexBridge, reason: str) -> None:
     await _close_ws(bridge.browser_ws)
     await _close_ws(bridge.engine_ws)
     logger.info(
-        f"Duplex {bridge.duplex_id[:8]}: closed ({reason})"
-        + (" — in-flight turn left running" if resumed else "")
+        "Duplex %s: closed (%s)%s", bridge.duplex_id[:8], reason,
+        " — in-flight turn left running" if resumed else "",
     )
 
 
@@ -174,7 +177,7 @@ async def ws_duplex_handler(websocket: WebSocket):
     try:
         raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
         init = json.loads(raw)
-    except Exception:
+    except Exception:  # noqa: BLE001  # a bad or missing init frame closes the socket with 4400
         await _close_ws(websocket, 4400)
         return
     claims = ws_audio_token.validate_ws_audio_token(
@@ -221,8 +224,11 @@ async def ws_duplex_handler(websocket: WebSocket):
         await _send_json(websocket, {"type": wire.ERROR, "reason": "engine_offline"})
         await _close_ws(websocket, 4503)
         return
+    # The browser's language rides the init frame: on the Automatic pick
+    # the session starts in it when the install lists it, else in the first
+    # listed one (``phone_config._detect_default``).
     session_config = await asyncio.to_thread(
-        phone_config.assemble_duplex_session_config, sub)
+        phone_config.assemble_duplex_session_config, sub, str(init.get("language") or ""))
     try:
         await mgmt_ws.send_json({
             "type": "duplex_open",
@@ -231,7 +237,7 @@ async def ws_duplex_handler(websocket: WebSocket):
             "rate_out": RATE_OUT,
             "config": session_config,
         })
-    except Exception:
+    except Exception:  # noqa: BLE001  # the caller is told the engine is offline whatever the send raised
         _pending.pop(bridge.duplex_id, None)
         await _send_json(websocket, {"type": wire.ERROR, "reason": "engine_offline"})
         await _close_ws(websocket, 4503)
@@ -254,7 +260,8 @@ async def ws_duplex_handler(websocket: WebSocket):
         "rate_in": RATE_IN, "rate_out": RATE_OUT,
     })
     logger.info(
-        f"Duplex {bridge.duplex_id[:8]}: live (sub={sub}, chat={chat_id})"
+        "Duplex %s: live (sub=%s, chat=%s)",
+        bridge.duplex_id[:8], sub, chat_id
     )
 
     # Pump browser → engine until either side dies.
@@ -266,7 +273,8 @@ async def ws_duplex_handler(websocket: WebSocket):
             data = msg.get("bytes")
             if data is not None:
                 with contextlib.suppress(Exception):
-                    await bridge.engine_ws.send_bytes(data)
+                    # The engine attached before ready went out (above).
+                    await cast("WebSocket", bridge.engine_ws).send_bytes(data)
                 continue
             text = msg.get("text")
             if not text:
@@ -362,7 +370,7 @@ async def ws_duplex_engine_handler(websocket: WebSocket, duplex_id: str):
             except json.JSONDecodeError:
                 continue
             ftype = frame.get("type", "")
-            if ftype in ("state", "interim", "interim_final", "final", "flush",
+            if ftype in ("state", "interim", "interim_final", "replace", "final", "flush",
                          "pause", "resume"):
                 await _send_json(bridge.browser_ws, frame)
             elif ftype == "utterance":

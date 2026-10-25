@@ -52,20 +52,20 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
-from auth.providers import UserContext, get_current_user, require_auth
-from storage.agents import agent_store
-from storage import database as task_store
-from storage.agents import memory_store
-from services.infra.path_confinement import safe_agent_dir
+import config
+from auth import roles
+from auth.providers import UserContext, acting_role_of, get_current_user, require_auth
+from core import layout
 from services.memory import memory_file
 from services.memory.memory_file import MemoryOpError, OpResult
-from auth import roles
-from auth.providers import acting_role_of
-from core import layout
-
+from storage import database as task_store
+from storage.agents import agent_store, memory_store
 
 logger = logging.getLogger("otodock.memory-api")
 router = APIRouter(prefix="/v1/internal/memory")
+
+_AGENT_GONE = "This agent no longer exists."
+_NO_SUCH_SETTING = "That memory setting does not exist."
 
 
 _COMMANDS = {"view", "create", "str_replace", "insert", "delete", "rename"}
@@ -185,10 +185,9 @@ async def _publish_changes(
     """Bookkeeping + live propagation for a successful mutation. Best-effort —
     a satellite being offline or a broadcast failing never fails the op."""
     try:
-        from services.remote import workspace_fanout
         from services.notifications.notification_manager import broadcast_file_updated
-        from storage.files import file_author_store
-        from storage.files import file_tombstones_store
+        from services.remote import workspace_fanout
+        from storage.files import file_author_store, file_tombstones_store
 
         for rel in result.changed:
             tree_rel = _tree_rel(agent_dir, root, rel)
@@ -234,7 +233,7 @@ async def _publish_changes(
             await broadcast_file_updated(
                 agent_slug, tree_rel, exclude_user_sub=exclude_user_sub,
             )
-    except Exception:
+    except Exception:  # noqa: BLE001  # propagation spans the db and satellites, the memory op already landed
         logger.warning(
             "memory write propagation failed for %s", agent_slug, exc_info=True,
         )
@@ -251,13 +250,13 @@ def _commit(
         repo.mkdir(parents=True, exist_ok=True)
         git_writer.init_if_missing(repo)
         root = memory_file.scope_root(agent_dir, scope, username)
-        paths = [root / rel for rel in (result.changed + result.deleted)]
+        paths: list[Path | str] = [root / rel for rel in (result.changed + result.deleted)]
         if not paths:
             return None
         return git_writer.commit_paths(
             repo, paths, f"memory: {command} ({scope} scope, by {writer})",
         )
-    except Exception:
+    except (ImportError, OSError, ValueError):
         logger.warning("memory git commit failed", exc_info=True)
         return None
 
@@ -313,7 +312,7 @@ async def memory_op(
     if user_sub:
         username = task_store.get_username_by_sub(user_sub)
     role = _resolve_effective_role(user_sub, agent)
-    agent_dir = safe_agent_dir(agent)
+    agent_dir = config.get_agent_dir(agent)
 
     # Scopes available to THIS session (existence is lazy — roots may not
     # exist on disk yet; that's fine for view/create).
@@ -463,7 +462,7 @@ async def get_settings_endpoint(
 ) -> dict[str, Any]:
     u = require_auth(user)
     if not u.is_admin:
-        raise HTTPException(403, "admin only")
+        raise HTTPException(403, "Only an admin can see the memory settings.")
     return await asyncio.to_thread(memory_store.get_settings)
 
 
@@ -474,7 +473,7 @@ async def patch_settings_endpoint(
 ) -> dict[str, Any]:
     u = require_auth(user)
     if not u.is_admin:
-        raise HTTPException(403, "admin only")
+        raise HTTPException(403, "Only an admin can change the memory settings.")
     body = await request.json()
     return await asyncio.to_thread(memory_store.update_settings, **body)
 
@@ -486,7 +485,7 @@ async def get_agent_settings(
 ) -> dict[str, Any]:
     u = require_auth(user)
     if not (u.is_admin or u.can_manage_agent(agent)):
-        raise HTTPException(403, "manager or admin only")
+        raise HTTPException(403, "Only a manager of this agent can see its memory settings.")
     toggles = await asyncio.to_thread(memory_store.get_agent_toggles, agent)
     # The platform master switches ride along under a distinct key (the
     # per-agent toggles reuse the same field names) so agent managers can
@@ -507,18 +506,19 @@ async def patch_agent_settings(
 ) -> dict[str, Any]:
     u = require_auth(user)
     if not (u.is_admin or u.can_manage_agent(agent)):
-        raise HTTPException(403, "manager or admin only")
+        raise HTTPException(403, "Only a manager of this agent can change its memory settings.")
     body = await request.json()
     key = body.get("key")
     value = body.get("value")
     if not key:
-        raise HTTPException(400, "key required")
+        raise HTTPException(400, _NO_SUCH_SETTING)
     try:
         return await asyncio.to_thread(
             memory_store.set_agent_toggle, agent, key, value,
         )
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        logger.warning("PATCH /v1/internal/memory/agent-settings/%s: %s", agent, e)
+        raise HTTPException(400, _NO_SUCH_SETTING) from e
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +528,7 @@ async def patch_agent_settings(
 def _clear_memory_dir(agent_slug: str, scope: str, username: str | None) -> int:
     """Delete every file in one scope's memory dir (git-committed). Returns
     the number of files removed. Tombstones are recorded by the caller."""
-    agent_dir = safe_agent_dir(agent_slug)
+    agent_dir = config.get_agent_dir(agent_slug)
     root = memory_file.scope_root(agent_dir, scope, username)
     if not root.is_dir():
         return 0
@@ -546,8 +546,8 @@ def _clear_memory_dir(agent_slug: str, scope: str, username: str | None) -> int:
             git_writer.commit_paths(
                 repo, [root], f"memory: clear ({scope} scope)",
             )
-    except Exception as exc:
-        logger.debug(f"Git commit of memory clear ({scope} scope) failed: {exc}")
+    except (ImportError, OSError, ValueError) as exc:
+        logger.debug("Git commit of memory clear (%s scope) failed: %s", scope, exc)
     return len(files)
 
 
@@ -556,7 +556,7 @@ async def _clear_and_tombstone(
 ) -> int:
     """Clear one scope dir + record per-file tombstones / fan out deletes so
     idle satellites apply the wipe instead of resurrecting it."""
-    agent_dir = safe_agent_dir(agent_slug)
+    agent_dir = config.get_agent_dir(agent_slug)
     root = memory_file.scope_root(agent_dir, scope, username)
     rels: list[str] = []
     if root.is_dir():
@@ -585,20 +585,20 @@ async def clear_all_endpoint(
     """Wipe memory for a scope across all (or one) agent. Admin only."""
     u = require_auth(user)
     if not u.is_admin:
-        raise HTTPException(403, "admin only")
+        raise HTTPException(403, "Only an admin can clear everyone's memory.")
     body = await request.json()
     scope = body.get("scope")
     agent = body.get("agent")
     if scope not in ("user", "agent"):
-        raise HTTPException(400, "scope must be 'user' or 'agent'")
+        raise HTTPException(400, "Choose whose memory to clear.")
 
     if agent and not agent_store.agent_exists(agent):
-        raise HTTPException(404, f"agent not found: {agent}")
+        raise HTTPException(404, _AGENT_GONE)
     slugs = [agent] if agent else [a["slug"] for a in agent_store.get_all_agents()]
     files_unlinked = 0
     agents_affected = 0
     for slug in slugs:
-        agent_dir = safe_agent_dir(slug)
+        agent_dir = config.get_agent_dir(slug)
         if not agent_dir.exists():
             continue
         touched = 0
@@ -634,9 +634,9 @@ async def clear_agent_memory(
     """
     u = require_auth(user)
     if not (u.is_admin or u.can_manage_agent(agent)):
-        raise HTTPException(403, "manager or admin only")
+        raise HTTPException(403, "Only a manager of this agent can clear its memory.")
     if not agent_store.agent_exists(agent):
-        raise HTTPException(404, f"agent not found: {agent}")
+        raise HTTPException(404, _AGENT_GONE)
     files_unlinked = await _clear_and_tombstone(agent, "agent", None)
     return {"files_unlinked": files_unlinked, "agent": agent, "scope": "agent"}
 
@@ -648,10 +648,13 @@ async def clear_my_memory(
     """User self-service: wipe own user-scope memory across all agents."""
     u = require_auth(user)
     if not u.sub or u.sub.startswith("session:") or u.sub == "api-key":
-        raise HTTPException(400, "no user sub")
+        raise HTTPException(
+            400, "Only a person signed in to the dashboard can clear their own memory.",
+        )
     username = await asyncio.to_thread(task_store.get_username_by_sub, u.sub)
     if not username:
-        raise HTTPException(400, "username not found")
+        logger.warning("POST /v1/internal/memory/clear-my-memory: no username for %s", u.sub)
+        raise HTTPException(400, "Could not find your account. Sign out, sign in again and retry.")
 
     files_unlinked = 0
     agents_affected = 0

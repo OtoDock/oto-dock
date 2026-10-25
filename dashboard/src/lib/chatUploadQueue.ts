@@ -18,6 +18,7 @@ import type { PendingFile } from '../store/types'
 import { canRead, UNREADABLE_ITEM, type CollectedFile } from './droppedItems'
 import { queryClient } from './queryClient'
 import { reserveUploadFolder, uploadWithProgress } from './uploadWithProgress'
+import { errorText, errorName } from './http/apiJson'
 
 /** The workspace tree shows what landed at once; the server's own
  *  `file_updated` frame covers the other tabs and a teammate's view. */
@@ -176,12 +177,12 @@ async function uploadOne(entry: ChatUploadEntry, file: File): Promise<void> {
       remotePush: resp.remote_push,
     })
     refreshTree(entry.agent)
-  } catch (e: any) {
+  } catch (e) {
     useTransferStore.getState().failLocalUpload(clientId)
-    if (e?.name === 'AbortError') return // user removed the file — chip is gone
+    if (errorName(e) === 'AbortError') return // user removed the file — chip is gone
     patchFile(entry.fileId, {
       uploading: false, queued: false,
-      error: e?.message || 'Upload failed',
+      error: errorText(e) || 'Upload failed',
     })
   }
 }

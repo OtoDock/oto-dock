@@ -42,6 +42,29 @@ def test_progress_frames_coalesce_per_key():
     ]
 
 
+def test_a_moves_progress_replaces_the_queued_one_of_its_chat():
+    """A slow tab holds one progress frame per moving chat: the newest."""
+    q = nm.NotifyQueue(bound=10)
+    for done in (1, 2, 3):
+        q.put_nowait({"type": wire.CHAT_MOVE_PROGRESS, "chat_id": "a", "done": done})
+    q.put_nowait({"type": wire.CHAT_MOVE_PROGRESS, "chat_id": "b", "done": 9})
+    q.put_nowait({"type": wire.CHAT_MOVED, "chat_id": "a"})
+    assert [(f["type"], f.get("done")) for f in q._queue] == [
+        (wire.CHAT_MOVE_PROGRESS, 3), (wire.CHAT_MOVE_PROGRESS, 9), (wire.CHAT_MOVED, None)]
+
+
+def test_a_chats_rows_frame_replaces_the_queued_one_of_its_chat():
+    """An interactive chat's tail batches fire one frame each: the queue
+    keeps one per chat, the held list of a streaming viewer likewise."""
+    q = nm.NotifyQueue()
+    q.put_nowait({"type": wire.NOTIFICATION, "delivery": {}})
+    q.put_nowait({"type": wire.CHAT_ROWS, "chat_id": "c1", "n": 1})
+    q.put_nowait({"type": wire.CHAT_ROWS, "chat_id": "c2"})
+    q.put_nowait({"type": wire.CHAT_ROWS, "chat_id": "c1", "n": 2})
+    assert _types(q) == [wire.NOTIFICATION, wire.CHAT_ROWS, wire.CHAT_ROWS]
+    assert [f.get("n") for f in list(q._queue) if f.get("chat_id") == "c1"] == [2]
+
+
 def test_the_broadcast_copies_the_drain_discards_are_refused():
     q = nm.NotifyQueue(bound=10)
     q.put_nowait({"type": wire.TITLE_UPDATED, "chat_id": "a", "title": "x"})
@@ -121,3 +144,21 @@ def test_a_drop_is_logged_once_a_minute(caplog, monkeypatch):
     assert len(lines) == 2
     assert "dropped 1 frame" in lines[0] and "dropped 5 frame" in lines[1]
     assert q.dropped == 6
+
+
+@pytest.mark.asyncio
+async def test_unget_puts_the_items_first_in_order_and_wakes_a_getter():
+    q = nm.NotifyQueue(bound=4)
+    q.put_nowait({"type": wire.NOTIFICATION, "delivery": {"id": "later"}})
+    q.unget([{"type": wire.NOTIFY_BG_NUDGE, "count": 1},
+             {"type": wire.CHAT_STATUS, "chat_id": "a", "status": "ready"}])
+    assert _types(q) == [wire.NOTIFY_BG_NUDGE, wire.CHAT_STATUS, wire.NOTIFICATION]
+    # Past the bound the items stay: each was counted when first queued.
+    q.put_nowait({"type": wire.NOTIFICATION, "delivery": {"id": 2}})
+    q.unget([{"type": wire.NOTIFY_SERVER_KICK, "chat_id": "c"}])
+    assert q.qsize() == 5 and q.dropped == 0
+    empty = nm.NotifyQueue(bound=4)
+    getter = asyncio.ensure_future(empty.get())
+    await asyncio.sleep(0)
+    empty.unget([{"type": wire.NOTIFICATION, "delivery": {"id": 9}}])
+    assert (await asyncio.wait_for(getter, 1))["delivery"]["id"] == 9

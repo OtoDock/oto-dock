@@ -1,6 +1,9 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react'
 import { useAgentFileContent, useSaveAgentFile } from '../api/agents'
 import { encodePathSegments } from '../lib/paths'
+import { errorText } from '../lib/http/apiJson'
+import { blockedByModal } from '../lib/ui/modalLayers'
+import Button from './ui/Button'
 
 interface FileEditorProps {
   agent: string
@@ -23,7 +26,7 @@ export default function FileEditor({ agent, path, readOnly = false, compact = fa
   // Latest value via a ref so the sync effect can check dirtiness without
   // re-running on every keystroke.
   const valueRef = useRef(value)
-  valueRef.current = value
+  useLayoutEffect(() => { valueRef.current = value })
   // The (path, content) last loaded into the editor.
   const syncedRef = useRef<{ path: string; content: string } | null>(null)
 
@@ -48,8 +51,8 @@ export default function FileEditor({ agent, path, readOnly = false, compact = fa
       try {
         JSON.parse(value)
         setJsonError(null)
-      } catch (e: any) {
-        setJsonError(e.message)
+      } catch (e) {
+        setJsonError(errorText(e))
         return
       }
     }
@@ -66,7 +69,15 @@ export default function FileEditor({ agent, path, readOnly = false, compact = fa
   useEffect(() => {
     if (readOnly) return
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+      const save = (e.metaKey || e.ctrlKey) && e.key === 's'
+      // With a dialog open over the editor the save waits, and the browser's
+      // own "Save page" is kept away. A preview opened from inside a dialog
+      // is inside it, so its target is not blocked.
+      if (blockedByModal(e)) {
+        if (save) e.preventDefault()
+        return
+      }
+      if (save) {
         e.preventDefault()
         handleSave()
       }
@@ -75,14 +86,14 @@ export default function FileEditor({ agent, path, readOnly = false, compact = fa
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [handleSave, readOnly])
 
-  if (isLoading) return <p className="text-sm text-gray-500 p-4">Loading...</p>
+  if (isLoading) return <p className="text-sm text-tertiary p-4">Loading...</p>
   if (error) {
     return (
       <div className="text-sm p-4 space-y-2">
-        <p className="text-red-500">{(error as Error).message || 'Failed to load file.'}</p>
+        <p className="text-status-danger-fg">{(error as Error).message || 'Failed to load file.'}</p>
         <a
           href={`/v1/agents/${encodeURIComponent(agent)}/files/${encodePathSegments(path)}?download=true&fn=${encodeURIComponent(path.split('/').pop() ?? path)}`}
-          className="text-blue-600 hover:underline"
+          className="text-link hover:underline"
         >
           Download the file
         </a>
@@ -94,43 +105,43 @@ export default function FileEditor({ agent, path, readOnly = false, compact = fa
     <div className="flex flex-col h-full relative">
       {/* Toolbar — hidden in `compact` mode (portal owns the filename chrome) */}
       {!compact && (
-        <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-200 dark:border-p-border-light bg-gray-50 dark:bg-p-surface min-w-0">
-          <span className="text-xs md:text-sm font-mono text-gray-600 dark:text-gray-300 truncate min-w-0 flex-1">{path.split('/').pop()}</span>
-          {readOnly && <span className="text-[10px] md:text-xs text-gray-400 dark:text-gray-500 shrink-0">read-only</span>}
-          {isDirty && !readOnly && <span className="text-[10px] md:text-xs text-amber-600 shrink-0">Modified</span>}
-          {savedFeedback && <span className="text-[10px] md:text-xs text-green-600 shrink-0">Saved</span>}
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-default bg-surface-sunken min-w-0">
+          <span className="text-xs md:text-sm font-mono text-secondary truncate min-w-0 flex-1">{path.split('/').pop()}</span>
+          {readOnly && <span className="text-3xs md:text-xs text-tertiary shrink-0">read-only</span>}
+          {isDirty && !readOnly && <span className="text-3xs md:text-xs text-status-warning-fg shrink-0">Modified</span>}
+          {savedFeedback && <span className="text-3xs md:text-xs text-status-success-fg shrink-0">Saved</span>}
           {!readOnly && (
-            <button
+            <Button variant="primary" size="xs"
               onClick={handleSave}
               disabled={saveMutation.isPending || !isDirty}
-              className="text-xs px-2.5 md:px-3 py-1 rounded-sm bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 shrink-0"
+              className="shrink-0"
             >
               {saveMutation.isPending ? 'Saving...' : 'Save'}
-            </button>
+            </Button>
           )}
         </div>
       )}
 
       {/* Compact mode floating Save action */}
       {compact && !readOnly && isDirty && (
-        <button
+        <Button variant="primary" size="xs"
           onClick={handleSave}
           disabled={saveMutation.isPending}
-          className="absolute top-2 right-2 z-10 text-xs px-3 py-1 rounded-lg bg-brand text-white shadow-md hover:bg-brand-hover disabled:opacity-40"
+          className="absolute top-2 right-2 z-10"
         >
           {saveMutation.isPending ? 'Saving…' : savedFeedback ? 'Saved' : 'Save'}
-        </button>
+        </Button>
       )}
 
       {/* Errors */}
       {jsonError && (
-        <div className="px-3 py-2 bg-red-50 border-b border-red-200 text-xs text-red-700">
+        <div className="px-3 py-2 bg-status-danger-bg border-b border-status-danger-border text-xs text-status-danger-fg">
           Invalid JSON: {jsonError}
         </div>
       )}
       {saveMutation.error && (
-        <div className="px-3 py-2 bg-red-50 border-b border-red-200 text-xs text-red-700">
-          Save failed: {(saveMutation.error as Error).message}
+        <div className="px-3 py-2 bg-status-danger-bg border-b border-status-danger-border text-xs text-status-danger-fg">
+          {(saveMutation.error as Error).message || 'The file was not saved. Try again.'}
         </div>
       )}
 
@@ -145,8 +156,8 @@ export default function FileEditor({ agent, path, readOnly = false, compact = fa
         }}
         readOnly={readOnly}
         spellCheck={false}
-        className={`flex-1 w-full p-3 font-mono text-sm text-gray-800 dark:text-gray-200 bg-white dark:bg-gray-900 resize-none focus:outline-hidden ${
-          readOnly ? 'bg-gray-50 dark:bg-p-surface cursor-default' : ''
+        className={`flex-1 w-full p-3 font-mono text-sm text-primary bg-surface-card resize-none focus:outline-hidden ${
+          readOnly ? 'bg-surface-sunken cursor-default' : ''
         }`}
       />
     </div>

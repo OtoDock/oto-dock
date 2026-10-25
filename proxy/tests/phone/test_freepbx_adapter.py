@@ -13,8 +13,7 @@ import asyncio
 
 import pytest
 
-from services.phone.phone_adapters import PhoneAdapterError
-from services.phone.phone_adapters import asterisk_freepbx
+from services.phone.phone_adapters import PhoneAdapterError, asterisk_freepbx
 from services.phone.phone_adapters.asterisk_freepbx import AsteriskFreePBXAdapter
 
 _UNSET = object()

@@ -5,13 +5,11 @@ and auth.json construction produce identical output on both paths.
 
 from __future__ import annotations
 
-
 from core.layers.codex.helpers import (
     build_auth_json,
     map_effort_to_codex,
     permission_to_sandbox,
 )
-
 
 # ---------------------------------------------------------------------------
 # permission_to_sandbox
@@ -96,10 +94,10 @@ def test_map_effort_gpt6_astra_unlocks_max_and_ultra():
 
 
 def test_map_effort_gpt61_sol_follows_the_0_160_catalog():
-    # Codex 0.160.0's bundled catalog (identical at 0.162.1): GPT-6.1 Sol carries low…max + ultra
-    # (ultra delegates at xhigh). The unlock is the exact id: "gpt-6-sol" is
-    # not a prefix of "gpt-6.1-sol", so without its own entry max and ultra
-    # would clamp to xhigh.
+    # Codex 0.160.0's bundled catalog (identical at 0.162.1 and 0.163.0): GPT-6.1
+    # Sol carries low…max + ultra (ultra delegates at xhigh). The unlock is the
+    # exact id: "gpt-6-sol" is not a prefix of "gpt-6.1-sol", so without its own
+    # entry max and ultra would clamp to xhigh.
     assert map_effort_to_codex("max", "gpt-6.1-sol") == "max"
     assert map_effort_to_codex("ultra", "gpt-6.1-sol") == "ultra"
     assert map_effort_to_codex("xhigh", "gpt-6.1-sol") == "xhigh"

@@ -29,18 +29,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from api.apps import manifest as _mf
-from services.apps import releases
+from auth import roles
+from core import layout, placement
+from services.apps import manifest as _mf, releases
+from services.infra import safe_fs
+from services.infra.path_confinement import join_under
 from services.scripts import runner as _runner
 from services.scripts.runner import ScriptRefused, ScriptSpec, ScriptUnavailable
 from storage import db_app_deliveries as deliveries
 from storage.automation import run_status
-from core import placement
 from storage.pg import run_db
-from auth import roles
-from core import layout
-from services.infra import safe_fs
-from services.infra.path_confinement import join_under
 
 logger = logging.getLogger("otodock.apps")
 
@@ -144,7 +142,7 @@ def placement_for(row: dict, identity) -> str:
     the step runs as — a user-scoped run may go to the owner's machine, an
     agent-scoped one to the admin machine or the sandbox, never to a user's
     machine. An offline target raises ``StepUnavailable``."""
-    from storage.remote_store import resolve_execution_target
+    from services.remote.remote_status import resolve_execution_target
     target, reason = resolve_execution_target(
         row.get("agent") or "", identity.creds_user_sub or None, identity.role)
     if placement.is_offline_sentinel(target):
@@ -183,14 +181,14 @@ def read_script(row: dict, step: dict) -> bytes:
         raise StepRefused("the step was never hashed — deploy the app again")
     try:
         live = releases.live_release_dir(row)
-    except releases.ReleaseDamaged:
-        raise StepRefused("the live release is damaged")
+    except releases.ReleaseDamaged as exc:
+        raise StepRefused("the live release is damaged") from exc
     if live is None:
         raise StepRefused("the app has no live release")
     try:
         data = releases.read_release_file(live, step["run"])
-    except releases.ReleaseDamaged:
-        raise StepRefused("the live release is damaged")
+    except releases.ReleaseDamaged as exc:
+        raise StepRefused("the live release is damaged") from exc
     if data is None:
         raise StepRefused(f"{step['run']} is not in the release")
     if hashlib.sha256(data).hexdigest() != signed:
@@ -199,8 +197,8 @@ def read_script(row: dict, step: dict) -> bytes:
         raise StepRefused("the script is larger than 256 KB")
     try:
         data.decode("utf-8")
-    except UnicodeDecodeError:
-        raise StepRefused("the script is not UTF-8 text")
+    except UnicodeDecodeError as exc:
+        raise StepRefused("the script is not UTF-8 text") from exc
     return data
 
 
@@ -331,9 +329,9 @@ async def run_local(plan: StepPlan, claim: str) -> StepResult:
         spec = await asyncio.to_thread(_spec_for, plan, claim)
         return _convert(await _runner.run_local(spec))
     except ScriptRefused as e:
-        raise StepRefused(e.reason)
+        raise StepRefused(e.reason) from e
     except ScriptUnavailable as e:
-        raise StepUnavailable(e.reason)
+        raise StepUnavailable(e.reason) from e
     finally:
         # The runner removes the scratch directory after a run; a run that
         # never started leaves the staged script there otherwise.
@@ -355,9 +353,9 @@ async def run_remote(plan: StepPlan, claim: str, machine_id: str) -> StepResult:
         spec.on_output = _on_output
         return _convert(await _runner.run_remote(spec, machine_id))
     except ScriptRefused as e:
-        raise StepRefused(e.reason.replace("too old for scripts", "too old for steps"))
+        raise StepRefused(e.reason.replace("too old for scripts", "too old for steps")) from e
     except ScriptUnavailable as e:
-        raise StepUnavailable(e.reason)
+        raise StepUnavailable(e.reason) from e
 
 
 # ── the fire ────────────────────────────────────────────────────────────────
@@ -454,7 +452,7 @@ async def fire(d: dict, row: dict) -> None:
         await app_supervisor.append_log(
             row, f"[{_now_iso()}] step {d['handler']}: {status} ({reason or 'exit 0'}) "
                  f"after {result.seconds:.1f}s on {where}\n")
-    except Exception:
+    except OSError:
         logger.debug("App step %s: log trailer failed", d["id"][:8], exc_info=True)
     logger.info("App step %s (%s/%s) %s on %s in %.1fs", d["id"][:8], row.get("slug"),
                 d["handler"], status, result.ran_on[:8], result.seconds)

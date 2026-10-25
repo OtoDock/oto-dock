@@ -98,7 +98,8 @@ async def test_gate2_veto_denies_without_eviction(env, monkeypatch):
     assert "low on memory" in adm.user_message
     assert "500 MB free" in adm.user_message          # live reading surfaces
     assert "1300 MB" in adm.user_message              # est(1000) + floor(300)
-    assert "sessions" not in adm.user_message.split("—")[0]  # no session-blame lead
+    assert "session" not in adm.user_message              # no session blame
+    assert "Free some memory on the server, then try again." in adm.user_message
     assert called["n"] == 0
     assert "bg" in C._sessions  # the innocent session was not sacrificed
 

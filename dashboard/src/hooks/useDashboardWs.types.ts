@@ -8,10 +8,10 @@ import type {
   ImagesFrame, LimitReachedFrame, LimitWarningFrame, LivenessFrame, LiveStateFrame,
   LocationRequestFrame, McpCostFrame, MediaFailedFrame, MediaProcessingFrame, MetadataFrame,
   NotificationCountFrame, NotificationFrame, NotificationSilentFrame, PermissionPromptFrame,
-  PromptRetiredFrame,
+  PermissionResolvedFrame, PromptRetiredFrame,
   PlanModeFrame, PlanReviewFrame, PlanStatusFrame, PreWarmupReadyFrame, QuestionFrame, ShareInboxFrame,
   QueueRemovedFrame, QueueSentFrame, QueuedFrame, SatelliteUpdateFailedFrame,
-  SatelliteUpdatedFrame, SatelliteUpdatingFrame, SteeredFrame, SwitchEngineDeniedFrame,
+  SatelliteUpdatedFrame, SatelliteUpdatingFrame, ServerTurnStartFrame, SteeredFrame, SwitchEngineDeniedFrame,
   SystemFrame, TaskSpawnFrame, ThinkingFrame, TitleUpdatedFrame, TodoUpdateFrame,
   ToolEndFrame, ToolInfoFrame, ToolResultFrame, ToolStartFrame, TurnCompleteFrame, UrlFrame,
   VideoFrame, WarmupFailedFrame, WarmupReadyFrame, WarmupStartedFrame, WorkflowEndFrame,
@@ -23,6 +23,18 @@ import type {
 // receives the frame it is named after, minus nothing: consumers read the
 // fields they need.
 export type { ThreadGoal } from '../api/wireEvents'
+
+/** A send the proxy refused before any turn, by the id the page sent it
+ *  under, with what the socket remembers of it (the text and attachments
+ *  the composer gets back; absent for an id this socket never sent). */
+/** A queued or busy send the proxy refused by its queue id. What was sent
+ *  went back to the composer of `chatId` (`returned`) before the page saw
+ *  the refusal; a send the socket no longer remembered returns nothing. */
+export interface RefusedSend {
+  queueId: string
+  chatId?: string
+  returned: boolean
+}
 
 export interface WsCallbacks {
   /**
@@ -38,7 +50,9 @@ export interface WsCallbacks {
    *  PTY chat must not trigger resume_chat — the resume replays history +
    *  re-attaches the PTY viewer, visibly reloading the terminal. */
   isViewedChatPtyLive?: () => boolean
-  onText?: (content: string) => void
+  /** `note`: a progress note, the agent's words between its steps (drawn
+   *  faint in the steps group). */
+  onText?: (content: string, note?: boolean) => void
   onThinking?: (data: ThinkingFrame) => void
   onToolStart?: (data: ToolStartFrame) => void
   onToolInfo?: (data: ToolInfoFrame) => void
@@ -53,7 +67,7 @@ export interface WsCallbacks {
   onBgCommandDone?: (data: BgCommandDoneFrame) => void
   onBgAgentsComplete?: (data: BgAgentsCompleteFrame) => void
   onBgCommandsComplete?: (data: BgCommandsCompleteFrame) => void
-  onServerTurnStart?: () => void
+  onServerTurnStart?: (data: ServerTurnStartFrame) => void
   onFgAgentsComplete?: () => void
   // Dynamic workflows (Workflow tool) — live phase/agent tree.
   onWorkflowStart?: (data: WorkflowStartFrame) => void
@@ -62,6 +76,8 @@ export interface WsCallbacks {
   onPermissionPrompt?: (data: PermissionPromptFrame) => void
   // A prompt card whose wait ended with no answer: drop it by request_id.
   onPromptRetired?: (data: PromptRetiredFrame) => void
+  // A card answered on another socket of the chat: close it by request_id.
+  onPermissionResolved?: (data: PermissionResolvedFrame) => void
   onLocationRequest?: (data: LocationRequestFrame) => void
   onPlanMode?: (data: PlanModeFrame) => void
   onPlanReview?: (data: PlanReviewFrame) => void
@@ -69,8 +85,11 @@ export interface WsCallbacks {
   // cost_billed false = subscription / local-model turn (cost hidden); missing = shown
   onMetadata?: (data: MetadataFrame) => void
   onDone?: () => void
-  /** `ending` is set when the engine stopped the turn (a decline, a usage limit). */
-  onError?: (message: string, ending?: { reason: string; resets_at?: string }) => void
+  /** `ending` is set when the engine stopped the turn (a decline, a usage
+   *  limit); `refused` when the error refuses one queued or busy send (no
+   *  turn ends: the page keeps its warmup and hands the text back). */
+  onError?: (message: string, ending?: { reason: string; resets_at?: string },
+             refused?: RefusedSend) => void
   onImages?: (data: ImagesFrame) => void
   onImageGenerating?: (data: ImageGeneratingFrame) => void
   onMcpCost?: (data: McpCostFrame) => void
@@ -100,6 +119,10 @@ export interface WsCallbacks {
   // the chat so the fresh warmup runs there and the "moved" history card
   // arrives. Failures come as standard error frames (toasts), not this.
   onChatMoved?: (data: ChatMovedFrame) => void
+  // The place the page picked for the new chat it composes on `agent`
+  // (`local` or a machine id; undefined for the default): sent with every
+  // pre_warmup and every warmup that names no chat (AgentChat holds it).
+  newChatTarget?: (agent: string) => string | undefined
   // chat_view_only — the viewed chat is driven from outside (a phone call):
   // its history is read-only until the chat's status reads ready, when the
   // hook re-resumes it and calls this with null.

@@ -1,5 +1,8 @@
 import { useState, useEffect } from 'react'
 import { askNative, callNative, inAppShell, openPrivacyPolicy } from '../../lib/nativeBridge'
+import Dialog from '../ui/Dialog'
+import Button from '../ui/Button'
+import { DIALOG_PANEL } from '../ui/classes'
 
 interface Props {
   open: boolean
@@ -39,11 +42,14 @@ export default function AppSettingsModal({ open, onClose }: Props) {
     void readInstallations().then((list) => { if (list) setInstalls(list) })
   }
 
+  // An opening forgets the rename in progress (in render) and re-reads the list.
+  const [wasOpen, setWasOpen] = useState(open)
+  if (wasOpen !== open) {
+    setWasOpen(open)
+    if (open) setRenamingId(null)
+  }
   useEffect(() => {
-    if (open) {
-      refresh()
-      setRenamingId(null)
-    }
+    if (open) void readInstallations().then((list) => { if (list) setInstalls(list) })
   }, [open])
 
   if (!open) return null
@@ -84,25 +90,20 @@ export default function AppSettingsModal({ open, onClose }: Props) {
   }
 
   return (
-    <>
-      {/* Backdrop */}
-      <div className="fixed inset-0 bg-black/50 z-50" onClick={onClose} />
-
-      {/* Modal */}
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-        <div
-          className="bg-white dark:bg-p-surface rounded-2xl shadow-xl border border-p-border-light w-full max-w-md p-6"
-          onClick={e => e.stopPropagation()}
-        >
-          <h2 className="text-lg font-medium text-p-text mb-1">Installations</h2>
-          <p className="text-xs text-p-text-light mb-4">
+    <Dialog
+      onClose={onClose}
+      aria-labelledby="app-installations-title"
+      panelClassName={`${DIALOG_PANEL} max-w-md p-6`}
+    >
+          <h2 id="app-installations-title" className="font-display text-lg font-semibold text-primary mb-1">Installations</h2>
+          <p className="text-xs text-tertiary mb-4">
             Tap a server to switch to it. The starred server opens by default.
           </p>
 
           {/* Installations list */}
           <div className="space-y-2 max-h-80 overflow-y-auto -mx-1 px-1">
             {installs.length === 0 && (
-              <div className="text-sm text-p-text-light py-4 text-center">No servers added.</div>
+              <div className="text-sm text-tertiary py-4 text-center">No servers added.</div>
             )}
 
             {installs.map(inst => (
@@ -110,10 +111,10 @@ export default function AppSettingsModal({ open, onClose }: Props) {
                 key={inst.id}
                 onClick={() => renamingId === inst.id ? undefined : handleSwitch(inst)}
                 className={
-                  'flex items-center gap-2 rounded-xl border px-3 py-2 transition-colors ' +
+                  'flex items-center gap-2 rounded-card border px-3 py-2 transition-colors ' +
                   (inst.active
-                    ? 'border-p-accent-teal/50 bg-p-accent-teal/5'
-                    : 'border-p-border-light hover:bg-p-surface-hover cursor-pointer')
+                    ? 'border-action-subtle-hover bg-action-subtle'
+                    : 'border-subtle hover:bg-surface-hover cursor-pointer')
                 }
               >
                 {/* Favorite star */}
@@ -123,7 +124,7 @@ export default function AppSettingsModal({ open, onClose }: Props) {
                   className="shrink-0 p-1 -ml-1"
                 >
                   <svg
-                    className={'w-4 h-4 ' + (inst.favorite ? 'text-p-accent-yellow' : 'text-p-text-light')}
+                    className={'w-4 h-4 ' + (inst.favorite ? 'text-link' : 'text-tertiary')}
                     fill={inst.favorite ? 'currentColor' : 'none'}
                     stroke="currentColor"
                     strokeWidth={1.7}
@@ -143,22 +144,23 @@ export default function AppSettingsModal({ open, onClose }: Props) {
                       onClick={e => e.stopPropagation()}
                       onKeyDown={e => {
                         if (e.key === 'Enter') commitRename(inst.id)
-                        if (e.key === 'Escape') setRenamingId(null)
+                        // Taken here: the dialog stays open.
+                        if (e.key === 'Escape') { e.preventDefault(); setRenamingId(null) }
                       }}
                       onBlur={() => commitRename(inst.id)}
-                      className="w-full px-2 py-1 text-sm rounded-md border border-p-border bg-p-bg text-p-text outline-hidden"
+                      className="w-full px-2 py-1 text-sm rounded-control border border-strong bg-surface-card text-primary outline-hidden"
                     />
                   ) : (
                     <>
-                      <div className="text-sm font-medium text-p-text truncate flex items-center gap-2">
+                      <div className="text-sm font-medium text-primary truncate flex items-center gap-2">
                         {inst.label}
                         {inst.active && (
-                          <span className="text-[10px] font-normal text-p-accent-teal uppercase tracking-wide">
+                          <span className="text-3xs font-normal text-link uppercase tracking-wide">
                             Active
                           </span>
                         )}
                       </div>
-                      <div className="text-xs text-p-text-light truncate font-mono">{hostOf(inst.url)}</div>
+                      <div className="text-xs text-tertiary truncate font-mono">{hostOf(inst.url)}</div>
                     </>
                   )}
                 </div>
@@ -169,7 +171,7 @@ export default function AppSettingsModal({ open, onClose }: Props) {
                     <button
                       onClick={e => { e.stopPropagation(); startRename(inst) }}
                       aria-label="Rename"
-                      className="p-1.5 text-p-text-light hover:text-p-text"
+                      className="p-1.5 text-tertiary hover:text-primary"
                     >
                       <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.7} viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 3.5a2.12 2.12 0 013 3L7 19l-4 1 1-4 12.5-12.5z" />
@@ -178,7 +180,7 @@ export default function AppSettingsModal({ open, onClose }: Props) {
                     <button
                       onClick={e => { e.stopPropagation(); handleRemove(inst.id) }}
                       aria-label="Remove"
-                      className="p-1.5 text-p-text-light hover:text-p-accent-red"
+                      className="p-1.5 text-tertiary hover:text-status-danger-fg"
                     >
                       <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.7} viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" d="M6 7h12M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2m-7 0v12a1 1 0 001 1h6a1 1 0 001-1V7" />
@@ -191,20 +193,17 @@ export default function AppSettingsModal({ open, onClose }: Props) {
           </div>
 
           {/* Add installation */}
-          <button
-            onClick={handleAdd}
-            className="w-full mt-4 px-4 py-2 rounded-xl border border-p-border-light text-sm font-medium text-p-text hover:bg-p-surface-hover transition-colors flex items-center justify-center gap-2"
-          >
+          <Button size="md" className="w-full mt-4 justify-center" onClick={handleAdd}>
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 5v14M5 12h14" />
             </svg>
             Add installation
-          </button>
+          </Button>
 
           {/* Close */}
           <button
             onClick={onClose}
-            className="w-full mt-2 px-4 py-2 rounded-xl text-sm text-p-text-secondary hover:bg-p-surface-hover transition-colors"
+            className="w-full mt-2 px-4 py-2 rounded-control text-sm text-secondary hover:bg-surface-hover transition-colors"
           >
             Close
           </button>
@@ -213,13 +212,11 @@ export default function AppSettingsModal({ open, onClose }: Props) {
           {inAppShell() && (
             <button
               onClick={openPrivacyPolicy}
-              className="w-full mt-3 text-xs text-p-text-light underline hover:text-p-text"
+              className="w-full mt-3 text-xs text-tertiary underline hover:text-primary"
             >
               Privacy policy
             </button>
           )}
-        </div>
-      </div>
-    </>
+    </Dialog>
   )
 }

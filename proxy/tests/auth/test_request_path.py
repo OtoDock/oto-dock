@@ -51,7 +51,7 @@ def _body_shape(path, name: str) -> str:
             param = node.args.args[0].arg
 
             class _Rename(ast.NodeTransformer):
-                def visit_Name(self, n):
+                def visit_Name(self, n, param=param):
                     return ast.copy_location(ast.Name(id="_p0" if n.id == param else n.id, ctx=n.ctx), n)
             return ast.dump(_Rename().visit(ast.Module(body=body, type_ignores=[])))
     raise AssertionError(f"{path}: no {name}")
@@ -67,16 +67,18 @@ def test_the_satellite_tunnel_carries_the_same_body():
 
 def test_confinement_judges_the_path_the_router_matches(monkeypatch):
     """A decoded ``?`` / ``#`` cut ``request.url.path`` short: the master key
-    on ``/v1/sessions/warmup%3F/abort`` was judged as the allowed warmup
-    route while the router ran the session's abort."""
+    on ``/v1/phone/calls/report%3F/answer`` would be judged as the allowed
+    call-report route while the router ran the call's answer route."""
     from fastapi.testclient import TestClient
 
     import config
     from app import app
+    from auth.service_endpoints import is_service_endpoint_allowed
     monkeypatch.setattr(config, "API_KEY", "test-master-key")
+    assert is_service_endpoint_allowed("POST", "/v1/phone/calls/report")
     client = TestClient(app)
     headers = {"Authorization": "Bearer test-master-key"}
-    for path in ("/v1/sessions/warmup%3F/abort", "/v1/sessions/warmup%23/abort"):
+    for path in ("/v1/phone/calls/report%3F/answer", "/v1/phone/calls/report%23/answer"):
         r = client.post(path, headers=headers)
         assert r.status_code == 403, (path, r.status_code, r.text)
         assert "service key" in r.json()["detail"]

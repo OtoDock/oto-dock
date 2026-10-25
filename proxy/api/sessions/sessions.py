@@ -1,5 +1,5 @@
-"""Session management endpoints -- models, helpers, health, file serving, plan files,
-warmup, and session control (mode/model/thinking/permission).
+"""Session management endpoints -- models, helpers, health, plan files,
+and session control (mode/model/thinking/permission).
 
 Also exports `verify_api_key_async` and `verify_session_match_async` for use by the
 `api.hooks` pieces.
@@ -10,7 +10,6 @@ import hmac
 import logging
 import os
 import stat
-import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -19,21 +18,18 @@ from pydantic import BaseModel
 
 import config
 from auth.providers import UserContext, get_current_user, require_admin
-from storage.agents import agent_store
-from services.infra.path_confinement import PathOutsideRoot, resolve_under
-from storage.pg import run_db
-from core.session.session_state import (
-    set_session_mode,
-    get_pending_result,
-)
+from core.execution_layer import PERMISSION_MODES, cli_mode, current_mode
 from core.layers.cli import (
     abort_session,
-    get_persistent_session,
-    get_or_create_persistent_session,
     close_persistent_session,
+    get_persistent_session,
     interrupt_persistent_session,
 )
-from core.layers.direct import create_direct_session, close_direct_session
+from core.layers.direct import close_direct_session
+from core.session.session_state import get_pending_result
+from services.infra.path_confinement import PathOutsideRoot, resolve_under
+from storage.agents import agent_store
+from storage.pg import run_db
 
 logger = logging.getLogger("otodock")
 router = APIRouter()
@@ -73,17 +69,6 @@ async def verify_api_key_async(authorization: str | None) -> None:
     payload = _bearer_payload(authorization)
     if payload is not None and not await token_holder.holder_ok(payload):
         raise HTTPException(status_code=401, detail="Invalid API key")
-
-
-def require_master_key(authorization: str | None) -> None:
-    """Master key ONLY — for the endpoints that mint whole sessions. A
-    session JWT (any agent subprocess, incl. a phone caller's) must never be
-    able to warm a new session for an arbitrary agent."""
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    parts = authorization.split(" ", 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer" or not config.is_master_key(parts[1]):
-        raise HTTPException(status_code=403, detail="This endpoint requires the service key")
 
 
 def _session_payload(authorization: str | None, session_id: str) -> dict | None:
@@ -145,10 +130,10 @@ async def admin_health(user: UserContext | None = Depends(get_current_user)):
     """The version payload (the admin footer, the fleet and version checks)
     and the loop's telemetry, for a platform admin."""
     require_admin(user)
-    from ws.satellite import MIN_SATELLITE_VERSION
     from core import log_queue, loop_watchdog
     from core.session.session_manager import get_all_layers
     from storage import pg
+    from ws.satellite import MIN_SATELLITE_VERSION
     return {
         "status": "ok",
         "service": "otodock",
@@ -222,7 +207,7 @@ async def abort_session_endpoint(session_id: str, authorization: str | None = He
         killed = await close_direct_session(session_id)
     if not killed:
         killed = await abort_session(session_id)
-    logger.info(f"Abort request: session={session_id}, killed={killed}")
+    logger.info("Abort request: session=%s, killed=%s", session_id, killed)
     return {"status": "aborted" if killed else "not_found", "session_id": session_id}
 
 
@@ -234,7 +219,7 @@ async def close_session_endpoint(session_id: str, authorization: str | None = He
     closed = await close_direct_session(session_id)
     if not closed:
         closed = await close_persistent_session(session_id)
-    logger.info(f"Close session request: session={session_id}, closed={closed}")
+    logger.info("Close session request: session=%s, closed=%s", session_id, closed)
     return {"status": "closed" if closed else "not_found", "session_id": session_id}
 
 
@@ -242,7 +227,7 @@ async def close_session_endpoint(session_id: str, authorization: str | None = He
 
 
 class ModeChangeRequest(BaseModel):
-    mode: str  # "default", "acceptEdits", "plan", "dontAsk"
+    mode: str  # a PERMISSION_MODES word (a word from before 1.9 is mapped)
 
 
 @router.patch("/v1/sessions/{session_id}/mode")
@@ -251,10 +236,15 @@ async def change_session_mode(
 ):
     """Change permission mode mid-session via the CLI control channel.
 
-    Only works for sessions started with use_native_permissions=True (dashboard).
-    Valid modes: default, acceptEdits, plan, dontAsk.
+    Only works for sessions started with use_native_permissions=True. The
+    mode is one of ``PERMISSION_MODES`` (``default`` and ``acceptEdits``,
+    the words before 1.9, are taken as Ask and Auto); the CLI is sent its
+    own word for it (``cli_mode``).
     """
     await verify_session_match_async(authorization, session_id)
+    mode = current_mode(req.mode)
+    if mode not in PERMISSION_MODES:
+        raise HTTPException(status_code=400, detail=f"Unknown mode {req.mode!r}")
     session = await get_persistent_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -264,12 +254,12 @@ async def change_session_mode(
             detail="Session doesn't use native permissions -- mode changes not supported",
         )
     async with session.lock:
-        result = await session.send_control_request("set_permission_mode", mode=req.mode)
+        result = await session.send_control_request("set_permission_mode", mode=cli_mode(mode))
     if result.get("subtype") == "error":
         raise HTTPException(status_code=400, detail=result.get("error", "Mode change failed"))
-    session.permission_mode = req.mode
-    logger.info(f"Session {session_id} mode changed to {req.mode}")
-    return {"status": "ok", "mode": req.mode}
+    session.permission_mode = mode
+    logger.info("Session %s mode changed to %s", session_id, mode)
+    return {"status": "ok", "mode": mode}
 
 
 class ModelChangeRequest(BaseModel):
@@ -289,7 +279,7 @@ async def change_session_model(
         result = await session.send_control_request("set_model", model=req.model)
     if result.get("subtype") == "error":
         raise HTTPException(status_code=400, detail=result.get("error", "Model change failed"))
-    logger.info(f"Session {session_id} model changed to {req.model}")
+    logger.info("Session %s model changed to %s", session_id, req.model)
     return {"status": "ok", "model": req.model}
 
 
@@ -312,7 +302,7 @@ async def change_session_thinking(
         )
     if result.get("subtype") == "error":
         raise HTTPException(status_code=400, detail=result.get("error", "Thinking change failed"))
-    logger.info(f"Session {session_id} thinking tokens set to {req.max_tokens}")
+    logger.info("Session %s thinking tokens set to %s", session_id, req.max_tokens)
     return {"status": "ok", "max_tokens": req.max_tokens}
 
 
@@ -355,15 +345,21 @@ class _PlanTooLarge(Exception):
 
 def _get_plans_dir(session_id: str | None) -> Path | None:
     """The plans folder of a local session: its persistent .claude/ dir's
-    ``plans`` (sandbox-aware), made yet or not; None for no session or a
-    session that registered no claude dir. No filesystem call: the routes
-    look in a worker thread. The proxy account's own home belongs to no
-    session and is never answered."""
+    ``plans`` (sandbox-aware), or a local Codex session's .codex/ dir's,
+    made yet or not; None for no session or a session with neither. No
+    filesystem call: the routes look in a worker thread. The proxy
+    account's own home belongs to no session and is never answered."""
     if not session_id:
         return None
     from core.session.session_state import get_session_claude_dir
     claude_dir = get_session_claude_dir(session_id)
-    return Path(claude_dir) / "plans" if claude_dir else None
+    if claude_dir:
+        return Path(claude_dir) / "plans"
+    # A local Codex session writes its plans under its own config dir
+    # (core/layers/codex/layer.queue_plan_review).
+    from core.layers.codex.session import _codex_sessions
+    codex = _codex_sessions.get(session_id)
+    return Path(codex.config_dir) / "plans" if codex is not None and codex.config_dir else None
 
 
 def _get_remote_session_info(session_id: str):
@@ -374,7 +370,7 @@ def _get_remote_session_info(session_id: str):
         if layer is None:
             return None
         return layer._sessions.get(session_id)
-    except Exception:
+    except ImportError:
         return None
 
 
@@ -386,7 +382,7 @@ def _list_local_plans(plans_dir: Path) -> list[dict]:
             entries = list(it)
     except OSError:
         return []
-    plans = []
+    plans: list[dict] = []
     for entry in entries:
         if not entry.name.endswith(".md"):
             continue
@@ -506,108 +502,3 @@ async def get_plan_file(
     if content is None:
         raise HTTPException(status_code=404, detail="Plan not found")
     return {"content": content, "filename": filename}
-
-
-class WarmupRequest(BaseModel):
-    model: str = ""  # agent name (required)
-    session_id: str | None = None
-    permission_mode: str = "auto"
-    llm_mode: str = "proxy"  # "proxy" (CLI) | "direct" (Anthropic API)
-    phone_mode: bool = False  # True = exclude visual MCPs (the "phone" client-type)
-    call_type: str = ""  # "inbound" | "outbound" (call context injection)
-    phone_context_override: str = ""  # per-route extra call context (appended)
-    use_native_permissions: bool = False  # True = dashboard native CLI modes
-
-
-@router.post("/v1/sessions/warmup")
-async def warmup_session_endpoint(req: WarmupRequest, authorization: str | None = Header(None)):
-    """Pre-create a persistent session without sending a message.
-
-    For llm_mode="proxy": starts Claude CLI subprocess + MCP servers.
-    For llm_mode="direct": starts MCP servers only, uses Anthropic API directly.
-
-    Used by phone server during greeting playback so MCP tools are warm
-    by the time the user speaks. Returns the session_id for follow-up requests.
-
-    Phone sessions are NOT warmed here any more: a call's identity (the
-    route, the caller, the PIN gate) rides the management WebSocket warmup
-    (``ws/phone.py``); this legacy HTTP path builds a bare, identity-less
-    session, so it refuses ``phone_mode`` outright rather than run a caller
-    outside the external-route rules.
-    """
-    require_master_key(authorization)
-    if req.phone_mode:
-        raise HTTPException(
-            status_code=410,
-            detail=(
-                "Phone sessions are warmed over the management WebSocket "
-                "(/ws/phone); the HTTP warmup carries no caller identity and "
-                "is not available for calls."
-            ),
-        )
-
-    session_id = req.session_id or str(uuid.uuid4())
-
-    # Build call context if this is a phone (call) session
-    call_context = ""
-    if req.phone_mode and req.call_type:
-        from adapters.phone import PhoneAdapter
-        call_context = "\n\n" + PhoneAdapter.get_phone_context(call_type=req.call_type)
-        if req.phone_context_override:
-            call_context += "\n" + req.phone_context_override
-
-    if req.llm_mode == "direct":
-        # Direct mode: Anthropic API + MCP servers (no CLI subprocess)
-        if not config.ANTHROPIC_API_KEY:
-            raise HTTPException(
-                status_code=500,
-                detail="ANTHROPIC_API_KEY not configured for direct mode",
-            )
-        # Build system prompt with call context for direct mode
-        system_prompt = ""
-        if call_context:
-            base_prompt = config.build_agent_prompt(req.model) or ""
-            system_prompt = base_prompt + call_context
-        try:
-            session = await create_direct_session(
-                session_id=session_id,
-                agent_name=req.model,
-                phone_mode=req.phone_mode,
-                system_prompt=system_prompt,
-            )
-            logger.info(
-                f"Direct warmup ready: {session_id} (agent={req.model}, "
-                f"tools={len(session.tools)})"
-            )
-            return {"status": "ready", "session_id": session_id, "llm_mode": "direct"}
-        except Exception as e:
-            logger.error(f"Direct warmup failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Direct session warmup failed: {e}")
-
-    # Proxy mode: CLI subprocess
-    agent_prompt = config.build_agent_prompt(req.model) or ""
-    if call_context:
-        agent_prompt += call_context
-    from services.mcp import mcp_registry
-    mcp_config_path, _, _, _, _ = mcp_registry.build_session_mcp_config(
-        req.model, None, session_id=session_id)
-
-    try:
-        await get_or_create_persistent_session(
-            session_id=session_id,
-            agent_prompt=agent_prompt,
-            mcp_config_path=mcp_config_path,
-            permission_mode=req.permission_mode,
-            use_native_permissions=req.use_native_permissions,
-        )
-        # For native-permission sessions, hook always allows (native perms gate)
-        if req.use_native_permissions:
-            set_session_mode(session_id, "auto")
-        logger.info(
-            f"Warmup session created: {session_id} (model={req.model}, "
-            f"native_perms={req.use_native_permissions})"
-        )
-        return {"status": "ready", "session_id": session_id, "llm_mode": "proxy"}
-    except Exception as e:
-        logger.error(f"Warmup session failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Session warmup failed: {e}")

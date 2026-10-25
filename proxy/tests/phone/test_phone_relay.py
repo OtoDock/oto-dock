@@ -34,7 +34,8 @@ class _FakeAsyncClient:
     calls: list[dict] = []
     response = _FakeResponse()
 
-    def __init__(self, timeout=None):
+    def __init__(self, timeout=None, **kw):
+        # ``transport``: the checked one a plain-http daemon URL gets.
         self._timeout = timeout
 
     async def __aenter__(self):
@@ -136,7 +137,8 @@ def test_relay_daemon_unreachable_maps_to_502(monkeypatch):
     with pytest.raises(HTTPException) as e:
         asyncio.run(phone_relay._relay("GET", "/api/calls/c1"))
     assert e.value.status_code == 502
-    assert "phone-daemon:9093" in e.value.detail
+    # The address is the admin's to read in the log, never in the answer.
+    assert e.value.detail == "The phone service is not answering. Check that it is running."
 
 
 def test_relay_passes_daemon_status_through(fake_daemon):
@@ -178,6 +180,7 @@ def relay_app(monkeypatch, fake_daemon, temp_db):
     pins route r-x, and the daemon answers 202 with a call id."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
+
     from storage.mcp import mcp_store
     _assigned(monkeypatch, ["phone-mcp"])
     monkeypatch.setattr(

@@ -13,12 +13,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core.remote.file_sync import FileAction
 from core.remote.remote_execution import (
     _DEFER_PULL_MIN_BYTES,
     RemoteExecutionLayer,
     _partition_deferred_pulls,
 )
-from core.remote.file_sync import FileAction
 
 BIG = _DEFER_PULL_MIN_BYTES + 1
 SMALL = _DEFER_PULL_MIN_BYTES - 1

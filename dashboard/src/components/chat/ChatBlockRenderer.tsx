@@ -2,12 +2,13 @@ import { type JSX, useState } from 'react'
 import MarkdownContent from './MarkdownContent'
 import ImageLightbox, { type LightboxImage } from './media/ImageLightbox'
 import ToolActivity from './ToolActivity'
-import ThinkingBlock from './ThinkingBlock'
+import ThinkingBlock, { NoteBlock } from './ThinkingBlock'
 import PermissionDialog from './PermissionDialog'
 import SubagentInfo from './SubagentInfo'
 import BgCommandInfo from './BgCommandInfo'
 import DelegateTaskInfo, { DelegateResultFiles } from './DelegateTaskInfo'
 import CheckVerdictCard from './checks/CheckVerdictCard'
+import { WAKE_SOURCE } from '../../api/wireEvents'
 import SystemEvent from './SystemEvent'
 import ImageGallery from './media/ImageGallery'
 import VideoPlayer from './media/VideoPlayer'
@@ -19,11 +20,13 @@ import UiArtifact from './media/UiArtifact'
 import PlanView from './plan/PlanView'
 import QuestionDialog from './QuestionDialog'
 import SearchHighlight from './SearchHighlight'
-import { useSearch } from '../../contexts/SearchContext'
+
 import type { MessageBlock } from './types'
 import type { BgCommandPair } from '../../lib/messageBlocks'
 import PlanReviewCard from './PlanReviewCard'
 import { FILE_ICON_PATH, FOLDER_ICON_PATH } from './attachmentIcons'
+import { useSearch } from '../../contexts/useSearch'
+import { CARD } from '../ui/classes'
 
 // URL regex for linkifying plain text (user messages)
 const URL_RE = /https?:\/\/[^\s<>)"'\]]+/g
@@ -81,7 +84,7 @@ function AttachedImageStrip({ images }: { images: string[] }) {
           key={i}
           src={src}
           alt={`Attached image ${i + 1}`}
-          className="w-20 h-20 rounded-lg object-cover border border-white/30 cursor-pointer
+          className="w-20 h-20 rounded-card object-cover border border-action-fg/30 cursor-pointer
                      hover:opacity-90 transition-opacity"
           onClick={() => setLightboxIdx(i)}
         />
@@ -114,6 +117,7 @@ export default function BlockRenderer({
   onQuestionAnswerStructured,
   onSendMessage,
   onSendAgain,
+  sendAgainKind,
   onPlanFetched,
   onArtifactInteraction,
   bgPair,
@@ -121,6 +125,7 @@ export default function BlockRenderer({
   uiSuperseded,
   uiTitle,
   dialogsInTerminal,
+  noteAside,
 }: {
   block: MessageBlock
   blockId: string
@@ -136,8 +141,10 @@ export default function BlockRenderer({
   onQuestionAnswer?: (response: string) => void
   onQuestionAnswerStructured?: (requestId: string, answers: Record<string, { answers: string[] }>) => void
   onSendMessage?: (text: string) => void
-  /** The turn-ended card's Send again (the page re-sends the last prompt). */
+  /** The turn-ended card's button: the page sends it (Resume, or the last
+   *  prompt again), the list says which from the transcript. */
   onSendAgain?: () => void
+  sendAgainKind?: 'resume' | 'again'
   onPlanFetched?: (filename: string, content: string) => void
   /** A live interactive terminal owns this chat's dialogs: question and plan
    * cards render read-only — the answer / approval happens in the TUI, and a
@@ -155,10 +162,16 @@ export default function BlockRenderer({
   /** ui blocks: fallback title inherited from an earlier display of the same
    * path (html-less re-displays carry none on the wire). */
   uiTitle?: string
+  /** A progress note drawn as an aside (faint, `noteAsides`); a note that is
+   * a real message is drawn as text. */
+  noteAside?: boolean
 }) {
   const { query: searchQuery } = useSearch()
   switch (block.type) {
     case 'text':
+      if (block.note && noteAside && !isUserMessage) {
+        return <NoteBlock content={block.content} blockId={blockId} blockOrder={blockOrder} />
+      }
       if (isUserMessage) {
         return (
           <p className="text-sm whitespace-pre-wrap">
@@ -185,22 +198,22 @@ export default function BlockRenderer({
         (block.name === 'mcp__display__display_ui' || block.name === 'mcp__display__pin_app')
       ) {
         return (
-          <div data-testid="ui-artifact-building" className="my-2 w-full max-w-md overflow-hidden rounded-xl border border-p-border-light bg-white dark:bg-p-surface">
+          <div data-testid="ui-artifact-building" className={`my-2 w-full max-w-md overflow-hidden ${CARD}`}>
             <div className="flex items-center gap-3 px-4 py-3">
-              <svg className="h-5 w-5 shrink-0 animate-spin text-p-text-light" fill="none" viewBox="0 0 24 24">
+              <svg className="h-5 w-5 shrink-0 animate-spin text-tertiary" fill="none" viewBox="0 0 24 24">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
-              <span className="text-xs text-p-text-secondary">
+              <span className="text-xs text-secondary">
                 {block.name === 'mcp__display__pin_app'
                   ? 'Working on an app…'
                   : 'Working on an interactive artifact…'}
               </span>
             </div>
             <div className="animate-pulse space-y-2 px-4 pb-4">
-              <div className="h-2.5 w-3/4 rounded bg-gray-200 dark:bg-gray-700" />
-              <div className="h-2.5 w-1/2 rounded bg-gray-200 dark:bg-gray-700" />
-              <div className="h-16 rounded-lg bg-linear-to-br from-gray-100 to-gray-200 dark:from-gray-800 dark:to-gray-700" />
+              <div className="h-2.5 w-3/4 rounded-sm bg-surface-muted" />
+              <div className="h-2.5 w-1/2 rounded-sm bg-surface-muted" />
+              <div className="h-16 rounded-card bg-surface-muted" />
             </div>
           </div>
         )
@@ -217,7 +230,7 @@ export default function BlockRenderer({
       )
 
     case 'subagent':
-      return <SubagentInfo description={block.description} subagentType={block.subagentType} isActive={block.isActive} failed={block.failed} background={(block as any)._background} toolInput={block.toolInput} toolResult={block.toolResult} />
+      return <SubagentInfo description={block.description} subagentType={block.subagentType} isActive={block.isActive} failed={block.failed} background={block._background} toolInput={block.toolInput} toolResult={block.toolResult} />
 
     case 'bgcommand':
       return <BgCommandInfo command={block.command} description={block.description} isActive={block.isActive} failed={block.failed} toolInput={bgPair?.toolInput} toolResult={bgPair?.toolResult} />
@@ -247,12 +260,23 @@ export default function BlockRenderer({
       )
 
     case 'schedulewake':
-      // A schedule_continuation wake drove this turn (no user present).
-      return (
-        <div className="my-1.5 flex items-center gap-2 py-1.5 px-2 rounded-lg bg-p-surface text-xs text-p-text-secondary">
+      // A schedule_continuation wake drove this turn (no user present), or
+      // the platform resumed the chat on its new place after the agent moved it.
+      return block.source === WAKE_SOURCE.MOVE ? (
+        <div className="my-1.5 flex items-center gap-2 py-1.5 px-2 rounded-card bg-surface-muted text-xs text-secondary"
+             data-testid="move-resume-row">
+          <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+          </svg>
+          <span className="shrink-0 font-medium">Continued after the move</span>
+          {block.prompt && <span className="truncate text-tertiary">{block.prompt}</span>}
+        </div>
+      ) : (
+        <div className="my-1.5 flex items-center gap-2 py-1.5 px-2 rounded-card bg-surface-muted text-xs text-secondary">
           <span className="shrink-0" aria-hidden>⏰</span>
           <span className="shrink-0 font-medium">Scheduled wake</span>
-          {block.prompt && <span className="truncate text-p-text-light">{block.prompt}</span>}
+          {block.prompt && <span className="truncate text-tertiary">{block.prompt}</span>}
         </div>
       )
 
@@ -312,7 +336,7 @@ export default function BlockRenderer({
       )
 
     case 'system':
-      return <SystemEvent subtype={block.subtype} agentName={block.agentName} agentColor={block.agentColor} message={block.message} reason={block.reason} onSendAgain={onSendAgain} />
+      return <SystemEvent subtype={block.subtype} agentName={block.agentName} agentColor={block.agentColor} message={block.message} reason={block.reason} returned={block.returned} sendAgain={sendAgainKind} onSendAgain={onSendAgain} />
 
     case 'images':
       return <ImageGallery images={block.images} />
@@ -342,12 +366,12 @@ export default function BlockRenderer({
 
     case 'media_processing':
       return (
-        <div className="my-2 flex max-w-md items-center gap-3 rounded-xl border border-p-border-light bg-white px-4 py-3 dark:bg-p-surface">
-          <svg className="h-5 w-5 animate-spin text-p-text-light" fill="none" viewBox="0 0 24 24">
+        <div className={`my-2 flex max-w-md items-center gap-3 px-4 py-3 ${CARD}`}>
+          <svg className="h-5 w-5 animate-spin text-tertiary" fill="none" viewBox="0 0 24 24">
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
           </svg>
-          <span className="text-xs text-p-text-secondary">
+          <span className="text-xs text-secondary">
             Preparing {block.mediaKind === 'audio' ? 'audio' : 'video'} for playback…
           </span>
         </div>
@@ -355,20 +379,20 @@ export default function BlockRenderer({
 
     case 'image_generating':
       return (
-        <div className="my-2 rounded-xl border border-p-border-light bg-white dark:bg-p-surface overflow-hidden max-w-md animate-pulse">
-          <div className="w-full aspect-square bg-linear-to-br from-gray-100 to-gray-200 dark:from-gray-800 dark:to-gray-700 flex items-center justify-center">
+        <div className={`my-2 overflow-hidden max-w-md animate-pulse ${CARD}`}>
+          <div className="w-full aspect-square bg-surface-muted flex items-center justify-center">
             <div className="text-center space-y-2">
-              <svg className="w-8 h-8 mx-auto text-gray-400 dark:text-gray-500 animate-spin" fill="none" viewBox="0 0 24 24">
+              <svg className="w-8 h-8 mx-auto text-tertiary animate-spin" fill="none" viewBox="0 0 24 24">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
-              <p className="text-xs text-gray-500 dark:text-gray-400">Generating image...</p>
+              <p className="text-xs text-tertiary">Generating image...</p>
             </div>
           </div>
           <div className="px-3 py-2">
-            <p className="text-xs text-p-text-light truncate">
+            <p className="text-xs text-tertiary truncate">
               {block.model === 'gpt-image' ? 'GPT Image 1.5' : 'Nano Banana Pro'}
-              {block.promptPreview && ` — ${block.promptPreview}`}
+              {block.promptPreview && `: ${block.promptPreview}`}
             </p>
           </div>
         </div>
@@ -392,7 +416,7 @@ export default function BlockRenderer({
       }
       // Legacy rows without saved paths: badge with count
       return (
-        <div className="flex items-center gap-1.5 mb-1 text-xs text-white/70">
+        <div className="flex items-center gap-1.5 mb-1 text-xs text-action-fg">
           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                   d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
@@ -406,7 +430,7 @@ export default function BlockRenderer({
       return (
         <div className="flex flex-col gap-1 mb-1">
           {block.files.map((f, i) => (
-            <div key={i} className="flex items-center gap-1.5 text-xs text-white/80 bg-white/10 rounded-md px-2.5 py-1.5 w-fit">
+            <div key={i} className="flex items-center gap-1.5 text-xs text-action-fg bg-action-fg/10 rounded-control px-2.5 py-1.5 w-fit">
               <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                       d={f.folder ? FOLDER_ICON_PATH : FILE_ICON_PATH} />
@@ -436,13 +460,13 @@ export default function BlockRenderer({
           <button
             onClick={scrollToLatest}
             data-testid="ui-artifact-superseded"
-            className="my-1 flex items-center gap-1.5 rounded-lg border border-p-border-light/60 bg-p-surface/60 px-2.5 py-1.5 text-xs text-p-text-secondary transition-colors hover:bg-p-surface"
+            className="my-1 flex items-center gap-1.5 rounded-control border border-subtle/60 bg-surface-muted/60 px-2.5 py-1.5 text-xs text-secondary transition-colors hover:bg-surface-muted"
           >
-            <svg className="h-3.5 w-3.5 shrink-0 text-p-text-light" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+            <svg className="h-3.5 w-3.5 shrink-0 text-tertiary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0V12a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 12V5.25" />
             </svg>
             <span className="font-medium">{block.title || uiTitle || 'UI artifact'}</span>
-            <span className="text-p-text-light">— updated version below ↓</span>
+            <span className="text-tertiary">· updated version below ↓</span>
           </button>
         )
       }
@@ -468,16 +492,16 @@ export default function BlockRenderer({
         } catch { return '' }
       })()
       return (
-        <div className="my-1 flex items-start gap-1.5 rounded-lg border border-p-border-light/60 bg-p-surface/60 px-2.5 py-1.5 text-xs">
-          <svg className="mt-0.5 h-3.5 w-3.5 shrink-0 text-p-text-light" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <div className="my-1 flex items-start gap-1.5 rounded-card border border-subtle/60 bg-surface-muted/60 px-2.5 py-1.5 text-xs">
+          <svg className="mt-0.5 h-3.5 w-3.5 shrink-0 text-tertiary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" />
           </svg>
           <div className="min-w-0">
-            <span className="font-medium text-p-text-secondary">
-              interaction from artifact{block.title ? ` “${block.title}”` : ''}
+            <span className="font-medium text-secondary">
+              Interaction from artifact{block.title ? ` “${block.title}”` : ''}
             </span>
             {payloadPreview && (
-              <code className="ml-1.5 break-all text-[11px] text-p-text-light">{payloadPreview}</code>
+              <code className="ml-1.5 break-all text-2xs text-tertiary">{payloadPreview}</code>
             )}
           </div>
         </div>
@@ -491,19 +515,19 @@ export default function BlockRenderer({
         ? (block.prompt || '').slice(0, 117) + '…'
         : block.prompt || ''
       return (
-        <div className="my-1 flex items-start gap-1.5 rounded-lg border border-p-border-light/60 bg-p-surface/60 px-2.5 py-1.5 text-xs">
-          <svg className="mt-0.5 h-3.5 w-3.5 shrink-0 text-p-text-light" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <div className="my-1 flex items-start gap-1.5 rounded-card border border-subtle/60 bg-surface-muted/60 px-2.5 py-1.5 text-xs">
+          <svg className="mt-0.5 h-3.5 w-3.5 shrink-0 text-tertiary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
             <rect x="3.75" y="3.75" width="7" height="7" rx="1.5" />
             <rect x="13.25" y="3.75" width="7" height="7" rx="1.5" />
             <rect x="3.75" y="13.25" width="7" height="7" rx="1.5" />
             <rect x="13.25" y="13.25" width="7" height="7" rx="1.5" />
           </svg>
           <div className="min-w-0">
-            <span className="font-medium text-p-text-secondary">
-              action from app{block.title ? ` “${block.title}”` : ''}{block.label ? ` — ${block.label}` : ''}
+            <span className="font-medium text-secondary">
+              Action from app{block.title ? ` “${block.title}”` : ''}{block.label ? `: ${block.label}` : ''}
             </span>
             {promptPreview && (
-              <span className="ml-1.5 break-all text-[11px] text-p-text-light">{promptPreview}</span>
+              <span className="ml-1.5 break-all text-2xs text-tertiary">{promptPreview}</span>
             )}
           </div>
         </div>

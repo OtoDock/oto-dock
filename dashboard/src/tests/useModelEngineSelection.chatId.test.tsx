@@ -42,10 +42,10 @@ describe('useModelEngineHandlers chat_id', () => {
 
 // ─── The mode invariant corrects a mode the engine does not declare, but a
 //     task chat's stored `auto` is the run's fact: flipping it to the first
-//     declared mode showed a task run as Default instead of Don't Ask. ───────
+//     declared mode showed a task run as Ask instead of Don't Ask. ───────────
 
 describe('usePermissionModeInvariant', () => {
-  const declared = ['default', 'acceptEdits', 'plan', 'dontAsk']
+  const declared = ['ask', 'autoReview', 'dontAsk', 'plan']
 
   it('keeps a task chat on its stored auto mode', () => {
     const setMode = vi.fn()
@@ -61,8 +61,17 @@ describe('usePermissionModeInvariant', () => {
 
   it('moves an undeclared pick to the first declared mode', () => {
     const setMode = vi.fn()
-    renderHook(() => usePermissionModeInvariant('plan', ['default', 'acceptEdits', 'dontAsk'], setMode))
-    expect(setMode).toHaveBeenCalledWith('default')
+    renderHook(() => usePermissionModeInvariant('plan', ['ask', 'autoReview', 'dontAsk'], setMode))
+    expect(setMode).toHaveBeenCalledWith('ask')
+  })
+
+  it('reads a word from before 1.9 as its current one', () => {
+    const setMode = vi.fn()
+    renderHook(() => usePermissionModeInvariant('acceptEdits', declared, setMode))
+    expect(setMode).toHaveBeenCalledWith('autoReview')
+    const direct = vi.fn()
+    renderHook(() => usePermissionModeInvariant('acceptEdits', ['ask', 'dontAsk'], direct))
+    expect(direct).toHaveBeenCalledWith('ask')
   })
 
   it('waits for the catalog before correcting anything', () => {

@@ -72,6 +72,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import config
+from storage.identity import oauth_app_kinds
 
 logger = logging.getLogger("otodock.oauth-refresh-worker")
 
@@ -302,7 +303,7 @@ def _refresh_threshold_for(provider_id: str) -> int:
             except (TypeError, ValueError):
                 continue
             best = max(best, v)
-    except Exception:
+    except ImportError:
         return _REFRESH_THRESHOLD_SECONDS
     return best
 
@@ -393,8 +394,8 @@ def _write_back(token_file: Path, expected_mtime: float, payload: dict) -> float
     mtime. Runs in a worker thread."""
     try:
         current = token_file.stat().st_mtime
-    except OSError:
-        raise _WriteAborted("vanished")
+    except OSError as exc:
+        raise _WriteAborted("vanished") from exc
     if current != expected_mtime:
         raise _WriteAborted("moved")
     fd, tmp_name = tempfile.mkstemp(prefix=token_file.name + ".", suffix=".partial",
@@ -487,10 +488,10 @@ async def _refresh_candidate(cand: _Candidate, state: _TickState) -> bool:
 async def _refresh_locked(cand: _Candidate, user_sub: str, state: _TickState) -> bool:
     """Under the account lock: the re-read is the source of every field, a
     pending write is retried first, the arms dispatch, the write-back."""
+    from auth.oauth_providers import get_provider
     from services.billing import relay_client
     from services.mcp import mcp_registry
     from services.oauth import mcp_authorization, oauth_account_store
-    from auth.oauth_providers import get_provider
     from storage.pg import run_db
 
     token_file, provider_id = cand.path, cand.provider_id
@@ -534,6 +535,12 @@ async def _refresh_locked(cand: _Candidate, user_sub: str, state: _TickState) ->
     #   * Standard OAuth → provider.refresh with the stored refresh_token.
     file_extra = raw2.get("extra", {}) or {}
     flow_marker = file_extra.get("flow", "")
+    if flow_marker == oauth_app_kinds.INSTALLATION_FLOW:
+        # An installation token (sessions/<provider>-tokens/_app/<id>.json):
+        # re-minted by the app in use while a binding stands, deleted as an
+        # orphan otherwise; checked before the relay arm, since a hosted
+        # installation file carries via_relay too.
+        return await _remint_installation(cand, raw2, mtime2)
     is_relay = bool(file_extra.get("via_relay"))
     if is_relay and not await run_db(relay_client.is_available):
         # Hosted token but the relay isn't reachable yet — can't refresh
@@ -678,6 +685,46 @@ async def _refresh_locked(cand: _Candidate, user_sub: str, state: _TickState) ->
     return True
 
 
+async def _remint_installation(cand: _Candidate, raw: dict, mtime: float) -> bool:
+    """The installation arm: a fresh token through the app in use (the
+    admin's key or the relay) while a binding stands, written through the
+    guarded write; an orphan file goes. A permanent refusal (the
+    installation gone, suspended, no longer owned; the key rejected; the
+    app changed) marks the file dead until a bind or a save rewrites it."""
+    from auth.oauth_providers.base import OAuthTokenError
+    from services.oauth import github_apps
+
+    key = str(cand.path)
+    try:
+        payload = await asyncio.to_thread(
+            github_apps.remint_file, cand.path, raw, provider_id=cand.provider_id,
+        )
+    except OAuthTokenError as exc:
+        if exc.code in oauth_app_kinds.INSTALLATION_REASONS:
+            await _mark_dead(cand.path, raw, mtime, exc.code, exc)
+            return False
+        raise
+    if payload is None:
+        _failure_state.pop(key, None)
+        _pending_writes.pop(key, None)
+        return False
+    try:
+        await asyncio.to_thread(_write_back, cand.path, mtime, payload)
+    except _WriteAborted as aborted:
+        logger.warning("Re-minted installation token for %s not written: the file %s",
+                       cand.path.name, aborted)
+        return False
+    except OSError as exc:
+        _pending_writes[key] = _PendingWrite(mtime=mtime, payload=payload)
+        logger.error("Re-minted installation token for %s could not be written (%s); kept "
+                     "in memory for the next tick", cand.path.name, exc)
+        return False
+    logger.debug("Re-minted installation token: provider=%s installation=%s",
+                 cand.provider_id, cand.path.stem)
+    _failure_state.pop(key, None)
+    return True
+
+
 async def _refresh_registered(
     raw: dict, *, provider_id: str, refresh_token: str, state: _TickState, issuer_override: str = "",
 ):
@@ -729,5 +776,5 @@ async def _refresh_registered(
         mcp_authorization.forget(resource)
         server = await mcp_authorization.discover(resource, issuer_override=issuer_override)
         if server.issuer.rstrip("/") != issuer.rstrip("/"):
-            raise _FileVerdict("issuer_changed")
+            raise _FileVerdict("issuer_changed") from exc
         return await _call(server.token_endpoint), server.token_endpoint, secret

@@ -42,7 +42,7 @@ describe('CommunitySkillsBrowser', () => {
     })
     renderBrowser()
     expect(
-      await screen.findByText(/Skills catalog unreachable — showing nothing/),
+      await screen.findByText(/Could not reach the community skills list/),
     ).toBeInTheDocument()
     // No spurious "no matches" empty-state alongside the banner.
     expect(screen.queryByText(/No skill packages match/)).toBeNull()
@@ -135,7 +135,7 @@ describe('CommunitySkillsBrowser', () => {
       </QueryClientProvider>,
     )
     expect(
-      await screen.findByText('Enabled — package files missing, reinstall needed'),
+      await screen.findByText('Enabled: package files missing, reinstall needed'),
     ).toBeInTheDocument()
     expect(await screen.findByRole('button', { name: 'Reinstall' })).toBeInTheDocument()
   })

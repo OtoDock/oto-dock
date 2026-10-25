@@ -74,8 +74,8 @@ def _add_sub(layer: str, *, owner: str = "", personal: bool = True,
 
 
 def _enabled_paths(slug: str) -> list[str]:
-    from api.agents._common import _get_execution_paths
     from storage.agents import agent_store
+    from storage.agents.agent_store import _get_execution_paths
     return _get_execution_paths(agent_store.get_agent(slug) or {})
 
 

@@ -13,11 +13,12 @@ from types import SimpleNamespace
 import pytest
 
 from tests._paths import PROXY_DIR, REPO_ROOT
+
 if str(PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(PROXY_DIR))
 
-from services.mcp import mcp_registry  # noqa: E402
-from services.mcp.mcp_manifest_types import SKILL_AUDIENCES  # noqa: E402
+from services.mcp import mcp_registry
+from services.mcp.mcp_manifest_types import SKILL_AUDIENCES
 
 
 def test_ssh_hosts_declares_the_editor_tier():

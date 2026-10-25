@@ -18,11 +18,10 @@ Two guarantees are covered:
 """
 import asyncio
 
-
-from core.events.common_events import SUBAGENT_START, SUBAGENT_END
+from core.events.common_events import SUBAGENT_END, SUBAGENT_START
 from core.layers.codex.layer import CodexEventTranslator
 from core.layers.codex.session import CodexAppServerSession, CodexEvent
-from core.session.session_state import get_subagent_registry, _subagent_registries
+from core.session.session_state import _subagent_registries, get_subagent_registry
 
 MAIN = "thread-MAIN"
 SUB = "thread-SUB-agent"      # in reality the agentId == the sub-agent thread id

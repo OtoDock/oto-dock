@@ -27,6 +27,7 @@ def _controller(*, accessible: set[str], do_warmup: AsyncMock):
     c._warmup_task = None
     c.session_id = None
     c.chat_id = None
+    c.user_sub = "user-x"
     return c
 
 

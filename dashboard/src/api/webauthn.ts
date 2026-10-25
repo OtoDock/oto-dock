@@ -34,6 +34,20 @@ function bufToB64url(buf: ArrayBuffer): string {
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
+/** A credential descriptor as the server sends it: the id base64url-encoded. */
+interface CredentialDescriptorJSON {
+  id: string
+  type: PublicKeyCredentialType
+  transports?: AuthenticatorTransport[]
+}
+
+/** What the passkey verify answers, by leg: the signed-in user, or the
+ *  native handoff's one-time token. */
+interface PasskeyVerified {
+  user: User
+  native_token: string
+}
+
 async function jsonOrThrow(res: Response, fallback: string) {
   if (!res.ok) {
     const detail = await res.json().catch(() => ({}))
@@ -60,7 +74,7 @@ export async function registerPasskey(password: string, name: string): Promise<v
     ...options,
     challenge: b64urlToBuf(options.challenge),
     user: { ...options.user, id: b64urlToBuf(options.user.id) },
-    excludeCredentials: (options.excludeCredentials || []).map((c: any) => ({
+    excludeCredentials: (options.excludeCredentials || []).map((c: CredentialDescriptorJSON) => ({
       ...c, id: b64urlToBuf(c.id),
     })),
   }
@@ -112,7 +126,7 @@ export async function deletePasskey(credentialId: string, password: string): Pro
 // match the proxy's NATIVE_HANDOFF_STATE.
 export const NATIVE_HANDOFF_STATE = 'passkey-handoff'
 
-async function runPasskeyAssertion(native: boolean, totpSessionToken?: string, handoff?: string): Promise<any> {
+async function runPasskeyAssertion(native: boolean, totpSessionToken?: string, handoff?: string): Promise<PasskeyVerified> {
   const optRes = await fetch('/auth/passkey/options', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -123,7 +137,7 @@ async function runPasskeyAssertion(native: boolean, totpSessionToken?: string, h
   const publicKey: PublicKeyCredentialRequestOptions = {
     ...options,
     challenge: b64urlToBuf(options.challenge),
-    allowCredentials: (options.allowCredentials || []).map((c: any) => ({
+    allowCredentials: (options.allowCredentials || []).map((c: CredentialDescriptorJSON) => ({
       ...c, id: b64urlToBuf(c.id),
     })),
   }
@@ -196,7 +210,7 @@ export async function passkeyConfirm(): Promise<string> {
   const publicKey: PublicKeyCredentialRequestOptions = {
     ...options,
     challenge: b64urlToBuf(options.challenge),
-    allowCredentials: (options.allowCredentials || []).map((c: any) => ({
+    allowCredentials: (options.allowCredentials || []).map((c: CredentialDescriptorJSON) => ({
       ...c, id: b64urlToBuf(c.id),
     })),
   }

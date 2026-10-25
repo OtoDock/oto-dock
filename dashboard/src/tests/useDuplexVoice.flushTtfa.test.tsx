@@ -27,22 +27,7 @@ vi.mock('@/audio/webaudioPlayer', () => ({
 
 import { useDuplexVoice } from '@/hooks/useDuplexVoice'
 import { installMicEnv, uninstallMicEnv } from './fakeMicEnv'
-
-class FakeWebSocket {
-  static OPEN = 1
-  static CONNECTING = 0
-  static instances: FakeWebSocket[] = []
-  readyState = FakeWebSocket.OPEN
-  binaryType = ''
-  sent: string[] = []
-  onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
-  onmessage: ((e: { data: string | ArrayBuffer }) => void) | null = null
-  constructor(public url: string) { FakeWebSocket.instances.push(this) }
-  send(data: string) { this.sent.push(data) }
-  close() { /* keep teardown quiet */ }
-}
+import { FakeWebSocket } from './fakeWebSocket'
 
 describe('useDuplexVoice flush + ttfa', () => {
   beforeEach(() => {

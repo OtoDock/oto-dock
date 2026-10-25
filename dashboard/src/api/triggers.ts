@@ -1,5 +1,6 @@
 import { apiFetch } from './auth'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { apiJson } from '../lib/http/apiJson'
 
 export interface Trigger {
   /** Set on a row the offboarding transfer moved: the first creator's sub,
@@ -56,9 +57,13 @@ export interface Trigger {
   can_fire: boolean
 }
 
+/** A trigger notification's severities (the notify block's select). */
+export const NOTIFY_SEVERITIES = ['info', 'success', 'warning', 'danger'] as const
+export type NotifySeverity = (typeof NOTIFY_SEVERITIES)[number]
+
 export interface NotifyConfig {
   enabled?: boolean
-  severity?: 'info' | 'success' | 'warning' | 'danger'
+  severity?: NotifySeverity
   title?: string
   body?: string
   target_scope?: 'user' | 'agent' | 'global'
@@ -125,13 +130,11 @@ export const useCreateTrigger = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (req: CreateTriggerRequest) => {
-      const res = await apiFetch('/v1/triggers', {
+      return apiJson<Trigger>('/v1/triggers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(req),
       })
-      if (!res.ok) throw new Error((await res.json()).detail ?? res.statusText)
-      return res.json()
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['triggers'] }),
   })
@@ -141,13 +144,11 @@ export const useEditTrigger = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (args: { id: string; fields: EditTriggerRequest }) => {
-      const res = await apiFetch(`/v1/triggers/${args.id}/edit`, {
+      return apiJson<Trigger>(`/v1/triggers/${args.id}/edit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(args.fields),
       })
-      if (!res.ok) throw new Error((await res.json()).detail ?? res.statusText)
-      return res.json()
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['triggers'] }),
   })
@@ -157,9 +158,7 @@ export const useDeleteTrigger = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: string) => {
-      const res = await apiFetch(`/v1/triggers/${id}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+      return apiJson(`/v1/triggers/${id}`, { method: 'DELETE' }, 'Could not delete the trigger')
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['triggers'] }),
   })
@@ -169,9 +168,7 @@ export const usePauseTrigger = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: string) => {
-      const res = await apiFetch(`/v1/triggers/${id}/pause`, { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+      return apiJson(`/v1/triggers/${id}/pause`, { method: 'POST' }, 'Could not pause the trigger')
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['triggers'] }),
   })
@@ -181,9 +178,7 @@ export const useResumeTrigger = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: string) => {
-      const res = await apiFetch(`/v1/triggers/${id}/resume`, { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+      return apiJson(`/v1/triggers/${id}/resume`, { method: 'POST' }, 'Could not resume the trigger')
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['triggers'] }),
   })
@@ -193,13 +188,11 @@ export const useFireTrigger = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (args: { id: string; body?: Record<string, unknown> }) => {
-      const res = await apiFetch(`/v1/triggers/${args.id}/fire`, {
+      return apiJson(`/v1/triggers/${args.id}/fire`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(args.body ?? {}),
       })
-      if (!res.ok) throw new Error((await res.json()).detail ?? res.statusText)
-      return res.json()
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['triggers'] }),
   })

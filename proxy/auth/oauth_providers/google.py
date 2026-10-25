@@ -153,6 +153,6 @@ class GoogleOAuthProvider(OAuthProvider):
                 return True
             logger.warning("Google token revocation returned %d", resp.status_code)
             return False
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.warning("Google token revocation failed: %s", e)
             return False

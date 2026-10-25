@@ -16,19 +16,18 @@ from __future__ import annotations
 import asyncio
 import json
 
-import pytest
-
-from services.scheduler import scheduler
-from services.scheduler import delivery, lanes
-from services.scheduler.scheduler import TaskDefinition
-from storage import database as task_store
-
-
 # The ws rung now has a LIVENESS GATE: queue presence alone no longer routes —
 # the target session must be alive. Tests that exercise the ws route register
 # a fake alive CLI session alongside their notify queue.
 from contextlib import contextmanager
 from types import SimpleNamespace
+
+import pytest
+
+from core.execution_layer import ResumeVerdict
+from services.scheduler import delivery, lanes, scheduler
+from services.scheduler.scheduler import TaskDefinition
+from storage import database as task_store
 
 
 @contextmanager
@@ -205,11 +204,35 @@ class TestDelegateDelivery:
             _dashboard_notify_queues.pop("sess-s", None)
 
 
+    def test_a_wake_never_drives_a_chat_locked_on_a_colleagues_computer(self, temp_db,
+                                                                         monkeypatch):
+        """The placement lock on the wake door: a delegate result for a person
+        whose chat's live session sits on another person's computer does not
+        run its echo turn there (no layer is even asked); the next rung meets
+        the guard and the wake is kept."""
+        from services.remote import chat_move
+        _owner()
+        task_store.create_chat("chat-lk", "user-1", "pa")
+        monkeypatch.setattr(chat_move, "lock_sentence",
+                            lambda chat, sub: "This chat is running on Ann's computer.")
+
+        def _no_layer(*a, **k):
+            raise AssertionError("a locked chat must not reach a layer")
+
+        import core.session.session_manager as sm
+        monkeypatch.setattr(sm, "get_execution_layer", _no_layer)
+        out = asyncio.run(delivery._deliver_via_persistent(
+            "sess-lk", "pa", "echo prompt", user_sub="user-1", role="editor",
+            chat_id="chat-lk"))
+        assert out is None
+
+
 class TestEchoOffTheLoop:
     def test_echo_row_rides_the_chat_writer(self, temp_db, monkeypatch):
         # The assistant echo is written on the chat's lane,
         # on the DB executor, never with a store call on the event loop.
         import threading
+
         from core.events import chat_writer
         _owner()
         task_store.create_chat("chat-w1", "user-1", "pa")
@@ -244,6 +267,7 @@ class TestEchoOffTheLoop:
 
     def test_a_continuation_wake_row_rides_the_chat_writer(self, temp_db, monkeypatch):
         import threading
+
         from core.events import chat_writer
         from core.session import session_delivery
         from services.scheduler import firing
@@ -298,6 +322,7 @@ def _owner(sub: str = "user-1", agent: str = "pa") -> None:
     """The chat's owner as a person holding the agent: a person's own chat
     is woken as them, and only while they hold it."""
     from datetime import datetime, timezone
+
     from storage.pg import get_conn
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
@@ -731,8 +756,8 @@ class TestOneshotSecurityContext:
         captured: dict = {}
 
         class _FakeLayer:
-            async def can_resume_session(self, sid, agent_name="", username=""):
-                return True
+            async def can_resume_session(self, sid, agent_name="", username="", external_home=""):
+                return ResumeVerdict.RESUMABLE
 
             async def start_session(self, sid, cfg):
                 captured["cfg"] = cfg
@@ -747,7 +772,7 @@ class TestOneshotSecurityContext:
                 return _Lock()
 
             async def send_message(self, sid, prompt):
-                from core.events.common_events import CommonEvent, TEXT
+                from core.events.common_events import TEXT, CommonEvent
                 yield CommonEvent(type=TEXT, data={"content": "ok"})
 
         from core.session import session_manager
@@ -837,10 +862,11 @@ class TestTaskStallWatchdog:
             async def _finish():
                 await asyncio.sleep(0.12)
                 hang.set_result(None)
-            asyncio.ensure_future(_finish())
+            finisher = asyncio.ensure_future(_finish())
             await scheduler._watch_task_pump(
                 self._FakeLayer(idle=1.0), pump, "run-p", "chat-p", "s" * 8,
                 on_parked=_parked)
+            await finisher
             return told
 
         assert self._run(_go(False)) == ["told"]
@@ -1102,7 +1128,7 @@ class _FakeEchoLayer:
         return self._locks.setdefault(sid, asyncio.Lock())
 
     async def send_message(self, sid, prompt, settle_after_result=None):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
         for part in self._text_parts:
             yield CommonEvent(type=TEXT, data={"content": part})
         yield CommonEvent(type=DONE, data={})
@@ -1258,7 +1284,7 @@ class _RecordingEchoLayer(_FakeEchoLayer):
         self._subagent_at_close = subagent_at_close
 
     async def send_message(self, sid, prompt, **kwargs):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
         from core.session.session_state import get_subagent_registry
         self.sends.append(kwargs)
         try:
@@ -1512,7 +1538,11 @@ class TestTypedEnding:
                 await asyncio.sleep(0.01)
 
         asyncio.run(run())
-        assert captured["prompt"].startswith("Worker finished with status=failed. Output:\nhalf the report")
+        # No file and no "Blocked on:" line: it ended without a report, which
+        # its first line says before the template.
+        first, _, rest = captured["prompt"].partition("\n\n")
+        assert first.startswith("[The worker ended without a report: the usage limit was reached.")
+        assert rest.startswith("Worker finished with status=failed. Output:\nhalf the report")
         assert captured["prompt"].endswith(f"[{ending.callback_note('')}]")
         assert "resets 2026-10-01 15:00 UTC" in captured["prompt"]
         assert captured["ending"] is ending
@@ -1678,8 +1708,8 @@ class TestWorkLeftRunning:
         """A run's turn waits on a person while nobody views it: a user-scope
         task's creator is told; an agent-scope run tells the agent's editors
         and managers, never its members."""
-        from services.notifications import notification_manager
         import auth.providers as providers
+        from services.notifications import notification_manager
         told: list[tuple[str, str]] = []
 
         async def fake_fire(title, body, **kw):
@@ -1761,3 +1791,141 @@ class TestWakeReplayAtAPumpsEnd:
             q.release(claim)
         assert not delivery._wake_superseded("", "wk-3")
         input_queue._registry.pop("wk-3", None)
+
+
+class TestReportMissing:
+    """A worker whose own run cut its turn short and that left no report
+    (no file, no ``Blocked on:`` line): the result says so first and is
+    flagged on every delivery path."""
+
+    def test_the_rule_reads_the_runs_end_never_the_answer(self):
+        from core.events import turn_ending as te
+        rule = lanes.report_missing
+        for cut in (te.DECLINED, te.LIMIT, te.ERROR, te.EXITED, te.SILENT, te.LOST):
+            assert rule(cut, "failed", "Now I will run the gates.", [], []) is True
+        # No end of its own: a short answer, an empty one, a long one.
+        for output in ("ok", "", "x" * 5000):
+            assert rule("", "completed", output, [], []) is False
+        # A person's Stop is its own badge; so is a cancellation.
+        assert rule(te.STOPPED, "user_interrupted", "half", [], []) is False
+        assert rule(te.LIMIT, "user_interrupted", "half", [], []) is False
+        assert rule(te.LIMIT, "cancelled", "half", [], []) is False
+        # A file or a skipped file is a deliverable: a report.
+        assert rule(te.LIMIT, "failed", "half", [{"path": "a.md", "bytes": 3}], []) is False
+        assert rule(te.LIMIT, "failed", "half", [], [{"path": "b", "reason": "too big"}]) is False
+        # The report's own line, plain, bulleted or bold.
+        for line in ("Blocked on: nothing", "- Blocked on: the key", "**Blocked on:** CI",
+                     "**Blocked on**: CI", "  blocked on : x"):
+            assert rule(te.LIMIT, "failed", f"Did the work.\n\n{line}", [], []) is False
+        assert rule(te.LIMIT, "failed", "I am not blocked on anything yet", [], []) is True
+        # A steer during the turn is part of the cut turn: still flagged; a
+        # person's own "Blocked on:" line is not the worker's report.
+        assert rule(te.LIMIT, "failed", "half\n\n[User interjected]: go on\n\nmore", [], []) is True
+        assert rule(te.LIMIT, "failed", "half\n\n[User interjected]: Blocked on: me", [], []) is True
+        # A person continued the lane after the turn ended.
+        assert rule(te.LIMIT, "failed", "half", [], [], continued=True) is False
+
+    @staticmethod
+    def _deliver(monkeypatch, output, **kw):
+        captured: dict = {}
+
+        async def fake_do_deliver(session_id, agent, result_prompt, task, **dkw):
+            captured.update(prompt=result_prompt, **dkw)
+
+        monkeypatch.setattr(delivery, "_do_deliver", fake_do_deliver)
+        monkeypatch.setattr(delivery.task_store, "get_dynamic_task", lambda tid: {
+            "on_complete_agent": "pa", "on_complete_session_id": "sess-1",
+            "on_complete_chat_id": None,
+            "on_complete_prompt": "[BACKGROUND_TASK_RESULT]\nstatus={{status}}\n{{output}}"})
+
+        async def run():
+            await delivery._deliver_task_result(_task(), kw.pop("status", "failed"), output, **kw)
+            for _ in range(100):
+                if captured:
+                    return
+                await asyncio.sleep(0.01)
+
+        asyncio.run(run())
+        return captured
+
+    def test_a_cut_short_run_opens_the_callback_and_flags_the_event(self, monkeypatch):
+        got = self._deliver(monkeypatch, "Next I will read the tests.", cut_short="limit")
+        first, _, rest = got["prompt"].partition("\n\n")
+        assert first.startswith("[The worker ended without a report: the usage limit was reached.")
+        assert "Continue the lane with delegate(continue_id=" in first
+        assert rest.startswith("[BACKGROUND_TASK_RESULT]")
+        assert got["report_missing"] is True
+
+    def test_a_typed_ending_counts_and_a_stop_does_not(self, monkeypatch):
+        from core.events import turn_ending as te
+        got = self._deliver(monkeypatch, "half",
+                            ending=te.TurnEnding(te.DECLINED, detail="cyber"))
+        assert got["prompt"].startswith("[The worker ended without a report: the model declined")
+        assert got["report_missing"] is True
+        got = self._deliver(monkeypatch, "half", status="user_interrupted",
+                            ending=te.TurnEnding(te.STOPPED))
+        assert got["report_missing"] is False
+        assert got["prompt"].startswith("[BACKGROUND_TASK_RESULT]")
+
+    def test_a_report_is_never_flagged(self, monkeypatch):
+        got = self._deliver(monkeypatch, "Done.\n\nBlocked on: nothing", cut_short="limit")
+        assert got["report_missing"] is False
+        got = self._deliver(monkeypatch, "Done.", status="completed")
+        assert got["report_missing"] is False
+
+    def test_a_steer_during_the_turn_keeps_the_flag_a_message_after_it_does_not(
+            self, temp_db, monkeypatch):
+        """The order decides: a continue steered into the running lane before
+        its limit end is part of the cut turn; a person's message written
+        after the turn ended continued the lane."""
+        task_store.create_chat("w-1", "user-1", "pa")
+        task_store.add_chat_message("w-1", "assistant", "Starting the review.")
+        task_store.add_chat_message("w-1", "user", "also check the docs")
+        task_store.add_chat_message("w-1", "assistant", "Reading the docs next.")
+        cursor = task_store.get_last_chat_message_id("w-1")
+        got = self._deliver(monkeypatch, "", cut_short="limit",
+                            worker_chat_id="w-1", turn_end_cursor=cursor)
+        assert got["report_missing"] is True
+        assert got["prompt"].startswith("[The worker ended without a report:")
+
+        task_store.add_chat_message("w-1", "user", "go on")
+        got = self._deliver(monkeypatch, "", cut_short="limit",
+                            worker_chat_id="w-1", turn_end_cursor=cursor)
+        assert got["report_missing"] is False
+
+    def test_the_flag_rides_every_path(self, temp_db, monkeypatch):
+        """The persisted row (a failed ladder), the notify payload the
+        dashboard socket's rung rebuilds the event from, and that rebuild."""
+        from core.session.session_state import _dashboard_notify_queues
+        from ws.dashboard_server_events import result_event_from_notify
+        _owner()
+        task_store.create_chat("chat-rm", "user-1", "pa")
+
+        async def _fail(*a, **k):
+            return None
+        monkeypatch.setattr(delivery, "_deliver_via_persistent", _fail)
+        monkeypatch.setattr(delivery, "_deliver_via_oneshot", _fail)
+        asyncio.run(scheduler._do_deliver(
+            "sess-rm", "pa", "echo", _task(), chat_id="chat-rm", output_text="half",
+            status="failed", report_missing=True, background_pending=2,
+        ))
+        data = json.loads(_delegate_events("chat-rm")[0]["event_data"])
+        assert data["report_missing"] is True and data["background_pending"] == 2
+
+        task_store.create_chat("chat-rm2", "user-1", "pa")
+        q: asyncio.Queue = asyncio.Queue()
+        _dashboard_notify_queues["sess-rm2"] = q
+        try:
+            with _alive_cli_session("sess-rm2"):
+                asyncio.run(scheduler._do_deliver(
+                    "sess-rm2", "pa", "echo", _task(), chat_id="chat-rm2", output_text="half",
+                    status="failed", report_missing=True, background_pending=2,
+                ))
+            payload = q.get_nowait()
+        finally:
+            _dashboard_notify_queues.pop("sess-rm2", None)
+        assert payload["report_missing"] is True and payload["background_pending"] == 2
+        event = result_event_from_notify(payload)
+        assert event["report_missing"] is True and event["background_pending"] == 2
+        # A result without the flag keeps its old shape.
+        assert "report_missing" not in result_event_from_notify({"task_id": "t", "status": "completed"})

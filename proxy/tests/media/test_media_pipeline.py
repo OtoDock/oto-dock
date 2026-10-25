@@ -10,7 +10,6 @@ import pytest
 
 from services.media import media_pipeline as mp
 
-
 # ----------------------------- mime + kind --------------------------------
 
 
@@ -136,7 +135,7 @@ async def test_ensure_playable_async_no_transcode_for_websafe():
 async def test_remux_h264_mov_to_mp4(tmp_path, monkeypatch):
     monkeypatch.setattr(mp, "_CACHE_DIR", tmp_path / "cache")
     src = tmp_path / "in.mov"
-    subprocess.run(
+    subprocess.run(  # noqa: ASYNC221  # the test builds its fixture clip with ffmpeg before the call under test
         [mp.FFMPEG, "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=10",
          "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
          "-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p", str(src)],

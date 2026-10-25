@@ -17,10 +17,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from api.hooks.hooks import resolve_hook_chat_id, resolve_hook_route
 from app import app
-from api.hooks.hooks import resolve_hook_route, resolve_hook_chat_id
 from core.events.bg_command_state import (
-    _bg_command_registries, get_bg_command_registry,
+    _bg_command_registries,
+    get_bg_command_registry,
 )
 from core.session import session_state
 from core.session.session_state import (
@@ -32,7 +33,6 @@ from core.session.session_state import (
     set_meeting_session_info,
 )
 from services.meetings import meeting_orchestrator as mo
-
 
 client = TestClient(app)
 
@@ -253,7 +253,10 @@ def test_bg_command_completion_clears_parent_chat_badge():
 @pytest.mark.asyncio
 async def test_pump_stamps_speaker_on_non_text_blocks(temp_db):
     from core.events.common_events import (
-        CommonEvent, THINKING, TOOL_RESULT, TOOL_USE,
+        THINKING,
+        TOOL_RESULT,
+        TOOL_USE,
+        CommonEvent,
     )
     from core.events.stream_pump import ChatStreamPump
 
@@ -307,9 +310,9 @@ def test_drain_system_notes_routes_nudges_to_moderator():
 # turn boundary — a participant that keeps working stalls the whole meeting;
 # observed live 2026-09-09, 304 s and 27 API turns after the first direct_to).
 
-from api.hooks.hooks import decide_tool_permission  # noqa: E402
-from auth.path_policy import SecurityContext  # noqa: E402
-from core.session.session_state import (  # noqa: E402
+from api.hooks.hooks import decide_tool_permission
+from auth.path_policy import SecurityContext
+from core.session.session_state import (
     clear_meeting_turn_routed,
     get_meeting_session_info,
     set_session_mode,
@@ -449,13 +452,16 @@ async def test_codex_named_meeting_tool_marks_the_turn(moderator_session, monkey
     # authority, so the backstop (and the manifest's open tier) see the
     # same name Claude sends.
     from pathlib import Path
+
     import config as app_config
     from core.session.session_manager import get_layer_by_path
     monkeypatch.setattr("core.session.session_manager.engine_layer_for_session",
                         lambda sid: get_layer_by_path("codex-cli"))
     from services.mcp import mcp_registry as reg
     from services.mcp.mcp_manifest_types import (
-        CredentialConfig, McpManifest, ServerConfig,
+        CredentialConfig,
+        McpManifest,
+        ServerConfig,
     )
     manifest = McpManifest(
         name="meetings-mcp", label="Meetings", description="d", version="1.0.0",

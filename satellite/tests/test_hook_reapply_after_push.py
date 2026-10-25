@@ -19,9 +19,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from satellite.config import hook_command
 from satellite.sessions.session_manager import SessionManager
 from satellite.transport import file_sync
-from satellite.config import hook_command
 
 
 def _virtual_settings() -> str:

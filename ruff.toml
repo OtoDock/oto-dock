@@ -21,8 +21,9 @@ extend-exclude = [
 
 # First-party roots for the import sorter: the proxy and the phone service
 # import their own packages by their top-level names (named, not ".", so a
-# gitignored directory at the root never counts as first-party on one machine).
-src = ["proxy", "phone"]
+# gitignored directory at the root never counts as first-party on one machine);
+# each custom MCP server imports its sibling modules by their bare names.
+src = ["proxy", "phone", "mcps/custom/*"]
 
 [lint]
 select = [
@@ -44,10 +45,13 @@ select = [
     "C901",    # function complexity, above max-complexity below
     "I",       # import order
     "UP",      # syntax the target version has a newer form for
+    "RUF100",  # a noqa marker nothing needs any more
 ]
 
 [lint.isort]
 known-first-party = ["satellite"]
+# One statement per module: `from x import a as b, c as d` stays one line.
+combine-as-imports = true
 
 [lint.mccabe]
 max-complexity = 40

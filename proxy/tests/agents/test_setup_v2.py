@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -151,7 +152,7 @@ class TestAttachHookSeeding:
 # ---------------------------------------------------------------------------
 
 def _call(user_ctx, scope=None, summary=""):
-    from api.agents.discovery import complete_agent_setup, CompleteSetupBody
+    from api.agents.discovery import CompleteSetupBody, complete_agent_setup
     with patch(
         "services.notifications.notification_manager.fire_notification",
         new=AsyncMock(),

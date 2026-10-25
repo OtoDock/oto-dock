@@ -19,10 +19,13 @@
  */
 
 import { useEffect, useRef, useState } from 'react'
+import Dialog from './ui/Dialog'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from '../api/auth'
 import { useAuth } from '../contexts/AuthContext'
 import { ICON_PATHS, highlightsFor, type Highlight, type IconName } from '../release/highlights'
+import { apiJson, apiOk, withMessage } from '../lib/http/apiJson'
+import Button from './ui/Button'
+import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT, DIALOG_PANEL } from './ui/classes'
 
 export interface ReleaseCard {
   show_admin: boolean
@@ -34,25 +37,25 @@ export interface ReleaseCard {
   release_url: string
 }
 
-export const RELEASE_CARD_KEY = ['release-card']
+const RELEASE_CARD_KEY = ['release-card']
 
 /** The cards the viewer sees: an admin both lists, a member the list for everyone; a downgrade none. */
-export function cardsFor(card: ReleaseCard): { everyone: Highlight[]; admins: Highlight[] } {
+function cardsFor(card: ReleaseCard): { everyone: Highlight[]; admins: Highlight[] } {
   if (card.direction === 'down') return { everyone: [], admins: [] }
   const h = highlightsFor(card.version)
   return { everyone: h.everyone, admins: card.show_admin ? h.admins : [] }
 }
 
 /** Whether the dialog opens: the server's eligibility, then for a member the file. */
-export function shouldShow(card: ReleaseCard): boolean {
+function shouldShow(card: ReleaseCard): boolean {
   if (!card.eligible) return false
   if (card.show_admin) return true
   return cardsFor(card).everyone.length > 0
 }
 
 async function markSeen(version: string): Promise<void> {
-  const res = await apiFetch('/v1/users/me/release-card/seen', { method: 'POST', body: JSON.stringify({ version }) })
-  if (!res.ok) throw new Error('Failed to mark the release seen')
+  await apiOk('/v1/users/me/release-card/seen', { method: 'POST', body: JSON.stringify({ version }) })
+    .catch(withMessage('Failed to mark the release seen'))
 }
 
 function Icon({ name }: { name: string }) {
@@ -69,12 +72,12 @@ function Cards({ items }: { items: Highlight[] }) {
     <ul className="space-y-3">
       {items.map((h, i) => (
         <li key={i} className="flex items-start gap-3">
-          <span className="w-9 h-9 rounded-full bg-brand/10 text-brand flex items-center justify-center shrink-0">
+          <span className="w-9 h-9 rounded-full bg-surface-muted text-secondary flex items-center justify-center shrink-0">
             <Icon name={h.icon} />
           </span>
           <div className="min-w-0">
-            <p className="text-sm font-semibold text-p-text">{h.title}</p>
-            <p className="text-sm text-p-text-secondary">{h.text}</p>
+            <p className="text-sm font-semibold text-primary">{h.title}</p>
+            <p className="text-sm text-secondary">{h.text}</p>
           </div>
         </li>
       ))}
@@ -90,9 +93,7 @@ export function ReleaseDialog() {
   const { data } = useQuery({
     queryKey: RELEASE_CARD_KEY,
     queryFn: async (): Promise<ReleaseCard> => {
-      const res = await apiFetch('/v1/users/me/release-card')
-      if (!res.ok) throw new Error('Failed to fetch')
-      return res.json()
+      return apiJson<ReleaseCard>('/v1/users/me/release-card').catch(withMessage('Failed to fetch'))
     },
     enabled: !!user,
     staleTime: 60 * 60_000,
@@ -123,75 +124,58 @@ export function ReleaseDialog() {
       .catch(() => { /* hidden for this load; the next load asks again */ })
   }
 
-  useEffect(() => {
-    if (!show) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') dismiss() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [show, data?.version])
-
   if (!data || !show) return null
 
   const down = data.direction === 'down'
   const headline = down
-    ? `OtoDock now runs ${data.version}${data.previous ? ` (it ran ${data.previous} before)` : ''}.`
-    : `OtoDock was updated to ${data.version}${data.previous ? ` (from ${data.previous})` : ''}.`
+    ? `OtoDock now runs ${data.version}.${data.previous ? ` It ran ${data.previous} before.` : ''}`
+    : `OtoDock was updated${data.previous ? ` from ${data.previous}` : ''} to ${data.version}.`
   const cards = cardsFor(data)
   const both = cards.everyone.length > 0 && cards.admins.length > 0
   const none = cards.everyone.length === 0 && cards.admins.length === 0
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={dismiss}>
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="release-dialog-title"
-        className="bg-white dark:bg-p-surface rounded-2xl shadow-xl border border-p-border dark:border-gray-700 w-full max-w-lg overflow-hidden"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="bg-brand-surface px-5 py-4 border-b border-brand/20">
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-brand">What is new</p>
-          <h2 id="release-dialog-title" className="text-lg font-semibold text-p-text mt-0.5">{headline}</h2>
+    <Dialog
+      onClose={dismiss}
+      aria-labelledby="release-dialog-title"
+      panelClassName={`${DIALOG_PANEL} max-w-lg overflow-hidden`}
+    >
+        <div className="bg-status-info-bg px-5 py-4 border-b border-subtle">
+          <p className="text-2xs font-semibold uppercase tracking-wider text-status-info-fg">What is new</p>
+          <h2 id="release-dialog-title" className="font-display text-lg font-semibold text-primary mt-0.5">{headline}</h2>
         </div>
         {!down && (
           <div className="px-5 py-4 max-h-[60vh] overflow-y-auto space-y-4">
-            {none && <p className="text-sm text-p-text-secondary">Fixes and polish throughout this release.</p>}
+            {none && <p className="text-sm text-secondary">Fixes and polish throughout this release.</p>}
             {cards.everyone.length > 0 && (
               <section>
-                {both && <p className="text-[11px] font-semibold uppercase tracking-wider text-p-text-light mb-2">For everyone</p>}
+                {both && <p className="text-2xs font-semibold uppercase tracking-wider text-tertiary mb-2">For everyone</p>}
                 <Cards items={cards.everyone} />
               </section>
             )}
             {cards.admins.length > 0 && (
               <section>
-                {both && <p className="text-[11px] font-semibold uppercase tracking-wider text-p-text-light mb-2">For admins</p>}
+                {both && <p className="text-2xs font-semibold uppercase tracking-wider text-tertiary mb-2">For admins</p>}
                 <Cards items={cards.admins} />
               </section>
             )}
           </div>
         )}
-        <div className="px-5 py-3 border-t border-p-border-light flex items-center justify-end gap-2">
+        <div className="px-5 py-3 border-t border-subtle flex items-center justify-end gap-2">
           {data.show_admin && !down && data.release_url && (
             <a
               href={data.release_url}
               target="_blank"
               rel="noopener noreferrer"
-              className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors"
+              className={`${BUTTON_BASE} ${BUTTON_VARIANT.secondary} ${BUTTON_SIZE.sm}`}
             >
               Release notes
             </a>
           )}
-          <button
-            type="button"
-            autoFocus
-            onClick={dismiss}
-            className="px-3 py-1.5 text-sm font-medium rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors"
-          >
+          <Button variant="primary" type="button" autoFocus onClick={dismiss}>
             Close
-          </button>
+          </Button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }

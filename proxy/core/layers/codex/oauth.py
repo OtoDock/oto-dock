@@ -31,7 +31,7 @@ CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 def _json_or_none(resp) -> dict | None:
     try:
         body = resp.json()
-    except Exception:
+    except ValueError:
         return None
     return body if isinstance(body, dict) else None
 
@@ -57,7 +57,7 @@ def refresh(refresh_token: str, stored: dict) -> OAuthRefresh:
             },
             timeout=15,
         )
-    except Exception as e:
+    except requests.RequestException as e:
         return OAuthRefresh(error=str(e))
     if resp.status_code != 200:
         return OAuthRefresh(status=resp.status_code, body=_json_or_none(resp))

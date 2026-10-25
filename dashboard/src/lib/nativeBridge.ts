@@ -26,6 +26,7 @@ import { openExternalUrl } from './openExternal'
 
 export type NativeMethod =
   | 'dashboardReady'
+  | 'firstScreen'
   | 'setStreaming'
   | 'setContainerColor'
   | 'enterVideoFullscreen'
@@ -40,6 +41,7 @@ export type NativeMethod =
   | 'renameInstallation'
   | 'disconnectServer'
   | 'openPrivacyPolicy'
+  | 'foldNote'
 
 export type NativeQuery = 'getInstallations' | 'switchToInstall' | 'openAuthBrowser'
 
@@ -74,6 +76,19 @@ export function hasNativeBridge(): boolean {
  *  native platform without it (the iOS app). */
 export function inAppShell(): boolean {
   return hasNativeBridge() || Capacitor.isNativePlatform()
+}
+
+/** The app's fold log (logcat tag `OtoDockFold`): one line per event from
+ *  the page, with the page clock, the visibility state and the device pixel
+ *  ratio, so a display switch on a foldable can be read next to the app's
+ *  own lines. A no-op off the app. The app caps the text; keep a note to one
+ *  short sentence. */
+export function noteFold(text: string): void {
+  if (!channel()) return
+  const t = typeof performance !== 'undefined' ? Math.round(performance.now()) : 0
+  const vis = typeof document !== 'undefined' ? document.visibilityState : '?'
+  const dpr = typeof window !== 'undefined' ? window.devicePixelRatio : 0
+  callNative('foldNote', `${text} [t=${t}ms ${vis} dpr=${dpr}]`)
 }
 
 /** OtoDock's privacy policy for the apps; the stores require a link to it

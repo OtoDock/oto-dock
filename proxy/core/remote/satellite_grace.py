@@ -9,6 +9,7 @@ with deregister + monkeypatched by tests) and is imported lazily where needed.
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 logger = logging.getLogger("otodock.satellite")
 
@@ -19,7 +20,13 @@ _GRACE_EXPIRED_MSG = (
 
 
 
-class SatelliteGraceMixin:
+if TYPE_CHECKING:
+    from core.remote.satellite_host import SatelliteManagerHost as _Host
+else:
+    _Host = object
+
+
+class SatelliteGraceMixin(_Host):
     async def _expire_grace(self, machine_id: str) -> None:
         """Reconnect-grace timeout. If the satellite hasn't reconnected within
         _GRACE_WINDOW_S, terminate the held in-flight sessions with a visible
@@ -39,7 +46,7 @@ class SatelliteGraceMixin:
             self._grace_timers.pop(machine_id, None)
         if not held:
             return
-        for session_id, (queue, _path) in held.items():
+        for _session_id, (queue, _path) in held.items():
             try:
                 # `durable_marker` tells the pump to PERSIST this as a visible
                 # block, not just forward it live, so a

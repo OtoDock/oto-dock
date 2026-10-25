@@ -47,6 +47,7 @@ def _make_chat(agent: str, *, chat_id: str | None = None,
 
 def _enable_codex(slug: str) -> None:
     import json
+
     from storage.agents import agent_store
     agent_store.update_agent(slug, execution_path="claude-code-cli",
                              execution_paths=json.dumps(["codex-cli"]))
@@ -89,9 +90,11 @@ def _switch(ws, path: str = "codex-cli", model: str = TEST_MODEL):
                     "execution_path": path, "model": model})
 
 
-def _off_loop_only(monkeypatch, module, name: str):
+def _off_loop_only(monkeypatch, module, name: str, *,
+                   on_loop: list[str] | None = None):
     """The store read must reach ``name`` from a worker thread, never on the
-    loop (a read on the loop raises)."""
+    loop (a read on the loop raises). With ``on_loop`` a read on the loop is
+    let through and recorded there instead, for a test that pins one."""
     real = getattr(module, name)
 
     def _guarded(*a, **kw):
@@ -99,7 +102,10 @@ def _off_loop_only(monkeypatch, module, name: str):
             asyncio.get_running_loop()
         except RuntimeError:
             return real(*a, **kw)
-        raise AssertionError(f"{name} read on the loop")
+        if on_loop is None:
+            raise AssertionError(f"{name} read on the loop")
+        on_loop.append(name)
+        return real(*a, **kw)
     monkeypatch.setattr(module, name, _guarded)
 
 
@@ -147,16 +153,21 @@ class TestSwitchEngineGates:
         cid = _make_chat(slug, chat_id=f"task-{uuid.uuid4()}")
         self._make_task_run(cid, status="completed", agent=slug)
         from storage import database as task_store
+        on_loop: list[str] = []
 
         async def scenario():
             async with dashboard_connection(session_cookie()) as ws:
                 await drain_startup(ws)
                 ws.client_send({"type": "resume_chat", "chat_id": cid})
                 await _drain_until(ws, "chat_history")
-                _off_loop_only(monkeypatch, task_store, "get_run")
+                _off_loop_only(monkeypatch, task_store, "get_run", on_loop=on_loop)
                 _switch(ws)
                 frame = await _drain_until(ws, "engine_switched")
                 assert frame["execution_path"] == "codex-cli"
+            # The gate reads the run off the loop; the re-check right before
+            # the commit reads it on the loop on purpose (no await between it
+            # and the compare-and-set).
+            assert on_loop == ["get_run"]
             chat = task_store.get_chat(cid)
             assert chat["execution_path"] == "codex-cli"
             assert chat["pending_history_seed"].startswith("engine_switch:")
@@ -239,8 +250,8 @@ class TestSwitchEngineGates:
         # A chat wired as an ACTIVE continuation target keeps its row
         # coherent with the continuation's delivery ladder (a rebind NULLs
         # session_id and the oneshot delivery would silently starve — see
-        # the plan doc's W2-F5; the pre-existing machine-removal starvation
-        # is ROADMAP'd, this deny closes the user-triggerable path).
+        # the plan doc's W2-F5; the machine-removal starvation has its own
+        # fix, this deny closes the user-triggerable path).
         from storage import database as task_store
         stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
         slug = make_test_agent()
@@ -477,6 +488,12 @@ class TestSwitchEngineHappyPath:
                 assert row["pending_history_seed"] == \
                     "engine_switch:claude-code-cli"
                 assert conns[-1].session_id is None
+                # The Claude session the switch left is recorded, to go
+                # once Codex has answered (switch_leftovers).
+                from storage import remote_store
+                [left] = remote_store.switch_leftovers()
+                assert (left["chat_id"], left["engine"], left["session_id"],
+                        left["place"]) == (cid, "claude-code-cli", sid, "local")
         run_ws_scenario(scenario)
 
     def test_switch_back_supported(self, temp_db, monkeypatch):
@@ -511,6 +528,7 @@ class TestSwitchEngineHappyPath:
         # hop back — and BOTH the prior pending notice and the switch card
         # are persisted immediately instead of silently swallowed.
         import json as _json
+
         from storage import database as task_store
         stub_dashboard_seams(monkeypatch, FakeExecutionLayer())
         slug = make_test_agent()
@@ -661,6 +679,7 @@ class TestInteractiveSeedRestoreOnSpawnFailure:
 class TestEngineSwitchSeedReason:
     def test_consume_engine_switch_reason(self, temp_db):
         import json as _json
+
         from core.session import history_seed
         from storage import database as task_store
         slug = make_test_agent()

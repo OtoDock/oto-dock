@@ -99,3 +99,16 @@ def test_delete_blocked_when_route_uses_server(client):
     # Deleting the route frees the server.
     assert client.delete(f"/v1/admin/phone/routes/{route.json()['id']}").status_code == 200
     assert client.delete(f"/v1/admin/phone-servers/{s['id']}").status_code == 200
+
+
+def test_a_server_that_cannot_be_added_says_so_in_plain_words(client, monkeypatch, caplog):
+    from storage.phone import phone_server_store
+
+    def broken(data):
+        raise RuntimeError("server closed the connection unexpectedly")
+    monkeypatch.setattr(phone_server_store, "create_server", broken)
+    with caplog.at_level("WARNING"):
+        r = client.post("/v1/admin/phone-servers", json={"name": "pbx9"})
+    assert (r.status_code, r.json()["detail"]) == (
+        400, "Could not add the phone server. The server log has the details.")
+    assert "closed the connection" in caplog.text

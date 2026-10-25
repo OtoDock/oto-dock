@@ -13,10 +13,9 @@ import time
 
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from storage import database as task_store
-
+from tests.media.wopi_signing import signed_client, signing
 
 
 @pytest.fixture(autouse=True)
@@ -142,6 +141,7 @@ def test_gc_age_gate_spares_inflight_snapshot(temp_db, tmp_path, snap_root):
     # in flight) is unreferenced but FRESH — GC must not eat it, even when
     # the source (whose times the copy keeps) was last written long ago.
     import os
+
     from services.media import preview_snapshots as ps
     task_store.create_chat("chat-1", "user-a", "test-agent")
     src = _seed_source(tmp_path)
@@ -185,6 +185,7 @@ def test_a_push_numbers_itself_and_caps_the_files_versions(temp_db, tmp_path, sn
 
 def _refresh_rig(tmp_path, snap_root):
     import os
+
     from services.media import preview_snapshots as ps
     task_store.create_chat("chat-1", "user-a", "test-agent")
     src = _seed_source(tmp_path, b"pushed bytes")
@@ -286,13 +287,14 @@ def _wopi_config(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "COLLABORA_URL", "https://collabora.example", raising=False)
     monkeypatch.setattr(config, "WOPI_BASE_URL", "https://wopi.example", raising=False)
     monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://app.example", raising=False)
+    signing(monkeypatch)
 
 
 def _wopi_client():
     from api.media import wopi
     app = FastAPI()
     app.include_router(wopi.router)
-    return TestClient(app)
+    return signed_client(app)
 
 
 def _snapshot_token(chat_id, sid, permissions="view", display_name="report.xlsx"):
@@ -410,7 +412,7 @@ def _mint_app(monkeypatch, tmp_path, *, sub="user-a", is_admin=False,
     app = FastAPI()
     app.include_router(wopi.router)
     app.dependency_overrides[get_current_user] = _stub
-    return TestClient(app)
+    return signed_client(app)
 
 
 def _mint(client, chat_id, sid):
@@ -420,9 +422,7 @@ def _mint(client, chat_id, sid):
 
 
 def test_snapshot_url_happy_path_is_view_only(temp_db, tmp_path, snap_root, monkeypatch):
-    import jwt as _jwt
-
-    import config
+    from auth import tokens
     from services.media import preview_snapshots as ps
     task_store.create_chat("chat-1", "user-a", "test-agent")
     client = _mint_app(monkeypatch, tmp_path)
@@ -433,7 +433,7 @@ def test_snapshot_url_happy_path_is_view_only(temp_db, tmp_path, snap_root, monk
     url = r.json()["wopi_url"]
     assert url.startswith("https://collabora.example/browser/dist/cool.html?WOPISrc=")
     assert "access_token" not in url
-    claims = _jwt.decode(r.json()["access_token"], config.WOPI_SECRET, algorithms=["HS256"])
+    claims = tokens.decode(r.json()["access_token"], tokens.WOPI)
     assert claims["permissions"] == "view"
     assert claims["display_name"] == "budget.xlsx"
 
@@ -531,11 +531,9 @@ def _remint(client, chat_id, file_id):
 
 
 def _claims(body):
-    import jwt as _jwt
-
-    import config
+    from auth import tokens
     assert "access_token" not in body["wopi_url"]
-    return _jwt.decode(body["access_token"], config.WOPI_SECRET, algorithms=["HS256"])
+    return tokens.decode(body["access_token"], tokens.WOPI)
 
 
 def test_preview_remint_recomputes_requester_permission(temp_db, tmp_path, monkeypatch):
@@ -594,9 +592,10 @@ def test_preview_remint_404s(temp_db, tmp_path, monkeypatch):
 
 
 def test_preview_remint_host_cache_is_session_scoped(temp_db, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
     import config
     from api.media.wopi import encode_file_id
-    from types import SimpleNamespace
     task_store.create_chat("chat-1", "user-a", "test-agent")
     task_store.update_chat("chat-1", session_id="sess-1")
     # The live session runs as user-a: the file on its machine is theirs.

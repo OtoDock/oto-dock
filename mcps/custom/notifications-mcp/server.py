@@ -14,7 +14,9 @@ import os
 
 import httpx
 from mcp.server import Server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+
+from _tool_args import ToolArgs
 
 AGENT = os.environ.get("NOTIF_MCP_AGENT", "system-admin")
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
@@ -42,6 +44,7 @@ AVAILABLE_SCOPES = [
 SCOPE_DEFAULT = _DEFAULT_SCOPE if _DEFAULT_SCOPE in AVAILABLE_SCOPES else AVAILABLE_SCOPES[0]
 
 server = Server("notifications-mcp")
+TOOL_ARGS = ToolArgs()
 
 _client = httpx.AsyncClient(timeout=30)
 
@@ -76,13 +79,13 @@ async def _get_current_session() -> dict:
     """Get the current session context (username, chat_id, etc.)."""
     try:
         return await _get("/v1/session/current")
-    except Exception:
+    except (httpx.HTTPError, ValueError):
         return {}
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="create_notification",
             description=(
@@ -191,6 +194,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["title", "body"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
         ),
         Tool(
             name="list_notifications",
@@ -223,6 +227,7 @@ async def list_tools() -> list[Tool]:
                     },
                 },
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="cancel_notification",
@@ -241,6 +246,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
         ),
         Tool(
             name="pause_notification",
@@ -259,6 +265,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
         ),
         Tool(
             name="resume_notification",
@@ -278,6 +285,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
         ),
         Tool(
             name="edit_notification",
@@ -334,12 +342,16 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
         ),
-    ]
+    ])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     if name == "create_notification":
         return await _handle_create(arguments)
     elif name == "list_notifications":
@@ -450,7 +462,7 @@ async def _handle_create(args: dict) -> list[TextContent]:
     except httpx.HTTPStatusError as e:
         detail = e.response.text if e.response else str(e)
         return [TextContent(type="text", text=f"Failed to create notification: {detail}")]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
 
@@ -483,7 +495,7 @@ async def _handle_list(args: dict) -> list[TextContent]:
             lines.append(f"- [{severity}] {title}{timing} (id={nid}, type={ntype}, {status})")
 
         return [TextContent(type="text", text="\n".join(lines))]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error listing notifications: {e}")]
 
 
@@ -496,7 +508,7 @@ async def _handle_cancel(args: dict) -> list[TextContent]:
         if e.response.status_code == 404:
             return [TextContent(type="text", text=f"Notification {nid} not found.")]
         return [TextContent(type="text", text=f"Failed to delete: {e.response.text}")]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
 
@@ -517,7 +529,7 @@ async def _handle_pause(args: dict) -> list[TextContent]:
         if e.response.status_code == 404:
             return [TextContent(type="text", text=f"Notification {nid} not found.")]
         return [TextContent(type="text", text=f"Failed to pause: {e.response.text}")]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
 
@@ -542,7 +554,7 @@ async def _handle_resume(args: dict) -> list[TextContent]:
         if e.response.status_code == 404:
             return [TextContent(type="text", text=f"Notification {nid} not found.")]
         return [TextContent(type="text", text=f"Failed to resume: {e.response.text}")]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
 
@@ -580,7 +592,7 @@ async def _handle_edit(args: dict) -> list[TextContent]:
         if e.response.status_code == 404:
             return [TextContent(type="text", text=f"Notification {nid} not found.")]
         return [TextContent(type="text", text=f"Failed to edit: {e.response.text}")]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
 

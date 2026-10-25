@@ -60,6 +60,45 @@ if [ ! -f "$_root/config.env" ]; then
     exit 1
 fi
 
+# Collabora's ssl.termination follows the scheme of DASHBOARD_PUBLIC_URL, as
+# Collabora's own entrypoint derived it at every start before 26.04 (whose
+# image has no shell): exported for the compose file's
+# ${COLLABORA_SSL_TERMINATION}, so this flow is always current. The shell wins.
+if [ -z "${COLLABORA_SSL_TERMINATION:-}" ]; then
+    _url="${DASHBOARD_PUBLIC_URL:-$(awk '
+        { line = $0; sub(/^[ \t]*/, "", line); sub(/^export[ \t]+/, "", line)
+          if (match(line, /^DASHBOARD_PUBLIC_URL[ \t]*=[ \t]*/)) v = substr(line, RLENGTH + 1) }
+        END { sub(/[ \t]+#.*$/, "", v); gsub(/["\047]/, "", v); print v }' "$_root/config.env")}"
+    case "$_url" in
+        [Hh][Tt][Tt][Pp][Ss]://*) export COLLABORA_SSL_TERMINATION=true ;;
+        *) export COLLABORA_SSL_TERMINATION=false ;;
+    esac
+fi
+
+# Collabora's WOPI proof key is mounted as one file of a volume (a subpath):
+# Docker Engine 26 (API 1.45) and Docker Compose 2.26 or later. An older engine,
+# or a Compose that parses the field but does not pass it on (2.25,
+# moby#47687), mounts the whole volume and Collabora runs without its key,
+# every document refused.
+_at_least() { # _at_least <version> <major> <minor>
+    awk -v v="${1#v}" -v M="$2" -v m="$3" 'BEGIN { n = split(v, a, "."); exit !(n >= 2 && (a[1] + 0 > M || (a[1] + 0 == M && a[2] + 0 >= m))) }'
+}
+case " $* " in
+    *" up "*|*" create "*|*" run "*|*" start "*)
+        _api="$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null || true)"
+        if ! _at_least "$_api" 1 45; then
+            echo "compose.sh: this host's Docker Engine (API ${_api:-unknown}) is older than 26:" >&2
+            echo "  OtoDock's Collabora needs Docker Engine 26 or later. Update Docker, then re-run." >&2
+            exit 1
+        fi
+        _cv="$(docker compose version --short 2>/dev/null || true)"
+        if ! _at_least "$_cv" 2 26; then
+            echo "compose.sh: this host's Docker Compose (${_cv:-unknown}) is older than 2.26:" >&2
+            echo "  OtoDock's Collabora needs Docker Compose 2.26 or later. Update Docker, then re-run." >&2
+            exit 1
+        fi ;;
+esac
+
 _files=(-f "$_root/docker-compose.yml" -f "$_root/docker-compose.build.yml")
 if [ -f "$_root/docker-compose.phone.yml" ] && [ "${OTODOCK_PHONE:-1}" != "0" ]; then
     _files+=(-f "$_root/docker-compose.phone.yml")

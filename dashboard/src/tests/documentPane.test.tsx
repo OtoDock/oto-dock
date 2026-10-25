@@ -23,15 +23,17 @@ vi.mock('@/hooks/useCollaboraLiveReload', () => ({
     modifiedRef: { get current() { return h.edited }, set current(v: boolean) { h.edited = v } },
   }),
 }))
-vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ authConfig: null }) }))
+vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ authConfig: null, user: { sub: 'me' } }) }))
 
 import DocumentPane from '@/components/chat/media/DocumentPane'
 import DocumentVersionsMenu from '@/components/chat/media/DocumentVersionsMenu'
-import ChatDocumentPane, { useDocumentChips, useDocumentPaneForm } from '@/pages/agent/chat/ChatDocumentPane'
+import ChatDocumentPane from '@/pages/agent/chat/ChatDocumentPane'
+import { useDocumentPaneForm } from '@/pages/agent/chat/useDocumentPaneForm'
 import DocumentCard from '@/components/chat/media/DocumentCard'
 import ArtifactDock from '@/components/chat/artifacts/ArtifactDock'
 import { paneChat, useDocumentPaneStore, useDocumentPushStore } from '@/store/documentPaneStore'
 import type { ChatDocument } from '@/api/documents'
+import { useDocumentChips } from '@/pages/agent/chat/useDocumentChips'
 
 const ORIGIN = window.location.origin
 const listing: ChatDocument[] = [
@@ -131,8 +133,8 @@ describe('the Live row of the Versions menu', () => {
     return (await screen.findAllByRole('menuitemradio'))[0]
   }
 
-  it('says "view only" when the mint gives a view token, "editable" for an edit one', async () => {
-    for (const [permissions, words] of [['view', 'view only'], ['edit', 'editable']] as const) {
+  it('says "View only" when the mint gives a view token, "Editable" for an edit one', async () => {
+    for (const [permissions, words] of [['view', 'View only'], ['edit', 'Editable']] as const) {
       vi.stubGlobal('fetch', vi.fn(async (url: string) => (url.includes('/v1/documents/chat-documents')
         ? { ok: true, status: 200, json: async () => ({ documents: listing }) }
         : { ok: true, status: 200, json: async () => ({ wopi_url: `${ORIGIN}/collabora/x`, access_token: 't', permissions }) })))
@@ -146,7 +148,7 @@ describe('the Live row of the Versions menu', () => {
 
   it("reads a pushed token's own claim, and says nothing while unknown", async () => {
     stubFetch()
-    const claims = btoa(JSON.stringify({ permissions: 'view' })).replace(/=+$/, '')
+    const claims = btoa(JSON.stringify({ permissions: 'view', user_sub: 'me' })).replace(/=+$/, '')
     useDocumentPushStore.setState({ pushed: { c1: { fa: {
       fileId: 'fa', filename: 'report.docx', wopiUrl: `${ORIGIN}/collabora/x`, accessToken: `h.${claims}.s`,
       downloadUrl: '/d', generation: Date.now(),
@@ -154,15 +156,15 @@ describe('the Live row of the Versions menu', () => {
     useDocumentPaneStore.getState().openFile('c1', 'fa')
     const { unmount } = wrap(<DocumentPane chatId="c1" placement="docked" shown />)
     await screen.findAllByRole('tab')
-    expect((await liveRow()).textContent).toContain('view only')
+    expect((await liveRow()).textContent).toContain('View only')
     unmount()
     useDocumentPushStore.setState({ pushed: {} })
     wrap(<DocumentPane chatId="c1" placement="docked" shown />)
     await screen.findAllByRole('tab')
     // stubFetch's mint names no permissions.
     const row = await liveRow()
-    expect(row.textContent).not.toContain('editable')
-    expect(row.textContent).not.toContain('view only')
+    expect(row.textContent).not.toContain('Editable')
+    expect(row.textContent).not.toContain('View only')
   })
 })
 
@@ -173,6 +175,11 @@ describe('the Versions menu by keyboard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Versions' }))
     const items = await screen.findAllByRole('menuitemradio')
     await waitFor(() => expect(document.activeElement).toBe(items[0]))
+    // The focus a click opening gives is not painted: only a keyboard's is.
+    for (const item of items) {
+      expect(item.className).not.toMatch(/(^|\s)focus:bg-/)
+      expect(item.className).toContain('focus-visible:bg-surface-hover')
+    }
     fireEvent.keyDown(screen.getByRole('menu'), { key: 'ArrowDown' })
     expect(document.activeElement).toBe(items[1])
     fireEvent.keyDown(screen.getByRole('menu'), { key: 'ArrowDown' })
@@ -325,6 +332,31 @@ describe('a version whose copy is gone', () => {
     expect(await screen.findByText(/That version is no longer available/)).toBeInTheDocument()
     expect(paneChat('c1').view).toEqual({})
   })
+
+  it('the note goes with the next change of document and stays gone on the way back', async () => {
+    let snapshotLoads = 0
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes('/v1/documents/chat-documents')) return { ok: true, status: 200, json: async () => ({ documents: listing }) }
+      if (url.includes('snapshot-wopi-url')) {
+        snapshotLoads += 1
+        if (snapshotLoads === 1) return { ok: false, status: 404, json: async () => ({}) }
+        return { ok: true, status: 200, json: async () => ({ wopi_url: `${ORIGIN}/collabora/v`, access_token: 'minted-v' }) }
+      }
+      return { ok: true, status: 200, json: async () => ({ wopi_url: `${ORIGIN}/collabora/x`, access_token: 'minted' }) }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    useDocumentPaneStore.getState().openFile('c1', 'fa', 'a2')
+    wrap(<DocumentPane chatId="c1" placement="docked" shown />)
+    expect(await screen.findByText(/That version is no longer available/)).toBeInTheDocument()
+    // The version is back (its copy restored): the note leaves with the change.
+    act(() => useDocumentPaneStore.getState().showVersion('c1', 'fa', 'a2'))
+    await waitFor(() => expect(snapshotLoads).toBe(2))
+    expect(screen.queryByText(/That version is no longer available/)).toBeNull()
+    // Back on the live file the note does not come back.
+    act(() => useDocumentPaneStore.getState().showVersion('c1', 'fa', null))
+    await waitFor(() => expect(paneChat('c1').view).toEqual({}))
+    expect(screen.queryByText(/That version is no longer available/)).toBeNull()
+  })
 })
 
 describe('a pane put away saves its unsaved edits', () => {
@@ -397,10 +429,13 @@ describe('Fullscreen shows the pane\'s own editor', () => {
     try {
       stubFetch()
       useDocumentPaneStore.getState().openFile('c1', 'fa')
+      const submit = vi.mocked(HTMLFormElement.prototype.submit)
+      const posts = submit.mock.calls.length + 1
       wrap(<DocumentPane chatId="c1" placement="floating" shown />)
       await waitFor(() => expect(document.querySelectorAll('iframe')).toHaveLength(1))
+      // The first load's post lands in a passive effect after the frame.
+      await waitFor(() => expect(submit.mock.calls.length).toBe(posts))
       const frame = document.querySelector('iframe')
-      const posts = vi.mocked(HTMLFormElement.prototype.submit).mock.calls.length
       const box = document.querySelector('[data-document-frame-box]') as HTMLElement
       expect(box.getAttribute('popover')).toBe('manual')
       expect(box.style.position).toBe('relative')
@@ -418,7 +453,7 @@ describe('Fullscreen shows the pane\'s own editor', () => {
       expect(document.querySelector('[data-preview-slot]')).toBeNull()
       expect(box.style.position).toBe('relative')
       expect(document.querySelector('iframe')).toBe(frame)
-      expect(vi.mocked(HTMLFormElement.prototype.submit).mock.calls.length).toBe(posts)
+      expect(submit.mock.calls.length).toBe(posts)
     } finally {
       pop.restore()
     }
@@ -516,5 +551,20 @@ describe('the minimized pane in the left stack', () => {
     expect(onRestore).toHaveBeenLastCalledWith()
     fireEvent.click(screen.getAllByTitle('Close')[0])
     expect(onClose).toHaveBeenCalledWith('a')
+  })
+})
+
+describe('ChatDocumentPane after a close', () => {
+  it('keeps the frames mounted through the slide, then unmounts them', async () => {
+    stubFetch()
+    useDocumentPaneStore.getState().openFile('c1', 'fa')
+    const { container } = wrap(<ChatDocumentPane chatId="c1" placement="docked" hidden={false} userSub="me" />)
+    await screen.findAllByRole('tab')
+    expect(container.querySelector('[data-document-pane]')).toBeTruthy()
+    act(() => useDocumentPaneStore.getState().close('c1'))
+    expect(paneChat('c1').open).toBe(false)
+    expect(container.querySelector('[data-document-pane]')).toBeTruthy()
+    await act(async () => { await new Promise((r) => setTimeout(r, 400)) })
+    expect(container.querySelector('[data-document-pane]')).toBeNull()
   })
 })

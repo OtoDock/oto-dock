@@ -19,6 +19,7 @@
 import { deepLinkPending } from './oauth'
 import { isNativeSwitchBusy } from './nativeBridge'
 import { chatUploadActive } from './chatUploadQueue'
+import { debugLog, debugWarn } from './debug/log'
 
 export const BUILD_META_NAME = 'otodock-build'
 const GUARD_KEY = 'oto-build-reloaded-for'
@@ -60,19 +61,19 @@ export function noteServerBuild(serverId: unknown, ready: () => boolean = canRel
   if (guardedFor() === server) {
     if (!warnedStale) {
       warnedStale = true
-      console.warn(`[build] server build ${server} still differs from this page (${page}) after a reload — not reloading again`)
+      debugWarn(`[build] server build ${server} still differs from this page (${page}) after a reload — not reloading again`)
     }
     return 'stale'
   }
   if (!ready()) {
     if (deferredFor !== server) {
       deferredFor = server
-      console.log(`[build] new build ${server} — reload deferred until the current work finishes`)
+      debugLog(`[build] new build ${server} — reload deferred until the current work finishes`)
     }
     return 'deferred'
   }
   setGuard(server)
-  console.log(`[build] new build ${server} (this page: ${page}) — reloading`)
+  debugLog(`[build] new build ${server} (this page: ${page}) — reloading`)
   reloadImpl()
   return 'reloading'
 }

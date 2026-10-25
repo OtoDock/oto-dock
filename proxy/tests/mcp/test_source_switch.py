@@ -19,14 +19,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import config
-from services.community import community_catalog
-from services.community import community_installer as ci
-from services.community import mcp_source_swap as swap
+from services.community import (
+    community_catalog,
+    community_installer as ci,
+    mcp_source_swap as swap,
+)
 from services.mcp import mcp_registry
 from storage.identity import credential_store
-from storage.mcp import mcp_store
-from storage.mcp import mcp_update_state_store as store
-
+from storage.mcp import mcp_store, mcp_update_state_store as store
 
 # ── fixtures ───────────────────────────────────────────────────────
 
@@ -422,6 +422,24 @@ async def test_an_interrupted_switch_is_taken_up_and_a_running_one_is_refused(ri
 
 
 @pytest.mark.asyncio
+async def test_an_interrupted_switch_whose_row_went_meanwhile_is_not_pending(rig, monkeypatch):
+    """An interrupted switch's row is reset to pending before the gate; a row
+    another path removed in between (the weekly check drops a change the
+    catalog reverted) answers that nothing is pending, and nothing installs."""
+    state = await rig()
+    store.set_source_change_status("pkg-mcp", store.STATUS_SWITCHING)
+    real = store.set_source_change_status
+
+    def _removed_first(name, status, **kw):
+        store.delete_source_change(name)
+        return real(name, status, **kw)
+    monkeypatch.setattr(store, "set_source_change_status", _removed_first)
+    with pytest.raises(HTTPException) as ei:
+        await swap.switch("pkg-mcp", **_switch_args(state))
+    assert ei.value.status_code == 409 and "No source change is pending" in ei.value.detail
+    assert state["installed_calls"] == []
+
+@pytest.mark.asyncio
 async def test_the_installed_source_must_still_be_the_row_s(rig, mcps_dir):
     state = await rig()
     path = _target(mcps_dir) / "manifest.json"
@@ -512,6 +530,10 @@ async def test_reconcile_restores_the_backup_of_an_interrupted_switch(rig, mcps_
     assert (target / "node_modules" / "marker").is_file()
     assert mcp_registry.get_manifest("pkg-mcp").server.source == "npm:pkg@1.0.0"
     assert state["installed_calls"] == []
+    # The restore rescanned under this loop's rescan lock, not beside it.
+    import asyncio
+    assert mcp_registry._rescan_lock is not None
+    assert mcp_registry._rescan_lock[0] is asyncio.get_running_loop()
 
 
 @pytest.mark.asyncio

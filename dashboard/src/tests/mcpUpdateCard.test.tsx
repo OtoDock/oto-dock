@@ -101,7 +101,11 @@ describe('McpServersPage — the update card', () => {
     mockApi([mcp(git)], { blender: { current: '1.0.2', latest: '1.0.3', registry: 'git', package: 'blender', reason: 'package', pinned_commit: true, catalog_ref: 'a'.repeat(40) } })
     renderPage()
     fireEvent.click(await screen.findByText('Blender'))
-    expect(screen.getByText(/The next automatic run builds the commit the catalog pins/)).toBeInTheDocument()
+    expect(screen.getByText(
+      'On the OtoDock platform, the next automatic run builds the commit the community list pins. '
+      + 'Paired machines rebuild it at their next sync.',
+    )).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('this server')
     expect(screen.getByRole('button', { name: 'Update' })).toBeEnabled()
   })
 })
@@ -128,7 +132,7 @@ describe('automaticUpdateNote', () => {
     // A git+ offer: built by the weekly job at a commit the catalog pins,
     // never at a tag or a branch (which the catalog install refuses).
     expect(automaticUpdateNote({ ...base, registry: 'git', pinned_commit: true }, true))
-      .toMatch(/^The next automatic run builds the commit the catalog pins/)
+      .toMatch(/^On the OtoDock platform, the next automatic run builds the commit the community list pins\./)
     expect(automaticUpdateNote({ ...base, registry: 'git', pinned_commit: true, held: true }, true))
       .toBe('Held: automatic updates skip it.')
     expect(automaticUpdateNote({ ...base, registry: 'git', pinned_commit: true }, false))
@@ -165,7 +169,7 @@ describe('optional credential fields', () => {
         onDone={() => {}}
       />,
     )
-    expect(screen.getByText('(optional)')).toBeInTheDocument()
+    expect(screen.getByText(', optional')).toBeInTheDocument()
     expect(screen.getByText(/This account needs Password before/)).toBeInTheDocument()
   })
 })

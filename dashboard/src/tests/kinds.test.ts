@@ -3,7 +3,7 @@ import { WIRE } from '@/api/wireEvents'
 import {
   ARTIFACT_BLOCK_KINDS, REPLAYABLE_ARTIFACT_EVENT_TYPES, evictedBy, identityKey, identityOf, isArtifactBlock,
 } from '@/lib/kinds/artifact'
-import { RUN_KIND, TASK_KIND, TRIGGER_KIND, formatTrigger } from '@/lib/kinds/task'
+import { RUN_KIND, RUN_KIND_STYLE, TASK_KIND, TRIGGER_KIND, formatTrigger } from '@/lib/kinds/task'
 import { APP_KIND, appKind } from '@/lib/kinds/app'
 import { MCP_RUNTIME, isContainerRuntime } from '@/lib/kinds/mcpRuntime'
 import { getTaskTypeLabel, getTaskTypeStyle } from '@/lib/runs'
@@ -53,7 +53,7 @@ describe('the task kinds', () => {
     expect(formatTrigger(TRIGGER_KIND.MANUAL, null)).toBe('Manual')
     expect(formatTrigger(TRIGGER_KIND.SCHEDULED, null)).toBe('Scheduled')
     expect(formatTrigger(TRIGGER_KIND.CHECK, 'check:style')).toBe('Check')
-    expect(formatTrigger(TRIGGER_KIND.APP_HANDLER, 'app:1:h')).toBe('App handler')
+    expect(formatTrigger(TRIGGER_KIND.APP_HANDLER, 'app:1:h')).toBe('App server')
     expect(formatTrigger(TRIGGER_KIND.APP_ACTION, 'x:y')).toBe('App action')
     expect(formatTrigger('schedule', null)).toBe('schedule')
     expect(formatTrigger('triggered', 'x')).toBe('triggered')
@@ -68,8 +68,13 @@ describe('the task kinds', () => {
     expect(getTaskTypeLabel('static')).toBe('Static')
     expect(getTaskTypeLabel('memory_run')).toBe('memory_run')
     expect(getTaskTypeLabel(null)).toBe('—')
-    expect(getTaskTypeStyle(RUN_KIND.DELEGATE)).toContain('purple')
-    expect(getTaskTypeStyle('nonsense')).toContain('gray')
+    expect(getTaskTypeStyle(RUN_KIND.DELEGATE)).toContain('accent-agent')
+    // A kind chip is information, never the action blue of a button.
+    expect(getTaskTypeStyle(RUN_KIND.SCHEDULED)).toBe('bg-status-info-bg text-status-info-fg')
+    expect(getTaskTypeStyle(RUN_KIND.CHECK)).toBe('bg-surface-muted text-secondary')
+    expect(Object.values(RUN_KIND_STYLE).filter((s) => s.includes('action'))).toEqual([])
+    expect(getTaskTypeStyle('nonsense')).toBe('bg-surface-muted text-secondary')
+    expect(getTaskTypeStyle('static')).toBe('bg-surface-muted text-secondary')
   })
 
   it('the definition kinds spell the API words', () => {

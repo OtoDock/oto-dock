@@ -16,6 +16,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+# The vendor codes the platform acts on: a dead grant (the account must be
+# reconnected) and refused client credentials (the admin's bundle).
+INVALID_GRANT = "invalid_grant"
+INVALID_CLIENT = "invalid_client"
+
 
 class OAuthTokenError(RuntimeError):
     """A token endpoint refused a request. ``code`` is the vendor's OAuth
@@ -261,7 +266,7 @@ class OAuthProvider(ABC):
         *,
         token: str,
         scopes: list[str],
-    ) -> tuple[TokenSet, "UserInfo"]:
+    ) -> tuple[TokenSet, UserInfo]:
         """Persist a user-pasted PAT as if it were an OAuth access token.
 
         No vendor round-trip required for the "exchange" — the PAT IS the

@@ -8,32 +8,63 @@ import asyncio
 import functools
 import json
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, cast
 
 import config as app_config
 from core import placement
-
 from core.events.common_events import (
-    CommonEvent,
-    TEXT, THINKING, TOOL_USE, TOOL_RESULT, DONE, ERROR, SYSTEM, METADATA,
     CONTEXT_COMPACT,
+    DONE,
+    ERROR,
+    METADATA,
+    SYSTEM,
+    TEXT,
+    THINKING,
+    TOOL_RESULT,
+    TOOL_USE,
+    CommonEvent,
+    is_note_mark,
+    note_mark,
 )
 from core.execution_layer import (
-    AgentConfig, AuthProfile, BehaviourProfile, EngineIdentity, ExecutionLayer,
-    LayerCapabilities, ModelPolicy, RuntimeProfile, SubscriptionHandle, UsageProfile,
-)
-from core.session.session_state import (
-    _record_session_use, cleanup_session_permission_state, register_session_state,
-    set_session_mode, mark_starting, clear_starting, session_is_held, START_MARK_TTL_S,
+    ASK_MODE,
+    DONT_ASK_MODE,
+    AgentConfig,
+    AuthProfile,
+    BehaviourProfile,
+    EngineIdentity,
+    ExecutionLayer,
+    LayerCapabilities,
+    ModelPolicy,
+    ResumeVerdict,
+    RuntimeProfile,
+    SubscriptionHandle,
+    UsageProfile,
 )
 from core.layers.direct.session import (
     DirectSession,
-    create_direct_session, get_direct_session,
-    close_direct_session, run_direct_stream,
+    close_direct_session,
+    create_direct_session,
+    get_direct_session,
+    run_direct_stream,
 )
 from core.session import session_kind
+from core.session.session_state import (
+    START_MARK_TTL_S,
+    _record_session_use,
+    cleanup_session_permission_state,
+    clear_starting,
+    mark_starting,
+    register_session_state,
+    session_is_held,
+    set_session_mode,
+)
+
+if TYPE_CHECKING:
+    from auth.path_policy import SecurityContext
 
 logger = logging.getLogger("otodock")
 
@@ -57,6 +88,8 @@ def direct_event_to_common(event: dict) -> CommonEvent | None:
         content = data.get("content", "")
         if content:
             return CommonEvent(type=TEXT, data={"content": content})
+        if is_note_mark(data):
+            return note_mark()
         return None
 
     if etype == "thinking":
@@ -112,7 +145,7 @@ _DIRECT_CAPABILITIES = LayerCapabilities(
     supports_context_compression=False,  # future: Anthropic compaction API
     supports_control_commands=False,
     supports_mcps=True,
-    permission_modes=["default", "acceptEdits", "dontAsk"],
+    permission_modes=[ASK_MODE, DONT_ASK_MODE],
     control_commands=[],
     models=app_config.get_layer_models("direct-llm"),
     effort_levels=["low", "medium", "high", "xhigh", "max"],
@@ -149,7 +182,7 @@ _DIRECT_CAPABILITIES = LayerCapabilities(
              "kind": "local", "relay_path": "", "api_path": "/v1",
              "effort_scale": ["low", "medium", "high", "xhigh"],
              "effort_per_model": []},
-            {"id": "openai_compatible", "label": "OpenAI-compatible endpoint", "requires_key": False,
+            {"id": "openai_compatible", "label": "OpenAI-compatible server", "requires_key": False,
              "kind": "local", "relay_path": "", "api_path": "",
              "effort_scale": ["low", "medium", "high", "xhigh"],
              "effort_per_model": []},
@@ -299,7 +332,7 @@ def _rebuild_history_from_db(session, session_id: str, chat_id: str = "", *,
         chat = (task_store.get_chat(chat_id) if chat_id
                 else task_store.get_chat_by_session(session_id))
         if not chat:
-            logger.info(f"Direct session resume: no chat found for session {session_id}")
+            logger.info("Direct session resume: no chat found for session %s", session_id)
             return
         chats = [chat]
 
@@ -337,9 +370,9 @@ def _rebuild_history_from_db(session, session_id: str, chat_id: str = "", *,
             resident = {t.get("name") for t in session.tools}
             gone = [n for n in used if n not in catalog.deferred and n not in resident]
             logger.info(
-                f"Direct session resume: re-loaded {len(new_defs)} deferred tool(s) "
-                f"from chat {chats[-1]['id'][:8]}"
-                + (f"; {len(gone)} no longer available: {gone}" if gone else "")
+                "Direct session resume: re-loaded %s deferred tool(s) from chat %s%s",
+                len(new_defs), chats[-1]['id'][:8],
+                f"; {len(gone)} no longer available: {gone}" if gone else "",
             )
 
     if rebuilt:
@@ -354,13 +387,15 @@ def _rebuild_history_from_db(session, session_id: str, chat_id: str = "", *,
             dropped = len(rebuilt) - KEEP_MESSAGES
             rebuilt = rebuilt[-KEEP_MESSAGES:]
             logger.info(
-                f"Direct session resume: truncated {dropped} old messages "
-                f"(~{estimated_tokens} tokens > {max_history_tokens} limit)"
+                "Direct session resume: truncated %s old messages "
+                "(~%s tokens > %s limit)",
+                dropped, estimated_tokens, max_history_tokens
             )
         session.messages = rebuilt
         logger.info(
-            f"Direct session resume: rebuilt {len(rebuilt)} messages "
-            f"from {len(chats)} chat(s) for session {session_id[:8]}"
+            "Direct session resume: rebuilt %s messages "
+            "from %s chat(s) for session %s",
+            len(rebuilt), len(chats), session_id[:8]
         )
 
 
@@ -374,8 +409,8 @@ def _aborted_trimmed(chat: dict, rebuilt: list[dict]) -> list[dict]:
     for i in range(len(rebuilt) - 1, -1, -1):
         if rebuilt[i]["role"] == "user":
             logger.info(
-                f"Direct session resume: dropped {len(rebuilt) - i} message(s) from "
-                f"the aborted turn of chat {chat['id'][:8]}"
+                "Direct session resume: dropped %s message(s) from "
+                "the aborted turn of chat %s", len(rebuilt) - i, chat['id'][:8]
             )
             return rebuilt[:i]
     return rebuilt
@@ -391,6 +426,20 @@ def direct_mcp_policy(client_type: str) -> tuple[bool, int]:
     if client_type == session_kind.PHONE.name:
         return False, TOOL_CALL_TIMEOUT
     return True, TOOL_CALL_TIMEOUT_CHAT
+
+
+def audience_gate(ctx, external: bool) -> tuple[str, str]:
+    """``(user_role, scope)`` the Direct manager's MCP build judges the
+    manifests' audience with, from the session's security context, as the
+    session's builder judged its own build: the person's effective role on
+    the agent and the mount scope. An external caller's session is never
+    the agent acting as itself (the phone builder judges it in user scope),
+    and a session with no context names no person and filters nothing."""
+    if ctx is None:
+        return "", "user"
+    role = str(getattr(ctx, "role", "") or "")
+    scope = "user" if external else str(getattr(ctx, "session_scope", "") or "user")
+    return role, scope
 
 
 class DirectLLMExecutionLayer(ExecutionLayer):
@@ -460,21 +509,19 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         # same restricted mount namespace as CLI MCPs.
         sandbox_builder = None
         if config.sandbox_host_claude_dir:
-            from core.sandbox.sandbox import SandboxBuilder, SandboxMount, resolve_sandbox_config
+            from core.sandbox.sandbox import (
+                SandboxBuilder,
+                mcp_sandbox_mounts,
+                resolve_sandbox_config,
+            )
             from services.mcp import mcp_registry as mcp_reg
 
-            ctx = config.security_context
+            ctx = cast("SecurityContext | None", config.security_context)
             # Resolve MCP sandbox mounts from manifest declarations.
             # is_remote=False (fail-closed default, explicit here): LOCAL bwrap
             # mount path — satellite_only device MCPs never mount locally.
-            mcp_mounts: list[SandboxMount] = []
             assigned_mcps = mcp_reg.get_agent_mcps(config.agent_name, placement=placement.LOCAL_PLACEMENT) or []
-            for manifest in assigned_mcps:
-                for m in getattr(manifest, "sandbox_mounts", []):
-                    # Host is allowlisted to the agent / mcps tree in the sandbox
-                    # builder; only the ${mcp_dir} template is offered.
-                    host = m.host.replace("${mcp_dir}", str(manifest.mcp_dir))
-                    mcp_mounts.append(SandboxMount(host=host, sandbox=m.sandbox, mode=m.mode))
+            mcp_mounts = mcp_sandbox_mounts(assigned_mcps)
 
             # Per-MCP dir binds: Direct-LLM has no MCP config FILE
             # (proxy-managed delivery), so derive the stdio dirs from the
@@ -513,6 +560,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             sandbox_builder = SandboxBuilder(sandbox_cfg)
 
         enable_http, tool_timeout = direct_mcp_policy(config.client_type)
+        user_role, scope = audience_gate(config.security_context, external)
         from services.phone.call_control import ASK_BACK_ENV, CALL_TOOLS_ENV
         session = await create_direct_session(
             session_id=session_id,
@@ -529,6 +577,8 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             external=external,
             call_tools=bool(extra.get(CALL_TOOLS_ENV)),
             call_ask_back=bool(extra.get(ASK_BACK_ENV)),
+            user_role=user_role,
+            scope=scope,
         )
         # The builtin file tools resolve against this session's mount table
         # (the same decisions the MCP subprocesses get from bwrap).
@@ -660,9 +710,10 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         new_provider = app_config.get_model_provider(model)
         if new_provider != session.provider:
             # Provider changed — acquire new subscription, release old
+            import asyncio as _asyncio
+
             from core.layers.providers.registry import get_adapter
             from services.engines import subscription_pool
-            import asyncio as _asyncio
 
             old_provider = session.provider
             subscription_pool.release_subscription(session_id)
@@ -699,14 +750,16 @@ class DirectLLMExecutionLayer(ExecutionLayer):
                 session.tools = [t for t in session.tools if "input_schema" in t]
                 session.tools.extend(get_adapter(session.provider).get_builtin_tools())
                 logger.info(
-                    f"Direct session {session_id[:8]} switched provider: "
-                    f"{old_provider} → {session.provider} for model {model}; "
-                    f"history kept as text ({before} → {len(session.messages)} messages)"
+                    "Direct session %s switched provider: "
+                    "%s → %s for model %s; "
+                    "history kept as text (%s → %s messages)",
+                    session_id[:8], old_provider, session.provider, model, before,
+                    len(session.messages)
                 )
             else:
                 logger.warning(
-                    f"No subscription for provider {new_provider} — "
-                    f"model change to {model} may fail"
+                    "No subscription for provider %s — "
+                    "model change to %s may fail", new_provider, model
                 )
 
         session.model = model
@@ -722,8 +775,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
     ) -> dict:
         """Handle permission mode changes (no CLI control channel)."""
         if subtype == "set_permission_mode":
-            mode = kwargs.get("mode", "default")
-            set_session_mode(session_id, mode)
+            set_session_mode(session_id, kwargs.get("mode") or ASK_MODE)
             return {"status": "ok"}
         return {}
 
@@ -816,10 +868,11 @@ class DirectLLMExecutionLayer(ExecutionLayer):
 
     async def can_resume_session(
         self, session_id: str, *, agent_name: str = "", username: str = "",
-    ) -> bool:
+        external_home: str = "",
+    ) -> ResumeVerdict:
         """Direct sessions can't resume (in-memory history).
 
         Recovery is handled via chat_id in AgentConfig instead — see
         _rebuild_history_from_db.
         """
-        return False
+        return ResumeVerdict.FRESH

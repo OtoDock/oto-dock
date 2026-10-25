@@ -9,6 +9,9 @@ phone ports honour their bind knobs; and the proxy carries fd/pids floors.
 from __future__ import annotations
 
 import re
+import shutil
+import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -306,3 +309,164 @@ def test_every_platform_volume_but_the_agents_tree_is_refused_to_mcps(base):
     from services.mcp.compose_rewrite import _PLATFORM_VOLUMES
     declared = {v.get("name", k) for k, v in base["volumes"].items()}
     assert declared - {"otodock-agents"} <= _PLATFORM_VOLUMES
+
+
+# --- Collabora 26.04: no shell, settings from outside, the proof key ---------
+_NATIVE = "mcps/custom/file-tools-mcp/docker-compose.yml"
+_KEY = "/etc/coolwsd/proof_key"
+_WELCOME = "/usr/share/coolwsd/browser/dist/welcome/welcome.js"
+
+
+def _extra_params(svc: dict) -> str:
+    env = svc["environment"]
+    pairs = dict(e.split("=", 1) for e in env) if isinstance(env, list) else env
+    return pairs["extra_params"]
+
+
+def _key_mount(svc: dict) -> dict:
+    mounts = [v for v in svc.get("volumes") or [] if isinstance(v, dict) and v.get("target") == _KEY]
+    assert len(mounts) == 1, svc.get("volumes")
+    return mounts[0]
+
+
+def test_every_collabora_image_is_one_pin_with_its_digest():
+    """The sweep reads the first collabora/code of each file: every one, in
+    both files, must be the same tag and manifest-list digest."""
+    pins = set()
+    for name in ("docker-compose.yml", _NATIVE):
+        pins |= set(re.findall(r"image:\s*(collabora/code:\S+)", (_REPO / name).read_text()))
+    assert len(pins) == 1, pins
+    assert re.fullmatch(r"collabora/code:26\.04\.[0-9.]+@sha256:[0-9a-f]{64}", pins.pop())
+
+
+def test_collabora_takes_its_settings_from_outside(base):
+    native = _load(_NATIVE)
+    for svc in (_svc(base, "collabora"), _svc(native, "collabora")):
+        assert "entrypoint" not in svc  # the image has no shell
+        params = _extra_params(svc)
+        assert "--o:mount_jail_tree=false" in params
+        assert "--o:ssl.termination=${COLLABORA_SSL_TERMINATION:-" in params
+        # The relay sends the public Host: no setting names it, and no
+        # client header may rebuild Collabora's addresses.
+        for gone in ("server_name", "frame_ancestors", "proxy_prefix"):
+            assert gone not in params, gone
+        assert "MKNOD" in svc["cap_add"]
+
+
+def _welcome_mounts(svc: dict) -> list:
+    return [v for v in svc.get("volumes") or [] if isinstance(v, dict) and v.get("target") == _WELCOME]
+
+
+def test_collabora_closes_its_welcome_dialog(base):
+    """The free edition has no setting for its welcome dialog short of home
+    mode, which caps the server: both stacks mount the same script over the
+    one the editor loads it from. Never a compose config: Compose 2.26 to
+    2.3x copy a config into the created container, which mounts the key's
+    volume before the one-shot wrote the key, and the first start fails. On
+    Docker the one-shot writes the script beside the key on every run (no
+    single `$`: compose fills variables in the command); a native install
+    binds the file shipped beside its compose file."""
+    native = _load(_NATIVE)
+    for doc in (base, native):
+        assert "configs" not in doc
+        assert "configs" not in _svc(doc, "collabora")
+    (t2,) = _welcome_mounts(_svc(base, "collabora"))
+    assert t2["type"] == "volume" and t2["source"] == "otodock-collabora-proof"
+    assert t2["read_only"] is True and t2["volume"] == {"subpath": "welcome.js"}
+    script = _svc(base, "otodock-agents-init")["command"][2]
+    assert "w=/opt/otodock/collabora-proof/welcome.js" in script
+    assert "cat > $$w.new <<'EOF' && chmod 0444 $$w.new && mv -fT $$w.new $$w" in script
+    assert "chown 1001:1001 $$w" in script
+    assert "$" not in script.replace("$$", ""), "a single $ in the init script"
+    body = script.split("<<'EOF'", 1)[1].split("\nEOF\n", 1)[0].split("\n", 1)[1]
+    (t1,) = _welcome_mounts(_svc(native, "collabora"))
+    assert t1["type"] == "bind" and t1["source"] == "./collabora-welcome.js"
+    assert t1["read_only"] is True and t1["bind"] == {"create_host_path": False}
+    shipped = (_REPO / _NATIVE).parent / "collabora-welcome.js"
+    assert shipped.read_text() == body + "\n"
+    assert "welcome-translate" in body and "welcome-close" in body
+    for doc in (base, native):
+        # The script's path and its two messages were read off 26.04: a
+        # bump re-checks both, or the mount misses and the welcome returns.
+        assert _svc(doc, "collabora")["image"].startswith("collabora/code:26.04."), (
+            "Collabora moved off 26.04: re-check the welcome override's path "
+            "and messages, then this pin")
+
+
+def test_the_init_writes_the_welcome_script_every_run_and_the_key_once(base, tmp_path):
+    """The one-shot's command run for real: `$$` becomes `$` as compose
+    makes it, the platform paths a temporary folder. The script lands with
+    mode 0444 and the shipped text, a stale one is replaced at the next
+    run, and the key is written once."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not installed")
+    script = _svc(base, "otodock-agents-init")["command"][2]
+    script = script.replace("$$", "$").replace("/opt/otodock/", f"{tmp_path}/")
+    proof = tmp_path / "collabora-proof"
+    proof.mkdir()
+
+    def run() -> None:
+        r = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, r.stderr
+
+    shipped = ((_REPO / _NATIVE).parent / "collabora-welcome.js").read_text()
+    run()
+    welcome, key = proof / "welcome.js", proof / "proof_key"
+    assert welcome.read_text() == shipped
+    assert stat.S_IMODE(welcome.stat().st_mode) == 0o444
+    first_key = key.read_bytes()
+    assert b"PRIVATE KEY" in first_key
+    welcome.chmod(0o644)
+    welcome.write_text("// another Collabora's script\n")
+    run()
+    assert welcome.read_text() == shipped
+    assert key.read_bytes() == first_key
+    assert not list(proof.glob("*.new"))
+
+
+def test_the_compose_floor_pin_is_the_floor_every_script_checks():
+    """The Compose the release candidate is booted with before a release
+    (VERSIONS.md "Docker floors") is the oldest the install scripts accept:
+    each script's check names the pin's major and minor."""
+    pin = re.search(r"^COMPOSE_FLOOR_VERSION=(\d+)\.(\d+)\.\d+$", (_REPO / "VERSIONS.md").read_text(), re.M)
+    assert pin, "VERSIONS.md has no COMPOSE_FLOOR_VERSION"
+    want = [pin.groups()]
+    for name in ("install.sh", "upgrade.sh", "compose.sh"):
+        text = (_REPO / "scripts" / name).read_text()
+        assert re.findall(r'at_least "[^"]*cv[^"]*" (\d+) (\d+)', text) == want, name
+    setup = [line for line in (_REPO / "scripts" / "dev-setup.sh").read_text().splitlines() if '"${cv#v}"' in line]
+    assert [re.search(r"== (\d+) && a\[2\] \+ 0 >= (\d+)", line).groups() for line in setup] == want
+
+
+def test_collabora_mounts_the_proof_key_read_only(base):
+    native = _load(_NATIVE)
+    t2 = _key_mount(_svc(base, "collabora"))
+    assert t2["source"] == "otodock-collabora-proof" and t2["read_only"] is True
+    assert t2["volume"] == {"subpath": "proof_key"}
+    assert _svc(base, "collabora")["depends_on"]["otodock-agents-init"]["condition"] == \
+        "service_completed_successfully"
+    assert base["volumes"]["otodock-collabora-proof"] == {"name": "otodock-collabora-proof"}
+    t1 = _key_mount(_svc(native, "collabora"))
+    assert t1["source"] == "collabora-proof" and t1["read_only"] is True
+    assert t1["volume"] == {"subpath": "proof_key"}
+    assert _svc(native, "collabora")["depends_on"]["collabora-proof"]["condition"] == \
+        "service_completed_successfully"
+    # The image's own health check stands: the proxy judges the project by
+    # the file tools' own service, so Collabora's start period never shows.
+    assert "healthcheck" not in _svc(native, "collabora")
+
+
+def test_the_key_is_written_once_for_collaboras_user_alone(base):
+    init = _svc(base, "otodock-agents-init")
+    assert "otodock-collabora-proof:/opt/otodock/collabora-proof" in init["volumes"]
+    command = " ".join(init["command"])
+    assert "[ -s $$k ] || {" in command and "openssl genpkey" in command
+    assert "mv $$k.new $$k" in command
+    assert "chown 1001:1001 $$k" in command and "chmod 0400 $$k" in command
+    one_shot = _svc(_load(_NATIVE), "collabora-proof")
+    assert one_shot["entrypoint"][:2] == ["/usr/bin/openssl", "genpkey"]
+    assert one_shot["network_mode"] == "none" and one_shot["healthcheck"] == {"disable": True}
+    for name, svc in base["services"].items():
+        if name in ("collabora", "otodock-agents-init"):
+            continue
+        assert not any("collabora-proof" in str(v) for v in svc.get("volumes") or []), name

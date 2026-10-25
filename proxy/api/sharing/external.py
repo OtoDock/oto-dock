@@ -25,25 +25,29 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from starlette.websockets import WebSocketDisconnect
 from pydantic import BaseModel
+from starlette.websockets import WebSocketDisconnect
 
 import config
-from api.apps import manifest as _mf
 from api.apps.app_actions import _check_fire_rate, _run_action
 from api.apps.apps import APP_RUNTIME, _app_document
-from api.media.ui import _placeholder, _ui_response, inject_runtime, is_full_document, request_origin, wrap_fragment
-from auth import rate_limiter
+from api.media.ui import (
+    _placeholder,
+    _ui_response,
+    inject_runtime,
+    is_full_document,
+    request_origin,
+    wrap_fragment,
+)
+from auth import confirm as _confirm, rate_limiter, tokens
 from auth.lan_check import auth_bucket_key, get_client_ip
-from auth import confirm as _confirm
-from auth.providers import UserContext, get_current_user
 from auth.password import HashBusy, verify_password_async
-from storage import database as task_store
+from auth.providers import UserContext, get_current_user
+from services.apps import manifest as _mf
+from storage import database as task_store, db_apps
 from storage.sharing import share_store
-from storage import db_apps
 
 logger = logging.getLogger("otodock.shares")
 router = APIRouter()
@@ -113,14 +117,11 @@ def _password_tag(share: dict) -> str:
 
 
 def _mint_unlock(share: dict) -> str:
-    payload = {
+    return tokens.mint(tokens.SHARE_UNLOCK, {
         "purpose": "share_unlock",
         "share_id": share["id"],
         "ph": _password_tag(share),
-        "iat": int(time.time()),
-        "exp": int(time.time()) + UNLOCK_TTL_S,
-    }
-    return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
+    }, ttl_s=UNLOCK_TTL_S)
 
 
 def needs_password(share: dict) -> bool:
@@ -136,11 +137,8 @@ def is_unlocked(request: Request, share: dict) -> bool:
     raw = request.cookies.get(_cookie_name(share))
     if not raw:
         return False
-    try:
-        payload = jwt.decode(raw, config.JWT_SECRET, algorithms=["HS256"])
-    except jwt.PyJWTError:
-        return False
-    return (payload.get("purpose") == "share_unlock"
+    payload = tokens.verify(raw, tokens.SHARE_UNLOCK)
+    return (payload is not None
             and payload.get("share_id") == share["id"]
             and payload.get("ph") == _password_tag(share))
 
@@ -150,10 +148,9 @@ def _session_cookie_name(share: dict) -> str:
 
 
 def _mint_session(share: dict, app_token: str, days: int) -> str:
-    now = int(time.time())
-    return jwt.encode({"purpose": "app_session", "share_id": share["id"], "s": app_token,
-                       "iat": now, "exp": now + int(days) * 86400},
-                      config.JWT_SECRET, algorithm="HS256")
+    return tokens.mint(tokens.SHARE_APP_SESSION,
+                       {"purpose": "app_session", "share_id": share["id"], "s": app_token},
+                       ttl_s=int(days) * 86400)
 
 
 def session_of(request: Request, share: dict) -> str:
@@ -162,11 +159,8 @@ def session_of(request: Request, share: dict) -> str:
     raw = request.cookies.get(_session_cookie_name(share))
     if not raw:
         return ""
-    try:
-        payload = jwt.decode(raw, config.JWT_SECRET, algorithms=["HS256"])
-    except jwt.PyJWTError:
-        return ""
-    if payload.get("purpose") != "app_session" or payload.get("share_id") != share["id"]:
+    payload = tokens.verify(raw, tokens.SHARE_APP_SESSION)
+    if payload is None or payload.get("share_id") != share["id"]:
         return ""
     s = payload.get("s")
     return s if isinstance(s, str) and 0 < len(s) <= SESSION_TOKEN_MAX_BYTES else ""
@@ -228,13 +222,32 @@ def _json_only(request: Request) -> None:
         raise HTTPException(status_code=403, detail="not available")
 
 
-_NOT_AVAILABLE_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex"><title>Not available</title>
-<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;font:15px system-ui,sans-serif;background:#f6f7f9;color:#334}
-@media (prefers-color-scheme:dark){body{background:#111318;color:#cdd3dc}}
-p{max-width:28rem;text-align:center;padding:0 1.5rem}</style></head>
-<body><p>This link is not available. It may have expired or been withdrawn.</p></body></html>"""
+# The link pages paint with the dashboard's own tokens: the UI kit's sheet
+# (the --p-* variables of both themes, the fonts), then the page's few rules
+# on top of the kit's base. The kit themes by a class on <html>, which only
+# the host script sets (to the person's choice in this browser), so until it
+# runs the page follows the device: the colours here are the kit's page,
+# text and secondary text values of each theme, and a test holds them to the
+# kit. The not-available page has no script, so it follows the device only.
+_SHELL_HEAD = (
+    '<link rel="stylesheet" href="/ui-kit/otodock-tokens.css">'
+    "<style>html,body{margin:0;padding:0;height:100%;"
+    "font:15px/1.5 var(--p-font,system-ui,sans-serif);"
+    "background:var(--p-bg,#faf9f9);color:var(--p-text,#1b2430)}"
+    "@media (prefers-color-scheme:dark){html:not(.light){--p-bg:#0d1117;--p-text:#e6edf5;"
+    "--p-text-secondary:#a3b1c2;color-scheme:dark}}"
+)
+
+_NOT_AVAILABLE_PAGE = (
+    '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+    '<meta name="robots" content="noindex"><title>Not available</title>\n'
+    + _SHELL_HEAD
+    + "body{min-height:100vh;display:flex;align-items:center;justify-content:center}"
+    "p{max-width:28rem;text-align:center;padding:0 1.5rem;color:var(--p-text-secondary,#4a5563)}"
+    "</style></head>\n"
+    "<body><p>This link is not available. It may have expired or been withdrawn.</p></body></html>"
+)
 
 
 def _not_available_page() -> HTMLResponse:
@@ -267,7 +280,7 @@ def _host_page(share: dict, row: dict, unlocked: bool, site_key: str) -> str:
     title = row.get("title") or row.get("slug") or ("Shared conversation" if is_chat else "Shared app")
     # What the link may do (APPS.md "External links"): the hosts the page
     # may open — once the manifest is approved — and the session's lifetime.
-    ext = _mf.parse_external(row) if not is_chat else {"links": [], "session_days": 30}
+    ext: dict = _mf.parse_external(row) if not is_chat else {"links": [], "session_days": 30}
     approved = (not is_chat) and task_store.app_actions_approved(row)
     cfg = {
         "share_id": share["id"],
@@ -295,9 +308,7 @@ def _host_page(share: dict, row: dict, unlocked: bool, site_key: str) -> str:
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <meta name="robots" content="noindex"><title>{html.escape(title)}</title>
-<style>html,body{{margin:0;height:100%;font:15px system-ui,sans-serif;background:#f6f7f9;color:#223}}
-@media (prefers-color-scheme:dark){{html,body{{background:#111318;color:#dde3ea}}}}
-#root{{height:100%;display:flex;flex-direction:column}}</style></head>
+{_SHELL_HEAD}#root{{height:100%;display:flex;flex-direction:column}}</style></head>
 <body><div id="root"></div>
 <script type="application/json" id="share-config">{cfg_json}</script>
 <script src="/ui-kit/share-host.js"></script>
@@ -378,8 +389,8 @@ async def share_unlock(token: str, req: UnlockRequest, request: Request):
             raise HTTPException(status_code=403, detail="Verification failed — reload and try again")
         try:
             ok = await verify_password_async(req.password or "", share.get("password_hash") or "")
-        except HashBusy:
-            raise _confirm.hash_busy()
+        except HashBusy as exc:
+            raise _confirm.hash_busy() from exc
         if not ok:
             rate_limiter.record_attempt("share_unlock_ip", ip_key, tag=share["id"])
             rate_limiter.record_attempt("share_unlock_share", share["id"])
@@ -478,8 +489,8 @@ async def share_viewer_token(token: str, request: Request):
     link and client IP (two seconds), not per link."""
     try:
         found = await asyncio.to_thread(_gate, request, token)
-    except HTTPException:
-        raise HTTPException(status_code=401, detail="password required")
+    except HTTPException as exc:
+        raise HTTPException(status_code=401, detail="password required") from exc
     if not found or found[0].get("target_kind") != "app":
         raise HTTPException(status_code=404, detail="not available")
     share, row = found
@@ -501,8 +512,8 @@ async def share_session_set(token: str, req: SessionRequest, request: Request):
     _json_only(request)
     try:
         found = await asyncio.to_thread(_gate, request, token)
-    except HTTPException:
-        raise HTTPException(status_code=401, detail="password required")
+    except HTTPException as exc:
+        raise HTTPException(status_code=401, detail="password required") from exc
     if not found or found[0].get("target_kind") != "app" or not db_apps.app_kind_of(found[1]).serves_tree:
         raise HTTPException(status_code=404, detail="not available")
     share, row = found
@@ -528,8 +539,8 @@ async def share_session_clear(token: str, request: Request):
         raise HTTPException(status_code=403, detail="not available")
     try:
         found = await asyncio.to_thread(_gate, request, token)
-    except HTTPException:
-        raise HTTPException(status_code=401, detail="password required")
+    except HTTPException as exc:
+        raise HTTPException(status_code=401, detail="password required") from exc
     if not found or found[0].get("target_kind") != "app" or not db_apps.app_kind_of(found[1]).serves_tree:
         raise HTTPException(status_code=404, detail="not available")
     share, row = found
@@ -672,7 +683,9 @@ async def share_snapshot_media(token: str, media_token: str, request: Request):
     """An image, clip or file from a chat link's snapshot; inert types
     inline, the rest as a download."""
     import mimetypes
+
     from fastapi.responses import FileResponse
+
     from services.sharing import chat_snapshot
     found = await asyncio.to_thread(_gate, request, token)
     if not found or found[0].get("target_kind") != "chat":
@@ -728,8 +741,9 @@ async def _run_link_action(share: dict, row: dict, action_id: str, args, ip: str
         json.dumps(args, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     ).hexdigest()[:16]
     out = await _run_action(row, action_id, args, None, actor=f"share:{share['id']}")
-    logger.info(f"Share action: share={share['id']}, app={row.get('slug')}, action={action_id}, "
-                f"args={args_hash}, ip={ip}, count={count}")
+    logger.info("Share action: share=%s, app=%s, action=%s, "
+                "args=%s, ip=%s, count=%s",
+                share['id'], row.get('slug'), action_id, args_hash, ip, count)
     return out
 
 

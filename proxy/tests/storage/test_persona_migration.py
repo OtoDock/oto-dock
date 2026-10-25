@@ -2,7 +2,7 @@
 
 Covers the one-shot sweep (rename / duplicate-drop / divergent-keep, with
 sync tombstones + config-repo commits) and the reader's name preference in
-``config._read_agent_files``.
+``configuration.prompts._read_agent_files``.
 
 Run: cd proxy && python -m pytest tests/storage/test_persona_migration.py -v
 """
@@ -13,11 +13,14 @@ import subprocess
 import sys
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
 import config as app_config
+from configuration import prompts
+from services.agents import agent_provisioning
 from storage.agents import agent_store
 from storage.files import file_tombstones_store
 
@@ -43,7 +46,7 @@ class TestMigratePersonaFilenames:
         cfg = _mk_agent("mig-rename") / "config"
         (cfg / "prompt.md").write_text("persona v1")
 
-        assert agent_store.migrate_persona_filenames() == 1
+        assert agent_provisioning.migrate_persona_filenames() == 1
 
         assert (cfg / "agent.md").read_text() == "persona v1"
         assert not (cfg / "prompt.md").exists()
@@ -58,7 +61,7 @@ class TestMigratePersonaFilenames:
         (cfg / "agent.md").write_text("same")
         (cfg / "prompt.md").write_text("same")
 
-        assert agent_store.migrate_persona_filenames() == 1
+        assert agent_provisioning.migrate_persona_filenames() == 1
 
         assert (cfg / "agent.md").read_text() == "same"
         assert not (cfg / "prompt.md").exists()
@@ -69,7 +72,7 @@ class TestMigratePersonaFilenames:
         (cfg / "agent.md").write_text("new persona")
         (cfg / "prompt.md").write_text("old persona")
 
-        assert agent_store.migrate_persona_filenames() == 0
+        assert agent_provisioning.migrate_persona_filenames() == 0
 
         assert (cfg / "agent.md").read_text() == "new persona"
         assert (cfg / "prompt.md").read_text() == "old persona"
@@ -79,7 +82,7 @@ class TestMigratePersonaFilenames:
         cfg = _mk_agent("mig-done") / "config"
         (cfg / "agent.md").write_text("persona")
 
-        assert agent_store.migrate_persona_filenames() == 0
+        assert agent_provisioning.migrate_persona_filenames() == 0
         assert (cfg / "agent.md").read_text() == "persona"
 
 
@@ -89,7 +92,7 @@ class TestReaderNamePreference:
         (cfg / "agent.md").write_text("current")
         (cfg / "prompt.md").write_text("stale")
 
-        files = app_config._read_agent_files("read-pref")
+        files = prompts._read_agent_files("read-pref")
         assert files[0] == ("agent.md", "current")
 
     def test_reader_falls_back_to_legacy_name(self, temp_db):
@@ -98,10 +101,10 @@ class TestReaderNamePreference:
         cfg = _mk_agent("read-legacy") / "config"
         (cfg / "prompt.md").write_text("legacy persona")
 
-        files = app_config._read_agent_files("read-legacy")
+        files = prompts._read_agent_files("read-legacy")
         # Content is served under the canonical label regardless of source.
         assert files[0] == ("agent.md", "legacy persona")
 
     def test_reader_missing_persona_returns_empty(self, temp_db):
         _mk_agent("read-none")
-        assert app_config._read_agent_files("read-none") == []
+        assert prompts._read_agent_files("read-none") == []

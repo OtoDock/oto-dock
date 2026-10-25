@@ -47,6 +47,9 @@ DECISIONS = (PENDING, ACCEPTED, DECLINED)
 # 2026-10-04).
 SETTING_TO_AGENTS = "sharing_to_agents_enabled"
 SETTING_TO_DEPARTMENTS = "sharing_to_departments_enabled"
+# Whether members read the user directory's names: unset means open, "0"
+# closes it to everyone but an admin.
+SETTING_DIRECTORY = "user_directory_visible_to_members"
 
 
 class ShareExists(Exception):

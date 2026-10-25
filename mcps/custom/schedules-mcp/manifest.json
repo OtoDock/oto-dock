@@ -2,7 +2,7 @@
   "name": "schedules-mcp",
   "label": "Schedules",
   "description": "Scheduled, one-time, and trigger-fired background tasks, each pinnable to its own model / execution layer",
-  "version": "1.3.4",
+  "version": "1.3.5",
   "category": "core",
 
   "server": {
@@ -40,7 +40,7 @@
       "id": "task-scheduling-guide",
       "loading": "on_demand",
       "file": "skills/task-scheduling-guide/SKILL.md",
-      "description": "Parameter shapes and worked detail for the schedules tools — notification modes, cron and interval schedules, self-continuations, editing and reading back tasks, model pinning, trigger-only tasks, timezone rules. Use before creating or editing a scheduled task.",
+      "description": "Parameter shapes and worked detail for the schedules tools — notification modes, cron and interval schedules, self-continuations, editing and reading back tasks, model pinning, choosing a machine, trigger-only tasks, timezone rules. Use before creating or editing a scheduled task.",
       "default_exclude_from": []
     }
   ],

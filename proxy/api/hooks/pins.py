@@ -9,25 +9,25 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, cast
 
+import psycopg
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 import config
-from storage import database as task_store
-from storage.pg import run_db
+from api.hooks import artifacts, paths
 from api.sessions.sessions import verify_session_match_async
+from auth import roles
+from core import layout
+from core.session import session_kind
 from core.session.session_state import (
     get_session_security,
 )
-from api.hooks import artifacts, paths
-from core.session import session_kind
 from core.session.visibility import is_task_chat_owner
-from storage import db_apps
-from auth import roles
+from storage import database as task_store, db_apps
+from storage.pg import run_db
 from ws import wire_events as wire
-from core import layout
 
 logger = logging.getLogger("otodock")
 router = APIRouter()
@@ -200,7 +200,7 @@ async def hook_app_pin(req: HookAppPinRequest, authorization: str | None = Heade
     the live-refresh path for scheduled tasks (a native Write doesn't
     broadcast file_updated on local sandboxes). A changed actions manifest
     silently breaks the approval sig — buttons stay dead until the user
-    re-approves (api/apps/manifest.py has the authority rules).
+    re-approves (services/apps/manifest.py has the authority rules).
 
     Restore paths: pinning a slug the user soft-unpinned from the dashboard
     revives the hidden row (manifest + approval intact — the ack says so);
@@ -220,11 +220,12 @@ async def hook_app_pin(req: HookAppPinRequest, authorization: str | None = Heade
     in BOTH namespaces (distinct rows + files); restore-by-slug looks up
     only the resolved namespace.
     """
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
+    from services.apps.slugs import APP_SLUG_RE
 
     await verify_session_match_async(authorization, req.session_id)
     slug = req.slug.strip().lower()
-    if not _mf.APP_SLUG_RE.match(slug):
+    if not APP_SLUG_RE.fullmatch(slug):
         raise HTTPException(status_code=400,
                             detail="slug must be 1-40 chars of [a-z0-9-], starting alphanumeric")
     title = req.title.strip()
@@ -380,18 +381,21 @@ async def hook_app_pin(req: HookAppPinRequest, authorization: str | None = Heade
             raise HTTPException(status_code=400, detail=err)
 
     from services.apps import releases
+    lint: dict = {}
     if req.html.strip():
         # The client rules a folder app's deploy applies, on the page a
         # single-file app IS (APPS.md "Deploy pipeline"): a raw fetch, a
         # form, storage or a self-navigation would fail only in the viewer's
         # browser, so the pin is refused with the line and the fix instead.
+        # Warnings ride the pin's answer.
         from services.apps import app_lint
         declared = actions_json if actions_json is not None else (
             (existing or {}).get("actions") or "[]")
         findings = await asyncio.to_thread(app_lint.lint_html, req.html, declared, f"apps/{slug}.html")
-        if findings:
+        lint = app_lint.summary(findings) if findings else {}
+        if lint.get("problems"):
             from services.apps import app_deploy
-            return {"status": app_deploy.RESULT_REFUSED, "slug": slug, **app_lint.summary(findings)}
+            return {"status": app_deploy.RESULT_REFUSED, "slug": slug, **lint}
         # Written next to the file and renamed into place: a viewer served
         # the working file (not deployed yet) never reads a truncated one.
         await asyncio.to_thread(releases.write_atomic, target, req.html)
@@ -445,15 +449,17 @@ async def hook_app_pin(req: HookAppPinRequest, authorization: str | None = Heade
     from services.notifications import notification_manager
     await notification_manager.broadcast_file_updated(ctx.agent, rel, source="disk")
     if release_n:
-        from api.apps.apps import announce_deploy
+        from services.apps.audience import announce_deploy
         await announce_deploy(row, release_n, file_updated=False)
     approved = task_store.app_actions_approved(row)
     has_actions = bool(_mf.parse_actions(row))
     logger.info(
-        f"Hook app pin: session={req.session_id}, agent={ctx.agent}, "
-        f"slug={slug}, scope={'shared' if not username else username}, "
-        f"pin_scope={scope}, approved={approved}, restored={restored}, "
-        f"replaced={replaced or '-'}, reused_file={reused_file}"
+        "Hook app pin: session=%s, agent=%s, "
+        "slug=%s, scope=%s, "
+        "pin_scope=%s, approved=%s, restored=%s, "
+        "replaced=%s, reused_file=%s",
+        req.session_id, ctx.agent, slug, 'shared' if not username else username, scope, approved,
+        restored, replaced or '-', reused_file
     )
     out = {
         "status": "ok",
@@ -465,6 +471,7 @@ async def hook_app_pin(req: HookAppPinRequest, authorization: str | None = Heade
         "actions_approved": approved,
         "approval": ("approved" if approved else "pending user approval")
                     if has_actions else "none",
+        **lint,
     }
     if replaced:
         out["replaced"] = (
@@ -508,8 +515,8 @@ async def hook_app_unpin(req: HookAppSlugRequest, authorization: str | None = He
     # The release copies go with the row; the workspace file (or folder)
     # and a folder app's data stay — pin_app(slug) finds them again.
     await asyncio.to_thread(releases.remove_release_dir, row)
-    logger.info(f"Hook app unpin: session={req.session_id}, slug={req.slug}, "
-                f"visibility={found_vis}")
+    logger.info("Hook app unpin: session=%s, slug=%s, "
+                "visibility=%s", req.session_id, req.slug, found_vis)
     out = {"status": "ok", "kept_file": row["rel_path"]}
     if row.get("template_ref"):
         out["opted_out"] = "the template will not seed it again; pin_app(slug) restores it"
@@ -532,8 +539,8 @@ async def hook_app_rollback(req: HookAppSlugRequest, authorization: str | None =
         _require_shared_pin_authority(ctx, "")
     from api.apps.apps import rollback_app_row
     out = await rollback_app_row(row)
-    logger.info(f"Hook app rollback: session={req.session_id[:8]}, slug={req.slug}, "
-                f"release={out['release']}")
+    logger.info("Hook app rollback: session=%s, slug=%s, "
+                "release=%s", req.session_id[:8], req.slug, out['release'])
     return {"status": "ok", "app_id": row["id"], **out}
 
 
@@ -652,9 +659,9 @@ async def write_state_row(row: dict, patch, *, replace: bool, updated_by: str) -
             updated_by=updated_by,
         )
     except task_store.AppStateError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except LookupError:
-        raise HTTPException(status_code=404, detail="no pinned app with that slug in your scope")
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="no pinned app with that slug in your scope") from exc
     frame = {"type": wire.APP_STATE, "app_id": row["id"], "doc": doc, "rev": rev}
     screens = await _live_fan_out(row, frame)
     return {"status": "ok", "app_id": row["id"], "rev": rev, "screens": screens}
@@ -729,13 +736,13 @@ async def hook_app_open(req: HookAppOpenRequest, authorization: str | None = Hea
         placed = await run_db(_placed_for, target_sub)
         if placed is None:
             raise HTTPException(status_code=404, detail="no pinned app with that slug in your scope")
-    row = own if own is not None else placed
+    row = cast("dict", own if own is not None else placed)  # both None was a 404 above
 
     def _check() -> str:
         chat = task_store.get_chat(chat_id) or {}
         if is_task_chat_owner(chat.get("user_sub")):
             return "no_screen"
-        from api.apps.apps import app_access
+        from services.apps.audience import app_access
         from services.apps.focus_context import PREF_AGENTS_MAY_OPEN, user_pref_on
         user = user_context_for_sub(target_sub)
         if user is None or row.get("hidden") or not app_access(row, user):
@@ -797,7 +804,7 @@ async def hook_app_open(req: HookAppOpenRequest, authorization: str | None = Hea
         notification_manager.push_live(target_sub, frame, connection_id=c.connection_id)
         for c in targets
     )
-    logger.info(f"Hook app open: session={req.session_id[:8]}, slug={req.slug}, screens={screens}")
+    logger.info("Hook app open: session=%s, slug=%s, screens=%s", req.session_id[:8], req.slug, screens)
     return {"status": "opened", "app_id": row["id"], "screens": screens}
 
 
@@ -812,8 +819,7 @@ async def hook_app_list(req: HookAppSlugRequest, authorization: str | None = Hea
     "Agents use a placed app"): another agent's rows, named by their home
     agent and slug with their id, the role this session acts at on them and
     their exported methods; never in the pinned order of ``apps``."""
-    from api.apps import manifest as _mf
-    from services.apps import releases as _releases
+    from services.apps import manifest as _mf, releases as _releases
 
     await verify_session_match_async(authorization, req.session_id)
     ctx = get_session_security(req.session_id)
@@ -884,7 +890,7 @@ def _waiting_reason(row: dict) -> str:
     from services.apps import app_secrets
     try:
         return app_secrets.waiting_reason(row)
-    except Exception:
+    except psycopg.Error:
         return ""
 
 
@@ -1024,8 +1030,8 @@ async def hook_file_pin(req: HookFilePinRequest,
         ctx.agent, rel, source="disk", pin=True,
     )
     logger.info(
-        f"Hook file pin: session={req.session_id}, agent={ctx.agent}, "
-        f"rel={rel}, pin_scope={scope}"
+        "Hook file pin: session=%s, agent=%s, "
+        "rel=%s, pin_scope=%s", req.session_id, ctx.agent, rel, scope
     )
     return {
         "status": "ok",
@@ -1081,8 +1087,8 @@ async def hook_file_unpin(req: HookFilePinRequest,
             ctx.agent, rel, source="disk", pin=True,
         )
     logger.info(
-        f"Hook file unpin: session={req.session_id}, agent={ctx.agent}, "
-        f"removed={removed}, pin_scope={scope}"
+        "Hook file unpin: session=%s, agent=%s, "
+        "removed=%s, pin_scope=%s", req.session_id, ctx.agent, removed, scope
     )
     return {"status": "ok", "removed": removed, "kept_files": True}
 

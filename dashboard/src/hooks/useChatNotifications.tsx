@@ -9,7 +9,9 @@ import { useNotificationSound } from './useNotificationSound'
 import { usePushSubscription } from './usePushSubscription'
 import { useAgents } from '../api/agents'
 import { INBOX_KEY, useAcceptShare, useDeclineShare, useHideShare, useShareInbox, type ShareInboxItem } from '../api/shares'
-import type { ShareInboxFrame } from '../api/wireEvents'
+import type {
+  NotificationCountFrame, NotificationFrame, NotificationSilentFrame, ShareInboxFrame,
+} from '../api/wireEvents'
 import { isTaskChatId, runIdOfChat } from '../lib/session/kind'
 
 /**
@@ -34,6 +36,8 @@ export function useChatNotifications() {
   const qc = useQueryClient()
   const notif = useNotifications()
   const notifSound = useNotificationSound()
+  const { closePanel } = notif
+  const { stopDangerAlarm } = notifSound
   usePushSubscription()  // Web Push (browsers)
   // Sender identity for the cards: the app-wide cached agents list resolves
   // each delivery's `agent_slug` to its avatar color + display name.
@@ -55,13 +59,13 @@ export function useChatNotifications() {
   // dismiss path).
   useEffect(() => {
     const hasDanger = notif.toasts.some(t => t.delivery.severity === 'danger')
-    if (!hasDanger) notifSound.stopDangerAlarm()
-  }, [notif.toasts])
+    if (!hasDanger) stopDangerAlarm()
+  }, [notif.toasts, stopDangerAlarm])
 
   // Navigate to the chat/task that originated a notification, or to the
   // page a row names itself (a shared app or chat).
   const handleNotifNavigate = useCallback((agentSlug: string, chatId: string, href?: string) => {
-    notif.closePanel()
+    closePanel()
     if (href && href.startsWith('/') && !href.startsWith('//')) {
       navigate(href)
     } else if (!chatId) {
@@ -77,7 +81,7 @@ export function useChatNotifications() {
     } else {
       navigate(`/chat/${agentSlug}/${chatId}`)
     }
-  }, [navigate, notif.closePanel])
+  }, [navigate, closePanel])
 
   const runShare = useCallback((item: ShareInboxItem, run: () => Promise<unknown>) => {
     setInboxBusyId(item.id)
@@ -93,9 +97,9 @@ export function useChatNotifications() {
   const onHideShare = useCallback((item: ShareInboxItem) =>
     runShare(item, () => hide.mutateAsync({ id: item.id })), [hide, runShare])
   const onOpenShare = useCallback((item: ShareInboxItem) => {
-    notif.closePanel()
+    closePanel()
     if (item.href.startsWith('/') && !item.href.startsWith('//')) navigate(item.href)
-  }, [navigate, notif.closePanel])
+  }, [navigate, closePanel])
 
   const notificationBell = (
     <div className="relative">
@@ -142,20 +146,20 @@ export function useChatNotifications() {
   const refreshInboxFor = useCallback((delivery: { source?: string } | undefined) => {
     if (delivery?.source === 'share') qc.invalidateQueries({ queryKey: INBOX_KEY })
   }, [qc])
-  const onNotification = useCallback((data: any) => {
+  const onNotification = useCallback((data: NotificationFrame) => {
     const d = data.delivery
     notif.addToast(d)
     notifSound.playForSeverity(d.severity, d.title, d.body)
     refreshInboxFor(d)
   }, [notif, notifSound, refreshInboxFor])
-  const onNotificationSilent = useCallback((data: any) => {
+  const onNotificationSilent = useCallback((data: NotificationSilentFrame) => {
     // Silent delivery — fires on this WS when it's connected but inactive
     // (hidden tab / 5-min idle). The alert is delivered via native push on the
     // engaged device; we only refresh the inbox + badge here.
     notif.addSilent(data.delivery)
     refreshInboxFor(data.delivery)
   }, [notif, refreshInboxFor])
-  const onNotificationCount = useCallback((data: any) => {
+  const onNotificationCount = useCallback((data: NotificationCountFrame) => {
     notif.setCount(data.count)
   }, [notif])
   // The section changed (a share to this person, a decision, a hide, a

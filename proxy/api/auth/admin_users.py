@@ -5,24 +5,27 @@ admin password resets. Attaches to the shared core-auth router."""
 
 import asyncio
 import logging
-import time
+from typing import cast
 
-import jwt as pyjwt
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 
 import config
-from auth.license import check_seat_limit
-from auth.password import HashBusy, check_password_strength_async, generate_temp_password, hash_password_async
-from auth.providers import UserContext, get_current_user, mask_email, require_admin
-from storage.agents import agent_store
-from storage.identity import credential_store
-from storage import database as task_store
-
 from api.auth._common import _build_user_response
 from api.auth._router import router
-from auth import roles as _roles
+from auth import roles as _roles, tokens
+from auth.license import check_seat_limit
+from auth.password import (
+    HashBusy,
+    check_password_strength_async,
+    generate_temp_password,
+    hash_password_async,
+)
+from auth.providers import UserContext, get_current_user, mask_email, require_admin
 from services.agents import offboarding, offboarding_sessions
+from storage import database as task_store
+from storage.agents import agent_store
+from storage.identity import credential_store
 
 logger = logging.getLogger("otodock")
 
@@ -31,12 +34,12 @@ async def _hash_or_503(plain: str) -> str:
     """The password hash, off the event loop (``auth.password``)."""
     try:
         return await hash_password_async(plain)
-    except HashBusy:
+    except HashBusy as exc:
         raise HTTPException(status_code=503, detail="Busy. Try again in a few seconds.",
-                            headers={"Retry-After": "5"})
+                            headers={"Retry-After": "5"}) from exc
 
-# Invite links are signed JWTs (purpose="invite"), same pattern as the
-# password-reset flow. Single-use is enforced structurally: accept-invite only
+# Invite links are signed tokens of their own kind (``auth/tokens.INVITE``),
+# like the password-reset links. Single-use is enforced structurally: accept-invite only
 # works while the account has no password, and accepting sets one.
 _INVITE_TOKEN_TTL = 48 * 3600
 
@@ -46,11 +49,8 @@ def mint_invite_url(sub: str) -> str:
 
     Relative when DASHBOARD_PUBLIC_URL is unset — the dashboard resolves it
     against its own origin for the copy-link flow."""
-    token = pyjwt.encode(
-        {"sub": sub, "purpose": "invite",
-         "iat": int(time.time()), "exp": int(time.time()) + _INVITE_TOKEN_TTL},
-        config.JWT_SECRET, algorithm="HS256",
-    )
+    token = tokens.mint(tokens.INVITE, {"sub": sub, "purpose": "invite"},
+                        ttl_s=_INVITE_TOKEN_TTL)
     return f"{config.DASHBOARD_PUBLIC_URL}/accept-invite?token={token}"
 
 
@@ -163,7 +163,7 @@ async def admin_set_user_agents(
 
     change = await asyncio.to_thread(
         task_store.set_user_agents, sub, req.agents, u.sub, agent_roles=roles)
-    logger.info(f"Admin {mask_email(u.email)} set agents for {sub}: {req.agents} roles={roles}")
+    logger.info("Admin %s set agents for %s: %s roles=%s", mask_email(u.email), sub, req.agents, roles)
     from services.notifications.notification_manager import invalidate_audience
     for added in added_agents:
         invalidate_audience(added)
@@ -249,7 +249,8 @@ async def admin_add_user_agent(
     )
     if inserted:
         logger.info(
-            f"Admin {mask_email(u.email)} added agent {agent} ({req.role}) to {sub}"
+            "Admin %s added agent %s (%s) to %s",
+            mask_email(u.email), agent, req.role, sub
         )
         from services.notifications.notification_manager import invalidate_audience
         invalidate_audience(agent)
@@ -295,7 +296,7 @@ async def admin_update_role(
     rows_before = await asyncio.to_thread(task_store.get_user_agent_roles, sub)
     await asyncio.to_thread(task_store.update_user_role, sub, req.role)
     await apply_platform_role_change(sub, target, req.role, rows_before, u.sub)
-    logger.info(f"Admin {mask_email(u.email)} changed role for {sub} to {req.role}")
+    logger.info("Admin %s changed role for %s to %s", mask_email(u.email), sub, req.role)
     return {"status": "updated", "role": req.role}
 
 
@@ -312,7 +313,7 @@ async def apply_platform_role_change(sub: str, person: dict, new_role: str,
     that stay are kept) and the person's subscriptions leave the shared
     platform pool; then the losses are dispatched to the offboarding
     subscribers."""
-    before = person.get("role")
+    before = cast("str", person.get("role"))
     if _roles.PLATFORM_RANK.get(new_role, -1) < _roles.PLATFORM_RANK.get(before, -1):
         from api.auth.identity import end_every_sign_in
         await end_every_sign_in(sub, person.get("username") or "", "platform_role_lowered")
@@ -343,7 +344,7 @@ async def apply_platform_role_change(sub: str, person: dict, new_role: str,
 
         current_agents, safe_agents = await asyncio.to_thread(_drop_admin_only)
         if len(safe_agents) != len(current_agents):
-            logger.info(f"Removed high-clearance agents from {sub} after role change to {new_role}")
+            logger.info("Removed high-clearance agents from %s after role change to %s", sub, new_role)
             from services.community import template_app_seeder
             for agent_slug in set(current_agents) - set(safe_agents):
                 try:
@@ -353,7 +354,7 @@ async def apply_platform_role_change(sub: str, person: dict, new_role: str,
         from storage.billing import subscription_store
         cleared = await asyncio.to_thread(subscription_store.clear_contribute_platform_for_owner, sub)
         if cleared:
-            logger.info(f"Cleared platform-pool contribution on {cleared} sub(s) for demoted user {sub}")
+            logger.info("Cleared platform-pool contribution on %s sub(s) for demoted user %s", cleared, sub)
             # Agent-scope sessions running on the demoted admin's pool subs are
             # now delisted: re-home them onto the remaining pool (scheduled
             # from the loop: the rebind is a loop task).
@@ -448,8 +449,8 @@ async def admin_delete_user(
     # user was NOT the full revocation an operator expects). Best-effort:
     # a failure here must not block the user delete.
     try:
-        from storage.identity import api_key_store
         from storage.automation import trigger_store
+        from storage.identity import api_key_store
         n_keys = await asyncio.to_thread(api_key_store.cleanup_user_api_keys, sub)
         n_trig = await asyncio.to_thread(trigger_store.cleanup_user_triggers, sub)
         if n_keys or n_trig:
@@ -494,10 +495,10 @@ async def admin_delete_user(
     # holder cache already holds must not outlive it.
     from auth import token_holder
     token_holder.forget(sub)
-    logger.info(f"Admin {mask_email(u.email)} deleted user {sub}")
+    logger.info("Admin %s deleted user %s", mask_email(u.email), sub)
     await offboarding.dispatch_losses(
-        sub, offboarding.losses(target["role"], rows_before, None, {}, all_agents),
-        u.sub, deleted=True, person=target, platform_before=target["role"],
+        sub, offboarding.losses(cast("dict", target)["role"], rows_before, None, {}, all_agents),
+        u.sub, deleted=True, person=target, platform_before=cast("dict", target)["role"],
     )
     return {"status": "deleted"}
 
@@ -590,7 +591,7 @@ async def admin_create_user(
         new_user = task_store.get_user(sub)
         return _build_user_response(new_user) if new_user else {}
 
-    result = {"user": await asyncio.to_thread(_created_user)}
+    result: dict[str, object] = {"user": await asyncio.to_thread(_created_user)}
     if temp_password:
         result["temp_password"] = temp_password
     if invite_url:
@@ -598,7 +599,7 @@ async def admin_create_user(
     if req.send_invite:
         result["invite_sent"] = True
 
-    logger.info(f"Admin {mask_email(u.email)} created user {mask_email(req.email)} role={req.role}")
+    logger.info("Admin %s created user %s role=%s", mask_email(u.email), mask_email(req.email), req.role)
     return result
 
 
@@ -630,7 +631,7 @@ async def admin_reset_password(
     # The write moved the token epoch: no cached pass may outlive it.
     from auth import token_holder
     token_holder.forget(sub)
-    logger.info(f"Admin {mask_email(u.email)} reset password for {mask_email(target['email'])}")
+    logger.info("Admin %s reset password for %s", mask_email(u.email), mask_email(target['email']))
     # The person's warm chats hold session tokens the reset just invalidated.
     await offboarding_sessions.close_person_sessions(
         sub, target.get("username") or "", "password_changed")
@@ -651,5 +652,5 @@ async def admin_set_local_only(
     await asyncio.to_thread(
         task_store.update_user_auth_fields, sub, local_only=bool(req.local_only),
     )
-    logger.info(f"Admin {mask_email(u.email)} set local_only={req.local_only} for {mask_email(target['email'])}")
+    logger.info("Admin %s set local_only=%s for %s", mask_email(u.email), req.local_only, mask_email(target['email']))
     return {"status": "updated", "local_only": req.local_only}

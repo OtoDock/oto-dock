@@ -17,7 +17,6 @@ free-disk floor, and stale staging is reaped off the request path.
 import asyncio
 import contextlib
 import errno
-import hashlib
 import json
 import logging
 import os
@@ -28,20 +27,36 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
-from fastapi import File as FileParam
+from fastapi import (
+    APIRouter,
+    Depends,
+    File as FileParam,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from pydantic import BaseModel
 
 import config
-from storage.agents import agent_store
 from auth import rate_limiter
-from auth.providers import UserContext, get_current_user, require_agent_access, require_auth, require_user
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_agent_access,
+    require_auth,
+    require_user,
+)
 from core import file_commit, layout
 from services.infra import safe_fs
 from services.infra.path_confinement import (
-    PathOutsideRoot, join_under, resolve_under, safe_agent_dir,
+    PathOutsideRoot,
+    join_under,
+    resolve_under,
 )
+from services.media.upload_staging import _occupancy, _open_metas, _user_staging_dirname
 from storage import database as task_store
+from storage.agents import agent_store
 from storage.pg import run_db
 
 logger = logging.getLogger("otodock.uploads")
@@ -223,7 +238,7 @@ def _resolve_upload_destination(
     if not is_agent_scoped and not username:
         raise HTTPException(status_code=400, detail="User has no username configured")
 
-    agent_dir = safe_agent_dir(agent)
+    agent_dir = config.get_agent_dir(agent)
     if target_dir:
         # Custom target — authorize the RESOLVED final path against the caller's
         # per-agent role (fixes a role-var bug — was user.role — and defeats
@@ -264,8 +279,8 @@ def _resolve_upload_destination(
     agent_root = Path(os.path.realpath(agent_dir))
     try:
         upload_dir = resolve_under(upload_dir, agent_root)
-    except PathOutsideRoot:
-        raise HTTPException(status_code=403, detail="Path outside agent directory")
+    except PathOutsideRoot as exc:
+        raise HTTPException(status_code=403, detail="Path outside agent directory") from exc
     if create:
         upload_dir.mkdir(parents=True, exist_ok=True)
 
@@ -430,8 +445,8 @@ async def upload_file(
 
     try:
         landing_rel = _landing_rel(upload_dir)
-    except safe_fs.SafeFsError:
-        raise HTTPException(status_code=403, detail="Path outside agent directory")
+    except safe_fs.SafeFsError as exc:
+        raise HTTPException(status_code=403, detail="Path outside agent directory") from exc
 
     # Stream into a `.partial` temp beside the landing name, then reserve the
     # name with a no-replace rename: a big upload has a long failure window,
@@ -441,13 +456,13 @@ async def upload_file(
     # swapped for a link meanwhile) is the same 403 the chunked routes give.
     try:
         f, tmp_rel = await file_commit.run(_open_landing_temp, landing_rel, safe_name, declared)
-    except safe_fs.SafeFsError:
-        raise HTTPException(status_code=403, detail="Path outside agent directory")
+    except safe_fs.SafeFsError as exc:
+        raise HTTPException(status_code=403, detail="Path outside agent directory") from exc
     except OSError as e:
         if _name_too_long(e):
-            raise HTTPException(status_code=400, detail=_NAME_TOO_LONG)
-        logger.error(f"Upload failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Upload failed")
+            raise HTTPException(status_code=400, detail=_NAME_TOO_LONG) from e
+        logger.exception("Upload failed: %s", e)
+        raise HTTPException(status_code=500, detail="Upload failed") from e
     total_bytes = 0
     landed_rel: str | None = None
     try:
@@ -472,13 +487,13 @@ async def upload_file(
         )
     except HTTPException:
         raise
-    except safe_fs.SafeFsError:
-        raise HTTPException(status_code=403, detail="Path outside agent directory")
+    except safe_fs.SafeFsError as exc:
+        raise HTTPException(status_code=403, detail="Path outside agent directory") from exc
     except Exception as e:
         if _name_too_long(e):
-            raise HTTPException(status_code=400, detail=_NAME_TOO_LONG)
-        logger.error(f"Upload failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Upload failed")
+            raise HTTPException(status_code=400, detail=_NAME_TOO_LONG) from e
+        logger.exception("Upload failed: %s", e)
+        raise HTTPException(status_code=500, detail="Upload failed") from e
     finally:
         if landed_rel is None:
             # Any exit without a landed file (a cap, a disk error, a client
@@ -487,7 +502,7 @@ async def upload_file(
 
     target = config.AGENTS_DIR / landed_rel
     rel_path = _rel_to_agent_path(landed_rel)
-    logger.info(f"File uploaded: {rel_path} ({total_bytes} bytes) by user={user.sub[:16]}...")
+    logger.info("File uploaded: %s (%s bytes) by user=%s...", rel_path, total_bytes, user.sub[:16])
 
     # If any active session for this agent runs on a remote satellite, push
     # the upload over so the agent CLI can see it — in the BACKGROUND, so
@@ -660,12 +675,6 @@ class ChunkedInitRequest(BaseModel):
 _UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
-def _user_staging_dirname(sub: str) -> str:
-    """One staging subdirectory per user, named by a hash of the sub (subs are
-    opaque ids and never become directory names)."""
-    return hashlib.sha256(sub.encode("utf-8")).hexdigest()[:32]
-
-
 def _staging_paths(upload_id: str, sub: str) -> tuple[Path, Path]:
     if not _UPLOAD_ID_RE.match(upload_id):
         raise HTTPException(status_code=404, detail="Unknown upload id")
@@ -686,8 +695,8 @@ def _read_chunk_meta(upload_id: str, sub: str) -> tuple[dict, Path, Path, int | 
     staging, meta_path = _staging_paths(upload_id, sub)
     try:
         meta = json.loads(meta_path.read_text())
-    except (OSError, ValueError):
-        raise HTTPException(status_code=404, detail="Unknown upload id")
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="Unknown upload id") from exc
     try:
         staged: int | None = staging.stat().st_size
     except FileNotFoundError:
@@ -717,35 +726,6 @@ def _save_chunk_meta_atomic(meta_path: Path, meta: dict) -> None:
     tmp = meta_path.with_name(meta_path.name + ".tmp")
     tmp.write_text(json.dumps(meta))
     os.replace(tmp, meta_path)
-
-
-def _occupancy(meta: dict) -> int:
-    """The bytes an open upload actually holds on disk (every received chunk
-    is exactly chunk_size but the last), never its declared size."""
-    try:
-        size = int(meta.get("size", 0))
-        chunk_size = int(meta.get("chunk_size", 0))
-        received = len(meta.get("received") or [])
-    except (TypeError, ValueError):
-        return 0
-    return max(0, min(received * chunk_size, size))
-
-
-def _open_metas(user_dir: Path) -> list[tuple[Path, dict, float]]:
-    """``(meta path, meta, mtime)`` for every open upload in a user dir."""
-    out: list[tuple[Path, dict, float]] = []
-    try:
-        entries = list(user_dir.iterdir())
-    except OSError:
-        return out
-    for p in entries:
-        if p.suffix != ".json":
-            continue
-        try:
-            out.append((p, json.loads(p.read_text()), p.stat().st_mtime))
-        except (OSError, ValueError):
-            continue
-    return out
 
 
 def _remove_pair(staging: Path, meta_path: Path) -> None:
@@ -918,37 +898,6 @@ async def staging_sweep_loop() -> None:
             logger.exception("upload staging sweep failed")
 
 
-def staged_bytes_by_user() -> dict[str, int]:
-    """Bytes actually staged per user dir (the hashed sub), for the quota view."""
-    out: dict[str, int] = {}
-    root = config.UPLOAD_STAGING_DIR
-    if not root.is_dir():
-        return out
-    try:
-        for d in root.iterdir():
-            if d.is_dir():
-                out[d.name] = sum(_occupancy(m) for _p, m, _t in _open_metas(d))
-    except OSError:
-        pass
-    return out
-
-
-def staged_bytes_total() -> int:
-    return sum(staged_bytes_by_user().values())
-
-
-def staged_bytes_for(sub: str) -> int:
-    """Bytes one user has staged (their directory only), for the per-user
-    quota bucket."""
-    d = config.UPLOAD_STAGING_DIR / _user_staging_dirname(sub)
-    if not d.is_dir():
-        return 0
-    try:
-        return sum(_occupancy(m) for _p, m, _t in _open_metas(d))
-    except OSError:
-        return 0
-
-
 class UploadFolderRequest(BaseModel):
     agent: str
     name: str
@@ -993,13 +942,13 @@ async def reserve_upload_folder(
     try:
         landing_rel = _landing_rel(upload_dir)
         rel = await file_commit.run(_reserve_folder, landing_rel, name)
-    except safe_fs.SafeFsError:
-        raise HTTPException(status_code=403, detail="Path outside agent directory")
+    except safe_fs.SafeFsError as exc:
+        raise HTTPException(status_code=403, detail="Path outside agent directory") from exc
     except OSError as e:
         if _name_too_long(e):
-            raise HTTPException(status_code=400, detail=_NAME_TOO_LONG)
-        logger.error(f"Folder reservation failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="The folder could not be created")
+            raise HTTPException(status_code=400, detail=_NAME_TOO_LONG) from e
+        logger.exception("Folder reservation failed: %s", e)
+        raise HTTPException(status_code=500, detail="The folder could not be created") from e
     created = rel.rsplit("/", 1)[-1]
     if body.target_dir and created != name:
         # The role check judged ``name``; the folder made may be ``name_N``
@@ -1018,7 +967,7 @@ def _check_reserved(user: UserContext, agent: str, target_dir: str, created: str
     """The role check of a file written in the folder a reservation made
     (``HTTPException`` 403 when refused). Store reads: run it on ``run_db``."""
     from api.agents.agents import safe_agent_path
-    safe_agent_path(safe_agent_dir(agent), agent, f"{target_dir}/{created}/x", user, writing=True)
+    safe_agent_path(config.get_agent_dir(agent), agent, f"{target_dir}/{created}/x", user, writing=True)
 
 
 @router.post("/v1/upload/chunked/init")
@@ -1200,14 +1149,14 @@ async def chunked_upload_chunk(
             if not had_chunks or exc.status_code == 404:
                 _chunk_locks.pop(upload_id, None)
             raise
-        except FileNotFoundError:
+        except FileNotFoundError as err:
             # The pair was evicted or swept while this chunk was in flight.
-            raise await _gone(upload_id, meta_path)
+            raise await _gone(upload_id, meta_path) from err
         except Exception as e:
-            logger.error(f"Chunk write failed ({upload_id}/{index}): {e}", exc_info=True)
+            logger.exception("Chunk write failed (%s/%s): %s", upload_id, index, e)
             if not had_chunks:
                 _chunk_locks.pop(upload_id, None)
-            raise HTTPException(status_code=500, detail="Chunk write failed")
+            raise HTTPException(status_code=500, detail="Chunk write failed") from e
         finally:
             if f is not None:
                 with contextlib.suppress(Exception):
@@ -1239,7 +1188,7 @@ def _finalize_staged_file(
         if exc.errno != errno.EXDEV or isinstance(exc, safe_fs.SafeFsError):
             raise
         if not _free_disk_ok(config.AGENTS_DIR, size):
-            raise _insufficient_storage()
+            raise _insufficient_storage() from exc
         tmp_rel = f"{landing_rel}/.{_temp_stem(name)}.{upload_id}.partial"
         safe_fs.copy_file_beneath(
             staging_root, staging_rel, config.AGENTS_DIR, tmp_rel,
@@ -1313,8 +1262,8 @@ async def chunked_upload_complete(
         )
         try:
             landing_rel = _landing_rel(upload_dir)
-        except safe_fs.SafeFsError:
-            raise HTTPException(status_code=403, detail="Path outside agent directory")
+        except safe_fs.SafeFsError as err:
+            raise HTTPException(status_code=403, detail="Path outside agent directory") from err
         try:
             landed_rel = await file_commit.run(
                 _finalize_staged_file, staging, landing_rel, meta["filename"],
@@ -1322,20 +1271,20 @@ async def chunked_upload_complete(
             )
         except HTTPException:
             raise
-        except safe_fs.SafeFsError:
-            raise HTTPException(status_code=403, detail="Path outside agent directory")
+        except safe_fs.SafeFsError as err:
+            raise HTTPException(status_code=403, detail="Path outside agent directory") from err
         except OSError as e:
             if _name_too_long(e):
-                raise HTTPException(status_code=400, detail=_NAME_TOO_LONG)
-            logger.error(f"Chunked upload finalize failed ({upload_id}): {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Upload failed")
+                raise HTTPException(status_code=400, detail=_NAME_TOO_LONG) from e
+            logger.exception("Chunked upload finalize failed (%s): %s", upload_id, e)
+            raise HTTPException(status_code=500, detail="Upload failed") from e
         _chunk_locks.pop(upload_id, None)
 
     target = config.AGENTS_DIR / landed_rel
     rel_path = _rel_to_agent_path(landed_rel)
     logger.info(
-        f"File uploaded (chunked, {n_chunks} chunks): {rel_path} "
-        f"({actual} bytes) by user={user.sub[:16]}..."
+        "File uploaded (chunked, %s chunks): %s "
+        "(%s bytes) by user=%s...", n_chunks, rel_path, actual, user.sub[:16]
     )
 
     import uuid as _uuid

@@ -1,0 +1,2451 @@
+{
+ "chat": {
+  "cache_read": 0,
+  "cache_write": 0,
+  "codex_thread_id": null,
+  "context_max": 0,
+  "context_used": 0,
+  "engine_cost_session_id": "sid-pw-agent",
+  "engine_cost_total": 0.046795,
+  "last_abort_graceful": false,
+  "last_response_at": false,
+  "last_turn_aborted": false,
+  "output_tokens": 0,
+  "permission_mode": "ask",
+  "thread_goal": null,
+  "title_generated": false,
+  "total_cost": 0.0
+ },
+ "events": [
+  [
+   "tool_use",
+   {
+    "name": "Agent",
+    "tool_id": "toolu_01YGNgLVY29ZHknewPWoNBNj"
+   }
+  ],
+  [
+   "subagent_start",
+   {
+    "description": "Run sleep and echo command",
+    "run_in_background": true,
+    "subagent_type": "claude",
+    "tool_input": {
+     "description": "Run sleep and echo command",
+     "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+     "run_in_background": true,
+     "subagent_type": "claude"
+    },
+    "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj"
+   }
+  ],
+  [
+   "tool_result",
+   {
+    "name": "Agent",
+    "tool_id": "toolu_01YGNgLVY29ZHknewPWoNBNj"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "S"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "PAWNED"
+   }
+  ],
+  [
+   "metadata",
+   {
+    "cache_read": 34660,
+    "cache_write": 3150,
+    "context_max": 1000000,
+    "context_used": 19228,
+    "cost_usd": 0.022237,
+    "duration_ms": 2956,
+    "input_tokens": 4,
+    "output_tokens": 165
+   }
+  ],
+  [
+   "done",
+   {}
+  ],
+  [
+   "bg_command_start",
+   {
+    "command": "",
+    "description": "Sleep 12 seconds then print SUB_DONE",
+    "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ"
+   }
+  ],
+  [
+   "bg_command_end",
+   {
+    "status": "completed",
+    "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "\n\n"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "The"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected."
+   }
+  ],
+  [
+   "metadata",
+   {
+    "cache_read": 19226,
+    "cache_write": 682,
+    "context_max": 1000000,
+    "context_used": 19910,
+    "cost_usd": 0.0467954,
+    "duration_ms": 2450,
+    "input_tokens": 2,
+    "output_tokens": 58
+   }
+  ],
+  [
+   "done",
+   {}
+  ]
+ ],
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "description": "Run sleep and echo command",
+    "run_in_background": true,
+    "subagent_type": "claude",
+    "tool_input": {
+     "description": "Run sleep and echo command",
+     "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+     "run_in_background": true,
+     "subagent_type": "claude"
+    },
+    "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+    "type": "task_spawn"
+   },
+   "event_type": "task_spawn",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "SPAWNED",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cache_read": 34660,
+    "cache_write": 3150,
+    "context_max": 1000000,
+    "context_used": 19228,
+    "cost_billed": true,
+    "cost_usd": 0.022237,
+    "duration_ms": 2956,
+    "input_tokens": 4,
+    "output_tokens": 165,
+    "type": "metadata"
+   },
+   "event_type": "metadata",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "command": "",
+    "description": "Sleep 12 seconds then print SUB_DONE",
+    "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+    "type": "bg_command_spawn"
+   },
+   "event_type": "bg_command_spawn",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cache_read": 19226,
+    "cache_write": 682,
+    "context_max": 1000000,
+    "context_used": 19910,
+    "cost_billed": true,
+    "cost_usd": 0.0245584,
+    "duration_ms": 2450,
+    "input_tokens": 2,
+    "output_tokens": 58,
+    "type": "metadata"
+   },
+   "event_type": "metadata",
+   "role": "event"
+  }
+ ],
+ "seams": {
+  "ephemeral": [],
+  "kept": [],
+  "reconciles": [],
+  "relocated": [],
+  "replays": [],
+  "rests": [],
+  "status": [],
+  "titles": [],
+  "tool_starts": []
+ },
+ "trace": [
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "name": "Agent",
+      "tool_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "tool_start"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_use/Agent"
+  },
+  {
+   "blocks": [
+    {
+     "description": "Run sleep and echo command",
+     "run_in_background": true,
+     "subagent_type": "claude",
+     "tool_input": {
+      "description": "Run sleep and echo command",
+      "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+      "run_in_background": true,
+      "subagent_type": "claude"
+     },
+     "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+     "type": "task_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "description": "Run sleep and echo command",
+      "run_in_background": true,
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "task_spawn"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:subagent_start"
+  },
+  {
+   "blocks": [
+    {
+     "description": "Run sleep and echo command",
+     "run_in_background": true,
+     "subagent_type": "claude",
+     "tool_input": {
+      "description": "Run sleep and echo command",
+      "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+      "run_in_background": true,
+      "subagent_type": "claude"
+     },
+     "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+     "type": "task_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "result_content": "Async agent launched successfully. (This tool result is internal metadata — never quote or paste any part of it, including the agentId below, into a user-facing reply.)\nagentId: a7b9545497cef9e06 (internal ID - do not mention to user. Use SendMessage with to: 'a7b9545497cef9e06', summary: '<5-10 word recap>' to continue this agent.)\nThe agent is working in the background. You will be notified automatically when it completes. You know nothing about its results until that notification arrives — do not report, assume, or predict them; continue other work or respond to the user in the meantime.\nDo not duplicate this agent's work — avoid working with the same files or topics it is using.\noutput_file: /tmp/probe-work",
+      "summary": "ok",
+      "tool_name": "Agent",
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "tool_result"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:tool_result"
+  },
+  {
+   "blocks": [
+    {
+     "description": "Run sleep and echo command",
+     "run_in_background": true,
+     "subagent_type": "claude",
+     "tool_input": {
+      "description": "Run sleep and echo command",
+      "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+      "run_in_background": true,
+      "subagent_type": "claude"
+     },
+     "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+     "type": "task_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Agent",
+      "tool_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "tool_end"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_result/Agent"
+  },
+  {
+   "blocks": [
+    {
+     "description": "Run sleep and echo command",
+     "run_in_background": true,
+     "subagent_type": "claude",
+     "tool_input": {
+      "description": "Run sleep and echo command",
+      "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+      "run_in_background": true,
+      "subagent_type": "claude"
+     },
+     "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+     "type": "task_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "S",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     },
+     {
+      "content": "S",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "S"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "description": "Run sleep and echo command",
+     "run_in_background": true,
+     "subagent_type": "claude",
+     "tool_input": {
+      "description": "Run sleep and echo command",
+      "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+      "run_in_background": true,
+      "subagent_type": "claude"
+     },
+     "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+     "type": "task_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "PAWNED",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     },
+     {
+      "content": "SPAWNED",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "S",
+     "PAWNED"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "description": "Run sleep and echo command",
+     "run_in_background": true,
+     "subagent_type": "claude",
+     "tool_input": {
+      "description": "Run sleep and echo command",
+      "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+      "run_in_background": true,
+      "subagent_type": "claude"
+     },
+     "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+     "type": "task_spawn"
+    },
+    {
+     "content": "SPAWNED",
+     "type": "text"
+    },
+    {
+     "cache_read": 34660,
+     "cache_write": 3150,
+     "context_max": 1000000,
+     "context_used": 19228,
+     "cost_billed": true,
+     "cost_usd": 0.022237,
+     "duration_ms": 2956,
+     "input_tokens": 4,
+     "output_tokens": 165,
+     "type": "metadata"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "cache_read": 34660,
+      "cache_write": 3150,
+      "context_max": 1000000,
+      "context_used": 19228,
+      "cost_billed": true,
+      "cost_usd": 0.022237,
+      "duration_ms": 2956,
+      "input_tokens": 4,
+      "output_tokens": 165,
+      "type": "metadata"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     },
+     {
+      "content": "SPAWNED",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     34660,
+     3150
+    ],
+    "completed": false,
+    "context": [
+     19228,
+     1000000
+    ],
+    "cost_delta": 0.022237,
+    "cumulative_cost": 0.022237,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.022237,
+    "leftover": [],
+    "llm_cost_delta": 0.022237,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     165
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:metadata"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "pump_type": "is_done"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     },
+     {
+      "content": "SPAWNED\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     34660,
+     3150
+    ],
+    "completed": false,
+    "context": [
+     19228,
+     1000000
+    ],
+    "cost_delta": 0.022237,
+    "cumulative_cost": 0.022237,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.022237,
+    "leftover": [],
+    "llm_cost_delta": 0.022237,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     165
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:done"
+  },
+  {
+   "blocks": [
+    {
+     "command": "",
+     "description": "Sleep 12 seconds then print SUB_DONE",
+     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+     "type": "bg_command_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "bg_command_spawn"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     },
+     {
+      "content": "SPAWNED\n\n",
+      "type": "text"
+     },
+     {
+      "active": true,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     34660,
+     3150
+    ],
+    "completed": false,
+    "context": [
+     19228,
+     1000000
+    ],
+    "cost_delta": 0.022237,
+    "cumulative_cost": 0.022237,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.022237,
+    "leftover": [],
+    "llm_cost_delta": 0.022237,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     165
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:bg_command_start"
+  },
+  {
+   "blocks": [
+    {
+     "command": "",
+     "description": "Sleep 12 seconds then print SUB_DONE",
+     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+     "type": "bg_command_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "status": "completed",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "bg_command_done"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     },
+     {
+      "content": "SPAWNED\n\n",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     34660,
+     3150
+    ],
+    "completed": false,
+    "context": [
+     19228,
+     1000000
+    ],
+    "cost_delta": 0.022237,
+    "cumulative_cost": 0.022237,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.022237,
+    "leftover": [],
+    "llm_cost_delta": 0.022237,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     165
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:bg_command_end"
+  },
+  {
+   "blocks": [
+    {
+     "command": "",
+     "description": "Sleep 12 seconds then print SUB_DONE",
+     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+     "type": "bg_command_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "\n\n",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     },
+     {
+      "content": "SPAWNED\n\n",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     },
+     {
+      "content": "\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     34660,
+     3150
+    ],
+    "completed": false,
+    "context": [
+     19228,
+     1000000
+    ],
+    "cost_delta": 0.022237,
+    "cumulative_cost": 0.022237,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.022237,
+    "leftover": [],
+    "llm_cost_delta": 0.022237,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     165
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "command": "",
+     "description": "Sleep 12 seconds then print SUB_DONE",
+     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+     "type": "bg_command_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "The",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     },
+     {
+      "content": "SPAWNED\n\n",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     },
+     {
+      "content": "\n\nThe",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     34660,
+     3150
+    ],
+    "completed": false,
+    "context": [
+     19228,
+     1000000
+    ],
+    "cost_delta": 0.022237,
+    "cumulative_cost": 0.022237,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.022237,
+    "leftover": [],
+    "llm_cost_delta": 0.022237,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "The"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     165
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "command": "",
+     "description": "Sleep 12 seconds then print SUB_DONE",
+     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+     "type": "bg_command_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": " background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     },
+     {
+      "content": "SPAWNED\n\n",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     },
+     {
+      "content": "\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     34660,
+     3150
+    ],
+    "completed": false,
+    "context": [
+     19228,
+     1000000
+    ],
+    "cost_delta": 0.022237,
+    "cumulative_cost": 0.022237,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.022237,
+    "leftover": [],
+    "llm_cost_delta": 0.022237,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "The",
+     " background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected."
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     165
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "command": "",
+     "description": "Sleep 12 seconds then print SUB_DONE",
+     "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+     "type": "bg_command_spawn"
+    },
+    {
+     "content": "\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.",
+     "type": "text"
+    },
+    {
+     "cache_read": 19226,
+     "cache_write": 682,
+     "context_max": 1000000,
+     "context_used": 19910,
+     "cost_billed": true,
+     "cost_usd": 0.0245584,
+     "duration_ms": 2450,
+     "input_tokens": 2,
+     "output_tokens": 58,
+     "type": "metadata"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "cache_read": 19226,
+      "cache_write": 682,
+      "context_max": 1000000,
+      "context_used": 19910,
+      "cost_billed": true,
+      "cost_usd": 0.0245584,
+      "duration_ms": 2450,
+      "input_tokens": 2,
+      "output_tokens": 58,
+      "type": "metadata"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     },
+     {
+      "content": "SPAWNED\n\n",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     },
+     {
+      "content": "\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     19226,
+     682
+    ],
+    "completed": false,
+    "context": [
+     19910,
+     1000000
+    ],
+    "cost_delta": 0.046795,
+    "cumulative_cost": 0.0467954,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0467954,
+    "leftover": [],
+    "llm_cost_delta": 0.046795,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     2,
+     58
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:metadata"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "pump_type": "is_done"
+    }
+   ],
+   "live": {
+    "active_agents": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     }
+    ],
+    "active_commands": [
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": true,
+      "background": true,
+      "description": "Run sleep and echo command",
+      "subagent_type": "claude",
+      "tool_input": {
+       "description": "Run sleep and echo command",
+       "prompt": "Run the shell command: sleep 12 && echo SUB_DONE — then report its output.",
+       "run_in_background": true,
+       "subagent_type": "claude"
+      },
+      "tool_use_id": "toolu_01YGNgLVY29ZHknewPWoNBNj",
+      "type": "agent"
+     },
+     {
+      "content": "SPAWNED\n\n",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "command": "",
+      "description": "Sleep 12 seconds then print SUB_DONE",
+      "tool_use_id": "toolu_0118gUB5QTbiv7u57EVr6feZ",
+      "type": "command"
+     },
+     {
+      "content": "\n\nThe background subagent finished: it ran `sleep 12 && echo SUB_DONE`, which slept 12 seconds and then printed `SUB_DONE` as expected.\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-agent",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     19226,
+     682
+    ],
+    "completed": false,
+    "context": [
+     19910,
+     1000000
+    ],
+    "cost_delta": 0.046795,
+    "cumulative_cost": 0.0467954,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0467954,
+    "leftover": [],
+    "llm_cost_delta": 0.046795,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [
+      "a7b9545497cef9e06"
+     ],
+     "has_pending": false,
+     "spawned": [
+      "a7b9545497cef9e06"
+     ]
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     2,
+     58
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:done"
+  }
+ ]
+}

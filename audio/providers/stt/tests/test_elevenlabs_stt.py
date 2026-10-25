@@ -10,10 +10,8 @@ import logging
 import httpx
 import pytest
 import websockets
-
 from audio.providers.stt import elevenlabs as el_mod
 from audio.providers.stt.elevenlabs import ElevenLabsSTT, _to_elevenlabs_lang
-
 
 # ── Offline contract surface ───────────────────────────────────────
 
@@ -171,41 +169,8 @@ async def test_transcribe_file_reports_the_identified_language_confidence(monkey
     assert given.language_confidence == 0.0
 
 
-async def test_identify_language_is_the_batch_answer(monkeypatch):
-    seen = {}
-
-    def handler(request):
-        seen["body"] = request.content
-        return httpx.Response(200, json=SCRIBE_RESPONSE)
-
-    _mock_client_factory(monkeypatch, handler)
-    stt = ElevenLabsSTT(api_key="k")
-    guess = await stt.identify_language(b"RIFF-wav")
-    assert (guess.language, guess.confidence, guess.text) == ("el", 0.97, "Καλημέρα κόσμε")
-    assert b"language_code" not in seen["body"]      # the engine names the language
-
-
 def test_to_elevenlabs_lang_auto_omits_the_param():
     assert _to_elevenlabs_lang("auto") is None
-
-
-async def test_restart_reopens_with_the_stored_parameters(monkeypatch):
-    stt = ElevenLabsSTT(api_key="k")
-    stt._active_rate = 8000
-    stt._interim_results = True
-    stt._endpointing_override = 400
-    calls = []
-
-    async def fake_close():
-        calls.append("close")
-
-    async def fake_start(*, language, sample_rate=None, interim_results=False, endpointing_ms=None):
-        calls.append(("start", language, sample_rate, interim_results, endpointing_ms))
-
-    monkeypatch.setattr(stt, "close", fake_close)
-    monkeypatch.setattr(stt, "start", fake_start)
-    assert await stt.restart("de") is True
-    assert calls == ["close", ("start", "de", 8000, True, 400)]
 
 
 async def test_transcribe_file_auth_error(monkeypatch):
@@ -315,6 +280,47 @@ async def test_streaming_lifecycle(fake_scribe):
 
     await stt.close()
     assert stt._is_open is False
+
+
+async def test_a_long_stretch_of_voice_is_committed_at_its_first_pause(fake_scribe):
+    """Scribe's own commit after ~36 s of unbroken voice writes the next
+    segment's head twice: ours comes first, at the first dip between words
+    past 20 s of voice (fast speech never pauses past the gate's hangover)."""
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(sample_rate=16000)
+    voiced, quiet = b"\x00\x10" * 1365, b"\x00\x00" * 1365       # 85 ms frames
+    await stt.send_audio(quiet)
+    for _ in range(int(19.0 / 0.0853)):
+        await stt.send_audio(voiced)
+    await stt.send_audio(quiet)
+    assert fake_scribe.commit_frames() == []                    # under 20 s: Scribe's VAD decides
+    for _ in range(int(1.5 / 0.0853)):
+        await stt.send_audio(voiced)
+    await stt.send_audio(quiet)                                  # one quiet frame between words
+    for _ in range(10):
+        await stt.send_audio(voiced)
+        await stt.send_audio(quiet)
+    await asyncio.sleep(0.1)
+    assert len(fake_scribe.commit_frames()) == 1
+    await stt.close()
+
+
+async def test_a_call_frames_dip_shorter_than_a_word_gap_commits_nothing(fake_scribe):
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(sample_rate=8000)
+    voiced, quiet = b"\x00\x10" * 160, b"\x00\x00" * 160         # 20 ms call frames
+    for _ in range(int(20.5 / 0.02)):
+        await stt.send_audio(voiced)
+    for _ in range(3):                                           # 60 ms: inside a word
+        await stt.send_audio(quiet)
+    await stt.send_audio(voiced)
+    await asyncio.sleep(0.05)
+    assert fake_scribe.commit_frames() == []
+    for _ in range(4):                                           # 80 ms: between words
+        await stt.send_audio(quiet)
+    await asyncio.sleep(0.1)
+    assert len(fake_scribe.commit_frames()) == 1
+    await stt.close()
 
 
 async def test_finish_commits_and_drains(fake_scribe):
@@ -586,3 +592,75 @@ async def test_send_skip_warning_rate_limited(fake_scribe, caplog):
     assert await stt.ensure_alive("en") is True
     assert stt._send_skips == 0
     await stt.close()
+
+
+async def test_the_clock_counts_the_keepalive_and_no_word_confidence_is_reported(fake_scribe):
+    """The realtime frames carry no confidence on the language rule's scale:
+    the capability stays off and the ledger empty. The audio clock counts
+    every chunk on the wire, the keepalive's zeros included."""
+    assert ElevenLabsSTT.capabilities.reports_confidence is False
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.send_audio(b"\x00" * 3200)                 # before the start: not on the clock
+    await stt.start(language="en", sample_rate=16000)
+    await stt.send_audio(b"\x00\x10" * 4000)             # 0.25 s
+    await stt.keepalive()                                # 0.1 s of zeros
+    assert round(stt.audio_offered_s, 3) == 0.35
+    await asyncio.sleep(0.1)
+    assert stt.heard == ()
+    await stt.close()
+
+
+# ── Dictation: painted words never die ─────────────────────────────────
+
+
+def test_the_batch_language_answers_as_a_base_code(monkeypatch):
+    async def handler(request):
+        return httpx.Response(200, json={"text": "Γεια", "language_code": "ell", "language_probability": 0.97,
+                                         "words": [{"type": "word", "text": "Γεια", "start": 0.0, "end": 0.4}]})
+    _mock_client_factory(monkeypatch, handler)
+    result = asyncio.run(ElevenLabsSTT(api_key="k").transcribe_file(b"\x00" * 10))
+    assert result.language == "el"
+    from audio.providers.stt.elevenlabs import _base_lang
+    assert [_base_lang(c) for c in ("eng", "deu", "spa", "fra", "ita", "gre", "en-US", "jpn", "")] == \
+        ["en", "de", "es", "fr", "it", "el", "en", "jpn", ""]
+
+
+async def test_an_empty_commit_after_a_shown_partial_commits_it_in_dictation(fake_scribe):
+    stt = ElevenLabsSTT(api_key="k")
+    stt.enable_dictation_mode()
+    await stt.start(language="el", sample_rate=16000, interim_results=True)
+    await stt.send_audio(b"\x00\x10" * 2000)            # voiced: the partial surfaces
+    await asyncio.sleep(0.2)
+    assert stt.pop_interim() == "kali"                  # the composer shows it
+    fake_scribe.committed_text = ""                     # the segment commits empty
+    await stt.force_endpoint()
+    await asyncio.sleep(0.2)
+    assert stt.drain_transcript() == "kali" and stt.latest_interim == ""
+    await stt.close()
+
+
+async def test_an_empty_commit_outside_dictation_commits_nothing(fake_scribe):
+    stt = ElevenLabsSTT(api_key="k")
+    await stt.start(language="el", sample_rate=16000, interim_results=True)
+    await stt.send_audio(b"\x00\x10" * 2000)
+    await asyncio.sleep(0.2)
+    stt.pop_interim()
+    fake_scribe.committed_text = ""
+    await stt.force_endpoint()
+    await asyncio.sleep(0.2)
+    assert stt.drain_transcript() is None
+    await stt.close()
+
+
+async def test_finish_commits_a_shown_partial_no_commit_consumed(fake_scribe, monkeypatch):
+    stt = ElevenLabsSTT(api_key="k")
+    stt.enable_dictation_mode()
+    await stt.start(language="el", sample_rate=16000, interim_results=True)
+    await stt.send_audio(b"\x00\x10" * 2000)
+    await asyncio.sleep(0.2)
+    assert stt.pop_interim() == "kali"
+
+    async def no_commit():                               # the commit never comes back in time
+        return None
+    monkeypatch.setattr(stt, "force_endpoint", no_commit)
+    assert await stt.finish() == "kali"

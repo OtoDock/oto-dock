@@ -18,17 +18,20 @@ paths against the workspace but never add a second allowlist.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
 
+from _tool_args import ToolArgs
 from _url_guard import validate_outbound_url
 
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +50,7 @@ TRANSCRIPT_SUBDIR = "transcripts"
 MAX_DOWNLOAD_MB = 200
 
 server = Server("transcribe")
+TOOL_ARGS = ToolArgs()
 
 
 class TranscribeError(Exception):
@@ -454,7 +458,7 @@ async def list_tools() -> list[Tool]:
         "type": "integer",
         "description": "Optional STT provider id to override the platform default.",
     }
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="transcribe_audio_file",
             description=(
@@ -477,6 +481,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["file_path"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
         ),
         Tool(
             name="transcribe_audio_url",
@@ -497,6 +502,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["url"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
         ),
         Tool(
             name="generate_subtitles",
@@ -573,12 +579,16 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["transcript_json", "output_path"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
-    ]
+    ])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     try:
         if name == "transcribe_audio_file":
             return await _handle_transcribe_file(arguments)
@@ -599,11 +609,10 @@ async def _handle_transcribe_file(args: dict) -> list[TextContent]:
     if not file_path:
         return _err("file_path is required")
     # Already gated + translated to a real absolute path by the interceptor — verbatim.
-    if not os.path.isfile(file_path):
+    if not await asyncio.to_thread(os.path.isfile, file_path):
         return _err(f"file not found: {file_path}")
     try:
-        with open(file_path, "rb") as f:
-            data = f.read()
+        data = await asyncio.to_thread(Path(file_path).read_bytes)
     except OSError as e:
         return _err(f"could not read file: {e}")
     if not data:
@@ -639,6 +648,13 @@ async def _handle_transcribe_url(args: dict) -> list[TextContent]:
     return _transcribe_response(result, os.path.splitext(filename)[0] or "audio", url)
 
 
+def _write_text(path: str, content: str) -> None:
+    """Write ``content`` to ``path``, its folder made first."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
 async def _handle_generate_subtitles(args: dict) -> list[TextContent]:
     transcript_json = (args.get("transcript_json") or "").strip()
     output_path = (args.get("output_path") or "").strip()
@@ -651,11 +667,10 @@ async def _handle_generate_subtitles(args: dict) -> list[TextContent]:
         return _err(f"unsupported format '{fmt}' (use 'srt' or 'ass')")
 
     # transcript_json + output_path are gated + translated by the interceptor — verbatim.
-    if not os.path.isfile(transcript_json):
+    if not await asyncio.to_thread(os.path.isfile, transcript_json):
         return _err(f"transcript JSON not found: {transcript_json}")
     try:
-        with open(transcript_json, encoding="utf-8") as f:
-            doc = json.load(f)
+        doc = json.loads(await asyncio.to_thread(Path(transcript_json).read_text, encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         return _err(f"could not read transcript JSON: {e}")
 
@@ -692,9 +707,7 @@ async def _handle_generate_subtitles(args: dict) -> list[TextContent]:
 
     out_path = output_path if output_path.endswith(ext) else output_path + ext
     try:
-        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        await asyncio.to_thread(_write_text, out_path, content)
     except OSError as e:
         return _err(f"could not write subtitles: {e}")
 

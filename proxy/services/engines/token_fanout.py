@@ -40,13 +40,13 @@ pass couldn't land (satellite offline, replacement connected later).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
-import contextlib
 
 from core.execution_layer import CredentialFileSpec
 
@@ -318,8 +318,7 @@ async def _tick() -> None:
     if pool.within_boot_grace():
         return
     try:
-        from storage.billing import subscription_status
-        from storage.billing import subscription_store as _store
+        from storage.billing import subscription_status, subscription_store as _store
         persisted = await asyncio.to_thread(_store.list_persisted_binding_sub_ids)
         rows = await asyncio.to_thread(_store.list_subscriptions)
     except Exception:

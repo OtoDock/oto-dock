@@ -11,21 +11,8 @@ import { useDashboardWs } from '@/hooks/useDashboardWs'
 import { WIRE, FRAMES, PER_CHAT_FRAMES, OUT, isWireType } from '@/api/wireEvents'
 import { _resetCatalogSubsForTests, subscribeCatalog } from '@/lib/appLive'
 import { useChatStore } from '@/store/chatStore'
-
-class FakeWebSocket {
-  static OPEN = 1
-  static CONNECTING = 0
-  static instances: FakeWebSocket[] = []
-  readyState = FakeWebSocket.OPEN
-  sent: string[] = []
-  onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
-  onmessage: ((e: { data: string }) => void) | null = null
-  constructor(public url: string) { FakeWebSocket.instances.push(this) }
-  send(data: string) { this.sent.push(data) }
-  close() { /* keeps reconnect logic out of the test */ }
-}
+import { FakeWebSocket } from './fakeWebSocket'
+import { connectDashboardWs } from './dashboardWsHarness'
 
 describe('the wire catalogue', () => {
   it('derives the per-chat set from the table', () => {
@@ -58,15 +45,7 @@ describe('the receiver', () => {
   })
 
   function connect(viewedChatId: string | null | undefined, cbs: Record<string, unknown> = {}) {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    const wrapper = ({ children }: { children: React.ReactNode }) => (
-      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
-    )
-    const hook = renderHook(() => useDashboardWs({ viewedChatId, ...cbs }), { wrapper })
-    act(() => { hook.result.current.connect() })
-    const ws = FakeWebSocket.instances[0]
-    act(() => { ws.onopen?.() })
-    return { hook, ws }
+    return connectDashboardWs(() => ({ viewedChatId, ...cbs }))
   }
 
   it('warns once per unknown frame type and still hands it to the bus', () => {
@@ -94,8 +73,11 @@ describe('the receiver', () => {
     act(() => { ws.onmessage?.({ data: JSON.stringify({ type: WIRE.TEXT, content: 'yes', chat_id: 'chat-A' }) }) })
     act(() => { ws.onmessage?.({ data: JSON.stringify({ type: WIRE.TITLE_UPDATED, chat_id: 'chat-B', title: 't' }) }) })
     expect(onText).toHaveBeenCalledTimes(1)
-    expect(onText).toHaveBeenCalledWith('yes')
+    expect(onText).toHaveBeenCalledWith('yes', false)
     expect(onTitleUpdated).toHaveBeenCalledTimes(1)
+    // A progress note's frame hands its flag on.
+    act(() => { ws.onmessage?.({ data: JSON.stringify({ type: WIRE.TEXT, content: 'noted', note: true, chat_id: 'chat-A' }) }) })
+    expect(onText).toHaveBeenLastCalledWith('noted', true)
   })
 
   it("an old page's socket closing late leaves the new socket's catalog sender alone", () => {
@@ -136,6 +118,20 @@ describe('the receiver', () => {
     expect(useChatStore.getState().byChat['chat-A'].queuedMessages).toEqual([{ text: 'mine' }])
     st.clear('chat-A')
     st.clear('chat-B')
+  })
+
+  it("hands a move's outcome to onChatMoved with every field the frame carries", () => {
+    const onChatMoved = vi.fn()
+    const { ws } = connect('chat-A', { onChatMoved })
+    const frame = {
+      type: WIRE.CHAT_MOVED, chat_id: 'chat-A', move_id: 'mv-1', ok: false, memory: 'files',
+      new_target: 'local', label: 'OtoDock platform', from_label: 'Attic PC',
+      message: 'The move to drill-sat did not finish: drill-sat went offline. The chat stays on Attic PC.',
+    }
+    act(() => { ws.onmessage?.({ data: JSON.stringify(frame) }) })
+    expect(onChatMoved).toHaveBeenCalledTimes(1)
+    expect(onChatMoved.mock.calls[0][0]).toEqual(frame)
+    expect(warn).not.toHaveBeenCalled()
   })
 
   it("hands a retired prompt to the viewed chat's stream and gates another chat's", () => {

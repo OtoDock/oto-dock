@@ -15,9 +15,7 @@ Covers the subscription_pool scope-rebalancing invariants:
 import time
 from unittest.mock import patch
 
-from services.engines import subscription_pool as sp
-from services.engines import token_fanout as tf
-
+from services.engines import subscription_pool as sp, token_fanout as tf
 
 _FAR_MS = int((time.time() + 8 * 3600) * 1000)
 _SCOPE = "local:/agents/dev/workspace/.claude"

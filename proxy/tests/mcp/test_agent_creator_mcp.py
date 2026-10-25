@@ -159,6 +159,18 @@ class TestRetries:
             asyncio.run(mod._tool_create_agent("/workspace/t", ""))
         assert len(calls) == 2
 
+    def test_the_answer_names_the_task_pins_the_install_dropped(self, monkeypatch):
+        import asyncio
+        mod = self._mod()
+        note = ("The task 'weekly-brief' runs on the agent's usual model and engine. "
+                "The model m is not turned on for Claude Code CLI.")
+        self._serve(monkeypatch, mod, (200, {"agent_slug": "demo", "dashboard_path": "/agents/demo",
+                                             "task_pins_dropped": [note]}))
+        text = asyncio.run(mod._tool_create_agent("/workspace/t", ""))
+        assert "Task pins the new agent cannot run" in text and note in text
+        self._serve(monkeypatch, mod, (200, {"agent_slug": "demo", "dashboard_path": "/agents/demo"}))
+        assert "Task pins" not in asyncio.run(mod._tool_create_agent("/workspace/t", ""))
+
     def test_an_install_refused_with_a_503_created_nothing(self, monkeypatch):
         import asyncio
         mod = self._mod()
@@ -190,6 +202,65 @@ class TestRetries:
 
         import httpx
         mod = self._mod()
-        calls = self._serve(monkeypatch, mod, httpx.ReadTimeout("slow"), (200, {"mcps": []}))
+        calls = self._serve(monkeypatch, mod, httpx.ReadTimeout("slow"), (200, {"mcps": []}),
+                            (200, {}))
         asyncio.run(mod._tool_list_building_blocks())
-        assert len(calls) == 2
+        assert len(calls) == 3 and calls[-1].endswith("/v1/execution-layers")
+
+
+class TestEngines:
+    """The engines and models a template task's pin may name, as this
+    install has them: the coding engines first in their page order (an
+    install picks one of those), a supporting engine marked as enabled by
+    hand only, the model ids with their tiers and never the empty System
+    Default; an engines read that fails leaves the rest of the listing."""
+
+    _LAYERS = {
+        "direct-llm": {"configured": True, "identity": {"role": "supporting", "sort_order": 30},
+                       "models": [{"value": "", "label": "System Default"},
+                                  {"value": "claude-haiku-5-5", "tier_label": "fast"}]},
+        "codex-cli": {"configured": False, "identity": {"role": "coding", "sort_order": 20},
+                      "models": [{"value": ""}, {"value": "gpt-6.1-sol", "tier_label": "strong"}]},
+        "claude-code-cli": {"configured": True, "identity": {"role": "coding", "sort_order": 10},
+                            "models": [{"value": ""}, {"value": "claude-fable-5-1", "tier_label": "frontier"},
+                                       {"value": "claude-opus-5-5"}]},
+    }
+
+    def test_the_engines_section_lists_what_a_pin_may_name(self, monkeypatch):
+        import asyncio
+        retries = TestRetries()
+        mod = retries._mod()
+        calls = retries._serve(monkeypatch, mod, (200, {"mcps": [], "agent_slugs": ["a"]}),
+                               (200, self._LAYERS))
+        text = asyncio.run(mod._tool_list_building_blocks())
+        assert calls[1].endswith("/v1/execution-layers")
+        section = text.split("# Engines a task pin may name", 1)[1].split("# Slugs already taken")[0]
+        rows = [line for line in section.splitlines() if line.startswith("| `")]
+        assert rows == [
+            "| `claude-code-cli` | yes | yes | `claude-fable-5-1` (frontier), `claude-opus-5-5` |",
+            "| `codex-cli` | yes | no | `gpt-6.1-sol` (strong) |",
+            "| `direct-llm` | no — enabled by hand only | yes | `claude-haiku-5-5` (fast) |",
+        ]
+        assert "this install's engines" in section and "dropped at install" in section
+        assert "System Default" not in section
+
+    def test_a_malformed_engine_entry_is_skipped_not_fatal(self, monkeypatch):
+        import asyncio
+        retries = TestRetries()
+        mod = retries._mod()
+        layers = {"odd": "not a dict", "weird": {"identity": "x", "models": []},
+                  "late": {"identity": {"role": "coding", "sort_order": "ten"}, "models": [{"value": "m"}]}}
+        retries._serve(monkeypatch, mod, (200, {"mcps": []}), (200, layers))
+        text = asyncio.run(mod._tool_list_building_blocks())
+        assert "| `late` | yes | no | `m` |" in text and "| `weird` |" in text and "`odd`" not in text
+
+    def test_a_failed_engines_read_keeps_the_rest(self, monkeypatch):
+        import asyncio
+        retries = TestRetries()
+        mod = retries._mod()
+        retries._serve(monkeypatch, mod, (200, {"mcps": [{"name": "m", "installed": True}],
+                                                "agent_slugs": ["a"]}),
+                       (403, {"detail": "no"}))
+        text = asyncio.run(mod._tool_list_building_blocks())
+        assert "| `m` | yes |" in text and "# Slugs already taken" in text
+        assert "The engines could not be read" in text and "without a pin" in text

@@ -16,8 +16,8 @@ import asyncio
 import sys
 from datetime import datetime, timedelta, timezone
 
-
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -103,6 +103,7 @@ class TestSchedulerRegisterInterval:
     def test_register_builds_interval_trigger(self, temp_db):
         """_register_task with interval_seconds builds an IntervalTrigger."""
         from apscheduler.triggers.interval import IntervalTrigger
+
         from services.scheduler import scheduler
 
         _create_interval_task("task-i1", interval_seconds=61200)
@@ -222,6 +223,7 @@ class TestAddDynamicInterval:
     def test_add_dynamic_interval_registers_trigger(self, temp_db):
         """add_dynamic_task with interval_seconds persists + registers IntervalTrigger."""
         from apscheduler.triggers.interval import IntervalTrigger
+
         from services.scheduler import scheduler
 
         task = scheduler.TaskDefinition(
@@ -257,6 +259,7 @@ class TestAddDynamicInterval:
 class TestNotificationInterval:
     def test_register_recurring_interval(self, temp_db):
         from apscheduler.triggers.interval import IntervalTrigger
+
         from services.notifications import notification_manager
         from services.scheduler import scheduler
 
@@ -339,6 +342,7 @@ class TestNullRequiredColumns:
     def test_an_edit_cannot_null_a_required_field(self, temp_db):
         import pytest
         from fastapi import HTTPException
+
         from api.tasks import tasks
         from auth.providers import UserContext
 

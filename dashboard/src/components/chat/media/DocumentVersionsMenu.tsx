@@ -2,8 +2,10 @@ import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent }
 import { createPortal } from 'react-dom'
 import type { DocumentVersion } from '@/api/documents'
 import { pushEscHandler } from '@/lib/escStack'
+import { usePortalRoot } from '@/components/ui/portalRoot'
 import { anchorBoxOf, usePopoverPlacement, type AnchorBox } from '@/components/ui/popoverPosition'
 import { pushTime } from './documentTabs'
+import { POPOVER } from '../../ui/classes'
 
 interface Props {
   /** The versions of the file on show, newest first. */
@@ -30,6 +32,7 @@ export default function DocumentVersionsMenu({ versions, current, failed, livePe
   const open = anchor !== null
   const buttonRef = useRef<HTMLButtonElement | null>(null)
   const panelRef = useRef<HTMLDivElement | null>(null)
+  const portalRoot = usePortalRoot()
   const placement = usePopoverPlacement(anchor, panelRef, { align: 'right' })
 
   const close = (refocus = true) => {
@@ -60,7 +63,7 @@ export default function DocumentVersionsMenu({ versions, current, failed, livePe
     window.addEventListener('resize', onMove)
     window.addEventListener('scroll', onScroll, true)
     window.addEventListener('blur', onMove)
-    const popEsc = pushEscHandler(() => close())
+    const popEsc = pushEscHandler(() => close(), () => panelRef.current)
     return () => {
       document.removeEventListener('mousedown', onDown)
       window.removeEventListener('resize', onMove)
@@ -95,9 +98,9 @@ export default function DocumentVersionsMenu({ versions, current, failed, livePe
     onPick(snapshotId)
   }
 
-  const item = 'flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-p-text transition-colors hover:bg-p-surface-hover focus:bg-p-surface-hover focus:outline-none disabled:cursor-not-allowed disabled:text-p-text-light disabled:hover:bg-transparent'
+  const item = 'flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-primary transition-colors hover:bg-surface-hover focus-visible:bg-surface-hover focus:outline-none disabled:cursor-not-allowed disabled:text-tertiary disabled:hover:bg-transparent'
   const mark = (on: boolean) => (
-    <span className={`w-3 shrink-0 text-brand ${on ? '' : 'invisible'}`} aria-hidden="true">✓</span>
+    <span className={`w-3 shrink-0 text-primary ${on ? '' : 'invisible'}`} aria-hidden="true">✓</span>
   )
 
   return (
@@ -110,7 +113,7 @@ export default function DocumentVersionsMenu({ versions, current, failed, livePe
         aria-expanded={open}
         aria-label="Versions"
         title="Versions"
-        className={`p-1.5 rounded-sm transition-colors hover:bg-p-surface ${current ? 'text-amber-600 dark:text-amber-400' : 'text-p-text-secondary'}`}
+        className={`p-1.5 rounded-sm transition-colors hover:bg-surface-muted ${current ? 'text-status-warning-fg' : 'text-secondary'}`}
       >
         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
           <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -126,18 +129,18 @@ export default function DocumentVersionsMenu({ versions, current, failed, livePe
             position: 'fixed', zIndex: 60, top: placement?.top ?? 0, left: placement?.left ?? 0,
             visibility: placement ? 'visible' : 'hidden',
           }}
-          className="w-60 max-h-80 overflow-y-auto rounded-lg border border-p-border-light bg-p-surface py-1 shadow-lg"
+          className={`w-60 max-h-80 overflow-y-auto ${POPOVER} py-1`}
         >
           <button type="button" role="menuitemradio" aria-checked={!current} className={item} onClick={() => pick(null)}>
             {mark(!current)}
             <span className="font-medium">Live</span>
             {livePermissions && (
-              <span className="ml-auto text-[10px] text-p-text-light">
-                {livePermissions === 'edit' ? 'editable' : 'view only'}
+              <span className="ml-auto text-3xs text-tertiary">
+                {livePermissions === 'edit' ? 'Editable' : 'View only'}
               </span>
             )}
           </button>
-          {failed && <p className="px-3 py-1.5 text-[11px] text-p-text-light">The versions could not be loaded.</p>}
+          {failed && <p className="px-3 py-1.5 text-2xs text-tertiary">The versions could not be loaded.</p>}
           {versions.map((v) => (
             <button
               key={`${v.message_id}-${v.snapshot_id}`}
@@ -151,13 +154,13 @@ export default function DocumentVersionsMenu({ versions, current, failed, livePe
             >
               {mark(!!current && current === v.snapshot_id)}
               <span>Version {v.version}</span>
-              <span className="ml-auto text-[10px] text-p-text-light">
+              <span className="ml-auto text-3xs text-tertiary">
                 {v.available ? `${pushTime(v.generation)} · turn ${v.turn}` : 'no longer available'}
               </span>
             </button>
           ))}
         </div>,
-        document.body,
+        portalRoot,
       )}
     </>
   )

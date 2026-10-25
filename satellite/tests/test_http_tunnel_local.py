@@ -386,6 +386,43 @@ def test_delegation_and_continuations_are_allowlisted():
     assert not _is_allowed_path("/v1/delegation/../admin")
 
 
+@pytest.mark.asyncio
+async def test_the_agents_move_is_forwarded_and_the_persons_is_not(tunnel_pair):
+    # delegation-mcp's move_chat from a chat on this machine (0.5.157): before
+    # it the satellite answered the call itself, a 403 the tool printed as
+    # "The move was refused." with no reason. The person's own move route is
+    # the dashboard's, never a tool's.
+    ws, tunnel, port = tunnel_pair
+
+    async def move():
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"http://127.0.0.1:{port}/v1/chats/agent-move",
+                                    json={"machine": "default"}) as resp:
+                return resp.status, await resp.json()
+
+    req_task = asyncio.create_task(move())
+    for _ in range(200):
+        if ws.sent:
+            break
+        await asyncio.sleep(0.01)
+    assert ws.sent[0]["type"] == "http_request"
+    assert ws.sent[0]["path"] == "/v1/chats/agent-move"
+    tunnel.dispatch_response({
+        "type": "http_response", "stream_id": ws.sent[0]["stream_id"], "status": 202,
+        "headers": {"Content-Type": "application/json"},
+        "body_b64": base64.b64encode(b'{"scheduled": true}').decode(), "body_eof": True,
+    })
+    assert await asyncio.wait_for(req_task, timeout=5) == (202, {"scheduled": True})
+
+    sent = len(ws.sent)
+    async with aiohttp.ClientSession() as session:
+        for path in ("/v1/chats/c-1/move", "/v1/chats/agent-move/x", "/v1/chats/c-1/targets"):
+            async with session.post(f"http://127.0.0.1:{port}{path}") as resp:
+                assert resp.status == 403, path
+                assert await resp.json() == {"error": "path-not-allowlisted"}
+    assert len(ws.sent) == sent
+
+
 def test_checks_routes_are_allowlisted():
     # checks-mcp (CHECKS.md, 0.5.123): the session-side routes ride the tunnel
     # (live 403 path-not-allowlisted on the first run_check from a machine);

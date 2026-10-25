@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
+from storage.identity import oauth_app_kinds
 
 logger = logging.getLogger("otodock.oauth-account-store")
 
@@ -215,13 +216,27 @@ def _write_generic_oauth_v1_token(
     partial.replace(token_path)
 
 
+def now_iso() -> str:
+    """The canonical ``expires_at`` form of this moment."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def write_token_payload(token_path: Path, payload: dict) -> None:
+    """Persist a token payload as it is (a rewrite of an existing file by a
+    caller that holds its account lock), atomically and owner-only."""
+    partial = token_path.with_suffix(token_path.suffix + ".partial")
+    partial.write_text(json.dumps(payload, indent=2))
+    partial.chmod(0o600)
+    partial.replace(token_path)
+
+
 def _read_oauth_token(token_path: Path) -> dict | None:
     """Read an OAuth token file (``generic_oauth_v1`` shape)."""
     if not token_path.exists():
         return None
     try:
         return json.loads(token_path.read_text())
-    except Exception:
+    except (OSError, ValueError):
         logger.warning("Corrupt OAuth token file: %s", token_path)
         return None
 
@@ -255,7 +270,19 @@ def get_canonical_access_token(raw: dict) -> str:
 # server to the client this install registered (services/oauth/mcp_authorization.py).
 MCP_AUTHORIZATION_FLOW = "mcp_authorization"
 # The flows whose files carry no refresh token by design.
-_FLOWS_WITHOUT_REFRESH = ("client_credentials", "personal_access_token")
+_FLOWS_WITHOUT_REFRESH = ("client_credentials", "personal_access_token", oauth_app_kinds.INSTALLATION_FLOW)
+
+
+def _parse_expiry(expiry: str) -> datetime | None:
+    """A file's ``expires_at`` as an aware datetime, ``None`` when empty or
+    unreadable."""
+    if not expiry:
+        return None
+    try:
+        dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
 def token_dead_reason(raw: dict) -> str:
@@ -275,11 +302,8 @@ def token_dead_reason(raw: dict) -> str:
         return ""
     if str(extra.get("flow") or "") in _FLOWS_WITHOUT_REFRESH:
         return ""
-    try:
-        expiry_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-        if expiry_dt.tzinfo is None:
-            expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
-    except ValueError:
+    expiry_dt = _parse_expiry(expiry)
+    if expiry_dt is None:
         return ""
     return "expired" if expiry_dt <= datetime.now(timezone.utc) else ""
 
@@ -331,9 +355,9 @@ def persist_oauth_account(
     This single entry point keeps the on-disk token, the DB account row,
     and the credentials row consistent.
     """
-    from storage.identity import credential_store
-    from storage import database as task_store
     from services.mcp import mcp_registry
+    from storage import database as task_store
+    from storage.identity import credential_store
 
     # --- target directory (per-provider) ---
     username = task_store.get_username_by_sub(user_sub)
@@ -423,6 +447,15 @@ def persist_oauth_account(
     )
     credential_store.set_account_display_email(
         user_sub, mcp_name, account_label, userinfo.email,
+    )
+    # Which kind of app issued the token: a GitHub-App account keeps its
+    # installations, any other kind clears them (services/oauth/github_apps.py).
+    from services.oauth import github_apps
+    github_apps.record_account_kind(
+        user_sub, mcp_name, account_label,
+        app_kind=str(token_set.raw.get("app_kind") or ""),
+        userinfo_raw=userinfo.raw if isinstance(userinfo.raw, dict) else {},
+        hosted=bool(token_set.raw.get("via_relay")),
     )
 
     logger.info(

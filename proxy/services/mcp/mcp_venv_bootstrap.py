@@ -46,8 +46,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
-from services.mcp import mcp_installer
-from services.mcp import mcp_manifest_types as _mt
+from services.mcp import mcp_installer, mcp_manifest_types as _mt
 
 logger = logging.getLogger("otodock.venv-bootstrap")
 
@@ -313,7 +312,7 @@ async def ensure_bundled_venvs_at_startup() -> dict[str, str]:
     """
     results: dict[str, str] = {}
     mcps_root = Path(config.MCPS_DIR)
-    if not mcps_root.is_dir():
+    if not mcps_root.is_dir():  # noqa: ASYNC240  # once at boot, before the minutes-long venv checks
         logger.warning(
             "ensure_bundled_venvs: MCPS_DIR %s not found; skipping", mcps_root,
         )

@@ -75,10 +75,11 @@ fi
 # 3. Install dependencies
 echo "[3/4] Installing Python dependencies..."
 venv/bin/pip install --quiet -r requirements.txt
-# The proxy imports the lean `oto-audio` CORE (cloud STT/TTS for chat audio +
-# phone config). It's an editable local package, NOT a requirements.txt pin, so
-# install it explicitly (base only — the heavy on-box `[localmodels]` ONNX stack
-# is phone-only). Without this the proxy crashes at boot: `No module named
+# The proxy imports the `oto-audio` CORE (cloud STT/TTS for chat audio, phone
+# config, and onnxruntime for the dictation's language identifier). It's an
+# editable local package, NOT a requirements.txt pin, so install it explicitly
+# (base only — the `[localmodels]` extra, transformers for Smart Turn, is
+# phone-only). Without this the proxy crashes at boot: `No module named
 # 'audio'` (app.py imports api.audio → audio.providers).
 venv/bin/pip install --quiet -e "$PLATFORM_ROOT/audio"
 echo "  Done"

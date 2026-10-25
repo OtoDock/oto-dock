@@ -1,0 +1,41 @@
+{
+  "name": "location-mcp",
+  "label": "Location",
+  "description": "Device GPS location bridge via WebSocket",
+  "version": "1.0.2",
+  "category": "core",
+
+  "server": {
+    "runtime": "python",
+    "transport": "stdio",
+    "command": "venv/bin/python",
+    "args": ["server.py"]
+  },
+
+  "credentials": {
+    "type": "none"
+  },
+
+  "config": [],
+
+  "env": {},
+  "agent_env": {
+    "LOC_MCP_AGENT": "${agent_name}"
+  },
+
+  "exclude_from": ["phone", "task", "terminal", "external"],
+
+  "skills": [],
+
+  "permissions": {
+    "default_tier": "standard",
+    "rules": [
+      {
+        "tool": "get_user_location",
+        "tier": "open"
+      }
+    ]
+  },
+  "patched": false,
+  "patch_note": null
+}

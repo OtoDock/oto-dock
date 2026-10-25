@@ -10,26 +10,10 @@
  * backend would keep pushing for a tab the user just backgrounded.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { renderHook, act } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act } from '@testing-library/react'
 import { useDashboardWs } from '@/hooks/useDashboardWs'
-
-class FakeWebSocket {
-  static OPEN = 1
-  static CONNECTING = 0
-  static instances: FakeWebSocket[] = []
-  readyState = FakeWebSocket.OPEN
-  sent: string[] = []
-  onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
-  onmessage: ((e: { data: string }) => void) | null = null
-  constructor(public url: string) {
-    FakeWebSocket.instances.push(this)
-  }
-  send(data: string) { this.sent.push(data) }
-  close() { /* never fires onclose — keeps reconnect logic out of the test */ }
-}
+import { FakeWebSocket } from './fakeWebSocket'
+import { connectDashboardWs } from './dashboardWsHarness'
 
 let visState: DocumentVisibilityState = 'visible'
 
@@ -61,16 +45,7 @@ describe('useDashboardWs presence tri-state', () => {
   })
 
   function connect() {
-    // The hook patches query caches (Active-now titles) → needs a provider.
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    const wrapper = ({ children }: { children: React.ReactNode }) => (
-      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
-    )
-    const hook = renderHook(() => useDashboardWs({}), { wrapper })
-    act(() => { hook.result.current.connect() })
-    const ws = FakeWebSocket.instances[0]
-    act(() => { ws.onopen?.() })
-    return { hook, ws }
+    return connectDashboardWs(() => ({}))
   }
 
   function setVisibility(v: DocumentVisibilityState) {

@@ -11,7 +11,6 @@ import time
 from pathlib import Path
 
 
-
 def test_symlink_skipped_from_manifest(tmp_path: Path):
     """compute_manifest must not include symlinks — they don't round-trip."""
     from core.remote.file_sync import compute_manifest
@@ -107,6 +106,7 @@ def test_apply_incoming_rejects_traversal(tmp_path: Path):
 
 def _swap_on_open(monkeypatch, agent_dir, victim):
     import contextlib
+
     from services.infra import safe_fs
     real = safe_fs.open_root
     state = {"done": False}

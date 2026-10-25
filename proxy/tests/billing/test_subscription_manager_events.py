@@ -11,15 +11,16 @@ import sys
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-import config  # noqa: E402
-from services.billing import relay_client  # noqa: E402
-from services.webhooks import subscription_manager  # noqa: E402
-from storage.identity import credential_store # noqa: E402
-from storage.automation import webhook_subscription_store # noqa: E402
+import config
+from services.billing import relay_client
+from services.webhooks import subscription_manager
+from storage.automation import webhook_subscription_store
+from storage.identity import credential_store
 
 _WB = {
     "available": True,
@@ -35,7 +36,7 @@ def _mode(monkeypatch, *, block=None, relay_up=True, extra=None,
 
     def fake_extra(**kw):
         if extra_raises:
-            raise RuntimeError("no account")
+            raise OSError("no account")
         return extra or {}
 
     monkeypatch.setattr(subscription_manager, "_resolve_account_extra", fake_extra)
@@ -178,6 +179,101 @@ def test_delete_relay_row_keeps_forwarding_when_others_remain(monkeypatch):
         subscription_id="s1")) == (True, True)
 
 
+def test_the_last_relay_subscription_keeps_forwarding_for_a_hosted_app_account(monkeypatch):
+    """OtoDock's hosted GitHub App: an account's installation changes reach
+    its card through the forwarding, with a subscription or without."""
+    from types import SimpleNamespace
+
+    from services.mcp import mcp_registry
+    row = {"id": "s1", "delivery_mode": "relay", "provider_id": "github"}
+    monkeypatch.setattr(webhook_subscription_store, "get_subscription", lambda sid: row)
+    monkeypatch.setattr(webhook_subscription_store, "delete_subscription", lambda sid: True)
+    monkeypatch.setattr(webhook_subscription_store, "list_subscriptions", lambda **kw: [])
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://inst.example")
+    monkeypatch.setattr(mcp_registry, "get_mcps_by_provider",
+                        lambda provider_id: [SimpleNamespace(name="github-mcp")])
+    hosted = {"held": True}
+    asked: list[list[str]] = []
+    monkeypatch.setattr(credential_store, "any_hosted_app_account",
+                        lambda names: (asked.append(list(names)), hosted["held"])[1])
+    reg: list[dict] = []
+
+    async def fake_register(**kw):
+        reg.append(kw)
+        return {"ok": True, "enabled": False}
+
+    monkeypatch.setattr(relay_client, "events_register", fake_register)
+    assert asyncio.run(subscription_manager.delete_subscription(subscription_id="s1")) == (True, True)
+    assert reg == [] and asked == [["github-mcp"]]
+    hosted["held"] = False
+    assert asyncio.run(subscription_manager.delete_subscription(subscription_id="s1")) == (True, True)
+    assert len(reg) == 1 and reg[0]["enabled"] is False and reg[0]["provider_id"] == "github"
+
+
+def test_two_first_registrations_at_once_rotate_the_secret_once(monkeypatch):
+    """A hosted connect beside a subscribe, with no forward secret held:
+    the second registration sees the first one's secret."""
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://inst.example")
+    store: dict = {}
+    monkeypatch.setattr(credential_store, "get_infra_credentials", lambda slug: dict(store.get(slug) or {}))
+    monkeypatch.setattr(credential_store, "set_infra_credentials", lambda slug, creds: store.update({slug: creds}))
+    rotations: list[int] = []
+
+    async def fake_register(**kw):
+        await asyncio.sleep(0)          # the other registration runs here
+        if kw["rotate_secret"]:
+            rotations.append(1)
+            return {"ok": True, "enabled": True, "forward_secret": f"fs-{len(rotations)}"}
+        return {"ok": True, "enabled": True, "forward_secret": None}
+
+    monkeypatch.setattr(relay_client, "events_register", fake_register)
+
+    async def both():
+        await asyncio.gather(*(subscription_manager._relay_register_events(provider_id="github")
+                               for _ in range(2)))
+    asyncio.run(both())
+    asyncio.run(both())                 # a later loop gets a lock of its own
+    assert rotations == [1]
+    assert store[relay_client.EVENTS_FORWARD_SECRET_SLUG] == {relay_client.EVENTS_FORWARD_SECRET_KEY: "fs-1"}
+
+
+def test_a_disable_never_lands_after_a_hosted_registration(monkeypatch):
+    """The last relay subscription goes while a hosted connect registers:
+    the forwarding ends on, whichever came first."""
+    import time
+    from types import SimpleNamespace
+
+    from services.mcp import mcp_registry
+    monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://inst.example")
+    monkeypatch.setattr(webhook_subscription_store, "list_subscriptions", lambda **kw: [])
+    monkeypatch.setattr(mcp_registry, "get_mcps_by_provider",
+                        lambda provider_id: [SimpleNamespace(name="github-mcp")])
+    monkeypatch.setattr(credential_store, "get_infra_credentials",
+                        lambda slug: {relay_client.EVENTS_FORWARD_SECRET_KEY: "fs"})
+    held = {"on": False}
+
+    def any_hosted(names):
+        seen = held["on"]
+        time.sleep(0.05)                # the connect writes its account meanwhile
+        return seen
+    monkeypatch.setattr(credential_store, "any_hosted_app_account", any_hosted)
+    calls: list[bool] = []
+
+    async def fake_register(**kw):
+        calls.append(kw["enabled"])
+        return {"ok": True, "enabled": kw["enabled"], "forward_secret": None}
+    monkeypatch.setattr(relay_client, "events_register", fake_register)
+
+    async def scenario():
+        disable = asyncio.create_task(subscription_manager._maybe_disable_relay_events("github"))
+        await asyncio.sleep(0.01)
+        held["on"] = True
+        await subscription_manager._relay_register_events(provider_id="github")
+        await disable
+    asyncio.run(scenario())
+    assert calls == [False, True]
+
+
 def test_vendor_delete_noop_for_relay_rows(monkeypatch):
     def boom(name):
         raise AssertionError("manifest lookup must not run for relay rows")
@@ -189,7 +285,7 @@ def test_vendor_delete_noop_for_relay_rows(monkeypatch):
 
 # --- per-event gating: admin_only / delivery: bot --------------------------------
 
-from types import SimpleNamespace  # noqa: E402
+from types import SimpleNamespace
 
 _GATED_CATALOG = [
     {"key": "reaction_added", "label": "Reactions"},
@@ -498,6 +594,7 @@ _GH = {
 
 def _service_create(monkeypatch, *, account_label: str):
     from types import SimpleNamespace
+
     from services.mcp import mcp_registry
     from services.oauth import credential_resolver
     monkeypatch.setattr(

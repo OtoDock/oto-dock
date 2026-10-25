@@ -16,9 +16,9 @@ fitz = pytest.importorskip("fitz")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-import isolation  # noqa: E402
-import pdf as pdf_mod  # noqa: E402
-import shared  # noqa: E402
+import isolation
+import pdf as pdf_mod
+import shared
 
 
 async def _async_ident(p, writing=False, **kw):

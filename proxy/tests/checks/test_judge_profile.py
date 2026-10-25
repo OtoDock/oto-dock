@@ -16,9 +16,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core import placement
 from core.sandbox.sandbox import SandboxBuilder, SandboxConfig
 from core.session import session_state
-from core import placement
 
 AGENT = "judge-agent"
 
@@ -186,10 +186,10 @@ def test_a_judge_leaves_the_scopes_settings_as_every_session_has_them(tmp_path, 
 
 
 def _stub_builder(monkeypatch, captured: dict, *, target=("local", None)):
-    from core.config import task_config_builder as tcb
     import core.layers.cli.config_dir as cli_cd
-    import core.session.visibility as v
     import core.sandbox.oto_env as oe
+    import core.session.visibility as v
+    from core.config import task_config_builder as tcb
 
     def _claude_dir(agent_name, *, username="", scope="user", **kw):
         captured["dir_kwargs"] = kw
@@ -205,7 +205,7 @@ def _stub_builder(monkeypatch, captured: dict, *, target=("local", None)):
     async def _to_thread(fn, *a, **k):
         return fn(*a, **k)
     monkeypatch.setattr(tcb.asyncio, "to_thread", _to_thread)
-    monkeypatch.setattr(tcb.remote_store, "resolve_execution_target", lambda *a, **k: target)
+    monkeypatch.setattr(tcb.remote_status, "resolve_execution_target", lambda *a, **k: target)
     monkeypatch.setattr(tcb.remote_store, "placement_of",
                         lambda value, *a, **k: placement.LOCAL_PLACEMENT if placement.is_local(value)
                         else placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, label="laptop", has_display=False))
@@ -226,7 +226,7 @@ def _stub_builder(monkeypatch, captured: dict, *, target=("local", None)):
         return []
     monkeypatch.setattr(tcb.dynamic_context, "get_dynamic_contexts", _no_dyn)
     monkeypatch.setattr(tcb.config, "build_agent_prompt", lambda *a, **k: "PROMPT")
-    monkeypatch.setattr(tcb.config, "get_cli_model", lambda *a, **k: "m")
+    monkeypatch.setattr("configuration.models.get_cli_model", lambda *a, **k: "m")
     monkeypatch.setattr(tcb.config, "get_cli_effort", lambda *a, **k: "")
     monkeypatch.setattr(tcb.subscription_pool, "resolve_subscription_env",
                         lambda *a, **k: ("sub-test", {}))
@@ -304,6 +304,27 @@ def test_the_target_override_wins(monkeypatch):
     assert cfg.execution_target == "local"
     cfg2 = asyncio.run(tcb.build_task_agent_config(AGENT, _task(), "s2"))
     assert cfg2.execution_target == "machine-9"
+    assert cfg.fallback_reason is None and cfg2.fallback_reason is None
+
+
+def test_a_judges_machine_the_guard_refuses_runs_on_the_resolvers_answer(monkeypatch):
+    """The judge mirrors the judged session's machine only when the guard
+    lets the judge's run there: the creator's own machine, yes; another
+    person's machine (or a personal one for an agent-scope judge), no."""
+    from core.config import task_config_builder as tcb
+    from services.remote import chat_targets
+    captured: dict = {}
+    _stub_builder(monkeypatch, captured, target=("machine-9", None))
+    rows = {"m-alice": {"id": "m-alice", "name": "alice-laptop", "pairing_scope": "user",
+                        "registered_by": "alice-sub"},
+            "m-bob": {"id": "m-bob", "name": "bob-laptop", "pairing_scope": "user",
+                      "registered_by": "bob-sub"}}
+    monkeypatch.setattr(tcb.remote_store, "get_remote_machine", rows.get)
+    monkeypatch.setattr(chat_targets, "user_machines_allowed", lambda: True)
+    cfg = asyncio.run(tcb.build_task_agent_config(AGENT, _task(execution_target_override="m-alice"), "s"))
+    assert cfg.execution_target == "m-alice"
+    cfg2 = asyncio.run(tcb.build_task_agent_config(AGENT, _task(execution_target_override="m-bob"), "s2"))
+    assert cfg2.execution_target == "machine-9" and cfg2.fallback_reason is None
 
 
 # ── the remote payload ─────────────────────────────────────────────────────
@@ -488,7 +509,7 @@ def test_a_retired_judge_model_follows_its_successor(judged, monkeypatch):
     # a current or custom id passes through unchanged.
     from services.checks.kinds import judge_kind
     from storage.billing import subscription_store
-    monkeypatch.setattr(subscription_store, "list_models", lambda path: [
+    monkeypatch.setattr(subscription_store, "list_models", lambda layer=None: [
         {"model_id": "claude-opus-5-5", "enabled": True}, {"model_id": "judge-model", "enabled": True}])
     ok = "```json\n{\"pass\": true, \"summary\": \"fine\"}\n```"
     seen = _fake_scheduler(monkeypatch, [ok])
@@ -526,8 +547,8 @@ def test_the_threshold_and_the_cap_and_the_platform_placement(judged, monkeypatc
     v = asyncio.run(judge_kind.run(_check(threshold=0.7), judged, _changed(judged), round_no=1))
     assert v.status == "pass"                       # the score decides
     # The cap: spent today from the judge runs' usage.
-    from storage.billing import db_usage
     from storage import database as task_store
+    from storage.billing import db_usage
     last_chat = task_store.get_run(f"run-{_RUN_COUNTER[0]}")["chat_id"]
     db_usage.insert_usage_record("alice-sub", AGENT, "user", "chat", last_chat, 3.0)
     db_checks.set_settings(AGENT, daily_cap_usd=2.0, updated_by="alice-sub")

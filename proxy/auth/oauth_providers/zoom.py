@@ -162,7 +162,7 @@ class ZoomOAuthProvider(OAuthProvider):
                 resp.status_code, resp.text[:200],
             )
             return False
-        except Exception as e:
+        except (httpx.HTTPError, ValueError) as e:
             logger.warning("Zoom token revocation failed: %s", e)
             return False
 

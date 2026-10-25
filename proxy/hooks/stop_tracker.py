@@ -29,6 +29,7 @@ by hook subprocesses):
   OTO_INTERACTIVE   - set on a terminal session (the CLI drives the turn)
 """
 
+import http.client
 import json
 import os
 import sys
@@ -85,7 +86,7 @@ def main():
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             result = json.loads(resp.read() or b"{}")
-    except Exception:
+    except (OSError, http.client.HTTPException, ValueError):
         return  # fail open — never hold the agent on a missing proxy
 
     if isinstance(result, dict) and result.get("decision") == "block":
@@ -97,5 +98,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except Exception:  # noqa: BLE001  # the stop hook exits 0 whatever failed, the agent must be free to stop
         sys.exit(0)

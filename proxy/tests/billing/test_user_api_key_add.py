@@ -12,6 +12,7 @@ import sys
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -24,6 +25,7 @@ URL = "/v1/users/me/execution-layers/{layer}/subscriptions"
 @pytest.fixture
 def client(temp_db):
     from fastapi.testclient import TestClient
+
     from app import app
     from auth.providers import UserContext, get_current_user
 

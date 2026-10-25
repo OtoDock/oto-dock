@@ -138,6 +138,24 @@ class TestStartSessionReplacement:
                 "thread_id": "thread-9"} in frames
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("refused", [True, False])
+    async def test_the_ack_says_when_the_engine_refused_the_resume(self, sat_config, refused):
+        sm = SessionManager(sat_config)
+        started = AsyncMock()
+        started.pid = 7
+        started.thread_id = "thread-fresh"
+        started.resume_refused = refused
+        ws = AsyncMock()
+        with patch("satellite.sessions.codex_session.CodexSession", return_value=started):
+            await sm.start_session({
+                "session_id": "sess-r", "execution_path": "codex-cli", "config": {},
+                "command_id": "cmd-r", "agent_slug": "test-agent",
+            }, ws)
+        ack = ws.enqueue_send.await_args_list[0].args[0]
+        assert ack["status"] == "ok"
+        assert ack.get("resume_refused") is (True if refused else None)
+
+    @pytest.mark.asyncio
     async def test_unknown_engine_is_an_ack_error_before_any_spawn(self, sat_config):
         sm = SessionManager(sat_config)
         ws = AsyncMock()
@@ -169,6 +187,142 @@ class TestFileSyncHandlers:
         target = sat_config.agents_dir / "test-agent" / "workspace" / "test.txt"
         assert target.exists()
         assert target.read_text() == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_a_push_into_an_engine_home_outside_skills_is_refused(self, sat_config, caplog):
+        # A platform before 1.9.0 still pushes the engine's own files there
+        # (its sandbox-path wrappers among them): refused with a rejected
+        # ack, said once per path; skills and a nested project config land.
+        import base64
+        import logging
+        sm = SessionManager(sat_config)
+        sat_config.agents_dir.mkdir(parents=True)
+        ws = _CapturingWS()
+        body = base64.b64encode(b"x").decode()
+
+        def _msg(rel, cid):
+            return {"agent_slug": "test-agent", "path": rel, "action": "write",
+                    "content_b64": body, "command_id": cid}
+
+        with caplog.at_level(logging.INFO, logger="satellite"):
+            await sm.file_push(_msg("users/alice/.claude/bin/gh", "c1"), ws)
+            await sm.file_push(_msg("users/alice/.claude/bin/gh", "c2"), ws)
+        assert [a["status"] for a in ws.sent] == ["rejected", "rejected"]
+        assert ws.sent[0]["error"] == "engine home path is host-local"
+        assert not (sat_config.agents_dir / "test-agent" / "users" / "alice" / ".claude").exists()
+        assert sum("under an engine home only a person's own folders sync" in r.getMessage()
+                   for r in caplog.records) == 1
+        await sm.file_push(_msg("users/alice/.claude/skills/x/SKILL.md", "c3"), ws)
+        await sm.file_push(_msg("workspace/repo/.claude/commands/deploy.md", "c4"), ws)
+        await sm.file_push(_msg("users/alice/.claude/commands/deploy.md", "c5"), ws)
+        await sm.file_push(_msg("workspace/.codex/prompts/review.md", "c6"), ws)
+        assert [a["status"] for a in ws.sent[2:]] == ["ok", "ok", "ok", "ok"]
+        assert (sat_config.agents_dir / "test-agent" / "users" / "alice" / ".claude" / "skills"
+                / "x" / "SKILL.md").read_bytes() == b"x"
+
+    @pytest.mark.asyncio
+    async def test_the_retention_frame_keeps_the_platforms_and_the_daemons_ids(self, sat_config):
+        import os
+        import time
+        import uuid
+        from types import SimpleNamespace
+        sm = SessionManager(sat_config)
+        home = sat_config.agents_dir / "a1" / "users" / "alice"
+        d = home / ".claude" / "projects" / "-p"
+        d.mkdir(parents=True)
+        kept, live_sid, live_tid, gone, recent = (str(uuid.uuid4()) for _ in range(5))
+        for ref in (kept, live_sid, live_tid, gone, recent):
+            f = d / f"{ref}.jsonl"
+            f.write_bytes(b"x" * 10)
+            if ref != recent:
+                then = time.time() - 10 * 86400
+                os.utime(f, (then, then))
+        # A live Codex session is known by its session id AND its thread.
+        sm.sessions[live_sid] = SimpleNamespace(thread_id=live_tid)
+        ws = _CapturingWS()
+        # The platform's grace is clamped to an hour at least: a file ten
+        # minutes old stays whatever the frame says.
+        then = time.time() - 600
+        os.utime(d / f"{recent}.jsonl", (then, then))
+        await sm.session_files_retention(
+            {"command_id": "c1", "keep": [kept], "min_age_s": 60, "dry_run": False}, ws)
+        assert ws.sent[-1] == {
+            "type": "ack", "command_id": "c1", "status": "ok", "error": "",
+            "files": 4, "bytes": 40, "deleted": 1, "deleted_bytes": 10,
+            "candidates": [f"a1/users/alice/.claude/projects/-p/{gone}.jsonl"],
+        }
+        assert sorted(p.stem for p in d.glob("*.jsonl")) == sorted([kept, live_sid, live_tid, recent])
+
+    @pytest.mark.asyncio
+    async def test_the_retention_frame_fails_closed(self, sat_config):
+        """The one irreversible delete on the wire: a frame with no keep list
+        or one that is not a list, and an empty list outside a dry run, are
+        refused and delete nothing; a frame that names no grace gets the
+        seven-day default, never the one-hour floor."""
+        import os
+        import time
+        import uuid
+
+        from satellite.host import session_retention
+        sm = SessionManager(sat_config)
+        d = sat_config.agents_dir / "a1" / "workspace" / ".claude" / "projects" / "-p"
+        d.mkdir(parents=True)
+        two_days, nine_days = str(uuid.uuid4()), str(uuid.uuid4())
+        for ref, days in ((two_days, 2), (nine_days, 9)):
+            f = d / f"{ref}.jsonl"
+            f.write_bytes(b"x" * 10)
+            then = time.time() - days * 86400
+            os.utime(f, (then, then))
+        ws = _CapturingWS()
+        for cid, frame in (("c1", {}), ("c2", {"keep": None}), ("c3", {"keep": "abc"}),
+                           ("c4", {"keep": []}), ("c5", {"keep": ["x"], "min_age_s": "soon"})):
+            await sm.session_files_retention({"command_id": cid, **frame}, ws)
+        assert [(a["status"], a["error"]) for a in ws.sent] == [
+            ("error", "keep list missing"), ("error", "keep list missing"),
+            ("error", "keep list missing"), ("error", "keep list empty"),
+            ("error", "min_age_s is not a number"),
+        ]
+        assert sorted(p.stem for p in d.glob("*.jsonl")) == sorted([two_days, nine_days])
+        # An empty list on a dry run only lists (the seven-day default grace
+        # keeps the two-day-old file out of the list).
+        await sm.session_files_retention({"command_id": "c6", "keep": [], "dry_run": True}, ws)
+        assert ws.sent[-1]["status"] == "ok" and ws.sent[-1]["deleted"] == 1
+        assert sorted(p.stem for p in d.glob("*.jsonl")) == sorted([two_days, nine_days])
+        # No grace named: seven days, so the two-day-old file stays.
+        assert session_retention.DEFAULT_MIN_AGE_S == 7 * 86400
+        await sm.session_files_retention({"command_id": "c7", "keep": ["x"]}, ws)
+        assert ws.sent[-1]["status"] == "ok" and ws.sent[-1]["deleted"] == 1
+        assert [p.stem for p in d.glob("*.jsonl")] == [two_days]
+
+    @pytest.mark.asyncio
+    async def test_a_stale_push_acks_the_files_stat_and_a_committed_one_its_own(self, sat_config):
+        import base64
+        import os
+        import time
+        sm = SessionManager(sat_config)
+        target = sat_config.agents_dir / "test-agent" / "workspace" / "run.log"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"busy")  # written now: live
+        ws = _CapturingWS()
+        msg = {
+            "agent_slug": "test-agent", "path": "workspace/run.log", "action": "write",
+            "content_b64": base64.b64encode(b"platform").decode(),
+            "command_id": "c1", "expect": "live",
+        }
+        await sm.file_push(msg, ws)
+        assert ws.sent[-1] == {
+            "type": "ack", "command_id": "c1", "status": "stale", "error": "",
+            "reason": "live", "size": 4, "mtime_ns": target.stat().st_mtime_ns,
+        }
+        assert target.read_bytes() == b"busy"
+        then = time.time() - 60
+        os.utime(target, (then, then))
+        await sm.file_push({**msg, "command_id": "c2"}, ws)
+        assert target.read_bytes() == b"platform"
+        assert ws.sent[-1] == {
+            "type": "ack", "command_id": "c2", "status": "ok", "error": "",
+            "size": 8, "mtime_ns": target.stat().st_mtime_ns,
+        }
 
 
 class _DeadCLISession:
@@ -362,6 +516,35 @@ class TestModeCTurnRetention:
         assert types[-1][0] == "turn_ended"
         # The sentinel itself is NOT forwarded as a session_event.
         assert ("session_event", "_turn_sentinel") not in types
+
+
+class TestReplayPauseRelease:
+    """A forwarder parked while a replay is enqueued goes on when the replay
+    ends, and when the session closes during the replay (the event is set,
+    never only dropped)."""
+
+    @pytest.mark.asyncio
+    async def test_the_replay_end_releases_a_parked_forwarder(self, sat_config):
+        sm = SessionManager(sat_config)
+        sm.forward_paused["s1"] = asyncio.Event()
+        waiter = asyncio.create_task(sm._wait_forward_unpaused("s1"))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        sm._release_forward("s1")
+        await asyncio.wait_for(waiter, 1)
+        assert "s1" not in sm.forward_paused
+
+    @pytest.mark.asyncio
+    async def test_a_close_during_the_replay_releases_a_parked_forwarder(self, sat_config):
+        sm = SessionManager(sat_config)
+        sm.forward_paused["s1"] = asyncio.Event()
+        waiter = asyncio.create_task(sm._wait_forward_unpaused("s1"))
+        await asyncio.sleep(0)
+        await sm.close_session({"session_id": "s1", "command_id": "c1"}, _CapturingWS())
+        await asyncio.wait_for(waiter, 1)
+        # The replay's own end then finds nothing left to release.
+        sm._release_forward("s1")
+        assert "s1" not in sm.forward_paused
 
 
 class _HeldCodexSession:
@@ -593,6 +776,7 @@ class TestCheckSessionResumable:
         }, fake_ws)
 
         assert fake_ws.sent[0]["resumable"] is False
+        assert fake_ws.sent[0]["reason"] == "empty"
 
     @pytest.mark.asyncio
     async def test_returns_false_when_file_missing(self, sat_config, fake_ws):
@@ -607,6 +791,85 @@ class TestCheckSessionResumable:
         }, fake_ws)
 
         assert fake_ws.sent[0]["resumable"] is False
+        assert fake_ws.sent[0]["reason"] == "missing"
+
+    @pytest.mark.asyncio
+    async def test_a_user_line_deep_in_a_long_file_is_read_without_the_whole_file(
+        self, sat_config, fake_ws, monkeypatch,
+    ):
+        """The probe reads line by line in a thread and stops at the first
+        user line: a whole-file read would hold a transcript of any size
+        on the loop (the 2026-10-10 stall read a 27 MB string there)."""
+        from pathlib import Path
+        sm = SessionManager(sat_config)
+        sat_config.agents_dir.mkdir(parents=True)
+        filler = '{"type":"assistant","content":"x"}\n' * 5000
+        self._write_session_file(
+            sat_config.agents_dir, "agent-1", "alice", "sess-L",
+            filler + '{"type": "user","content":"hi"}\n' + filler,
+        )
+
+        def _refused(*a, **k):
+            raise AssertionError("the probe read the whole file")
+
+        monkeypatch.setattr(Path, "read_text", _refused)
+        await sm.check_session_resumable({
+            "command_id": "cmd-6",
+            "session_id": "sess-L",
+            "agent_slug": "agent-1",
+            "username": "alice",
+        }, fake_ws)
+        assert fake_ws.sent[0]["resumable"] is True
+        assert "reason" not in fake_ws.sent[0]
+
+    @pytest.mark.asyncio
+    async def test_a_name_nobody_can_load_is_a_definite_no(
+        self, sat_config, fake_ws,
+    ):
+        """A directory planted at the transcript's name: the resume could
+        not load it either, so the answer is final (never a stuck chat)."""
+        sm = SessionManager(sat_config)
+        project_dir = (sat_config.agents_dir / "agent-1" / "users" / "alice"
+                       / ".claude" / "projects" / "-h")
+        (project_dir / "sess-D.jsonl").mkdir(parents=True)
+
+        await sm.check_session_resumable({
+            "command_id": "cmd-7",
+            "session_id": "sess-D",
+            "agent_slug": "agent-1",
+            "username": "alice",
+        }, fake_ws)
+        ack = fake_ws.sent[0]
+        assert ack["status"] == "ok"
+        assert ack["resumable"] is False
+        assert ack["reason"] == "unreadable"
+
+    @pytest.mark.asyncio
+    async def test_a_read_the_machine_could_not_finish_is_an_error_ack(
+        self, sat_config, fake_ws, monkeypatch,
+    ):
+        """Memory or I/O trouble is the machine's moment, not the file's:
+        the platform reads the error ack as undecided and asks again."""
+        import errno
+
+        from satellite.sessions import session_manager as smod
+        sm = SessionManager(sat_config)
+        sat_config.agents_dir.mkdir(parents=True)
+
+        def _enomem(*a):
+            raise OSError(errno.ENOMEM, "Cannot allocate memory")
+
+        monkeypatch.setattr(smod, "_probe_session_file", _enomem)
+        await sm.check_session_resumable({
+            "command_id": "cmd-8",
+            "session_id": "sess-E",
+            "agent_slug": "agent-1",
+            "username": "alice",
+        }, fake_ws)
+        ack = fake_ws.sent[0]
+        assert ack["status"] == "error"
+        assert "resumable" not in ack
+        assert "Cannot allocate memory" in ack["error"]
 
     @pytest.mark.asyncio
     async def test_returns_false_when_agent_dir_missing(
@@ -668,7 +931,7 @@ class TestFixWindowsExePathsAfterSwap:
     def _build_fake_exe(self, python_exe_path: str) -> bytes:
         """Fake distlib launcher: PE-ish header, shebang, then zip data."""
         launcher_blob = b"MZ\x90\x00" + b"\x00" * 60 + b"PE\x00\x00"
-        shebang = f"#!{python_exe_path}\n".encode("utf-8")
+        shebang = f"#!{python_exe_path}\n".encode()
         # Real zip data not required for the unit test — any bytes after
         # the shebang stand in for the appended zip payload.
         zip_payload = b"PK\x03\x04zipped-script-bytes"
@@ -676,7 +939,9 @@ class TestFixWindowsExePathsAfterSwap:
 
     def test_rewrites_embedded_python_path(self, tmp_path, monkeypatch):
         monkeypatch.setattr(satcfg, "HOST", satcfg.ROWS[satcfg.WINDOWS])
-        from satellite.sessions.mcp_install_support import _fix_windows_exe_paths_after_swap
+        from satellite.sessions.mcp_install_support import (
+            _fix_windows_exe_paths_after_swap,
+        )
 
         old_root = tmp_path / "workspace-mcp.new"
         new_root = tmp_path / "workspace-mcp"
@@ -706,7 +971,9 @@ class TestFixWindowsExePathsAfterSwap:
 
     def test_noop_on_non_windows(self, tmp_path, monkeypatch):
         monkeypatch.setattr(satcfg, "HOST", satcfg.ROWS[satcfg.LINUX])
-        from satellite.sessions.mcp_install_support import _fix_windows_exe_paths_after_swap
+        from satellite.sessions.mcp_install_support import (
+            _fix_windows_exe_paths_after_swap,
+        )
 
         old_root = tmp_path / "workspace-mcp.new"
         new_root = tmp_path / "workspace-mcp"
@@ -722,7 +989,9 @@ class TestFixWindowsExePathsAfterSwap:
 
     def test_noop_when_no_scripts_dir(self, tmp_path, monkeypatch):
         monkeypatch.setattr(satcfg, "HOST", satcfg.ROWS[satcfg.WINDOWS])
-        from satellite.sessions.mcp_install_support import _fix_windows_exe_paths_after_swap
+        from satellite.sessions.mcp_install_support import (
+            _fix_windows_exe_paths_after_swap,
+        )
 
         old_root = tmp_path / "workspace-mcp.new"
         new_root = tmp_path / "workspace-mcp"
@@ -1052,6 +1321,7 @@ class TestSyncMcpsCategoryGate:
         remote session. Docker and context-only MCPs never install on a
         satellite, so only satellite-installable manifests are checked."""
         from pathlib import Path
+
         from satellite.sessions.session_manager import MCP_CATEGORIES
         root = Path(__file__).resolve().parents[2] / "mcps"
         manifests = sorted(root.glob("*/*/manifest.json"))
@@ -1176,6 +1446,7 @@ class TestStateDirectoriesReported:
         """A home reached through a link: the resolved forms above, and the
         unresolved ones beside them, so the proxy refuses both spellings."""
         from pathlib import Path
+
         from satellite import config
         real = tmp_path / "data" / "home" / "bob"
         real.mkdir(parents=True)
@@ -1226,6 +1497,7 @@ class TestManifestPaging:
         """Sizing a big tree's pages is a serialization per entry: it runs
         with the walk, off the loop that carries heartbeats and PTY frames."""
         import threading
+
         from satellite.sessions import session_manager as smod
         real = smod._manifest_pages
         threads: list[bool] = []
@@ -1285,10 +1557,10 @@ class TestSourceBuildOnTheSpec:
 
     @pytest.mark.asyncio
     async def test_the_install_receives_it(self, sat_config):
-        from types import SimpleNamespace
         import base64
         import io
         import tarfile
+        from types import SimpleNamespace
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             data = json.dumps({"name": "unifi-mcp", "server": {"transport": "stdio"}}).encode()

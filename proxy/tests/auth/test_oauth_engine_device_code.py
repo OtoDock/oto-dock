@@ -6,7 +6,7 @@ the generic provider's start/poll endpoints without hitting any vendor.
 
 from __future__ import annotations
 
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -134,6 +134,7 @@ async def test_device_code_start_refuses_hosted_mode(monkeypatch):
     The start route must 400 with a clear message instead of falling
     through to the raw 'credentials not configured' 500."""
     from fastapi import HTTPException
+
     from api.auth import oauth as oauth_api
 
     monkeypatch.setattr(
@@ -157,6 +158,7 @@ async def test_device_code_start_passes_guard_when_self_managed(monkeypatch):
     app-credential resolution (stubbed with a sentinel to prove control
     flow reached it)."""
     from fastapi import HTTPException
+
     from api.auth import oauth as oauth_api
 
     monkeypatch.setattr(

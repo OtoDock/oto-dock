@@ -15,18 +15,21 @@ import re
 import shlex
 import urllib.parse
 
+from auth import roles
 from auth.path_policy import (
+    _ALLOW,
     TIER_ADMIN,
     TIER_EDIT,
     TIER_EXTENDED,
     TIER_READ,
     PathDecision,
     SecurityContext,
-    _ALLOW,
     _check_path_arg,
     _check_remote_bash_path,
     _check_remote_protected_path,
 )
+from auth.path_shell_hosts import local_refusal, rsync_shell_commands
+from auth.path_shell_remote import local_view, remote_command
 from auth.path_shell_subst import (
     backtick_end,
     has_placeholder,
@@ -34,9 +37,20 @@ from auth.path_shell_subst import (
     lift_substitutions,
     subst_end,
 )
-from auth.path_shell_remote import local_view, remote_command
+from auth.path_shell_words import (
+    RootDelete,
+    awk_option,
+    awk_runs_commands,
+    has_shell_quoting,
+    identity_scope,
+    remote_operand,
+    remote_shell_paths,
+    rsync_reaches_host,
+    rsync_shell_option,
+    rsync_words,
+    words_view,
+)
 from core.session.external_identity import is_external_ctx
-from auth import roles
 
 # Hostnames always treated as private (no DNS resolution needed)
 _PRIVATE_HOSTNAMES = {"localhost"}
@@ -128,22 +142,21 @@ _BASH_TIER_EXTENDED: set[str] = {
     "uv", "uvx", "xargs",
     # Package installers — write to scope-allowed dirs (./venv, ./node_modules)
     "pip", "pip3", "npm", "npx", "yarn", "pnpm",
+    # pnpm 12's short names: `pn` is pnpm, `pnx` its download-and-run (npx's).
+    "pn", "pnx",
     # Build tooling
     "make", "cmake", "go", "cargo", "gcc", "g++",
 }
 
 # Tier "admin": host-touching ops — containers, host services, remote SSH,
-# system package installation. Admin role only.
-#
-# These would typically fail in a default sandbox anyway (docker has no
-# socket mount, ssh has no key access, apt requires root), but we
-# explicitly deny them at the role layer so the LLM gets a clear error
-# instead of an opaque failure. Future work could allow ssh on
-# admin-paired remote satellites where the operator has set up keys.
+# system package installation. On the local sandbox a platform admin's, and
+# a manager's or editor's for ssh/scp/sftp/rsync to the hosts the agent's ssh-hosts
+# instances name (``path_shell_hosts``); on a paired machine the editor tier's.
+# rsync joins the tier when an operand is on another host.
 _BASH_TIER_ADMIN: set[str] = {
     "docker", "docker-compose", "podman",
     "systemctl", "journalctl",
-    "ssh", "scp",
+    "ssh", "scp", "sftp", "ssh-copy-id",
     "apt", "apt-get",
 }
 
@@ -265,26 +278,14 @@ class _TargetWrite:
 
 
 # A floor entry: a compiled pattern, or a matcher with the same ``search``.
-_Matcher = re.Pattern[str] | _TargetWrite
+_Matcher = re.Pattern[str] | _TargetWrite | RootDelete
 
 _CATASTROPHE_PATTERNS: list[tuple[_Matcher, str]] = [
-    # Recursive force-delete at root or home: the r/f flags in any order
-    # with other letters (`-Rf`, `-rfv`), the root or home (`/`, `~`, `~/`,
-    # or a glob right under them: `/*`, `/*/`, `/**`, `~/*`; quoted or not)
-    # among the first operands (`rm -rf / x`,
-    # `rm -rf --no-preserve-root /`). Blanks only, and the very end (`\Z`,
-    # where `$` would match before a final newline): the raw scan also
-    # sees heredoc DATA lines, and the multi-line forms (`rm -rf /`
-    # followed by a line, `rm -rf \<newline>/`) are caught by the
-    # per-segment scan in _check_command_string instead. The operands stop
-    # at a separator or a comment and are bounded: the gate runs on the
-    # event loop, and an unbounded run is quadratic on a long command.
-    (re.compile(
-        r"\brm[ \t]+(?:-[a-zA-Z]*(?:[rR][a-zA-Z]*f|f[a-zA-Z]*[rR])[a-zA-Z]*"
-        r"|--recursive[ \t]+--force|--force[ \t]+--recursive)"
-        r"(?:[ \t]+(?!#)[^ \t\n;&|]+){0,16}?[ \t]+"
-        r"(['\"]?)(?:/|~/?)(?:\*[^ \t\n;&|'\"]*)?\1(?=[ \t;&|]|\Z)"
-    ), "Recursive force-delete of / or ~ is blocked"),
+    # Recursive force-delete at root or home: the recursive and force flags
+    # anywhere in the flag run, together or apart, short or long, and the
+    # root or the home (or a glob right under them, quoted or not) among
+    # the operands (``path_shell_words.RootDelete``).
+    (RootDelete(), "Recursive force-delete of / or ~ is blocked"),
 
     # Fork bombs
     (re.compile(r":\(\)\s*\{.*\|.*\}"), "Fork bomb detected"),
@@ -314,6 +315,11 @@ _HOST_STATE_PATTERNS: list[tuple[_Matcher, str]] = [
     (re.compile(r"\b(insmod|modprobe|rmmod)\b"), "Kernel module operations blocked"),
 ]
 
+# A NUL byte: no shell argument can carry one, so a command holding one is
+# refused in every context (an undeclared tool's argument too).
+_NUL = "\x00"
+_NUL_REASON = "a command holding a NUL byte is refused"
+
 # Every floor pattern, for the callers that judge text with no host (an
 # undeclared tool's arguments: ``path_policy._unknown_tool_dangerous_scan``).
 _DANGEROUS_PATTERNS: list[tuple[_Matcher, str]] = _CATASTROPHE_PATTERNS + _HOST_STATE_PATTERNS
@@ -330,16 +336,36 @@ def _host_state_asks(ctx: SecurityContext) -> bool:
     return placement.is_remote and placement.allow_full_fs and roles.can_edit(ctx.role)
 
 
-def _floor_denial(text: str, *, remote_host: bool = False,
-                  host_asks: bool = False) -> PathDecision | None:
-    """The catastrophe floor on ``text``: every catastrophe pattern on the
-    whole text and, for a command this host runs, the host-state patterns
-    on its local view. ``remote_host``: the text runs on another host;
-    ``host_asks``: this host lets them ask (``_host_state_asks``). Either
-    way the caller weighs a host-state match (``_host_state_seen``)."""
+def _catastrophe_seen(text: str, *, words: bool) -> str | None:
+    """The reason of the first catastrophe pattern ``text`` matches, read as
+    written and, with ``words``, as the shell reads its words
+    (``path_shell_words.words_view``: quotes removed, escapes and ``$'…'``
+    decoded, brace groups expanded). The words are a second reading, never
+    instead of the first."""
     for pattern, reason in _CATASTROPHE_PATTERNS:
         if pattern.search(text):
-            return PathDecision(False, f"Bash denied: {reason}")
+            return reason
+    if words and has_shell_quoting(text):
+        view = words_view(text)
+        if view is not None and view != text:
+            for pattern, reason in _CATASTROPHE_PATTERNS:
+                if pattern.search(view):
+                    return reason
+    return None
+
+
+def _floor_denial(text: str, *, remote_host: bool = False,
+                  host_asks: bool = False, words: bool = False) -> PathDecision | None:
+    """The catastrophe floor on ``text``: every catastrophe pattern on the
+    whole text (``words``: on its shell words too, for a text that is one
+    command: a segment, never the raw command with its heredoc data) and,
+    for a command this host runs, the host-state patterns on its local
+    view. ``remote_host``: the text runs on another host; ``host_asks``:
+    this host lets them ask (``_host_state_asks``). Either way the caller
+    weighs a host-state match (``_host_state_seen``)."""
+    reason = _catastrophe_seen(text, words=words)
+    if reason is not None:
+        return PathDecision(False, f"Bash denied: {reason}")
     if remote_host or host_asks:
         return None
     local = local_view(text)
@@ -395,8 +421,10 @@ _WRITE_PATH_COMMANDS: set[str] = {
     "rm", "rmdir", "touch", "mkdir",
 }
 
-# Source/dest: last positional = write, rest = read
-_COPY_COMMANDS: set[str] = {"cp", "mv", "ln", "install", "rsync"}
+# Source/dest: last positional = write, rest = read. An rsync or scp operand
+# that names another host (``path_shell_words.remote_operand``) is no path.
+_COPY_COMMANDS: set[str] = {"cp", "mv", "ln", "install", "rsync", "scp"}
+_REMOTE_COPY_COMMANDS: set[str] = {"rsync", "scp"}
 
 # Copy-family flags whose value is the next token (never a path operand).
 _COPY_VALUE_FLAGS: dict[str, set[str]] = {
@@ -404,7 +432,20 @@ _COPY_VALUE_FLAGS: dict[str, set[str]] = {
     "mv": {"-S", "--suffix"},
     "ln": {"-S", "--suffix"},
     "install": {"-S", "--suffix", "-m", "--mode", "-o", "--owner", "-g", "--group"},
+    "scp": {"-c", "-D", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-X"},
+    "rsync": {"--rsync-path"},
 }
+# Of those, the ones whose value is a local file the command reads (scp's
+# identity and its ssh config), checked as a read path, separate or fused.
+_COPY_READ_VALUE_FLAGS: dict[str, set[str]] = {"scp": {"-F", "-i"}}
+# What the copy family's option loop waits for in the next argument.
+_EXPECT_TARGET = "target"
+_EXPECT_VALUE = "value"
+
+
+def _read_value(flag: str, value: str) -> str:
+    return identity_scope(value) if flag == "-i" else value
+
 
 # First positional is a pattern (not a path), rest are read paths
 _GREP_COMMANDS: set[str] = {"grep", "egrep", "fgrep"}
@@ -419,10 +460,10 @@ _INPLACE_FLAG_COMMANDS: dict[str, str] = {"sed": "-i"}
 _PROGRAM_FIRST_READ_COMMANDS: set[str] = {"awk", "jq", "rg"}
 
 # Flags that SUPPLY the program/pattern (so there is no inline positional one);
-# their value is consumed, not treated as a path.
+# their value is consumed, not treated as a path. awk's options are read by
+# ``path_shell_words.awk_option`` (gawk takes fused values and prefixes).
 _PROGRAM_FLAGS_BY_CMD: dict[str, set[str]] = {
     "rg":  {"-e", "--regexp", "-f", "--file"},
-    "awk": {"-f", "--file"},
     "jq":  {"-f", "--from-file"},
 }
 
@@ -458,7 +499,6 @@ _VALUE_FLAGS_BY_CMD: dict[str, set[str]] = {
                "--output-separator", "--table-columns"},
     "nl":   {"-b", "-d", "-f", "-h", "-i", "-l", "-n", "-s", "-v", "-w"},
     "tac":  {"-s", "--separator"},
-    "awk":  {"-v", "-F", "--assign", "--field-separator"},
     "jq":   {"-L", "--indent", "--arg", "--argjson", "--slurpfile", "--rawfile"},
     "rg":   {"-A", "-B", "-C", "--after-context", "--before-context",
              "--context", "-m", "--max-count", "-g", "--glob", "-t", "--type",
@@ -554,9 +594,15 @@ _COMMAND_WRAPPERS: set[str] = {"command", "builtin"}
 # a separate boolean, NOT a tier). Catastrophic forms (``rm -rf /``,
 # ``dd of=/dev/…``) are ALSO hard-denied by _DANGEROUS_PATTERNS.
 _DESTRUCTIVE_COMMANDS: set[str] = {
-    "rm", "rmdir", "shred", "truncate", "dd", "mkfs", "wipefs", "blkdiscard",
-    "fdisk", "sgdisk", "parted",
+    "rm", "rmdir", "shred", "truncate", "dd", "mkfs", "mke2fs", "mkswap", "wipefs",
+    "blkdiscard", "fdisk", "sgdisk", "parted",
 }
+# ``mkfs.<type>`` (``mkfs.ext4``, ``mkfs.vfat``): the per-filesystem builders.
+_DESTRUCTIVE_PREFIXES = ("mkfs.",)
+
+
+def _is_destructive_command(cmd_name: str) -> bool:
+    return cmd_name in _DESTRUCTIVE_COMMANDS or cmd_name.startswith(_DESTRUCTIVE_PREFIXES)
 
 # Tokens that look like wrapper options/values/durations/assignments to skip
 # while locating a prefix wrapper's inner command (best-effort — see above).
@@ -565,6 +611,75 @@ _DURATION_RE = re.compile(r"^\d+(\.\d+)?[smhd]?$")
 # ---------------------------------------------------------------------------
 # Bash command parsing helpers
 # ---------------------------------------------------------------------------
+
+
+def _heredoc_operator(command: str, i: int, current: list[str],
+                      pending_heredocs: list[tuple[str, bool, bool, bool]]) -> int:
+    """A ``<<`` / ``<<-`` at ``i``: queue its body (delimiter, strip_tabs,
+    body-is-shell, body-expands) when it names a delimiter, keep the
+    operator text in the segment; answers the index past it."""
+    j = i + 2
+    strip_tabs = False
+    if j < len(command) and command[j] == "-":
+        strip_tabs = True
+        j += 1
+    k = j
+    while k < len(command) and command[k] in " \t":
+        k += 1
+    delim: str | None = None
+    expands = False  # an unquoted delimiter: the body is expanded
+    if k < len(command) and command[k] in "'\"":
+        q = command[k]
+        end = command.find(q, k + 1)
+        if end != -1:
+            delim = command[k + 1:end]
+            k = end + 1
+    else:
+        m = k
+        while m < len(command) and command[m] not in " \t\n\r;|&<>()`":
+            m += 1
+        if m > k:
+            expands = "\\" not in command[k:m]
+            delim = command[k:m].replace("\\", "")
+            k = m
+    # Digit/`$`-leading "delimiters" are almost certainly arithmetic
+    # shifts in disguise (`((x<<2))`) — treat the operator literally
+    # rather than risk swallowing the rest of the command as body.
+    if delim and not delim[0].isdigit() and not delim.startswith("$"):
+        line_tokens = "".join(current).split()
+        body_is_shell = any(
+            t.rsplit("/", 1)[-1] in _SHELL_DASH_C for t in line_tokens
+        )
+        pending_heredocs.append((delim, strip_tabs, body_is_shell, expands))
+        current.append(command[i:k])
+        return k
+    current.append("<<")
+    return i + 2
+
+
+def _consume_heredocs(command: str, i: int,
+                      pending_heredocs: list[tuple[str, bool, bool, bool]],
+                      segments: list[str]) -> int:
+    """The queued heredoc bodies from ``i`` (the start of the line after the
+    operators' line), each up to its terminator line; answers the index past
+    the last one."""
+    for delim, strip_tabs, body_is_shell, expands in pending_heredocs:
+        while i < len(command):
+            nl = command.find("\n", i)
+            line = command[i:nl] if nl != -1 else command[i:]
+            i = (nl + 1) if nl != -1 else len(command)
+            check = line.rstrip("\r")
+            if strip_tabs:
+                check = check.lstrip("\t")
+            if check == delim:
+                break
+            if body_is_shell:
+                body_seg = line.strip()
+                if body_seg:
+                    segments.append(body_seg)
+            elif expands:
+                segments.extend(heredoc_line_commands(line))
+    return i
 
 
 def _split_command_segments(command: str) -> list[str]:
@@ -659,44 +774,7 @@ def _split_command_segments(command: str) -> list[str]:
         # << / <<- heredoc operator: parse the delimiter and queue the body
         # for consumption at this line's newline.
         if ch == "<" and command[i:i + 2] == "<<":
-            j = i + 2
-            strip_tabs = False
-            if j < len(command) and command[j] == "-":
-                strip_tabs = True
-                j += 1
-            k = j
-            while k < len(command) and command[k] in " \t":
-                k += 1
-            delim: str | None = None
-            expands = False  # an unquoted delimiter: the body is expanded
-            if k < len(command) and command[k] in "'\"":
-                q = command[k]
-                end = command.find(q, k + 1)
-                if end != -1:
-                    delim = command[k + 1:end]
-                    k = end + 1
-            else:
-                m = k
-                while m < len(command) and command[m] not in " \t\n\r;|&<>()`":
-                    m += 1
-                if m > k:
-                    expands = "\\" not in command[k:m]
-                    delim = command[k:m].replace("\\", "")
-                    k = m
-            # Digit/`$`-leading "delimiters" are almost certainly arithmetic
-            # shifts in disguise (`((x<<2))`) — treat the operator literally
-            # rather than risk swallowing the rest of the command as body.
-            if delim and not delim[0].isdigit() and not delim.startswith("$"):
-                line_tokens = "".join(current).split()
-                body_is_shell = any(
-                    t.rsplit("/", 1)[-1] in _SHELL_DASH_C for t in line_tokens
-                )
-                pending_heredocs.append((delim, strip_tabs, body_is_shell, expands))
-                current.append(command[i:k])
-                i = k
-                continue
-            current.append("<<")
-            i += 2
+            i = _heredoc_operator(command, i, current, pending_heredocs)
             continue
 
         # Unquoted separator detection
@@ -716,22 +794,7 @@ def _split_command_segments(command: str) -> list[str]:
             # its terminator line. Data bodies vanish; shell bodies keep
             # per-line classification (appended as segments); an expanded
             # body contributes each of its substitutions as a segment.
-            for delim, strip_tabs, body_is_shell, expands in pending_heredocs:
-                while i < len(command):
-                    nl = command.find("\n", i)
-                    line = command[i:nl] if nl != -1 else command[i:]
-                    i = (nl + 1) if nl != -1 else len(command)
-                    check = line.rstrip("\r")
-                    if strip_tabs:
-                        check = check.lstrip("\t")
-                    if check == delim:
-                        break
-                    if body_is_shell:
-                        body_seg = line.strip()
-                        if body_seg:
-                            segments.append(body_seg)
-                    elif expands:
-                        segments.extend(heredoc_line_commands(line))
+            i = _consume_heredocs(command, i, pending_heredocs, segments)
             pending_heredocs = []
             continue
         if ch == ";":
@@ -913,6 +976,224 @@ def _filter_redirect_tokens(args: list[str]) -> list[str]:
     return filtered
 
 
+def _read_command_paths(cmd_name: str, args: list[str], read_paths: list[str],
+                        write_paths: list[str]) -> None:
+    """A read command: every positional is a read path but a value flag's
+    value; a write-value flag's value (``sort -o FILE``) is a write path."""
+    # Skip the token AFTER a flag that takes a non-path value (e.g.
+    # the `8` in `head -c 8 file.txt`). Without this, the `8` gets
+    # path-validated and the command is denied. See
+    # _VALUE_FLAGS_BY_CMD docstring. A WRITE-value flag (`sort -o FILE`)
+    # routes its value to write_paths instead of read_paths.
+    value_flags = _VALUE_FLAGS_BY_CMD.get(cmd_name, set())
+    write_value_flags = _WRITE_VALUE_FLAGS_BY_CMD.get(cmd_name, set())
+    skip_next = False
+    write_next = False
+    for arg in args:
+        if write_next:
+            write_next = False
+            write_paths.append(arg)
+            continue
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in write_value_flags:
+            write_next = True
+            continue
+        if arg in value_flags:
+            skip_next = True
+            continue
+        if not arg.startswith("-"):
+            read_paths.append(arg)
+
+
+def _grep_paths(cmd_name: str, args: list[str], read_paths: list[str],
+                write_paths: list[str]) -> None:
+    """grep, egrep, fgrep: the first positional is the pattern, the rest are
+    read paths."""
+    # First positional is the pattern (skip), rest are file paths
+    positional = [a for a in args if not a.startswith("-")]
+    for p in positional[1:]:
+        read_paths.append(p)
+
+
+def _program_first_paths(cmd_name: str, args: list[str], read_paths: list[str],
+                         write_paths: list[str]) -> None:
+    """awk, jq, rg: the first positional is the program unless a flag names it;
+    the other positionals are read paths."""
+    # awk/jq/rg: skip value-flag values; the first POSITIONAL is the
+    # program/pattern UNLESS supplied via a flag (-e/-f), in which case
+    # EVERY positional is a read path. (Without value-flag skipping,
+    # `rg -A 3 PAT /path` would parse `3`/`PAT` as files and falsely deny;
+    # without the flag check, `rg -e PAT /path` would drop `/path`.)
+    value_flags = _VALUE_FLAGS_BY_CMD.get(cmd_name, set())
+    program_flags = _PROGRAM_FLAGS_BY_CMD.get(cmd_name, set())
+    positional = []
+    skip_next = False
+    pattern_from_flag = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if cmd_name == "awk" and arg.startswith("-") and arg != "-":
+            # awk's options read like gawk reads them: fused values and
+            # long-option prefixes (``--source='{print}' FILE``: FILE is input).
+            program, takes = awk_option(arg)
+            pattern_from_flag = pattern_from_flag or program
+            skip_next = takes
+            continue
+        if arg in program_flags:
+            pattern_from_flag = True
+            skip_next = True  # its value is the pattern/script, not a path
+            continue
+        if arg in value_flags:
+            skip_next = True
+            continue
+        if not arg.startswith("-"):
+            positional.append(arg)
+    files = positional if pattern_from_flag else positional[1:]
+    read_paths.extend(files)
+
+
+def _find_paths(cmd_name: str, args: list[str], read_paths: list[str],
+                write_paths: list[str]) -> None:
+    """find: the positionals before the first flag are its search paths."""
+    # First positional arg(s) before any -flag are search paths
+    for arg in args:
+        if arg.startswith("-"):
+            break
+        read_paths.append(arg)
+
+
+def _write_command_paths(cmd_name: str, args: list[str], read_paths: list[str],
+                         write_paths: list[str]) -> None:
+    """A write command: every positional is a write path."""
+    for arg in args:
+        if not arg.startswith("-"):
+            write_paths.append(arg)
+
+
+def _copy_paths(cmd_name: str, args: list[str], read_paths: list[str],
+                write_paths: list[str]) -> None:
+    """cp, mv, install, ln, rsync, scp: the sources are read paths, the
+    destination (and each source's name under it) a write path; mv's sources
+    are writes too. An rsync or scp operand on another host is no path here:
+    a remote source is not read and a remote destination not written, but a
+    remote source's name still lands under a local destination."""
+    # Last non-flag = destination (write), rest = sources (read), unless
+    # `-t DIR` / `--target-directory=DIR` names the destination up front
+    # (not rsync, where -t is --times). A directory destination receives
+    # DEST/<basename of each source>, so that path is write-checked too:
+    # the literal DEST alone would let `cp x/settings.json .claude` past
+    # the protected-file check. `mv` removes its sources: writes as well.
+    value_flags = _COPY_VALUE_FLAGS.get(cmd_name, set())
+    read_value_flags = _COPY_READ_VALUE_FLAGS.get(cmd_name, set())
+    takes_target = cmd_name not in _REMOTE_COPY_COMMANDS
+    positional = []
+    target_dir: str | None = None
+    dest: str | None
+    expect: str | None = None
+    options_done = False
+    for arg in args:
+        if expect is not None:
+            if expect == _EXPECT_TARGET:
+                target_dir = arg
+            elif expect in read_value_flags:
+                read_paths.append(_read_value(expect, arg))
+            expect = None
+            continue
+        if options_done or not arg.startswith("-") or arg == "-":
+            positional.append(arg)
+        elif arg == "--":
+            options_done = True
+        elif arg in read_value_flags:
+            expect = arg
+        elif cmd_name == "rsync" and (shell := rsync_shell_option(arg))[0]:
+            # The remote shell is a command, checked as one (``find_exec``).
+            expect = _EXPECT_VALUE if shell[1] is None else None
+        elif arg[:2] in read_value_flags and len(arg) > 2:
+            read_paths.append(_read_value(arg[:2], arg[2:]))
+        elif takes_target and arg == "--target-directory":
+            expect = _EXPECT_TARGET
+        elif takes_target and arg.startswith("--target-directory="):
+            target_dir = arg.split("=", 1)[1]
+        elif arg in value_flags:
+            expect = _EXPECT_VALUE
+        elif takes_target and not arg.startswith("--") and "t" in arg[1:]:
+            # A short cluster: `-t DIR`, `-rt DIR`, `-tDIR`.
+            rest = arg[arg.index("t", 1) + 1:]
+            if rest:
+                target_dir = rest
+            else:
+                expect = _EXPECT_TARGET
+    if target_dir is not None:
+        sources, dest = positional, target_dir
+    elif len(positional) >= 2:
+        sources, dest = positional[:-1], positional[-1]
+    else:
+        sources, dest = [], (positional[0] if positional else None)
+    local = sources
+    if cmd_name in _REMOTE_COPY_COMMANDS:
+        local = [src for src in sources if not remote_operand(src)]
+        if dest is not None and remote_operand(dest):
+            dest = None
+    read_paths.extend(local)
+    if cmd_name == "mv":
+        write_paths.extend(sources)
+    if dest is not None:
+        write_paths.append(dest)
+        for src in sources:
+            base = posixpath.basename(src.rstrip("/"))
+            if base.strip("."):  # no basename for `.` / `..`
+                write_paths.append(posixpath.join(dest, base))
+
+
+def _inplace_paths(cmd_name: str, args: list[str], read_paths: list[str],
+                   write_paths: list[str]) -> None:
+    """sed: the files after the script are write paths with the in-place
+    flag, read paths without it."""
+    flag = _INPLACE_FLAG_COMMANDS[cmd_name]
+    has_inplace = any(a == flag or a.startswith(flag) for a in args)
+    # First positional is the script/pattern (not a path), rest are files
+    positional = [a for a in args if not a.startswith("-")]
+    file_args = positional[1:]  # skip script arg
+    if has_inplace:
+        for p in file_args:
+            write_paths.append(p)
+    else:
+        for p in file_args:
+            read_paths.append(p)
+
+
+def _tee_paths(cmd_name: str, args: list[str], read_paths: list[str],
+               write_paths: list[str]) -> None:
+    """tee: every positional is a write path."""
+    for arg in args:
+        if not arg.startswith("-"):
+            write_paths.append(arg)
+
+
+def _mode_owner_paths(cmd_name: str, args: list[str], read_paths: list[str],
+                      write_paths: list[str]) -> None:
+    """chmod, chown, chgrp: the first positional is the mode or owner, the rest
+    are write paths."""
+    # First positional is mode/owner, rest are target paths
+    positional = [a for a in args if not a.startswith("-")]
+    if len(positional) >= 2:
+        for p in positional[1:]:
+            write_paths.append(p)
+
+
+def _tar_paths(cmd_name: str, args: list[str], read_paths: list[str],
+               write_paths: list[str]) -> None:
+    """tar: ``-C DIR`` is a write path, ``-f FILE`` a read path."""
+    for i, arg in enumerate(args):
+        if arg in ("-C", "--directory") and i + 1 < len(args):
+            write_paths.append(args[i + 1])
+        elif arg in ("-f", "--file") and i + 1 < len(args):
+            read_paths.append(args[i + 1])
+
+
 def _extract_path_args(
     cmd_name: str, segment: str
 ) -> tuple[list[str], list[str]]:
@@ -951,161 +1232,25 @@ def _extract_path_args(
     # --- Command-specific path extraction ---
 
     if cmd_name in _READ_PATH_COMMANDS:
-        # Skip the token AFTER a flag that takes a non-path value (e.g.
-        # the `8` in `head -c 8 file.txt`). Without this, the `8` gets
-        # path-validated and the command is denied. See
-        # _VALUE_FLAGS_BY_CMD docstring. A WRITE-value flag (`sort -o FILE`)
-        # routes its value to write_paths instead of read_paths.
-        value_flags = _VALUE_FLAGS_BY_CMD.get(cmd_name, set())
-        write_value_flags = _WRITE_VALUE_FLAGS_BY_CMD.get(cmd_name, set())
-        skip_next = False
-        write_next = False
-        for arg in args:
-            if write_next:
-                write_next = False
-                write_paths.append(arg)
-                continue
-            if skip_next:
-                skip_next = False
-                continue
-            if arg in write_value_flags:
-                write_next = True
-                continue
-            if arg in value_flags:
-                skip_next = True
-                continue
-            if not arg.startswith("-"):
-                read_paths.append(arg)
-
+        _read_command_paths(cmd_name, args, read_paths, write_paths)
     elif cmd_name in _GREP_COMMANDS:
-        # First positional is the pattern (skip), rest are file paths
-        positional = [a for a in args if not a.startswith("-")]
-        for p in positional[1:]:
-            read_paths.append(p)
-
+        _grep_paths(cmd_name, args, read_paths, write_paths)
     elif cmd_name in _PROGRAM_FIRST_READ_COMMANDS:
-        # awk/jq/rg: skip value-flag values; the first POSITIONAL is the
-        # program/pattern UNLESS supplied via a flag (-e/-f), in which case
-        # EVERY positional is a read path. (Without value-flag skipping,
-        # `rg -A 3 PAT /path` would parse `3`/`PAT` as files and falsely deny;
-        # without the flag check, `rg -e PAT /path` would drop `/path`.)
-        value_flags = _VALUE_FLAGS_BY_CMD.get(cmd_name, set())
-        program_flags = _PROGRAM_FLAGS_BY_CMD.get(cmd_name, set())
-        positional = []
-        skip_next = False
-        pattern_from_flag = False
-        for arg in args:
-            if skip_next:
-                skip_next = False
-                continue
-            if arg in program_flags:
-                pattern_from_flag = True
-                skip_next = True  # its value is the pattern/script, not a path
-                continue
-            if arg in value_flags:
-                skip_next = True
-                continue
-            if not arg.startswith("-"):
-                positional.append(arg)
-        files = positional if pattern_from_flag else positional[1:]
-        read_paths.extend(files)
-
+        _program_first_paths(cmd_name, args, read_paths, write_paths)
     elif cmd_name == "find":
-        # First positional arg(s) before any -flag are search paths
-        for arg in args:
-            if arg.startswith("-"):
-                break
-            read_paths.append(arg)
-
+        _find_paths(cmd_name, args, read_paths, write_paths)
     elif cmd_name in _WRITE_PATH_COMMANDS:
-        for arg in args:
-            if not arg.startswith("-"):
-                write_paths.append(arg)
-
+        _write_command_paths(cmd_name, args, read_paths, write_paths)
     elif cmd_name in _COPY_COMMANDS:
-        # Last non-flag = destination (write), rest = sources (read), unless
-        # `-t DIR` / `--target-directory=DIR` names the destination up front
-        # (not rsync, where -t is --times). A directory destination receives
-        # DEST/<basename of each source>, so that path is write-checked too:
-        # the literal DEST alone would let `cp x/settings.json .claude` past
-        # the protected-file check. `mv` removes its sources: writes as well.
-        value_flags = _COPY_VALUE_FLAGS.get(cmd_name, set())
-        takes_target = cmd_name != "rsync"
-        positional = []
-        target_dir: str | None = None
-        dest: str | None
-        expect: str | None = None
-        options_done = False
-        for arg in args:
-            if expect is not None:
-                if expect == "target":
-                    target_dir = arg
-                expect = None
-                continue
-            if options_done or not arg.startswith("-") or arg == "-":
-                positional.append(arg)
-            elif arg == "--":
-                options_done = True
-            elif takes_target and arg == "--target-directory":
-                expect = "target"
-            elif takes_target and arg.startswith("--target-directory="):
-                target_dir = arg.split("=", 1)[1]
-            elif arg in value_flags:
-                expect = "value"
-            elif takes_target and not arg.startswith("--") and "t" in arg[1:]:
-                # A short cluster: `-t DIR`, `-rt DIR`, `-tDIR`.
-                rest = arg[arg.index("t", 1) + 1:]
-                if rest:
-                    target_dir = rest
-                else:
-                    expect = "target"
-        if target_dir is not None:
-            sources, dest = positional, target_dir
-        elif len(positional) >= 2:
-            sources, dest = positional[:-1], positional[-1]
-        else:
-            sources, dest = [], (positional[0] if positional else None)
-        read_paths.extend(sources)
-        if cmd_name == "mv":
-            write_paths.extend(sources)
-        if dest is not None:
-            write_paths.append(dest)
-            for src in sources:
-                base = posixpath.basename(src.rstrip("/"))
-                if base.strip("."):  # no basename for `.` / `..`
-                    write_paths.append(posixpath.join(dest, base))
-
+        _copy_paths(cmd_name, args, read_paths, write_paths)
     elif cmd_name in _INPLACE_FLAG_COMMANDS:
-        flag = _INPLACE_FLAG_COMMANDS[cmd_name]
-        has_inplace = any(a == flag or a.startswith(flag) for a in args)
-        # First positional is the script/pattern (not a path), rest are files
-        positional = [a for a in args if not a.startswith("-")]
-        file_args = positional[1:]  # skip script arg
-        if has_inplace:
-            for p in file_args:
-                write_paths.append(p)
-        else:
-            for p in file_args:
-                read_paths.append(p)
-
+        _inplace_paths(cmd_name, args, read_paths, write_paths)
     elif cmd_name == "tee":
-        for arg in args:
-            if not arg.startswith("-"):
-                write_paths.append(arg)
-
+        _tee_paths(cmd_name, args, read_paths, write_paths)
     elif cmd_name in ("chmod", "chown", "chgrp"):
-        # First positional is mode/owner, rest are target paths
-        positional = [a for a in args if not a.startswith("-")]
-        if len(positional) >= 2:
-            for p in positional[1:]:
-                write_paths.append(p)
-
+        _mode_owner_paths(cmd_name, args, read_paths, write_paths)
     elif cmd_name == "tar":
-        for i, arg in enumerate(args):
-            if arg in ("-C", "--directory") and i + 1 < len(args):
-                write_paths.append(args[i + 1])
-            elif arg in ("-f", "--file") and i + 1 < len(args):
-                read_paths.append(args[i + 1])
+        _tar_paths(cmd_name, args, read_paths, write_paths)
 
     return read_paths, write_paths
 
@@ -1424,7 +1569,8 @@ def _classify_segment(
     if inners:
         # The lifted text is a new normalised form of the segment: the
         # catastrophe floor runs on it like on every other one.
-        denied = _floor_denial(lifted, remote_host=remote_host, host_asks=host_asks)
+        denied = _floor_denial(lifted, remote_host=remote_host, host_asks=host_asks,
+                               words=True)
         if denied is not None:
             return denied
     outer = _classify_command(lifted, ctx, is_remote=is_remote, depth=depth,
@@ -1470,23 +1616,33 @@ def _remote_protected_denial(
     return None
 
 
-def _classify_command(
-    segment: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
-    dangerous_only: bool = False, remote_host: bool = False,
-    host_asks: bool = False,
-) -> PathDecision:
-    """Classify a segment whose substitutions were already lifted: shell
-    structure, wrappers, the command's tier, role gate and path arguments.
-    An ``ssh`` segment's remote command is judged as the other host's
-    (``_ssh_remote_decision``) besides the segment's own classification."""
-    state_asks = host_asks or remote_host
+class _CommandCheck:
+    """One segment's classification context: the session, where the command
+    runs, the recursion depth and the floor flags, and what the find -exec
+    and ssh checks found for the tier and the destructive flag."""
 
-    def _bash_path_decision(rp: str, *, writing: bool) -> PathDecision:
-        if is_remote:
-            return _check_remote_bash_path(rp, ctx, writing=writing)
-        return _check_path_arg(rp, ctx, writing=writing)
+    find_exec_destructive: bool
+    find_exec_tier: str
+    ssh_destructive: bool
 
-    def _structural_decision(seg: str) -> PathDecision:
+    def __init__(self, ctx: SecurityContext, *, is_remote: bool, depth: int,
+                 dangerous_only: bool, remote_host: bool, host_asks: bool) -> None:
+        self.ctx = ctx
+        self.is_remote = is_remote
+        self.depth = depth
+        self.dangerous_only = dangerous_only
+        self.remote_host = remote_host
+        self.host_asks = host_asks
+        self.state_asks = host_asks or remote_host
+
+    def bash_path_decision(self, rp: str, *, writing: bool) -> PathDecision:
+        """A path argument against the remote resolver on a machine, the
+        local path policy otherwise."""
+        if self.is_remote:
+            return _check_remote_bash_path(rp, self.ctx, writing=writing)
+        return _check_path_arg(rp, self.ctx, writing=writing)
+
+    def structural_decision(self, seg: str) -> PathDecision:
         """Read-tier decision for a segment that runs no command — but the
         shell still performs its REDIRECTS (``F=x > f`` creates f, ``done <
         f`` reads f, ``: > f`` truncates), so those are checked like a
@@ -1497,12 +1653,12 @@ def _classify_command(
         state_destructive = False
         if not comparison:
             denied, state_destructive = _host_state_write_floor(
-                _extract_redirect_targets(seg), asks=state_asks)
+                _extract_redirect_targets(seg), asks=self.state_asks)
             if denied is not None:
                 return denied
-        if dangerous_only:
-            if is_remote and not remote_host:
-                denied = _remote_protected_denial(None, seg, ctx)
+        if self.dangerous_only:
+            if self.is_remote and not self.remote_host:
+                denied = _remote_protected_denial(None, seg, self.ctx)
                 if denied is not None:
                     return denied
             return PathDecision(allowed=True, permission_tier="read", destructive=state_destructive)
@@ -1512,17 +1668,170 @@ def _classify_command(
         for rp in _extract_redirect_targets(seg):
             if _is_pseudo_path(rp) or has_placeholder(rp):
                 continue
-            d = _bash_path_decision(rp, writing=True)
+            d = self.bash_path_decision(rp, writing=True)
             if not d.allowed:
                 return PathDecision(False, f"Bash denied: redirect target '{rp}' — {d.reason}")
             tier = "edit"
         for rp in _extract_input_redirects(seg):
             if _is_pseudo_path(rp) or has_placeholder(rp):
                 continue
-            d = _bash_path_decision(rp, writing=False)
+            d = self.bash_path_decision(rp, writing=False)
             if not d.allowed:
                 return PathDecision(False, f"Bash denied: input redirect '{rp}' — {d.reason}")
         return PathDecision(allowed=True, permission_tier=tier, destructive=state_destructive)
+
+    def unparsed(self, segment: str) -> PathDecision:
+        """A segment whose command word does not parse."""
+        if self.dangerous_only:
+            return PathDecision(allowed=True, permission_tier="read")
+        for tok in _path_looking_tokens(segment):
+            if _is_pseudo_path(tok) or has_placeholder(tok):
+                continue
+            d = self.bash_path_decision(tok, writing=True)
+            if not d.allowed:
+                return PathDecision(
+                    False,
+                    f"Bash denied: could not parse command, and it names "
+                    f"'{tok}' — {d.reason}",
+                )
+        return PathDecision(allowed=True, permission_tier="ask")
+
+    def find_exec(self, cmd_name: str, segment: str) -> PathDecision | None:
+        """``find -exec <cmd>`` and rsync's remote shell (``-e <cmd>``): the
+        inner command checked as a command of its own; its destructiveness
+        and its highest tier recorded."""
+        self.find_exec_destructive = False
+        self.find_exec_tier = ""
+        inners = (_find_exec_inners(segment) if cmd_name == "find"
+                  else rsync_shell_commands(segment) if cmd_name == "rsync" else [])
+        for exec_inner in inners:
+            r = _check_command_string(exec_inner, self.ctx, is_remote=self.is_remote,
+                                      depth=self.depth + 1,
+                                      dangerous_only=self.dangerous_only,
+                                      remote_host=self.remote_host,
+                                      host_asks=self.host_asks)
+            if not r.allowed:
+                return r
+            self.find_exec_destructive = self.find_exec_destructive or r.destructive
+            inner_tier = r.permission_tier or "read"
+            if _TIER_ORDER.get(inner_tier, 0) > _TIER_ORDER.get(self.find_exec_tier, 0):
+                self.find_exec_tier = inner_tier
+        return None
+
+    def ssh_remote(self, cmd_name: str, segment: str) -> PathDecision | None:
+        """``ssh``'s remote command, rsync's ``--rsync-path`` and a remote
+        path a far side's shell reads (``remote_shell_paths``): checked as
+        the other host's; their destructiveness recorded."""
+        self.ssh_destructive = False
+        remotes = ([remote_command(segment)] if cmd_name == "ssh"
+                   else rsync_words(segment).rsync_paths if cmd_name == "rsync" else [])
+        remotes += remote_shell_paths(cmd_name, segment)
+        for remote in remotes:
+            if remote:
+                r = _check_command_string(remote, self.ctx, is_remote=self.is_remote,
+                                          depth=self.depth + 1,
+                                          dangerous_only=True, remote_host=True)
+                if not r.allowed:
+                    return r
+                self.ssh_destructive = self.ssh_destructive or r.destructive
+        return None
+
+    def floor_pass(self, cmd_name: str, segment: str) -> PathDecision | None:
+        """The floor pass's answer (``None`` outside it)."""
+        if self.dangerous_only:
+            if self.is_remote and not self.remote_host:
+                denied = _remote_protected_denial(cmd_name, segment, self.ctx)
+                if denied is not None:
+                    return denied
+            denied, state_destructive = _host_state_write_floor(
+                [*_extract_path_args(cmd_name, segment)[1], *_extract_redirect_targets(segment)],
+                asks=self.state_asks)
+            if denied is not None:
+                return denied
+            return PathDecision(allowed=True, permission_tier="read",
+                                destructive=self.find_exec_destructive or self.ssh_destructive
+                                or state_destructive)
+        return None
+
+    def role_gate(self, cmd_name: str, tier: str, segment: str) -> PathDecision | None:
+        """The admin tier's role gate (``None`` when the role passes); on the
+        local sandbox the attached SSH hosts' opening, whose option files are
+        path-checked here."""
+        if tier == TIER_ADMIN:
+            if self.is_remote:
+                if not roles.can_edit(self.ctx.role):
+                    return PathDecision(
+                        False,
+                        f"Bash denied: '{cmd_name}' is restricted to manager / "
+                        f"editor / admin roles on remote satellites (current role: "
+                        f"{self.ctx.role}).",
+                    )
+            elif not roles.is_admin(self.ctx.role):
+                reach = local_refusal(cmd_name, segment, self.ctx)
+                if reach.refusal is not None:
+                    return PathDecision(False, f"Bash denied: {reach.refusal}")
+                for rp, writing in [(identity_scope(p), False) for p in reach.reads] + [
+                        (p, True) for p in reach.writes]:
+                    d = self.bash_path_decision(rp, writing=writing)
+                    if not d.allowed:
+                        use = "writes" if writing else "reads"
+                        return PathDecision(False, f"Bash denied: '{cmd_name}' {use} '{rp}' — {d.reason}")
+        return None
+
+    def path_checks(self, cmd_name: str, segment: str, tier: str,
+                    destructive: bool) -> PathDecision:
+        """The path arguments and redirects, then the command's answer."""
+        read_paths, write_paths = _extract_path_args(cmd_name, segment)
+        denied, state_destructive = _host_state_write_floor(
+            [*write_paths, *_extract_redirect_targets(segment)], asks=self.state_asks)
+        if denied is not None:
+            return denied
+        destructive = destructive or state_destructive
+        for rp in read_paths:
+            if has_placeholder(rp):
+                continue
+            d = self.bash_path_decision(rp, writing=False)
+            if not d.allowed:
+                return PathDecision(False, f"Bash denied: read path '{rp}' — {d.reason}")
+        for rp in write_paths:
+            if has_placeholder(rp):
+                continue
+            d = self.bash_path_decision(rp, writing=True)
+            if not d.allowed:
+                return PathDecision(False, f"Bash denied: write path '{rp}' — {d.reason}")
+            if _TIER_ORDER.get(tier, 0) < _TIER_ORDER["edit"]:
+                tier = "edit"
+
+        for rp in _extract_redirect_targets(segment):
+            if _is_pseudo_path(rp) or has_placeholder(rp):
+                continue
+            d = self.bash_path_decision(rp, writing=True)
+            if not d.allowed:
+                return PathDecision(False, f"Bash denied: redirect target '{rp}' — {d.reason}")
+            if _TIER_ORDER.get(tier, 0) < _TIER_ORDER["edit"]:
+                tier = "edit"
+        for rp in _extract_input_redirects(segment):
+            if _is_pseudo_path(rp) or has_placeholder(rp):
+                continue
+            d = self.bash_path_decision(rp, writing=False)
+            if not d.allowed:
+                return PathDecision(False, f"Bash denied: input redirect '{rp}' — {d.reason}")
+
+        return PathDecision(allowed=True, permission_tier=tier, destructive=destructive)
+
+
+def _classify_command(
+    segment: str, ctx: SecurityContext, *, is_remote: bool, depth: int,
+    dangerous_only: bool = False, remote_host: bool = False,
+    host_asks: bool = False,
+) -> PathDecision:
+    """Classify a segment whose substitutions were already lifted: shell
+    structure, wrappers, the command's tier, role gate and path arguments.
+    An ``ssh`` segment's remote command is judged as the other host's
+    (``_CommandCheck.ssh_remote``) besides the segment's own classification."""
+    check = _CommandCheck(ctx, is_remote=is_remote, depth=depth,
+                          dangerous_only=dangerous_only, remote_host=remote_host,
+                          host_asks=host_asks)
 
     # 1. Shell structure — subshell parens, leading keywords (``do``/``then``/
     #    ``if``/``!``/``{``) and case labels are peeled off so the command
@@ -1532,12 +1841,12 @@ def _classify_command(
     #    structure (``do``, ``then``, ``(``) is read tier.
     body = _strip_shell_structure(segment)
     if not body:
-        return _structural_decision(segment)
+        return check.structural_decision(segment)
     if body != segment.strip():
         # Re-run the catastrophe floor on the peeled body, as every unwrap
         # level does: ``( rm -rf / )`` hides the bare root behind the closing
         # paren's boundary in the raw scan.
-        denied = _floor_denial(body, remote_host=remote_host, host_asks=host_asks)
+        denied = _floor_denial(body, remote_host=remote_host, host_asks=host_asks, words=True)
         if denied is not None:
             return denied
     segment = body
@@ -1558,7 +1867,7 @@ def _classify_command(
     #    ``> out``) is structure — exactly like ``export F=/x`` — not a parse
     #    failure; ``((…))`` arithmetic runs nothing either.
     if segment.startswith("((") or _is_command_less(segment):
-        return _structural_decision(segment)
+        return check.structural_decision(segment)
     cmd_name = _extract_command_name(segment)
     if cmd_name is None:
         # Genuinely unparseable (a dangling backslash, an odd quote): the
@@ -1566,55 +1875,26 @@ def _classify_command(
         # else it is an unknown command, which asks — after every token that
         # looks like a path is checked, so an unparsable form never reaches
         # further than a parsable one would.
-        if dangerous_only:
-            return PathDecision(allowed=True, permission_tier="read")
-        for tok in _path_looking_tokens(segment):
-            if _is_pseudo_path(tok) or has_placeholder(tok):
-                continue
-            d = _bash_path_decision(tok, writing=True)
-            if not d.allowed:
-                return PathDecision(
-                    False,
-                    f"Bash denied: could not parse command, and it names "
-                    f"'{tok}' — {d.reason}",
-                )
-        return PathDecision(allowed=True, permission_tier="ask")
+        return check.unparsed(segment)
 
     # Shell control-flow keywords / no-op builtins → structural, read tier
     # (their redirects still checked).
     if cmd_name in _SHELL_STRUCTURAL:
-        return _structural_decision(segment)
+        return check.structural_decision(segment)
 
     # find -exec <cmd> — recurse the inner (carries the dangerous scan to it, in
     # BOTH modes) so `find . -exec rm -rf / \;` is dangerous-denied; capture the
-    # inner destructiveness for the non-admin tier below.
     # inner destructiveness and the highest inner tier for the non-admin tier
     # below: an exec clause never lowers the tier its command has on its own.
-    find_exec_destructive = False
-    find_exec_tier = ""
-    if cmd_name == "find":
-        for exec_inner in _find_exec_inners(segment):
-            r = _check_command_string(exec_inner, ctx, is_remote=is_remote, depth=depth + 1,
-                                      dangerous_only=dangerous_only, remote_host=remote_host,
-                                      host_asks=host_asks)
-            if not r.allowed:
-                return r
-            find_exec_destructive = find_exec_destructive or r.destructive
-            inner_tier = r.permission_tier or "read"
-            if _TIER_ORDER.get(inner_tier, 0) > _TIER_ORDER.get(find_exec_tier, 0):
-                find_exec_tier = inner_tier
+    decision = check.find_exec(cmd_name, segment)
+    if decision is not None:
+        return decision
 
     # ssh — the remote command runs on the other host: its catastrophes are
     # refused, a host-state write there asks (destructive) instead.
-    ssh_destructive = False
-    if cmd_name == "ssh":
-        remote = remote_command(segment)
-        if remote:
-            r = _check_command_string(remote, ctx, is_remote=is_remote, depth=depth + 1,
-                                      dangerous_only=True, remote_host=True)
-            if not r.allowed:
-                return r
-            ssh_destructive = r.destructive
+    decision = check.ssh_remote(cmd_name, segment)
+    if decision is not None:
+        return decision
 
     # Floor pass: the dangerous scan (in the caller) + the recursions above are the
     # whole check — skip tier / role-gate / path (admin unrestricted beyond it).
@@ -1622,89 +1902,37 @@ def _classify_command(
     # protected (the machine's own OtoDock state, the OAuth credentials, the
     # agent's CLI config): those hold for every role, the admin's included —
     # but not in a command another host runs.
-    if dangerous_only:
-        if is_remote and not remote_host:
-            denied = _remote_protected_denial(cmd_name, segment, ctx)
-            if denied is not None:
-                return denied
-        denied, state_destructive = _host_state_write_floor(
-            [*_extract_path_args(cmd_name, segment)[1], *_extract_redirect_targets(segment)],
-            asks=state_asks)
-        if denied is not None:
-            return denied
-        return PathDecision(allowed=True, permission_tier="read",
-                            destructive=find_exec_destructive or ssh_destructive
-                            or state_destructive)
+    decision = check.floor_pass(cmd_name, segment)
+    if decision is not None:
+        return decision
 
     # ===== Non-admin: tier classification + admin-role-gate + path checks =====
     # Unknown command → "ask" (prompt in default/acceptEdits, run in dontAsk/auto)
     # — NEVER a hard-deny. Known commands keep their tier.
     tier = _BASH_COMMAND_TIER.get(cmd_name) or "ask"
-    if _TIER_ORDER.get(find_exec_tier, 0) > _TIER_ORDER.get(tier, 0):
-        tier = find_exec_tier
+    if cmd_name == "awk" and awk_runs_commands(segment):
+        # awk reads at the read tier unless its program can start a command
+        # (``system(``, a pipe, ``getline``) or runs code the gate cannot see.
+        tier = TIER_EXTENDED
+    if _TIER_ORDER.get(check.find_exec_tier, 0) > _TIER_ORDER.get(tier, 0):
+        tier = check.find_exec_tier
+    if cmd_name == "rsync" and rsync_reaches_host(segment):
+        tier = TIER_ADMIN
 
     # Admin-tier role gating (host-touching ops — docker/systemctl/ssh/apt).
-    # Local sandbox: admin only. Remote satellite: open to manager/editor/admin
+    # Local sandbox: admin, and ssh/scp/rsync to the agent's attached hosts
+    # for a manager or editor. Remote satellite: open to manager/editor/admin
     # (pairing is a trust act; the path policy is the real boundary there).
-    if tier == TIER_ADMIN:
-        if is_remote:
-            if not roles.can_edit(ctx.role):
-                return PathDecision(
-                    False,
-                    f"Bash denied: '{cmd_name}' is restricted to manager / "
-                    f"editor / admin roles on remote satellites (current role: "
-                    f"{ctx.role}).",
-                )
-        elif not roles.is_admin(ctx.role):
-            return PathDecision(
-                False,
-                f"Bash denied: '{cmd_name}' requires platform admin role on "
-                f"local sandbox sessions (current role: {ctx.role}). These "
-                f"commands touch host state outside the sandbox.",
-            )
+    decision = check.role_gate(cmd_name, tier, segment)
+    if decision is not None:
+        return decision
 
-    destructive = (cmd_name in _DESTRUCTIVE_COMMANDS or find_exec_destructive
-                   or ssh_destructive)
+    destructive = (_is_destructive_command(cmd_name) or check.find_exec_destructive
+                   or check.ssh_destructive)
     if cmd_name == "find" and _find_has_delete(segment):
         destructive = True
 
-    read_paths, write_paths = _extract_path_args(cmd_name, segment)
-    denied, state_destructive = _host_state_write_floor(
-        [*write_paths, *_extract_redirect_targets(segment)], asks=state_asks)
-    if denied is not None:
-        return denied
-    destructive = destructive or state_destructive
-    for rp in read_paths:
-        if has_placeholder(rp):
-            continue
-        d = _bash_path_decision(rp, writing=False)
-        if not d.allowed:
-            return PathDecision(False, f"Bash denied: read path '{rp}' — {d.reason}")
-    for rp in write_paths:
-        if has_placeholder(rp):
-            continue
-        d = _bash_path_decision(rp, writing=True)
-        if not d.allowed:
-            return PathDecision(False, f"Bash denied: write path '{rp}' — {d.reason}")
-        if _TIER_ORDER.get(tier, 0) < _TIER_ORDER["edit"]:
-            tier = "edit"
-
-    for rp in _extract_redirect_targets(segment):
-        if _is_pseudo_path(rp) or has_placeholder(rp):
-            continue
-        d = _bash_path_decision(rp, writing=True)
-        if not d.allowed:
-            return PathDecision(False, f"Bash denied: redirect target '{rp}' — {d.reason}")
-        if _TIER_ORDER.get(tier, 0) < _TIER_ORDER["edit"]:
-            tier = "edit"
-    for rp in _extract_input_redirects(segment):
-        if _is_pseudo_path(rp) or has_placeholder(rp):
-            continue
-        d = _bash_path_decision(rp, writing=False)
-        if not d.allowed:
-            return PathDecision(False, f"Bash denied: input redirect '{rp}' — {d.reason}")
-
-    return PathDecision(allowed=True, permission_tier=tier, destructive=destructive)
+    return check.path_checks(cmd_name, segment, tier, destructive)
 
 
 def _check_command_string(
@@ -1753,7 +1981,8 @@ def _check_command_string(
         # line continuation (`rm -rf \<newline>/`) or a lifted heredoc
         # substitution only exist here, so a host-state match that asks is
         # weighed here too.
-        denied = _floor_denial(segment, remote_host=remote_host, host_asks=host_asks)
+        denied = _floor_denial(segment, remote_host=remote_host, host_asks=host_asks,
+                               words=True)
         if denied is not None:
             return denied
         saw_destructive = saw_destructive or (state_asks and _host_state_seen(segment))
@@ -1794,6 +2023,10 @@ def _check_bash(command: str, ctx: SecurityContext) -> PathDecision:
           scan), else unrestricted (tier/path skipped).
       3.  Non-admin → _check_command_string (recursive): dangerous + classify.
     """
+    # No shell argument can carry a NUL: a command holding one is refused
+    # in every context, before anything reads a path of it.
+    if _NUL in command:
+        return PathDecision(False, f"Bash denied: {_NUL_REASON}")
     # 0/0b. Defense-in-depth backstops on the RAW command (catch literal refs
     # anywhere, incl. inside quotes/substitutions as substrings — robust to
     # wrapping). Universal, BEFORE the admin fast-path. See
@@ -1803,7 +2036,7 @@ def _check_bash(command: str, ctx: SecurityContext) -> PathDecision:
         return PathDecision(
             False,
             "Bash denied: command references OAuth credentials directory. "
-            "Manage accounts via Settings → Integrations.",
+            "Manage accounts in User Settings, Integrations.",
         )
     if path_roles.command_references_protected_agent_config(command):
         return PathDecision(False, "Bash denied: agent CLI config files are protected.")
@@ -2372,7 +2605,7 @@ def _check_powershell_string(
         saw_enc = True
         try:
             inner = base64.b64decode(m.group(1)).decode("utf-16-le")
-        except Exception:
+        except ValueError:
             inner = ""
         if not inner.strip():
             continue
@@ -2430,12 +2663,14 @@ def _check_powershell(command: str, ctx: SecurityContext) -> PathDecision:
       3.  Non-admin → _check_powershell_string (recursive): dangerous + encoded +
           classify.
     """
+    if _NUL in command:
+        return PathDecision(False, f"PowerShell denied: {_NUL_REASON}")
     from services import path_roles
     if path_roles.command_references_protected_path(command):
         return PathDecision(
             False,
             "PowerShell denied: command references OAuth credentials directory. "
-            "Manage accounts via Settings → Integrations.",
+            "Manage accounts in User Settings, Integrations.",
         )
     if path_roles.command_references_protected_agent_config(command):
         return PathDecision(False, "PowerShell denied: agent CLI config files are protected.")
@@ -2485,7 +2720,7 @@ def _check_webfetch(url: str, ctx: SecurityContext) -> PathDecision:
     try:
         parsed = urllib.parse.urlparse(url)
         hostname = parsed.hostname or ""
-    except Exception:
+    except ValueError:
         return PathDecision(False, "WebFetch denied: malformed URL")
 
     if not hostname:

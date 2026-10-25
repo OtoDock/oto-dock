@@ -93,6 +93,27 @@ def test_audio_settings_roundtrip_and_policy_excluded(client):
 
 # --- user prefs -----------------------------------------------------------
 
+def test_language_candidates_are_validated_to_the_supported_set(client):
+    resp = client.put("/v1/admin/audio/settings", json={"language_candidates": "el-GR, xx, en, el"})
+    assert resp.status_code == 200
+    assert client.get("/v1/admin/audio/settings").json()["language_candidates"] == "el,en"
+    client.put("/v1/admin/audio/settings", json={"language_candidates": "zz"})
+    assert client.get("/v1/admin/audio/settings").json()["language_candidates"] == "en,el,de,es,fr,it"
+
+
+def test_identifier_settings_are_validated(client):
+    # The cap is fixed (8), never this host's CPU count: the daemon clamps
+    # the value again to its own machine on read.
+    for raw, want in (("0", "1"), ("2", "2"), ("9999", "8"), (" 1 ", "1")):
+        assert client.put("/v1/admin/audio/settings", json={"language_identify_threads": raw}).status_code == 200
+        assert client.get("/v1/admin/audio/settings").json()["language_identify_threads"] == want
+    assert client.put("/v1/admin/audio/settings", json={"language_identify_threads": "many"}).status_code == 400
+    for raw, want in (("yes", "true"), ("0", "false"), ("True", "true"), ("no", "false")):
+        assert client.put("/v1/admin/audio/settings", json={"language_identify_enabled": raw}).status_code == 200
+        assert client.get("/v1/admin/audio/settings").json()["language_identify_enabled"] == want
+    assert client.put("/v1/admin/audio/settings", json={"language_identify_enabled": "maybe"}).status_code == 400
+
+
 def test_user_audio_prefs_roundtrip(client):
     p = client.get("/v1/users/me/audio-prefs").json()
     assert p["stt_mode"] == "auto" and p["tts_voice_map"] == {}
@@ -104,3 +125,15 @@ def test_user_audio_prefs_roundtrip(client):
 def test_user_audio_prefs_rejects_bad_mode(client):
     r = client.put("/v1/users/me/audio-prefs", json={"stt_mode": "bogus"})
     assert r.status_code == 400
+
+
+def test_audio_settings_are_checked_before_any_is_written(client):
+    # A bad value after a good one: nothing is written.
+    r = client.put("/v1/admin/audio/settings", json={"vad_threshold": "0.61", "language_identify_threads": "many"})
+    assert r.status_code == 400
+    assert client.get("/v1/admin/audio/settings").json().get("vad_threshold") != "0.61"
+    # A JSON array or object is refused, never stored as its text.
+    for bad in (["a", "b"], {"k": "v"}):
+        r = client.put("/v1/admin/audio/settings", json={"wake_word_threshold": bad})
+        assert r.status_code == 400 and "wake_word_threshold" in r.json()["detail"]
+    assert "wake_word_threshold" not in client.get("/v1/admin/audio/settings").json()

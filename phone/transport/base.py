@@ -90,6 +90,7 @@ class MediaTransport(ABC):
         (barge-in hard cut). Default no-op: paced transports buffer at most
         one in-flight frame. A transport whose peer buffers ahead (Twilio
         media streams) drops its queued audio and cuts the peer's buffer."""
+        return
 
     def pause_playback(self) -> None:
         """Tell a lead-buffering peer to SUSPEND playback in place (barge-in
@@ -97,10 +98,12 @@ class MediaTransport(ABC):
         transports have at most one frame in flight, so the daemon-side
         sender stopping IS the pause. The duplex connection forwards a
         control frame so the browser player suspends its scheduled lead."""
+        return
 
     def resume_playback(self) -> None:
         """Undo ``pause_playback``: the peer resumes from where it froze.
         Default no-op (see pause_playback)."""
+        return
 
     def poll_dtmf(self) -> tuple[str, int] | None:
         """Next side-channel keypad digit as ``(digit, duration_ms)``, or

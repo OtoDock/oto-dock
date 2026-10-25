@@ -42,9 +42,10 @@ class TestBetweenTurnsFrames:
                     ws.client_send({"type": "chat_read", "chat_id": chat_id})
                     await ws.expect({"type": "chat_read", "chat_id": chat_id})
 
-                    ws.client_send({"type": "mode_change", "mode": "acceptEdits",
+                    ws.client_send({"type": "mode_change", "mode": "dontAsk",
                                     "chat_id": chat_id})
-                    await ws.expect({"type": "mode_changed", "mode": "acceptEdits"})
+                    await ws.expect({"type": "mode_changed", "mode": "dontAsk",
+                                     "chat_id": chat_id})
 
                     ws.client_send({"type": "model_change", "model": TEST_MODEL,
                                     "chat_id": chat_id})
@@ -60,7 +61,7 @@ class TestBetweenTurnsFrames:
                     await sync_dispatch(ws)
 
                 row = temp_db.get_chat(chat_id)
-                assert row["permission_mode"] == "acceptEdits"
+                assert row["permission_mode"] == "dontAsk"
                 assert row["model"] == TEST_MODEL
                 ws.client_send({"type": "close"})
         run_ws_scenario(scenario)
@@ -94,7 +95,7 @@ class TestBetweenTurnsFrames:
 
 class TestSendPath:
     def test_first_prompt_title_and_second_send_run_off_loop(self, temp_db, monkeypatch, loop_db_guard):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
         layer = FakeExecutionLayer()
         layer.turn_events = [
             CommonEvent(type=TEXT, data={"content": "Hello there!"}),
@@ -154,6 +155,45 @@ class TestSendPath:
         run_ws_scenario(scenario)
 
 
+class TestIdleAbort:
+    def test_an_idle_abort_runs_off_loop_and_stamps_no_cancelled_turn(
+            self, temp_db, monkeypatch, loop_db_guard):
+        """A Stop between turns, with nothing running: the row read rides the
+        chat's lane, ``aborted`` answers, and no cancelled turn is stamped (a
+        later background review would read the stamp as a refusal)."""
+        from core.events.common_events import DONE, TEXT, CommonEvent
+        layer = FakeExecutionLayer()
+        layer.turn_events = [
+            CommonEvent(type=TEXT, data={"content": "Hello there!"}),
+            CommonEvent(type=DONE, data={}),
+        ]
+        stub_dashboard_seams(monkeypatch, layer)
+        slug = make_test_agent()
+        set_username("user-admin", "admin")
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                chat_id, sid = await warm_new_chat(ws, layer, slug)
+                ws.client_send({"type": "chat", "text": "Say hello", "chat_id": chat_id})
+                while (await ws.next_frame(5))["type"] != "turn_complete":
+                    pass
+                with loop_db_guard.active():
+                    ws.client_send({"type": "abort"})
+                    await ws.expect({"type": "aborted", "chat_id": chat_id})
+                    # The hard abort's liveness clear fans its badge frames
+                    # out before the barrier's pong.
+                    ws.client_send({"type": "ping"})
+                    while (await ws.next_frame(5))["type"] != "pong":
+                        pass
+                row = temp_db.get_chat(chat_id)
+                assert row["last_turn_aborted"] is False
+                assert layer.aborted == [sid]
+                ws.client_send({"type": "close"})
+            ws.no_more_frames()
+        run_ws_scenario(scenario)
+
+
 def _task_chat_with_sibling(temp_db, slug: str) -> tuple[str, str]:
     """A task chat whose session also ran a later turn in its own chat (a
     continue_session task): the resume aggregates the sibling's rows."""
@@ -176,6 +216,7 @@ class TestTaskChatReads:
         """The idle poll of a task chat looks up a related turn's pump
         without reading the database on the loop."""
         import asyncio
+
         from ws.dashboard import DashboardConnection
         slug = make_test_agent()
         cid, _ = _task_chat_with_sibling(temp_db, slug)

@@ -1,0 +1,233 @@
+{
+ "calls": [
+  {
+   "args": [
+    "char-agent",
+    "user-viewer"
+   ],
+   "call": "build_session_mcp_config",
+   "kwargs": {
+    "call_ask_back": false,
+    "delegation_targets": [
+     "char-agent"
+    ],
+    "extra_mcps": [
+     "call-control-mcp"
+    ],
+    "interactive_local": false,
+    "mcp_config_format": "json",
+    "phone_mode": false,
+    "placement": {},
+    "session_id": "s-chat",
+    "target_browser": null,
+    "task_scope": "user",
+    "user_role": "editor",
+    "username": "vic"
+   }
+  },
+  {
+   "args": [],
+   "call": "build_oto_env",
+   "kwargs": {
+    "agent_name": "char-agent",
+    "available_scopes": [
+     "user",
+     "agent"
+    ],
+    "default_scope": "user",
+    "force_config": false,
+    "memory_agent_enabled": true,
+    "memory_user_enabled": true,
+    "platform_role": "member",
+    "session_id": "s-chat",
+    "task_type": "",
+    "user_role": "editor",
+    "user_sub": "user-viewer",
+    "username": "vic"
+   }
+  },
+  {
+   "args": [
+    "char-agent",
+    [
+     "char-files",
+     "phone-mcp"
+    ]
+   ],
+   "call": "get_dynamic_contexts",
+   "kwargs": {
+    "delegation_roster": {
+     "char-agent": [
+      {
+       "catalog": [
+        {
+         "good_at": "",
+         "model_id": "claude-char-1",
+         "tier": 2,
+         "tier_label": "strong"
+        }
+       ],
+       "default_model": "claude-char-1",
+       "is_default": true,
+       "local_only": false,
+       "models": [
+        "claude-char-1"
+       ],
+       "more": 0,
+       "path": "claude-code-cli",
+       "tiers": {
+        "claude-char-1": 2
+       }
+      }
+     ]
+    },
+    "delegation_targets": [
+     "char-agent"
+    ],
+    "meetings_access": [
+     {
+      "description": "",
+      "display_name": "Char Agent",
+      "role": "editor",
+      "slug": "char-agent"
+     },
+     {
+      "description": "",
+      "display_name": "Char Shared",
+      "role": "viewer",
+      "slug": "char-shared"
+     }
+    ],
+    "nouser_reads": false,
+    "placement": {},
+    "trigger_payload": null,
+    "user_role": "editor",
+    "user_sub": "user-viewer"
+   }
+  },
+  {
+   "args": [
+    "char-agent"
+   ],
+   "call": "build_agent_prompt",
+   "kwargs": {
+    "client_type": "dashboard",
+    "dynamic_contexts": null,
+    "excluded_mcps": null,
+    "execution_path": "claude-code-cli",
+    "mount_shared": true,
+    "placement": {},
+    "role": "editor",
+    "sandboxed": true,
+    "skip_http_mcps": false,
+    "user_role": "editor",
+    "username": "vic"
+   }
+  },
+  {
+   "args": [
+    null
+   ],
+   "call": "build_client_context",
+   "kwargs": {}
+  },
+  {
+   "args": [
+    {
+     "agent": "char-agent",
+     "config_visible": false,
+     "is_admin_agent": false,
+     "role": "editor",
+     "username": "vic"
+    }
+   ],
+   "call": "build_permission_context",
+   "kwargs": {
+    "assigned_mcp_names": [
+     "char-files",
+     "phone-mcp"
+    ],
+    "execution_path": "claude-code-cli"
+   }
+  },
+  {
+   "args": [
+    "char-agent"
+   ],
+   "call": "ensure_persistent_agent_dir",
+   "kwargs": {
+    "execution_path": "claude-code-cli",
+    "scope": "user",
+    "username": "vic"
+   }
+  },
+  {
+   "args": [
+    "claude-code-cli",
+    "user-viewer"
+   ],
+   "call": "resolve_subscription_env",
+   "kwargs": {
+    "agent_info": {
+     "admin_only": false,
+     "collaborative": true,
+     "color": "",
+     "community_template": null,
+     "community_template_data": {},
+     "community_template_version": null,
+     "created_at": "<stamp>",
+     "created_by": "",
+     "default_effort": "",
+     "default_execution_mode": "",
+     "default_for_new_users_role": "",
+     "default_model": "",
+     "default_scope": "user",
+     "department_id": "",
+     "department_level_id": "",
+     "description": "",
+     "display_name": "Char Agent",
+     "execution_path": "claude-code-cli",
+     "execution_paths": "",
+     "execution_target": "local",
+     "setup_completed_at": null,
+     "slug": "char-agent",
+     "updated_at": "<stamp>"
+    },
+    "model": "claude-char-1",
+    "sticky_scope": "local:/char/.claude"
+   }
+  }
+ ],
+ "config": {
+  "agent_name": "char-agent",
+  "client_type": "dashboard",
+  "credential_env": {
+   "CHAR_FILES_DIR": "/users/vic/workspace/files",
+   "MCP_CRED": "1",
+   "OTO_STUB": "1",
+   "PROXY_API_KEY": "<session-token>"
+  },
+  "effort": "high",
+  "execution_path": "claude-code-cli",
+  "extra_env": {
+   "SUB_ENV": "1"
+  },
+  "model": "claude-char-1",
+  "multi_value_envs": {
+   "OTO_STUB_ROOTS": ":"
+  },
+  "sandbox_host_claude_dir": "/char/.claude",
+  "security_context": {
+   "agent": "char-agent",
+   "config_visible": false,
+   "is_admin_agent": false,
+   "role": "editor",
+   "username": "vic"
+  },
+  "subscription_id": "sub-char",
+  "subscription_user_sub": "user-viewer",
+  "system_prompt": "PROMPT\n\nCLIENT\n\nPERMISSIONS",
+  "token_minted_at": "<now>",
+  "user_sub": "user-admin"
+ }
+}

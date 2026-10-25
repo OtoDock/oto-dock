@@ -12,8 +12,7 @@ Run: env TEST_DATABASE_URL=... venv/bin/pytest tests/session/test_shared_chat_se
 
 import uuid
 
-from core.events.common_events import CommonEvent, TEXT, DONE
-
+from core.events.common_events import DONE, TEXT, CommonEvent
 from tests.fixtures.ws_dashboard_harness import (
     FakeExecutionLayer,
     dashboard_connection,
@@ -210,6 +209,7 @@ class TestRecycleAcrossAReconnect:
         check reads the live session and recycles it, so the turn never runs
         on a session warmed for someone else."""
         import asyncio
+
         from core.events import input_queue
         from core.events.common_events import TurnInput
         layer, slug, live_sid, cid = _setup(monkeypatch)

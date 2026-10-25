@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useSyncExternalStore } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '../api/auth'
 import { encodePathSegments } from '../lib/paths'
+import { blobUrl, holdBlobUrl } from '../lib/media/blobUrl'
 
 /**
  * Image thumbnail loader for workspace grid tiles.
@@ -31,16 +32,17 @@ export function useFileThumbnail(agent: string, path: string, isImage: boolean) 
     },
   })
 
-  const [src, setSrc] = useState<string | null>(null)
-  useEffect(() => {
-    if (!query.data) {
-      setSrc(null)
-      return
-    }
-    const url = URL.createObjectURL(query.data)
-    setSrc(url)
-    return () => URL.revokeObjectURL(url)
-  }, [query.data])
+  // The blob's URL is held while this tile shows it (lib/media/blobUrl):
+  // made on the first hold, read back once held, revoked with the last.
+  const blob = query.data ?? null
+  const subscribe = useCallback((notify: () => void) => {
+    if (!blob) return () => {}
+    const release = holdBlobUrl(blob)
+    notify()
+    return release
+  }, [blob])
+  const getSnapshot = useCallback(() => (blob ? blobUrl(blob) : null), [blob])
+  const src = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 
   return { src, loading: query.isLoading }
 }

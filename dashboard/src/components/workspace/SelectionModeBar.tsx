@@ -8,6 +8,38 @@ interface Props {
   onDone: () => void
 }
 
+function ChipButton({
+  onClick,
+  title,
+  disabled,
+  tone,
+  children,
+}: {
+  onClick: () => void
+  title: string
+  disabled?: boolean
+  tone?: 'danger'
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-label={title}
+      className={`shrink-0 w-9 h-9 flex items-center justify-center rounded-full transition-colors ${
+        disabled
+          ? 'bg-action-fg/10 text-action-fg/50'
+          : tone === 'danger'
+            ? 'bg-status-danger-fill text-on-solid hover:bg-status-danger-fill-hover'
+            : 'bg-action-fg/10 text-action-fg hover:bg-action-fg/20'
+      }`}
+    >
+      {children}
+    </button>
+  )
+}
+
 /**
  * Mobile-only action bar shown while the user is in selection mode (or
  * has more than zero items selected). Matches the Google Drive / Files
@@ -26,38 +58,8 @@ export default function SelectionModeBar({
   onDelete,
   onDone,
 }: Props) {
-  const ChipButton = ({
-    onClick,
-    title,
-    disabled,
-    tone,
-    children,
-  }: {
-    onClick: () => void
-    title: string
-    disabled?: boolean
-    tone?: 'danger'
-    children: React.ReactNode
-  }) => (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      aria-label={title}
-      className={`shrink-0 w-9 h-9 flex items-center justify-center rounded-full transition-colors ${
-        disabled
-          ? 'text-p-text-light/50'
-          : tone === 'danger'
-            ? 'text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20'
-            : 'text-p-text-secondary hover:bg-p-surface-hover'
-      }`}
-    >
-      {children}
-    </button>
-  )
-
   return (
-    <div className="md:hidden flex items-center gap-1 px-2 py-1.5 bg-brand text-white">
+    <div className="md:hidden flex items-center gap-1 px-2 py-1.5 bg-action text-action-fg">
       <ChipButton onClick={onCut} title="Cut" disabled={!canWrite || selectedCount === 0}>
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
           <circle cx="6" cy="6" r="3" />
@@ -88,12 +90,12 @@ export default function SelectionModeBar({
           <path fillRule="evenodd" d="M5 3.25V4H2.75a.75.75 0 000 1.5h.3l.815 8.15A1.5 1.5 0 005.357 15h5.285a1.5 1.5 0 001.493-1.35l.815-8.15h.3a.75.75 0 000-1.5H11v-.75A2.25 2.25 0 008.75 1h-1.5A2.25 2.25 0 005 3.25z" clipRule="evenodd" />
         </svg>
       </ChipButton>
-      <span className="flex-1 text-xs text-white/90 text-center font-medium">
+      <span className="flex-1 text-xs text-action-fg text-center font-medium">
         {selectedCount} selected
       </span>
       <button
         onClick={onDone}
-        className="shrink-0 px-3 py-1 text-xs font-medium rounded-full bg-white/15 hover:bg-white/25 text-white transition-colors"
+        className="shrink-0 px-3 py-1 text-xs font-medium rounded-full border border-action-fg text-action-fg hover:bg-action-fg/10 transition-colors"
       >
         Done
       </button>

@@ -4,7 +4,6 @@
  * 2026-09-10; the effect and its dependency array stay in the component). */
 import type { Dispatch, RefObject, SetStateAction } from 'react'
 import * as THREE from 'three'
-import type { User } from '../../api/auth'
 import type { DelegationEdge } from '../../api/departments'
 import { prunePointers, type PointerMap } from './gestures'
 import type { MapCluster, MapLayout, MapNode, StageLayout } from './layout'
@@ -29,7 +28,9 @@ export interface SceneBuildParams {
   streamingSet: Set<string>
   edges: DelegationEdge[]
   nodeBySlug: Map<string, MapNode>
-  user: User | null
+  /** The favorite's slug (the user's only field the builders read — a
+   * refreshed user snapshot with the same favorite never rebuilds). */
+  defaultAgent: string | undefined
   moveFromRef: RefObject<string | null>
   linkFromRef: RefObject<string | null>
   attemptLinkRef: RefObject<(from: string, to: string) => Promise<void>>
@@ -53,7 +54,7 @@ export interface BuildSceneInput extends Omit<
 
 export function buildScene({
   bag, layout, stage, stageData, heat, liveSet, streamingSet, edges,
-  nodeBySlug, user, activePointers, gestureOwnedIds, moveFromRef,
+  nodeBySlug, defaultAgent, activePointers, gestureOwnedIds, moveFromRef,
   linkFromRef, attemptLinkRef, openAgentRef, onDeptTapRef, setPopup,
 }: BuildSceneInput) {
   const { dynamic } = bag
@@ -100,7 +101,7 @@ export function buildScene({
 
   const params: SceneBuildParams = {
     bag, dynamic, layout, staged, arc, positions, memberCount, heat, liveSet,
-    streamingSet, edges, nodeBySlug, user, moveFromRef, linkFromRef,
+    streamingSet, edges, nodeBySlug, defaultAgent, moveFromRef, linkFromRef,
     attemptLinkRef, openAgentRef, onDeptTapRef, setPopup,
   }
   buildDais(params)

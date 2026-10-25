@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { pushEscHandler } from '@/lib/escStack'
+import { POPOVER } from '@/components/ui/classes'
+import { GLASS, GLASS_HOVER, GLASS_PRESSED } from '@/components/ui/glass'
 import { isCtrlHeld, setCtrlHold, subscribeCtrlHold } from '@/lib/terminalCtrlHold'
 
 /**
@@ -34,11 +36,12 @@ const NAV_KEYS: Array<{ label: string; seq: string }> = [
   { label: '⌫', seq: '\x7f' },
 ]
 
-function keyBtn(extra = '') {
+// The key bar sits over the terminal beside the composer: chat chrome, so
+// glass; a key that is on (Ctrl armed, the open ⋯) shows the pressed glass.
+function keyBtn(pressed = false) {
   return (
-    'shrink-0 min-w-[2.25rem] h-8 px-2 rounded-lg border border-p-border-light ' +
-    'bg-white/80 dark:bg-gray-900/80 text-xs font-medium text-p-text ' +
-    'hover:bg-black/5 dark:hover:bg-white/10 active:scale-95 transition ' + extra
+    'shrink-0 min-w-[2.25rem] h-8 px-2 rounded-control text-xs font-medium text-primary ' +
+    'active:scale-95 transition ' + (pressed ? GLASS_PRESSED : `${GLASS} ${GLASS_HOVER}`)
   )
 }
 
@@ -69,16 +72,16 @@ export default function TerminalControlBar({ send, className }: Props) {
   return (
     <div ref={expandRef} className={`relative ${className || ''}`}>
       {expanded && (
-        <div className="absolute bottom-full left-0 right-0 z-50 mb-2 rounded-xl border border-p-border-light bg-white/95 dark:bg-gray-900/95 backdrop-blur-xs shadow-2xl p-2.5">
+        <div className={`absolute bottom-full left-0 right-0 z-50 mb-2 ${POPOVER} p-2.5`}>
           <div className="mb-2 flex items-center justify-between">
-            <span className="text-[11px] font-semibold text-p-text-light">More keys</span>
-            <button onClick={() => setExpanded(false)} className="text-p-text-light hover:text-p-text text-sm px-1">&times;</button>
+            <span className="text-2xs font-semibold text-tertiary">More keys</span>
+            <button onClick={() => setExpanded(false)} className="text-tertiary hover:text-primary text-sm px-1">&times;</button>
           </div>
           <div className="flex flex-wrap gap-1.5">
             <button
               onMouseDown={(e) => e.preventDefault()}
               onClick={toggleCtrl}
-              className={keyBtn(ctrlArmed ? 'bg-black/10! dark:bg-white/15!' : '')}
+              className={keyBtn(ctrlArmed)}
               title="Arm Ctrl for the next typed key (c → ^C)"
             >
               Ctrl
@@ -95,8 +98,8 @@ export default function TerminalControlBar({ send, className }: Props) {
           <button
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => setCtrlHold(false)}
-            className={keyBtn('bg-black/10! dark:bg-white/15!')}
-            title="Ctrl armed — next typed key becomes its control byte; tap to disarm"
+            className={keyBtn(true)}
+            title="Ctrl is on. The next key you type gets Ctrl. Tap to turn it off."
           >
             Ctrl
           </button>
@@ -109,7 +112,7 @@ export default function TerminalControlBar({ send, className }: Props) {
         <button onClick={() => send('\x1b[C')} className={keyBtn()}>→</button>
         <button onClick={() => send(TAB)} className={keyBtn()}>Tab</button>
         <button onClick={() => send(CR)} className={keyBtn()}>Enter</button>
-        <button onClick={() => setExpanded((v) => !v)} className={keyBtn(expanded ? 'bg-black/10! dark:bg-white/15!' : '')} title="More keys">⋯</button>
+        <button onClick={() => setExpanded((v) => !v)} className={keyBtn(expanded)} title="More keys">⋯</button>
       </div>
     </div>
   )

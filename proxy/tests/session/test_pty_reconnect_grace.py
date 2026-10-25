@@ -78,8 +78,8 @@ async def test_reconcile_ptys_readopts_and_cancels_timer():
     """A reconnect with the session still alive: re-adopt (keep the handle),
     cancel the grace timer, notify the viewer "reconnected", reap no orphan."""
     from core.remote import remote_pty
-    from core.session import interactive_session
     from core.remote.satellite_connection import SatelliteConnectionManager
+    from core.session import interactive_session
 
     cm = SatelliteConnectionManager()
     cm.send_fire_and_forget = AsyncMock()
@@ -128,8 +128,7 @@ async def test_reconcile_ptys_exits_dead_and_closes_orphan():
 async def test_expire_pty_grace_terminates():
     """When the window lapses with no reconnect, the held PTYs are torn down
     (today's immediate behavior, just delayed)."""
-    from core.remote import satellite_connection as sc
-    from core.remote import remote_pty
+    from core.remote import remote_pty, satellite_connection as sc
     from core.remote.satellite_connection import SatelliteConnectionManager
 
     cm = SatelliteConnectionManager()
@@ -167,7 +166,7 @@ if __name__ == "__main__":
         try:
             asyncio.run(_t())
             print(f"PASS {_t.__name__}")
-        except Exception:
+        except Exception:  # noqa: BLE001  # the script runner reports each failure and runs the rest
             _fails += 1
             traceback.print_exc()
             print(f"FAIL {_t.__name__}")

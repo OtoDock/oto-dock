@@ -47,11 +47,11 @@ import struct
 import subprocess
 import termios
 from collections import deque
-from typing import Awaitable, Callable, Optional, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 
 from .._vendored.terminal_queries import PasteModeTracker
 
-logger = logging.getLogger("claude-proxy.pty_relay")
+logger = logging.getLogger("otodock.pty_relay")
 
 DEFAULT_SCROLLBACK_BYTES = 256 * 1024
 DEFAULT_ROWS, DEFAULT_COLS = 24, 80
@@ -59,8 +59,8 @@ _READ_CHUNK = 65536
 
 # on_output(rendered_bytes) / on_exit(exit_code|None) — either may be sync or
 # return a coroutine (it's scheduled on the loop).
-OutputCb = Callable[[bytes], "Optional[Awaitable[None]]"]
-ExitCb = Callable[["Optional[int]"], "Optional[Awaitable[None]]"]
+OutputCb = Callable[[bytes], "Awaitable[None] | None"]
+ExitCb = Callable[["int | None"], "Awaitable[None] | None"]
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -85,7 +85,7 @@ class PtyProcess:
         rows: int,
         cols: int,
         on_output: OutputCb,
-        on_exit: Optional[ExitCb],
+        on_exit: ExitCb | None,
         scrollback_limit: int,
     ) -> None:
         self._popen = popen
@@ -96,7 +96,7 @@ class PtyProcess:
         self._on_output = on_output
         self._on_exit = on_exit
         self._scrollback_limit = scrollback_limit
-        self._scrollback: "deque[bytes]" = deque()
+        self._scrollback: deque[bytes] = deque()
         self._scrollback_len = 0
         self._paste_mode = PasteModeTracker()
         self._loop = asyncio.get_running_loop()
@@ -104,7 +104,7 @@ class PtyProcess:
         # The output reader is a TASK (not a fire-and-forget add_reader
         # callback) so it can AWAIT the backpressured lane put — pausing the read
         # when the WS is congested/disconnected instead of dropping bytes.
-        self._reader_task: "asyncio.Task | None" = None
+        self._reader_task: asyncio.Task | None = None
         # Input awaiting the (non-blocking) master fd: the kernel PTY buffer
         # is small and a busy TUI drains it between frames, so a large paste
         # hits partial writes / EAGAIN. The remainder is buffered and flushed
@@ -292,7 +292,7 @@ class PtyProcess:
             os.close(self.master_fd)
         self._loop.create_task(self._reap_and_notify())
 
-    def _signal_group(self, sig: "signal.Signals") -> None:
+    def _signal_group(self, sig: signal.Signals) -> None:
         # The child is its own session/group leader (setsid in the preexec), so
         # its pgid == pid; signal the whole group to take down the TUI and
         # anything it spawned. bwrap's --die-with-parent is the backstop.
@@ -304,7 +304,7 @@ class PtyProcess:
             logger.debug("pty %s: killpg(%s) failed: %s", self.pid, sig, exc)
 
     async def _reap_and_notify(self) -> None:
-        code: Optional[int] = None
+        code: int | None = None
         try:
             code = await self._loop.run_in_executor(None, self._wait_child)
         except Exception:
@@ -317,7 +317,7 @@ class PtyProcess:
             except Exception:
                 logger.exception("pty %s: on_exit callback failed", self.pid)
 
-    def _wait_child(self) -> Optional[int]:
+    def _wait_child(self) -> int | None:
         # Runs in a threadpool. SIGTERM was already sent in close() (or the
         # child exited on its own); escalate to SIGKILL if it lingers.
         try:
@@ -336,11 +336,11 @@ def spawn_pty(
     argv: Sequence[str],
     *,
     env: dict,
-    cwd: Optional[str] = None,
+    cwd: str | None = None,
     rows: int = DEFAULT_ROWS,
     cols: int = DEFAULT_COLS,
     on_output: OutputCb,
-    on_exit: Optional[ExitCb] = None,
+    on_exit: ExitCb | None = None,
     scrollback_limit: int = DEFAULT_SCROLLBACK_BYTES,
 ) -> PtyProcess:
     """Spawn ``argv`` on a fresh PTY and return a loop-integrated handle.

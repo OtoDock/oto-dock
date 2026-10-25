@@ -17,7 +17,7 @@ import pytest
 pytest.importorskip("onnxruntime")
 pytest.importorskip("transformers")
 
-from audio.providers.turn import smart_turn  # noqa: E402
+from audio.providers.turn import smart_turn
 
 
 def test_vendored_feature_extractor_ships():

@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import type { NotificationDelivery } from '../api/notifications'
 import { fetchDeliveries, markRead as apiMarkRead, markAllRead as apiMarkAllRead, dismissDelivery } from '../api/notifications'
+import { debugWarn } from '../lib/debug/log'
 
 export interface ToastItem {
   id: string
@@ -92,7 +93,7 @@ export function useNotifications() {
       const data = await fetchDeliveries()
       setDeliveries(data)
     } catch (e) {
-      console.error('Failed to fetch notifications:', e)
+      debugWarn('Failed to fetch notifications:', e)
     } finally {
       setLoading(false)
     }
@@ -113,7 +114,7 @@ export function useNotifications() {
       )
       setUnreadCount(c => Math.max(0, c - 1))
     } catch (e) {
-      console.error('Failed to mark read:', e)
+      debugWarn('Failed to mark read:', e)
     }
   }, [])
 
@@ -124,7 +125,7 @@ export function useNotifications() {
       setDeliveries(prev => prev.map(d => ({ ...d, read: 1, read_at: new Date().toISOString() })))
       setUnreadCount(0)
     } catch (e) {
-      console.error('Failed to mark all read:', e)
+      debugWarn('Failed to mark all read:', e)
     }
   }, [])
 
@@ -146,14 +147,15 @@ export function useNotifications() {
       const was = deliveries.find(d => d.id === deliveryId)
       if (was && !was.read) setUnreadCount(c => Math.max(0, c - 1))
     } catch (e) {
-      console.error('Failed to dismiss:', e)
+      debugWarn('Failed to dismiss:', e)
     }
   }, [deliveries])
 
   // Cleanup timers on unmount
   useEffect(() => {
+    const pending = timers.current
     return () => {
-      timers.current.forEach(t => clearTimeout(t))
+      pending.forEach(t => clearTimeout(t))
     }
   }, [])
 

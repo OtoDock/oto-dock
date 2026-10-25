@@ -80,3 +80,45 @@ def test_create_refuses_a_level_off_the_ladder(client, monkeypatch, tmp_path):
                                         "default_effort": "maximum"})
     assert r.status_code == 400
     assert not agent_store.agent_exists("effort-create")
+
+
+@pytest.mark.parametrize("body", [
+    {"display_name": "Admin"},                       # the slug comes from the name
+    {"display_name": "Platform helper", "slug": "system"},
+    {"display_name": "Who", "slug": " ME "},
+])
+def test_create_refuses_a_reserved_slug(client, monkeypatch, tmp_path, body):
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+    r = client.post("/v1/agents", json={**body, "execution_path": "claude-code-cli"})
+    assert r.status_code == 400
+    assert "is reserved by OtoDock. Pick another ID." in r.json()["detail"]
+    assert not list(tmp_path.iterdir())
+
+
+def test_an_agent_that_already_holds_a_reserved_slug_keeps_working(client):
+    agent_store.create_agent("setup", "Setup from an older release")
+    r = client.patch("/v1/agents/setup", json={"description": "still here"})
+    assert r.status_code == 200, r.text
+
+
+def test_a_create_that_fails_says_so_without_the_cause(client, monkeypatch, tmp_path, caplog):
+    from pathlib import Path
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
+
+    def no_room(self, *a, **kw):
+        raise PermissionError(13, "Permission denied", str(self))
+    with monkeypatch.context() as m, caplog.at_level("ERROR", logger="otodock"):
+        m.setattr(Path, "write_text", no_room)
+        r = client.post("/v1/agents", json={"display_name": "Folder Fails",
+                                            "execution_path": "claude-code-cli"})
+    assert (r.status_code, r.json()["detail"]) == (
+        500, "Could not create the agent's files. The server log has the details.")
+    assert str(tmp_path) not in r.text and "Permission denied" in caplog.text
+
+    def broken(*a, **kw):
+        raise RuntimeError("duplicate key value violates unique constraint")
+    monkeypatch.setattr(agent_store, "create_agent", broken)
+    r = client.post("/v1/agents", json={"display_name": "Record Fails",
+                                        "execution_path": "claude-code-cli"})
+    assert (r.status_code, r.json()["detail"]) == (
+        500, "Could not save the new agent. The server log has the details.")

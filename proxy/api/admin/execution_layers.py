@@ -7,19 +7,30 @@ execution layer.  User endpoints for connecting personal subscriptions.
 from __future__ import annotations
 
 import logging
+from typing import cast
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 import config
-from auth.providers import get_current_user, require_auth, require_admin, UserContext, require_user
-from storage.billing import subscription_status, subscription_store
-from storage.pg import run_db
+from auth import roles
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_admin,
+    require_auth,
+    require_user,
+)
 from core.execution_layer import PROVIDER_LOCAL, LayerCapabilities, provider_entry
 from core.session.session_manager import (
-    capabilities_for_path, get_all_capabilities, get_all_layers, get_layer_capabilities,
+    capabilities_for_path,
+    get_all_capabilities,
+    get_all_layers,
+    get_layer_capabilities,
 )
 from services.engines import subscription_pool
-from auth import roles
+from storage.billing import subscription_status, subscription_store
+from storage.pg import run_db
 
 logger = logging.getLogger(__name__)
 # No route here takes an anonymous caller (auth.providers.require_user).
@@ -120,13 +131,6 @@ class SetPlatformAuthRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _require_admin(user: UserContext | None) -> None:
-    # Delegates to the shared guard: 401 if unauthenticated (user is None),
-    # then 403 if not admin. Without the None-guard, an unauthenticated request
-    # dereferenced `user.role` → AttributeError → 500 instead of 401.
-    require_admin(user)
-
-
 def _valid_layers() -> set[str]:
     """The registered engine ids — read per call, never frozen at import.
 
@@ -211,14 +215,14 @@ def _attach_windows(subs: list[dict]) -> None:
     for s in subs:
         if s.get("auth_type") != "oauth":
             continue
-        w = readings.get(s.get("id"))
+        w = readings.get(cast("str", s.get("id")))
         s["windows"] = subscription_windows.to_public(w) if w else None
 
 
 @router.get("/v1/admin/execution-layers")
 async def admin_list_layers(user: UserContext = Depends(get_current_user)):
     """List all execution layers with subscriptions, models, and pool stats."""
-    _require_admin(user)
+    require_admin(user)
 
     capabilities = get_all_capabilities()
 
@@ -277,7 +281,7 @@ async def admin_list_subscriptions(
     layer: str,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    require_admin(user)
     if layer not in _valid_layers():
         raise HTTPException(400, f"Invalid layer: {layer}")
 
@@ -297,7 +301,7 @@ async def admin_add_subscription(
     req: AddSubscriptionRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    require_admin(user)
     if layer not in _valid_layers():
         raise HTTPException(400, f"Invalid layer: {layer}")
     caps = capabilities_for_path(layer)
@@ -372,8 +376,8 @@ async def admin_add_subscription(
             label=req.label,
             credential_data=cred_data,
         )
-    except subscription_store.SubscriptionExists:
-        raise HTTPException(409, "A credential of this kind already exists on this engine")
+    except subscription_store.SubscriptionExists as exc:
+        raise HTTPException(409, "A credential of this kind already exists on this engine") from exc
     subscription_pool.schedule_rebind("admin subscription add")
     await _subscriptions_changed(layer)
     return sub
@@ -386,7 +390,7 @@ async def admin_update_subscription(
     req: UpdateSubscriptionRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    require_admin(user)
 
     def _job() -> dict | None:
         # Owner-or-infra only: an admin manages their OWN accounts (and owner-less
@@ -423,7 +427,7 @@ async def admin_delete_subscription(
     force: bool = False,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    require_admin(user)
     sub = await run_db(subscription_store.get_subscription, sub_id)
     if not sub:
         raise HTTPException(404, "Subscription not found")
@@ -524,7 +528,7 @@ async def admin_add_local_endpoint(
 ):
     """Connect a self-hosted OpenAI-compatible server to one or both engines:
     one ``local_endpoint`` subscription row per engine, same credential."""
-    _require_admin(user)
+    require_admin(user)
     # The local-endpoint route: refused outright on hosted OtoDock, where
     # no engine declares a local provider.
     if config.OTODOCK_CLOUD:
@@ -543,7 +547,7 @@ async def admin_add_local_endpoint(
     url = subscription_store.normalize_endpoint_url(req.endpoint_url)
     if not url:
         raise HTTPException(400, "endpoint_url required")
-    api_path = entries[0].get("api_path") or ""
+    api_path = cast("dict", entries[0]).get("api_path") or ""
     if api_path and not url.lower().endswith(api_path):
         # The provider's OpenAI-compatible API answers under this path (Ollama:
         # /v1 — the server root answers only the native API; Discover strips
@@ -592,7 +596,7 @@ async def admin_set_local_endpoint_engine(
     missing sibling row (copying the credential) or re-activates a disabled
     one; disabling sets that engine's row ``disabled`` — its models stay,
     hidden from the pickers while no active row serves their provider."""
-    _require_admin(user)
+    require_admin(user)
     if req.layer not in _layers_with_auth_type("local_endpoint"):
         raise HTTPException(400, f"Local endpoints cannot serve: {req.layer}")
 
@@ -637,7 +641,7 @@ async def admin_delete_local_endpoint(
     force: bool = False,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    require_admin(user)
     g = await run_db(_local_group, group)
     _require_group_owner(g, user)
     # Same rule as the subscription delete: live bindings decide, the stored
@@ -673,7 +677,7 @@ async def admin_list_models(
     layer: str,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    require_admin(user)
     if layer not in _valid_layers():
         raise HTTPException(400, f"Invalid layer: {layer}")
     # Sync builtins from capabilities
@@ -693,7 +697,7 @@ async def admin_add_model(
     req: AddModelRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    require_admin(user)
     if layer not in _valid_layers():
         raise HTTPException(400, f"Invalid layer: {layer}")
     if not req.model_id or not req.display_name:
@@ -726,7 +730,7 @@ async def admin_discover_models(
     user: UserContext = Depends(get_current_user),
 ):
     """Discover available models from a provider using subscription credentials."""
-    _require_admin(user)
+    require_admin(user)
     if layer not in _valid_layers():
         raise HTTPException(400, f"Invalid layer: {layer}")
 
@@ -753,8 +757,10 @@ async def admin_discover_models(
             endpoint_url=creds.get("endpoint_url"),
         )
     except Exception as e:
-        logger.error(f"Model discovery failed for {provider}: {e}")
-        raise HTTPException(502, f"Failed to fetch models from {provider}: {e}")
+        logger.warning("Model discovery failed for %s: %s", provider, e)
+        raise HTTPException(
+            502, f"Could not list the models of {provider}. Check its key or address, then try again.",
+        ) from e
 
     return {"models": models, "provider": provider}
 
@@ -766,7 +772,7 @@ async def admin_bulk_add_models(
     user: UserContext = Depends(get_current_user),
 ):
     """Add multiple models at once (from discover-models flow)."""
-    _require_admin(user)
+    require_admin(user)
     if layer not in _valid_layers():
         raise HTTPException(400, f"Invalid layer: {layer}")
     targets = [t for t in dict.fromkeys(req.layers or [layer]) if t]
@@ -799,7 +805,7 @@ async def admin_toggle_model(
     req: UpdateModelRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    require_admin(user)
     tier_sent = "tier" in req.model_fields_set
 
     def _job() -> dict | None:
@@ -840,7 +846,7 @@ async def admin_delete_model(
     model_id: int,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    require_admin(user)
     deleted = await run_db(subscription_store.delete_model, model_id)
     if not deleted:
         raise HTTPException(404, "Model not found or is a builtin model")
@@ -853,7 +859,7 @@ async def admin_delete_model(
 
 @router.get("/v1/admin/execution-layers/pool-status")
 async def admin_pool_status(user: UserContext = Depends(get_current_user)):
-    _require_admin(user)
+    require_admin(user)
     capabilities = get_all_capabilities()
 
     def _job() -> dict:
@@ -875,7 +881,7 @@ async def admin_set_platform_auth(
     req: SetPlatformAuthRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    _require_admin(user)
+    require_admin(user)
     await run_db(subscription_store.set_user_allow_platform_auth, user_sub, req.allowed)
     subscription_pool.schedule_rebind("platform-auth toggle")
     return {"user_sub": user_sub, "allow_platform_auth": req.allowed}
@@ -965,8 +971,8 @@ async def user_add_subscription(
             label=req.label,
             credential_data={"api_key": api_key},
         )
-    except subscription_store.SubscriptionExists:
-        raise HTTPException(409, "You already have an API key on this engine")
+    except subscription_store.SubscriptionExists as exc:
+        raise HTTPException(409, "You already have an API key on this engine") from exc
     subscription_pool.schedule_rebind("user subscription add")
     return sub
 

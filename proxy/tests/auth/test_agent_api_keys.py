@@ -17,10 +17,10 @@ from fastapi.testclient import TestClient
 
 from app import app
 from auth.providers import create_session_jwt
-from tests.conftest import live_session_token
 from services.infra import api_key_manager
 from storage import database as task_store
 from storage.agents import agent_store
+from tests.conftest import live_session_token
 
 client = TestClient(app)
 AGENT = "keys-proj"

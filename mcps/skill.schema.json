@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.9.0/mcps/skill.schema.json",
+  "title": "OtoDock skill front matter",
+  "description": "The catalog rules for the front matter of an Agent Skill's SKILL.md (OtoDock is a fair source project): the YAML mapping between the two --- fences that open the file, cut by the rule of services/mcp/skill_format.py (the engines' own). It applies to the skills of a skill package (the community skills catalog) and to the skills an MCP package bundles. At install the platform keeps only name, description, license, compatibility and metadata and drops every other key, so a key an engine would read as a permission never reaches it; other keys are allowed here because they are dropped, not refused. A flat skill file without front matter is legal in an MCP package (the platform writes one when it serves the skill); a skill package's SKILL.md carries one.",
+  "$comment": "Custom annotation keywords, ignored by validators. x-otodock-first-release: the platform release that first ships this schema. x-otodock-hint: the words a finding uses for the rule, {value} standing for the value found.",
+  "x-otodock-first-release": "1.9.0",
+  "type": "object",
+  "required": ["name", "description"],
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "x-otodock-hint": "invalid skill name {value} (lowercase letters and digits in words joined by single dashes, at most 64 characters)",
+      "description": "The skill's id: the folder name, the id the package manifest declares and the name the engines index. Never rename a shipped skill: installs keep rows by it.",
+      "not": {"type": "string", "pattern": "\\n"}
+    },
+    "description": {
+      "type": "string",
+      "pattern": "\\S",
+      "x-otodock-hint": "must not be empty: it is what tells the engine when to load the skill",
+      "description": "What the skill does and when to use it, with the words a task would carry: an on-demand skill is loaded when its description matches. Quote it when it holds a colon. The Agent Skills format recommends at most 1,024 characters."
+    },
+    "license": {"type": "string", "description": "The license of the skill's content, or a pointer to its LICENSE.txt."},
+    "compatibility": {"type": "string", "description": "What the skill needs from its environment, in a sentence."},
+    "metadata": {
+      "type": "object",
+      "description": "Free key and value pairs. A bare skill folder installed on its own takes its version from metadata.version."
+    },
+    "allowed-tools": {
+      "description": "Dropped at install: the platform's own permission rules decide what a skill's agent may run."
+    }
+  }
+}

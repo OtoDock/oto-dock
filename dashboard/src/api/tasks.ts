@@ -1,5 +1,11 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { apiOk } from '../lib/http/apiJson'
+import { AUTO_REVIEW_MODE, DONT_ASK_MODE } from '../lib/engines/modes'
+
+/** A task's permission mode: Don't Ask (every tool runs) or Auto (the
+ *  engine's own reviewer checks what needs approval). */
+export type TaskPermissionMode = typeof DONT_ASK_MODE | typeof AUTO_REVIEW_MODE
 
 export interface Task {
   /** Set on a row the offboarding transfer moved: the first creator's sub,
@@ -52,6 +58,15 @@ export interface Task {
   user_tz?: string | null
   effective_tz?: string
   schedule_text?: string
+  // Where the task runs: a machine id, '' for the agent's default (then the
+  // label and state are ''). The label is the machine's name, the state its
+  // live state (lib/status/machine.ts). Optional: absent on an older proxy.
+  target_machine?: string
+  target_machine_label?: string
+  target_machine_state?: string
+  // The run's permission mode: Don't Ask or Auto (the engine's own review).
+  // Optional: absent on an older proxy.
+  permission_mode?: TaskPermissionMode
   can_run: boolean
   can_delete: boolean
   can_pause: boolean
@@ -178,6 +193,40 @@ export const useResumeTask = () => {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['tasks'] })
       qc.invalidateQueries({ queryKey: ['schedules'] })
+    },
+  })
+}
+
+/** The value of a task's "Runs on" that follows the agent's default. */
+export const TASK_MACHINE_DEFAULT = 'default'
+
+// Where a task runs (POST /v1/tasks/{id}/edit with only `machine`): a
+// machine id, or TASK_MACHINE_DEFAULT for the agent's default. A refusal
+// raises the server's sentence.
+/** A task's permission mode: Don't Ask or Auto (POST /v1/tasks/{id}/edit,
+ *  `permission_mode`; refused when the task's engine has no reviewer). */
+export const useEditTaskMode = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ taskId, mode }: { taskId: string; mode: TaskPermissionMode }): Promise<void> => {
+      await apiOk(`/v1/tasks/${taskId}/edit`, { method: 'POST', json: { permission_mode: mode } },
+        "Could not change the task's mode")
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+    },
+  })
+}
+
+export const useEditTaskMachine = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ taskId, machine }: { taskId: string; machine: string }): Promise<void> => {
+      await apiOk(`/v1/tasks/${taskId}/edit`, { method: 'POST', json: { machine } },
+        'Could not change where the task runs')
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['tasks'] })
     },
   })
 }

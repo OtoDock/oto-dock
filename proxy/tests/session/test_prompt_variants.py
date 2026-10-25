@@ -9,12 +9,12 @@ LLM comprehension).
 
 import sys
 
-
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
-from auth.path_policy import (  # noqa: E402
+from auth.path_policy import (
     SecurityContext,
     _build_execution_environment_section,
 )

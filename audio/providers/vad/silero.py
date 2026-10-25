@@ -84,13 +84,15 @@ class SileroVad:
         self._model = SileroModel(self._sample_rate)
         self._chunk_bytes = self._model.window_size_samples * SAMPLE_WIDTH
         logger.info(
-            f"Silero VAD loaded (threshold={threshold}, "
-            f"bargein_threshold={self._bargein_threshold}, "
-            f"silence={silence_duration_ms}ms, "
-            f"bargein_silence={self._bargein_silence_ms}ms, "
-            f"bargein_debounce={self._bargein_debounce_chunks} chunks, "
-            f"bargein_ratio={self._bargein_chunk_ratio}, "
-            f"rate={self._sample_rate})"
+            "Silero VAD loaded (threshold=%s, "
+            "bargein_threshold=%s, "
+            "silence=%sms, "
+            "bargein_silence=%sms, "
+            "bargein_debounce=%s chunks, "
+            "bargein_ratio=%s, "
+            "rate=%s)",
+            threshold, self._bargein_threshold, silence_duration_ms, self._bargein_silence_ms,
+            self._bargein_debounce_chunks, self._bargein_chunk_ratio, self._sample_rate
         )
 
     def _reset_model(self) -> None:
@@ -115,7 +117,7 @@ class SileroVad:
             self._bargein_chunks_since_reset = 0
             # Always reset Silero on mode transitions
             self._reset_model()
-            logger.debug(f"VAD: Silero state reset (bargein={'on' if enabled else 'off'})")
+            logger.debug("VAD: Silero state reset (bargein=%s)", 'on' if enabled else 'off')
 
     def reset(self) -> None:
         """Reset state for a new call."""
@@ -166,13 +168,15 @@ class SileroVad:
         if self.state == VadState.IDLE and not is_speech:
             if self._bargein_mode and (probability >= 0.3 or rms >= 400):
                 logger.debug(
-                    f"VAD: near-miss prob={probability:.2f} rms={rms:.0f} "
-                    f"(thresh={active_threshold} min_rms={self._min_energy_rms})"
+                    "VAD: near-miss prob=%.2f rms=%.0f "
+                    "(thresh=%s min_rms=%s)",
+                    probability, rms, active_threshold, self._min_energy_rms
                 )
             elif not self._bargein_mode and (probability >= 0.3 or rms >= 200):
                 logger.debug(
-                    f"VAD: near-miss prob={probability:.2f} rms={rms:.0f} "
-                    f"(thresh={active_threshold} min_rms={self._min_energy_rms})"
+                    "VAD: near-miss prob=%.2f rms=%.0f "
+                    "(thresh=%s min_rms=%s)",
+                    probability, rms, active_threshold, self._min_energy_rms
                 )
 
         if self.state == VadState.IDLE:
@@ -215,8 +219,9 @@ class SileroVad:
                         self._early_speech_count = 0
                         self._probable_fired = False
                         logger.info(
-                            f"VAD: SPEECH_START bargein "
-                            f"(prob={probability:.2f}, ratio={speech_ratio:.2f})"
+                            "VAD: SPEECH_START bargein "
+                            "(prob=%.2f, ratio=%.2f)",
+                            probability, speech_ratio
                         )
                         return VadEvent.SPEECH_START
 
@@ -228,8 +233,8 @@ class SileroVad:
                 if self._early_speech_count >= 1 and not self._probable_fired:
                     self._probable_fired = True
                     logger.info(
-                        f"VAD: SPEECH_PROBABLE "
-                        f"(prob={probability:.2f}, rms={rms:.0f})"
+                        "VAD: SPEECH_PROBABLE "
+                        "(prob=%.2f, rms=%.0f)", probability, rms
                     )
                     return VadEvent.SPEECH_PROBABLE
             else:
@@ -241,7 +246,7 @@ class SileroVad:
                         self._speech_chunks = 0
                         self._silence_start_ms = None
                         logger.debug(
-                            f"VAD: SPEECH_START (prob={probability:.2f})"
+                            "VAD: SPEECH_START (prob=%.2f)", probability
                         )
                         return VadEvent.SPEECH_START
                 else:
@@ -265,7 +270,7 @@ class SileroVad:
                         # starts fresh — prevents LSTM hidden state from getting
                         # stuck on "not speech" after processing silence.
                         self._reset_model()
-                        logger.debug(f"VAD: SPEECH_END (silence={active_silence_ms}ms)")
+                        logger.debug("VAD: SPEECH_END (silence=%sms)", active_silence_ms)
                         return VadEvent.SPEECH_END
 
         return VadEvent.NONE

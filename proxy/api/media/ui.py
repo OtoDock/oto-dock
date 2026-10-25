@@ -38,17 +38,21 @@ of agent markup: the runtime carries no per-request interpolation.
 import asyncio
 import html as html_escape
 import logging
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
 
 import config
 from api.media.access import can_serve_token
-from api.media.media import MediaUnserveable, locate_media_row
 from auth.lan_check import trusted_forwarded_proto
 from auth.providers import UserContext, get_current_user
 from services.infra import safe_fs
+from services.media.media_pipeline import MediaUnserveable, locate_media_row
 from storage import database as task_store
+
+if TYPE_CHECKING:
+    from starlette.requests import HTTPConnection
 
 logger = logging.getLogger("otodock.ui")
 router = APIRouter()
@@ -74,7 +78,16 @@ _ORIGIN_SCHEMES = {"http": "http", "https": "https", "ws": "http", "wss": "https
 #     see ws/artifact_interactions.py). The host answers with an "action_ack"
 #     message, re-fired in-frame as an `otodock:action-ack` window event
 #     (detail: {status: sent|queued|blocked|denied|unavailable, reason}).
-UI_RUNTIME = """<script>
+# Tailwind's browser build reads this style element: the ``dark:`` variant
+# follows the ``.dark`` class the runtime toggles, never the device's scheme.
+# Inert without tailwind.js, byte-static, allowed by style-src 'unsafe-inline'.
+DARK_VARIANT_STYLE = (
+    '<style type="text/tailwindcss">'
+    "@custom-variant dark (&:where(.dark, .dark *));"
+    "</style>"
+)
+
+UI_RUNTIME = DARK_VARIANT_STYLE + """<script>
 (function(){
   var q = new URLSearchParams(location.search);
   if (q.get('theme') === 'dark') document.documentElement.classList.add('dark');
@@ -147,9 +160,8 @@ UI_RUNTIME = """<script>
 // drawer gestures die over an artifact/app. Recognize the SAME horizontal
 // swipe the host uses (useSwipeGesture's thresholds, incl. the
 // horizontally-scrollable-ancestor skip) and post it up — the host validates
-// the source window and routes it into its gesture bus. Full-document HTML
-// is served verbatim (no runtime), so only fragment-authored content
-// forwards; that matches the authoring contract for apps/artifacts.
+// the source window and routes it into its gesture bus. A full document gets
+// the same runtime before its </body>, so every artifact and app forwards.
 (function(){
   var sx = 0, sy = 0, st = 0, on = false;
   function hscroll(t){
@@ -185,7 +197,7 @@ UI_RUNTIME = """<script>
 </script>"""
 
 
-def request_origin(request: Request) -> str:
+def request_origin(request: "HTTPConnection") -> str:
     """The concrete origin the browser used for this request (also where the
     document's ``/ui-kit/*`` subresources resolve — the CSP pins it because a
     sandboxed document's origin is opaque, so ``'self'`` matches nothing).
@@ -249,7 +261,8 @@ def _ui_response(body: str, origin: str, status_code: int = 200, *,
 
 def is_full_document(content: str) -> bool:
     """Leading ``<!doctype``/``<html`` (after whitespace/comments,
-    case-insensitive) marks a full document → served verbatim."""
+    case-insensitive) marks a full document: it keeps its own head and gets
+    the runtime injected before its ``</body>``."""
     lead = content.lstrip()
     while lead.startswith("<!--"):
         end = lead.find("-->")

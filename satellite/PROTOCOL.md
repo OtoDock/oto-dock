@@ -18,6 +18,11 @@ machine opens no port and needs no VPN.
   secret from pairing, `satellite_version` and the `capabilities` object.
   The platform answers `auth_result`. A version below its
   `MIN_SATELLITE_VERSION` is refused with an upgrade error.
+- **Frames.** Each frame either way is one JSON object with a string
+  `type`. The satellite drops a frame it cannot read, or one that is not an
+  object, with a warning naming its kind and length (never its content),
+  and a frame of a type it does not know with a debug line; the link stays
+  up for both (0.5.155).
 - **A dumb pipe.** The satellite does not parse, filter or interpret an
   engine's output: every NDJSON / JSONL line goes to the platform verbatim
   as a `session_event`. Every turn-end decision (settle, background agents,
@@ -48,6 +53,17 @@ the byte twin of the proxy's `auth/request_path.py`). Docker MCPs stay on the
 platform. An HTTP MCP's URL is rewritten to the tunnel
 (`http://127.0.0.1:<port>/mcp/<slug>/mcp/`).
 
+The tunnel answers some requests itself, with a JSON body `{"error": <code>}`
+and no `detail`: `403 path-not-allowlisted` for a path it does not forward
+(no frame is sent; the platform's own refusal of a path reaches the caller in
+the same shape), `503 tunnel-not-connected` while the link is down,
+`503 tunnel-shutting-down` as the satellite stops, `504 tunnel-no-response`
+when the platform sends no first frame in time and `502 tunnel-disconnected`
+for a request the link dropped on its way. A tool that calls back reads the
+code, not a sentence (every delegation-mcp tool puts them in words, each
+with its own outcome: `_tunnel_sentence`; the other platform MCPs show the
+code).
+
 ### Capabilities
 
 The `capabilities` object in `auth` tells the platform what this satellite
@@ -62,7 +78,13 @@ can do. The platform sends a frame only where it is handled.
 | `engines` | 0.5.124 | the wire ids of the engines this satellite runs. The platform refuses any other engine, and reads an absent value as `claude-code-cli` and `codex-cli`. |
 | `mcp_gateway` | 0.5.132 | vendor MCP credentials go through the loopback gateway. An older satellite keeps the inline shape. |
 | `paced_transfers` | 0.5.137 | `file_pull_cancel` |
+| `session_move` | 0.5.156 | `session_move`: a chat's engine session files moved on and off this machine |
 | `insecure_transport` | | set on an opted-in plaintext link: the platform withholds the update push |
+
+Some frames are gated by the satellite's version instead:
+`session_files_retention` from 0.5.150 (`satellite_supports_session_retention`).
+The `expect` key of a `file_push` goes to every version: an older satellite
+ignores it and commits as before.
 
 `auth_result` carries `cli_pins` (`{claude_code, codex}`): the satellite
 reconciles its installed CLIs to those versions and spawns only a binary
@@ -74,7 +96,7 @@ that satisfies the pin (`host/cli_versions.py`).
 |------|---------|
 | `auth` | Authentication (first message, 5 s timeout): `satellite_version` and the `capabilities` object, with `home_dir`, `otodock_dir` and `mcps_dir` resolved and `home_dir_unresolved` and `otodock_dir_unresolved` as the OS names them (a link or a Windows short name left as it is). |
 | `heartbeat` | System load, active sessions and per-agent stat fingerprints, every 20 s. |
-| `ack` | Command acknowledgment. Carries `results` / `installed_mcps` for `sync_mcps`, and `mcps` for `sync_mcps_verify`. `file_push` is acked when the platform supplied a `command_id`. |
+| `ack` | Command acknowledgment. Carries `results` / `installed_mcps` for `sync_mcps`, and `mcps` for `sync_mcps_verify`. `file_push` is acked when the platform supplied a `command_id`: `ok` with the committed file's `size` and `mtime_ns` (0.5.150), or `stale` with `reason` (`changed`, `live`) and the file's current `size` and `mtime_ns` when the push left the file alone. |
 | `session_event` | A raw CLI / Codex event, forwarded verbatim. A Codex revive whose `thread/resume` was refused first sends `{type: "_resume_handle", handle}`, and the platform records it as the session's thread (0.5.138). |
 | `session_started` | The process spawned. |
 | `session_ended` | The process exited. |
@@ -102,7 +124,7 @@ that satisfies the pin (`host/cli_versions.py`).
 | Type | Purpose |
 |------|---------|
 | `auth_result` | The authentication answer, with `cli_pins`. |
-| `start_session` | Spawn a CLI or Codex session. Carries `hook_scripts`, `use_native_permissions` (Claude), `multi_value_envs` (`{env_var: separator}` for joined path lists such as `OTO_ALLOWED_ROOTS=":"`) and the session's MCP `env` (manifest-declared `path_env` values and the standard `OTO_*` set, all sandbox-style virtual paths, translated before the spawn, see "Path translation"). From 0.5.139 `command_wrappers` (`bin/gh`, `bin/gh.cmd`) are written beside the hook scripts, `OTO_HOOKS_DIR` and `OTO_HOOK_PY` are set and `bin` leads the session's `PATH`, so `git` and `gh` ask the platform for the connected GitHub account's token per command (`POST /v1/hooks/cli-credential`) and no environment or file holds it. An older satellite ignores the key. Claude payloads add `disallowed_tools`, the platform-wide deny list written into the scope's shared `settings.json` (a session's own denials never ride it: the permission gate refuses them). Codex payloads add `sandbox_mode`, the mapped `effort`, `auth_json`, `permission_mode` (the live platform mode for a 0.5.143 satellite, and below it `judge` for a check's judge and `""` otherwise), `codex_hooks_floor` (0.5.118), `codex_attended_floor` (0.5.143), `local_model_provider` (0.5.116: `{base_url, env_key}` for a local OpenAI-compatible endpoint, written into `config.toml` as `model_provider = "oto_local"`, and the key rides the payload `env` under the `env_key` name), and from 0.5.117 `stream_idle_timeout_ms` and `catalog_json` (written as `<CODEX_HOME>/models.json` so Codex defers its MCP tools on a local model, and the warm gate then waits for every configured server, 90 s at most on a local model, before the ack). |
+| `start_session` | Spawn a CLI or Codex session. Carries `hook_scripts`, `use_native_permissions` (Claude), `multi_value_envs` (`{env_var: separator}` for joined path lists such as `OTO_ALLOWED_ROOTS=":"`) and the session's MCP `env` (manifest-declared `path_env` values and the standard `OTO_*` set, all sandbox-style virtual paths, translated before the spawn, see "Path translation"). From 0.5.139 `command_wrappers` (`bin/gh`, `bin/gh.cmd`) are written beside the hook scripts, `OTO_HOOKS_DIR` and `OTO_HOOK_PY` are set and `bin` leads the session's `PATH`, so `git` and `gh` ask the platform for the connected GitHub account's token per command (`POST /v1/hooks/cli-credential`) and no environment or file holds it. An older satellite ignores the key. Since platform 1.9.0 the payload `env` also carries `OTO_CLI_TOKEN`, the session's command-line token, the bearer the helper presents on that route (a session token minted since 1.9.0 is refused there); every satellite version passes it on unchanged, since the payload `env` is overlaid on the CLI's own, and the stdio MCP entries of the shipped config name it empty. Every payload carries `permission_mode`, the platform's word for the session's mode (`ask`, `autoReview`, `dontAsk`, `plan`, the unattended `auto`, `judge`); a satellite before 0.5.156 is sent the older words instead (`default` for Ask, `acceptEdits` for Auto) and runs them as before. Claude payloads add `cli_permission_mode`, Claude Code's own word for the mode (`default`, `auto`, `dontAsk`, `plan`; the unattended `auto` is `default`), which a 0.5.156 satellite spawns by, and `disallowed_tools`, the platform-wide deny list written into the scope's shared `settings.json` (a session's own denials never ride it: the permission gate refuses them). Codex payloads add `sandbox_mode`, the mapped `effort`, `auth_json`, `permission_mode` (the live platform mode for a 0.5.143 satellite, and below it `judge` for a check's judge and `""` otherwise), `codex_hooks_floor` (0.5.118), `codex_attended_floor` (0.5.143), `local_model_provider` (0.5.116: `{base_url, env_key}` for a local OpenAI-compatible endpoint, written into `config.toml` as `model_provider = "oto_local"`, and the key rides the payload `env` under the `env_key` name), and from 0.5.117 `stream_idle_timeout_ms` and `catalog_json` (written as `<CODEX_HOME>/models.json` so Codex defers its MCP tools on a local model, and the warm gate then waits for every configured server, 90 s at most on a local model, before the ack). |
 | `send_message` | A user message for the session. |
 | `steer_turn` / `codex_steer` | A message written into a running headless turn (Claude from 0.5.128). The platform asks the version first, and an older satellite keeps the message queued for the next turn. One handler serves both and acks a strict `{steered}`. |
 | `resume_session_stream` | Replay a turn's retained buffer to a platform that re-adopts the session after a restart: a begin marker, the replay, then the live stream. |
@@ -113,16 +135,17 @@ that satisfies the pin (`host/cli_versions.py`).
 | `abort` | Interrupt a running session. For the Claude CLI it is a tree kill (the hard fallback since 0.5.89, see `interrupt_turn`). Codex interrupts its daemon's turn (`turn/interrupt`, the daemon and its MCPs survive), the platform's graceful Codex path. |
 | `interrupt_turn` | The soft abort for a headless Claude CLI (0.5.89): writes `control_request {interrupt}` to its stdin. The turn closes with a normal `result`, and the process and its MCPs survive. Claude only. The platform escalates to `abort` after 12 s if the turn does not close. |
 | `close_session` | A clean shutdown. An optional `incarnation` (0.5.138) closes only the session object that carries it, so a close decided on a `sessions_alive` report never ends a session a later `start_session` put under the same id. Without the key the session holding the id closes. |
-| `control_request` | A model or mode change, written to the CLI's stdin as `{"type":"control_request",...}`. A Codex session applies `set_model` and `set_permission_mode` (`sandbox_mode`, and from 0.5.143 `permission_mode`) on its next `turn/start`. |
+| `control_request` | A model or mode change, written to the CLI's stdin as `{"type":"control_request",...}`. A Claude `set_permission_mode` carries the CLI's own word (`default`, `auto`, `dontAsk`, `plan`) and is written verbatim. A Codex session applies `set_model` and `set_permission_mode` (`sandbox_mode`, and from 0.5.143 `permission_mode`, an older word for a satellite before 0.5.156) on its next `turn/start`. |
 | `control_response` | The answer to a native `can_use_tool` prompt, written to the CLI's stdin. From 0.5.140 in the CLI's own shape: `response.response` with `behavior` (`allow` with the `updatedInput` the CLI printed, or `deny` with its message), the decision taken from the platform's `response` when its `request_id` matches, else from `approved`. |
 | `credentials_update` | The token-rotation fan-out: `{agent_slug, dir_relative, kind, content, command_id}` rewrites one scope's CLI credential file with a freshly rotated token. `kind` names the engine's row in `satellite/engines.py` (`claude`: `.claude/.credentials.json`, `codex`: `.codex/auth.json`). The target must be that engine's config folder inside the agent tree, relative, with no traversal, or the frame is refused. These files never sync, so this push is their only delivery. The running CLIs pick the rewrite up on their own. |
 | `mcp_gateway_token` | (0.5.132) One vendor MCP credential for the satellite-local gateway: `{session_id, token_hash, mcp, header, value, expires_in, upstream}`. See "The credential gateway". `expires_in: 0` is a revoke. From 0.5.140 it carries the refusal's `kind` and `reason` and leaves a tombstone, so the session's next request is refused at once with why (reconnect the account in Settings, Integrations). The platform sends a machine's revokes again right after it reconnects. |
 | `mcp_gateway_wipe` | (0.5.132) Remove a session's pushed credentials, by `token_hash`, or by `session_id` when the hash is absent. Sent at the session's close or purge. |
 | `request_manifest` | Request the file manifest for a sync. An optional `page_size` asks for pages, and `report_skipped: true` (0.5.145) asks for the `skipped` entries too. The platform asks `report_skipped` only in its merge and only of a 0.5.145 satellite. Without it the reply never holds an entry without a hash. |
-| `file_push` | Push a file, written beneath the agent's folder through `host/safe_fs.py` with no link followed: a temp file, fsync, rename in the parent (or append to `<path>.partial` and rename on the last chunk). A link on the way is an error. With a `command_id` the satellite acks after the write, a write barrier for the platform. |
+| `file_push` | Push a file, written beneath the agent's folder through `host/safe_fs.py` with no link followed: a temp file, fsync, rename in the parent (or append to `<path>.partial` and rename on the last chunk). A link on the way is an error. With a `command_id` the satellite acks after the write, a write barrier for the platform. A write frame from a 1.9.0 platform carries `expect`: the stat of this machine's copy the platform knows (`{size, mtime_ns}`, the manifest's rounding allowed) or `"live"` when it knows none. A regular file at the name whose stat differs, or one written within the last 5 s by this machine's clock when the platform knows none, is not replaced (0.5.150, `LIVE_WRITE_WINDOW_S`): the ack is `stale`, the staged bytes are removed, and a chunked push is refused at its first chunk and checked again at its last. A missing file, a link or a directory at the name is never stale; a frame without `expect` commits as before. A write into an engine home outside a person's own folders (`transport/file_sync.is_unsynced_engine_home_path`) is refused with `status: "rejected"`: those files are this machine's, and a platform before 1.9.0 still sends them (0.5.150). From 0.5.156 the path is canonicalised before that check (on Windows trailing dots and spaces dropped from every segment first, as Win32 drops them; `.` and empty segments dropped; the case folded where the filesystem folds it) and a `satellite_host` write landing under an engine home inside the agents tree is refused the same way, the paths compared canonical (realpath on both sides, the path taken as given and resolved, so an alias of the agents folder or a link inside it is caught): only `session_move` places a chat's session files. |
 | `file_pull` | Pull a file (clamped to the agent folder, streamed from a descriptor opened beneath the agents root with no link followed). From 0.5.137 each block is read off the event loop and the pull is registered by its `request_id` until it ends. |
 | `file_pull_cancel` | (0.5.137) `{request_id}`: stop a pull the platform gave up on and drop its queued chunks. An unknown id is ignored. |
 | `file_stat` | A cheap revalidation probe for a cached file, answered as an ack and checked as `file_pull` is. |
+| `session_move` | (0.5.156) A chat's engine session files, moved with the chat to another place: `{op, engine, agent_slug, username, refs, move_id?, rel?}`. The platform names the engine (a row of `engines.py`), the agent, the scope's user (empty: the `workspace` home) and the session's ids (`refs`: the session id and the thread id, UUID-shaped); the satellite resolves the home itself and accepts a file only where the engines' own layout names it a file of those ids (`host/session_retention.classify`): Claude's `.claude/projects/<key>/<id>.jsonl` with the `<id>/` folder beside it, Codex's `.codex/sessions/YYYY/MM/DD/rollout-<stamp>-<thread>.jsonl`. `list` answers `{files: [{rel, size, sha256}]}`; `stat` (no `move_id`) answers `{files: [{rel, size}]}`, sizes only: the session files themselves (no file of a sibling folder), each size from an lstat that follows no link (a link or anything but a regular file left out), no hash; `pull` (with `rel` and a `request_id`) streams `file_content` as `file_pull` does, from a regular file with one link; `push` (chunks with the hash on the last, acked one by one, written in arrival order) stages beneath `<agent>/.session-move/<move_id>/`, the `.partial` name unlinked at the first chunk and a staged file with more than one link refused; `commit` puts the staged files in place after removing every other copy of the session under the home (one copy per home: a second one makes Claude's resume by id fail) and answers the placed files; `discard` drops the staging; `delete` removes the session's files. Every op works in the engine's own folder: another engine's file of the same id is never listed, removed or replaced. `list`, `pull`, `commit` and `delete` answer `busy` while a live session on the machine holds one of the ids; `stat` and `discard` never do (the move's proof reads a transcript a live session still appends to: its growth is the proof). A staging folder a day old is swept at the satellite's start and at a move's first push into the agent. Inline in the link's loop: a pull is registered before the next frame is read. Nothing on the way is a link (`host/safe_fs.py`). A Claude transcript whose full path would pass 240 characters is placed under the key `-m`. |
 | `sync_mcps` | Batched MCP install, update and removal: per-MCP gzipped base64 tarballs, the manifest, `source`, `source_build`, `version_hash`, `system_requirements`, and from a 1.7.1 platform `remove_any_category`. Answered with `mcp_install_progress` while it works. See "MCP installs". |
 | `sync_mcps_verify` | Compute a fresh `version_hash` for every installed MCP and report it in the ack. Sent on reconnect and before every `sync_mcps` diff. |
 | `step_run` | (0.5.122) An app step or a check's script. See "App steps". |
@@ -132,7 +155,8 @@ that satisfies the pin (`host/cli_versions.py`).
 | `pty_inject` | A platform prompt written into the stdin of a CLI attached through the `otodock` command (how a delegated result reaches it). Answered with `pty_inject_result`. |
 | `local_session_opened` / `local_session_listed` / `local_session_error` | The answers to the `otodock` command's requests (keyed by `request_id`). |
 | `policy_update` | A live refresh of the machine's path policy (`allow_full_fs`, `device_grants`). |
-| `check_session_resumable` | Whether a chat's CLI or Codex session can be resumed on this machine. |
+| `check_session_resumable` | Whether a chat's CLI or Codex session can be resumed on this machine. From 0.5.150 the ack carries `reason` (`missing`, `empty`, `unreadable`) beside `resumable: false`, a read fault is an error ack, and the transcript is read in a thread. From 0.5.156 an unsafe agent slug, session id or username is answered `missing` without a lookup. |
+| `session_files_retention` | Remove the CLI transcripts under this machine's agent trees that no chat and no live session names (0.5.150, the platform's retention sweep): `keep` is every session and thread id the platform still needs here: the rows pinned to this machine, the unpinned rows and the scheduled tasks' continued sessions, and the sessions live on this machine; `min_age_s` is the grace a file must be older than by this machine's clock (never under an hour; seven days when the frame names none), `dry_run` lists and counts instead of deleting. A frame without a `keep` list, or with an empty one outside a dry run, is answered with an error and deletes nothing. Answered as an ack with `files` and `bytes` held after the pass, `deleted`, `deleted_bytes` and up to 50 `candidates`. |
 | `uninstall` | Self-uninstall and exit (the machine was deleted in the dashboard). |
 | `update_required` | Auto-update: apply the pushed tarball, swap the install folder atomically, restart. At the auth the platform sends it after `auth_result: ok` (with empty `cli_pins`). In its first 10 s of serving (`UPDATE_HOLD_S`) it first reads the socket for the rest of that window, and a disconnect there drops the push. It then waits up to 20 s for a 0.5.140 satellite's `update_received` and closes with 4007. It does not wait for the update to be applied. From 0.5.140 the satellite answers `update_received` as soon as it reads the frame, before it applies it. |
 | `http_response` / `http_response_chunk` | A tunneled HTTP response for the waiting subprocess. |
@@ -154,7 +178,9 @@ drive and meets the same checks.
 
 (0.5.132) A machine session's **vendor** HTTP MCP leaves the machine with its
 credential added here, from memory. The platform is not in that request's
-path. The tunnel server mounts a handler under `/v1/mcp-gateway/`
+path, except for a credential an agent's GitHub reach narrows: its entry takes
+the tunnel's `/mcp/<name>/` shape on every version, the platform judges and
+forwards it, and its token is never pushed to the machine. The tunnel server mounts a handler under `/v1/mcp-gateway/`
 (`transport/mcp_gateway.py`), and the session's MCP config names
 `http://127.0.0.1:<port>/v1/mcp-gateway/<mcp>/<path>` with the session's
 **own token** as the bearer.
@@ -227,10 +253,15 @@ A persistent subprocess. The satellite:
 5. Leaves the loop on `stop_turn` or EOF, runs the file-change scan and
    sends `turn_ended`.
 
-The CLI prints `control_request.can_use_tool` under `use_native_permissions`,
-and on its own under `--dangerously-skip-permissions` for some calls (a
-background subagent's call, a dangerous `rm` inside `bash -c`). The spawn
-passes `--permission-prompt-tool stdio`. The satellite forwards the request
+The headless spawn's permission flag comes from the payload: `--permission-mode
+plan` in Plan, `--permission-mode auto` when `cli_permission_mode` is `auto`
+(0.5.156: the CLI's classifier judges what the hook leaves undecided), and
+`--dangerously-skip-permissions` otherwise; the last two pass
+`--permission-prompt-tool stdio`. The CLI prints `control_request.can_use_tool`
+under `use_native_permissions`, on its own under `--dangerously-skip-permissions`
+for some calls (a background subagent's call, a dangerous `rm` inside
+`bash -c`), and in auto after its classifier declines several actions in a row
+(the platform refuses that one at once, with a message the model reads). The satellite forwards the request
 unchanged and writes the platform's
 `control_response` to stdin (`send_permission_response()`), in the CLI's own
 shape from 0.5.140 (it remembers the last 64 requests' inputs, so an allow
@@ -249,19 +280,29 @@ The satellite:
    `plugins = false` and `hooks = true` for unattended sessions and, from
    0.5.143, attended chats), the platform's `[mcp_servers.*]` sections
    (`~` expanded, env paths translated, `DISPLAY` injected,
-   interceptor-wrapped) and, on a local endpoint, the `oto_local` provider.
+   interceptor-wrapped; a headless session's carry the per-tool
+   `approval_mode` tables where Codex's own MCP rule and the platform's tier
+   disagree) and, on a local endpoint, the `oto_local` provider.
 2. Spawns the daemon once, then `thread/start` (or `thread/resume` for a
    persisted thread, with `excludeTurns` from 0.5.140) with the mapped
    `sandbox_mode` and `effort`, the approval policy
-   (`codex_approvals.approval_policy`: an attended chat by the platform mode
-   from 0.5.143, `never` in Don't Ask and auto and `untrusted` in every
-   other mode, and an unattended session by the sandbox) and, for unattended
+   and reviewer from the vendored `codex_approvals`, read from the shipped
+   platform mode with an older word taken as its current one
+   (`_platform_mode`): in Auto `on-request` with `approvalsReviewer:
+   "auto_review"`, Codex's own reviewer judging what crosses the sandbox;
+   in every other mode the sandbox's own policy (`never` under
+   `danger-full-access`, `on-request` otherwise) with `approvalsReviewer:
+   "user"`, the bridge taking the requests) and, for unattended
    sessions and from 0.5.143 attended chats, `config = {"bypass_hook_trust":
    true}`. It then waits for the configured MCP servers to start.
 3. Reports the thread id (`codex_thread_id`). A turn that finds the daemon
    dead re-warms it. When `thread/resume` is refused and a new thread
    starts, the new id goes to the platform before `turn/start`.
-4. On each `send_message`, `turn/start` with the turn's approval and sandbox
+4. Each `turn/start` asks for the reasoning summary (`summary: "auto"`,
+   0.5.158) unless the session saw it refused: a turn whose final error or
+   failed completion says the organization is not verified for summaries is
+   dropped and run once more without it, and the session stops asking.
+5. On each `send_message`, `turn/start` with the turn's approval and sandbox
    policy. A forwarder ships every daemon notification verbatim, a
    background sub-agent's events after the main turn included. Approvals
    and questions go to the platform over the tunnel (`/v1/hooks/permission`,
@@ -275,10 +316,11 @@ The satellite:
 
 No effort mapping or sandbox default is decided here: the platform is the
 single source, including which sessions run the hook floor
-(`codex_hooks_floor` for unattended sessions, judged in every mode, and
-`codex_attended_floor` from 0.5.143 for attended chats, whose daemon env adds
-`OTO_HOOK_BRIDGED`: the gate judges the turns Codex runs under `never` and
-stands aside while the bridge asks).
+(`codex_hooks_floor` for unattended sessions and `codex_attended_floor` from
+0.5.143 for attended chats). From 0.5.156 the gate judges every call of both
+and the daemon env never carries `OTO_HOOK_BRIDGED`; from 0.5.143 to 0.5.155
+an attended chat's bridge asks for every command and the gate, under that
+flag, stands aside on such a turn.
 
 ### Interactive terminals (`pty_open`)
 
@@ -286,8 +328,12 @@ Both engines can also run as a full interactive TUI under a real PTY,
 driven from the dashboard's terminal or a local `otodock` command
 (`pty_relay` on Unix, `winpty_relay` / ConPTY on Windows, and `pty_session.py`
 and `codex_pty_session.py` on the shared `pty_session_base`). The Claude TUI takes
-the headless argv without `-p` and the stream flags. The Codex TUI passes
-`--no-daemon` on the fresh and the resume form (0.5.135). Output streams back
+the headless argv without `-p` and the stream flags, with a real
+`--permission-mode` (`terminal_permission_mode`: the payload's
+`cli_permission_mode` when it is `auto` or `plan`, else `default`; from an older
+platform, its mode word when the CLI knows it). The Codex TUI passes
+`--no-daemon` on the fresh and the resume form (0.5.135), and in Auto
+`-c approvals_reviewer="auto_review"` (0.5.156). Output streams back
 as base64 `pty_output` on a **lossless, backpressured lane** (a full lane
 pauses the PTY read instead of dropping bytes), keystrokes arrive as
 `pty_input`, and the engine's own transcript file is tailed into
@@ -301,7 +347,11 @@ machine's agent in the current folder. The client talks to a local control
 socket (`~/.oto-dock/run/otodock.sock`, mode `0600` in a `0700` folder, or a
 per-install named pipe on Windows) whose format is `terminal/otodock_proto.py`.
 The daemon (`terminal/local_socket.py`) brokers the session through the
-websocket (`local_session_*` frames). **The platform derives the identity from
+websocket (`local_session_*` frames). `--mode ask|auto|dontAsk|plan` (default
+`auto`) picks the chat's permission mode and is sent as the platform's word
+(`ask`, `autoReview`, `dontAsk`, `plan`; the older `default` and `acceptEdits`
+are taken too). A satellite before 0.5.156 sends `--mode` as typed, and the
+platform reads its `auto` as Don't Ask. **The platform derives the identity from
 the machine's owner, and the client's fields are untrusted input.** When the
 dashboard takes a session over, `pty_local_detach` detaches the terminal while
 the PTY keeps running. Such chats are marked `origin = 'otodock'` with their
@@ -343,7 +393,7 @@ Agent folders are synced continuously, in real time during a turn:
 | `config/` | platform to satellite | the platform (admin-managed, pushed at session start) |
 | `workspace/` | both ways | last writer wins |
 | `users/{name}/` | both ways | last writer wins |
-| `.claude/`, `.codex/` (anywhere in the path) | platform to satellite | the platform (regenerated each session) |
+| `.claude/`, `.codex/` (anywhere in the path) | platform to satellite | the platform (regenerated each session); under an engine home (`workspace/.claude`, `users/<u>/.codex`) only a person's own folders sync (`skills`, `commands`, `agents`, `output-styles` under `.claude`; `prompts`, `skills` under `.codex`), the rest is this machine's (0.5.150), except a chat's session files a move places (`session_move`, 0.5.156) |
 
 - **At session start** the platform requests a manifest, diffs it with its
   own and pushes what is missing or changed before the engine spawns.
@@ -386,6 +436,15 @@ Agent folders are synced continuously, in real time during a turn:
   walk) and switches back to blocking only then: on Windows
   `os.set_blocking` takes only a pipe, and calling it on a regular file
   failed every hash from 0.5.131 to 0.5.143 (fixed in 0.5.144).
+- **A push never replaces a file this machine is changing** (0.5.150). The
+  platform's write frames say which copy they expect to replace (`expect`,
+  above); a copy that moved since, or one written moments ago, stays, the
+  ack says so with the copy's stat, and the platform keeps its own copy and
+  compares both at the next merge, newest wins. A script appending to a log
+  under the workspace keeps its file and its later lines (before, the
+  rename left it writing an unlinked inode). The window between the stat
+  and the rename is narrowed, not closed, and a delete of a live file still
+  removes it.
 
 ### Path translation
 
@@ -432,7 +491,7 @@ the missing or outdated ones in `sync_mcps` (protocol 0.3.0).
 
 ## Resilience
 
-- **Reconnect:** jittered exponential backoff, 1 s to a 30 s cap.
+- **Reconnect:** jittered exponential backoff, 1 s to a 30 s cap, reset only once the platform accepts the auth (0.5.154: a refused or a 1013 auth keeps doubling).
 - **Send buffer:** up to 10,000 messages kept during a disconnect and
   replayed on reconnect. Terminal output rides its own lossless lane.
 - **Bulk lane** (0.5.137, `paced_transfers`): a pull's chunks ride a third
@@ -482,7 +541,7 @@ update push, so the machine updates only when the installer runs again.
 
 ## Vendored modules
 
-Six modules are byte-for-byte copies of proxy source in `_vendored/`, so both
+Seven modules are byte-for-byte copies of proxy source in `_vendored/`, so both
 sides run one implementation. `scripts/sync-satellite-code.sh` copies each and
 writes its sha256 into a `SHARED_*_HASH` constant in `satellite/config.py`. At
 start (`__main__._verify_installer_drift`) the satellite hashes each copy and
@@ -496,9 +555,10 @@ exits with an error on a mismatch.
 | `_vendored/codex_approvals.py` | `proxy/core/layers/codex/codex_approvals.py` |
 | `_vendored/terminal_queries.py` | `proxy/core/terminal_queries.py` (the terminal query and reply strips, the clipboard-write strip and the mouse-report pattern from 0.5.125, and the bracketed-paste mode tracker of the scrollback rings from 0.5.140) |
 | `_vendored/layout.py` | `proxy/core/layout.py` (the agent tree: the folder names, the per-user tree, the virtual roots and `host_of_virtual`, `user_of`, `state_dir`, from 0.5.126) |
+| `_vendored/loop_watchdog.py` | `proxy/core/loop_watchdog.py` (the event-loop watchdog: a late tick logs the loop thread's stack, the watcher's own late wake with no CPU spent names a frozen process; the daemon runs it at its own cadence, from 0.5.150) |
 
 ```bash
-# after changing any of the six proxy sources:
+# after changing any of the seven proxy sources:
 ./scripts/sync-satellite-code.sh
 ```
 
@@ -532,6 +592,16 @@ or new routes on the tunnel allowlist.
 
 | Version | What changed on the wire or on the machine |
 |---|---|
+| 0.5.158 | Machine only: a Codex turn asks for the reasoning summary (`turn/start` `summary` "auto", the platform's twin); no frame or payload change. |
+| 0.5.157 | Two fixes for a chat on this machine. The tunnel forwards `/v1/chats/agent-move`, the agent's `move_chat` (an older satellite answers it `403 path-not-allowlisted`). A Codex `thread/start` and `thread/resume` carry the session's working folder as `cwd`: a thread moved here from the platform resumed in the folder its rollout recorded (the sandbox's `/users/<name>`), where every stdio MCP failed at spawn. The platform moves a chat's session files only to and from a 0.5.157 satellite; with a 0.5.156 one the chat continues from a summary. |
+| 0.5.156 | Two additions in one release. The chat move: `session_move` and its `session_move` capability; a chat moved to another place takes its engine session files with it, scoped to the named session's ids, with the `stat` op sizing a transcript for the move's proof and day-old staging swept at start. The `file_push` engine-home refusal canonicalises the path (realpath on both sides; on Windows trailing dots and spaces dropped) and covers the `satellite_host` door; `check_session_resumable` refuses unsafe names. A start whose engine refused the session it was asked to resume (a Codex thread it cannot open) acks with `resume_refused: true`, and a revive's `_resume_handle` carries `resumed: false`: the platform reseeds the chat from its history instead of letting it run without its memory. The permission modes: the start config's `cli_permission_mode` (Claude Code's own word for the chat's mode): Auto spawns a headless chat with `--permission-mode auto` and the stdio prompt tool, and the terminal starts in auto or plan by itself, default otherwise. The platform's mode words `ask` and `autoReview` (an older platform's `default` and `acceptEdits` read as them). A Codex session in Auto runs `approvalsReviewer: auto_review` with `on-request`; every other mode takes its sandbox's policy, with no `untrusted` and no `OTO_HOOK_BRIDGED`. The `otodock` command's `--mode ask, auto, dontAsk, plan` sends the platform word. Additive: the platform gates `session_move` on the capability and the version, and sends an older satellite the mode words before 1.9. Behind a platform downgraded below 1.9, a 0.5.156 satellite reads that platform's `acceptEdits` as Auto (Codex's reviewer, `on-request`); that platform's hook still cards every call first, since the satellite no longer marks a session bridged. |
+| 0.5.155 | Machine only: a frame the link cannot read, or one that is not a JSON object, is dropped with a warning (its kind and length) and the link reads the next one; it no longer ends the link. |
+| 0.5.154 | Machine only: a refused sign-in (4001, or the platform's 1013) backs off, doubling to 30 s, instead of reconnecting every second. |
+| 0.5.152 | Machine only: the link's message loop dispatches the platform's frames through a table instead of one chain; every frame is handled as before, and a frame of an unknown type is still dropped with a debug line. |
+| 0.5.151 | Machine only: the scrollback ring's bracketed-paste tracker (`_vendored/terminal_queries.py`) follows a saved mode (`CSI ? 2004 s`, XTSAVE) and its restore (`CSI ? 2004 r`, XTRESTORE), so a local `otodock` terminal attaching after a trimmed replay pastes bracketed when the program expects it. |
+| 0.5.150 | `session_files_retention` (the retention sweep's keep list; the transcripts it does not name go). `check_session_resumable` answers `reason` (`missing`, `empty`, `unreadable`) and an error ack for a read fault, the file read in a thread. A `file_push` write carries `expect` and is answered `stale` with the file's stat when the file moved under it, a committed write's ok ack carries the committed stat, a push into an engine home outside a person's own folders (Claude's `skills/`, `commands/`, `agents/`, `output-styles/`; Codex's `prompts/`, `skills/`) is refused, and only those folders sync under an engine home. The DISPLAY injection into a Codex MCP env table closes the table at the line's last brace. The CLI reconcile skips a probe that did not run instead of installing over it. The event-loop watchdog (the proxy's twin, seven vendored modules now) and the heartbeat's sleep rule tell a suspend from a starved daemon. Additive: the platform gates the retention frame on the version. |
+| 0.5.149 | Lint only: every background task held until it ends and a task that dies logged under its name, the forward pause during a replay awaited instead of polled and released when the session closes, broad exception handlers narrowed to what the call raises. Nothing on the wire. |
+| 0.5.148 | Lint only: import order, lazy logging arguments, explicit exception causes, newer syntax, no behaviour change. The PTY relay logs under `otodock.pty_relay`. Nothing on the wire. |
 | 0.5.147 | The permission gate's hook carries `onFailure: "block"` (a hook that cannot run denies the call). The Codex terminal's `[desktop] git-worktree-root` points beside `.codex`. Nothing on the wire. |
 | 0.5.146 | `disableClaudeAiConnectors` written into the scope's `settings.json` (the pool account's claude.ai connectors never load). Nothing on the wire. |
 | 0.5.145 | `report_skipped` on `request_manifest` and the `skipped` manifest entries. Unlistable folders collected and Windows junctions not followed. The end-of-turn scan's strict delete probe. The per-walk skip summary. A Windows satellite at this version restores the platform's held paths. |

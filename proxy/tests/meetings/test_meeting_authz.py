@@ -18,7 +18,7 @@ import asyncio
 import pytest
 from fastapi import HTTPException
 
-from api.meetings.meetings import create_meeting, CreateMeetingRequest
+from api.meetings.meetings import CreateMeetingRequest, create_meeting
 from auth.providers import UserContext
 from storage.agents import agent_store
 
@@ -131,13 +131,17 @@ def test_master_key_unclamped(temp_db):
 # creator, an admin, or a session of the participant it is about.
 # ---------------------------------------------------------------------------
 
-from api.meetings.meetings import (  # noqa: E402
-    end_meeting_endpoint, get_meeting_endpoint, get_transcript_endpoint,
-    leave_meeting_endpoint, list_meetings_endpoint, propose_conclude_endpoint,
+from api.meetings.meetings import (
+    end_meeting_endpoint,
+    get_meeting_endpoint,
+    get_transcript_endpoint,
+    leave_meeting_endpoint,
+    list_meetings_endpoint,
+    propose_conclude_endpoint,
     start_meeting_endpoint,
 )
-from storage import database as task_store  # noqa: E402
-from storage.chat import meeting_status  # noqa: E402
+from storage import database as task_store
+from storage.chat import meeting_status
 
 
 def _nouser_on(agent: str, sid: str) -> UserContext:
@@ -289,6 +293,7 @@ def test_a_paused_resume_never_overwrites_an_end(temp_db):
 
 def _leave_office(monkeypatch):
     import json
+
     from services.meetings import meeting_orchestrator as MO
     _office()
     agent_store.create_agent("gamma", "Gamma", default_scope="agent", collaborative=True)
@@ -312,6 +317,7 @@ def _run_rounds(monkeypatch, mid, sessions, turn):
     """meeting_produce on the real row, each turn scripted by ``turn(agent)``;
     returns the rounds run and the SYSTEM events emitted."""
     from types import SimpleNamespace
+
     from core.events.common_events import SYSTEM
     from services.meetings import meeting_orchestrator as MO
     rounds: list[list[str]] = []
@@ -351,6 +357,7 @@ def test_a_rest_leave_during_a_round_keeps_the_agent_out(temp_db, monkeypatch):
     addresses beta: beta gets no further turn, its session is closed and the
     dashboard is told it left."""
     import json
+
     from ws import wire_events as wire
     ceo, mid, sessions, closed = _leave_office(monkeypatch)
     spoken: list[str] = []
@@ -453,7 +460,7 @@ def test_thinking_goes_to_an_admin_or_the_creator_only(temp_db):
     ceo = _user({"head": "manager", "alpha": "manager", "beta": "manager"}, sub="ceo-1")
     mid = _create(ceo, ["head", "alpha", "beta"], scope="agent", x_agent_name="head")["meeting_id"]
     _turns(mid)
-    head_turn = lambda u: next(t for t in asyncio.run(  # noqa: E731
+    head_turn = lambda u: next(t for t in asyncio.run(
         get_transcript_endpoint(mid, user=u))["turns"] if t["agent"] == "head")
     assert head_turn(ceo)["thinking"] == "x" * 400                       # the creator
     admin = UserContext(sub="root-1", email="r@x", name="r", role="admin", agents=[])
@@ -467,6 +474,7 @@ def test_thinking_goes_to_an_admin_or_the_creator_only(temp_db):
 
 def test_the_participants_prompt_carries_no_thinking(temp_db):
     import json
+
     from services.meetings import meeting_context
     _office()
     meeting = {"id": "m1", "topic": "margins", "participants": json.dumps(["head", "beta"]),
@@ -475,3 +483,332 @@ def test_the_participants_prompt_carries_no_thinking(temp_db):
                    "thinking": "SECRET-REASONING", "tools": []}]
     prompt = meeting_context.build_turn_prompt(meeting, "beta", transcript)
     assert "HEAD says hi" in prompt and "SECRET-REASONING" not in prompt
+
+
+@pytest.mark.parametrize("gamma_ends", ["leaves", "fails"])
+def test_every_departure_reaches_the_others_without_a_turn_of_its_own(temp_db, monkeypatch, gamma_ends):
+    """The creator takes beta out while gamma's turn runs, and gamma then
+    leaves or fails: the transcript says each is gone, the moderator reads it
+    in its next prompt (the wrap-up after gamma's leave), and no line queues
+    anybody."""
+    from types import SimpleNamespace
+
+    from services.meetings import meeting_context, meeting_orchestrator as MO
+    ceo, mid, sessions, _closed = _leave_office(monkeypatch)
+    spoken: list[str] = []
+    prompts: list[str] = []
+    seen: list[list[dict]] = []
+
+    async def fake_live(agent, agent_sessions, meeting, transcript, pending, q, meeting_id):
+        spoken.append(agent)
+        seen.append(transcript)
+        if agent == "head":
+            prompts.append(meeting_context.build_turn_prompt(meeting, "head", transcript))
+            return (_said("head", directed=["gamma"]) if spoken.count("head") == 1
+                    else _said("head", called=("end_meeting",)))
+        await leave_meeting_endpoint(mid, user=ceo, x_agent_name="beta")
+        if gamma_ends == "leaves":
+            await leave_meeting_endpoint(mid, user=_nouser_on("gamma", "s-gamma"))
+            return _said("gamma", called=("leave_meeting",))
+        return _said("gamma", called=("_failed",))
+    monkeypatch.setattr(MO, "_run_live_turn", fake_live)
+    asyncio.run(MO.meeting_produce(mid, sessions, asyncio.Queue(),
+                                   SimpleNamespace(chat_id="chat-mtg", system_queue=[])))
+    lines = [e["content"] for e in seen[-1] if e["agent"] == "system"]
+    assert "Beta (`beta`) is no longer in the meeting; do not address them." in lines
+    assert "Gamma (`gamma`) is no longer in the meeting; do not address them." in lines
+    if gamma_ends == "leaves":
+        assert spoken == ["head", "gamma", "head"]
+        assert "Beta (`beta`) is no longer in the meeting" in prompts[-1]
+        assert "Gamma (`gamma`) is no longer in the meeting" in prompts[-1]
+    else:
+        # The moderator spoke last before the failure: the meeting concludes.
+        assert spoken == ["head", "gamma"]
+
+
+def test_the_roster_lists_the_agents_still_in_the_meeting(temp_db):
+    import json
+
+    from services.meetings import meeting_context
+    _office()
+    meeting = {"id": "m1", "topic": "margins", "moderator": "head", "scope": "agent",
+               "participants": json.dumps(["head", "alpha", "beta"]),
+               "active_participants": json.dumps(["head", "alpha"])}
+    prompt = meeting_context.build_turn_prompt(meeting, "alpha", [])
+    assert "(`head`)" in prompt and "(`alpha`)" in prompt and "(`beta`)" not in prompt
+    # A row without the live list (an older caller) shows the convened roster.
+    meeting.pop("active_participants")
+    assert "(`beta`)" in meeting_context.build_turn_prompt(meeting, "alpha", [])
+
+
+# ---------------------------------------------------------------------------
+# A concluded meeting leaves its host chat a note for the next turn
+# ---------------------------------------------------------------------------
+
+def _note_office(monkeypatch, *, person=True, run_id=None, chat_id="chat-leave"):
+    """A real meeting row (topic, host chat, run) on a real host chat; the
+    creator a person with a row, or not."""
+    import json
+
+    from services.meetings import meeting_orchestrator as MO
+    _office()
+    agent_store.create_agent("gamma", "Gamma", default_scope="agent", collaborative=True)
+    if person:
+        task_store.upsert_user("ceo-1", "ceo@x.test", "Ceo", "member")
+        task_store.set_user_agents("ceo-1", ["head", "alpha", "beta", "gamma"], "test",
+                                   {a: "manager" for a in ("head", "alpha", "beta", "gamma")})
+    task_store.create_chat(chat_id, "ceo-1", "head", "default")
+    mid = task_store.create_meeting(
+        "mtg-note", "office margins", json.dumps(["head", "alpha", "beta", "gamma"]), "head",
+        "directed", 30, chat_id, None, run_id, "agent", "ceo-1")["id"]
+    task_store.update_meeting(mid, status=meeting_status.ACTIVE)
+    sessions = {a: f"s-{a}" for a in ("head", "alpha", "beta", "gamma")}
+
+    class _Layer:
+        async def close_session(self, sid):
+            pass
+    for sid in sessions.values():
+        monkeypatch.setitem(MO._meeting_session_layers, sid, _Layer())
+    return mid, sessions
+
+
+def _wakes(chat_id="chat-leave") -> list[dict]:
+    import json
+    return json.loads(task_store.get_chat(chat_id)["pending_delegate_wake"] or "[]")
+
+
+def test_an_ended_meeting_leaves_its_summary_for_the_host_chats_next_turn(temp_db, monkeypatch):
+    from services.meetings import meeting_orchestrator as MO
+    mid, sessions = _note_office(monkeypatch)
+    spoken: list[str] = []
+
+    async def turn(agent):
+        spoken.append(agent)
+        if agent == "head" and spoken.count("head") == 1:
+            return _said("head", directed=["alpha"])
+        if agent == "head":
+            await MO.end_meeting(mid, "head")
+            return MO.TurnResult(agent="head", events=[], content="We keep the margin at 12 %.",
+                                 directed_to=[], tools_called={"end_meeting"}, tail_text=27)
+        return _said(agent, directed=["head"])
+    _run_rounds(monkeypatch, mid, sessions, turn)
+    wakes = _wakes()
+    assert len(wakes) == 1
+    note = wakes[0]["prompt"]
+    assert note.startswith(f'[Meeting "office margins" ({mid}) ended ')
+    assert "after 3 turns, with Head, Alpha, Beta, Gamma." in note
+    assert "Summary: We keep the margin at 12 %." in note
+    assert note.endswith("you have only this note.]")
+    assert wakes[0]["person"] == "ceo-1" and wakes[0]["role"]
+    # The next turn's claim takes it once.
+    assert wakes[0]["kind"] == task_store.WAKE_NOTE
+    # A sweep's claim leaves it; the next typed turn's claim takes it, once.
+    assert task_store.claim_pending_delegate_wake("chat-leave") == []
+    assert task_store.claim_pending_delegate_wake("chat-leave", notes=True) == [note]
+    assert task_store.claim_pending_delegate_wake("chat-leave", notes=True) == []
+
+
+def test_a_meeting_that_ran_out_of_speakers_quotes_the_moderators_last_turn(temp_db, monkeypatch):
+    mid, sessions = _note_office(monkeypatch, person=False)
+    spoken: list[str] = []
+
+    async def turn(agent):
+        spoken.append(agent)
+        first = agent == "head" and spoken.count("head") == 1
+        return _said(agent, directed=["alpha"] if first else [])
+    _run_rounds(monkeypatch, mid, sessions, turn)
+    wakes = _wakes()
+    assert len(wakes) == 1 and "The moderator's last turn: head reports" in wakes[0]["prompt"]
+    assert "after 3 turns" in wakes[0]["prompt"]
+    assert wakes[0]["person"] == ""
+
+
+def test_a_task_runs_meeting_leaves_no_note(temp_db, monkeypatch):
+    """The run takes the summary as its result; a later continue of the
+    run's chat must not be handed the meeting a second time."""
+    mid, sessions = _note_office(monkeypatch, run_id="run-1")
+    spoken: list[str] = []
+
+    async def turn(agent):
+        spoken.append(agent)
+        first = agent == "head" and spoken.count("head") == 1
+        return _said(agent, directed=["alpha"] if first else [])
+    _run_rounds(monkeypatch, mid, sessions, turn)
+    assert _wakes() == []
+
+
+def _drain(q: asyncio.Queue) -> list:
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out
+
+
+def _produce(mid, sessions, turn):
+    """``meeting_produce`` on the real row with ``turn(agent)`` as every live
+    turn; returns the events it queued."""
+    from types import SimpleNamespace
+
+    from services.meetings import meeting_orchestrator as MO
+
+    async def _go():
+        q: asyncio.Queue = asyncio.Queue()
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(MO, "_run_live_turn", lambda agent, *a: turn(agent))
+            await MO.meeting_produce(mid, sessions, q,
+                                     SimpleNamespace(chat_id="chat-mtg", system_queue=[]))
+        return _drain(q)
+    return asyncio.run(_go())
+
+
+def test_a_stopped_meeting_leaves_no_note_and_ends_its_pump(temp_db, monkeypatch):
+    """A Stop or a shutdown cancels the producer mid-meeting: no note, and
+    the done event still goes out."""
+    from types import SimpleNamespace
+
+    from core.events.common_events import PRODUCER_DONE
+    from services.meetings import meeting_orchestrator as MO
+    mid, sessions = _note_office(monkeypatch)
+    started = asyncio.Event()
+
+    async def fake_live(agent, *a):
+        if agent == "head":
+            return _said("head", directed=["alpha"])
+        started.set()
+        await asyncio.sleep(3600)
+    monkeypatch.setattr(MO, "_run_live_turn", fake_live)
+
+    async def _go():
+        q: asyncio.Queue = asyncio.Queue()
+        task = asyncio.create_task(MO.meeting_produce(
+            mid, sessions, q, SimpleNamespace(chat_id="chat-mtg", system_queue=[])))
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        await asyncio.wait({task}, timeout=5)
+        return _drain(q)
+    events = asyncio.run(_go())
+    assert events[-1].type == PRODUCER_DONE
+    assert any(e.data.get("cancelled") for e in events if e.type != PRODUCER_DONE)
+    assert _wakes() == []
+
+
+def test_a_failed_producer_leaves_no_note(temp_db, monkeypatch):
+    from core.events.common_events import PRODUCER_DONE
+    mid, sessions = _note_office(monkeypatch)
+
+    async def turn(agent):
+        if agent == "head":
+            return _said("head", directed=["alpha"])
+        raise RuntimeError("the engine went away")
+    events = _produce(mid, sessions, turn)
+    assert events[-1].type == PRODUCER_DONE
+    assert any("error" in e.data for e in events if e.type != PRODUCER_DONE)
+    assert _wakes() == []
+
+
+def test_a_meeting_with_no_turn_leaves_no_note(monkeypatch):
+    from services.meetings import meeting_orchestrator as MO
+    stored = []
+    monkeypatch.setattr(MO.task_store, "append_pending_delegate_wake",
+                        lambda *a, **k: stored.append(a) or True)
+    asyncio.run(MO._leave_parent_note("mtg-x", [], 0, MO._ENDED, summary=True))
+    assert stored == []
+
+
+def test_a_meeting_a_person_ended_quotes_the_moderators_last_turn(temp_db, monkeypatch):
+    """The creator (or an admin) ending the meeting through the route makes
+    the moderator's last turn no summary: the note says what it is."""
+    from services.meetings import meeting_orchestrator as MO
+    mid, sessions = _note_office(monkeypatch)
+
+    async def turn(agent):
+        if agent == "head":
+            return _said("head", directed=["alpha"])
+        assert (await MO.end_meeting(mid))["status"] == meeting_status.CONCLUDING
+        return _said("alpha", directed=["head"])
+    _produce(mid, sessions, turn)
+    (wake,) = _wakes()
+    assert "The moderator's last turn: head reports" in wake["prompt"]
+    assert "Summary:" not in wake["prompt"]
+
+
+def test_a_note_that_cannot_be_stored_still_ends_the_host_chats_pump(temp_db, monkeypatch):
+    """Whatever the note's store raises, the meeting's done event goes out
+    and the host chat's pump ends and leaves the chat."""
+    from core.events.stream_pump import ChatStreamPump, _active_pumps
+    from core.session import session_kind
+    from services.meetings import meeting_orchestrator as MO
+    mid, sessions = _note_office(monkeypatch)
+
+    def _broken(*a, **k):
+        raise RuntimeError("the store's executor is shutting down")
+    monkeypatch.setattr(MO.task_store, "append_pending_delegate_wake", _broken)
+    monkeypatch.setattr(MO, "_run_live_turn", lambda agent, *a: _said_now(agent))
+
+    async def _go():
+        q: asyncio.Queue = asyncio.Queue()
+        pump = ChatStreamPump(chat_id="chat-leave", session_id=f"meeting-{mid}", producer=None,
+                              event_queue=q, perm_queue=None, scope="agent",
+                              source_type=session_kind.MEETING.source_type)
+        pump.producer = asyncio.create_task(MO.meeting_produce(mid, sessions, q, pump))
+        pump.system_queue_consumer = True
+        pump.queue_closed = False
+        _active_pumps["chat-leave"] = pump
+        pump.start()
+        await asyncio.wait_for(pump._task, 10)
+        return pump
+    try:
+        pump = asyncio.run(_go())
+    finally:
+        released = "chat-leave" not in _active_pumps
+        _active_pumps.pop("chat-leave", None)
+    assert pump._task.done() and released
+    assert _wakes() == []
+
+
+async def _said_now(agent):
+    return (_said("head", directed=["alpha"]) if agent == "head"
+            else _said(agent, directed=["head"]))
+
+
+def test_the_done_event_goes_out_whatever_the_note_path_raises(temp_db, monkeypatch):
+    from core.events.common_events import PRODUCER_DONE
+    from services.meetings import meeting_orchestrator as MO
+    mid, sessions = _note_office(monkeypatch)
+
+    async def _boom(*a, **k):
+        raise KeyError("an unexpected store shape")
+    monkeypatch.setattr(MO, "_leave_parent_note", _boom)
+    q: asyncio.Queue = asyncio.Queue()
+
+    async def _go():
+        from types import SimpleNamespace
+        monkeypatch.setattr(MO, "_run_live_turn", lambda agent, *a: _said_now(agent))
+        with pytest.raises(KeyError):
+            await MO.meeting_produce(mid, sessions, q,
+                                     SimpleNamespace(chat_id="chat-mtg", system_queue=[]))
+    asyncio.run(_go())
+    assert _drain(q)[-1].type == PRODUCER_DONE
+
+
+def test_a_meeting_gone_before_its_start_still_ends_the_pump(temp_db):
+    from types import SimpleNamespace
+
+    from core.events.common_events import PRODUCER_DONE
+    from services.meetings import meeting_orchestrator as MO
+    q: asyncio.Queue = asyncio.Queue()
+    asyncio.run(MO.meeting_produce("mtg-gone", {}, q,
+                                   SimpleNamespace(chat_id="chat-mtg", system_queue=[])))
+    assert [e.type for e in _drain(q)] == [PRODUCER_DONE]
+
+
+def test_the_note_cuts_long_closing_words():
+    from services.meetings import meeting_context
+    note = meeting_context.parent_note(
+        {"id": "m1", "topic": "t"}, turns=2, names=["A", "B"],
+        last_words="word " * 1000, summary=True, ended_at="2026-10-15 21:00")
+    words = note.split("Summary: ", 1)[1].split(" The person sees", 1)[0]
+    assert len(words) <= meeting_context.PARENT_NOTE_SUMMARY_CHARS + 1 and words.endswith("…")
+    empty = meeting_context.parent_note({"id": "m1", "topic": "t"}, turns=1, names=["A"],
+                                        last_words="", summary=False, ended_at="x")
+    assert "The moderator wrote no closing words." in empty

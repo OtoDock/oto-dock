@@ -17,10 +17,16 @@ the between-turns delivery (router OOB hook) and the pull-API drain backstop.
 import asyncio
 
 from core.events.bg_command_state import (
-    _bg_command_registries, get_bg_command_registry,
+    _bg_command_registries,
+    get_bg_command_registry,
 )
 from core.events.common_events import (
-    BG_COMMAND_END, BG_COMMAND_START, DONE, TEXT, TOOL_RESULT, TOOL_USE,
+    BG_COMMAND_END,
+    BG_COMMAND_START,
+    DONE,
+    TEXT,
+    TOOL_RESULT,
+    TOOL_USE,
 )
 from core.layers.codex.app_server_client import AppServerError
 from core.layers.codex.layer import CodexEventTranslator

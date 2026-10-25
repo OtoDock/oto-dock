@@ -1,10 +1,12 @@
 import { useState, type ReactNode } from 'react'
 import { useApproveApp, type AppAction, type AppInboundHook, type AppSecret, type PinnedApp } from '../../api/apps'
 import AppSettingsPanel from './AppSettingsPanel'
-import { ROLE, type ActionFloor } from '../../lib/permissions'
-import { SITE } from '../../lib/placement'
+import { type ActionFloor } from '../../lib/permissions'
+import { placePhrase } from '../../api/remoteMachines'
+import { SITE, TARGET_LOCAL } from '../../lib/placement'
 import { appKind } from '../../lib/kinds/app'
-import { DEPLOY_STATE } from '../../lib/status/appDeploy'
+import Button from '../ui/Button'
+import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT } from '../ui/classes'
 
 /**
  * Approval card — shared between the standing apps overlay, the Dock
@@ -28,22 +30,16 @@ import { DEPLOY_STATE } from '../../lib/status/appDeploy'
  * deploy card reuses.
  */
 
-export function appNeedsApproval(app: PinnedApp | null | undefined): boolean {
-  if (!app) return false
-  // A pending release carries its manifest to the deploy card instead
-  // (APPS.md "Deploy pipeline"); approving the release approves it.
-  if (app.deploy_state === DEPLOY_STATE.PENDING) return false
-  // The server says whether there is anything to approve; an older proxy
-  // does not send it and the actions alone decide, as before.
-  const empty = app.manifest_empty ?? app.actions.length === 0
-  return !empty && (!app.actions_approved || app.approval_stale)
-}
-
 /** The manifest as declared — the expander's text (non-empty blocks only). */
-export function exactManifest(app: PinnedApp): Record<string, unknown> {
+function exactManifest(app: PinnedApp): Record<string, unknown> {
   const out: Record<string, unknown> = { actions: app.actions }
   const files = app.files
-  if (files && (files.read.length || files.write.length)) out.files = files
+  if (files && (files.read.length || files.write.length)) {
+    // The declaration as the manifest has it: an empty list of folders to
+    // make is left out.
+    const { create, ...prefixes } = files
+    out.files = create?.length ? files : prefixes
+  }
   if (app.egress?.length) out.egress = app.egress
   if (app.handlers && Object.keys(app.handlers).length) out.handlers = app.handlers
   if (app.exports && Object.keys(app.exports).length) out.exports = app.exports
@@ -75,31 +71,31 @@ export function exactManifest(app: PinnedApp): Record<string, unknown> {
 
 /** The secrets the manifest declares (a stored name it no longer declares
  * is the settings panel's business, not the card's). */
-export function declaredSecrets(app: PinnedApp): AppSecret[] {
+function declaredSecrets(app: PinnedApp): AppSecret[] {
   return (app.secrets ?? []).filter((s) => s.declared !== false)
 }
 
 /** What an inbound hook receives, in words (APPS.md "Inbound hooks"). */
-export function inboundWords(h: AppInboundHook): ReactNode {
+function inboundWords(h: AppInboundHook): ReactNode {
   if (h.verify === 'stripe') return 'Stripe-signed events'
   if (h.verify === 'github') return 'GitHub-signed events'
   if (h.verify === 'bearer') return 'bearer-authenticated events'
-  return <>HMAC-signed events (the <Code>{h.header}</Code> header)</>
+  return <>HMAC-signed events with the <Code>{h.header}</Code> header</>
 }
 
 /** Where a secret's value goes, in words (APPS.md "Secrets"). */
-export function secretUseWords(s: AppSecret): ReactNode {
+function secretUseWords(s: AppSecret): ReactNode {
   if (s.sends_to) {
-    return <>sent by the platform to <Code>{s.sends_to.host}</Code> as <Code>{s.sends_to.header}</Code>, never seen by the server</>
+    return <>The platform sends it to <Code>{s.sends_to.host}</Code> as <Code>{s.sends_to.header}</Code>. The server never sees it.</>
   }
-  if (s.env) return <span className="text-amber-600 dark:text-amber-400">read by the server itself</span>
-  return 'used by the platform only'
+  if (s.env) return <span className="text-status-warning-fg">The server reads it itself.</span>
+  return 'Only the platform uses it.'
 }
 
 /** Compact `key: value` chip for approval-card parameter summaries. */
 function ParamChip({ k, v }: { k: string; v?: string }) {
   return (
-    <code className="inline-flex max-w-56 items-baseline gap-0.5 truncate rounded bg-black/8 px-1 py-px font-mono text-[10px] dark:bg-white/10">
+    <code className="inline-flex max-w-56 items-baseline gap-0.5 truncate rounded-sm bg-surface-muted px-1 py-px font-mono text-3xs">
       <span className="font-semibold">{k}</span>
       {v !== undefined && <span className="truncate">: {v}</span>}
     </code>
@@ -122,13 +118,21 @@ const FLOOR_LABEL: Record<ActionFloor, string> = {
   contributor: 'contributors and up',
 }
 
-function FloorChip({ role }: { role?: ActionFloor }) {
-  if (!role) return null
+/** A button that acts for the agent with no floor: anyone the app reaches. */
+const NO_FLOOR_LABEL = 'everyone who opens the app'
+const NO_FLOOR_WHO = 'Anyone who opens the app can press it'
+/** A folder the platform makes once the manifest is approved (`files.create`). */
+export const CREATES_FOLDER = 'Creates the folder'
+const CHIP = 'rounded-sm bg-surface-muted px-1 py-px text-3xs font-medium text-secondary'
+
+/** Who may press: the floor, or for a button that acts for the agent with
+ *  none, everyone who opens the app. */
+function FloorChip({ role, acts = false }: { role?: ActionFloor; acts?: boolean }) {
+  if (!role) {
+    return acts ? <span title={NO_FLOOR_WHO} className={CHIP}>{NO_FLOOR_LABEL}</span> : null
+  }
   return (
-    <span
-      title={`Only ${FLOOR_WHO[role]} of this agent can use it`}
-      className="rounded bg-p-primary/10 px-1 py-px text-[10px] font-medium text-p-primary"
-    >
+    <span title={`Only ${FLOOR_WHO[role]} of this agent can use it`} className={CHIP}>
       {FLOOR_LABEL[role]}
     </span>
   )
@@ -141,67 +145,66 @@ export function ActionLine({ ac }: { ac: AppAction }) {
   const pageFills = Object.keys(ac.args_schema?.properties ?? {})
   return (
     <li className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
-      <span className="font-medium text-p-text">{ac.label}</span>
+      <span className="font-medium text-primary">{ac.label}</span>
       {ac.type === 'mcp_tool' ? (
         <>
-          <span>calls <code className="font-mono text-[11px]">{ac.tool}</code> on {ac.mcp}</span>
+          <span>Calls <code className="font-mono text-2xs">{ac.tool}</code> on {ac.mcp}</span>
           {Object.entries(ac.fixed_args ?? {}).map(([k, v]) => (
             <ParamChip key={k} k={k} v={chipValue(v)} />
           ))}
           {pageFills.map((k) => <ParamChip key={k} k={k} v="filled by the page" />)}
           {ac.mcp_available === false && (
-            <span className="text-amber-600 dark:text-amber-400">— its MCP is currently unavailable</span>
+            <span className="text-status-warning-fg">Its MCP is unavailable right now</span>
           )}
         </>
       ) : ac.type === 'fire_task' ? (
         <>
-          <span>runs the task “{ac.task_name || ac.task_id}”</span>
+          <span>Runs the task “{ac.task_name || ac.task_id}”.</span>
           {(ac.checks?.length ?? 0) > 0 && (
             <span>
-              and the check{ac.checks!.length > 1 ? 's' : ''} {ac.checks!.map((c, i) => (
+              It also runs the check{ac.checks!.length > 1 ? 's' : ''} {ac.checks!.map((c, i) => (
                 <span key={c}>{i > 0 ? ', ' : ''}<Code>{c}</Code></span>
-              ))} on its result (a judge may run up to three times per run)
+              ))} on its result. A judge may run up to three times per run.
             </span>
           )}
           {pageFills.map((k) => <ParamChip key={k} k={k} v="filled by the page" />)}
         </>
       ) : ac.type === 'data_feed' ? (
         <span>
-          receives the live <code className="font-mono text-[11px]">{ac.feed}</code> platform
-          feed (read-only — your own view of it)
+          Receives your own read-only view of the live <code className="font-mono text-2xs">{ac.feed}</code> platform feed
         </span>
       ) : ac.type === 'platform' ? (
         <>
           <span>
-            asks the platform for <code className="font-mono text-[11px]">{ac.method}</code>
-            {' '}({PLATFORM_METHOD_WORDS[ac.method || ''] || 'your own view of it'})
+            Asks the platform for <code className="font-mono text-2xs">{ac.method}</code>
+            : {PLATFORM_METHOD_WORDS[ac.method || ''] || 'your own view of it'}
           </span>
           {pageFills.map((k) => <ParamChip key={k} k={k} v="filled by the page" />)}
         </>
       ) : (
         <span className="break-all">
-          sends to the chat: “{(ac.prompt || '').slice(0, 100)}{(ac.prompt || '').length > 100 ? '…' : ''}”
+          Sends to the chat: “{(ac.prompt || '').slice(0, 100)}{(ac.prompt || '').length > 100 ? '…' : ''}”
         </span>
       )}
-      <FloorChip role={ac.min_role} />
+      <FloorChip role={ac.min_role} acts={BUTTON_TYPES.includes(ac.type)} />
     </li>
   )
 }
 
 // The catalog methods in words (APPS.md "Platform catalog").
 const PLATFORM_METHOD_WORDS: Record<string, string> = {
-  'viewer.me': 'who you are: your name, username and role on this agent',
+  'viewer.me': 'who you are, with your name, username and role on this agent',
   'integrations.status': 'which connected-account providers you have connected',
   'tasks.run_result': 'the result of a task run you may see',
-  'notifications.create': 'a notification to yourself — or, on the app’s own identity (a wake, or its server telling its people), to every member of this agent or the owner of a personal app',
+  'notifications.create': 'a notification to yourself. Acting alone, the app may notify this agent’s members or a personal app’s owner.',
   'files.list': 'the entries of a folder under its declared read prefixes',
   'files.read': 'a text file under its declared read prefixes',
   'files.write': 'to write a text file under its declared write prefixes',
-  'setup.status': 'whether your setup of this agent is still pending, and which of the tools it names are ready for you',
-  'setup.complete': 'to mark your setup of this agent complete when you press its button (a manager may complete the agent’s own setup too)',
-  'app.audience': 'who uses this app: its members, the agents it is placed in with their members, and the people it is shared with, each with their role (read on a page by the app’s own editors and managers, the owner of a personal app or an admin, and by the app’s own server as the app)',
-  'viewer.data.read': 'your own saved data in this app (a small document each viewer keeps for themselves)',
-  'viewer.data.write': 'to save your own data in this app (your document alone, which nobody else reads)',
+  'setup.status': 'whether your setup of this agent is pending, and which tools are ready for you',
+  'setup.complete': 'to mark your setup of this agent complete when you press its button. A manager may also complete the agent’s own setup.',
+  'app.audience': 'who uses this app and with what role. That is its members and the people it is shared with. It also lists the agents it is placed in, and their members. Only the app’s editors and managers may read it on a page. So may an admin, or the owner of a personal app. The app’s own server may read it too.',
+  'viewer.data.read': 'your own saved data in this app, a small document each viewer keeps for themselves',
+  'viewer.data.write': 'to save your own data in this app, in a document of your own that nobody else reads',
 }
 
 // The same methods in two or three words, for the summary line.
@@ -233,11 +236,11 @@ const EVENT_WORDS: Record<string, string> = {
 
 function eventWords(e: string): ReactNode {
   const m = /^app:([^:]+):(.+)$/.exec(e)
-  if (m) return <>the app behind <Code>{m[1]}</Code> emits <Code>{m[2]}</Code></>
+  if (m) return <><Code>{m[2]}</Code> comes from the app behind <Code>{m[1]}</Code></>
   const s = /^step:(.+)$/.exec(e)
-  if (s) return <>the step <Code>{s[1]}</Code> finishes</>
+  if (s) return <>the <Code>{s[1]}</Code> step finishes</>
   const c = /^check:(.+)$/.exec(e)
-  if (c) return <>the check <Code>{c[1]}</Code> asks it to judge a turn</>
+  if (c) return <>the <Code>{c[1]}</Code> check asks it to judge a turn</>
   return EVENT_WORDS[e] || e
 }
 
@@ -256,7 +259,7 @@ function cronWords(cron: string): ReactNode {
   if (every) return `every ${every[1]} minutes`
   if (/^\d+ \* \* \* \*$/.test(cron)) return 'every hour'
   if (/^\d+ \*\/(\d+) \* \* \*$/.test(cron)) return `every ${cron.split(' ')[1].slice(2)} hours`
-  return <>on the schedule <Code>{cron}</Code></>
+  return <>on a <Code>{cron}</Code> schedule</>
 }
 
 /** Where the app's steps run, in words. */
@@ -264,11 +267,11 @@ function stepPlaceWords(app: PinnedApp): ReactNode {
   const t = app.step_target
   if (!t) return 'where this agent runs'
   if (t.kind === SITE.MACHINE) return <>on <Code>{t.name || 'a paired machine'}</Code></>
-  return 'in this agent’s sandbox'
+  return `on ${placePhrase(TARGET_LOCAL, '')}`
 }
 
 function Code({ children }: { children: ReactNode }) {
-  return <code className="font-mono text-[11px]">{children}</code>
+  return <code className="font-mono text-2xs">{children}</code>
 }
 
 const BUTTON_TYPES: ReadonlyArray<AppAction['type']> = ['mcp_tool', 'fire_task', 'send_prompt']
@@ -276,10 +279,10 @@ const BUTTON_TYPES: ReadonlyArray<AppAction['type']> = ['mcp_tool', 'fire_task',
 function Group({ heading, count, children }: { heading: string; count?: number; children: ReactNode }) {
   return (
     <div>
-      <p className="text-[10px] font-semibold uppercase tracking-wide text-p-text-light">
+      <p className="text-3xs font-semibold uppercase tracking-wide text-tertiary">
         {heading}{count !== undefined ? ` (${count})` : ''}
       </p>
-      <ul className="mt-0.5 space-y-0.5 text-p-text-secondary">{children}</ul>
+      <ul className="mt-0.5 space-y-0.5 text-secondary">{children}</ul>
     </div>
   )
 }
@@ -296,20 +299,20 @@ export function SecretsGroup({ app, onSetSecret }: { app: PinnedApp; onSetSecret
       {secrets.map((s) => (
         <li key={`sec-${s.name}`} className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5" data-testid="secret-line">
           <span>
-            needs the secret <Code>{s.name}</Code>{s.description ? ` (${s.description})` : ''} — {secretUseWords(s)}
+            Needs the secret <Code>{s.name}</Code>{s.description ? `, ${s.description}` : ''}. {secretUseWords(s)}
           </span>
           {s.set ? (
-            <span className="text-emerald-600 dark:text-emerald-400">set</span>
+            <span className="text-status-success-fg">Set</span>
           ) : s.required ? (
-            <span className="text-amber-600 dark:text-amber-400">not set — required before the release goes live</span>
+            <span className="text-status-warning-fg">Not set, required before the release goes live</span>
           ) : (
-            <span className="text-p-text-light">not set (optional)</span>
+            <span className="text-tertiary">Not set, optional</span>
           )}
           {onSetSecret && (
             <button
               type="button"
               onClick={() => onSetSecret(s.name)}
-              className="rounded-md border border-p-border-light px-1.5 py-px text-[11px] text-p-text-secondary transition-colors hover:bg-p-surface-hover"
+              className={`${BUTTON_BASE} ${BUTTON_VARIANT.secondary} ${BUTTON_SIZE.xs}`}
               data-testid={`secret-set-${s.name}`}
             >
               {s.set ? 'Change' : 'Set'}
@@ -331,6 +334,7 @@ export function ManifestBlocks({ app, onSetSecret }: {
   const buttons = app.actions.filter((a) => BUTTON_TYPES.includes(a.type))
   const data = app.actions.filter((a) => !BUTTON_TYPES.includes(a.type))
   const files = app.files ?? { read: [], write: [] }
+  const folders = files.create ?? []
   const hosts = app.egress ?? []
   const links = app.external?.links ?? []
   const challenge = app.external?.challenge ?? []
@@ -344,9 +348,9 @@ export function ManifestBlocks({ app, onSetSecret }: {
   const unattended = wakesPressButtons(app)
   const ex = app.exports ?? {}
   const offers = [
-    ...Object.entries(ex.methods ?? {}).map(([name, e]) => ({ kind: 'answers the call', name, ...e })),
-    ...Object.entries(ex.snapshots ?? {}).map(([name, e]) => ({ kind: 'publishes the snapshot', name, ...e })),
-    ...Object.entries(ex.events ?? {}).map(([name, e]) => ({ kind: 'emits the event', name, ...e })),
+    ...Object.entries(ex.methods ?? {}).map(([name, e]) => ({ kind: 'Answers the call', name, ...e })),
+    ...Object.entries(ex.snapshots ?? {}).map(([name, e]) => ({ kind: 'Publishes the snapshot', name, ...e })),
+    ...Object.entries(ex.events ?? {}).map(([name, e]) => ({ kind: 'Emits the event', name, ...e })),
   ]
   const placedCalls = Object.keys(ex.methods ?? {})
   const uses = app.bindings ?? []
@@ -368,23 +372,24 @@ export function ManifestBlocks({ app, onSetSecret }: {
       )}
       {(files.read.length > 0 || files.write.length > 0) && (
         <Group heading="Files">
-          {files.read.length > 0 && <li>reads files under {codeList(files.read)}</li>}
+          {files.read.length > 0 && <li>Reads files under {codeList(files.read)}</li>}
           {files.write.length > 0 && (
             <li>
-              writes files under {codeList(files.write)}
+              Writes files under {codeList(files.write)}
               {' '}<FloorChip role="contributor" />
             </li>
           )}
+          {folders.map((path) => <li key={path}>{CREATES_FOLDER} <Code>{path}</Code></li>)}
         </Group>
       )}
       {(hosts.length > 0 || links.length > 0) && (
         <Group heading="Hosts">
           {hosts.length > 0 && (
-            <li>its server may reach {codeList(hosts)}, and other sites that share their address (a CDN) and DNS, but never your local network or the platform</li>
+            <li>Its server may reach {codeList(hosts)} and DNS. It may also reach other sites that share their address, as on a CDN. It can never reach your local network or the platform.</li>
           )}
           {links.length > 0 && (
             <li data-testid="external-links-line">
-              its page may open {codeList(links)} in a new tab — from a link too
+              Its page may open {codeList(links)} in a new tab, also on a link
             </li>
           )}
         </Group>
@@ -393,40 +398,40 @@ export function ManifestBlocks({ app, onSetSecret }: {
         <Group heading="On a link">
           {challenge.length > 0 && (
             <li data-testid="external-challenge-line">
-              asks a visitor to pass a bot check before {codeList(challenge)}
+              Asks a visitor to pass a bot check before {codeList(challenge)}
             </li>
           )}
           {sessionDays !== undefined && sessionDays !== 30 && (
-            <li data-testid="external-session-line">keeps a visitor’s login for {sessionDays} day{sessionDays === 1 ? '' : 's'}</li>
+            <li data-testid="external-session-line">Keeps a visitor’s login for {sessionDays} day{sessionDays === 1 ? '' : 's'}</li>
           )}
         </Group>
       )}
       {wakes > 0 && (
         <Group heading="Wakes" count={wakes}>
           {schedules.map(([name, { cron }]) => (
-            <li key={`s-${name}`}>wakes on the schedule <Code>{cron}</Code> as <Code>{name}</Code></li>
+            <li key={`s-${name}`}>Wakes on the schedule <Code>{cron}</Code> as <Code>{name}</Code></li>
           ))}
           {triggers.map((name) => (
-            <li key={`t-${name}`}>wakes when a trigger aimed at <Code>{name}</Code> fires</li>
+            <li key={`t-${name}`}>Wakes when a trigger aimed at <Code>{name}</Code> fires</li>
           ))}
           {events.map(([name, evs]) => (
             <li key={`e-${name}`}>
-              wakes when {evs.map((e, i) => <span key={e}>{i ? ' or ' : ''}{eventWords(e)}</span>)} (<Code>{name}</Code>)
+              Wakes when {evs.map((e, i) => <span key={e}>{i ? ' or ' : ''}{eventWords(e)}</span>)}, as <Code>{name}</Code>
             </li>
           ))}
           {inbound.map(([name, hook]) => (
             <li key={`i-${name}`} data-testid="inbound-line">
-              receives {inboundWords(hook)} at <Code>/v1/apps/{app.id}/inbound/{name}</Code> as <Code>{hook.handler}</Code>,
+              Receives {inboundWords(hook)} at <Code>/v1/apps/{app.id}/inbound/{name}</Code> as <Code>{hook.handler}</Code>,
               verified with the secret <Code>{hook.secret}</Code>
             </li>
           ))}
           {inbound.length > 0 && (
-            <li className="text-p-text-light" data-testid="inbound-note">
-              an event from outside reaches the app’s own data and its open pages only — never files, buttons or a chat
+            <li className="text-tertiary" data-testid="inbound-note">
+              An event from outside reaches only the app’s own data and its open pages. It never reaches files, buttons or a chat.
             </li>
           )}
           {unattended && (
-            <li className="text-amber-600 dark:text-amber-400">wakes may press the app’s buttons unattended</li>
+            <li className="text-status-warning-fg">Wakes may press the app’s buttons unattended</li>
           )}
         </Group>
       )}
@@ -434,22 +439,22 @@ export function ManifestBlocks({ app, onSetSecret }: {
         <Group heading="Steps" count={steps.length}>
           {steps.map(([name, st]) => (
             <li key={`st-${name}`} data-testid="step-line">
-              runs the script <Code>{st.run}</Code> {stepPlaceWords(app)} when <Code>{name}</Code> wakes
-              {' '}(up to {timeoutWords(st.timeout)}{st.sha256 ? <>, sha256 <Code>{st.sha256.slice(0, 12)}</Code></> : ''})
+              Runs the script <Code>{st.run}</Code> {stepPlaceWords(app)} when <Code>{name}</Code> wakes.
+              {' '}It runs for up to {timeoutWords(st.timeout)}{st.sha256 ? <>, sha256 <Code>{st.sha256.slice(0, 12)}</Code></> : ''}.
             </li>
           ))}
           {needProviders.length > 0 && (
             <li data-testid="step-accounts">
-              the scripts receive the {needProviders.map((p) => p.provider).join(', ')} account
+              The scripts receive the {needProviders.map((p) => p.provider).join(', ')} account
               {needProviders.length > 1 ? 's' : ''} of {app.scope === 'shared' ? 'the agent' : 'the owner'}
               {app.scope === 'shared' && (
-                <span className="text-amber-600 dark:text-amber-400"> — a manager of this agent must approve this</span>
+                <span className="text-status-warning-fg">, and a manager of this agent must approve this</span>
               )}
             </li>
           )}
           {app.has_live_link && (
-            <li className="text-amber-600 dark:text-amber-400" data-testid="step-link-warning">
-              this app runs scripts and is reachable by a link, so a visitor’s input is data to the scripts, never instructions
+            <li className="text-status-warning-fg" data-testid="step-link-warning">
+              This app runs scripts and is reachable by a link. A visitor’s input is only data to the scripts, never instructions.
             </li>
           )}
         </Group>
@@ -459,13 +464,13 @@ export function ManifestBlocks({ app, onSetSecret }: {
         <Group heading={placedCalls.length ? 'Offers to other apps and to the agents it is placed in' : 'Offers to other apps'} count={offers.length}>
           {offers.map((o) => (
             <li key={`${o.kind}-${o.name}`} className="flex flex-wrap items-baseline gap-x-1.5">
-              <span>{o.kind} <Code>{o.name}</Code> — {o.description}</span>
+              <span>{o.kind} <Code>{o.name}</Code>: {o.description}</span>
               <FloorChip role={o.min_role} />
             </li>
           ))}
           {placedCalls.length > 0 && (
-            <li className="text-p-text-light" data-testid="offers-placed-note">
-              The calls also answer the chats and tasks of agents a share places this app in, at the role the share gives (a floor is judged there as here).
+            <li className="text-tertiary" data-testid="offers-placed-note">
+              The calls also answer chats and tasks in agents a share places this app in. They get the role the share gives. The same minimum roles apply there.
             </li>
           )}
         </Group>
@@ -473,7 +478,7 @@ export function ManifestBlocks({ app, onSetSecret }: {
       {uses.length > 0 && (
         <Group heading="Uses other apps" count={uses.length}>
           {uses.map((b) => (
-            <li key={b.name}>calls the app <Code>{b.app}</Code> of agent <Code>{b.agent}</Code> as <Code>{b.name}</Code></li>
+            <li key={b.name}>Calls the app <Code>{b.app}</Code> of agent <Code>{b.agent}</Code> as <Code>{b.name}</Code></li>
           ))}
         </Group>
       )}
@@ -481,27 +486,27 @@ export function ManifestBlocks({ app, onSetSecret }: {
         <Group heading="Needs">
           {needMcps.map((m) => (
             <li key={`m-${m.name}`}>
-              the MCP <Code>{m.name}</Code>
-              {m.assigned === undefined ? '' : m.assigned ? ' — assigned to this agent' : (
-                <span className="text-amber-600 dark:text-amber-400"> — not assigned to this agent</span>
+              The MCP <Code>{m.name}</Code>
+              {m.assigned === undefined ? '' : m.assigned ? ', assigned to this agent' : (
+                <span className="text-status-warning-fg">, not assigned to this agent</span>
               )}
             </li>
           ))}
           {needProviders.map((p) => (
             <li key={`p-${p.provider}`}>
-              a connected {p.provider} account{p.mcp ? <> (<Code>{p.mcp}</Code>)</> : ''}
+              A connected {p.provider} account{p.mcp ? <> for <Code>{p.mcp}</Code></> : ''}
               {p.connected === undefined ? '' : p.connected ? (
                 // The identity the buttons run with (the server's word):
                 // the agent's service account for a shared app, the
                 // owner's for a personal one.
-                p.identity === 'the agent' ? <> — the agent's account{p.account ? <> <Code>{p.account}</Code></> : ''}</>
-                  : p.identity === 'the owner' ? <> — the owner's account{p.account ? <> <Code>{p.account}</Code></> : ''}</>
-                    : <> — connected{p.account ? <> as <Code>{p.account}</Code></> : ''}</>
+                p.identity === 'the agent' ? <>, the agent's account{p.account ? <> <Code>{p.account}</Code></> : ''}</>
+                  : p.identity === 'the owner' ? <>, the owner's account{p.account ? <> <Code>{p.account}</Code></> : ''}</>
+                    : <>, connected{p.account ? <> as <Code>{p.account}</Code></> : ''}</>
               ) : (
-                <span className="text-amber-600 dark:text-amber-400">
+                <span className="text-status-warning-fg">
                   {p.identity === 'the agent'
-                    ? ' — no account is bound to this agent (Agent Settings → MCPs → use an account for this agent)'
-                    : p.identity === 'the owner' ? ' — the owner has not connected one' : ' — not connected for you'}
+                    ? ', but none is set for this agent. Choose a service account on the agent’s MCPs page.'
+                    : p.identity === 'the owner' ? ', but the owner has not connected one' : ', not connected for you'}
                 </span>
               )}
             </li>
@@ -558,7 +563,7 @@ export interface SummaryLine {
 /** The plain list: one short line per kind of thing the app may do, in the
  * order of the groups. The sentences with every name, hash and address are
  * the groups behind "Details". */
-export function summaryLines(app: PinnedApp): SummaryLine[] {
+function summaryLines(app: PinnedApp): SummaryLine[] {
   const out: SummaryLine[] = []
   const buttons = app.actions.filter((a) => BUTTON_TYPES.includes(a.type))
   const data = app.actions.filter((a) => !BUTTON_TYPES.includes(a.type))
@@ -577,6 +582,9 @@ export function summaryLines(app: PinnedApp): SummaryLine[] {
   const files = app.files ?? { read: [], write: [] }
   if (files.read.length) out.push({ key: 'reads', text: <>Reads files under {few(codeItems(files.read))}</> })
   if (files.write.length) out.push({ key: 'writes', text: <>Writes files under {few(codeItems(files.write))}</> })
+  for (const path of files.create ?? []) {
+    out.push({ key: `creates-${path}`, testId: 'summary-creates', text: <>{CREATES_FOLDER} <Code>{path}</Code></> })
+  }
   if (app.egress?.length) out.push({ key: 'hosts', text: <>Its server may reach {few(codeItems(app.egress))}</> })
   const ext = app.external
   if (ext?.links.length) out.push({ key: 'links', text: <>Its page may open {few(codeItems(ext.links))}</> })
@@ -587,7 +595,7 @@ export function summaryLines(app: PinnedApp): SummaryLine[] {
   const h = app.handlers ?? {}
   const wakes: ReactNode[] = [
     ...Object.values(h.on_schedule ?? {}).map(({ cron }) => cronWords(cron)),
-    ...(h.on_trigger ?? []).map((name) => <>on the trigger <Code>{name}</Code></>),
+    ...(h.on_trigger ?? []).map((name) => <>on a <Code>{name}</Code> trigger</>),
     ...Object.values(h.on_event ?? {}).flat().map((e) => <>when {eventWords(e)}</>),
     ...Object.values(app.inbound ?? {}).map((hook) => <>on {inboundWords(hook)}</>),
   ]
@@ -607,7 +615,7 @@ export function summaryLines(app: PinnedApp): SummaryLine[] {
         key: 'step-accounts', warn: app.scope === 'shared', testId: 'summary-step-accounts',
         text: <>
           Its scripts receive the {providers.map((p) => p.provider).join(', ')} account{providers.length > 1 ? 's' : ''} of
-          {app.scope === 'shared' ? ' the agent — a manager must approve' : ' the owner'}
+          {app.scope === 'shared' ? ' the agent, so approval needs a manager' : ' the owner'}
         </>,
       })
     }
@@ -625,28 +633,28 @@ export function summaryLines(app: PinnedApp): SummaryLine[] {
       key: 'secrets', testId: 'summary-secrets', warn: unset > 0,
       text: <>
         Needs the secret{secrets.length > 1 ? 's' : ''} {few(secrets.map((s) => (
-          <><Code>{s.name}</Code> ({s.set ? 'set' : s.required ? 'not set' : 'optional, not set'})</>
+          <><Code>{s.name}</Code>{s.set ? ', set' : s.required ? ', not set' : ', optional, not set'}</>
         )))}
       </>,
     })
   }
   const ex = app.exports ?? {}
   const offers: ReactNode[] = [
-    ...Object.keys(ex.methods ?? {}).map((n) => <>the call <Code>{n}</Code></>),
-    ...Object.keys(ex.snapshots ?? {}).map((n) => <>the snapshot <Code>{n}</Code></>),
-    ...Object.keys(ex.events ?? {}).map((n) => <>the event <Code>{n}</Code></>),
+    ...Object.keys(ex.methods ?? {}).map((n) => <>the <Code>{n}</Code> call</>),
+    ...Object.keys(ex.snapshots ?? {}).map((n) => <>the <Code>{n}</Code> snapshot</>),
+    ...Object.keys(ex.events ?? {}).map((n) => <>the <Code>{n}</Code> event</>),
   ]
   if (offers.length) out.push({ key: 'offers', text: <>Offers other apps {few(offers)}</> })
   const placedCalls = Object.keys(ex.methods ?? {})
   if (placedCalls.length) {
     out.push({
       key: 'placed-calls', testId: 'summary-placed-calls',
-      text: <>Answers the agents it is placed in with {few(placedCalls.map((n) => <>the call <Code>{n}</Code></>))}</>,
+      text: <>Answers the agents it is placed in with {few(placedCalls.map((n) => <>the <Code>{n}</Code> call</>))}</>,
     })
   }
   const uses = app.bindings ?? []
   if (uses.length) {
-    out.push({ key: 'uses', text: <>Uses {few(uses.map((b) => <>the app <Code>{b.app}</Code> of agent <Code>{b.agent}</Code></>))}</> })
+    out.push({ key: 'uses', text: <>Uses {few(uses.map((b) => <>the <Code>{b.app}</Code> app of agent <Code>{b.agent}</Code></>))}</> })
   }
   // One line for the MCPs an app needs (a template app lists every tool
   // its cards describe — seven lines said the same thing on a phone), the
@@ -660,24 +668,24 @@ export function summaryLines(app: PinnedApp): SummaryLine[] {
       text: <>
         Needs the MCPs {few(codeItems(mcps.map((m) => m.name)))}
         {!judged ? '' : missing.length
-          ? <> — {few(codeItems(missing.map((m) => m.name)))} not assigned to this agent</>
-          : ' (all assigned)'}
+          ? <>. Not assigned to this agent: {few(codeItems(missing.map((m) => m.name)))}</>
+          : ', all assigned'}
       </>,
     })
   } else {
     for (const m of mcps) {
       out.push({
         key: `mcp-${m.name}`, testId: `summary-mcp-${m.name}`, warn: m.assigned === false,
-        text: <>Needs the MCP <Code>{m.name}</Code>{m.assigned === undefined ? '' : m.assigned ? ' (assigned)' : ' — not assigned to this agent'}</>,
+        text: <>Needs the MCP <Code>{m.name}</Code>{m.assigned === undefined ? '' : m.assigned ? ', assigned' : ', not assigned to this agent'}</>,
       })
     }
   }
   for (const p of neededProviders(app)) {
     const who = p.connected === undefined ? ''
       : p.connected
-        ? p.identity === 'the agent' ? ' — the agent’s' : p.identity === 'the owner' ? ' — the owner’s' : ' — yours'
-        : p.identity === 'the agent' ? ' — none bound to this agent'
-          : p.identity === 'the owner' ? ' — the owner has not connected one' : ' — not connected for you'
+        ? p.identity === 'the agent' ? ', the agent’s own' : p.identity === 'the owner' ? ', the owner’s own' : ', connected for you'
+        : p.identity === 'the agent' ? ', but none is set for this agent'
+          : p.identity === 'the owner' ? ', but the owner has not connected one' : ', not connected for you'
     out.push({
       key: `provider-${p.provider}`, testId: `summary-provider-${p.provider}`, warn: p.connected === false,
       text: <>Needs a {p.provider} account{who}</>,
@@ -702,11 +710,11 @@ export function ManifestSummary({ app, onSetSecret, before, only }: {
   const lines = [...(before ?? []), ...own]
   if (!lines.length) return null
   return (
-    <ul className="mt-1.5 space-y-1 text-p-text-secondary" data-testid="manifest-summary">
+    <ul className="mt-1.5 space-y-1 text-secondary" data-testid="manifest-summary">
       {lines.map((l) => (
         <li
           key={l.key}
-          className={`flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 ${l.warn ? 'text-amber-600 dark:text-amber-400' : ''}`}
+          className={`flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 ${l.warn ? 'text-status-warning-fg' : ''}`}
           data-testid={l.testId}
         >
           <span>{l.text}</span>
@@ -714,7 +722,7 @@ export function ManifestSummary({ app, onSetSecret, before, only }: {
             <button
               type="button"
               onClick={onSetSecret}
-              className="rounded-md border border-p-border-light px-1.5 py-px text-[11px] text-p-text-secondary transition-colors hover:bg-p-surface-hover"
+              className={`${BUTTON_BASE} ${BUTTON_VARIANT.secondary} ${BUTTON_SIZE.xs}`}
               data-testid="summary-secret-set"
             >
               Set
@@ -733,7 +741,7 @@ export function DetailsToggle({ open, onToggle }: { open: boolean; onToggle: () 
     <button
       type="button"
       onClick={onToggle}
-      className="text-p-text-secondary underline decoration-dotted underline-offset-2 hover:text-p-text"
+      className="text-secondary underline decoration-dotted underline-offset-2 hover:text-primary"
       data-testid="details-toggle"
     >
       {open ? 'Hide details' : 'Details'}
@@ -748,24 +756,24 @@ export function ExactManifestToggle({ open, onToggle }: { open: boolean; onToggl
     <button
       type="button"
       onClick={onToggle}
-      className="text-p-text-light underline decoration-dotted underline-offset-2 hover:text-p-text-secondary"
+      className="text-tertiary underline decoration-dotted underline-offset-2 hover:text-secondary"
       data-testid="exact-manifest-toggle"
     >
-      {open ? 'Hide manifest' : 'Exact manifest'}
+      {open ? 'Hide declaration' : 'Exact declaration'}
     </button>
   )
 }
 
 export function ExactManifest({ app }: { app: PinnedApp }) {
   return (
-    <pre className="mt-1 overflow-x-auto rounded-lg bg-black/5 p-2 font-mono text-[10px] leading-snug text-p-text-secondary dark:bg-white/5" data-testid="exact-manifest">
+    <pre className="mt-1 overflow-x-auto rounded-card bg-surface-sunken p-2 font-mono text-3xs leading-snug text-secondary" data-testid="exact-manifest">
       {JSON.stringify(exactManifest(app), null, 2)}
     </pre>
   )
 }
 
-/** The card's shell: an amber box that is a shrinkable flex column of the
- * column it sits in (`min-h-0 shrink`), with a pinned header, a body that
+/** The card's shell: a warning-tinted box that is a shrinkable flex column
+ * of the column it sits in (`min-h-0 shrink`), with a pinned header, a body that
  * scrolls when the card is clamped, and a pinned footer. Used by the
  * approval card and the deploy card so the two behave the same on every
  * mount point. */
@@ -774,7 +782,7 @@ export function AppCardShell({ header, body, footer, testId }: {
 }) {
   return (
     <div
-      className="mx-3 mt-2 flex min-h-0 shrink flex-col rounded-xl border border-amber-500/40 bg-amber-500/5 px-3 py-2.5 text-xs"
+      className="mx-3 mt-2 flex min-h-0 shrink flex-col rounded-card border border-status-warning-border bg-status-warning-bg px-3 py-2.5 text-xs"
       data-testid={testId}
     >
       <div className="shrink-0" data-testid="app-card-header">{header}</div>
@@ -803,15 +811,15 @@ export default function AppApprovalCard({ app, agent }: Props) {
   const n = app.actions.length
   const onlyButtons = Object.keys(exactManifest(app)).length === 1
   const headline = app.approval_stale
-    ? 'The approval for this app’s actions is stale — review and re-approve.'
+    ? 'The approval of this app’s actions no longer holds. Review and approve them again.'
     : onlyButtons && n > 0
-      ? `“${app.title || app.slug}” declares ${n} action button${n > 1 ? 's' : ''} — review before they work.`
-      : `“${app.title || app.slug}” declares what it may do — review before it works.`
+      ? `“${app.title || app.slug}” declares ${n} action button${n > 1 ? 's' : ''}. Review ${n > 1 ? 'them' : 'it'} before use.`
+      : `“${app.title || app.slug}” declares what it may do. Review it before it works.`
 
   return (
     <AppCardShell
       testId="app-approval-card"
-      header={<p className="font-medium text-p-text">{headline}</p>}
+      header={<p className="font-medium text-primary">{headline}</p>}
       body={(
         <>
           <ManifestSummary app={app} onSetSecret={onSetSecret} />
@@ -823,26 +831,27 @@ export default function AppApprovalCard({ app, agent }: Props) {
       footer={(
         <>
           {app.can_approve ? (
-            <button
+            <Button
+              variant="primary"
+              size="xs"
               onClick={() => approve.mutate({ appId: app.id, sig: app.actions_sig })}
               disabled={approve.isPending}
-              className="rounded-md bg-emerald-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-60"
             >
               Approve
-            </button>
+            </Button>
           ) : (
-            <span className="text-p-text-light">
+            <span className="text-tertiary">
               {app.steps_need_manager
                 ? 'Approval needs a manager of this agent: its scripts receive the agent’s accounts.'
                 : app.scope === 'shared'
-                  ? 'Approval needs an editor of this agent (with run access to the tasks).'
+                  ? 'Approval needs an editor of this agent with run access to the tasks.'
                   : 'Approval needs run access to the referenced tasks.'}
             </span>
           )}
           <DetailsToggle open={details} onToggle={() => setDetails((v) => !v)} />
           <ExactManifestToggle open={showManifest} onToggle={() => setShowManifest((v) => !v)} />
           {approve.isError && (
-            <span className="text-red-500">{(approve.error as Error).message}</span>
+            <span className="text-status-danger-fg">{(approve.error as Error).message}</span>
           )}
         </>
       )}

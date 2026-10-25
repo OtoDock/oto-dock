@@ -1,8 +1,10 @@
 /** The renderer lifecycle of the 3D map — renderer, CSS3D layer, camera,
  * controls, texture loads, lights, bloom, wheel and click capture, the rAF
  * `tick`, the ResizeObserver and the teardown — as the one effect that runs
- * once per mount (split out of AgentsMap3D.tsx on 2026-09-10; the body and
- * its empty dependency array are the component's, verbatim). */
+ * once per mount. The bag it builds is the scene controller: render never
+ * reads it, and the two facts render needs from it (the stage row cap for
+ * the viewport, whether the user grabbed the controls) are published as
+ * state through the setters this hook takes. */
 import { useEffect } from 'react'
 import type { Dispatch, RefObject, SetStateAction } from 'react'
 import * as THREE from 'three'
@@ -17,6 +19,7 @@ import {
   ENTER_STAGE_DIST, STAGE_ZOOM_MAX, STAGE_ZOOM_MIN, WHEEL_EXIT_ACCUM,
   WHEEL_HOLD_GAP_MS, WHEEL_HOLD_MS,
 } from './mapConstants'
+import { rowCapFor } from './camera'
 import {
   disposeObject, TMP_FWD, TMP_LOOK, TMP_RIGHT, updateSparks, viewScale,
   WORLD_UP, type SceneBag,
@@ -34,6 +37,7 @@ import skyUrl from '../../assets/agents-map/sky-night.jpg'
 import skyLowUrl from '../../assets/agents-map/sky-night-low.jpg'
 import woodUrl from '../../assets/agents-map/wood-walnut.jpg'
 import grassUrl from '../../assets/agents-map/ground-grass.jpg'
+import { debugLog } from '../../lib/debug/log'
 
 /** The stage machine's refs (enterStage / findCluster / exitStage), read
  * LAZILY: `useStageMachine` is called after this hook in the component —
@@ -47,13 +51,19 @@ export interface StageRefs {
 }
 
 export function useMapRenderer({
-  containerRef, bagRef, stageRefs, onUnavailable, setAssetsTick, user,
+  containerRef, bagRef, stageRefs, onUnavailable, setAssetsTick, setRowCap,
+  setUserMoved, user,
 }: {
   containerRef: RefObject<HTMLDivElement | null>
   bagRef: RefObject<SceneBag | null>
   stageRefs: () => StageRefs
   onUnavailable: () => void
   setAssetsTick: Dispatch<SetStateAction<number>>
+  /** Seats per stage row for the current viewport (`rowCapFor`), set on
+   * the ResizeObserver's first callback and on every resize. */
+  setRowCap: Dispatch<SetStateAction<number>>
+  /** Set once, on the first grab of the controls. */
+  setUserMoved: Dispatch<SetStateAction<boolean>>
   /** The mount-time user (`user?.default_agent` for the pose park) — the
    * effect runs once and reads the argument it was called with. */
   user: User | null
@@ -311,6 +321,7 @@ export function useMapRenderer({
       bag.lookTarget = null
       bag.userMoved = true
       bag.firstFocus = false // a grabbed map never snap-repositions later
+      setUserMoved(true)
     })
 
     // On stage the wheel first drives a GENTLE zoom (a factor on the
@@ -395,7 +406,7 @@ export function useMapRenderer({
           bag.bloomOn = false
           // The wind is the other GPU luxury — freeze it alongside bloom.
           bag.envAnimOn = false
-          console.info('[map] quality tier lowered — sustained slow frames')
+          debugLog('[map] quality tier lowered — sustained slow frames')
         }
       }
       updateSparks(bag)
@@ -564,6 +575,9 @@ export function useMapRenderer({
         labels.setSize(w, h)
         bag.lineRes.set(w, h)
         for (const m of bag.lineMats) m.resolution.copy(bag.lineRes)
+        // An integer: the amphitheater rebuilds only when the seat count
+        // changes, never per resized pixel.
+        setRowCap(rowCapFor(camera.aspect, viewScale()))
       })
       : null
     ro?.observe(el)

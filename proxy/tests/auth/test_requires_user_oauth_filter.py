@@ -18,7 +18,6 @@ from fastapi.testclient import TestClient
 from storage.identity import credential_store
 from storage.pg import get_conn
 
-
 # ---------------------------------------------------------------------------
 # Validator sanity (covered in 3a, repeated here as a defence-in-depth gate)
 # ---------------------------------------------------------------------------
@@ -147,8 +146,9 @@ class TestAccountsEndpointServiceOnlyFlag:
         because there's no S2S to gate against."""
         # mcp_registry needs the MCP to be a known manifest; rather than
         # writing a fixture manifest to disk, register one in-memory.
-        from services.mcp import mcp_registry
         from dataclasses import dataclass, field
+
+        from services.mcp import mcp_registry
 
         @dataclass
         class _Cred:
@@ -181,8 +181,9 @@ class TestAccountsEndpointServiceOnlyFlag:
     def test_user_oauth_present_flag_is_false(self, mcp_name, user_sub):
         """With a user-OAuth account connected, the flag is False and the
         account is listed."""
-        from services.mcp import mcp_registry
         from dataclasses import dataclass, field
+
+        from services.mcp import mcp_registry
 
         @dataclass
         class _Cred:

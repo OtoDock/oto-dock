@@ -76,7 +76,7 @@ async def test_a_heartbeat_goes_out_between_the_chunks_of_a_large_pull(tmp_path,
     await c.enqueue_send({"type": "heartbeat"})
     writer = asyncio.create_task(c._writer_loop())
     await asyncio.wait_for(pull, 5)
-    while not c._lanes_empty():
+    while not c._lanes_empty():  # noqa: ASYNC110  # the client's lanes drain without an event to await
         await asyncio.sleep(0.01)
     writer.cancel()
     types_ = [(m["type"], m.get("chunk_index")) for m in c._ws.sent]
@@ -214,7 +214,7 @@ async def test_a_bulk_frame_goes_after_a_run_of_pty_frames():
         await c.enqueue_pty({"type": "pty_output", "i": i, "data_b64": ""})
     await c.enqueue_bulk({"type": "file_content", "chunk_index": 0})
     writer = asyncio.create_task(c._writer_loop())
-    while not c._lanes_empty():
+    while not c._lanes_empty():  # noqa: ASYNC110  # the client's lanes drain without an event to await
         await asyncio.sleep(0.01)
     writer.cancel()
     kinds = [m["type"] for m in c._ws.sent]
@@ -227,7 +227,7 @@ async def test_control_goes_before_pty_and_bulk():
     await c.enqueue_pty({"type": "pty_output", "data_b64": ""})
     await c.enqueue_send({"type": "heartbeat"})
     writer = asyncio.create_task(c._writer_loop())
-    while not c._lanes_empty():
+    while not c._lanes_empty():  # noqa: ASYNC110  # the client's lanes drain without an event to await
         await asyncio.sleep(0.01)
     writer.cancel()
     assert [m["type"] for m in c._ws.sent] == ["heartbeat", "pty_output", "file_content"]
@@ -251,6 +251,7 @@ async def test_tcp_notsent_lowat_is_set_beside_the_keepalive():
 
 async def test_a_pull_cancelled_while_its_file_opens_closes_the_descriptor(tmp_path, monkeypatch):
     import threading
+
     from satellite.host import safe_fs
     _file(tmp_path, 2, 64)
     sm = _sm(tmp_path)

@@ -5,40 +5,12 @@ import type { Components } from 'react-markdown'
 import { resolveChatPath, type ResolvedChatPath } from '../../api/chats'
 import CodeBlock from './CodeBlock'
 import ChatFilePreview from './ChatFilePreview'
-import { useChatFileContext } from './ChatFileContext'
+
 import SearchHighlight from './SearchHighlight'
-import { useSearch } from '../../contexts/SearchContext'
 
-// Known document/asset extensions — the last-resort path signal for hrefs
-// that carry no other filesystem marker (bare `report.xlsx` relative links).
-const FILE_EXT_RE = /\.(xlsx|xlsm|xls|csv|docx|doc|pptx|ppt|pdf|md|txt|rtf|odt|ods|odp|png|jpe?g|gif|webp|svg|bmp|tiff?|zip|tar|gz|7z|json|xml|ya?ml|log)$/i
-
-// Filesystem roots on the platform's containers and common OSes. Deliberately
-// NOT `/agents`: it is both an SPA route and the container mount root — the
-// extension rule disambiguates those hrefs.
-const POSIX_ROOT_RE = /^\/(workspace|users|knowledge|config|home|tmp|mnt|var|opt|srv|etc|root|media|private)\//i
-
-/**
- * True when a markdown href is a filesystem path, not a navigable URL.
- * Agents sometimes emit `[open](C:\Users\...\file.xlsx)` — the browser cannot
- * open local files, so such links render as inert chips instead of anchors.
- * Order matters: the drive-letter/backslash tests must precede the generic
- * scheme test because `C:` parses as a URI scheme.
- * Accepted false positive: `./notes.md`-style relative file links become
- * chips too — they have no working SPA target anyway.
- */
-export function isFileSystemPathHref(href: string): boolean {
-  // Windows drive-relative + UNC. micromark's normalizeUri percent-encodes
-  // '\' as %5C before urlTransform ever runs — both forms must match.
-  if (/\\|%5C/i.test(href)) return true
-  if (/^[a-zA-Z]:\//.test(href)) return true // C:/...
-  if (/^(file|sandbox):/i.test(href)) return true
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) return false // any other real scheme
-  if (/^~\//.test(href)) return true
-  if (/^[#?]/.test(href)) return false
-  if (POSIX_ROOT_RE.test(href)) return true
-  return FILE_EXT_RE.test(href.split(/[?#]/)[0])
-}
+import { isFileSystemPathHref } from '../../lib/chat/markdownLinks'
+import { useChatFileContext } from '../../lib/chat/chatFileContext'
+import { useSearch } from '../../contexts/useSearch'
 
 // micromark percent-encodes non-ASCII hrefs (Greek filenames); a raw '%' in
 // a path would make decodeURI throw.
@@ -86,8 +58,8 @@ function FileChip({ href }: { href: string }) {
   if (!ctx) {
     return (
       <span
-        title="Local file path — ask for a preview or download link"
-        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-200 text-[0.85em] font-mono border border-gray-200 dark:border-gray-700 cursor-default break-all"
+        title="A local file path. Ask the agent for a preview or a download link."
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm bg-surface-muted text-primary text-[0.85em] font-mono cursor-default break-all"
       >
         <span aria-hidden="true">📄</span>
         {decoded}
@@ -103,7 +75,7 @@ function FileChip({ href }: { href: string }) {
     }
     setNotFound(false)
     setBusy(true)
-    let resolved: ResolvedChatPath | null = null
+    let resolved: ResolvedChatPath | null
     try {
       resolved = await resolveChatPath(ctx.chatId, decoded)
     } catch {
@@ -124,18 +96,34 @@ function FileChip({ href }: { href: string }) {
         type="button"
         onClick={handleClick}
         title={notFound ? "File not found in the agent's workspace" : 'Open file preview'}
-        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-200 text-[0.85em] font-mono border border-gray-200 dark:border-gray-700 cursor-pointer hover:ring-1 hover:ring-brand/40 break-all text-left align-baseline${busy ? ' opacity-60' : ''}`}
+        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm bg-surface-muted text-primary text-[0.85em] font-mono cursor-pointer hover:ring-1 hover:ring-action break-all text-left align-baseline${busy ? ' opacity-60' : ''}`}
       >
         <span aria-hidden="true">📄</span>
         {decoded}
         {notFound ? (
-          <span className="font-sans text-amber-600 dark:text-amber-400 whitespace-nowrap">not found</span>
+          <span className="font-sans text-status-warning-fg whitespace-nowrap">Not found</span>
         ) : (
           <span aria-hidden="true" className="opacity-60">↗</span>
         )}
       </button>
       {preview && <ChatFilePreview resolved={preview} onClose={() => setPreview(null)} />}
     </>
+  )
+}
+
+function headerCell({ children }: { children?: React.ReactNode }) {
+  return (
+    <th className="px-3 py-2 text-left text-xs font-semibold text-secondary uppercase tracking-wider whitespace-nowrap">
+      {children}
+    </th>
+  )
+}
+
+function dataCell({ children }: { children?: React.ReactNode }) {
+  return (
+    <td className="px-3 py-2 text-primary border-t border-subtle whitespace-nowrap">
+      {children}
+    </td>
   )
 }
 
@@ -175,7 +163,7 @@ const baseComponents: Components = {
         href={href}
         target={isExternal ? '_blank' : undefined}
         rel={isExternal ? 'noopener noreferrer' : undefined}
-        className="text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 hover:underline underline-offset-2 inline-flex items-center gap-0.5"
+        className="text-link hover:text-link-hover hover:underline underline-offset-2 inline-flex items-center gap-0.5"
       >
         {children}
         {isExternal && (
@@ -190,8 +178,8 @@ const baseComponents: Components = {
   // Tables — scrollable wrapper
   table({ children }) {
     return (
-      <div className="overflow-x-auto my-3 rounded-lg border border-p-border-light">
-        <table className="min-w-full divide-y divide-p-border-light text-sm">
+      <div className="overflow-x-auto my-3 rounded-card border border-subtle">
+        <table className="min-w-full divide-y divide-subtle text-sm">
           {children}
         </table>
       </div>
@@ -199,27 +187,15 @@ const baseComponents: Components = {
   },
 
   thead({ children }) {
-    return <thead className="bg-brand-50">{children}</thead>
+    return <thead className="bg-surface-muted">{children}</thead>
   },
 
-  th({ children }) {
-    return (
-      <th className="px-3 py-2 text-left text-xs font-semibold text-brand uppercase tracking-wider whitespace-nowrap">
-        {children}
-      </th>
-    )
-  },
+  th: headerCell,
 
-  td({ children }) {
-    return (
-      <td className="px-3 py-2 text-p-text border-t border-p-border-light whitespace-nowrap">
-        {children}
-      </td>
-    )
-  },
+  td: dataCell,
 
   tr({ children }) {
-    return <tr className="even:bg-p-surface/40">{children}</tr>
+    return <tr className="even:bg-surface-muted/40">{children}</tr>
   },
 }
 
@@ -240,10 +216,10 @@ function highlightChildren(
         const id = `${idPrefix}-${counterRef.current++}`
         return <SearchHighlight key={i} text={child} matchId={id} order={order} />
       }
-      if (isValidElement(child)) {
-        const childProps = child.props as any
+      if (isValidElement<{ children?: React.ReactNode }>(child)) {
+        const childProps = child.props
         if (childProps?.children) {
-          return cloneElement(child as React.ReactElement<any>, {
+          return cloneElement(child, {
             ...childProps,
             key: child.key ?? i,
             children: highlightChildren(childProps.children, idPrefix, counterRef, order),
@@ -253,10 +229,10 @@ function highlightChildren(
       return child
     })
   }
-  if (isValidElement(children)) {
-    const p = (children as any).props
+  if (isValidElement<{ children?: React.ReactNode }>(children)) {
+    const p = children.props
     if (p?.children) {
-      return cloneElement(children as React.ReactElement<any>, {
+      return cloneElement(children, {
         ...p,
         children: highlightChildren(p.children, idPrefix, counterRef, order),
       })
@@ -265,16 +241,25 @@ function highlightChildren(
   return children
 }
 
+type WrappedTag = 'p' | 'li' | 'td' | 'th' | 'strong' | 'em' | 'h1' | 'h2' | 'h3' | 'h4' | 'blockquote'
+type WrappedProps = React.HTMLAttributes<HTMLElement> & { node?: unknown }
+
+// The wrapped tags that baseComponents renders itself (the table cells).
+const BASE_RENDERERS: Partial<Record<WrappedTag, (props: { children?: React.ReactNode }) => React.ReactNode>> = {
+  th: headerCell,
+  td: dataCell,
+}
+
 /** Build components with search highlighting injected into text-bearing elements. */
 function buildSearchComponents(idPrefix: string, counterRef: { current: number }, order: number): Components {
-  const wrap = (Tag: string) =>
-    function WrappedElement({ children, ...props }: any) {
-      // Use base component if it exists, otherwise use raw tag
-      const base = (baseComponents as any)[Tag]
+  const wrap = (Tag: WrappedTag) =>
+    function WrappedElement({ children, ...props }: WrappedProps) {
+      // Use the base renderer where the tag has one, otherwise the raw tag
+      const base = BASE_RENDERERS[Tag]
       if (base) {
         return base({ ...props, children: highlightChildren(children, idPrefix, counterRef, order) })
       }
-      const El = Tag as any
+      const El = Tag
       return <El {...props}>{highlightChildren(children, idPrefix, counterRef, order)}</El>
     }
 
@@ -309,24 +294,23 @@ interface Props {
 // still pass through memo as always.
 function MarkdownContent({ children, className, searchMatchIdPrefix, searchOrder }: Props) {
   const { query } = useSearch()
-  const counterRef = useRef(0)
-  // Reset counter on each render so IDs are stable for same content
-  counterRef.current = 0
+  // A fresh counter each render, so the IDs are stable for the same content
+  const counter = { current: 0 }
 
   const idPrefix = searchMatchIdPrefix || 'md'
   const order = searchOrder ?? 0
   const components = query
-    ? buildSearchComponents(idPrefix, counterRef, order)
+    ? buildSearchComponents(idPrefix, counter, order)
     : baseComponents
 
   return (
-    <div className={`markdown-content prose prose-sm max-w-none dark:prose-invert
-      prose-headings:mt-4 prose-headings:mb-2 prose-headings:font-semibold
+    <div className={`markdown-content prose prose-sm max-w-none
+      prose-headings:mt-4 prose-headings:mb-2 prose-headings:font-semibold prose-h1:font-display prose-h2:font-display
       prose-p:my-2 prose-p:leading-relaxed
       prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5
-      prose-blockquote:border-l-blue-400 prose-blockquote:bg-blue-50 dark:prose-blockquote:bg-blue-900/20 prose-blockquote:py-1 prose-blockquote:px-3 prose-blockquote:rounded-r-lg prose-blockquote:not-italic
+      prose-blockquote:border-l-strong prose-blockquote:bg-surface-muted prose-blockquote:py-1 prose-blockquote:px-3 prose-blockquote:rounded-r-card prose-blockquote:not-italic
       prose-hr:my-4
-      prose-strong:text-gray-900 dark:prose-strong:text-gray-100
+      prose-strong:text-primary
       ${className || ''}`}
     >
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={components} urlTransform={urlTransform}>

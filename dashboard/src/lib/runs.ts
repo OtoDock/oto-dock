@@ -7,8 +7,8 @@ export { formatTrigger }
 // (the initial release's config-file tasks); no writer has minted it since,
 // so it is a legacy read-through beside the mirror's kinds, not a kind.
 const LEGACY_RUN_KIND_LABEL: Record<string, string> = { static: 'Static' }
-const LEGACY_RUN_KIND_STYLE: Record<string, string> = { static: 'bg-gray-100 text-gray-700' }
-const NEUTRAL_STYLE = 'bg-gray-100 text-gray-700'
+const NEUTRAL_STYLE = 'bg-surface-muted text-secondary'
+const LEGACY_RUN_KIND_STYLE: Record<string, string> = { static: NEUTRAL_STYLE }
 
 // Internal task types that should be filtered out of user-facing lists
 // (admin History). Admin views show them via the audit log.

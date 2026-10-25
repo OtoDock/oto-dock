@@ -147,7 +147,7 @@ describe('Admin → Shares', () => {
       '“Register” will not come back to Ops Desk\'s apps when the app is pinned again.')
     fireEvent.click(revokes()[2])
     expect(screen.getByTestId('admin-revoke-confirm').textContent).toContain(
-      '“Roster” will not come back to the agents of the Engineering department when the app is pinned again.')
+      '“Roster” will not return to the Engineering department\'s agents when the app is pinned again.')
     fireEvent.click(revokes()[3])
     expect(screen.getByTestId('admin-revoke-confirm').textContent).toContain(
       'Ana will not get “Schedule” back when the app is pinned again.')
@@ -203,7 +203,7 @@ describe('Admin → Shares', () => {
   it('says so when there are none', () => {
     render(<SharesPage />)
     expect(screen.getByText('Every share on the platform, to people, agents and departments or by link. '
-      + 'Revoke ends a share at once and tells nobody. Sharing is switched on and off under Setup → Security.')).toBeTruthy()
+      + 'Revoke ends a share at once and tells nobody. Sharing is switched on and off in Setup, Security.')).toBeTruthy()
     expect(screen.getByText('No external links.')).toBeTruthy()
     expect(screen.getByText('No shares to people, agents or departments.')).toBeTruthy()
     expect(screen.queryByTestId('admin-shares-cut')).toBeNull()

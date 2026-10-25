@@ -2,6 +2,15 @@
   "title": "Kanban",
   "actions": [],
   "exports": {
+    "methods": {
+      "summary": {
+        "description": "GET. Every card with its column and who moved it last. Answers {cards: [{id, title, col, moved_by}]}."
+      },
+      "move": {
+        "description": "POST {id, col}. Moves a card to todo, doing or done and answers {ok}.",
+        "min_role": "editor"
+      }
+    },
     "snapshots": {
       "board": {
         "description": "every card with its column and who moved it last"

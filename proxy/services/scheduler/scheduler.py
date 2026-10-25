@@ -33,42 +33,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
 import config
-from services.scheduler import scheduler_triggers
-from storage import database as task_store
-from services.scheduler import runner, shared
-from services.scheduler.shared import (  # noqa: F401
-    RetryPolicy,
-    TaskDefinition,
-    _active_task_ids,
-    _dynamic_task_ids,
-    _platform_interrupts,
-    _run_event_buffer,
-    _run_subscribers,
-    _running_tasks,
-    _user_cancelled_runs,
-    now_iso,
-)
-from services.scheduler.lanes import (  # noqa: F401
-    _DELEGATE_PREVIEW_CAP,
-    _TaskTurnStalled,
-    _await_lane_quiescence,
-    _collect_lane_output_since,
-    _collect_task_output,
-    _delegate_output_preview,
-    _lane_pump_wedged,
-    _limit_notice,
-    _post_run_session_action,
-    _reap_prior_lane_pump,
-    _settle_prior_lane,
-    _try_reuse_warm_session,
-    _watch_task_pump,
-)
-from services.scheduler.interactive import (  # noqa: F401
-    INTERACTIVE_TASK_MAX_S,
-    _InteractiveSessionDied,
-    _close_interactive_task_session,
-    _run_interactive_task,
-)
+from services.scheduler import runner, scheduler_triggers, shared, task_kinds
 from services.scheduler.delivery import (  # noqa: F401
     _deliver_task_result,
     _deliver_via_oneshot,
@@ -88,7 +53,27 @@ from services.scheduler.firing import (  # noqa: F401
     _spawn_slot_lock,
     _spawn_spacing_gate,
 )
-from services.scheduler import task_kinds
+from services.scheduler.interactive import (  # noqa: F401
+    INTERACTIVE_TASK_MAX_S,
+    _close_interactive_task_session,
+    _InteractiveSessionDied,
+    _run_interactive_task,
+)
+from services.scheduler.lanes import (  # noqa: F401
+    _DELEGATE_PREVIEW_CAP,
+    _await_lane_quiescence,
+    _collect_lane_output_since,
+    _collect_task_output,
+    _delegate_output_preview,
+    _lane_pump_wedged,
+    _limit_notice,
+    _post_run_session_action,
+    _reap_prior_lane_pump,
+    _settle_prior_lane,
+    _TaskTurnStalled,
+    _try_reuse_warm_session,
+    _watch_task_pump,
+)
 from services.scheduler.runner import (  # noqa: F401
     _broadcast,
     _create_task_chat_row,
@@ -100,6 +85,19 @@ from services.scheduler.runner import (  # noqa: F401
     _run_task,
     _run_task_body,
 )
+from services.scheduler.shared import (  # noqa: F401
+    RetryPolicy,
+    TaskDefinition,
+    _active_task_ids,
+    _dynamic_task_ids,
+    _platform_interrupts,
+    _run_event_buffer,
+    _run_subscribers,
+    _running_tasks,
+    _user_cancelled_runs,
+    now_iso,
+)
+from storage import database as task_store
 
 logger = logging.getLogger("otodock.scheduler")
 
@@ -133,7 +131,7 @@ def start() -> None:
 
     _scheduler.start()
 
-    logger.info(f"Scheduler started: {reloaded} dynamic tasks reloaded")
+    logger.info("Scheduler started: %s dynamic tasks reloaded", reloaded)
 
 
 def apply_platform_timezone_change() -> None:
@@ -162,7 +160,7 @@ def _check_timezone_change() -> None:
         return
     old_tz = _current_tz
     _current_tz = new_tz
-    logger.info(f"Platform timezone changed: {old_tz} → {new_tz}, re-registering recurring jobs")
+    logger.info("Platform timezone changed: %s → %s, re-registering recurring jobs", old_tz, new_tz)
 
     # Re-register all dynamic recurring tasks
     for row in task_store.list_dynamic_tasks(enabled_only=True):
@@ -186,8 +184,8 @@ async def shutdown() -> None:
         return
 
     count = len(shared._running_tasks)
-    logger.info(f"Scheduler shutdown: cancelling {count} running task(s)")
-    for run_id, task in list(shared._running_tasks.items()):
+    logger.info("Scheduler shutdown: cancelling %s running task(s)", count)
+    for _run_id, task in list(shared._running_tasks.items()):
         if not task.done():
             task.cancel()
 
@@ -197,7 +195,7 @@ async def shutdown() -> None:
         done, pending = await asyncio.wait(tasks, timeout=10)
         if pending:
             logger.warning(
-                f"Scheduler shutdown: {len(pending)} task(s) didn't finish in 10s"
+                "Scheduler shutdown: %s task(s) didn't finish in 10s", len(pending)
             )
 
     logger.info("Scheduler shutdown: all running tasks cancelled")
@@ -212,8 +210,8 @@ def _resolve_task_tz(task: shared.TaskDefinition):
     name = task.user_tz or config.get_platform_timezone()
     try:
         return zoneinfo.ZoneInfo(name)
-    except Exception:
-        logger.warning(f"Invalid user_tz {name!r} on task {task.id}; falling back to platform TZ")
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+        logger.warning("Invalid user_tz %r on task %s; falling back to platform TZ", name, task.id)
         return zoneinfo.ZoneInfo(config.get_platform_timezone())
 
 
@@ -226,7 +224,7 @@ def _register_task(task: shared.TaskDefinition) -> None:
     # the trigger fire path (services/scheduler/trigger_manager.py). Storing them
     # without an APScheduler job is the correct end state.
     if not task_kinds.of(task).clocked:
-        logger.debug(f"Skipping APScheduler registration for trigger-only task: {task.id}")
+        logger.debug("Skipping APScheduler registration for trigger-only task: %s", task.id)
         return
 
     if task.run_at:
@@ -239,11 +237,11 @@ def _register_task(task: shared.TaskDefinition) -> None:
                 # MCP tool description that tells agents to write local time.
                 run_date = run_date.replace(tzinfo=task_tz)
             if run_date < datetime.now(timezone.utc):
-                logger.debug(f"Skipping past one-time task: {task.id}")
+                logger.debug("Skipping past one-time task: %s", task.id)
                 return
             trigger = DateTrigger(run_date=run_date)
-        except Exception as e:
-            logger.warning(f"Invalid run_at for task {task.id}: {e}")
+        except (ValueError, TypeError) as e:
+            logger.warning("Invalid run_at for task %s: %s", task.id, e)
             return
     elif task.delay_seconds is not None:
         run_date = datetime.now(timezone.utc) + timedelta(seconds=task.delay_seconds)
@@ -256,17 +254,17 @@ def _register_task(task: shared.TaskDefinition) -> None:
             trigger = scheduler_triggers.build_interval_trigger(
                 task.interval_seconds, task.created_at, task_tz,
             )
-        except Exception as e:
-            logger.warning(f"Invalid interval_seconds for task {task.id}: {e}")
+        except (ValueError, TypeError, OverflowError) as e:
+            logger.warning("Invalid interval_seconds for task %s: %s", task.id, e)
             return
     elif task.schedule:
         try:
             trigger = scheduler_triggers.build_cron_trigger(task.schedule, task_tz)
-        except Exception as e:
-            logger.warning(f"Invalid cron schedule for task {task.id}: {e}")
+        except ValueError as e:
+            logger.warning("Invalid cron schedule for task %s: %s", task.id, e)
             return
     else:
-        logger.warning(f"Task {task.id} has no schedule/run_at/delay_seconds/interval_seconds — skipping")
+        logger.warning("Task %s has no schedule/run_at/delay_seconds/interval_seconds — skipping", task.id)
         return
 
     _scheduler.add_job(
@@ -278,7 +276,7 @@ def _register_task(task: shared.TaskDefinition) -> None:
         misfire_grace_time=300,
         coalesce=True,
     )
-    logger.info(f"Registered task: {task.id} (agent={task.agent})")
+    logger.info("Registered task: %s (agent=%s)", task.id, task.agent)
 
 
 def _row_to_task(row: dict) -> shared.TaskDefinition:
@@ -318,6 +316,8 @@ def _row_to_task(row: dict) -> shared.TaskDefinition:
         # `override or default` consumer reads the same way.
         override_model=row.get("override_model") or None,
         override_execution_path=row.get("override_execution_path") or None,
+        target_machine=row.get("target_machine") or "",
+        permission_mode=row.get("permission_mode") or "",
         app_id=row.get("app_id") or None,
         app_handler=row.get("app_handler") or None,
         checks=_checks_of(row.get("checks")),
@@ -435,7 +435,7 @@ def _compute_next_run_times() -> list[dict]:
                     None, datetime.now(timezone.utc)
                 )
                 next_run = next_fire.isoformat() if next_fire else None
-            except Exception:
+            except ValueError:
                 pass
         elif task.interval_seconds is not None:
             has_recurring = True
@@ -447,7 +447,7 @@ def _compute_next_run_times() -> list[dict]:
                     None, datetime.now(timezone.utc)
                 )
                 next_run = next_fire.isoformat() if next_fire else None
-            except Exception:
+            except (ValueError, TypeError, OverflowError):
                 pass
         elif task.run_at:
             next_run = task.run_at
@@ -525,6 +525,8 @@ async def add_dynamic_task(task: shared.TaskDefinition) -> str:
         until_at=task.until_at,
         override_model=task.override_model,
         override_execution_path=task.override_execution_path,
+        target_machine=task.target_machine or "",
+        permission_mode=task.permission_mode,
         app_id=task.app_id,
         app_handler=task.app_handler,
         checks=json.dumps(list(task.checks)) if task.checks else "",
@@ -655,8 +657,10 @@ async def update_dynamic_task(task_id: str, fields: dict) -> tuple[bool, str | N
     if "user_tz" in payload and payload["user_tz"] is not None:
         try:
             zoneinfo.ZoneInfo(payload["user_tz"])
-        except Exception as e:
-            return False, f"Invalid user_tz: {e}"
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError, TypeError) as e:
+            logger.warning("Edit of task %s refused, time zone %r: %s",
+                           task_id, payload["user_tz"], e)
+            return False, "That time zone is not known. Use a name like Europe/Athens."
         edit_tz_name = payload["user_tz"]
     else:
         edit_tz_name = dyn.get("user_tz") or config.get_platform_timezone()
@@ -667,8 +671,10 @@ async def update_dynamic_task(task_id: str, fields: dict) -> tuple[bool, str | N
     if "schedule" in payload and payload["schedule"] is not None:
         try:
             scheduler_triggers.build_cron_trigger(payload["schedule"], edit_tz)
-        except Exception as e:
-            return False, f"Invalid cron schedule: {e}"
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.warning("Edit of task %s refused, cron %r: %s",
+                           task_id, payload["schedule"], e)
+            return False, "That schedule is not a valid cron line. Example: 0 9 * * 1."
 
     # Validate ISO datetime — naive interpreted in post-edit TZ (NOT UTC).
     # Aligns with notification_manager and the new browser-snapshot model.
@@ -677,8 +683,10 @@ async def update_dynamic_task(task_id: str, fields: dict) -> tuple[bool, str | N
             run_date = datetime.fromisoformat(payload["run_at"])
             if run_date.tzinfo is None:
                 payload["run_at"] = run_date.replace(tzinfo=edit_tz).isoformat()
-        except Exception as e:
-            return False, f"Invalid run_at: {e}"
+        except (ValueError, TypeError) as e:
+            logger.warning("Edit of task %s refused, run_at %r: %s",
+                           task_id, payload["run_at"], e)
+            return False, "That time is not valid. Use a date and time like 2026-10-18T09:00."
 
     # Validate interval bounds when present
     if "interval_seconds" in payload and payload["interval_seconds"] is not None:

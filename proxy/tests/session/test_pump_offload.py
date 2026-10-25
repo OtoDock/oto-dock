@@ -10,11 +10,19 @@ pump's cutoff observes its predecessor's rows, and the pump leaves
 import asyncio
 import threading
 
+import psycopg
 import pytest
 
 from core.events import chat_writer, stream_pump
 from core.events.common_events import (
-    CommonEvent, DONE, PRODUCER_DONE, QUEUE_TURN, SYSTEM, TEXT, TOOL_RESULT, TOOL_USE,
+    DONE,
+    PRODUCER_DONE,
+    QUEUE_TURN,
+    SYSTEM,
+    TEXT,
+    TOOL_RESULT,
+    TOOL_USE,
+    CommonEvent,
 )
 from core.events.stream_pump import ChatStreamPump
 from storage import database as task_store
@@ -290,7 +298,7 @@ def test_a_failed_search_rebuild_keeps_the_rows_and_warns(temp_db, monkeypatch, 
     from storage.chat import db_chats
 
     def boom(conn, chat_id):
-        raise RuntimeError("tsvector too long")
+        raise psycopg.errors.ProgramLimitExceeded("string is too long for tsvector")
 
     monkeypatch.setattr(db_chats, "_rebuild_chat_search_row", boom)
     monkeypatch.setattr(db_chats, "_rebuild_warned_at", 0.0)
@@ -326,6 +334,7 @@ def test_a_connection_failure_fails_the_batch_once(temp_db, monkeypatch, error):
     path."""
     import psycopg
     import psycopg_pool
+
     from storage.chat import db_chats
     temp_db.create_chat("po-conn", "user-admin", "a1")
     fallbacks = _batch_fallbacks(monkeypatch)
@@ -346,7 +355,9 @@ def test_a_commit_with_an_unknown_outcome_is_not_written_again(temp_db, monkeypa
     """A commit that fails may have landed on the server: the rows are never
     written a second time row by row (a duplicated turn)."""
     import contextlib
+
     import psycopg
+
     from storage.chat import db_chats
     temp_db.create_chat("po-commit", "user-admin", "a1")
     fallbacks = _batch_fallbacks(monkeypatch)
@@ -388,6 +399,7 @@ def test_a_search_rebuild_that_cannot_connect_keeps_the_batch(temp_db, monkeypat
     """The rows landed: a pool timeout on the search rebuild after them is
     logged, never raised, so the writer lane counts the turn as saved."""
     import psycopg_pool
+
     from storage.chat import db_chats
     temp_db.create_chat("po-search", "user-admin", "a1")
     real = db_chats.get_conn
@@ -424,6 +436,7 @@ def test_a_pool_timeout_before_the_commit_is_tried_once_more(temp_db, monkeypatc
     """Nothing was committed, so the whole batch is safe to send again once:
     a busy pool does not cost the turn."""
     import psycopg_pool
+
     from storage.chat import db_chats
     temp_db.create_chat("po-retry", "user-admin", "a1")
     fallbacks = _batch_fallbacks(monkeypatch)
@@ -449,6 +462,7 @@ def test_a_cancel_before_the_commit_is_not_sent_again(temp_db, monkeypatch):
     """A statement timeout or an admin cancel is the server's answer, not a
     busy pool: the batch raises at once instead of holding the lane twice."""
     import psycopg
+
     from storage.chat import db_chats
     temp_db.create_chat("po-cancel", "user-admin", "a1")
     calls = {"n": 0}
@@ -461,3 +475,76 @@ def test_a_cancel_before_the_commit_is_not_sent_again(temp_db, monkeypatch):
     with pytest.raises(psycopg.errors.QueryCanceled):
         task_store.add_chat_messages_batch("po-cancel", [("assistant", "a", "", "")])
     assert calls["n"] == 1
+
+
+# The turn's usage attribution: the pool's in-memory binding is read at the
+# snapshot, a binding only the store holds is read by the turn-start job, and
+# no store call runs on the loop. A close at the turn's end deletes the stored
+# row on the binding writer before the cost job runs.
+
+@pytest.fixture
+def usage_rows(monkeypatch):
+    from services.billing import usage_service
+    from services.engines import subscription_pool as sp
+    captured: list[dict] = []
+    monkeypatch.setattr(usage_service, "record_turn_usage",
+                        lambda rows: captured.extend(rows) or list(range(len(rows))))
+    yield captured
+    with sp._session_maps_lock:
+        sp._session_subscriptions.clear()
+        sp._session_binding_ctx.clear()
+        sp._session_scope_keys.clear()
+
+
+def _cost_turn(chat_id: str, session_id: str, loop_db_guard, *, scope: str = "user",
+               between=None) -> None:
+    """A turn's start job, then its cost job with ``between`` run after the
+    snapshot and before the job lands."""
+    async def scenario():
+        producer = asyncio.get_running_loop().create_task(asyncio.sleep(3600))
+        pump = ChatStreamPump(chat_id=chat_id, session_id=session_id, producer=producer,
+                              event_queue=asyncio.Queue(), perm_queue=None, scope=scope)
+        pump._llm_cost_delta, pump._input_tokens, pump._output_tokens = 0.01, 100, 50
+        pump._submit_turn_start()
+        await chat_writer.drain(chat_id)
+        with loop_db_guard.active():
+            fut = pump._submit_cost_job()
+        if between is not None:
+            between()
+        await fut
+        producer.cancel()
+    asyncio.run(scenario())
+
+
+def test_a_session_outside_the_pool_bills_the_default_source(temp_db, loop_db_guard, usage_rows):
+    temp_db.create_chat("po-usage-x", "user-admin", "a1")
+    _cost_turn("po-usage-x", "sess-usage-x", loop_db_guard)
+    assert usage_rows[0]["source_key"] == "default"
+
+
+def test_a_released_pool_binding_keeps_the_turn_on_its_subscription(
+        temp_db, loop_db_guard, usage_rows):
+    from services.engines import subscription_pool as sp
+    temp_db.create_chat("po-usage-b", "user-admin", "a1")
+    sp.bind_session("sess-usage-b", "sub-b", layer="claude-code-cli", user_sub="")
+    _cost_turn("po-usage-b", "sess-usage-b", loop_db_guard,
+               between=lambda: sp.release_subscription("sess-usage-b"))
+    assert usage_rows[0]["source_key"] == "sub-b"
+
+
+def test_a_stored_binding_read_at_the_turn_start_outlives_the_close(
+        temp_db, loop_db_guard, usage_rows):
+    """A session bound before a restart: only the store knows its
+    subscription and its payer, and the close's delete lands before the
+    cost job."""
+    from services.engines import subscription_pool as sp
+    from storage.billing import subscription_store
+    temp_db.create_chat("po-usage-s", "user-admin", "a1")
+    sp.bind_session("sess-usage-s", "sub-s", layer="claude-code-cli", user_sub="local:alice")
+    with sp._session_maps_lock:
+        sp._session_subscriptions.clear()
+        sp._session_binding_ctx.clear()
+    _cost_turn("po-usage-s", "sess-usage-s", loop_db_guard, scope="agent",
+               between=lambda: subscription_store.delete_session_binding("sess-usage-s"))
+    row = usage_rows[0]
+    assert (row["source_key"], row["user_sub"], row["scope"]) == ("sub-s", "local:alice", "user")

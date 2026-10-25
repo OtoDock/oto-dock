@@ -32,7 +32,8 @@ vi.mock('@/api/auth', async (importOriginal) => {
   }
 })
 
-import { AuthProvider, useAuth } from '@/contexts/AuthContext'
+import { useAuth } from '@/contexts/AuthContext'
+import { AuthProvider } from '@/contexts/AuthProvider'
 import { useCreateAgent } from '@/api/agents'
 
 /** Renders the auth snapshot's agent slugs — the same data source the

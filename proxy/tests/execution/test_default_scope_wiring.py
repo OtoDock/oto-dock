@@ -17,7 +17,6 @@ from storage.agents import agent_store
 # hardcoded developer home directory.
 from tests._paths import CUSTOM_MCPS as _CUSTOM_MCPS, load_mcp_server
 
-
 # ---------------------------------------------------------------------------
 # Resolver behaviour
 # ---------------------------------------------------------------------------

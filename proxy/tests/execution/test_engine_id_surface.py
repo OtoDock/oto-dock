@@ -19,7 +19,7 @@ exempt — an engine names itself):
    docstring (f-string parts, implicit concatenation, dict keys and tuples
    all surface as constants; what hides is a runtime-built id such as
    ``"codex" + "-cli"`` — stated, not defended), counted per file and
-   literal; ``config.py``'s must all sit inside ``MODEL_REGISTRY``;
+   literal; ``configuration/models.py``'s must all sit inside ``MODEL_REGISTRY``;
 2. the OTHER spellings of an identity as a BRANCH operand — a short name
    (``claude`` / ``codex`` / ``direct``) or a config dir (``.claude`` /
    ``.codex``) on either side of a compare (``==``, ``!=``, ``in``,
@@ -58,9 +58,9 @@ if str(PROXY_DIR) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from core.events import tool_roles  # noqa: E402
-from core.session.session_manager import get_all_layers  # noqa: E402
-from satellite.engines import ENGINES  # noqa: E402
+from core.events import tool_roles
+from core.session.session_manager import get_all_layers
+from satellite.engines import ENGINES
 
 ENGINE_IDS = ("claude-code-cli", "codex-cli", "direct-llm")
 SHORT_NAMES = ("claude", "codex", "direct")
@@ -70,19 +70,17 @@ _EXCLUDED_PARTS = {"tests", "docs", "venv", ".venv", "_vendored", "skills", "nod
 
 # --- pass 1: the ids ---------------------------------------------------------
 # {path: {literal: count}} — every string constant naming an engine id outside
-# the engine packages, with the reason it stays. ``config.py`` is the one
+# the engine packages, with the reason it stays. ``configuration/models.py`` is the one
 # file judged by WHERE its literals sit (all inside MODEL_REGISTRY), not by
 # count: a new model row must not fail this test.
 KNOWN_ENGINE_ID_SITES: dict[str, tuple[str, dict[str, int]]] = {
     "proxy/core/session/session_manager.py": (
         "the registry itself — one row per engine, by design",
         {"claude-code-cli": 1, "codex-cli": 1, "direct-llm": 1}),
-    "proxy/core/execution_layer.py": (
-        "DEFAULT_EXECUTION_PATH, the one constant every no-opinion caller reads",
-        {"claude-code-cli": 1}),
     "proxy/storage/agents/schema.py": (
-        "the agents column's DDL default — DDL cannot read a constant; a test pins it equal",
-        {"claude-code-cli": 1}),
+        "DEFAULT_EXECUTION_PATH, the one constant every no-opinion caller reads, and the agents "
+        "column's DDL default beside it — DDL cannot read a constant; a test pins the two equal",
+        {"claude-code-cli": 2}),
     "proxy/core/remote/satellite_connection.py": (
         "_LEGACY_SATELLITE_ENGINES — what every satellite before 0.5.124 ran, a wire fact",
         {"claude-code-cli": 1, "codex-cli": 1}),
@@ -123,7 +121,7 @@ KNOWN_ENGINE_ID_SITES: dict[str, tuple[str, dict[str, int]]] = {
         "a tool description names the engines as examples (roadmap: read the catalog like agent-config-mcp)",
         {"claude-code-cli": 1, "codex-cli": 1, "direct-llm": 1}),
 }
-_REGISTRY_ONLY = {"proxy/config.py"}   # MODEL_REGISTRY rows tag the engines a model runs on
+_REGISTRY_ONLY = {"proxy/configuration/models.py"}   # MODEL_REGISTRY rows tag the engines a model runs on
 
 # --- pass 2: the other spellings as branch operands --------------------------
 KNOWN_SPELLING_BRANCHES: dict[str, tuple[str, dict[str, int]]] = {
@@ -142,12 +140,9 @@ KNOWN_SPELLING_BRANCHES: dict[str, tuple[str, dict[str, int]]] = {
     "satellite/transport/file_sync.py": (
         "the satellite's twin of the file-sync helpers",
         {".claude": 1, ".codex": 1}),
-    "proxy/config.py": (
+    "proxy/configuration/models.py": (
         "a provider heuristic on MODEL ids (`model.startswith(\"claude\")`), not an engine",
         {"claude": 1}),
-    "proxy/api/sessions/sessions.py": (
-        "the legacy /v1/sessions `llm_mode` field's value, hard-wired to the Anthropic API — not an engine",
-        {"direct": 1}),
 }
 
 
@@ -165,9 +160,6 @@ KNOWN_TOOL_NAME_SITES: dict[str, tuple[str, dict[str, int]]] = {
     "proxy/auth/path_policy.py": (
         "the deny message's user-facing verbs (\"Write denied\" / \"Read denied\"), not tools",
         {"Write": 1, "Read": 1}),
-    "proxy/api/hooks/preview.py": (
-        "the WOPI token's display name for the agent, not a tool",
-        {"Agent": 1}),
     "proxy/core/layers/providers/openai_adapter.py": (
         "the vendor's server-side web search tool, named by the provider adapter (the providers package is not an engine package)",
         {"web_search": 5}),

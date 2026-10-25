@@ -14,8 +14,7 @@ import asyncio
 import time
 
 import pytest
-
-from pipeline_fakes import FakeSTT, FakeLLM, make_route
+from pipeline_fakes import FakeLLM, FakeSTT, make_route
 
 
 class GuardProbeSTT(FakeSTT):

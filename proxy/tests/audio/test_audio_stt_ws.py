@@ -7,24 +7,37 @@ bad-token rejection. Provider building is mocked.
 
 from __future__ import annotations
 
-import asyncio
 import time
 
 import numpy as np
 import pytest
+from audio.capabilities import STTCapabilities
+from audio.providers.stt.base import Heard
 from fastapi import FastAPI, WebSocketDisconnect
 from fastapi.testclient import TestClient
 
-from audio.providers.stt.base import LanguageGuess
-from services.media import audio_service
-from services.media import ws_audio_token
+from services.media import audio_service, ws_audio_token
 from ws.audio import ws_audio_stt_handler
 
 
 class WsFakeSTT:
+    is_open = True
+    last_result_monotonic = 0.0
+    latest_interim = ""
+
     def __init__(self):
         self.started_with: dict = {}
         self.fatal: str | None = None
+
+    @property
+    def has_pending_finals(self):
+        return False
+
+    def streams_language(self, language):
+        return True
+
+    def enable_dictation_mode(self):
+        self.dictation_mode = True
 
     async def start(self, language, sample_rate=None, interim_results=False, endpointing_ms=None):
         self.started_with = dict(
@@ -35,6 +48,11 @@ class WsFakeSTT:
     def pop_fatal_error(self):
         err, self.fatal = self.fatal, None
         return err
+
+    keepalives = 0
+
+    async def keepalive(self):
+        self.keepalives += 1
 
     async def send_audio(self, b):
         pass
@@ -59,18 +77,34 @@ class WsFakeSTT:
 def client(temp_db, monkeypatch):
     fakes: list[WsFakeSTT] = []
 
-    def _build(ptype, *, provider_id=None):
-        fake = WsFakeSTT()
-        fakes.append(fake)
-        return fake, {"id": provider_id or 1, "provider_name": "fake",
-                      "advanced": {"chat_endpointing_ms": 1234}}
+    def _factory(ptype, *, provider_id=None):
+        def build():
+            fake = WsFakeSTT()
+            fakes.append(fake)
+            return fake
+        return build, {"id": provider_id or 1, "provider_name": "fake",
+                       "advanced": {"chat_endpointing_ms": 1234}}
 
-    monkeypatch.setattr(audio_service, "build_chat_provider", _build)
+    monkeypatch.setattr(audio_service, "chat_provider_factory", _factory)
+    monkeypatch.setattr(audio_service, "language_identify_enabled", lambda: False)
     app = FastAPI()
     app.add_api_websocket_route("/ws/audio/stt", ws_audio_stt_handler)
     c = TestClient(app)
     c.fakes = fakes  # the providers built during the test, in order
     return c
+
+
+@pytest.fixture(autouse=True)
+def _no_progress(monkeypatch):
+    # The progress frame goes out every 2 s; these tests read frames by
+    # position, so it is off unless a test turns it on.
+    import ws.audio as relay
+    monkeypatch.setattr(relay, "_PROGRESS_EVERY_S", 1e6)
+
+
+def _ready(ws):
+    msg = ws.receive_json()
+    assert msg["type"] == "ready" and msg["marks_last"] is True and msg["progress_every_s"] > 0
 
 
 def _token(sub="user-admin", *, max_seconds=60):
@@ -80,7 +114,7 @@ def _token(sub="user-admin", *, max_seconds=60):
 def test_handshake_and_final_transcript(client):
     with client.websocket_connect("/ws/audio/stt") as ws:
         ws.send_json({"type": "init", "token": _token(), "language": "en", "sample_rate": 16000})
-        assert ws.receive_json() == {"type": "ready"}
+        _ready(ws)
         ws.send_bytes(b"\x00" * 3200)
         ws.send_json({"type": "stop"})
         msg = ws.receive_json()
@@ -104,7 +138,7 @@ def test_replayed_token_rejected(client):
     tok = _token()
     with client.websocket_connect("/ws/audio/stt") as ws:
         ws.send_json({"type": "init", "token": tok, "sample_rate": 16000})
-        assert ws.receive_json() == {"type": "ready"}
+        _ready(ws)
         ws.send_json({"type": "stop"})
         ws.receive_json()
     # Same token again → jti already consumed → rejected.
@@ -117,7 +151,7 @@ def test_replayed_token_rejected(client):
 def test_cost_cap_closes(client):
     with client.websocket_connect("/ws/audio/stt") as ws:
         ws.send_json({"type": "init", "token": _token(max_seconds=0), "sample_rate": 16000})
-        assert ws.receive_json() == {"type": "ready"}
+        _ready(ws)
         ws.send_bytes(b"\x00" * 3200)
         msg = ws.receive_json()
         assert msg["type"] == "error" and msg["code"] == "max_seconds"
@@ -128,12 +162,16 @@ def test_provider_fatal_error_is_forwarded(client):
     surface as an error frame — not a mic that silently hears nothing."""
     with client.websocket_connect("/ws/audio/stt") as ws:
         ws.send_json({"type": "init", "token": _token(), "language": "en", "sample_rate": 16000})
-        assert ws.receive_json() == {"type": "ready"}
-        client.fakes[0].fatal = "ElevenLabs speech-to-text auth error: bad key"
+        _ready(ws)
+        client.fakes[0].fatal = ("ElevenLabs speech-to-text auth error: You must be "
+                                 "authenticated to use this endpoint.")
         ws.send_bytes(b"\x00" * 3200)
         msg = ws.receive_json()
         assert msg["type"] == "error" and msg["code"] == "provider"
-        assert "auth error" in msg["message"]
+        assert msg["message"] == ("Dictation stopped because the speech service refused its key. "
+                                  "An admin can check it in Setup, Audio.")
+        # The words owed go out after it, as the one last final.
+        assert ws.receive_json() == {"type": "final", "text": "hello world", "last": True}
 
 
 def test_provider_start_failure_reports_error(client, monkeypatch):
@@ -143,10 +181,8 @@ def test_provider_start_failure_reports_error(client, monkeypatch):
         async def start(self, *a, **k):
             raise RuntimeError("Failed to start Deepgram connection")
 
-    def _build(ptype, *, provider_id=None):
-        return BoomSTT(), {"id": 1, "provider_name": "fake", "advanced": {}}
-
-    monkeypatch.setattr(audio_service, "build_chat_provider", _build)
+    monkeypatch.setattr(audio_service, "chat_provider_factory",
+                        lambda ptype, *, provider_id=None: (BoomSTT, {"id": 1, "provider_name": "fake", "advanced": {}}))
     with client.websocket_connect("/ws/audio/stt") as ws:
         ws.send_json({"type": "init", "token": _token(), "sample_rate": 16000})
         msg = ws.receive_json()
@@ -154,334 +190,777 @@ def test_provider_start_failure_reports_error(client, monkeypatch):
         assert "could not start" in msg["message"]
 
 
-def test_automatic_pick_opens_the_detection_stream(client):
-    # The dashboard's Automatic row stores "auto"; the provider gets its own
-    # detection sentinel.
+def test_automatic_pick_without_the_identifier_opens_the_detection_stream(client):
+    # The identifier off or unavailable: the dashboard's Automatic row stores
+    # "auto" and the provider gets its own detection sentinel.
     with client.websocket_connect("/ws/audio/stt") as ws:
         ws.send_json({"type": "init", "token": _token(), "language": "auto", "sample_rate": 16000})
-        assert ws.receive_json() == {"type": "ready"}
+        _ready(ws)
         ws.send_json({"type": "stop"})
         ws.receive_json()
     assert client.fakes[0].started_with["language"] == "multi"
 
 
-# ── The dictation lock on the Automatic pick ─────────────────────────────
+# ── Automatic language with the local identifier ─────────────────────────
 #
-# A provider whose automatic stream covers a fixed set of languages (Deepgram:
-# ten, Greek not among them): the relay identifies the first words through
-# the batch endpoint, holds the automatic stream's results meanwhile, and
-# reopens the stream in the identified language with the buffered audio
-# replayed (the phone route's mechanism, on the chat mic).
+# The Automatic pick: the stream opens in the browser's language, the
+# identifier reads the voiced audio, a candidate stream opens on a lean with
+# the audio replayed, and the shown text switches to it the moment it has
+# caught up (a ``replace`` frame carries the new stream's words). Nothing is
+# held. A scripted identifier drives the real rule, tracker and streams.
 
 VOICED = np.full(int(16000 * 0.7), 3000, dtype=np.int16).tobytes()   # 0.7 s of voiced audio
 
 
-class LockFakeSTT(WsFakeSTT):
-    """An automatic stream that covers English only."""
+class ScriptedIdentifier:
+    labels = ["en", "el", "de", "es", "fr", "it"]
 
-    multi_languages = frozenset({"en"})
+    def __init__(self, probs):
+        self.probs = probs
 
-    def __init__(self, guess=None, *, identify_delay=0.0):
+    def scores(self, pcm_16k):
+        import math
+        return np.array([math.log(self.probs.get(lang, 1e-6)) for lang in self.labels])
+
+
+class StreamFakeSTT(WsFakeSTT):
+    """One stream: records what it was sent, answers scripted finals and
+    partials, closes on request."""
+
+    def __init__(self):
         super().__init__()
-        self.guess = guess
-        self.identify_delay = identify_delay
-        self.identify_delays: list[float] = []   # per request, ahead of identify_delay
-        self.restart_fails: set[str] = set()
-        self.identified: list[bytes] = []
-        self.restarts: list[str] = []
+        self.language = None
         self.sent: list[bytes] = []
-        self.finals: list[str] = []      # what drain_transcript answers, in order
-        self.interims: list[str] = []    # what pop_interim answers, in order
+        self.finals: list[str] = []
+        self.interims: list[str] = []
+        self.closed = False
         self.endpoints = 0
+        self.later: list[str] = []
 
-    def pop_interim(self):
-        return self.interims.pop(0) if self.interims else None
+    async def start(self, language, sample_rate=None, interim_results=False, endpointing_ms=None):
+        await super().start(language, sample_rate, interim_results, endpointing_ms)
+        self.language = language
 
-    async def identify_language(self, wav):
-        self.identified.append(wav)
-        delay = self.identify_delays.pop(0) if self.identify_delays else self.identify_delay
-        if delay:
-            await asyncio.sleep(delay)
-        return self.guess
-
-    def streams_language(self, lang):
-        return True
-
-    async def restart(self, lang):
-        self.restarts.append(lang)
-        self.sent.append(f"restart:{lang}".encode())
-        return lang not in self.restart_fails
+    def answered(self, final=None, interim=""):
+        if final:
+            self.finals.append(final)
+        if interim:
+            self.interims.append(interim)
+            self.latest_interim = interim
+        self.last_result_monotonic = time.monotonic()
 
     async def send_audio(self, b):
         self.sent.append(bytes(b))
 
-    def drain_transcript(self):
-        return self.finals.pop(0) if self.finals else None
+    drain_hook = None
 
-    async def force_endpoint(self):
-        self.endpoints += 1
+    def drain_transcript(self):
+        if self.drain_hook is not None:
+            hook, self.drain_hook = self.drain_hook, None
+            hook()
+        if not self.finals:
+            text = None
+        else:
+            text, self.finals = " ".join(self.finals), []
+        if self.later:
+            self.finals.append(self.later.pop(0))
+        return text
+
+    @property
+    def has_pending_finals(self):
+        return bool(self.finals)
+
+    def pop_interim(self):
+        return self.interims.pop(0) if self.interims else None
 
     async def wait_for_transcript(self, timeout=1.0):
         return self.drain_transcript()
 
+    async def force_endpoint(self):
+        self.endpoints += 1
+
     async def finish(self):
-        return "the end"
+        self.closed = True
+        return "the end" if self.language else None
+
+    async def close(self):
+        self.closed = True
+        self.is_open = False
 
 
-def _lock_client(monkeypatch, fake):
-    def _build(ptype, *, provider_id=None):
-        return fake, {"id": 1, "provider_name": "fake", "advanced": {}}
+class WordFakeSTT(StreamFakeSTT):
+    """A stream whose provider reports a word confidence: ``hear`` writes its
+    ledger on its own audio clock (16 kHz bytes sent)."""
 
-    monkeypatch.setattr(audio_service, "build_chat_provider", _build)
-    app = FastAPI()
-    app.add_api_websocket_route("/ws/audio/stt", ws_audio_stt_handler)
-    return TestClient(app)
+    capabilities = STTCapabilities(reports_confidence=True)
+
+    def __init__(self):
+        super().__init__()
+        self.heard: list[Heard] = []
+        self.audio_offered_s = 0.0
+
+    async def send_audio(self, b):
+        await super().send_audio(b)
+        self.audio_offered_s += len(b) / 32000
+
+    def hear(self, start, end, words, confidence, *, final=True):
+        self.heard.append(Heard(start, end, words, confidence if words else 0.0, final))
+        self.last_result_monotonic = time.monotonic()
 
 
-def _open_auto(ws):
-    ws.send_json({"type": "init", "token": _token(), "language": "auto", "sample_rate": 16000})
-    assert ws.receive_json() == {"type": "ready"}
+@pytest.fixture
+def switching(temp_db, monkeypatch):
+    """A client whose Automatic pick runs the identifier with ``probs``;
+    ``fakes`` lists the streams in the order they were built (``words``: a
+    provider that reports a word confidence)."""
+    fakes: list[StreamFakeSTT] = []
+    kind = {"cls": StreamFakeSTT}
+
+    def _factory(ptype, *, provider_id=None):
+        def build():
+            fake = kind["cls"]()
+            fakes.append(fake)
+            return fake
+        return build, {"id": 1, "provider_name": "fake", "advanced": {}}
+
+    identifiers: list[ScriptedIdentifier] = []
+
+    def _make(probs, *, candidates=("en", "el", "de", "es", "fr", "it"), enabled=True, words=False):
+        kind["cls"] = WordFakeSTT if words else StreamFakeSTT
+
+        def _identifier(num_threads=1):
+            ident = ScriptedIdentifier(probs)
+            identifiers.append(ident)
+            return ident
+        monkeypatch.setattr(audio_service, "chat_provider_factory", _factory)
+        monkeypatch.setattr(audio_service, "language_identify_enabled", lambda: enabled)
+        monkeypatch.setattr(audio_service, "language_identify_threads", lambda: 1)
+        monkeypatch.setattr(audio_service, "language_candidates", lambda: list(candidates))
+        from ws import audio as wsaudio
+        monkeypatch.setattr(wsaudio, "EcapaIdentifier", _identifier)
+        app = FastAPI()
+        app.add_api_websocket_route("/ws/audio/stt", ws_audio_stt_handler)
+        c = TestClient(app)
+        c.fakes = fakes
+        c.identifiers = identifiers
+        return c
+
+    return _make
+
+
+def _open_auto(ws, default_language="en-US"):
+    ws.send_json({"type": "init", "token": _token(), "language": "auto", "sample_rate": 16000,
+                  "default_language": default_language})
+    _ready(ws)
 
 
 def _voiced(ws, n):
     for _ in range(n):
         ws.send_bytes(VOICED)
-        time.sleep(0.03)        # the server's loop runs the identification between chunks
+        time.sleep(0.05)        # the server's loop runs the reading between chunks
 
 
-def test_a_greek_speaker_reopens_the_stream_in_greek_with_the_audio_replayed(temp_db, monkeypatch):
-    fake = LockFakeSTT(LanguageGuess("el", 0.95, "καλησπέρα σας λέω"))
-    client = _lock_client(monkeypatch, fake)
+def _until(cond, timeout=3.0):
+    """The server runs on its own thread: wait, bounded, for a state it
+    reaches between chunks."""
+    deadline = time.monotonic() + timeout
+    while not cond():
+        if time.monotonic() > deadline:
+            raise AssertionError("the server did not reach the expected state in time")
+        time.sleep(0.01)
+
+
+def _frames_until(ws, kind, limit=12):
+    """Frames up to and including the first of ``kind``."""
+    out = []
+    for _ in range(limit):
+        frame = ws.receive_json()
+        out.append(frame)
+        if frame["type"] == kind:
+            return out
+    raise AssertionError(f"no {kind} frame in {out}")
+
+
+def test_the_automatic_pick_starts_in_the_browser_language_and_the_candidate_replays(switching):
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05})
     with client.websocket_connect("/ws/audio/stt") as ws:
-        _open_auto(ws)
-        fake.finals = ["kalispera sas leo"]          # the automatic stream's reading: held, then dropped
-        fake.interims = ["kalispera"]                # its partial shows meanwhile
-        _voiced(ws, 2)                               # 1.4 s voiced: the identification runs
-        assert ws.receive_json() == {"type": "interim", "text": "kalispera"}
-        _voiced(ws, 1)                               # the answer is in: the restart and the replay
-        fake.finals = ["Καλησπέρα σας λέω"]
-        _voiced(ws, 1)                               # locked: forwarded as it comes
-        assert ws.receive_json() == {"type": "final", "text": "Καλησπέρα σας λέω"}
+        _open_auto(ws, "en-GB")
+        en = client.fakes[0]
+        assert en.started_with["language"] == "en" and en.dictation_mode
+        ws.send_bytes(bytes(16000 * 2))                 # a second of silence before the first word
+        time.sleep(0.05)
+        _voiced(ws, 3)                                  # 2.1 s of voice: a lean at 1.4 s, a switch at 2.1 s
+        _until(lambda: len(client.fakes) == 2)
+        el = client.fakes[1]
+        assert el.started_with["language"] == "el" and el.dictation_mode
+        # The replay: the pre-roll of silence (0.3 s), then every voiced chunk
+        # that had gone out when the candidate opened (the lean's reading was
+        # applied with the third chunk).
+        replay = b"".join(el.sent)
+        assert replay.endswith(VOICED * 3) and len(replay) == 3 * len(VOICED) + int(0.3 * 16000) * 2
         ws.send_json({"type": "stop"})
-        assert ws.receive_json() == {"type": "final", "text": "the end"}
-    assert fake.restarts == ["el"] and len(fake.identified) == 1
-    assert fake.identified[0][:4] == b"RIFF"
-    i = fake.sent.index(b"restart:el")
-    assert fake.sent[:i] == [VOICED, VOICED]        # the automatic stream heard the first chunks
-    replay = fake.sent[i + 1:-1]
-    assert b"".join(replay) == VOICED * 3           # every buffered chunk, the trigger included
-    assert all(len(p) == 6400 for p in replay[:-1]) # in 200 ms pieces
-    assert fake.sent[-1] == VOICED                  # then the live feed resumes
-    assert fake.endpoints == 1                      # the stop right after a replay waits for its final
+        ws.receive_json()
+    assert all(f.closed for f in client.fakes)
 
 
-def test_a_covered_language_releases_the_held_finals_without_a_restart(temp_db, monkeypatch):
-    fake = LockFakeSTT(LanguageGuess("en", 0.92, "hello there friend"))
-    client = _lock_client(monkeypatch, fake)
+def test_finals_are_never_held_and_a_switch_replaces_the_shown_text(switching):
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05})
     with client.websocket_connect("/ws/audio/stt") as ws:
         _open_auto(ws)
-        fake.finals = ["hello there"]
-        _voiced(ws, 3)
-        assert ws.receive_json() == {"type": "final", "text": "hello there"}
-        ws.send_json({"type": "stop"})
-        assert ws.receive_json() == {"type": "final", "text": "the end"}
-    assert fake.restarts == [] and len(fake.identified) == 1
-    assert fake.sent == [VOICED, VOICED, VOICED]
-
-
-def test_three_unsure_answers_release_the_held_finals(temp_db, monkeypatch):
-    fake = LockFakeSTT(LanguageGuess("el", 0.3, "κάτι"))
-    client = _lock_client(monkeypatch, fake)
-    with client.websocket_connect("/ws/audio/stt") as ws:
-        _open_auto(ws)
-        fake.finals = ["one"]
-        _voiced(ws, 7)                               # attempts at 1.2, 2.2 and 3.2 s of voiced audio
-        assert ws.receive_json() == {"type": "final", "text": "one"}
-        ws.send_json({"type": "stop"})
-        assert ws.receive_json() == {"type": "final", "text": "the end"}
-    assert len(fake.identified) == 3 and fake.restarts == []
-
-
-def test_a_covered_language_stays_at_the_lower_confidence(temp_db, monkeypatch):
-    """Accented English read as English at 0.65: the automatic stream already
-    covers it, so the held words go out at once instead of after three tries."""
-    fake = LockFakeSTT(LanguageGuess("en", 0.65, "hello"))
-    client = _lock_client(monkeypatch, fake)
-    with client.websocket_connect("/ws/audio/stt") as ws:
-        _open_auto(ws)
-        fake.finals = ["hello"]
-        _voiced(ws, 3)
-        assert ws.receive_json() == {"type": "final", "text": "hello"}
-        ws.send_json({"type": "stop"})
-        assert ws.receive_json() == {"type": "final", "text": "the end"}
-    assert len(fake.identified) == 1 and fake.restarts == []
-
-
-def test_a_menu_language_the_stream_lacks_moves_at_the_lower_confidence(temp_db, monkeypatch):
-    """The first clip of continuous Greek answers Greek at about 0.75: that
-    moves the stream, since a wrong move can only reach Greek here."""
-    fake = LockFakeSTT(LanguageGuess("el", 0.72, "καλησπέρα σας"))
-    client = _lock_client(monkeypatch, fake)
-    with client.websocket_connect("/ws/audio/stt") as ws:
-        _open_auto(ws)
-        _voiced(ws, 3)
-        fake.finals = ["Καλησπέρα σας"]
+        en = client.fakes[0]
+        en.answered(final="yes sir")                    # the default stream's reading goes out at once
         _voiced(ws, 1)
-        assert ws.receive_json() == {"type": "final", "text": "Καλησπέρα σας"}
-        ws.send_json({"type": "stop"})
-        ws.receive_json()
-    assert fake.restarts == ["el"] and len(fake.identified) == 1
-
-
-def test_a_second_request_in_flight_answers_first_and_locks(temp_db, monkeypatch):
-    """A slow first identification does not hold the lock: a second request
-    goes out a second of voice later, its answer lands first and moves the
-    stream, and the first is dropped."""
-    fake = LockFakeSTT(LanguageGuess("el", 0.95, "καλησπέρα σας λέω"))
-    fake.identify_delays = [5.0, 0.0]
-    client = _lock_client(monkeypatch, fake)
-    with client.websocket_connect("/ws/audio/stt") as ws:
-        _open_auto(ws)
-        _voiced(ws, 2)                               # the first request, slow
-        _voiced(ws, 2)                               # the second at 2.8 s voiced, answered at once
-        _voiced(ws, 1)                               # its answer is in: the restart and the replay
-        fake.finals = ["Καλησπέρα σας λέω"]
-        _voiced(ws, 1)                               # locked: forwarded as it comes
-        assert ws.receive_json() == {"type": "final", "text": "Καλησπέρα σας λέω"}
-        ws.send_json({"type": "stop"})
-        ws.receive_json()
-    assert fake.restarts == ["el"] and len(fake.identified) == 2
-
-
-def test_a_language_the_menu_does_not_offer_never_moves_the_stream(temp_db, monkeypatch):
-    """A confident Polish guess (accented speech, say) keeps the automatic
-    stream: the lock moves only to a language the dictation menu offers."""
-    fake = LockFakeSTT(LanguageGuess("pl", 0.9, "dzień dobry państwu"))
-    client = _lock_client(monkeypatch, fake)
-    with client.websocket_connect("/ws/audio/stt") as ws:
-        _open_auto(ws)
-        fake.finals = ["jen dobry"]
-        _voiced(ws, 3)
-        assert ws.receive_json() == {"type": "final", "text": "jen dobry"}
-        ws.send_json({"type": "stop"})
-        assert ws.receive_json() == {"type": "final", "text": "the end"}
-    assert len(fake.identified) == 1 and fake.restarts == []
-
-
-def test_wordless_answers_spend_requests_not_attempts(temp_db, monkeypatch):
-    """Room noise over the floor: an answer with no words keeps the lock open
-    for the first real words, each request a second of voice apart, until the
-    request budget is gone; then the stream stays."""
-    fake = LockFakeSTT(LanguageGuess("", 0.0, ""))
-    client = _lock_client(monkeypatch, fake)
-    with client.websocket_connect("/ws/audio/stt") as ws:
-        _open_auto(ws)
-        fake.finals = ["one"]
-        _voiced(ws, 12)                              # requests a second of voice apart, five in all
-        assert ws.receive_json() == {"type": "final", "text": "one"}
-        ws.send_json({"type": "stop"})
-        assert ws.receive_json() == {"type": "final", "text": "the end"}
-    assert len(fake.identified) == 5 and fake.restarts == []
-
-
-def test_a_provider_that_identifies_in_stream_is_never_asked(temp_db, monkeypatch):
-    class SelfDetecting(LockFakeSTT):
-        multi_languages = None
-
-    fake = SelfDetecting(LanguageGuess("el", 0.95, "καλησπέρα σας λέω"))
-    client = _lock_client(monkeypatch, fake)
-    with client.websocket_connect("/ws/audio/stt") as ws:
-        _open_auto(ws)
-        fake.finals = ["Καλησπέρα"]
-        _voiced(ws, 3)
-        assert ws.receive_json() == {"type": "final", "text": "Καλησπέρα"}
-        ws.send_json({"type": "stop"})
-        ws.receive_json()
-    assert fake.identified == [] and fake.restarts == []
-
-
-def test_a_failed_restart_reopens_the_automatic_stream_and_replays(temp_db, monkeypatch):
-    """The Greek stream refused: the automatic stream is reopened and the
-    buffered audio replayed into it (the old stream's unfinished window died
-    with it), the held reading dropped since the replay re-delivers it."""
-    fake = LockFakeSTT(LanguageGuess("el", 0.95, "καλησπέρα σας λέω"))
-    fake.restart_fails = {"el"}
-    client = _lock_client(monkeypatch, fake)
-    with client.websocket_connect("/ws/audio/stt") as ws:
-        _open_auto(ws)
-        fake.finals = ["kalispera"]
-        _voiced(ws, 3)
-        fake.finals = ["kalispera sas"]
+        assert ws.receive_json() == {"type": "final", "text": "yes sir"}
+        _voiced(ws, 3)                                  # the lean, the open, the switch (pending)
+        el = client.fakes[1]
+        el.answered(final="Ναι κύριε")                  # the candidate caught up
         _voiced(ws, 1)
-        assert ws.receive_json() == {"type": "final", "text": "kalispera sas"}
+        frames = _frames_until(ws, "replace")
+        assert frames[-1] == {"type": "replace", "text": "Ναι κύριε"}
+        el.answered(final="συνεχίζω")
+        _voiced(ws, 1)
+        assert _frames_until(ws, "final")[-1] == {"type": "final", "text": "συνεχίζω"}
         ws.send_json({"type": "stop"})
-        assert ws.receive_json() == {"type": "final", "text": "the end"}
-    assert fake.restarts == ["el", "multi"]
-    i = fake.sent.index(b"restart:multi")
-    assert b"".join(fake.sent[i + 1:-1]) == VOICED * 3
+        _frames_until(ws, "final")
 
 
-def test_partials_show_while_the_lock_holds_the_finals(temp_db, monkeypatch):
-    """The identification still running: the automatic stream's partials
-    reach the composer at once (a partial is replaced by the next, never
-    committed), the finals wait for the answer."""
-    fake = LockFakeSTT(LanguageGuess("en", 0.9, "hello there"), identify_delay=5.0)
-    client = _lock_client(monkeypatch, fake)
+def test_the_identifier_off_falls_back_to_the_providers_automatic_stream(switching):
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05}, enabled=False)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws, "el-GR")
+        _voiced(ws, 4)
+        ws.send_json({"type": "stop"})
+        ws.receive_json()
+    assert len(client.fakes) == 1 and client.fakes[0].started_with["language"] == "multi"
+
+
+def test_a_browser_language_the_install_does_not_list_starts_in_the_first_listed(switching):
+    """The admin's list bounds every outcome, the start included: a German
+    browser on a Greek and English install starts in Greek."""
+    client = switching({"en": 0.9, "el": 0.05, "de": 0.05}, candidates=("el", "en"))
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws, "de-DE")
+        assert client.fakes[0].started_with["language"] == "el"
+        ws.send_json({"type": "stop"})
+        ws.receive_json()
+    assert client.identifiers and client.identifiers[-1] is not None
+
+
+def test_one_listed_language_is_a_fixed_stream_with_nothing_to_detect(switching):
+    client = switching({"en": 0.9, "el": 0.05, "de": 0.05}, candidates=("el",))
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws, "el-GR")
+        assert client.fakes[0].started_with["language"] == "el"
+        _voiced(ws, 3)
+        ws.send_json({"type": "stop"})
+        ws.receive_json()
+    assert len(client.fakes) == 1 and client.identifiers == []
+
+
+def test_a_rate_the_identifier_does_not_read_falls_back_to_the_automatic_stream(switching):
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05})
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(), "language": "auto", "sample_rate": 24000,
+                      "default_language": "en-US"})
+        _ready(ws)
+        assert client.fakes[0].started_with["language"] == "multi"
+        ws.send_json({"type": "stop"})
+        ws.receive_json()
+    assert client.identifiers == []
+
+
+def test_a_provider_whose_constructor_raises_answers_an_error_frame(client, monkeypatch):
+    def boom():
+        raise RuntimeError("no such provider row")
+
+    monkeypatch.setattr(audio_service, "chat_provider_factory",
+                        lambda ptype, *, provider_id=None: (boom, {"id": 1, "provider_name": "fake", "advanced": {}}))
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(), "sample_rate": 16000})
+        msg = ws.receive_json()
+        assert msg["type"] == "error" and msg["code"] == "provider"
+        assert "could not start" in msg["message"]
+
+
+def test_an_unsupported_browser_language_means_english(switching):
+    client = switching({"en": 0.9, "el": 0.05, "de": 0.05})
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws, "xx-YY")
+        ws.send_json({"type": "stop"})
+        ws.receive_json()
+    assert client.fakes[0].started_with["language"] == "en"
+
+
+def test_one_candidate_at_a_time(switching):
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05})
     with client.websocket_connect("/ws/audio/stt") as ws:
         _open_auto(ws)
-        fake.interims = ["hel", "hello"]
-        fake.finals = ["hello there"]
+        _voiced(ws, 3)
+        assert len(client.fakes) == 2 and client.fakes[1].language == "el"
+        client.fakes[1].answered(interim="γ")
+        _voiced(ws, 1)                                  # the switch to el resolves
+        # The leader moves to German: a German candidate opens beside the
+        # default and the active Greek stream (the one inactive candidate).
+        client.identifiers[-1].probs = {"en": 0.1, "el": 0.05, "de": 0.85}
         _voiced(ws, 2)
-        assert ws.receive_json() == {"type": "interim", "text": "hel"}
-        assert ws.receive_json() == {"type": "interim", "text": "hello"}
+        assert [f.language for f in client.fakes] == ["en", "el", "de"]
+        assert not client.fakes[1].closed and not client.fakes[2].closed
+        # The leader moves on again: the German candidate goes, a French one opens.
+        client.identifiers[-1].probs = {"en": 0.1, "el": 0.05, "fr": 0.85}
+        _voiced(ws, 2)
+        assert [f.language for f in client.fakes] == ["en", "el", "de", "fr"]
+        assert client.fakes[2].closed and not client.fakes[3].closed
         ws.send_json({"type": "stop"})
-        assert ws.receive_json() == {"type": "final", "text": "hello there the end"}
+        _frames_until(ws, "final")
 
 
-def test_the_silence_before_the_first_word_is_neither_identified_nor_replayed(temp_db, monkeypatch):
-    """A pause before speaking: only a 0.3 s pre-roll of it reaches the
-    identification request and the replay, so neither waits on dead air."""
-    fake = LockFakeSTT(LanguageGuess("el", 0.95, "καλησπέρα σας λέω"))
-    client = _lock_client(monkeypatch, fake)
-    silence = bytes(3200)                            # 0.1 s at 16 kHz
+def test_usage_and_the_cap_count_every_stream(switching, monkeypatch):
+    recorded = {}
+
+    def _record(sub, source, name, provider, *, seconds=0.0, chars=0):
+        recorded.update(sub=sub, seconds=seconds)
+    monkeypatch.setattr(audio_service, "record_audio_usage", _record)
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05})
     with client.websocket_connect("/ws/audio/stt") as ws:
         _open_auto(ws)
-        for _ in range(10):
-            ws.send_bytes(silence)                   # a second of nothing
-        _voiced(ws, 3)                               # the request, the answer, the restart
-        _voiced(ws, 1)                               # locked: the live feed resumes
+        _voiced(ws, 4)                                  # 2.8 s to the default, a replay of 2.1 s plus 0.7 live to el
+        ws.send_json({"type": "stop"})
+        _frames_until(ws, "final")
+        # The usage is written as the socket ends: close it and wait here,
+        # before the client's exit cancels the server's teardown.
+        ws.close()
+        _until(lambda: "seconds" in recorded, timeout=10.0)
+    assert round(recorded["seconds"], 1) == round(2.8 + 2.1 + 0.7, 1)
+
+
+def test_the_cap_closes_once_every_streams_seconds_pass_it(switching):
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05})
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(max_seconds=4), "language": "auto",
+                      "sample_rate": 16000, "default_language": "en"})
+        _ready(ws)
+        _voiced(ws, 4)                                  # 2.8 s of audio, but 5.6 s billed across two streams
+        frames = _frames_until(ws, "error")
+        assert frames[-1]["code"] == "max_seconds"
+
+
+def test_a_stop_right_after_a_switch_waits_for_the_new_streams_final(switching):
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05})
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
+        _voiced(ws, 3)
+        el = client.fakes[1]
+        el.answered(interim="γεια")
+        _voiced(ws, 1)                                  # the switch resolves on the partial
+        frames = _frames_until(ws, "replace")
+        assert frames[-1] == {"type": "replace", "text": ""}
+        el.finals.append("γεια σας")                    # the final the stop must wait for
+        ws.send_json({"type": "stop"})
+        assert _frames_until(ws, "final")[-1] == {"type": "final", "text": "γεια σας the end", "last": True}
+    assert client.fakes[1].endpoints == 1
+
+
+def test_a_stop_while_the_switch_is_pending_and_answered_sends_the_replace_then_the_final(switching, monkeypatch):
+    """A short Greek sentence under an English browser, stop pressed while
+    the candidate catches up: the stop resolves the switch, the composer
+    gets the Greek words as a replace before the one final."""
+    from ws import audio as wsaudio
+    monkeypatch.setattr(wsaudio, "_STOP_FINAL_WAIT_S", 0.1)
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05})
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
+        en = client.fakes[0]
+        en.answered(final="Anna Viotria")
+        _voiced(ws, 1)
+        assert ws.receive_json() == {"type": "final", "text": "Anna Viotria"}
+        _voiced(ws, 3)                                  # the lean, the open, the switch (pending)
+        _until(lambda: len(client.fakes) == 2)
+        el = client.fakes[1]
+        el.answered(final="Ένα, δύο, τρία")             # answered, but no frame flows after it
+        ws.send_json({"type": "stop"})
+        frames = _frames_until(ws, "final")
+        assert frames[-2:] == [{"type": "replace", "text": "Ένα, δύο, τρία"}, {"type": "final", "text": "the end", "last": True}]
+    assert client.fakes[0].closed and client.fakes[1].closed
+
+
+# ── The words decide (a provider that reports a word confidence) ─────────
+#
+# The ear (the scripted identifier) leans to Greek on every reading, as it
+# does for a Greek speaker's English. The streams' words confirm, refuse or
+# call the switch back.
+
+
+def _el_exists(client):
+    _until(lambda: len(client.fakes) == 2 and client.fakes[1].language == "el")
+    time.sleep(0.05)
+    return client.fakes[0], client.fakes[1]
+
+
+def _all_frames_until(ws, kind, limit=40):
+    return _frames_until(ws, kind, limit)
+
+
+def test_a_switch_the_shown_words_refuse_never_sends_a_replace(switching):
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05}, words=True)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
+        _voiced(ws, 3)
+        en, el = _el_exists(client)
+        en.hear(0.0, 5.0, 14, 0.97)                     # accented English: the English words are clear
+        el.hear(0.0, 5.0, 12, 0.70)                     # the Greek stream's are garbage
+        _voiced(ws, 3)
+        ws.send_json({"type": "stop"})
+        frames = _all_frames_until(ws, "final")
+        assert all(f["type"] != "replace" for f in frames)
+        assert frames[-1] == {"type": "final", "text": "the end", "last": True}
+
+
+def test_a_decisive_refusal_settles_on_the_shown_language(switching, caplog):
+    import logging
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05}, words=True)
+    with caplog.at_level(logging.INFO, logger="otodock"):
+        with client.websocket_connect("/ws/audio/stt") as ws:
+            _open_auto(ws)
+            _voiced(ws, 3)
+            en, el = _el_exists(client)
+            en.hear(0.0, 6.0, 18, 0.97)
+            el.hear(0.0, 6.0, 15, 0.68)
+            _voiced(ws, 6)                              # 3 s of voice since the open: the refusal finalises
+            _until(lambda: el.closed)
+            ws.send_json({"type": "stop"})
+            _all_frames_until(ws, "final")
+    assert any("dictation language final: en" in r.getMessage() for r in caplog.records)
+
+
+def test_the_defaults_decisive_words_call_the_switch_back_with_a_replace(switching):
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05}, words=True)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
+        _voiced(ws, 3)
+        en, el = _el_exists(client)
+        en.hear(0.0, 2.0, 0, 0.0)                       # the English stream heard nothing at first
+        el.hear(0.0, 2.0, 5, 0.92)
+        _voiced(ws, 1)
+        assert _frames_until(ws, "replace")[-1]["type"] == "replace"
+        en.finals.append("and then I said")
+        en.hear(2.0, 6.0, 12, 0.97)
+        el.hear(2.0, 6.0, 10, 0.60)
+        _voiced(ws, 2)
+        frames = _frames_until(ws, "replace")
+        assert frames[-1] == {"type": "replace", "text": "and then I said"}
+        ws.send_json({"type": "stop"})
+        _all_frames_until(ws, "final")
+
+
+def test_a_final_drained_after_the_switch_travels_inside_the_replace(switching):
+    """The switch resolved before the chunk's drain: the new stream's final
+    that the drain then hands back is folded into the replace, never sent as
+    a final the replace would overwrite."""
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05}, words=True)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
+        _voiced(ws, 3)
+        en, el = _el_exists(client)
+        en.hear(0.0, 2.0, 0, 0.0)
+        el.hear(0.0, 2.0, 6, 0.93)
+        el.finals.append("Καλησπέρα")                    # drained at the resolve: in the replace's snapshot
+        el.later = ["με ακούς"]                          # drained by the chunk's own drain, after it
+        _voiced(ws, 1)
+        frames = _frames_until(ws, "replace")
+        assert frames[-1] == {"type": "replace", "text": "Καλησπέρα με ακούς"}
+        assert all(f["type"] != "final" for f in frames)
+        ws.send_json({"type": "stop"})
+        _all_frames_until(ws, "final")
+
+
+def test_the_new_streams_partial_is_painted_again_after_the_replace(switching):
+    """The composer repaints from the placed words on a replace, which wipes
+    the partial it showed a pass earlier: the active stream's latest partial
+    goes out once more right after the replace, even when nothing new was
+    popped."""
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05}, words=True)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
+        _voiced(ws, 3)
+        en, el = _el_exists(client)
+        en.hear(0.0, 2.0, 0, 0.0)
+        el.hear(0.0, 2.0, 6, 0.93)
+        el.latest_interim = "Καλησπέρα με ακούς"            # shown before the switch, popped already
+        _voiced(ws, 1)
+        frames = _frames_until(ws, "interim", limit=16)
+        kinds = [f["type"] for f in frames]
+        assert "replace" in kinds and kinds.index("replace") < kinds.index("interim")
+        assert frames[-1] == {"type": "interim", "text": "Καλησπέρα με ακούς"}
+        ws.send_json({"type": "stop"})
+        _all_frames_until(ws, "final")
+
+
+def test_a_switch_that_resolves_inside_the_drain_sends_the_old_final_then_the_replace(switching):
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05}, words=True)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
+        _voiced(ws, 3)
+        en, el = _el_exists(client)
+        en.hear(0.0, 2.0, 0, 0.0)
+        en.finals.append("Can you spell out")           # the shown stream's final, drained first
+
+        def words_arrive():
+            el.hear(0.0, 2.0, 6, 0.93)
+            el.finals.append("Καλησπέρα με ακούς")
+        el.drain_hook = words_arrive                    # the candidate's words land inside the drain
+        _voiced(ws, 2)
+        frames = _frames_until(ws, "replace")
+        kinds = [(f["type"], f.get("text")) for f in frames]
+        assert kinds.index(("final", "Can you spell out")) < kinds.index(("replace", "Καλησπέρα με ακούς"))
+        ws.send_json({"type": "stop"})
+        _all_frames_until(ws, "final")
+
+
+def test_the_language_list_is_read_off_the_loop(switching, monkeypatch):
+    import asyncio
+    on_loop = []
+
+    def candidates():
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        return ["en", "el"]
+
+    client = switching({"en": 0.9, "el": 0.05, "de": 0.05})
+    monkeypatch.setattr(audio_service, "language_candidates", candidates)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
         ws.send_json({"type": "stop"})
         ws.receive_json()
-    assert len(fake.identified) == 1
-    assert len(fake.identified[0]) == 44 + 3 * 3200 + 2 * len(VOICED)   # the pre-roll, two voiced chunks
-    i = fake.sent.index(b"restart:el")
-    assert b"".join(fake.sent[i + 1:-1]) == bytes(3 * 3200) + VOICED * 3
+    assert on_loop == [False]
 
 
-def test_both_restarts_failing_sends_the_held_words_before_the_error(temp_db, monkeypatch):
-    fake = LockFakeSTT(LanguageGuess("el", 0.95, "καλησπέρα σας λέω"))
-    fake.restart_fails = {"el", "multi"}
-    client = _lock_client(monkeypatch, fake)
+def test_an_unreadable_language_list_starts_with_every_language(switching, monkeypatch):
+    def broken():
+        raise RuntimeError("the settings store is down")
+
+    client = switching({"en": 0.9, "el": 0.05, "de": 0.05})
+    monkeypatch.setattr(audio_service, "language_candidates", broken)
     with client.websocket_connect("/ws/audio/stt") as ws:
-        _open_auto(ws)
-        fake.finals = ["kalispera"]
-        _voiced(ws, 3)
-        assert ws.receive_json() == {"type": "final", "text": "kalispera"}
-        err = ws.receive_json()
-        assert err["type"] == "error" and err["code"] == "provider"
-
-
-def test_a_stop_during_the_hold_sends_one_final_with_the_held_words_first(temp_db, monkeypatch):
-    """The client resolves on the first final after a stop and closes, so
-    the held words and the stream's own tail travel in ONE frame."""
-    fake = LockFakeSTT(LanguageGuess("el", 0.95, "καλησπέρα σας λέω"), identify_delay=5.0)
-    client = _lock_client(monkeypatch, fake)
-    with client.websocket_connect("/ws/audio/stt") as ws:
-        _open_auto(ws)
-        fake.finals = ["held words"]
-        _voiced(ws, 2)                               # the identification is still running
-        fake.finals = ["more held"]
-        _voiced(ws, 1)
+        _open_auto(ws, "el-GR")
+        assert client.fakes[0].started_with["language"] == "el"
         ws.send_json({"type": "stop"})
-        assert ws.receive_json() == {"type": "final", "text": "held words more held the end"}
-    assert len(fake.identified) == 1 and fake.restarts == []
+        ws.receive_json()
+    assert client.identifiers                           # the streams and the identifier ran
+
+
+def test_a_one_word_dictation_decides_at_the_stop(switching, monkeypatch):
+    """A stop with the switch still pending: the speech has ended, every
+    stream is finalised, and one Greek word against an English stream that
+    heard nothing switches."""
+    from ws import audio as wsaudio
+    monkeypatch.setattr(wsaudio, "_STOP_FINAL_WAIT_S", 0.1)
+    client = switching({"en": 0.1, "el": 0.85, "de": 0.05}, words=True)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
+        _voiced(ws, 3)
+        en, el = _el_exists(client)
+        _voiced(ws, 1)                                  # the switch goes pending: no words yet
+        en.hear(0.0, 2.8, 0, 0.0)
+        el.hear(0.0, 2.8, 1, 0.95)
+        el.finals.append("Ναι")
+        ws.send_json({"type": "stop"})
+        frames = _all_frames_until(ws, "final")
+        assert {"type": "replace", "text": "Ναι"} in frames
+    assert en.endpoints >= 1                            # the stop finalised the shown stream
+
+
+def test_the_stop_is_the_dictations_take_a_one_word_dictation_is_read_there(switching, monkeypatch):
+    """0.7 s of voice is never read while the person dictates (the first
+    reading needs a second): the stop takes one reading, the take rule lets a
+    sure leader open and switch, and the candidate's word decides."""
+    from ws import audio as wsaudio
+    monkeypatch.setattr(wsaudio, "_STOP_FINAL_WAIT_S", 0.1)
+    client = switching({"en": 0.02, "el": 0.97, "de": 0.01}, words=True)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
+        en = client.fakes[0]
+        ws.send_bytes(VOICED)                           # one word: no reading yet
+        time.sleep(0.05)
+        assert len(client.fakes) == 1
+        en.hear(0.0, 0.7, 0, 0.0)                       # the English stream heard nothing
+        ws.send_json({"type": "stop"})
+        _until(lambda: len(client.fakes) == 2 and client.fakes[1].language == "el")
+        el = client.fakes[1]
+        el.finals.append("Ναι")
+        el.hear(0.0, 0.7, 1, 0.95)
+        frames = _all_frames_until(ws, "final")
+        assert {"type": "replace", "text": "Ναι"} in frames
+
+
+def test_a_one_word_english_dictation_the_ear_is_not_sure_of_stays(switching, monkeypatch):
+    from ws import audio as wsaudio
+    monkeypatch.setattr(wsaudio, "_STOP_FINAL_WAIT_S", 0.1)
+    client = switching({"en": 0.3, "el": 0.68, "de": 0.02}, words=True)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
+        ws.send_bytes(VOICED)
+        time.sleep(0.05)
+        ws.send_json({"type": "stop"})
+        frames = _all_frames_until(ws, "final")
+        assert all(f["type"] != "replace" for f in frames) and len(client.fakes) == 1
+
+
+def test_a_provider_without_word_confidence_never_switches_a_short_dictation_at_the_stop(switching, monkeypatch):
+    """Without the words to check it, a lone reading at the stop would switch
+    an accented "Yes, send it": the stop is no take there, as before."""
+    from ws import audio as wsaudio
+    monkeypatch.setattr(wsaudio, "_STOP_FINAL_WAIT_S", 0.1)
+    client = switching({"en": 0.02, "el": 0.97, "de": 0.01}, words=False)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        _open_auto(ws)
+        ws.send_bytes(VOICED)                           # 0.7 s of voice: never read while dictating
+        time.sleep(0.05)
+        ws.send_json({"type": "stop"})
+        frames = _all_frames_until(ws, "final")
+        assert all(f["type"] != "replace" for f in frames)
+    assert len(client.fakes) == 1                       # no candidate stream was opened
+
+
+# ── The link: the keepalive, the progress, the endings ─────────────────
+
+def _quick_link(monkeypatch, **values):
+    import ws.audio as relay
+    for name, value in {"_TICK_S": 0.02, **values}.items():
+        monkeypatch.setattr(relay, name, value)
+
+
+def test_a_quiet_link_keeps_the_stream_alive_and_says_how_much_arrived(client, monkeypatch):
+    _quick_link(monkeypatch, _IDLE_KEEPALIVE_S=0.05, _PROGRESS_EVERY_S=0.1)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(), "language": "en", "sample_rate": 16000})
+        _ready(ws)
+        ws.send_bytes(b"\x00" * 3200)                   # 0.1 s, then the link goes quiet
+        frames = [ws.receive_json() for _ in range(3)]
+        assert all(f["type"] == "progress" and f["audio_s"] == 0.1 for f in frames)
+        assert all(0 < f["left_s"] <= 180 for f in frames)     # the seconds before the limit
+        assert client.fakes[0].keepalives >= 1
+        ws.send_json({"type": "stop"})
+        assert _frames_until(ws, "final")[-1] == {"type": "final", "text": "hello world", "last": True}
+
+
+def test_the_stop_answers_one_marked_final_even_when_empty(client, monkeypatch):
+    async def nothing(self):
+        return None
+    monkeypatch.setattr(WsFakeSTT, "finish", nothing)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(), "language": "en", "sample_rate": 16000})
+        _ready(ws)
+        ws.send_json({"type": "stop"})
+        assert ws.receive_json() == {"type": "final", "text": "", "last": True}
+
+
+def test_the_cap_says_so_plainly_and_sends_the_words_owed(client):
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(max_seconds=0), "language": "en", "sample_rate": 16000})
+        _ready(ws)
+        ws.send_bytes(b"\x00" * 3200)
+        assert ws.receive_json() == {
+            "type": "error", "code": "max_seconds",
+            "message": "Dictation reached its time limit and stopped. What was heard is in the box. "
+                       "Tap the mic to continue.",
+        }
+        assert ws.receive_json() == {"type": "final", "text": "hello world", "last": True}
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_a_stream_that_stopped_answering_says_so_plainly(client):
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(), "language": "en", "sample_rate": 16000})
+        _ready(ws)
+        client.fakes[0].fatal = ('Deepgram speech-to-text error: {"description": "ConnectionClosed in '
+                                 'AbstractAsyncWebSocketClient._listening", "message": "received 1011"}')
+        ws.send_bytes(b"\x00" * 3200)
+        msg = ws.receive_json()
+        assert msg["code"] == "provider" and msg["message"] == (
+            "Dictation stopped because the speech service stopped answering. What was heard is in the box. "
+            "Tap the mic to continue.")
+        assert ws.receive_json() == {"type": "final", "text": "hello world", "last": True}
+
+
+def test_a_minute_without_audio_ends_the_dictation(client, monkeypatch):
+    _quick_link(monkeypatch, _IDLE_END_S=0.2)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(), "language": "en", "sample_rate": 16000})
+        _ready(ws)
+        msg = ws.receive_json()
+        assert msg["type"] == "error" and msg["code"] == "idle"
+        assert msg["message"].startswith("Dictation stopped because no sound reached it for a minute.")
+        assert ws.receive_json() == {"type": "final", "text": "hello world", "last": True}
+
+
+def test_words_a_provider_releases_go_out_while_the_link_is_quiet(client, monkeypatch):
+    _quick_link(monkeypatch)
+    later = {"text": None}
+    monkeypatch.setattr(WsFakeSTT, "drain_transcript", lambda self: later.pop("text", None))
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(), "language": "en", "sample_rate": 16000})
+        _ready(ws)
+        later["text"] = "ένα δύο"                         # released while no frame arrives at all
+        assert ws.receive_json() == {"type": "final", "text": "ένα δύο"}
+        ws.send_json({"type": "stop"})
+        _frames_until(ws, "final")
+
+
+def test_the_seconds_listened_again_are_a_usage_row_of_their_own(client, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="otodock")
+    recorded = {}
+
+    def _record(sub, source, name, provider, *, seconds=0.0, chars=0):
+        recorded[source] = seconds
+    monkeypatch.setattr(audio_service, "record_audio_usage", _record)
+    monkeypatch.setattr(WsFakeSTT, "relisten_seconds", 2.5, raising=False)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(), "language": "en", "sample_rate": 16000})
+        _ready(ws)
+        ws.send_bytes(b"\x00" * 32000)                  # 1 s
+        ws.send_json({"type": "stop"})
+        _frames_until(ws, "final")
+        ws.close()
+        _until(lambda: len(recorded) == 2, timeout=10.0)
+    assert recorded == {"audio-stt-chat": pytest.approx(1.0), "audio-stt-chat-relisten": pytest.approx(2.5)}
+    assert any("1.0 s streamed, 2.5 s listened again" in r.message for r in caplog.records)
+
+
+def test_a_stall_then_a_burst_keeps_every_final_in_order(client, monkeypatch):
+    _quick_link(monkeypatch, _IDLE_KEEPALIVE_S=0.05)
+    sent = {"n": 0}
+    pending: list[str] = []
+
+    async def count(self, b):
+        sent["n"] += 1
+        pending.append(f"w{sent['n']}")                # one final per chunk, drained once
+    monkeypatch.setattr(WsFakeSTT, "send_audio", count)
+    monkeypatch.setattr(WsFakeSTT, "drain_transcript", lambda self: pending.pop(0) if pending else None)
+    with client.websocket_connect("/ws/audio/stt") as ws:
+        ws.send_json({"type": "init", "token": _token(), "language": "en", "sample_rate": 16000})
+        _ready(ws)
+        finals = []
+        for _ in range(3):
+            ws.send_bytes(b"\x00" * 3200)
+            finals.append(ws.receive_json()["text"])
+        time.sleep(0.3)                                  # the link stalls: the vendor gets its keepalive
+        for _ in range(3):
+            ws.send_bytes(b"\x00" * 3200)               # the burst
+        while len(finals) < 6:
+            frame = ws.receive_json()
+            if frame["type"] == "final":
+                finals.append(frame["text"])
+        assert client.fakes[0].keepalives >= 1
+        ws.send_json({"type": "stop"})
+        _frames_until(ws, "final")
+    assert finals[:6] == [f"w{i}" for i in range(1, 7)]
+
+
+def test_a_refused_key_is_told_apart_from_other_failures():
+    assert audio_service.is_key_refusal("ElevenLabs speech-to-text auth error: You must be authenticated")
+    assert audio_service.is_key_refusal("Deepgram rejected the API key")
+    assert not audio_service.is_key_refusal("received 1011 (internal error) Deepgram did not receive audio data")

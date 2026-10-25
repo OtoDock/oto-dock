@@ -34,20 +34,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+import psycopg
 from fastapi import HTTPException
 
 import config
 from auth.providers import UserContext
+from core import layout
 from core.session.visibility import available_scopes_for
 from services.infra import safe_fs
-from services.infra.path_confinement import PathOutsideRoot, join_under, normalize_rel_path, resolve_under
+from services.infra.path_confinement import (
+    PathOutsideRoot,
+    join_under,
+    normalize_rel_path,
+    resolve_under,
+)
+from storage import database as task_store, remote_store
 from storage.agents import agent_store
 from storage.files import db_file_transfers
 from storage.mcp import mcp_store
-from storage import remote_store
-from storage import database as task_store
 from storage.pg import run_db
-from core import layout
 
 logger = logging.getLogger("otodock.delegation")
 
@@ -61,6 +66,8 @@ _NOTE_CAP = 500
 
 def _config_int(key: str, default: int) -> int:
     raw = mcp_store.get_mcp_config_values("delegation-mcp").get(key)
+    if raw is None:
+        return default
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -546,11 +553,13 @@ def perform_send_files(
         created_by=authz.created_by,
     )
     logger.info(
-        f"send_files: transfer={transfer_id} {authz.source_agent}→"
-        f"{authz.target_agent} scope={authz.dest_scope} files={len(landed)} "
-        f"bytes={total_bytes} by={authz.created_by} "
-        f"dest=inbox/{authz.source_agent}/{clean_dest_dir or ''} "
-        f"skipped={len(skipped)}"
+        "send_files: transfer=%s %s→"
+        "%s scope=%s files=%s "
+        "bytes=%s by=%s "
+        "dest=inbox/%s/%s "
+        "skipped=%s",
+        transfer_id, authz.source_agent, authz.target_agent, authz.dest_scope, len(landed),
+        total_bytes, authz.created_by, authz.source_agent, clean_dest_dir or '', len(skipped)
     )
     return TransferResult(
         transfer_id=transfer_id,
@@ -573,7 +582,7 @@ def schedule_inbox_fanout(
     try:
         from core.remote import upload_inflight
         from services.remote import workspace_fanout
-    except Exception:
+    except ImportError:
         return
     agent_dir = config.get_agent_dir(target_agent)
     for rel in rel_paths:
@@ -682,7 +691,7 @@ async def prefetch_remote_sources(
                 return None
             fallback.append(remote_rel)
             return got
-        except Exception:
+        except Exception:  # noqa: BLE001  # a failed prefetch pull leaves the file to the send's own read
             logger.warning(
                 "send_files prefetch: pull failed for %s", remote_rel, exc_info=True,
             )
@@ -699,7 +708,7 @@ async def prefetch_remote_sources(
             return await asyncio.wait_for(
                 remote_file_flow.stat_probe(session_id, remote_rel), max(_left(), 0.1),
             )
-        except Exception:
+        except Exception:  # noqa: BLE001  # a failed prefetch probe leaves the file to the send's own read
             logger.warning(
                 "send_files prefetch: probe failed for %s", remote_rel, exc_info=True,
             )
@@ -712,7 +721,7 @@ async def prefetch_remote_sources(
                 manifest = await asyncio.wait_for(
                     remote_file_flow.list_remote_files(session_id, prefix), max(_left(), 0.1),
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001  # a failed prefetch listing leaves the folder to the send's own read
                 logger.warning("send_files prefetch: manifest failed", exc_info=True)
                 manifest = None
             if manifest is None:
@@ -803,12 +812,12 @@ async def remote_source_label(session_id: str) -> str:
         from core.remote.satellite_connection import get_connection_manager
         conn = get_connection_manager().get_connection(machine_id)
         name = getattr(conn, "name", "") if conn is not None else ""
-    except Exception:
+    except ImportError:
         name = ""
     if not name:
         try:
             row = await run_db(remote_store.get_remote_machine, machine_id)
-        except Exception:
+        except psycopg.Error:
             row = None
         name = (row or {}).get("name") or ""
     return f"'{name}'" if name else machine_id[:8]

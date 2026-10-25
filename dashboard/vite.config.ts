@@ -3,7 +3,6 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { viteStaticCopy } from 'vite-plugin-static-copy'
 import path from 'path'
-import type { ClientRequest, IncomingMessage } from 'http'
 import { precompressDir } from './build/precompress'
 import { stampBuildId } from './build/buildId'
 
@@ -173,15 +172,6 @@ function precompressAssets(): Plugin {
   }
 }
 
-// The dev server's own pages reach the proxy under the proxy's origin.
-function ownOriginToTarget(proxyReq: ClientRequest, req: IncomingMessage) {
-  const origin = proxyReq.getHeader('origin')
-  if (!origin || !req.headers.host) return
-  try {
-    if (new URL(String(origin)).host === req.headers.host) proxyReq.setHeader('origin', 'http://localhost:8400')
-  } catch { /* not a URL: left as it is */ }
-}
-
 export default defineConfig({
   plugins: [
     react(),
@@ -213,11 +203,21 @@ export default defineConfig({
           dest: 'ui-kit/fonts',
           rename: { stripBase: true },
         },
+        {
+          src: 'node_modules/@fontsource/manrope/files/manrope-{latin,greek}-{400,500,600,700}-normal.woff2',
+          dest: 'ui-kit/fonts',
+          rename: { stripBase: true },
+        },
         // The Android app's bundled setup page (public/setup.html) loads its
         // font from here, never from another host; cap sync puts it beside
         // the page in the app's assets.
         {
-          src: 'node_modules/@fontsource/comfortaa/files/comfortaa-{latin,greek}-{400,600}-normal.woff2',
+          src: 'node_modules/@fontsource/manrope/files/manrope-{latin,greek}-{400,600}-normal.woff2',
+          dest: 'setup-fonts',
+          rename: { stripBase: true },
+        },
+        {
+          src: 'node_modules/@fontsource/comfortaa/files/comfortaa-{latin,greek}-700-normal.woff2',
           dest: 'setup-fonts',
           rename: { stripBase: true },
         },
@@ -244,28 +244,20 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // The browser's Host passes through (no changeOrigin): the proxy reads
+    // the page's origin from it. Its origin check accepts an Origin that names
+    // the Host a request was sent to (cookie writes, the dashboard socket),
+    // and an app page's CSP names that origin for the kit, which this server
+    // serves. `vite preview` reuses these rules.
     proxy: {
-      // changeOrigin rewrites Host to the target; the proxy also refuses a
-      // cookie write whose Origin is another host (its origin check), so a
-      // page of this dev server names the target's origin instead (any
-      // other origin passes through and is refused, as in production).
+      // ws: an app page's live sockets (/v1/apps/<id>/ws).
       '/v1': {
         target: 'http://localhost:8400',
-        changeOrigin: true,
-        configure: (proxy) => {
-          proxy.on('proxyReq', ownOriginToTarget)
-        },
+        ws: true,
       },
       '/auth': {
         target: 'http://localhost:8400',
-        changeOrigin: true,
-        configure: (proxy) => {
-          proxy.on('proxyReq', ownOriginToTarget)
-        },
       },
-      // No changeOrigin: the proxy's dashboard socket accepts a page whose
-      // Origin names the Host it was sent to, so the browser's Host must
-      // pass through.
       '/ws': {
         target: 'http://localhost:8400',
         ws: true,
@@ -274,7 +266,6 @@ export default defineConfig({
       // proxy/assets/kws (outside dist, see config.KWS_ASSETS_DIR).
       '/kws-assets': {
         target: 'http://localhost:8400',
-        changeOrigin: true,
       },
     },
   },

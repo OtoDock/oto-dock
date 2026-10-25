@@ -34,7 +34,7 @@ def can_serve_token(info: dict, user: UserContext | None) -> bool:
         return False
     chat_id = info.get("chat_id")
     if chat_id:
-        from api.agents.chats import can_access_chat
+        from core.session.visibility import can_access_chat
         chat = task_store.get_chat(chat_id)
         if not chat:
             return False

@@ -28,14 +28,13 @@ import logging
 import os
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
+from .. import config
+from .._vendored import layout, terminal_queries
 from ..host import env_hygiene, path_translator
 from ..transport import file_sync
-from .._vendored import terminal_queries
-from .. import config
-from .._vendored import layout
 
 logger = logging.getLogger("satellite")
 
@@ -115,8 +114,8 @@ class BasePtySession:
         session_id: str,
         agent_dir: Path,
         config: dict,
-        sat_config: "object",
-        ws: "object",
+        sat_config: object,
+        ws: object,
         *,
         rows: int = 24,
         cols: int = 80,
@@ -138,7 +137,7 @@ class BasePtySession:
         # the PTY twin of the -p path's end-of-turn detect_file_changes.
         self._files_dirty = False
         # Transcript forwarding state.
-        self._tail_task: "asyncio.Task | None" = None
+        self._tail_task: asyncio.Task | None = None
         self._tail_stop = False
         self._transcript_path: Path | None = None
         self._transcript_offset = 0
@@ -150,13 +149,13 @@ class BasePtySession:
         # post-auth `pty_alive` set accurate (no dead-session re-adopt). Set by
         # session_manager.pty_open; the proxy-driven pty_close pops the dict
         # itself, so this fires only on a child-initiated exit.
-        self._on_dead: "Callable[[], None] | None" = None
+        self._on_dead: Callable[[], None] | None = None
         # otodock-CLI: optional TEE of PTY output/exit to a local control-socket
         # client (the `otodock` terminal on this machine). Set via
         # :meth:`attach_local_relay`; both are best-effort and never block or break
         # the proxy mirror (the dashboard view + transcript are unaffected).
-        self._local_relay: "Callable[[bytes], None] | None" = None
-        self._local_exit: "Callable[[int | None], None] | None" = None
+        self._local_relay: Callable[[bytes], None] | None = None
+        self._local_exit: Callable[[int | None], None] | None = None
         # Server-prompt injection (proxy `pty_inject`): local input-line state
         # (fed by :meth:`note_local_input` from the T_INPUT path), one
         # injection in flight at a time, and a recent-id ring so a proxy
@@ -170,8 +169,8 @@ class BasePtySession:
     # --- otodock-CLI local relay --------------------------------------------
     def attach_local_relay(
         self,
-        on_output: "Callable[[bytes], None]",
-        on_exit: "Callable[[int | None], None]",
+        on_output: Callable[[bytes], None],
+        on_exit: Callable[[int | None], None],
     ) -> None:
         """Tee this PTY's output/exit to a local `otodock` terminal in addition to
         the proxy mirror. Idempotent (last attach wins)."""
@@ -215,7 +214,7 @@ class BasePtySession:
         else:
             self._local_line_dirty = True
 
-    def _inject_blocked(self) -> "str | None":
+    def _inject_blocked(self) -> str | None:
         """The first injection gate blocking right now, or None when clear.
         ``session_gone``/``not_attached`` are terminal (NACK immediately);
         the rest are retryable within the bounded window."""
@@ -384,7 +383,7 @@ class BasePtySession:
             if relay is not None:
                 try:
                     relay(data)
-                except Exception:
+                except Exception:  # noqa: BLE001  # a local terminal's tee callback must not stall the proxy mirror
                     logger.debug("otodock local relay output failed", exc_info=True)
             # Ride the LOSSLESS pty lane (blocking put) — the backend
             # AWAITS this coroutine (Unix reader task) / blocks on it (Windows
@@ -402,7 +401,7 @@ class BasePtySession:
             if exit_cb is not None:
                 try:
                     exit_cb(code)
-                except Exception:
+                except Exception:  # noqa: BLE001  # a local terminal's exit callback must not skip the proxy's pty_exit
                     logger.debug("otodock local relay exit failed", exc_info=True)
             # Drop ourselves from session_manager.pty_sessions BEFORE
             # forwarding the exit, so a racing reconnect's pty_alive doesn't list a
@@ -410,7 +409,7 @@ class BasePtySession:
             if self._on_dead is not None:
                 try:
                     self._on_dead()
-                except Exception:
+                except Exception:  # noqa: BLE001  # the on-dead hook must not skip reporting the exit to the proxy
                     logger.debug("pty _on_dead hook failed", exc_info=True)
             return self._ws.enqueue_send({
                 "type": "pty_exit",
@@ -441,7 +440,7 @@ class BasePtySession:
         self._tail_task = asyncio.create_task(self._transcript_tail_loop())
 
     # --- transcript forwarding (shared) --------------------------------------
-    def _locate_transcript_file(self) -> "Path | None":  # pragma: no cover - abstract
+    def _locate_transcript_file(self) -> Path | None:  # pragma: no cover - abstract
         """Find this session's JSONL on disk. Claude: ``<id>.jsonl`` by name;
         Codex: discover the rollout. Returns None until the CLI has created it."""
         raise NotImplementedError
@@ -517,7 +516,7 @@ class BasePtySession:
             changes = await asyncio.to_thread(
                 file_sync.detect_changes, self.agent_dir, self._file_snapshot,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001  # the tail loop's file scan: a raise would end transcript forwarding
             logger.debug(
                 "PTY %s: file scan failed", self.session_id, exc_info=True,
             )
@@ -545,7 +544,7 @@ class BasePtySession:
                     await self._scan_and_forward_files()
         except asyncio.CancelledError:
             pass
-        except Exception:
+        except Exception:  # noqa: BLE001  # the transcript tail task's top: nobody awaits it
             logger.debug(
                 "PTY %s: transcript tail loop error", self.session_id, exc_info=True
             )
@@ -571,7 +570,7 @@ class BasePtySession:
         try:
             self.pty.resize(self.rows, max(1, self.cols - 1))
             self.pty.resize(self.rows, self.cols)
-        except Exception:
+        except OSError:
             logger.debug("PTY %s: force_repaint nudge failed", self.session_id, exc_info=True)
 
     async def close(self) -> None:
@@ -585,7 +584,7 @@ class BasePtySession:
             self._tail_task = None
         try:
             await self._forward_transcript_delta()
-        except Exception:
+        except Exception:  # noqa: BLE001  # the final transcript flush must not skip the PTY's teardown
             logger.debug(
                 "PTY %s: final transcript flush failed", self.session_id, exc_info=True
             )
@@ -593,7 +592,7 @@ class BasePtySession:
         # after it (and a file can change without a transcript line at all).
         try:
             await self._scan_and_forward_files()
-        except Exception:
+        except Exception:  # noqa: BLE001  # the final file scan must not skip the PTY's teardown
             logger.debug(
                 "PTY %s: final file scan failed", self.session_id, exc_info=True
             )

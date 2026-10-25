@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from cryptography.fernet import InvalidToken
+
 from storage.identity import credential_store
 from storage.pg import get_conn
 
@@ -129,7 +131,7 @@ def client_secret(reg_id: int) -> str | None:
         return ""
     try:
         return credential_store.decrypt_secret(enc)
-    except Exception:
+    except (InvalidToken, UnicodeDecodeError):
         return None
 
 

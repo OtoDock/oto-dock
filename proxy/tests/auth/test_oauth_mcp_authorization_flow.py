@@ -24,11 +24,24 @@ from fastapi.testclient import TestClient
 import config
 from auth.providers import UserContext, get_current_user
 from services.mcp import mcp_manifest_parse, mcp_registry
-from services.oauth import credential_resolver, mcp_authorization as ma, oauth_account_store
-from storage.identity import bearer_allowlist, credential_store
-from storage.identity import oauth_client_registrations as regs
+from services.oauth import (
+    credential_resolver,
+    mcp_authorization as ma,
+    oauth_account_store,
+)
+from storage.identity import (
+    bearer_allowlist,
+    credential_store,
+    oauth_client_registrations as regs,
+)
 from storage.pg import get_conn
-from tests.auth.test_mcp_authorization_discovery import AS_META, ISSUER, PRM_PATH, RESOURCE, Vendor
+from tests.auth.test_mcp_authorization_discovery import (
+    AS_META,
+    ISSUER,
+    PRM_PATH,
+    RESOURCE,
+    Vendor,
+)
 
 MCP = "notion-hosted-mcp"
 PROVIDER = "notion-hosted"

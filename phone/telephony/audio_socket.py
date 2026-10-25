@@ -100,10 +100,10 @@ class AudioSocketConnection(MediaTransport):
             if header is None:
                 header = await self.reader.readexactly(HEADER_SIZE)
                 self._pending_header = header
-        except asyncio.IncompleteReadError:
-            raise AudioSocketError("Connection closed during header read")
+        except asyncio.IncompleteReadError as exc:
+            raise AudioSocketError("Connection closed during header read") from exc
         except ConnectionError as e:
-            raise AudioSocketError(f"Connection error: {e}")
+            raise AudioSocketError(f"Connection error: {e}") from e
 
         frame_type = header[0]
         payload_len = struct.unpack(">H", header[1:3])[0]
@@ -114,9 +114,9 @@ class AudioSocketConnection(MediaTransport):
 
         try:
             payload = await self.reader.readexactly(payload_len)
-        except asyncio.IncompleteReadError:
+        except asyncio.IncompleteReadError as exc:
             self._pending_header = None
-            raise AudioSocketError("Connection closed during payload read")
+            raise AudioSocketError("Connection closed during payload read") from exc
 
         self._pending_header = None
         return frame_type, payload
@@ -133,7 +133,7 @@ class AudioSocketConnection(MediaTransport):
         else:
             # Some Asterisk versions send UUID as ASCII string
             self.call_uuid = payload.decode("ascii", errors="replace").strip()
-        logger.info(f"[{self.peer_addr}] Call UUID: {self.call_uuid}")
+        logger.info("[%s] Call UUID: %s", self.peer_addr, self.call_uuid)
         return self.call_uuid
 
     def inject_dtmf(self, digit: str, duration_ms: int = 0) -> None:
@@ -188,7 +188,7 @@ class AudioSocketConnection(MediaTransport):
         try:
             self.writer.close()
             await self.writer.wait_closed()
-        except Exception:
+        except Exception:  # noqa: BLE001  # closing a socket that is already going away
             pass
 
     @property

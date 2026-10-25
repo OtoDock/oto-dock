@@ -21,7 +21,7 @@ import pytest
 # Redundant under pytest (conftest handles it); kept for `python <file>` runs.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from core.session import interactive_session as I # noqa: E402
+from core.session import interactive_session as I
 
 pytestmark = pytest.mark.asyncio
 
@@ -191,8 +191,8 @@ async def test_mark_attached_read(monkeypatch):
     the scrollback replay just showed any pending answer — and is a silent
     no-op on missing chats / DB failures (never blocks the open)."""
     from core.session import otodock_session as O
-    from storage import database as db
     from services.notifications import notification_manager as nm
+    from storage import database as db
 
     marked, fanned = [], []
     monkeypatch.setattr(db, "get_chat", lambda cid: {

@@ -8,7 +8,7 @@ here, so edit this file and keep it short.
 
 OtoDock is a self-hosted platform for AI agents: a FastAPI backend (`proxy/`)
 that runs Claude Code, Codex and direct model sessions in per-session
-sandboxes, a React dashboard (`dashboard/`), a daemon
+sandboxes, a React dashboard (`dashboard/`) with an Android shell, a daemon
 for remote machines (`satellite/`), a phone-call service (`phone/`), a shared
 speech package (`audio/`) and first-party MCP servers (`mcps/`).
 
@@ -39,7 +39,7 @@ speech package (`audio/`) and first-party MCP servers (`mcps/`).
 | `proxy/storage/` | the schema (`schema.py`) and database access, one subpackage per domain |
 | `proxy/auth/`, `proxy/hooks/` | authentication, path policy and the command floor, and the hook scripts that run inside sessions |
 | `proxy/tests/` | the proxy's pytest suite, mirroring the package layout |
-| `dashboard/src/` | the React app |
+| `dashboard/src/` | the React app (`dashboard/android/` is the Capacitor shell) |
 | `satellite/` | the remote-machine daemon (`satellite/_vendored/` holds copies of proxy modules) |
 | `phone/` | the phone-call service (`audio/` is the speech package it shares with the proxy) |
 | `mcps/custom/`, `mcps/skills/` | first-party MCP servers, one folder each, and skill packages installed from the catalog (a runtime install dir, gitignored) |
@@ -55,7 +55,8 @@ report a failure with its output instead of calling the work done. A change
 in `audio/` checks the proxy, the phone and the audio package. A change in
 `mcps/` checks the proxy, and an MCP that carries its own tests
 (`mcps/custom/<name>/tests/` or `__tests__/`) runs them too. A change to a
-proxy module the satellite vendors (below) checks the satellite too. The environments each line
+proxy module the satellite vendors (below) checks the satellite too. A
+dashboard change ships inside the Android app. The environments each line
 needs (`proxy/venv` with the test
 extras, `satellite/venv`, `node_modules`) are set up once as
 `CONTRIBUTING.md`, "Running the tests", shows, where each command below
@@ -70,11 +71,17 @@ cd dashboard && npm run build && npx vitest run  # dashboard: tsc, build, tests
 proxy/venv/bin/ruff check .                      # lint, the whole tree
 cd proxy && venv/bin/mypy                        # proxy types
 cd dashboard && npm run lint                     # dashboard lint
+cd dashboard && npm run build && npx cap sync android && cd android && ./gradlew assembleDebug testDebugUnitTest
 ```
 
 - The proxy suite makes its own disposable database (`otodock_test`, one per
   worker) on the PostgreSQL at `127.0.0.1:5432`. `TEST_DATABASE_URL` points
   it elsewhere, and its database name must contain `test`.
+- The Android line is needed when `dashboard/android/` changed, and only
+  where the person installed JDK 21 and the Android SDK (`ANDROID_HOME`).
+  `npx cap sync android` regenerates two tracked files under
+  `dashboard/android/`. They change only when the native plugins do, and a
+  change there belongs in a commit only then.
 - A test that fails, then passes alone, under `-n 8` on a loaded machine is
   worth one serial re-run before you debug it.
 
@@ -93,9 +100,10 @@ cd dashboard && npm run lint                     # dashboard lint
 - A task the proxy starts without keeping it goes through
   `core.background.spawn(coro, name=..., owner=...)`, never a bare
   `asyncio.create_task`.
-- Lint and types ratchet: `ruff-baseline.toml`,
-  `dashboard/eslint-suppressions.json` and `proxy/mypy.ini`'s `files` list
-  froze the old findings. Fix a new finding, and never add to those files.
+- Lint and types ratchet: `ruff-baseline.toml` and
+  `dashboard/eslint-suppressions.json` froze the old findings, and mypy
+  checks the whole proxy (`proxy/mypy.ini`). Fix a new finding, and never
+  add to those files.
 - Python is type-hinted, and async in the proxy, on the version
   `VERSIONS.md` pins (`PYTHON_VERSION`). The satellite runs on the machines
   it is paired with, down to `PYTHON_MIN_VERSION`: no newer syntax there.

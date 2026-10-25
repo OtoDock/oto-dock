@@ -4,6 +4,7 @@ import { useRemoteMachines } from '../api/remoteMachines'
 import { isLocalTarget } from '../lib/placement'
 import { MODE_LABEL, modeOfAgent } from '../lib/visibility'
 import RemoteBadge from './RemoteBadge'
+import { BADGE_BASE, BADGE_TONE, CARD, CARD_BORDERED } from './ui/classes'
 
 function getInitials(name: string): string {
   return name.slice(0, 2).toUpperCase()
@@ -16,9 +17,17 @@ interface Props {
   /** Department role (level name) when the card renders inside a
    *  department group on the grid — e.g. "Head", "Senior". */
   roleLabel?: string
+  /** `card` on the page (raised), `item` inside a group (on the page's
+   *  own colour with a hairline). */
+  surface?: 'card' | 'item'
 }
 
-export default function AgentCard({ agent, isDefault, onSetDefault, roleLabel }: Props) {
+const SURFACE = {
+  card: `${CARD} hover:shadow-elevation-2 transition-shadow`,
+  item: `${CARD_BORDERED} hover:border-default hover:bg-surface-hover transition-colors`,
+} as const
+
+export default function AgentCard({ agent, isDefault, onSetDefault, roleLabel, surface = 'card' }: Props) {
   // If agent has a remote target configured, look up the live status so the
   // badge reflects reality (admin-visible). The query is role-gated inside
   // useRemoteMachines — non-admins never hit the admin endpoint and get no
@@ -40,15 +49,15 @@ export default function AgentCard({ agent, isDefault, onSetDefault, roleLabel }:
   return (
     <Link
       to={`/chat/${agent.name}`}
-      className="block bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-5 hover:shadow-md transition-shadow relative"
+      className={`${SURFACE[surface]} block p-5 relative`}
     >
       {/* Default agent star — top right */}
       <button
         onClick={handleStarClick}
-        className={`absolute top-3 right-3 p-1 rounded-lg transition-colors ${
+        className={`absolute top-3 right-3 p-1 rounded-control transition-colors ${
           isDefault
-            ? 'text-brand cursor-default'
-            : 'text-p-text-light/40 hover:text-brand/60 hover:bg-brand-50'
+            ? 'text-link cursor-default'
+            : 'text-tertiary hover:text-link hover:bg-action-subtle'
         }`}
         title={isDefault ? 'Default agent' : 'Set as default agent'}
       >
@@ -68,14 +77,15 @@ export default function AgentCard({ agent, isDefault, onSetDefault, roleLabel }:
       {/* Header */}
       <div className="flex items-center gap-3 mb-3 pr-8">
         <div
+          // eslint-disable-next-line otodock/no-raw-palette -- white initials on the agent's own colour
           className="w-10 h-10 rounded-full flex items-center justify-center text-white text-sm font-bold shrink-0"
-          style={{ backgroundColor: agent.color || '#6B7280' }}
+          style={{ backgroundColor: agent.color || 'var(--color-accent-agent-fill)' }}
         >
           {getInitials(agent.name)}
         </div>
         <div className="min-w-0">
           <div className="flex items-center gap-1.5">
-            <h3 className="text-sm font-semibold text-p-text truncate">
+            <h3 className="text-sm font-semibold text-primary truncate">
               {agent.display_name || agent.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}
             </h3>
             {agentMachine && (
@@ -89,17 +99,16 @@ export default function AgentCard({ agent, isDefault, onSetDefault, roleLabel }:
             )}
           </div>
           {agent.display_name && agent.display_name !== agent.name && (
-            <span className="text-xs text-p-text-light truncate block">{agent.name}</span>
+            <span className="text-xs text-tertiary truncate block">{agent.name}</span>
           )}
           <span className="flex items-center gap-1.5 flex-wrap">
-            <span className="inline-flex items-center px-1.5 py-0.5 rounded-sm text-xs text-p-text-secondary bg-p-surface">
+            <span className={`${BADGE_BASE} ${BADGE_TONE.neutral}`}>
               {MODE_LABEL[mode]}
             </span>
             {roleLabel && (
-              // The bordered house label badge (DepartmentsEditor's
-              // "View only" / the AI-engines provider tag) — bg-p-bg so it
-              // stays visible against the card's own dark:bg-p-surface.
-              <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-p-bg text-p-text-secondary border border-p-border-light">
+              // The house label badge (DepartmentsEditor's "View only", the
+              // AI-engines provider tag), on the muted fill.
+              <span className="shrink-0 text-3xs font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-surface-muted text-secondary">
                 {roleLabel}
               </span>
             )}
@@ -109,11 +118,11 @@ export default function AgentCard({ agent, isDefault, onSetDefault, roleLabel }:
 
       {/* Description */}
       {agent.description && (
-        <p className="text-xs text-p-text-light line-clamp-2 mb-3">{agent.description}</p>
+        <p className="text-xs text-tertiary line-clamp-2 mb-3">{agent.description}</p>
       )}
 
       {/* Stats */}
-      <div className="flex gap-4 text-xs text-p-text-secondary">
+      <div className="flex gap-4 text-xs text-secondary">
         <span>{agent.mcp_count} MCPs</span>
         <span>{agent.schedule_count} Schedules</span>
         <span>{agent.trigger_count} Triggers</span>

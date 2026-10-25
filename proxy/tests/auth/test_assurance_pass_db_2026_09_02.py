@@ -89,8 +89,8 @@ def test_totp_setup_reconfigure_requires_password():
 # --- User delete revokes API keys + user triggers ----------------------------
 
 def test_delete_user_revokes_api_keys_and_triggers():
-    from storage.identity import api_key_store
     from storage.automation import trigger_store
+    from storage.identity import api_key_store
 
     admin_sub = _mk_user(email="admin@t.com", role="admin")
     victim_sub = _mk_user(email="victim@t.com")

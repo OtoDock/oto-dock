@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { answerDialog, renderWithDialogs } from './dialogsHarness'
 
 // ─── An MCP server that names its own authorization server (1.7.1) ───
 //
@@ -34,7 +35,7 @@ type Call = { url: string; method: string; body?: unknown }
 
 function wrap(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<MemoryRouter><QueryClientProvider client={qc}>{ui}</QueryClientProvider></MemoryRouter>)
+  return renderWithDialogs(<MemoryRouter><QueryClientProvider client={qc}>{ui}</QueryClientProvider></MemoryRouter>)
 }
 
 const integration: Integration = {
@@ -76,7 +77,7 @@ describe('the connect form of a registered-client MCP', () => {
     expect(screen.getByText(/Signs you in at/)).toBeInTheDocument()
     expect(screen.getByText('mcp.notion.com')).toBeInTheDocument()
     expect(screen.getByText(/no OAuth app to create/)).toBeInTheDocument()
-    fireEvent.change(screen.getByPlaceholderText('Account label (optional)'), { target: { value: ' Work ' } })
+    fireEvent.change(screen.getByPlaceholderText('Account label, optional'), { target: { value: ' Work ' } })
     fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
     await waitFor(() => expect(calls.some(c => c.url.endsWith('/v1/oauth/notion-hosted/start'))).toBe(true))
     const start = calls.find(c => c.url.endsWith('/v1/oauth/notion-hosted/start'))!
@@ -88,15 +89,15 @@ describe('the connect form of a registered-client MCP', () => {
     const inactive = { ...integration, oauth_meta: { ...integration.oauth_meta!, authorization_server: { ...integration.oauth_meta!.authorization_server!, active: false } } }
     wrap(<OAuthAccountForm integration={inactive} account={null} onDone={() => {}} />)
     expect(screen.queryByText(/Signs you in at/)).toBeNull()
-    expect(screen.queryByPlaceholderText('Account label (optional)')).toBeNull()
+    expect(screen.queryByPlaceholderText('Account label, optional')).toBeNull()
     expect(screen.getByRole('button', { name: 'Connect' })).toBeInTheDocument()
   })
 
   it('shows the reconnect reason for a dead account', () => {
     mockApi([], { '/accounts?mcp_name=notion-hosted-mcp': { accounts: [], has_service_credentials_only: false } })
     wrap(<OAuthAccountForm integration={{ ...integration, accounts: [deadAccount] }} account={deadAccount} onDone={() => {}} />)
-    expect(screen.getByText(/Reconnect needed: its access expired and the vendor issued no refresh token/)).toBeInTheDocument()
-    expect(screen.queryByPlaceholderText('Account label (optional)')).toBeNull()
+    expect(screen.getByText(/Reconnect needed: its access expired and the vendor gave no way to renew it/)).toBeInTheDocument()
+    expect(screen.queryByPlaceholderText('Account label, optional')).toBeNull()
     expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
   })
 })
@@ -153,7 +154,6 @@ describe('the admin MCP row', () => {
       '/v1/admin/mcps': MCPS, '/update-state': { updates: {}, checked: 0, checked_at: '' },
       '/v1/mcp-credential-schema': schema, '/v1/admin/oauth-client-registrations': registrations,
     })
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
     wrap(<McpServersPage />)
     fireEvent.click(await screen.findByText('Notion (hosted)'))
     expect(await screen.findByText('Signs in at mcp.notion.com')).toBeInTheDocument()
@@ -162,8 +162,8 @@ describe('the admin MCP row', () => {
     expect(screen.getByText(/1 older registration kept/)).toBeInTheDocument()
     expect(screen.getByText(/no OAuth app is created/)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Forget' }))
+    await act(async () => { await answerDialog('Forget', /Forget this install's registration/) })
     await waitFor(() => expect(calls.some(c => c.method === 'POST' && c.url.endsWith('/v1/admin/oauth-client-registrations/7/forget'))).toBe(true))
-    confirm.mockRestore()
   })
 
   it('offers the registration as the fallback when the server accepts app tokens', async () => {
@@ -217,8 +217,59 @@ describe('the admin MCP row', () => {
     const fallback = await screen.findByText('Sign in without an app')
     const appCreds = screen.getByText('OAuth App Credentials')
     expect(screen.getByText('Hosted via OtoDock')).toBeInTheDocument()
+    // The sign-in mode is a segmented control: the saved mode is the pressed one.
+    const mode = screen.getByRole('group', { name: 'Sign-in mode' })
+    expect(within(mode).getByRole('button', { name: 'Self-managed' })).toHaveAttribute('aria-pressed', 'true')
+    expect(within(mode).getByRole('button', { name: 'Use OtoDock' })).toHaveAttribute('aria-pressed', 'false')
     // The app credentials come first; the registered client is the fallback under them.
     expect(appCreds.compareDocumentPosition(fallback) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('opens and closes a server row from the keyboard', async () => {
+    mockApi([], {
+      '/v1/admin/mcps': WITH_APP, '/update-state': { updates: {}, checked: 0, checked_at: '' },
+      '/v1/mcp-credential-schema': schema, '/v1/admin/oauth-client-registrations': registrations,
+    })
+    wrap(<McpServersPage />)
+    const header = (await screen.findByText('Notion (hosted)')).closest('[role="button"]') as HTMLElement
+    expect(header).toHaveAttribute('tabindex', '0')
+    expect(header).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.keyDown(header, { key: 'Enter' })
+    expect(header).toHaveAttribute('aria-expanded', 'true')
+    fireEvent.keyDown(header, { key: ' ' })
+    expect(header).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('keeps the chosen sign-in mode at full strength: a click on it sends nothing, the other one saves', async () => {
+    const calls: Call[] = []
+    const accepting = {
+      'notion-hosted-mcp': {
+        ...schema['notion-hosted-mcp'],
+        oauth_meta: {
+          ...schema['notion-hosted-mcp'].oauth_meta,
+          authorization_server: { registration: 'dynamic', issuer: '', resource_host: 'mcp.notion.com', confidential: false, accepts_app_tokens: true },
+        },
+      },
+    }
+    mockApi(calls, {
+      '/v1/admin/mcps': WITH_APP, '/update-state': { updates: {}, checked: 0, checked_at: '' },
+      '/v1/mcp-credential-schema': accepting, '/v1/admin/oauth-client-registrations': registrations,
+    })
+    wrap(<McpServersPage />)
+    fireEvent.click(await screen.findByText('Notion (hosted)'))
+    await screen.findByText('Sign in without an app')
+    const chosen = screen.getByRole('button', { name: 'Self-managed' })
+    const other = screen.getByRole('button', { name: 'Use OtoDock' })
+    expect(chosen).toBeEnabled()
+    expect(other).toBeEnabled()
+    fireEvent.click(chosen)
+    expect(calls.some((c) => c.url.endsWith('/hosted-service-mode'))).toBe(false)
+    fireEvent.click(other)
+    await waitFor(() => expect(calls).toContainEqual({
+      url: '/v1/admin/mcps/notion-hosted-mcp/hosted-service-mode', method: 'PUT', body: { mode: 'hosted' },
+    }))
+    const heading = screen.getByText('Hosted via OtoDock').parentElement!
+    await waitFor(() => expect([...heading.querySelectorAll('[role=status]')].map((r) => r.textContent)).toContain('Saved'))
   })
 
   it('shows only the registration card when the server takes its own tokens only', async () => {

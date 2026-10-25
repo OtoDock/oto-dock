@@ -98,7 +98,7 @@ describe('LoginPage SSO start refused', () => {
     renderPage(cfg({ oidc_enabled: true }))
     fireEvent.click(screen.getByRole('button', { name: /continue with authentik/i }))
     const shown = await screen.findByText(/Too many sign-ins started; try again in a few minutes\./)
-    expect(shown.textContent).toContain('(retry in 5 minutes)')
+    expect(shown.textContent).toContain('Try again in 5 minutes.')
     expect(fetchMock.mock.calls[0][0]).toBe('/auth/oidc-url')
     expect(screen.queryByText(/OIDC not configured/)).toBeNull()
   })

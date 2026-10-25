@@ -13,6 +13,7 @@ verbatim. HTTP errors are reserved for auth-shape failures.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,7 @@ def _assign_roles(user_sub: str, agent_roles: dict[str, str]) -> None:
     """Ensure the user row exists, then set their full agent/role map
     (``set_user_agents`` REPLACES the list — assign all agents at once)."""
     from datetime import datetime, timezone
+
     from storage import database as task_store
     from storage.pg import get_conn
     now = datetime.now(timezone.utc).isoformat()
@@ -524,3 +526,85 @@ def test_clear_all_unknown_or_traversal_agent_404(client):
             headers=_admin_cookie(),
         )
         assert r.status_code == 404, agent
+
+
+# ---------------------------------------------------------------------------
+# Refusals a person reads: one plain sentence, no field name or user id
+# ---------------------------------------------------------------------------
+
+def _member_cookie(sub: str = "user-member") -> dict[str, str]:
+    from auth.providers import create_session_jwt
+    _seed_agent("other")
+    _assign_role(sub, "other", "viewer")
+    return {"Cookie": f"session={create_session_jwt(sub, f'{sub}@test.com', sub, 'member')}"}
+
+
+def test_memory_settings_refusals_read_as_sentences(client, caplog):
+    _seed_agent("acme")
+    member = _member_cookie()
+    cases = [
+        ("get", "/v1/internal/memory/settings", None, 403,
+         "Only an admin can see the memory settings."),
+        ("patch", "/v1/internal/memory/settings", {"user_memory_enabled": False}, 403,
+         "Only an admin can change the memory settings."),
+        ("get", "/v1/internal/memory/agent-settings/acme", None, 403,
+         "Only a manager of this agent can see its memory settings."),
+        ("patch", "/v1/internal/memory/agent-settings/acme", {"key": "user_memory_enabled"}, 403,
+         "Only a manager of this agent can change its memory settings."),
+        ("post", "/v1/internal/memory/clear-agent-memory/acme", None, 403,
+         "Only a manager of this agent can clear its memory."),
+        ("post", "/v1/internal/memory/clear-all", {"scope": "agent"}, 403,
+         "Only an admin can clear everyone's memory."),
+    ]
+    for method, path, body, status, sentence in cases:
+        r = getattr(client, method)(path, headers=member, **({"json": body} if body else {}))
+        assert (r.status_code, r.json()["detail"]) == (status, sentence), path
+
+    admin = _admin_cookie()
+    with caplog.at_level("WARNING", logger="otodock.memory-api"):
+        r = client.patch("/v1/internal/memory/agent-settings/acme",
+                         json={"key": "agent_memory_settings_owner", "value": True}, headers=admin)
+    assert (r.status_code, r.json()["detail"]) == (400, "That memory setting does not exist.")
+    assert "agent_memory_settings_owner" in caplog.text
+    r = client.patch("/v1/internal/memory/agent-settings/acme", json={"value": True}, headers=admin)
+    assert (r.status_code, r.json()["detail"]) == (400, "That memory setting does not exist.")
+    r = client.post("/v1/internal/memory/clear-all", json={"scope": "x"}, headers=admin)
+    assert (r.status_code, r.json()["detail"]) == (400, "Choose whose memory to clear.")
+    r = client.post("/v1/internal/memory/clear-agent-memory/ghost", headers=admin)
+    assert (r.status_code, r.json()["detail"]) == (404, "This agent no longer exists.")
+
+
+def test_clear_my_memory_refusals_name_no_identifier(temp_db, caplog):
+    from fastapi import HTTPException
+
+    from api.agent_data import memory
+    from auth.providers import UserContext
+
+    def refused(sub: str) -> str:
+        user = UserContext(sub=sub, email="x@test.com", name="X", role="member", agents=[])
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(memory.clear_my_memory(user=user))
+        assert exc.value.status_code == 400
+        return exc.value.detail
+
+    assert refused("api-key") == "Only a person signed in to the dashboard can clear their own memory."
+    with caplog.at_level("WARNING", logger="otodock.memory-api"):
+        assert refused("user-ghost") == "Could not find your account. Sign out, sign in again and retry."
+    assert "user-ghost" in caplog.text
+
+
+def test_git_history_refusals_name_no_identifier(temp_db):
+    from fastapi import HTTPException
+
+    from api.agent_data import git_history
+    _seed_agent("acme")
+
+    def refused(scope: str, agent: str, sub: str | None) -> tuple[int, str]:
+        with pytest.raises(HTTPException) as exc:
+            git_history._resolve_repo(scope, agent, sub)
+        return exc.value.status_code, exc.value.detail
+
+    assert refused("agent", "ghost", None) == (404, "This agent no longer exists.")
+    assert refused("user", "acme", None) == (400, "Choose whose history to show.")
+    assert refused("user", "acme", "sub-ghost-7") == (404, "That person's account no longer exists.")
+    assert refused("bogus", "acme", None) == (400, "That history does not exist.")

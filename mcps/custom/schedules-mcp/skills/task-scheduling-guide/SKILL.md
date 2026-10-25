@@ -1,6 +1,6 @@
 ---
 name: task-scheduling-guide
-description: Parameter shapes and worked detail for the schedules-mcp tools — notification modes, cron and interval schedules, self-continuations, editing and reading back tasks, model pinning, trigger-only tasks, timezone rules. Load before creating or editing a scheduled task.
+description: Parameter shapes and worked detail for the schedules-mcp tools — notification modes, cron and interval schedules, self-continuations, editing and reading back tasks, model pinning, choosing a machine, the permission mode, trigger-only tasks, timezone rules. Load before creating or editing a scheduled task.
 ---
 
 # Task scheduling — the guide
@@ -102,6 +102,31 @@ the noisy tasks pinned down.
 - **Valid values come from your own `layers:` line** — it lists your enabled execution layers and the model ids on each, with your current default marked `[default, tN]`. Look for it under **Scheduled-task Execution** in your prompt; if you also have the delegation tools it lives on your own row in **Available Agents** instead, and the Scheduled-task Execution block points you there. A model that isn't on that line is rejected with a 400; do not guess ids.
 - **Pick by tier, not by name.** Every id on that line carries a capability tag, `[t1]` (frontier: complex coding, the hardest reasoning, judgement calls, long autonomous work) down to `[t4]` (fast: mechanical, high-volume routine work); `[t?]` is a local or custom model nobody rated. The **Model tiers** list next to it says what each model is good at. Complex, open-ended or judgement-heavy tasks (a code change on a real codebase, a review, a decision, a briefing that weighs evidence) belong on tier 1; only a mechanical, well-defined job (a sync, a reformat) belongs on tier 3 or 4. A newer, bigger-sounding or more expensive-sounding id is not a stronger model: the tag is.
 - **Retuning is cheap.** `edit_task(task_id, model="...")` re-pins a live schedule from its next run on, with no change to when it fires. `edit_task(task_id, model="")` clears the pin and returns the task to your default.
+
+## Choosing a machine for a task
+
+Every task runs where the agent's default sends it. Leave `machine` out
+unless the person asks for one. `create_scheduled_task`,
+`create_one_time_task` and `edit_task` take an optional `machine` (a name or
+an id) that sends that one task's runs to a machine.
+
+- **The machine must be one the person may use.** That is one of their own paired machines, or an admin machine when the person is a platform admin. An agent-wide task (`scope: "agent"`) belongs to no person, so it never runs on a personal machine. A session without a person can only leave it at the default. A task that runs inside a chat (a continuation) keeps the chat's machine and takes none.
+- **A refusal names the choices.** Pick one of the names it lists, or leave `machine` out.
+- **An offline machine does not stop the run.** A run that starts while the machine is offline uses the agent's default, and the run's chat says so. `get_task_history` shows where each run ran (`ran on:`).
+- **Read it back.** `list_tasks` shows `machine: <name>` and `get_task` a `Machine:` line when a task has its own machine.
+- **Clearing it.** `edit_task(task_id, machine="default")` returns the task to the agent's default.
+
+## The task's permission mode (`permission_mode`)
+
+A task runs in Don't Ask unless it says otherwise. Leave `permission_mode`
+out unless the person asks for Auto. `create_scheduled_task`,
+`create_one_time_task` and `edit_task` take it.
+
+- **`dontAsk`** (the default) runs every tool. Nobody is there to answer, so the few tools that always ask a person are refused.
+- **`autoReview`** (Auto) runs reads, file edits and safe tools, and has the engine's own reviewer check anything else first. On Codex the reviewer checks only what reaches beyond the workspace. A tool that needs a check and cannot get one is refused, and the run says why.
+- **Auto needs Claude Code or Codex.** A task on Direct LLM is refused Auto, and the refusal says so.
+- **Read it back.** `get_task` shows the mode on its `Mode:` line.
+- **Changing it.** `edit_task(task_id, permission_mode="dontAsk")` returns the task to Don't Ask from its next run on.
 
 ## Checks on a task (`checks`)
 

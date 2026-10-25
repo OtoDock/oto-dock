@@ -9,24 +9,24 @@ import sys
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
-from services.path_policy_v2 import (  # noqa: E402
+from core import placement
+from services.path_policy_v2 import (
     PathPolicyContext,
     ResolveItem,
     SessionTargetRevoked,
     classify_path,
+    context_from_security,
     expand_tilde,
     is_other_user_tilde,
     is_path_string,
-    context_from_security,
     normalize_path,
     resolve_path_batch,
     resolve_path_for_session,
 )
-from core import placement
-
 
 # ---------------------------------------------------------------------------
 # Helpers

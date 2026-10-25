@@ -11,7 +11,7 @@
  * - useDuplexWakeArm: the wake-word ARM effect. Runs after handleNewChat,
  *   which it reuses for the stale-state reset.
  *
- * duplexVoiceProp builds ChatInput's ready-made `voice` prop (the mic
+ * useDuplexVoiceProp builds ChatInput's ready-made `voice` prop (the mic
  * toggle's never-warmed branch lives there).
  */
 import { useState, useEffect, useRef } from 'react'
@@ -95,9 +95,14 @@ export function useChatDuplexVoice({ chatId, warming, duplexActiveRef, searchPar
   const [wakeRequested, setWakeRequested] = useState(false)
   // Marks the CURRENT duplex session as wake-initiated (10 s silence guard).
   const wakeInitiatedRef = useRef(false)
+  const wakeParam = searchParams.get('wake') === '1'
+  const [wakeSeen, setWakeSeen] = useState(false)
+  if (wakeSeen !== wakeParam) {
+    setWakeSeen(wakeParam)
+    if (wakeParam) setWakeRequested(true)
+  }
   useEffect(() => {
     if (searchParams.get('wake') === '1') {
-      setWakeRequested(true)
       setSearchParams(prev => { prev.delete('wake'); return prev }, { replace: true })
     }
   }, [searchParams, setSearchParams])
@@ -190,15 +195,17 @@ export function useDuplexWakeArm({
     wakeInitiatedRef.current = true
     keepAppsOnChatEntryRef.current = true // belt-and-braces beside the render-time arm
     duplexPendingRef.current = true
+    // A voice chat starts where the agent's chats start (the page's place
+    // pick is for a typed chat): a voice conversation keeps its chat put.
     ws.warmup(agentName, undefined, mode, model,
       chatActiveLayer ?? selectedLayer ?? undefined, undefined,
       interactive.chatExecMode || undefined,
-      currentDashboardTheme())
+      currentDashboardTheme(), { place: false })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wakeRequested, ws.connected, warming, audioCapability, chatId, urlChatId, handleNewChat])
 }
 
-export function duplexVoiceProp({
+export function useDuplexVoiceProp({
   audioCapability, duplexVoice, chatId, agentName, keepAppsOnChatEntryRef, duplexPendingRef,
   ws, mode, model, chatActiveLayer, selectedLayer, interactive,
 }: {
@@ -238,7 +245,7 @@ export function duplexVoiceProp({
         ws.warmup(agentName, undefined, mode, model,
           chatActiveLayer ?? selectedLayer ?? undefined, undefined,
           interactive.chatExecMode || undefined,
-          currentDashboardTheme())
+          currentDashboardTheme(), { place: false })
       },
       muted: duplexVoice.muted,
       onToggleMute: duplexVoice.toggleMute,

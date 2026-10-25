@@ -27,9 +27,10 @@ from core.layers.codex import session as codex_session
 from core.layers.codex.app_server_client import AppServerClient, AppServerError
 from core.session import session_state
 from ws.dashboard_dispatch import (
-    ClientMessageDispatcher, _question_answers_to_text,
+    ClientMessageDispatcher,
+    _question_answers_to_text,
 )
-
+from ws.dashboard_prompts import PromptController
 
 # ─────────────────────────────────────────────────────────────────────────
 # Codex idle sweep: the question spare
@@ -103,8 +104,9 @@ def test_has_pending_question_tracks_the_session_index():
 # question_response: fallback when no live waiter took the answer
 # ─────────────────────────────────────────────────────────────────────────
 
-class _FakeConnection(ClientMessageDispatcher):
-    """The dispatcher mixin with only the collaborators question_response uses."""
+class _FakeConnection(ClientMessageDispatcher, PromptController):
+    """The dispatcher and prompt mixins with only the collaborators
+    question_response uses."""
 
     def __init__(self, *, streaming: bool = False, chat_id: str = "chat-q"):
         self.session_id = "sid-reaped"

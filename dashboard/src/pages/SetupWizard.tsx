@@ -3,6 +3,9 @@ import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { setupFirstUser } from '../api/auth'
 import PasswordStrengthBar from '../components/PasswordStrengthBar'
+import { errorText } from '../lib/http/apiJson'
+import Button from '../components/ui/Button'
+import { Input } from '../components/ui/Field'
 
 export default function SetupWizard() {
   const { setUser } = useAuth()
@@ -37,8 +40,8 @@ export default function SetupWizard() {
       } else {
         navigate('/admin/platform', { replace: true })
       }
-    } catch (err: any) {
-      setError(err.message || 'Setup failed')
+    } catch (err) {
+      setError(errorText(err) || 'Setup failed')
     } finally {
       setLoading(false)
     }
@@ -46,22 +49,22 @@ export default function SetupWizard() {
 
   if (urlCaptured) {
     return (
-      <div className="flex items-center justify-center min-h-screen bg-p-bg">
+      <div className="flex items-center justify-center min-h-screen bg-hero-bg">
         <div className="w-full max-w-md mx-4">
-          <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-6 shadow-xs text-center">
-            <h1 className="text-2xl font-bold text-p-text">You're all set</h1>
-            <p className="text-sm text-p-text-secondary mt-3">
+          <div className="bg-surface-overlay text-primary rounded-hero shadow-elevation-4 p-6 text-center">
+            <h1 className="font-display text-2xl font-bold text-primary">You're all set</h1>
+            <p className="text-sm text-secondary mt-3">
               Document preview was pinned to{' '}
-              <span className="font-mono text-p-text">{window.location.origin}</span>.
+              <span className="font-mono text-primary">{window.location.origin}</span>.
               To activate it, run <span className="font-mono">docker compose up -d</span>{' '}
-              once (or restart the platform). Everything else works right away.
+              once, or restart the platform. Everything else works right away.
             </p>
-            <button
+            <Button variant="primary" size="lg"
               onClick={() => navigate('/admin/platform', { replace: true })}
-              className="mt-5 w-full py-2 text-sm font-medium rounded-lg bg-brand text-white hover:opacity-90 transition-opacity"
+              className="mt-5 w-full"
             >
               Continue to dashboard
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -69,52 +72,48 @@ export default function SetupWizard() {
   }
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-p-bg">
+    <div className="flex items-center justify-center min-h-screen bg-hero-bg">
       <div className="w-full max-w-md mx-4">
-        <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-6 shadow-xs">
+        <div className="bg-surface-overlay text-primary rounded-hero shadow-elevation-4 p-6">
           <div className="text-center mb-6">
-            <h1 className="text-2xl font-bold text-p-text">Welcome to OtoDock</h1>
-            <p className="text-sm text-p-text-secondary mt-2">
+            <h1 className="font-display text-2xl font-bold text-primary">Welcome to OtoDock</h1>
+            <p className="text-sm text-secondary mt-2">
               Create your administrator account to get started.
             </p>
           </div>
 
-          {error && <div className="text-sm text-p-accent-red mb-4 p-3 bg-red-50 dark:bg-red-900/20 rounded-lg">{error}</div>}
+          {error && <div className="text-sm text-status-danger-fg mb-4 p-3 bg-status-danger-bg rounded-card">{error}</div>}
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
-              <label className="block text-xs font-medium text-p-text-secondary mb-1">Display Name</label>
-              <input type="text" value={displayName} onChange={e => setDisplayName(e.target.value)}
-                required autoFocus placeholder="John Smith"
-                className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+              <label className="block text-xs font-medium text-secondary mb-1">Display Name</label>
+              <Input type="text" value={displayName} onChange={e => setDisplayName(e.target.value)}
+                required autoFocus placeholder="John Smith" className="h-control-lg" />
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-p-text-secondary mb-1">Email</label>
-              <input type="email" value={email} onChange={e => setEmail(e.target.value)}
-                required placeholder="admin@example.com" autoComplete="email"
-                className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+              <label className="block text-xs font-medium text-secondary mb-1">Email</label>
+              <Input type="email" value={email} onChange={e => setEmail(e.target.value)}
+                required placeholder="admin@example.com" autoComplete="email" className="h-control-lg" />
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-p-text-secondary mb-1">Password</label>
-              <input type="password" value={password} onChange={e => setPassword(e.target.value)}
-                required autoComplete="new-password"
-                className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+              <label className="block text-xs font-medium text-secondary mb-1">Password</label>
+              <Input type="password" value={password} onChange={e => setPassword(e.target.value)}
+                required autoComplete="new-password" className="h-control-lg" />
               <PasswordStrengthBar password={password} />
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-p-text-secondary mb-1">Confirm Password</label>
-              <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)}
-                required autoComplete="new-password"
-                className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+              <label className="block text-xs font-medium text-secondary mb-1">Confirm Password</label>
+              <Input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)}
+                required autoComplete="new-password" className="h-control-lg" />
             </div>
 
-            <button type="submit" disabled={loading}
-              className="w-full px-4 py-2.5 text-sm font-medium text-white bg-brand hover:bg-brand-hover rounded-lg disabled:opacity-50 transition-colors">
+            <Button variant="primary" size="lg" type="submit" disabled={loading}
+              className="w-full">
               {loading ? 'Creating account...' : 'Create Admin Account'}
-            </button>
+            </Button>
           </form>
         </div>
       </div>

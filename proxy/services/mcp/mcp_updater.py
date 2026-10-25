@@ -24,16 +24,20 @@ it here cannot self-deadlock.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import logging
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 
+import httpx
+import psycopg
 from fastapi import HTTPException
 
-from services.mcp import mcp_manifest_types as _mt
-from services.mcp import mcp_registry
+from services.mcp import mcp_manifest_types as _mt, mcp_registry
 from storage import database as task_store
 from storage.mcp import mcp_store
 
@@ -119,28 +123,28 @@ def pin_local_manifest(
 # Registry version probes (npm / pypi)
 # ---------------------------------------------------------------------------
 
+async def _registry_json(url: str, accept: str) -> dict | None:
+    """A registry document off the loop (``_read_capped``: the response
+    closed, the body capped, an object or nothing). None on any error."""
+    try:
+        return await asyncio.to_thread(_read_capped, url, accept)
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+
+
 async def _check_npm_version(package: str) -> str | None:
     """Query the npm registry for the latest version. None on any error."""
-    import urllib.request
-    try:
-        url = f"https://registry.npmjs.org/{package}/latest"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
-        return json.loads(resp.read()).get("version")
-    except Exception:
-        return None
+    doc = await _registry_json(f"https://registry.npmjs.org/{package}/latest", "application/json")
+    version = (doc or {}).get("version")
+    return version if isinstance(version, str) else None
 
 
 async def _check_pypi_version(package: str) -> str | None:
     """Query PyPI for the latest version. None on any error."""
-    import urllib.request
-    try:
-        url = f"https://pypi.org/pypi/{package}/json"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
-        return json.loads(resp.read()).get("info", {}).get("version")
-    except Exception:
-        return None
+    doc = await _registry_json(f"https://pypi.org/pypi/{package}/json", "application/json")
+    info = (doc or {}).get("info")
+    version = info.get("version") if isinstance(info, dict) else None
+    return version if isinstance(version, str) else None
 
 
 # ---------------------------------------------------------------------------
@@ -177,16 +181,10 @@ def _is_stable_in_bound(registry: str, version: str, spec) -> bool:
 async def _all_npm_versions(package: str) -> list[str]:
     """All published version strings for an npm package (abbreviated metadata —
     ~3x smaller than the full packument, same ``versions`` map)."""
-    import urllib.request
-    try:
-        url = f"https://registry.npmjs.org/{package}"
-        req = urllib.request.Request(
-            url, headers={"Accept": "application/vnd.npm.install-v1+json"},
-        )
-        resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
-        return list((json.loads(resp.read()).get("versions") or {}).keys())
-    except Exception:
-        return []
+    doc = await _registry_json(f"https://registry.npmjs.org/{package}",
+                               "application/vnd.npm.install-v1+json")
+    versions = (doc or {}).get("versions")
+    return [v for v in versions if isinstance(v, str)] if isinstance(versions, dict) else []
 
 
 async def _all_pypi_versions(package: str) -> list[str]:
@@ -194,18 +192,15 @@ async def _all_pypi_versions(package: str) -> list[str]:
 
     A ``releases`` key with an empty file list is registered-but-not-uploaded and
     isn't installable, so it must not be selected as the bounded latest."""
-    import urllib.request
-    try:
-        url = f"https://pypi.org/pypi/{package}/json"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
-        releases = json.loads(resp.read()).get("releases") or {}
-        return [
-            v for v, files in releases.items()
-            if files and not all(f.get("yanked") for f in files)
-        ]
-    except Exception:
+    doc = await _registry_json(f"https://pypi.org/pypi/{package}/json", "application/json")
+    releases = (doc or {}).get("releases")
+    if not isinstance(releases, dict):
         return []
+    return [
+        v for v, files in releases.items()
+        if isinstance(files, list) and files
+        and not all(isinstance(f, dict) and f.get("yanked") for f in files)
+    ]
 
 
 async def resolve_latest_in_bound(
@@ -298,7 +293,7 @@ async def _registry_doc(registry: str, package: str) -> dict | None:
         url, accept = f"https://pypi.org/pypi/{package}/json", "application/json"
     try:
         return await asyncio.to_thread(_read_capped, url, accept)
-    except Exception:
+    except (OSError, ValueError, http.client.HTTPException, zlib.error):
         return None
 
 
@@ -321,7 +316,8 @@ def _release_times(registry: str, doc: dict) -> dict[str, datetime | None]:
     old release waits as a new release would)."""
     out: dict[str, datetime | None] = {}
     if registry == "npm":
-        times = doc.get("time") if isinstance(doc.get("time"), dict) else {}
+        raw_times = doc.get("time")
+        times = raw_times if isinstance(raw_times, dict) else {}
         for version in (doc.get("versions") or {}):
             out[str(version)] = _parse_time(times.get(version))
         return out
@@ -330,7 +326,7 @@ def _release_times(registry: str, doc: dict) -> dict[str, datetime | None]:
         if not live:
             continue
         stamps = [_parse_time(f.get("upload_time_iso_8601") or f.get("upload_time")) for f in live]
-        out[str(version)] = None if None in stamps else max(stamps)
+        out[str(version)] = None if None in stamps else max(cast("list[datetime]", stamps))
     return out
 
 
@@ -370,7 +366,7 @@ async def resolve_release(
         return Release(latest=str(latest))
     settled_ok = [
         v for v in usable
-        if Version(v) <= ceiling and times[v] is not None and times[v] <= now - RELEASE_MIN_AGE
+        if Version(v) <= ceiling and times[v] is not None and cast("datetime", times[v]) <= now - RELEASE_MIN_AGE
     ]
     at = times.get(str(latest))
     return Release(
@@ -407,7 +403,7 @@ def _is_pkg_newer(target: str | None, current: str) -> bool:
     try:
         from packaging.version import Version
         return Version(target) > Version(current)
-    except Exception:
+    except (ImportError, ValueError, TypeError):
         return target != current
 
 
@@ -420,7 +416,7 @@ def _is_downgrade(target: str | None, current: str) -> bool:
     try:
         from packaging.version import Version
         return Version(target) < Version(current)
-    except Exception:
+    except (ImportError, ValueError, TypeError):
         return False
 
 
@@ -469,10 +465,7 @@ async def detect_available_updates() -> dict:
     both bound + manifest signals degrade off (the npm/pypi package probe still
     runs), so a transient outage never breaks the caller.
     """
-    from services.community import community_catalog, community_installer
-    from services.mcp import mcp_installer, mcp_venv_bootstrap
-
-    from services.community import mcp_source_swap
+    from services.community import community_catalog, mcp_source_swap
 
     manifests = mcp_registry.get_all_manifests()
     results: dict[str, dict] = {}
@@ -481,7 +474,7 @@ async def detect_available_updates() -> dict:
     try:
         registry_doc = await community_catalog.fetch_registry()
         catalog = {e.get("name"): e for e in registry_doc.get("mcps", []) if isinstance(e, dict)}
-    except Exception as e:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError) as e:
         logger.warning("Catalog registry fetch failed for update check: %s", e)
         catalog = {}
         registry_ok = False
@@ -497,6 +490,32 @@ async def detect_available_updates() -> dict:
             source_changes, unchanged = await mcp_source_swap.detect_changes(manifests, catalog)
         except Exception:
             logger.exception("Source-change detection failed; ordinary axes only")
+
+    checks = await _package_axis(manifests, catalog, source_changes, results)
+    docker_checked = await _pinned_axis(manifests, catalog, source_changes, results)
+    skills_checked = await _skills_axis(manifests, results)
+
+    checked = len(checks) + docker_checked + skills_checked + len(source_changes)
+    state = await _persist_check(results, source_changes, unchanged, registry_ok)
+    if state is None:
+        # The store is unavailable: answer with what this check found.
+        versions = {name: m.version for name, m in manifests.items()}
+        rows = [{"mcp_name": n, "status": "pending", **c} for n, c in source_changes.items()]
+        return {
+            "updates": mcp_source_swap.merge_update_state(results, rows, versions),
+            "checked": checked, "checked_at": "",
+        }
+    state["checked"] = checked
+    return state
+
+
+async def _package_axis(manifests: dict, catalog: dict, source_changes: dict,
+                        results: dict) -> list:
+    """The npm and pypi community MCPs: a newer version within the catalog's
+    bound, a changed catalog manifest, a venv outside the sandbox. Fills
+    ``results``; answers the MCPs it checked."""
+    from services.community import community_catalog
+    from services.mcp import mcp_installer, mcp_venv_bootstrap
 
     # npm/pypi candidates — COMMUNITY only. Update execution converges to the
     # community-catalog folder (install_from_catalog), which custom/local MCPs
@@ -521,7 +540,7 @@ async def detect_available_updates() -> dict:
             try:
                 data = json.loads((Path(cm.mcp_dir) / "manifest.json").read_text())
                 out[cname] = community_catalog.normalized_manifest_hash(data)
-            except Exception:
+            except (OSError, ValueError):
                 out[cname] = None
         return out
     installed_hashes = await asyncio.to_thread(_installed_hashes)
@@ -574,9 +593,19 @@ async def detect_available_updates() -> dict:
     for result in await asyncio.gather(
         *[_check_one(*c) for c in checks], return_exceptions=True,
     ):
-        if result and not isinstance(result, Exception):
+        if result and not isinstance(result, BaseException):
             mcp_name, info = result
             results[mcp_name] = info
+    return checks
+
+
+async def _pinned_axis(manifests: dict, catalog: dict, source_changes: dict,
+                       results: dict) -> int:
+    """The catalog-pinned community MCPs (a container's tag, a git+ ref)
+    against the catalog's version and manifest. Fills ``results``; answers
+    how many it checked."""
+    from services.community import community_catalog, community_installer
+    from services.mcp import mcp_installer, mcp_venv_bootstrap
 
     # Catalog-pinned MCPs — a container (its image tag) and a git+ source (its
     # ref): the installed version against the catalog version, then the
@@ -599,7 +628,7 @@ async def detect_available_updates() -> dict:
             try:
                 data = json.loads((Path(dm.mcp_dir) / "manifest.json").read_text())
                 out[dname] = community_catalog.normalized_manifest_hash(data)
-            except Exception:
+            except (OSError, ValueError):
                 out[dname] = None
         return out
     docker_hashes = await asyncio.to_thread(_docker_hashes) if docker_targets else {}
@@ -653,6 +682,13 @@ async def detect_available_updates() -> dict:
             results[name]["pinned_commit"] = community_installer.git_ref_is_commit(catalog_source)
             parsed_ref = mcp_installer.parse_source(catalog_source) if isinstance(catalog_source, str) else None
             results[name]["catalog_ref"] = parsed_ref.version if parsed_ref is not None else ""
+    return docker_checked
+
+
+async def _skills_axis(manifests: dict, results: dict) -> int:
+    """The standalone skill packages against the skills catalog. Fills
+    ``results``; answers how many it checked."""
+    from services.community import community_catalog
 
     # Standalone skill packages (category "skill", runtime none) — the skills
     # catalog's version moves an install forward only (``_catalog_relation``,
@@ -666,7 +702,7 @@ async def detect_available_updates() -> dict:
             e.get("name"): e for e in skills_doc.get("skills", [])
             if isinstance(e, dict)
         }
-    except Exception as e:
+    except (AttributeError, TypeError) as e:
         logger.warning("Skills registry fetch failed for update check: %s", e)
         skills_catalog = {}
     if skills_catalog:
@@ -678,7 +714,7 @@ async def detect_available_updates() -> dict:
                 try:
                     data = json.loads((Path(sm.mcp_dir) / "manifest.json").read_text())
                     out[sname] = community_catalog.normalized_manifest_hash(data)
-                except Exception:
+                except (OSError, ValueError):
                     out[sname] = None
             return out
         skill_hashes = await asyncio.to_thread(_skill_hashes)
@@ -715,19 +751,7 @@ async def detect_available_updates() -> dict:
                 "latest": latest if pkg_newer else m.version,
                 "registry": "skills-catalog", "package": name, "reason": reason,
             }
-
-    checked = len(checks) + docker_checked + skills_checked + len(source_changes)
-    state = await _persist_check(results, source_changes, unchanged, registry_ok)
-    if state is None:
-        # The store is unavailable: answer with what this check found.
-        versions = {name: m.version for name, m in manifests.items()}
-        rows = [{"mcp_name": n, "status": "pending", **c} for n, c in source_changes.items()]
-        return {
-            "updates": mcp_source_swap.merge_update_state(results, rows, versions),
-            "checked": checked, "checked_at": "",
-        }
-    state["checked"] = checked
-    return state
+    return skills_checked
 
 
 async def _persist_check(results: dict, source_changes: dict, unchanged: set,
@@ -785,9 +809,9 @@ async def _update_docker_mcp(name: str) -> dict:
         files is the whole update (the orchestrator skips docker MCPs on T3
         anyway; this stays correct if a manual update is invoked).
     """
+    from core.config import deployment
     from services.community import community_installer
     from services.mcp import docker_manager
-    from core.config import deployment
 
     # Capture the current image tag BEFORE the catalog replaces the manifest so
     # we can reclaim it afterwards if the update moves to a new tag.
@@ -829,7 +853,7 @@ async def _catalog_entry(name: str) -> dict | None:
     from services.community import community_catalog
     try:
         doc = await community_catalog.fetch_registry()
-    except Exception:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError):
         return None
     return next(
         (e for e in doc.get("mcps", []) if isinstance(e, dict) and e.get("name") == name),
@@ -889,7 +913,7 @@ async def _update_node_python_mcp(name: str, manifest, *, settled_only: bool = F
             mf = Path(manifest.mcp_dir) / "manifest.json"
             data = await asyncio.to_thread(lambda: json.loads(mf.read_text()))
             edited = community_catalog.normalized_manifest_hash(data) != catalog_hash
-        except Exception:
+        except (OSError, ValueError):
             edited = False
     if entry is not None and community_catalog.source_detail_differs(
             manifest.server.source, entry.get("source")):
@@ -911,7 +935,7 @@ async def _update_node_python_mcp(name: str, manifest, *, settled_only: bool = F
         return {"status": "waiting", "name": name, "version": cur}
 
     # Package axis only moves forward; a manifest-only converge keeps the version.
-    install_version = target if pkg_newer else cur
+    install_version = cast("str", target) if pkg_newer else cur  # pkg_newer needs a target
     result = await community_installer.install_from_catalog(name, install_version=install_version)
     if rel is not None and _is_pkg_newer(rel.latest, install_version):
         # The newer release still waits: the page keeps showing it.
@@ -982,7 +1006,7 @@ def _keep_check_result(name: str, info: dict) -> None:
     from storage.mcp import mcp_update_state_store as state_store
     try:
         state_store.put_check_result(name, info)
-    except Exception:
+    except psycopg.Error:
         logger.warning("The persisted check result of %s could not be rewritten", name)
 
 
@@ -992,7 +1016,7 @@ def _forget_check_result(name: str) -> None:
     from storage.mcp import mcp_update_state_store as state_store
     try:
         state_store.delete_check_result(name)
-    except Exception:
+    except psycopg.Error:
         logger.warning("The persisted check result of %s could not be dropped", name)
 
 

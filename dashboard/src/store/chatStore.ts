@@ -108,10 +108,14 @@ interface ChatStoreState {
   /** A `queued` chip: by its queue id when both carry one (a re-announce
    *  replaces it in place), else at the index the proxy names. */
   addQueuedMessage: (chatId: string, index: number, item: QueuedMessage) => void
-  /** A chip leaves: by queue id when given, else by index. */
+  /** A chip leaves: by queue id when given (from every slice that holds
+   *  it), else by index in the named slice. */
   removeQueuedMessage: (chatId: string, key: { queueId?: string; index?: number }) => void
-  /** The chips of `queueIds` leave (every chip when the list is absent). */
+  /** The chips of `queueIds` leave, from every slice that holds them (every
+   *  chip of the named slice when the list is absent). */
   clearQueuedMessages: (chatId: string, queueIds?: string[]) => void
+  /** The slice that holds the chip of `queueId`, or null. */
+  findQueuedChat: (queueId: string) => string | null
   // Pending image mutators.
   setPendingImages: (chatId: string, images: PendingImage[]) => void
   addPendingImages: (chatId: string, images: PendingImage[]) => void
@@ -175,7 +179,20 @@ function debouncedLocalStorage(): StateStorage {
   }
 }
 
-export const useChatStore = create<ChatStoreState>()(persist((set) => ({
+/** The slices without the chips of `queueIds`, wherever they sit; the same
+ *  object when no slice held one. */
+function withoutQueueIds(byChat: Record<string, ChatSlice>, queueIds: string[]): Record<string, ChatSlice> {
+  let out = byChat
+  for (const [cid, slice] of Object.entries(byChat)) {
+    const next = slice.queuedMessages.filter((m) => !m.queueId || !queueIds.includes(m.queueId))
+    if (next.length === slice.queuedMessages.length) continue
+    if (out === byChat) out = { ...byChat }
+    out[cid] = { ...slice, queuedMessages: next }
+  }
+  return out
+}
+
+export const useChatStore = create<ChatStoreState>()(persist((set, get) => ({
   byChat: {},
 
   beginWarmup: (chatId, data) =>
@@ -341,11 +358,16 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
 
   removeQueuedMessage: (chatId, key) =>
     set((s) => {
+      // By id: from every slice that holds the chip (a task chat viewed
+      // through a sibling run files it under the viewed chat while the
+      // frame names the queue's). By index: the named slice alone.
+      if (key.queueId) {
+        const byChat = withoutQueueIds(s.byChat, [key.queueId])
+        return byChat === s.byChat ? s : { byChat }
+      }
       const prev = s.byChat[chatId]
       if (!prev) return s
-      const next = key.queueId
-        ? prev.queuedMessages.filter((m) => m.queueId !== key.queueId)
-        : prev.queuedMessages.filter((_, i) => i !== key.index)
+      const next = prev.queuedMessages.filter((_, i) => i !== key.index)
       if (next.length === prev.queuedMessages.length) return s
       return {
         byChat: { ...s.byChat, [chatId]: { ...prev, queuedMessages: next } },
@@ -354,16 +376,23 @@ export const useChatStore = create<ChatStoreState>()(persist((set) => ({
 
   clearQueuedMessages: (chatId, queueIds) =>
     set((s) => {
+      if (queueIds && queueIds.length) {
+        const byChat = withoutQueueIds(s.byChat, queueIds)
+        return byChat === s.byChat ? s : { byChat }
+      }
       const prev = s.byChat[chatId]
       if (!prev || prev.queuedMessages.length === 0) return s
-      const next = queueIds && queueIds.length
-        ? prev.queuedMessages.filter((m) => !m.queueId || !queueIds.includes(m.queueId))
-        : []
-      if (next.length === prev.queuedMessages.length) return s
       return {
-        byChat: { ...s.byChat, [chatId]: { ...prev, queuedMessages: next } },
+        byChat: { ...s.byChat, [chatId]: { ...prev, queuedMessages: [] } },
       }
     }),
+
+  findQueuedChat: (queueId) => {
+    for (const [cid, slice] of Object.entries(get().byChat)) {
+      if (slice.queuedMessages.some((m) => m.queueId === queueId)) return cid
+    }
+    return null
+  },
 
   setPendingImages: (chatId, images) =>
     set((s) => {

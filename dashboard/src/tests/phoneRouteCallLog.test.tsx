@@ -74,7 +74,7 @@ describe('CallLogModal', () => {
       entry({ id: 4, outcome: 'pin_failed', pin_attempts: 1, from_number: '+15550004444' }),
     ])
     renderModal()
-    expect(await screen.findByText('Caller (PIN)')).toBeInTheDocument()
+    expect(await screen.findByText('Caller with PIN')).toBeInTheDocument()
     expect(screen.getByText('memory-mcp/memory, Read')).toBeInTheDocument()
     expect(screen.getByText('User alice')).toBeInTheDocument()
     expect(screen.getByText('Anonymous')).toBeInTheDocument()

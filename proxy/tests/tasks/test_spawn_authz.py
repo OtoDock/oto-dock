@@ -10,15 +10,15 @@ Run: cd proxy && python -m pytest tests/tasks/test_spawn_authz.py -v
 
 import uuid
 
+import psycopg
 import pytest
 from fastapi import HTTPException
 
 from auth.providers import UserContext
 from services.delegation.spawn_authz import authorize_spawn
+from storage import database as task_store
 from storage.agents import agent_store
 from storage.mcp import mcp_store
-from storage import database as task_store
-
 
 # ───────────────────────────────────────────────────────────────────────────
 # Caller factories
@@ -333,6 +333,7 @@ class TestValidateSpawnOverrides:
 
     def test_disabled_model_rejected(self, monkeypatch):
         from fastapi import HTTPException
+
         from services.delegation.spawn_authz import validate_spawn_overrides
         self._agent(monkeypatch)
         self._models(monkeypatch, [{"model_id": "m1", "enabled": False}])
@@ -341,6 +342,7 @@ class TestValidateSpawnOverrides:
 
     def test_unknown_model_rejected(self, monkeypatch):
         from fastapi import HTTPException
+
         from services.delegation.spawn_authz import validate_spawn_overrides
         self._agent(monkeypatch)
         self._models(monkeypatch, [{"model_id": "m1", "enabled": True}])
@@ -352,7 +354,7 @@ class TestValidateSpawnOverrides:
         from storage.billing import subscription_store
 
         def _boom(layer=None):
-            raise RuntimeError("db down")
+            raise psycopg.OperationalError("db down")
 
         self._agent(monkeypatch)
         monkeypatch.setattr(subscription_store, "list_models", _boom)
@@ -360,6 +362,7 @@ class TestValidateSpawnOverrides:
 
     def test_disallowed_layer_rejected(self, monkeypatch):
         from fastapi import HTTPException
+
         from services.delegation.spawn_authz import validate_spawn_overrides
         self._agent(monkeypatch, path="claude-code-cli")
         with pytest.raises(HTTPException):
@@ -378,7 +381,7 @@ class TestDelegationChainGuard:
         """Create chats c0←c1←…, agent[i] on chat i; returns the LAST chat id."""
         prev = ""
         cid = ""
-        for i, agent in enumerate(agents):
+        for _i, agent in enumerate(agents):
             cid = f"chain-{uuid.uuid4().hex[:8]}"
             task_store.create_chat(cid, "user-1", agent, parent_chat_id=prev)
             prev = cid

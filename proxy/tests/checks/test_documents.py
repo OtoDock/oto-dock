@@ -238,7 +238,7 @@ def test_a_judge_engine_the_agent_does_not_enable_is_refused(tree):
 def test_a_judge_model_the_agent_does_not_offer_is_refused(tree, monkeypatch):
     from storage.billing import subscription_store
     monkeypatch.setattr(subscription_store, "list_models",
-                        lambda path: [{"model_id": "m-enabled", "enabled": True},
+                        lambda layer=None: [{"model_id": "m-enabled", "enabled": True},
                                       {"model_id": "m-off", "enabled": False}])
     assert d.judge_envelope_problem(AGENT, {"model": "m-enabled"}) is None
     assert "not available" in d.judge_envelope_problem(AGENT, {"model": "m-off"})

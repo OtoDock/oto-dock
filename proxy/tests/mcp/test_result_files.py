@@ -146,6 +146,29 @@ def test_the_cli_image_pointer_is_no_caption():
     assert rf.text_of(blocks) == "Route: 12 km https://maps.example/r"
 
 
+@pytest.mark.parametrize("text, caption", [
+    # @cablate/mcp-google-map's maps_static_map: the byte count goes, the size stays.
+    ("Map generated (67917 bytes, 640x480)", "Map generated (640x480)"),
+    ("Map generated (67,917 bytes, 640 × 480)", "Map generated (640 × 480)"),
+    ("Map generated (67917 bytes)", "Map generated"),
+    ("Map generated\n(67917 bytes,\n640x480)  ", "Map generated (640x480)"),
+    ("(67917 bytes)", ""),
+    # Any other parenthesis is the tool's own text.
+    ("Report (2 bytes of data) ready", "Report (2 bytes of data) ready"),
+    ("Tile (640x480)", "Tile (640x480)"),
+    ("A (12 bytes, 640x480) then more", "A (12 bytes, 640x480) then more"),
+    ("Took (12 Bytes)", "Took (12 Bytes)"),
+    ("Saved (1 byte)", "Saved (1 byte)"),
+])
+def test_a_trailing_byte_count_leaves_the_caption(text, caption):
+    assert rf._caption(text) == caption
+
+
+def test_a_long_digit_run_costs_the_caption_nothing():
+    text = "x (" + "1" * 200_000 + " bytes"
+    assert rf._caption(text).startswith("x (111")
+
+
 # --- keep ---------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -374,7 +397,9 @@ async def test_an_unknown_session_changes_nothing(manifests):
 
 def _post_hook(body):
     from unittest.mock import AsyncMock, patch
+
     from fastapi.testclient import TestClient
+
     from app import app
     with patch("api.hooks.lifecycle.verify_session_match_async", new_callable=AsyncMock):
         return TestClient(app).post("/v1/hooks/tool-result", json=body,

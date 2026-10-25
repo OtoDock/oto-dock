@@ -3,9 +3,10 @@
 Covers the three pieces that make the tier system a security contract:
   * ``_parse_permissions_block`` — strict manifest validation (bad blocks
     reject the manifest at install/scan time, like the ``costs`` block).
-  * ``mcp_permissions.resolve_tool_tier`` — first-match rules, glob support,
-    fallbacks, and the community exact-name rail for ``open`` (keyed off the
-    scan DIRECTORY, never the spoofable ``category`` field).
+  * ``mcp_permissions.resolve_tool_tier`` — first-match rules, the tools' own
+    hints, glob support, fallbacks, and the community exact-name rail for
+    ``open`` (keyed off the scan DIRECTORY, never the spoofable ``category``
+    field).
   * ``mcp_permissions.tier_decision`` — the full tier × mode outcome table.
 
 DB-free by design: manifests are monkeypatched into the registry cache.
@@ -16,14 +17,13 @@ import pytest
 
 import config
 from services.mcp import mcp_permissions, mcp_registry as reg
+from services.mcp.mcp_manifest_types import PermissionRule, PermissionsBlock
 from services.mcp.mcp_registry import (
     CredentialConfig,
     McpManifest,
     ServerConfig,
     _parse_permissions_block,
 )
-from services.mcp.mcp_manifest_types import PermissionRule, PermissionsBlock
-
 
 # ---------------------------------------------------------------------------
 # _parse_permissions_block — strict validation
@@ -107,6 +107,9 @@ def _mk(name, *, permissions=None, server_name="", category="custom",
 def manifests(monkeypatch):
     cache: dict[str, McpManifest] = {}
     monkeypatch.setattr(reg, "_manifests", cache)
+    # No hints a server sent elsewhere in the run.
+    monkeypatch.setattr(mcp_permissions, "_hints", {})
+    monkeypatch.setattr(mcp_permissions, "_hints_loaded", True)
     return cache
 
 
@@ -199,6 +202,173 @@ class TestResolveToolTier:
 
 
 # ---------------------------------------------------------------------------
+# The tools' own hints: the rule after a manifest rule, before default_tier
+# ---------------------------------------------------------------------------
+
+_RO = {"readOnlyHint": True, "openWorldHint": True}
+_LOCAL_WRITE = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}
+_DESTRUCTIVE = {"readOnlyHint": False, "destructiveHint": True}
+
+
+class TestToolHints:
+    @pytest.mark.parametrize("hints,tier", [
+        (None, None),
+        ({}, None),
+        ({"title": "x"}, None),
+        ({"readOnlyHint": True}, "open"),
+        (_RO, "open"),                                            # a web search is open
+        (_LOCAL_WRITE, "standard"),
+        ({"destructiveHint": False}, "sensitive"),                # open world by default
+        ({"destructiveHint": False, "openWorldHint": True}, "sensitive"),  # sends outward
+        ({"idempotentHint": True}, "sensitive"),                  # destructive by default
+        (_DESTRUCTIVE, "sensitive"),
+        ({"readOnlyHint": True, "destructiveHint": True}, "open"),  # Codex's order: read-only first
+    ])
+    def test_the_hint_rule(self, hints, tier):
+        assert mcp_permissions.hint_tier(hints) == tier
+        # Codex's own MCP rule asks exactly where the tier is sensitive or unlabelled.
+        assert mcp_permissions.codex_asks(hints) is (tier in (None, "sensitive"))
+
+    def test_a_rule_beats_a_hint_and_a_hint_beats_default_tier(self, manifests):
+        manifests["srv"] = _mk("srv", permissions=PermissionsBlock(
+            default_tier="standard",
+            rules=[PermissionRule(tool="pinned", tier="open")],
+        ))
+        mcp_permissions._hints["srv"] = {"pinned": _DESTRUCTIVE, "reader": _RO,
+                                         "writer": _LOCAL_WRITE, "sender": _DESTRUCTIVE}
+        assert mcp_permissions.resolve_tool_tier("srv", "pinned") == "open"
+        assert mcp_permissions.resolve_tool_tier("srv", "reader") == "open"
+        assert mcp_permissions.resolve_tool_tier("srv", "writer") == "standard"
+        assert mcp_permissions.resolve_tool_tier("srv", "sender") == "sensitive"
+        # A tool that sent no hints (or whose list was never read) keeps the default.
+        assert mcp_permissions.resolve_tool_tier("srv", "unlisted") == "standard"
+
+    def test_a_catalog_hint_is_honoured_like_a_first_party_one(self, manifests):
+        manifests["cat"] = _mk("cat", bundled=False, category="community",
+                               permissions=PermissionsBlock(default_tier="sensitive", rules=[]))
+        mcp_permissions._hints["cat"] = {"search": _RO}
+        assert mcp_permissions.resolve_tool_tier("cat", "search") == "open"
+        # No manifest block at all: the hints, else sensitive.
+        mcp_permissions._hints["bare"] = {"read": _RO}
+        assert mcp_permissions.resolve_tool_tier("bare", "read") == "open"
+        assert mcp_permissions.resolve_tool_tier("bare", "other") == "sensitive"
+
+    def test_hints_are_kept_across_a_restart(self, manifests, monkeypatch, tmp_path, caplog):
+        monkeypatch.setattr(config, "PLATFORM_DATA_DIR", str(tmp_path))
+        mcp_permissions.record_tool_hints("srv", [("read", {**_RO, "title": "Read"}),
+                                                  ("write", _DESTRUCTIVE), ("plain", None)])
+        on_disk = (tmp_path / "mcp-tool-hints.json").read_text()
+        assert '"title"' not in on_disk
+        monkeypatch.setattr(mcp_permissions, "_hints", {})
+        monkeypatch.setattr(mcp_permissions, "_hints_loaded", False)
+        assert mcp_permissions.tool_hints("srv", "read") == _RO
+        assert mcp_permissions.tool_hints("srv", "plain") == {}
+        assert mcp_permissions.known_tools("srv") == ["plain", "read", "write"]
+        # A server that loosens its own word is logged.
+        with caplog.at_level("INFO", logger="services.mcp.mcp_permissions"):
+            mcp_permissions.record_tool_hints("srv", [("write", _RO)])
+        assert "srv/write now labels itself open (was sensitive)" in caplog.text
+        assert mcp_permissions.known_tools("srv") == ["write"]
+
+    def test_an_unreadable_hints_file_is_an_empty_cache(self, manifests, monkeypatch, tmp_path, caplog):
+        monkeypatch.setattr(config, "PLATFORM_DATA_DIR", str(tmp_path))
+        (tmp_path / "mcp-tool-hints.json").write_text("{not json")
+        monkeypatch.setattr(mcp_permissions, "_hints_loaded", False)
+        with caplog.at_level("WARNING", logger="services.mcp.mcp_permissions"):
+            assert mcp_permissions.tool_hints("srv", "read") is None
+        assert "unreadable" in caplog.text
+
+    def test_codex_prompts_a_globbed_sensitive_server_until_its_list_is_read(self, manifests):
+        manifests["glob"] = _mk("glob", permissions=PermissionsBlock(
+            default_tier="standard", rules=[PermissionRule(tool="send_*", tier="sensitive")]))
+        manifests["exact"] = _mk("exact", permissions=PermissionsBlock(
+            default_tier="sensitive", rules=[PermissionRule(tool="send_mail", tier="sensitive")]))
+        assert mcp_permissions.codex_server_default("glob") == "prompt"
+        assert mcp_permissions.codex_server_default("exact") is None   # named: its own table
+        assert mcp_permissions.codex_server_default("ghost") is None
+        # Once a session lists the tools, each gets its own table instead.
+        mcp_permissions._hints["glob"] = {"send_note": _RO}
+        assert mcp_permissions.codex_server_default("glob") is None
+        assert mcp_permissions.codex_tool_approvals("glob") == {"send_note": "prompt"}
+
+    def test_codex_gets_a_table_where_its_rule_and_the_tier_disagree(self, manifests):
+        manifests["srv"] = _mk("srv", permissions=PermissionsBlock(
+            default_tier="standard",
+            rules=[PermissionRule(tool="share", tier="critical"),
+                   PermissionRule(tool="peek", tier="sensitive"),
+                   PermissionRule(tool="note", tier="open")],
+        ))
+        mcp_permissions._hints["srv"] = {"peek": _RO, "local": _LOCAL_WRITE, "send": _DESTRUCTIVE}
+        assert mcp_permissions.codex_tool_approvals("srv") == {
+            "share": "approve",   # critical: the person's card is its one judge
+            "note": "approve",    # open by rule, unlabelled: Codex would ask
+            "peek": "prompt",     # sensitive by rule, labelled read-only: Codex would not
+        }
+
+
+# ---------------------------------------------------------------------------
+# critical is the platform's own tier: bounded at parse, by scan directory
+# ---------------------------------------------------------------------------
+
+
+class TestCriticalIsThePlatformsOwn:
+    PERMS = {"default_tier": "critical", "rules": [
+        {"tool": "read", "tier": "open"}, {"tool": "ban_user", "tier": "critical"}]}
+
+    def _parse(self, monkeypatch, root, kind, name, category="community"):
+        import json
+
+        from services.mcp import mcp_manifest_parse as mmp
+        monkeypatch.setattr(config, "MCPS_DIR", root)
+        folder = root / kind / name
+        folder.mkdir(parents=True)
+        (folder / "manifest.json").write_text(json.dumps({
+            "name": name, "label": name, "description": "d", "version": "",
+            "category": category, "permissions": self.PERMS,
+            "server": {"runtime": "node", "transport": "stdio", "command": "node",
+                       "source": f"npm:{name}"}}))
+        return mmp._parse_manifest(folder / "manifest.json")
+
+    def test_a_catalog_manifest_runs_critical_as_sensitive(self, monkeypatch, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            m = self._parse(monkeypatch, tmp_path, "community", "chat")
+        assert m is not None and m.permissions.default_tier == "sensitive"
+        assert m.permissions.rules == [PermissionRule(tool="read", tier="open"),
+                                       PermissionRule(tool="ban_user", tier="sensitive")]
+        assert "chat: critical is the platform's own tier; default_tier, ban_user run as sensitive" \
+            in caplog.text
+        # A self-declared category does not make a catalog folder the platform's.
+        spoof = self._parse(monkeypatch, tmp_path, "community", "spoof", category="custom")
+        assert spoof.permissions.default_tier == "sensitive"
+
+    def test_the_platforms_own_manifest_keeps_it(self, monkeypatch, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            m = self._parse(monkeypatch, tmp_path, "custom", "checks", category="custom")
+        assert m.permissions.default_tier == "critical"
+        assert m.permissions.rules[1] == PermissionRule(tool="ban_user", tier="critical")
+        assert "platform's own tier" not in caplog.text
+
+    @pytest.mark.parametrize(("kind", "category"), [
+        ("custom", "custom"), ("community", "community"), ("community", "custom")])
+    def test_the_parser_and_the_open_rail_share_one_directory_test(
+            self, monkeypatch, tmp_path, kind, category):
+        m = self._parse(monkeypatch, tmp_path, kind, "both", category=category)
+        bundled = kind == "custom"
+        assert mcp_permissions._is_bundled(m) is bundled
+        assert (m.permissions.default_tier == "critical") is bundled
+
+    def test_the_bundled_manifests_that_use_it_are_all_under_custom(self):
+        import json
+        users = sorted(
+            p.parent.name for p in (config.MCPS_DIR / "custom").glob("*/manifest.json")
+            if '"critical"' in p.read_text())
+        assert users == ["agent-config-mcp", "checks-mcp"]
+        for name in users:
+            perms = json.loads((config.MCPS_DIR / "custom" / name / "manifest.json").read_text())
+            assert "critical" in {r["tier"] for r in perms["permissions"]["rules"]}
+
+
+# ---------------------------------------------------------------------------
 # tier_decision — the full tier × mode outcome table
 # ---------------------------------------------------------------------------
 
@@ -206,35 +376,38 @@ class TestResolveToolTier:
 class TestTierDecision:
     @pytest.mark.parametrize("tier,mode,expected", [
         # open: never prompts, any mode — including plan
-        ("open", "default", "allow"),
-        ("open", "acceptEdits", "allow"),
+        ("open", "ask", "allow"),
+        ("open", "autoReview", "allow"),
         ("open", "plan", "allow"),
         ("open", "dontAsk", "allow"),
         ("open", "auto", "allow"),
-        # standard: prompts only in default
-        ("standard", "default", "prompt"),
-        ("standard", "acceptEdits", "allow"),
+        # standard: prompts only in Ask (a local, reversible write runs in Auto)
+        ("standard", "ask", "prompt"),
+        ("standard", "autoReview", "allow"),
         ("standard", "plan", "deny"),
         ("standard", "dontAsk", "allow"),
         ("standard", "auto", "allow"),
-        # sensitive: prompts in both prompting modes (the pre-tier status quo)
-        ("sensitive", "default", "prompt"),
-        ("sensitive", "acceptEdits", "prompt"),
+        # sensitive: the card in Ask, the engine's reviewer (else the card) in Auto
+        ("sensitive", "ask", "prompt"),
+        ("sensitive", "autoReview", "prompt"),
         ("sensitive", "plan", "deny"),
         ("sensitive", "dontAsk", "allow"),
         ("sensitive", "auto", "allow"),
         # critical: always prompts; denied where nobody can answer
-        ("critical", "default", "prompt"),
-        ("critical", "acceptEdits", "prompt"),
+        ("critical", "ask", "prompt"),
+        ("critical", "autoReview", "prompt"),
         ("critical", "plan", "deny"),
         ("critical", "dontAsk", "prompt"),
         ("critical", "auto", "deny"),
+        # a word from before 1.9 reads as its current one
+        ("standard", "default", "prompt"),
+        ("standard", "acceptEdits", "allow"),
     ])
     def test_grid(self, tier, mode, expected):
         assert mcp_permissions.tier_decision(tier, mode) == expected
 
     def test_unknown_tier_treated_as_sensitive(self):
-        assert mcp_permissions.tier_decision("bogus", "acceptEdits") == "prompt"
+        assert mcp_permissions.tier_decision("bogus", "autoReview") == "prompt"
         assert mcp_permissions.tier_decision("bogus", "dontAsk") == "allow"
 
 

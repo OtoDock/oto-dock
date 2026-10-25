@@ -282,8 +282,9 @@ async def test_a_returned_copy_carries_the_text_the_others_do_not(temp_db, pushe
     cid = _chat(temp_db, sub="agent::agent-a")
     q = await input_queue.loaded(cid)
     q.owner_sub, q.agent = "agent::agent-a", "agent-a"
-    from services.notifications import notification_manager
     import unittest.mock as um
+
+    from services.notifications import notification_manager
     with um.patch.object(notification_manager, "agent_audience",
                          return_value=["user-admin", "user-b"]):
         await q.add("q1", "user-b", TurnInput("b's"))

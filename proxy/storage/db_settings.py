@@ -64,7 +64,7 @@ def seed_platform_timezone_if_unset() -> None:
         if tz:
             set_platform_setting("platform_timezone", tz)
             log.info("Seeded platform_timezone from server local time: %s", tz)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # a fresh install's timezone seed at boot: UTC stays if it fails
         log.warning("Could not seed platform_timezone (UTC fallback stays): %s", e)
 
 

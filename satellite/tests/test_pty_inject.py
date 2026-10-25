@@ -268,3 +268,21 @@ async def test_manager_nacks_unknown_session(tmp_path):
     res = _results(ws)
     assert res[0]["ok"] is False and res[0]["reason"] == "session_gone"
     assert res[0]["session_id"] == "no-such"
+
+
+def test_the_payload_env_reaches_the_terminal_as_sent(tmp_path, monkeypatch):
+    """A terminal's env is the curated ambient one with the platform's
+    payload env on top: the session token and the shell's command-line
+    token reach the CLI as the platform minted them, and an ambient value of
+    the same name never wins."""
+    monkeypatch.setenv("OTO_CLI_TOKEN", "ambient")
+    agent_dir = tmp_path / "agents" / "test-agent"
+    agent_dir.mkdir(parents=True)
+    sess = BasePtySession(
+        "sess-env", agent_dir, sat_config=SimpleNamespace(), ws=_CapturingWS(),
+        config={"env": {"PROXY_API_KEY": "session-token", "OTO_CLI_TOKEN": "cli-token"}},
+    )
+    env = sess._base_env()
+    assert env["PROXY_API_KEY"] == "session-token"
+    assert env["OTO_CLI_TOKEN"] == "cli-token"
+    assert env["OTO_SESSION_ID"] == "sess-env"

@@ -17,16 +17,17 @@ from pydantic import BaseModel
 
 import config
 from api.hooks.pins import (
-    _find_app_row, _require_shared_pin_authority, _resolve_pin_visibility,
+    _find_app_row,
+    _require_shared_pin_authority,
+    _resolve_pin_visibility,
 )
 from api.sessions.sessions import verify_session_match_async
+from core import layout
 from core.session.session_state import get_session_security
 from core.session.visibility import SCOPE_AGENT
 from services.apps import app_deploy, app_sandbox, app_supervisor, releases
 from services.infra import path_confinement, safe_fs
-from storage import database as task_store
-from storage import db_apps
-from core import layout
+from storage import database as task_store, db_apps
 
 logger = logging.getLogger("otodock")
 router = APIRouter()
@@ -59,9 +60,9 @@ async def _ctx(authorization: str | None, session_id: str):
 
 
 def _slug(raw: str) -> str:
-    from api.apps import manifest as _mf
+    from services.apps.slugs import APP_SLUG_RE
     slug = (raw or "").strip().lower()
-    if not _mf.APP_SLUG_RE.match(slug):
+    if not APP_SLUG_RE.fullmatch(slug):
         raise HTTPException(status_code=400,
                             detail="slug must be 1-40 chars of [a-z0-9-], starting alphanumeric")
     return slug
@@ -72,8 +73,8 @@ def _under_agent(ctx, rel: str) -> Path:
     path, joined in the shape the scanner recognizes as confined."""
     try:
         return path_confinement.join_under(config.get_agent_dir(ctx.agent), rel)
-    except path_confinement.PathOutsideRoot:
-        raise HTTPException(status_code=400, detail="the path leaves the agent's tree")
+    except path_confinement.PathOutsideRoot as exc:
+        raise HTTPException(status_code=400, detail="the path leaves the agent's tree") from exc
 
 
 def _scoped(ctx, username: str, rel: str) -> Path:
@@ -83,7 +84,7 @@ def _scoped(ctx, username: str, rel: str) -> Path:
     try:
         app_deploy.confine_to_scope(ctx.agent, username, path)
     except app_deploy.DeployError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return path
 
 
@@ -104,7 +105,7 @@ async def deploy_from_session(session_id: str, ctx, slug: str, visibility: str) 
         out = await app_deploy.deploy_folder(ctx.agent, username, owner_sub, slug, source, rel_dir,
                                              session_id=session_id)
     except app_deploy.DeployError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     out["scope"] = db_apps.app_scope(username)
     out["path"] = "/" + rel_dir
     logger.info("Hook app deploy: session=%s agent=%s slug=%s status=%s release=%s problems=%s",
@@ -147,7 +148,7 @@ async def hook_app_check(req: HookAppDeployRequest, authorization: str | None = 
         try:
             await app_deploy.pull_folder(req.session_id, rel_dir)
         except app_deploy.DeployError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
     # The tree first (no link anywhere in it), then the manifest and the
     # page, each read without following a link.
     try:
@@ -184,7 +185,7 @@ async def hook_app_check(req: HookAppDeployRequest, authorization: str | None = 
         except releases.ReleaseInvalid as e:
             # A file swapped for a link between the walk above and the copy:
             # the rule's refusal, never an error page.
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
         server = "up" if (report.status in ("ok", "soft") and app_sandbox.server_entry(source)) else (
             "none" if not app_sandbox.server_entry(source) else report.status)
         if report.status == "unavailable":
@@ -239,7 +240,7 @@ async def hook_app_screenshot(req: HookAppScreenshotRequest, authorization: str 
             try:
                 await app_deploy.pull_folder(req.session_id, rel_dir)
             except app_deploy.DeployError as e:
-                raise HTTPException(status_code=400, detail=str(e))
+                raise HTTPException(status_code=400, detail=str(e)) from e
         if not source.is_dir():
             raise HTTPException(status_code=400, detail=f"no folder at apps/{slug} in your scope")
         try:
@@ -247,7 +248,7 @@ async def hook_app_screenshot(req: HookAppScreenshotRequest, authorization: str 
         except releases.ReleaseInvalid as e:
             # The working tree holds a link: the rule's refusal, as the
             # check and the deploy answer it.
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
     return {"status": "ok", "app_id": row["id"], "slug": row["slug"],
             "source": req.source or "working", "render": report.as_dict()}
 
@@ -277,11 +278,11 @@ async def hook_app_preview(req: HookAppDeployRequest, authorization: str | None 
         try:
             await app_deploy.pull_folder(req.session_id, rel_dir)
         except app_deploy.DeployError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
     try:
         sha = await app_deploy.cut_preview(row, source)
     except app_deploy.DeployError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     server = "none"
     if (releases.preview_dir(row) / "server").is_dir():
         try:
@@ -289,7 +290,7 @@ async def hook_app_preview(req: HookAppDeployRequest, authorization: str | None 
             server = inst.state
         except app_supervisor.AppUnavailable as e:
             server = f"failed: {e.reason}"
-        except Exception:  # noqa: BLE001 — the log has the detail, the agent gets the state
+        except Exception:  # the log has the detail, the agent gets the state
             logger.exception("App preview %s: the server did not start", row.get("slug"))
             server = "failed"
     return {"status": "ok", "app_id": row["id"], "url": f"/apps/{row['id']}?preview=1",
@@ -426,9 +427,9 @@ async def hook_app_export(req: HookExportRequest, authorization: str | None = He
     try:
         data, blueprint = await asyncio.to_thread(app_blueprints.export_bundle, row)
     except (app_blueprints.BlueprintError, app_deploy.DeployError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     apps_rel = rel_dir.rsplit("/", 1)[0]
-    rel = os.path.normpath(f"{apps_rel}/{slug}.otoapp")
+    rel = os.path.normpath(f"{apps_rel}/{slug}.otoapp")  # noqa: ASYNC240  # normpath is lexical, it touches no file
     if not rel.startswith(apps_rel + "/"):
         raise HTTPException(status_code=400, detail="the path leaves the agent's tree")
     target = _scoped(ctx, username, rel)
@@ -437,9 +438,9 @@ async def hook_app_export(req: HookExportRequest, authorization: str | None = He
     try:
         await asyncio.to_thread(safe_fs.atomic_write_beneath, config.AGENTS_DIR,
                                 f"{ctx.agent}/{rel}", data, mkdirs=True)
-    except OSError:
+    except OSError as exc:
         raise HTTPException(status_code=400, detail=f"{slug}.otoapp could not be written there: "
-                                                    "a link, a folder or a file is in the way")
+                                                    "a link, a folder or a file is in the way") from exc
     from services.infra import file_bookkeeping
     try:
         await file_bookkeeping.push_file_write(ctx.agent, rel, target, writer="app-export")
@@ -482,17 +483,17 @@ async def hook_app_import(req: HookImportRequest, authorization: str | None = He
     try:
         data = await asyncio.to_thread(safe_fs.read_bytes_beneath, config.AGENTS_DIR,
                                        f"{ctx.agent}/{full_rel}", max_size=app_blueprints.MAX_BUNDLE_BYTES)
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=(
-            remote_file_flow.held_reason(full_rel) if held else f"no file at {full_rel}"))
-    except safe_fs.FileTooLarge:
-        raise HTTPException(status_code=400, detail="the bundle is larger than 40 MB")
-    except OSError:
-        raise HTTPException(status_code=400, detail=f"{full_rel} is not a regular file in the workspace")
+            remote_file_flow.held_reason(full_rel) if held else f"no file at {full_rel}")) from exc
+    except safe_fs.FileTooLarge as exc:
+        raise HTTPException(status_code=400, detail="the bundle is larger than 40 MB") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"{full_rel} is not a regular file in the workspace") from exc
     try:
         folder, blueprint = await asyncio.to_thread(app_blueprints.read_bundle, data)
     except app_blueprints.BlueprintError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     try:
         slug = _slug(req.slug or str(blueprint.get("slug") or ""))
         _scoped(ctx, username, f"{layout.scope_workspace(username)}/apps/{slug}")
@@ -500,7 +501,7 @@ async def hook_app_import(req: HookImportRequest, authorization: str | None = He
             ctx.agent, username, owner_sub, slug, folder,
             template_slug=f"bundle:{slug}", tasks=blueprint.get("tasks") or [])
     except (app_blueprints.BlueprintError, app_deploy.DeployError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     finally:
         await asyncio.to_thread(shutil.rmtree, folder, True)
     out["scope"] = db_apps.app_scope(username)

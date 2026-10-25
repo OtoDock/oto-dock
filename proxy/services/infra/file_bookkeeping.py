@@ -34,9 +34,9 @@ from pathlib import Path
 
 import config
 from core import layout
+from core.background import spawn
 from services.infra import safe_fs
 from storage.pg import run_db
-from core.background import spawn
 
 logger = logging.getLogger("otodock.agents")
 
@@ -99,8 +99,7 @@ async def record_platform_write(agent_slug: str, rel_path: str, writer: str | No
     """Versioned-sync bookkeeping for a platform-side write: retire any tombstone
     (the path is live again) and record the author (username slug) for cross-user
     conflict attribution. Best-effort; runs regardless of remote targets."""
-    from storage.files import file_tombstones_store
-    from storage.files import file_author_store
+    from storage.files import file_author_store, file_tombstones_store
     await asyncio.to_thread(file_tombstones_store.drop, agent_slug, rel_path)
     if writer:
         await asyncio.to_thread(file_author_store.record, agent_slug, rel_path, writer)
@@ -111,8 +110,7 @@ def tombstone_path_sync(agent_slug: str, rel_path: str) -> None:
     """The store half of ``tombstone_path``: the tombstone row and the author
     cleared, for a caller already in a worker thread (the projection is the
     caller's, on the loop)."""
-    from storage.files import file_tombstones_store
-    from storage.files import file_author_store
+    from storage.files import file_author_store, file_tombstones_store
     file_tombstones_store.record(agent_slug, rel_path, time.time(), origin="dashboard")
     file_author_store.clear(agent_slug, rel_path)
 

@@ -25,12 +25,12 @@ import copy
 import hashlib
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-
-import re
+from typing import Any, cast
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -101,6 +101,7 @@ def require_platform_compat(name: str, required: str | None) -> None:
     if platform_version_ok(required):
         return
     from fastapi import HTTPException
+
     import config as app_config
     raise HTTPException(
         400,
@@ -132,6 +133,40 @@ _lock = asyncio.Lock()
 # Fetchers
 # ---------------------------------------------------------------------------
 
+# Every catalog's DEV/TEST override (this module's and the agents catalog's).
+_CATALOG_OVERRIDES = (
+    "OTODOCK_MCPS_CATALOG_REGISTRY_URL", "OTODOCK_MCPS_CATALOG_RAW_BASE",
+    "OTODOCK_SKILLS_CATALOG_REGISTRY_URL", "OTODOCK_SKILLS_CATALOG_RAW_BASE",
+    "OTODOCK_AGENTS_CATALOG_REGISTRY_URL", "OTODOCK_AGENTS_CATALOG_RAW_BASE",
+    "OTODOCK_AGENTS_CATALOG_TARBALL_URL", "OTODOCK_AGENTS_CATALOG_TARBALL_FALLBACK_URL",
+)
+
+
+def http_client(**kwargs) -> httpx.AsyncClient:
+    """The client of every catalog fetch: GitHub's public hosts, so the
+    dial is checked (``pinned_http.public_only``). An install pointed at a
+    DEV/TEST override (a staging catalog, a local static server) keeps the
+    plain client."""
+    if any(_os.environ.get(k) for k in _CATALOG_OVERRIDES):
+        return httpx.AsyncClient(**kwargs)
+    from services.infra import pinned_http
+    return pinned_http.checked_pool(pinned_http.public_only, **kwargs)
+
+
+def load_refusal(what: str, url: str, exc: BaseException) -> str:
+    """The sentence a person reads when the ``what`` at ``url`` could not be
+    loaded, by cause: unreachable (the host to allow), not there, unreadable,
+    anything else."""
+    host = urlsplit(url).hostname or url
+    if isinstance(exc, httpx.TransportError):
+        return f"Could not load the {what}. Check that this server can reach {host}."
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404:
+        return f"The {what} was not found at {host}."
+    if isinstance(exc, ValueError):
+        return f"The {what} could not be read. Try again in a minute."
+    return f"Could not load the {what}. Try again in a minute."
+
+
 async def _http_get_json(url: str, etag: str | None) -> tuple[Any | None, str | None, int]:
     """GET a JSON URL with optional ETag. Returns (json, new_etag, status).
 
@@ -141,7 +176,7 @@ async def _http_get_json(url: str, etag: str | None) -> tuple[Any | None, str | 
     headers = {"Accept": "application/json"}
     if etag:
         headers["If-None-Match"] = etag
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+    async with http_client(timeout=HTTP_TIMEOUT_SECONDS) as client:
         resp = await client.get(url, headers=headers)
     if resp.status_code == 304:
         return None, etag, 304
@@ -154,7 +189,7 @@ async def _http_get_text(url: str, etag: str | None) -> tuple[str | None, str | 
     headers: dict[str, str] = {}
     if etag:
         headers["If-None-Match"] = etag
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+    async with http_client(timeout=HTTP_TIMEOUT_SECONDS) as client:
         resp = await client.get(url, headers=headers)
     if resp.status_code == 304:
         return None, etag, 304
@@ -225,7 +260,7 @@ async def fetch_manifest(name: str) -> dict[str, Any]:
             return cached.value
         entry = _CacheEntry(value=body, fetched_at=now, etag=etag)
         _manifest_cache[name] = entry
-        return body
+        return cast("dict[str, Any]", body)  # None only for a 304, answered above
 
 
 async def fetch_readme(name: str) -> str:
@@ -283,7 +318,7 @@ async def fetch_skills_registry() -> dict[str, Any]:
             _skills_registry_cache.fetched_at = now
             _skills_registry_cache.etag = etag
             return body
-        except Exception as exc:
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError) as exc:
             if _skills_registry_cache.value is not None:
                 logger.warning(
                     "Failed to refresh community skills registry (%s) — "
@@ -340,7 +375,7 @@ async def _fetch_cached_json(url: str, cache: dict[str, _CacheEntry],
             cached.fetched_at = now
             return cached.value
         cache[key] = _CacheEntry(value=body, fetched_at=now, etag=etag)
-        return body
+        return cast("dict[str, Any]", body)  # None only for a 304, answered above
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +421,7 @@ def _catalog_is_newer(catalog_version, local_version) -> bool:
     try:
         from packaging.version import Version
         return Version(str(catalog_version)) > Version(str(local_version))
-    except Exception:
+    except (ImportError, ValueError):
         return str(catalog_version) != str(local_version)
 
 
@@ -597,7 +632,7 @@ def _collect_installed_manifest_hashes() -> dict[str, str]:
         try:
             data = json.loads((Path(m.mcp_dir) / "manifest.json").read_text())
             out[name] = normalized_manifest_hash(data)
-        except Exception:
+        except (OSError, ValueError):
             continue
     return out
 
@@ -621,8 +656,7 @@ async def collect_local_state() -> tuple[
     - ``installed_manifest_hashes[mcp_name]`` = normalized manifest hash for
       installed node/python MCPs (for integration-change detection in Browse).
     """
-    from storage.mcp import mcp_store
-    from storage.mcp import mcp_request_store
+    from storage.mcp import mcp_request_store, mcp_store
 
     installed_versions = await asyncio.to_thread(_collect_installed_versions)
     installed_manifest_hashes = await asyncio.to_thread(_collect_installed_manifest_hashes)

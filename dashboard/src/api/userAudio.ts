@@ -2,7 +2,7 @@
 // Consumed by the chat audio UI; the hooks ship now alongside the backend.
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './auth'
+import { apiJson, withMessage } from '../lib/http/apiJson'
 
 export type AudioMode = 'native' | 'platform' | 'auto'
 
@@ -33,9 +33,7 @@ export function useMyAudioPrefs(enabled = true) {
     queryKey: ['my-audio-prefs'],
     enabled,
     queryFn: async (): Promise<AudioPrefs> => {
-      const res = await apiFetch('/v1/users/me/audio-prefs')
-      if (!res.ok) throw new Error('Failed to fetch audio preferences')
-      return res.json()
+      return apiJson<AudioPrefs>('/v1/users/me/audio-prefs').catch(withMessage('Failed to fetch audio preferences'))
     },
   })
 }
@@ -44,18 +42,16 @@ export function useUpdateMyAudioPrefs() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (data: AudioPrefsUpdate): Promise<AudioPrefs> => {
-      const res = await apiFetch('/v1/users/me/audio-prefs', {
+      return apiJson<AudioPrefs>('/v1/users/me/audio-prefs', {
         method: 'PUT',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error('Failed to save audio preferences')
-      return res.json()
+      }).catch(withMessage('Failed to save audio preferences'))
     },
     // The PUT returns the full row: write it at once so the very next
     // dictation start reads the new language, then reconcile.
     onSuccess: (data) => {
       qc.setQueryData(['my-audio-prefs'], data)
-      qc.invalidateQueries({ queryKey: ['my-audio-prefs'] })
+      return qc.invalidateQueries({ queryKey: ['my-audio-prefs'] })
     },
   })
 }

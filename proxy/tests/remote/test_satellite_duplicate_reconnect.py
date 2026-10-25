@@ -157,6 +157,7 @@ async def test_a_transfer_that_starts_across_a_replacement_uses_the_new_connecti
     """A duplicate reconnect lands while a push hashes its file: the push
     goes out on the new connection instead of failing on the replaced one."""
     import json
+
     from services.path_policy_v2 import PathRef
 
     class _RecWS(_FakeWS):

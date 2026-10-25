@@ -18,14 +18,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from tests.mcp.test_mcp_broker_activation import (  # noqa: E402
-    _FakeManifest, _stub_assembly,
+from core import placement
+from tests.mcp.test_mcp_broker_activation import (
+    _FakeManifest,
+    _stub_assembly,
 )
-from core import placement  # noqa: E402
 
 _ADMIN_PAIRED = placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE, machine_id="m")
 _USER_PAIRED = placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m")
@@ -367,6 +369,7 @@ def test_provider_block_cross_links_the_tool():
 
 def _ssh_hosts_app(user):
     from fastapi import FastAPI
+
     from api.mcp import mcps as mcps_api
     from auth.providers import get_current_user
 
@@ -471,7 +474,7 @@ def test_endpoint_403_when_not_enabled_for_agent():
 # The editor tier: keys, the prompt block and the tool answer
 # ---------------------------------------------------------------------------
 
-import pytest  # noqa: E402
+import pytest
 
 
 def _ctx(role, username="pm", **extra):
@@ -528,6 +531,7 @@ def test_endpoint_no_user_session_is_judged_on_its_live_context():
     role its registered SecurityContext carries, and no live context is
     refused."""
     from fastapi.testclient import TestClient
+
     from auth import roles
     from auth.providers import UserContext
     from core.session import session_state
@@ -556,6 +560,7 @@ def test_endpoint_judges_a_persons_session_on_its_live_context_too():
     an external caller's, beside the person's live editor role. An editor's
     ordinary session still lists."""
     from fastapi.testclient import TestClient
+
     from core.session import session_state
 
     rows = _instances({"name": "x", "host": "10.0.0.5", "username": "u"})
@@ -586,6 +591,7 @@ def test_endpoint_refuses_an_agent_scope_judge():
     """An agent-scope check's judge carries a manager context marked
     read-only: it is not handed the keys, so it does not list the hosts."""
     from fastapi.testclient import TestClient
+
     from auth import roles
     from auth.providers import UserContext
     from core.session import session_state
@@ -671,6 +677,7 @@ def test_a_judge_and_an_external_caller_leave_the_dir_alone(tmp_path):
 
 def test_both_local_layers_route_through_the_one_rule():
     from pathlib import Path
+
     from tests._paths import PROXY_DIR
     for rel in ("core/layers/cli/layer.py", "core/layers/codex/layer.py"):
         src = (Path(PROXY_DIR) / rel).read_text()

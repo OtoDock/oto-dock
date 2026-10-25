@@ -8,28 +8,37 @@ dashboard users on their role.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import uuid
 import zoneinfo
-from typing import Literal
+from typing import Literal, cast
 
+import psycopg
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import config
 from api.tasks import run_stream, task_quota
+from auth import roles
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_agent_access,
+    require_auth,
+    require_user,
+)
+from core.permission_modes import AUTO_REVIEW_MODE, DONT_ASK_MODE
+from core.session import visibility as _vis
+from core.session.session_state import get_user_tz
+from core.session.visibility import nouser_read_targets
 from services.scheduler import schedule_text, scheduler, task_kinds
 from storage import database as task_store
 from storage.agents import agent_store
 from storage.automation import run_status, trigger_store
 from storage.pg import run_db
-from core.session.session_state import get_user_tz
-from core.session.visibility import nouser_read_targets
-from auth.providers import UserContext, get_current_user, require_agent_access, require_auth, require_user
-from auth import roles
-from core.session import visibility as _vis
 from ws import wire_events as wire
 
 logger = logging.getLogger("otodock.task-api")
@@ -95,6 +104,14 @@ class CreateScheduledTaskRequest(BaseModel):
     # guards delegate spawns. Omit both to inherit.
     model: str | None = None
     layer: str | None = None
+    # The machine THIS task's runs use: a machine's name or id, ``local``,
+    # or ``default`` / omitted for the agent's default. Validated for the
+    # task's run person (``resolve_task_machine``).
+    machine: str | None = None
+    # The run's permission mode: Don't Ask (the default, every task before
+    # 1.9) or Auto (the engine's own review; refused on an agent whose engine
+    # has no reviewer). Omit for Don't Ask.
+    permission_mode: Literal["dontAsk", "autoReview"] | None = None
     # Checks (CHECKS.md): the agent's offered checks and the caller's own,
     # by name, run at the end of each run's turn; the agent's mandatory
     # checks run without being named.
@@ -131,6 +148,11 @@ class CreateOneTimeTaskRequest(BaseModel):
     # Per-task execution overrides — see CreateScheduledTaskRequest.
     model: str | None = None
     layer: str | None = None
+    machine: str | None = None
+    # The run's permission mode: Don't Ask (the default, every task before
+    # 1.9) or Auto (the engine's own review; refused on an agent whose engine
+    # has no reviewer). Omit for Don't Ask.
+    permission_mode: Literal["dontAsk", "autoReview"] | None = None
     checks: list[str] | None = None
 
 
@@ -141,7 +163,9 @@ def _validate_user_tz(value: str | None) -> str | None:
     try:
         zoneinfo.ZoneInfo(value)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid user_tz: {e}")
+        raise HTTPException(
+            status_code=400, detail="That time zone is not known. Use a name like Europe/Athens.",
+        ) from e
     return value
 
 
@@ -162,6 +186,24 @@ def _resolve_user_tz(
     return None
 
 
+def _stored_task_mode(agent: str, layer: str | None, mode: str | None) -> str:
+    """A task's permission mode as stored: '' for Don't Ask, the Auto word
+    for Auto, refused (400) on an agent whose run engine offers no Auto (its
+    engine has no reviewer: Direct LLM)."""
+    if mode != AUTO_REVIEW_MODE:
+        return ""
+    from core.session.session_manager import (
+        get_layer_capabilities,
+        resolve_execution_path,
+    )
+    path = layer or resolve_execution_path(agent)
+    caps = get_layer_capabilities(path)
+    if caps is None or AUTO_REVIEW_MODE not in caps.permission_modes:
+        raise HTTPException(400, f"Auto needs an engine with its own review; {path} has none. "
+                                 "Use Don't Ask for this task, or pin an engine that offers Auto.")
+    return AUTO_REVIEW_MODE
+
+
 async def _validate_task_overrides(
     agent: str, layer: str | None, model: str | None,
 ) -> None:
@@ -177,6 +219,68 @@ async def _validate_task_overrides(
         return
     from services.delegation.spawn_authz import validate_spawn_overrides
     await asyncio.to_thread(validate_spawn_overrides, agent, layer, model)
+
+
+#: The word that names the agent's default machine (``chat_targets.find``).
+MACHINE_DEFAULT = "default"
+_NO_PERSON_MACHINE = ("Only a person can pick a machine for this work. Leave machine out "
+                      "and it runs on the agent's default.")
+_CHAT_TASK_MACHINE = "This task runs in its chat, which keeps its own machine."
+_OMITTED = object()   # an edit field the request did not name
+
+
+def is_default_machine(wanted: str | None) -> bool:
+    """``wanted`` names the agent's default: omitted, "" or ``default``."""
+    return (wanted or "").strip() in ("", MACHINE_DEFAULT)
+
+
+def task_run_person(agent: str, scope: str, created_by: str | None):
+    """The person a task's runs (or a delegated worker's) run as, for its
+    machine: the creator of a user-scope task on an agent that is not
+    Shared-only; no person otherwise (``resolve_task_identity``: those runs
+    never reach a personal machine). Synchronous: the DB executor."""
+    from auth.providers import acting_role_of
+    from services.remote.chat_targets import RunPerson
+    if scope == _vis.SCOPE_USER and created_by and not _vis.is_shared_only(agent):
+        return RunPerson(created_by, acting_role_of(created_by, agent))
+    return RunPerson(None, roles.MANAGER)
+
+
+async def resolve_task_machine(u: UserContext, agent: str, wanted: str | None, *,
+                               scope: str, created_by: str | None, engine_path: str = "") -> str:
+    """The ``target_machine`` to store for ``wanted`` ("" = the agent's
+    default), validated with ``chat_targets.resolve_work_machine`` for the
+    run person (``task_run_person``); a platform admin writer is offered
+    the admin machines. A caller with no person names only the default.
+    Raises 400 with the refusal."""
+    if is_default_machine(wanted):
+        return ""
+    if u.acting_sub is None:
+        raise HTTPException(400, _NO_PERSON_MACHINE)
+    from services.remote import chat_targets
+    person = await run_db(task_run_person, agent, scope, created_by)
+    machine, refusal = await run_db(functools.partial(
+        chat_targets.resolve_work_machine, agent, str(wanted).strip(), person=person,
+        admin_asker=u.is_admin, engine_path=engine_path or ""))
+    if refusal:
+        raise HTTPException(400, refusal)
+    return machine
+
+
+def _machine_view(target: str) -> dict:
+    """A task's machine as the views show it: its name and live state ("" for
+    the default; the server has no state). Synchronous: the DB executor."""
+    if not target:
+        return {"target_machine": "", "target_machine_label": "", "target_machine_state": ""}
+    from core import placement
+    from services.remote import chat_targets, remote_status
+    from storage import remote_store
+    if placement.is_local(target):
+        return {"target_machine": target, "target_machine_label": chat_targets.label_of(target),
+                "target_machine_state": ""}
+    row = remote_store.get_remote_machine(target)
+    return {"target_machine": target, "target_machine_label": chat_targets.label_of(target, row or {}),
+            "target_machine_state": remote_status.get_live_machine_status(target, machine=row)["state"]}
 
 
 # --- Scope + permission helpers ---
@@ -456,9 +560,9 @@ async def create_scheduled_task(
     x_agent_name: str | None = Header(None, alias="x-agent-name"),
 ):
     u = require_auth(user)
-    _enforce_task_scope(u, req.scope, req.agent)
+    await asyncio.to_thread(_enforce_task_scope, u, req.scope, req.agent)
     if u.is_api_key:
-        _check_agent_access_s2s(req.agent, _caller_agent(u, x_agent_name))
+        await asyncio.to_thread(_check_agent_access_s2s, req.agent, _caller_agent(u, x_agent_name))
         if u.acting_sub is not None:
             # A delegation edge is the agent's reach, not the person's: a
             # session minted for a person reaches only the agents they can.
@@ -488,6 +592,8 @@ async def create_scheduled_task(
     await _validate_task_overrides(req.agent, req.layer, req.model)
 
     created_by, acting_sub = _resolve_creator_identity(u, req.scope, _caller_agent(u, x_agent_name))
+    machine = await resolve_task_machine(u, req.agent, req.machine, scope=req.scope,
+                                         created_by=created_by, engine_path=req.layer or "")
     checks = await _validate_checks(req.agent, req.checks, u)
     task_id = f"dyn-{uuid.uuid4().hex[:8]}"
     user_tz = _resolve_user_tz(req.user_tz, u, acting_sub)
@@ -500,7 +606,6 @@ async def create_scheduled_task(
         interval_seconds=req.interval_seconds,
         llm_mode=req.llm_mode,
         timeout_seconds=req.timeout_seconds,
-        source="dynamic",
         created_by=created_by,
         scope=req.scope,
         notification_mode=req.notification_mode,
@@ -508,6 +613,9 @@ async def create_scheduled_task(
         user_tz=user_tz,
         override_model=req.model or None,
         override_execution_path=req.layer or None,
+        target_machine=machine,
+        permission_mode=await asyncio.to_thread(_stored_task_mode, req.agent, req.layer,
+                                                req.permission_mode),
         checks=checks,
     )
     async with task_quota.creating():
@@ -518,8 +626,9 @@ async def create_scheduled_task(
         else f"interval={req.interval_seconds}s"
     )
     logger.info(
-        f"Created scheduled task: {task_id} scope={req.scope} {timing_desc} "
-        f"by {created_by} tz={user_tz or '-'} notify={req.notification_mode}"
+        "Created scheduled task: %s scope=%s %s "
+        "by %s tz=%s notify=%s",
+        task_id, req.scope, timing_desc, created_by, user_tz or '-', req.notification_mode
     )
     return {"task_id": task_id, "status": "created"}
 
@@ -531,9 +640,9 @@ async def create_one_time_task(
     x_agent_name: str | None = Header(None, alias="x-agent-name"),
 ):
     u = require_auth(user)
-    _enforce_task_scope(u, req.scope, req.agent)
+    await asyncio.to_thread(_enforce_task_scope, u, req.scope, req.agent)
     if u.is_api_key:
-        _check_agent_access_s2s(req.agent, _caller_agent(u, x_agent_name))
+        await asyncio.to_thread(_check_agent_access_s2s, req.agent, _caller_agent(u, x_agent_name))
         if u.acting_sub is not None:
             require_agent_access(u, req.agent)  # see create_scheduled_task
     else:
@@ -558,6 +667,8 @@ async def create_one_time_task(
     await _validate_task_overrides(req.agent, req.layer, req.model)
 
     created_by, acting_sub = _resolve_creator_identity(u, req.scope, _caller_agent(u, x_agent_name))
+    machine = await resolve_task_machine(u, req.agent, req.machine, scope=req.scope,
+                                         created_by=created_by, engine_path=req.layer or "")
     checks = await _validate_checks(req.agent, req.checks, u)
     task_id = f"dyn-{uuid.uuid4().hex[:8]}"
     user_tz = _resolve_user_tz(req.user_tz, u, acting_sub)
@@ -587,7 +698,6 @@ async def create_one_time_task(
         delay_seconds=req.delay_seconds,
         llm_mode=req.llm_mode,
         timeout_seconds=req.timeout_seconds,
-        source="dynamic",
         created_by=created_by,
         on_complete_agent=req.on_complete_agent,
         on_complete_prompt=req.on_complete_prompt,
@@ -601,6 +711,9 @@ async def create_one_time_task(
         task_type=task_type,
         override_model=req.model or None,
         override_execution_path=req.layer or None,
+        target_machine=machine,
+        permission_mode=await asyncio.to_thread(_stored_task_mode, req.agent, req.layer,
+                                                req.permission_mode),
         checks=checks,
     )
     async with task_quota.creating():
@@ -608,8 +721,9 @@ async def create_one_time_task(
             await task_quota.enforce_task_caps(u, req.agent, created_by, req.scope)
         await scheduler.add_dynamic_task(task)
     logger.info(
-        f"Created task: {task_id} type={task_type} scope={req.scope} "
-        f"by {created_by} tz={user_tz or '-'} notify={req.notification_mode}"
+        "Created task: %s type=%s scope=%s "
+        "by %s tz=%s notify=%s",
+        task_id, task_type, req.scope, created_by, user_tz or '-', req.notification_mode
     )
     return {"task_id": task_id, "status": "created"}
 
@@ -666,17 +780,23 @@ async def list_tasks(
     resolve = _make_model_resolver()
     # The run counts, one grouped query (see _run_count_for).
     counts = await run_db(task_store.count_runs_by_task, [t.id for t in all_tasks])
-    platform_tz = config.get_platform_timezone()
     from services.agents import offboarding_transfer
     moved_from = await run_db(offboarding_transfer.transferred_from_names,
                               [t.transferred_from for t in all_tasks])
-    views = []
-    for t in all_tasks:
-        job = {"next_run_time": next_fires[t.id]} if t.id in next_fires else None
-        d = _task_view(t, u, resolve, job, platform_tz, moved_from=moved_from)
-        d["run_count"] = _run_count_for(t, counts.get(t.id, 0))
-        views.append(d)
-    return {"tasks": views}
+
+    def _views() -> list[dict]:
+        # The platform zone and each row's model resolution read the store:
+        # the views are built in one job.
+        platform_tz = config.get_platform_timezone()
+        out = []
+        for t in all_tasks:
+            job = {"next_run_time": next_fires[t.id]} if t.id in next_fires else None
+            d = _task_view(t, u, resolve, job, platform_tz, moved_from=moved_from)
+            d["run_count"] = _run_count_for(t, counts.get(t.id, 0))
+            out.append(d)
+        return out
+
+    return {"tasks": await run_db(_views)}
 
 
 def _run_count_for(t, history_count: int) -> int:
@@ -698,7 +818,7 @@ def _make_model_resolver():
     agents and every resolution hits the DB. An install with no enabled
     model for the layer resolves to "" = unresolved, which the UI renders
     as nothing rather than a wrong claim."""
-    from api.agents._common import _get_execution_paths
+    from storage.agents.agent_store import _get_execution_paths
     from storage.billing import subscription_store
 
     agent_rows: dict[str, dict] = {}
@@ -714,7 +834,7 @@ def _make_model_resolver():
         if layer not in layer_rows:
             try:
                 layer_rows[layer] = subscription_store.list_models(layer)
-            except Exception:
+            except psycopg.Error:
                 layer_rows[layer] = []
         return layer_rows[layer]
 
@@ -730,7 +850,7 @@ def _make_model_resolver():
         if key not in defaults:
             try:
                 defaults[key] = config.resolve_agent_model(t.agent, layer=path or None)
-            except Exception:
+            except (RuntimeError, psycopg.Error):
                 defaults[key] = ""
         model = override_model or defaults[key]
         if override_model:
@@ -769,6 +889,7 @@ def _task_view(t, u: UserContext, resolve, job: dict | None,
     ``moved_from`` is ``offboarding_transfer.transferred_from_names`` for the
     rows being shown."""
     d = t.model_dump()
+    d["permission_mode"] = d.get("permission_mode") or DONT_ASK_MODE
     d["transferred_from_name"] = (moved_from or {}).get(d.get("transferred_from") or "", "")
     d["next_run_time"] = job["next_run_time"] if job else None
     # The zone the cron and a naive run_at are read in: the row's own, else
@@ -784,6 +905,7 @@ def _task_view(t, u: UserContext, resolve, job: dict | None,
                   "tier_label": "", "pin_warnings": []})
     else:
         d.update(resolve(t))
+    d.update(_machine_view(getattr(t, "target_machine", "") or ""))
 
     # Permission metadata for UI (3-tier per-agent model).
     # owner = manager + admin; can mutate any task on the agent.
@@ -817,8 +939,8 @@ async def _delete_task_impl(task_id: str, user: UserContext, x_agent_name: str |
         raise HTTPException(status_code=404, detail="Task not found")
 
     if user.is_api_key:
-        _check_agent_access_s2s(dyn["agent"], _caller_agent(user, x_agent_name))
-        _check_task_permission(dyn, user)
+        await asyncio.to_thread(_check_agent_access_s2s, dyn["agent"], _caller_agent(user, x_agent_name))
+        await asyncio.to_thread(_check_task_permission, dyn, user)
     else:
         require_agent_access(user, dyn["agent"])
         # Dashboard users: check ownership.
@@ -876,10 +998,10 @@ async def _resolve_pause_resume_target(
     if not dyn:
         raise HTTPException(status_code=404, detail="Task not found")
     if user.is_api_key:
-        _check_agent_access_s2s(dyn["agent"], _caller_agent(user, x_agent_name))
+        await asyncio.to_thread(_check_agent_access_s2s, dyn["agent"], _caller_agent(user, x_agent_name))
     else:
         require_agent_access(user, dyn["agent"])
-    _check_task_permission(dyn, user)
+    await asyncio.to_thread(_check_task_permission, dyn, user)
     return dyn
 
 
@@ -934,6 +1056,11 @@ class EditTaskRequest(BaseModel):
     # field entirely to leave the current pin untouched.
     model: str | None = None
     layer: str | None = None
+    # The task's machine: omit to leave it, ``default`` or "" (or null)
+    # clears it back to the agent's default; validated like on create.
+    machine: str | None = None
+    # The run's permission mode (see the create models); omit to leave it.
+    permission_mode: Literal["dontAsk", "autoReview"] | None = None
     # Checks (CHECKS.md): the whole list; [] clears it. Omit to leave it.
     checks: list[str] | None = None
 
@@ -951,7 +1078,7 @@ async def _validate_checks(agent: str, names: list[str] | None, u: UserContext) 
     from services.checks import documents as _checks
     username = ""
     if u.acting_sub:
-        username = await asyncio.to_thread(task_store.get_username_by_sub, u.acting_sub) or ""
+        username = await asyncio.to_thread(task_store.get_username_by_sub, u.acting_sub) or ""  # type: ignore[arg-type]  # mypy solves to_thread's return from the target's declared str through `or ""` (checker limitation)
     refs: list[str] = []
     for raw in names:
         if not isinstance(raw, str) or not raw.strip():
@@ -990,10 +1117,10 @@ async def _edit_task_impl(
     if not dyn:
         raise HTTPException(status_code=404, detail="Task not found")
     if user.is_api_key:
-        _check_agent_access_s2s(dyn["agent"], _caller_agent(user, x_agent_name))
+        await asyncio.to_thread(_check_agent_access_s2s, dyn["agent"], _caller_agent(user, x_agent_name))
     else:
         require_agent_access(user, dyn["agent"])
-    _check_task_permission(dyn, user)
+    await asyncio.to_thread(_check_task_permission, dyn, user)
 
     # exclude_unset: only fields the caller explicitly supplied flow through.
     # That's how we tell "leave field alone" apart from "explicitly set to None".
@@ -1038,6 +1165,25 @@ async def _edit_task_impl(
             fields["override_model"] = fields.pop("model") or ""
         if "layer" in fields:
             fields["override_execution_path"] = fields.pop("layer") or ""
+    wanted = fields.pop("machine", _OMITTED)
+    if wanted is not _OMITTED:
+        # Validated for the task's own run person (its creator for a
+        # user-scope task, whoever edits it), on the layer it will run.
+        if dyn.get("target_chat_id") and not is_default_machine(wanted):
+            raise HTTPException(status_code=400, detail=_CHAT_TASK_MACHINE)
+        fields["target_machine"] = await resolve_task_machine(
+            user, dyn["agent"], wanted, scope=dyn.get("scope") or _vis.SCOPE_USER,
+            created_by=dyn.get("created_by"),
+            engine_path=fields.get("override_execution_path", dyn.get("override_execution_path")) or "")
+    if "permission_mode" in fields or "override_execution_path" in fields:
+        # A new mode, or a new engine for the stored one: Auto stays only on
+        # an engine with its own review (400 otherwise).
+        layer = fields.get("override_execution_path", dyn.get("override_execution_path")) or None
+        mode = (fields["permission_mode"] if "permission_mode" in fields
+                else dyn.get("permission_mode") or None)
+        stored = await asyncio.to_thread(_stored_task_mode, dyn["agent"], layer, mode)
+        if "permission_mode" in fields:
+            fields["permission_mode"] = stored
     if "checks" in fields:
         refs = await _validate_checks(dyn["agent"], fields.pop("checks") or [], user)
         fields["checks"] = json.dumps(refs) if refs else ""
@@ -1104,7 +1250,7 @@ async def _edit_task_impl(
                             row.get("user_sub") or "", cid, new_name,
                             agent=row.get("agent") or "",
                         )
-        except Exception:
+        except (ImportError, psycopg.Error):
             logger.debug("task-rename title broadcast failed for %s",
                          task_id, exc_info=True)
     return {"status": "updated", "task_id": task_id}
@@ -1161,10 +1307,10 @@ async def update_task_on_complete(
     # gate as DELETE/edit: a token caller passes the s2s agent check, everyone
     # gets the scope-aware ownership check (user-scope → creator only).
     if u.is_api_key:
-        _check_agent_access_s2s(dyn["agent"], _caller_agent(u, x_agent_name))
+        await asyncio.to_thread(_check_agent_access_s2s, dyn["agent"], _caller_agent(u, x_agent_name))
     else:
         require_agent_access(u, dyn["agent"])
-    _check_task_permission(dyn, u)
+    await asyncio.to_thread(_check_task_permission, dyn, u)
     await _check_callback_anchor(
         u, req.on_complete_agent, req.on_complete_session_id, req.on_complete_chat_id,
     )
@@ -1208,10 +1354,10 @@ async def run_task_now(
         # token-authoritative via _check_task_permission. A no-user session
         # is denied user-scoped runs; agent-scope runs are allowed on the
         # agents the caller reaches.
-        _check_agent_access_s2s(task_def.agent, _caller_agent(u, x_agent_name))
+        await asyncio.to_thread(_check_agent_access_s2s, task_def.agent, _caller_agent(u, x_agent_name))
         if u.acting_sub is not None:
             require_agent_access(u, task_def.agent)  # see create_scheduled_task
-        _check_task_permission(dyn, u)
+        await asyncio.to_thread(_check_task_permission, dyn, u)
     else:
         require_agent_access(u, task_def.agent)
         # Dashboard user permission check (per-agent role).
@@ -1242,7 +1388,7 @@ async def run_task_now(
     # still streaming when its delegate_task MCP call hits this endpoint).
     on_complete_chat_id = dyn.get("on_complete_chat_id")
     if on_complete_chat_id:
-        from core.events.common_events import CommonEvent, DELEGATE_SPAWN
+        from core.events.common_events import DELEGATE_SPAWN, CommonEvent
         from core.session.session_state import inject_pump_event
         spawn_data = {
             # "type" rides along so the event-row fallback below persists the
@@ -1324,7 +1470,21 @@ async def list_runs(
         created_by=created_by, exclude_task_type=exclude,
         agents_filter=agents_filter, edge_agents_filter=edge_filter,
     )
-    return {"runs": runs, "total": total, "limit": limit, "offset": offset}
+    return {"runs": await run_db(_label_run_targets, runs), "total": total,
+            "limit": limit, "offset": offset}
+
+
+def _label_run_targets(runs: list[dict]) -> list[dict]:
+    """Each run's ``execution_target_label``: where it ran, as a person reads
+    it (each place read once). Synchronous: the DB executor."""
+    from services.remote import chat_targets
+    labels: dict[str, str] = {}
+    for r in runs:
+        where = r.get("execution_target") or ""
+        if where not in labels:
+            labels[where] = chat_targets.label_of(where)
+        r["execution_target_label"] = labels[where]
+    return runs
 
 
 async def _enrich_run_with_delegator(run: dict) -> dict:
@@ -1448,20 +1608,21 @@ async def get_task(
 
     def _build() -> dict:
         from services.agents import offboarding_transfer
+        dyn_row = cast("dict", dyn)  # task_def was built from it
         next_fire = scheduler.next_run_time(task_id)
         d = _task_view(task_def, u, _make_model_resolver(),
                        {"next_run_time": next_fire} if next_fire else None,
                        moved_from=offboarding_transfer.transferred_from_names(
-                           [dyn.get("transferred_from") or ""]))
-        d["transferred_from"] = dyn.get("transferred_from") or ""
-        d["transferred_at"] = dyn.get("transferred_at") or ""
+                           [dyn_row.get("transferred_from") or ""]))
+        d["transferred_from"] = dyn_row.get("transferred_from") or ""
+        d["transferred_at"] = dyn_row.get("transferred_at") or ""
         history = task_store.count_runs_by_task([task_id]).get(task_id, 0)
         if getattr(task_def, "task_type", "") == task_kinds.CONTINUATION:
-            d["run_count"] = max(int(dyn.get("run_count", 0) or 0), history)
+            d["run_count"] = max(int(dyn_row.get("run_count", 0) or 0), history)
         else:
             d["run_count"] = history
-        d["fired"] = bool(dyn.get("fired", False))
-        d["on_complete_chat_id"] = dyn.get("on_complete_chat_id")
+        d["fired"] = bool(dyn_row.get("fired", False))
+        d["on_complete_chat_id"] = dyn_row.get("on_complete_chat_id")
         triggers: list[dict] = []
         if task_def.task_type == task_kinds.TRIGGER:
             from api.events.triggers import trigger_webhook_path

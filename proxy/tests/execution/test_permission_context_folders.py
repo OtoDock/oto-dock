@@ -10,9 +10,9 @@ Agent Context Deep Pass:
 
 from __future__ import annotations
 
-from auth.path_policy import build_permission_context, SecurityContext
-from storage.agents import agent_store
+from auth.path_policy import SecurityContext, build_permission_context
 from core import placement
+from storage.agents import agent_store
 
 
 def _ctx(role: str, username: str, agent: str = "pa", display_name: str = "Alice") -> SecurityContext:

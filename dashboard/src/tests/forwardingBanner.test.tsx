@@ -61,9 +61,9 @@ describe('ForwardingBanner', () => {
     h.warnings = [BOOT, GATEWAY]
     show()
     const alert = await screen.findByRole('alert')
-    expect(alert.textContent).toMatch(/public URL is https but no reverse proxy is trusted/)
+    expect(alert.textContent).toMatch(/public URL is https, but no reverse proxy is trusted/)
     // The proxy raises this row for ignored entries too, never only for an empty list.
-    expect(alert.textContent).toMatch(/TRUSTED_PROXY is empty, or every entry in it is ignored, such as a loopback address in a container/)
+    expect(alert.textContent).toMatch(/TRUSTED_PROXY is empty, or every entry in it is ignored\. For example, a loopback address is ignored in a container/)
     expect(alert.textContent).toMatch(/1 more in the Security settings/)
   })
 

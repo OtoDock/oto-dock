@@ -8,6 +8,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { apiJson } from '../lib/http/apiJson'
 import type { McpRuntime } from '../lib/kinds/mcpRuntime'
 import type { McpRequestStatus } from '../lib/status/mcpRequest'
 
@@ -65,7 +66,7 @@ export type McpTrustTier = 'first-party' | 'maintained' | 'third-party'
 // The badge and its tooltip per tier.
 export const MCP_TRUST_TIERS: Record<McpTrustTier, { label: string; title: string }> = {
   'first-party': { label: 'first-party', title: 'OtoDock writes or maintains this server.' },
-  maintained: { label: 'maintained', title: "The vendor's or a maintained project's own server, reviewed by the catalog." },
+  maintained: { label: 'maintained', title: "The vendor's or a maintained project's own server, reviewed for the community list." },
   'third-party': { label: 'third-party', title: 'A community package that follows its upstream project.' },
 }
 
@@ -218,14 +219,8 @@ export function useInstallCommunityMcp() {
   const qc = useQueryClient()
   return useMutation<InstallStartResponse, Error, string>({
     mutationFn: (name: string) =>
-      apiFetch(`/v1/admin/community/mcps/${name}/install`, { method: 'POST' })
-        .then(async r => {
-          if (!r.ok) {
-            const body = await r.text()
-            throw new Error(body || `Install failed (HTTP ${r.status})`)
-          }
-          return r.json()
-        }),
+      apiJson<InstallStartResponse>(`/v1/admin/community/mcps/${name}/install`, { method: 'POST' },
+        'Could not install the MCP'),
     onSuccess: (data) => {
       // Seed the returned running job into the installs cache so the progress
       // bar appears immediately, without waiting for the next poll tick.
@@ -247,14 +242,8 @@ export function useInstallCommunitySkill() {
   const qc = useQueryClient()
   return useMutation<InstallStartResponse, Error, string>({
     mutationFn: (name: string) =>
-      apiFetch(`/v1/admin/community/skills/${name}/install`, { method: 'POST' })
-        .then(async r => {
-          if (!r.ok) {
-            const body = await r.text()
-            throw new Error(body || `Install failed (HTTP ${r.status})`)
-          }
-          return r.json()
-        }),
+      apiJson<InstallStartResponse>(`/v1/admin/community/skills/${name}/install`, { method: 'POST' },
+        'Could not install the skill'),
     onSuccess: (data) => {
       qc.setQueryData<CatalogInstallsResponse>(['catalog-installs'], old => {
         const others = (old?.installs ?? []).filter(j => j.name !== data.job.name)
@@ -348,17 +337,14 @@ export function useCreateMcpRequest(agentSlug: string) {
   const qc = useQueryClient()
   return useMutation<McpRequest, Error, CreateMcpRequestBody>({
     mutationFn: (body: CreateMcpRequestBody) =>
-      apiFetch(`/v1/agents/${agentSlug}/mcp-requests`, {
+      apiJson<McpRequest>(`/v1/agents/${agentSlug}/mcp-requests`, {
         method: 'POST',
-        body: JSON.stringify({
+        json: {
           mcp_name: body.mcp_name,
           reason: (body.reason ?? '').trim(),
           kind: body.kind ?? 'mcp',
-        }),
-      }).then(async r => {
-        if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`)
-        return r.json()
-      }),
+        },
+      }, 'Could not send the request'),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['community-mcps'] })
       qc.invalidateQueries({ queryKey: ['community-skills'] })
@@ -376,12 +362,9 @@ export function useCancelMcpRequest(agentSlug: string) {
   const qc = useQueryClient()
   return useMutation<McpRequest, Error, number>({
     mutationFn: (requestId: number) =>
-      apiFetch(`/v1/agents/${agentSlug}/mcp-requests/${requestId}/cancel`, {
+      apiJson<McpRequest>(`/v1/agents/${agentSlug}/mcp-requests/${requestId}/cancel`, {
         method: 'POST',
-      }).then(async r => {
-        if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`)
-        return r.json()
-      }),
+      }, 'Could not cancel the request'),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['community-mcps'] })
       qc.invalidateQueries({ queryKey: ['community-skills'] })
@@ -409,13 +392,10 @@ export function useApproveMcpRequest() {
   const qc = useQueryClient()
   return useMutation<McpRequest, Error, { id: number; admin_note?: string; instance_id?: number | null }>({
     mutationFn: ({ id, admin_note = '', instance_id = null }) =>
-      apiFetch(`/v1/admin/mcp-requests/${id}/approve`, {
+      apiJson<McpRequest>(`/v1/admin/mcp-requests/${id}/approve`, {
         method: 'POST',
-        body: JSON.stringify({ admin_note, instance_id }),
-      }).then(async r => {
-        if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`)
-        return r.json()
-      }),
+        json: { admin_note, instance_id },
+      }, 'Could not approve the request'),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['admin-mcp-requests'] })
       qc.invalidateQueries({ queryKey: ['community-mcps'] })
@@ -430,13 +410,10 @@ export function useRejectMcpRequest() {
   const qc = useQueryClient()
   return useMutation<McpRequest, Error, { id: number; admin_note?: string }>({
     mutationFn: ({ id, admin_note = '' }) =>
-      apiFetch(`/v1/admin/mcp-requests/${id}/reject`, {
+      apiJson<McpRequest>(`/v1/admin/mcp-requests/${id}/reject`, {
         method: 'POST',
-        body: JSON.stringify({ admin_note }),
-      }).then(async r => {
-        if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`)
-        return r.json()
-      }),
+        json: { admin_note },
+      }, 'Could not reject the request'),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['admin-mcp-requests'] })
       qc.invalidateQueries({ queryKey: ['community-mcps'] })

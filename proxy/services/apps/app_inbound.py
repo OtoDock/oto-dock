@@ -159,7 +159,7 @@ def payload_for(name: str, spec: dict, raw_body: bytes, headers, event_id: str) 
     """What the handler receives: the hook, the scheme, the body as text,
     the header subset, the vendor's event id and when it arrived."""
     h = _lower(headers)
-    keep = {k: h[k] for k in (*KEEP_HEADERS, *VENDOR_HEADERS.get(spec.get("verify"), ())) if k in h}
+    keep = {k: h[k] for k in (*KEEP_HEADERS, *VENDOR_HEADERS.get(spec.get("verify"), ())) if k in h}  # type: ignore[arg-type]  # typeshed types dict.get's key as the key type; a spec with no verify looks up None and gets ()
     return {"hook": name, "verify": spec.get("verify"), "body": raw_body.decode("utf-8", "replace"),
             "headers": keep, "event_id": event_id,
             "received_at": datetime.now(timezone.utc).isoformat()}

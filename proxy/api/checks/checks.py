@@ -19,14 +19,20 @@ import asyncio
 import json
 import logging
 
+import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from api.apps import catalog
+from api._guards import require_manager
 from auth.providers import (
-    UserContext, get_current_user, require_agent_access, require_auth, session_bound_to,
+    UserContext,
+    get_current_user,
+    require_agent_access,
+    require_auth,
     require_user,
+    session_bound_to,
 )
+from services.apps import catalog
 from services.checks import documents
 from storage import database as task_store
 from storage.checks import db_checks
@@ -41,9 +47,7 @@ MAX_ATTACHED = 16
 _BOUND = [Depends(session_bound_to("agent"))]
 
 
-def _manager(u: UserContext, agent: str) -> None:
-    if not u.can_manage_agent(agent):
-        raise HTTPException(403, "Manager or admin access required for this agent's checks")
+_MANAGER_DETAIL = "Manager or admin access required for this agent's checks"
 
 
 def _not_a_run(u: UserContext) -> None:
@@ -117,7 +121,7 @@ async def list_checks(agent: str, user: UserContext | None = Depends(get_current
     try:
         from services.mcp import mcp_registry
         tool_enabled = any(m.name == "checks-mcp" for m in mcp_registry.get_agent_mcps(agent))
-    except Exception:
+    except (ImportError, psycopg.Error):
         tool_enabled = True
     return {"checks": items, "can_manage": manages, "username": username, "tool_enabled": tool_enabled}
 
@@ -131,7 +135,7 @@ async def put_check(agent: str, name: str, body: CheckBody,
     u = require_auth(user)
     require_agent_access(u, agent)
     _agent_exists(agent)
-    _manager(u, agent)
+    require_manager(u, agent, detail=_MANAGER_DETAIL)
     await asyncio.to_thread(_not_a_run, u)
     doc = dict(body.doc or {})
     doc["name"] = name
@@ -139,7 +143,7 @@ async def put_check(agent: str, name: str, body: CheckBody,
         it = await asyncio.to_thread(documents.write_check, agent, "", doc, body.script,
                                      updated_by=_username(u, agent) or u.sub)
     except documents.CheckError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     await documents.fan_out(agent, "", name)
     catalog.check_changed(agent, "", name, it)
     return documents.describe(it)
@@ -150,12 +154,12 @@ async def delete_check(agent: str, name: str, user: UserContext | None = Depends
     u = require_auth(user)
     require_agent_access(u, agent)
     _agent_exists(agent)
-    _manager(u, agent)
+    require_manager(u, agent, detail=_MANAGER_DETAIL)
     await asyncio.to_thread(_not_a_run, u)
     try:
         existed = await asyncio.to_thread(documents.delete_check, agent, "", name)
     except documents.CheckError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     if not existed:
         raise HTTPException(404, "No such check")
     catalog.check_changed(agent, "", name, None)
@@ -180,7 +184,7 @@ async def put_user_check(agent: str, name: str, body: CheckBody,
         it = await asyncio.to_thread(documents.write_check, agent, username, doc, body.script,
                                      updated_by=username)
     except documents.CheckError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     await documents.fan_out(agent, username, name)
     catalog.check_changed(agent, username, name, it, u.sub)
     return documents.describe(it)
@@ -198,7 +202,7 @@ async def delete_user_check(agent: str, name: str,
     try:
         existed = await asyncio.to_thread(documents.delete_check, agent, username, name)
     except documents.CheckError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     if not existed:
         raise HTTPException(404, "No such check")
     catalog.check_changed(agent, username, name, None, u.sub)
@@ -237,7 +241,7 @@ async def patch_settings(agent: str, body: SettingsBody,
     u = require_auth(user)
     require_agent_access(u, agent)
     _agent_exists(agent)
-    _manager(u, agent)
+    require_manager(u, agent, detail=_MANAGER_DETAIL)
     await asyncio.to_thread(_not_a_run, u)
     cap = body.daily_cap_usd
     if cap is not None and (cap < 0 or cap > 1_000_000):
@@ -308,7 +312,7 @@ async def run_now(body: AttachBody, user: UserContext | None = Depends(get_curre
     try:
         return await evaluator.run_by_hand(u.session_id, body.ref)
     except LookupError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404, str(e)) from e
 
 
 @router.post("/v1/checks/detach")

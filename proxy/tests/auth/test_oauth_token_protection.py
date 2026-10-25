@@ -20,15 +20,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from services import path_roles
-from services.mcp import mcp_registry
 from auth.path_policy import (
     SecurityContext,
     _check_bash,
     _check_read_path,
     _check_write_path,
 )
-
+from services import path_roles
+from services.mcp import mcp_registry
 
 # ---------------------------------------------------------------------------
 # Manifest-driven subpath collection
@@ -301,6 +300,7 @@ def test_check_file_role_denies_oauth_path_for_admin(_protected_set):
     """``_check_file_role`` is the dashboard-API path gate; admin role
     normally bypasses, but the OAuth gate fires FIRST."""
     from fastapi import HTTPException
+
     from api.agents.agents import _check_file_role
     with pytest.raises(HTTPException) as exc:
         _check_file_role("workspace/google-tokens/x.json", role="admin", username="alice")
@@ -310,6 +310,7 @@ def test_check_file_role_denies_oauth_path_for_admin(_protected_set):
 
 def test_check_file_role_denies_for_manager(_protected_set):
     from fastapi import HTTPException
+
     from api.agents.agents import _check_file_role
     with pytest.raises(HTTPException) as exc:
         _check_file_role("users/alice/google-tokens/x.json", role="manager", username="alice")

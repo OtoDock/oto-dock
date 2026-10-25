@@ -131,10 +131,11 @@ def init_audio_telephony(conn) -> None:
             -- Where the agent may hand the caller (``transfer_call``): the
             -- admin's list of {label, number}; [] = no transfers on the line.
             transfer_targets JSONB NOT NULL DEFAULT '[]',
-            -- Identify the caller's language on the first utterance and lock
-            -- the call to it; ``language`` stays the greeting's and the
-            -- fallback. Off on existing rows (run_migrations), on for routes
-            -- the form creates (the API model's default).
+            -- Read the caller's language from the audio while they speak and
+            -- switch the call to it; ``language`` stays the greeting's and
+            -- the default.
+            -- Off on existing rows (run_migrations), on for routes the API or
+            -- the form creates.
             language_detect BOOLEAN NOT NULL DEFAULT FALSE,
             -- A voice for this route only (the TTS provider's own id); ''
             -- = the provider's voice for the call's language.

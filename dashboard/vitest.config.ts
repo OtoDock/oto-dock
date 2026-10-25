@@ -17,5 +17,9 @@ export default defineConfig({
     setupFiles: ['./src/tests/setup.ts'],
     css: false,
     include: ['src/**/*.{test,spec}.{ts,tsx}'],
+    // Node 26 defines a global localStorage that is undefined without
+    // --localstorage-file and hides jsdom's; turning Node's off gives the
+    // workers jsdom's storage again (Node 22 and 24 accept the flag too).
+    execArgv: ['--no-experimental-webstorage'],
   },
 })

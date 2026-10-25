@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Generated from the design tokens: regenerate, never edit. -->
+<resources>
+    <color name="colorPrimary">#146bb5</color>
+    <color name="colorPrimaryDark">#0f5a9a</color>
+    <color name="colorAccent">#146bb5</color>
+    <color name="bootField">#1d4f80</color>
+    <color name="bootFieldDeep">#174067</color>
+    <color name="pageLight">#faf9f9</color>
+    <color name="pageDark">#0d1117</color>
+</resources>

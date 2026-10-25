@@ -16,8 +16,7 @@ import pytest
 from fastapi import HTTPException
 
 import config
-from api.tasks import tasks as tasks_api
-from api.tasks import task_quota
+from api.tasks import task_quota, tasks as tasks_api
 from auth.providers import UserContext
 from services.scheduler import task_kinds
 from storage import database as task_store

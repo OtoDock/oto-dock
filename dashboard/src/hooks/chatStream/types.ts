@@ -1,4 +1,8 @@
 import type { AttachedFileMeta, AttachedImageMeta, QueuedMessage } from '../../store/types'
+import type {
+  ChatHistoryDeltaFrame, ChatHistoryFrame, ChatMovedFrame, NotificationCountFrame, NotificationFrame, NotificationSilentFrame,
+  PreWarmupReadyFrame, WarmupFailedFrame, WarmupReadyFrame, WarmupStartedFrame,
+} from '../../api/wireEvents'
 
 /** Per-page adapter for the queued-messages store (chatStore for AgentChat,
  * local useState elsewhere). The hook only writes the queue; the page
@@ -12,9 +16,11 @@ export interface ChatStreamQueueAdapter {
 }
 
 export interface UseChatStreamOptions {
+  /** The place picked for the new chat on `agent` (sent with its first frames). */
+  newChatTarget?: (agent: string) => string | undefined
   /** useAgents() data — delegate identity lookup (agent display_name + color). */
   agents: Array<{ name: string; display_name?: string; color?: string }> | undefined
-  /** Initial permission mode: 'default' (chat) | 'auto' (task). */
+  /** Initial permission mode: Auto (a chat) | 'auto' (a task, shown as Don't Ask). */
   defaultMode?: string
   /** Seed for the owned chatId state. chat: urlChatId; task: run.chat_id. */
   initialChatId?: string | null
@@ -38,30 +44,30 @@ export interface UseChatStreamOptions {
   onWarmupRefetch?: () => void
   /** Page tail after the common warmup_ready apply (chat: lock layer +
    * setWarmingUp(false) + navigate; task: setNeedsWarmup). */
-  onWarmupReadyExtra?: (data: any) => void
+  onWarmupReadyExtra?: (data: WarmupReadyFrame) => void
   /** Page tail inside warmup_started, after setChatId (chat: refetchChats). */
-  onWarmupStartedExtra?: (data: any) => void
+  onWarmupStartedExtra?: (data: WarmupStartedFrame) => void
   /** pre_warmup_ready tail (chat: stash preWarmedRef). */
-  onPreWarmupReady?: (data: any) => void
+  onPreWarmupReady?: (data: PreWarmupReadyFrame) => void
   /** Whether a warmup is currently in flight — drives onError's optimistic
    * bubble removal (chat: warmingUp state; task: false). */
   isWarmingUp?: boolean
   /** onError page tail when isWarmingUp (chat: reset warmup state + pending refs). */
   onWarmupReset?: () => void
   /** onError page tail, always (task: setChatReady(true)). */
-  onErrorExtra?: () => void
+  onErrorExtra?: (message: string) => void
   /** onWarmupFailed page tail (chat: reset warmup state; task: setChatReady(true)). */
-  onWarmupFailedReset?: () => void
+  onWarmupFailedReset?: (data: WarmupFailedFrame) => void
   /** On warmup_failed with an empty message list, append a standalone error
    * message (task: true — the run may have no optimistic bubble). chat leaves
    * the empty chat untouched (false/omitted). */
   appendErrorOnEmptyWarmupFail?: boolean
   /** title_updated tail (chat: refetchChats). */
   onTitleUpdated?: () => void
-  /** move_chat ack for the VIEWED chat (the hook drops acks for any other) —
-   * the page re-resumes it so the fresh warmup runs on the new target and
-   * the "moved" history card arrives. */
-  onChatMoved?: (data: { chat_id: string; new_target: string; resolved_label?: string }) => void
+  /** chat_moved for the VIEWED chat (the hook drops frames for any other):
+   * a move's outcome, broadcast to every tab that sees the chat. The page
+   * re-resumes it so the next warmup runs where it went. */
+  onChatMoved?: (data: ChatMovedFrame) => void
   /** chat_view_only for the VIEWED chat: a phone call drives it (read-only
    * history until the call ends); null when the chat is its own again. */
   onChatViewOnly?: (data: { chat_id: string; kind: string } | null) => void
@@ -80,13 +86,13 @@ export interface UseChatStreamOptions {
   // --- Chat-history tails ---
   /** Early restore from chat_history that the hook doesn't own (chat: restore
    * chatActiveLayer + model from execution_path). */
-  onChatHistoryMeta?: (data: any) => void
+  onChatHistoryMeta?: (data: ChatHistoryFrame | ChatHistoryDeltaFrame) => void
   /** The viewed chat's stored execution mode: the ack of a terminal pick or
    *  the echo of a refused one. */
   onExecutionModeChanged?: (executionMode: string) => void
   /** Fires after chat_history is applied (chat: deferred find-bar; task:
    * setChatReady(true)). */
-  onChatHistoryLoaded?: (data: any) => void
+  onChatHistoryLoaded?: (data: ChatHistoryFrame) => void
 
   // --- Turn-done tails ---
   /** Fires at turn end with the ping gate inputs (chat: play ping when not in
@@ -105,7 +111,7 @@ export interface UseChatStreamOptions {
   isViewedChatPtyLive?: () => boolean
 
   // --- Notifications (page-owned; AgentChat / useChatNotifications) ---
-  onNotification?: (data: any) => void
-  onNotificationSilent?: (data: any) => void
-  onNotificationCount?: (data: any) => void
+  onNotification?: (data: NotificationFrame) => void
+  onNotificationSilent?: (data: NotificationSilentFrame) => void
+  onNotificationCount?: (data: NotificationCountFrame) => void
 }

@@ -9,13 +9,17 @@ import { useDashboardWs } from '../../hooks/useDashboardWs'
 import AppFrame from '../../components/apps/AppFrame'
 import AppMenu from '../../components/apps/AppMenu'
 import { RollbackConfirm, RollbackNotice, UnpinConfirm } from '../../components/apps/AppsOverlay'
-import AppApprovalCard, { appNeedsApproval } from '../../components/apps/AppApprovalCard'
+import AppApprovalCard from '../../components/apps/AppApprovalCard'
 import AppDeployCard from '../../components/apps/AppDeployCard'
 import AppLogsPanel from '../../components/apps/AppLogsPanel'
 import AppSettingsPanel from '../../components/apps/AppSettingsPanel'
 import SharePopover from '../../components/sharing/SharePopover'
 import { GRANTEE_KIND, useHideShare, usePatchShare } from '../../api/shares'
 import { toastError } from '../../lib/http/apiJson'
+import { appNeedsApproval } from '../../components/apps/AppApprovalCard.helpers'
+import Button from '../../components/ui/Button'
+import { CARD } from '../../components/ui/classes'
+import { Input } from '../../components/ui/Field'
 
 /**
  * /apps/:appId — one app full screen. Every app has this URL: the menu's
@@ -68,14 +72,28 @@ export default function AppPage() {
   const [preview, setPreview] = useState(false)
   // `?preview=1` from preview_app's own URL: the working copy, for whoever
   // may manage the row (everyone else keeps the live release).
-  useEffect(() => {
-    if (searchParams.get('preview') === '1' && canManage) setPreview(true)
-  }, [searchParams, canManage])
+  const previewAsked = searchParams.get('preview') === '1' && canManage
+  const [previewAsking, setPreviewAsking] = useState(false)
+  if (previewAsking !== previewAsked) {
+    setPreviewAsking(previewAsked)
+    if (previewAsked) setPreview(true)
+  }
+  // `?share=1` opens the share popover on the tab it names, with the
+  // provider's reason when the confirm came back refused; the params are
+  // dropped once read.
+  const shareAsked = searchParams.get('share') === '1' && canManage
+    ? `${searchParams.get('tab') ?? ''}|${searchParams.get('confirm_error') ?? ''}` : null
+  const [shareAsking, setShareAsking] = useState<string | null>(null)
+  if (shareAsking !== shareAsked) {
+    setShareAsking(shareAsked)
+    if (shareAsked !== null) {
+      setShareTab(searchParams.get('tab') === 'link' ? 'link' : 'people')
+      setShareError(searchParams.get('confirm_error') || '')
+      setSharing(true)
+    }
+  }
   useEffect(() => {
     if (searchParams.get('share') !== '1' || !canManage) return
-    setShareTab(searchParams.get('tab') === 'link' ? 'link' : 'people')
-    setShareError(searchParams.get('confirm_error') || '')
-    setSharing(true)
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev)
       next.delete('share')
@@ -102,9 +120,11 @@ export default function AppPage() {
   const home = !app ? '/' : member ? `/chat/${app.agent}` : app.placement ? `/chat/${app.placement.agent}` : '/'
   const hideForViewer = () => {
     if (!app) return
-    if (app.placement) hideShare.mutate({ id: app.placement.share_id, agent: app.placement.agent })
-    else if (app.share_id) hideShare.mutate({ id: app.share_id })
-    else hideForMe.mutate(app.id)
+    // The page leaves at once: a refusal shows as a toast there.
+    const hidden = toastError('The app was not hidden')
+    if (app.placement) hideShare.mutateAsync({ id: app.placement.share_id, agent: app.placement.agent }).catch(hidden)
+    else if (app.share_id) hideShare.mutateAsync({ id: app.share_id }).catch(hidden)
+    else hideForMe.mutateAsync(app.id).catch(hidden)
     navigate(home)
   }
   const onSendPrompt = useCallback(
@@ -118,47 +138,44 @@ export default function AppPage() {
 
   if (isLoading) {
     return (
-      <div className="flex h-screen-safe items-center justify-center bg-p-bg text-sm text-p-text-light">
+      <div className="flex h-screen-safe items-center justify-center bg-surface-page text-sm text-tertiary">
         Loading…
       </div>
     )
   }
   if (!app) {
     return (
-      <div className="flex h-screen-safe flex-col items-center justify-center gap-3 bg-p-bg px-6 text-center">
-        <p className="text-sm font-medium text-p-text-secondary">This app is not available.</p>
-        <p className="max-w-sm text-xs text-p-text-light">
+      <div className="flex h-screen-safe flex-col items-center justify-center gap-3 bg-surface-page px-6 text-center">
+        <p className="text-sm font-medium text-secondary">This app is not available.</p>
+        <p className="max-w-sm text-xs text-tertiary">
           It may have been unpinned, or it is not shared with you.
         </p>
-        <button
-          onClick={() => navigate('/')}
-          className="rounded-md border border-p-border-light px-3 py-1.5 text-xs font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
-        >
+        <Button size="xs" onClick={() => navigate('/')}>
           Back to OtoDock
-        </button>
+        </Button>
       </div>
     )
   }
 
   const title = app.title || app.slug
   return (
-    <div className="flex h-screen-safe flex-col overflow-clip bg-p-bg">
+    <div className="flex h-screen-safe flex-col overflow-clip bg-surface-page">
       <header
-        className="flex shrink-0 items-center gap-2 border-b border-p-border-light/60 px-2 py-1.5"
+        className="flex shrink-0 items-center gap-2 border-b border-subtle px-2 py-1.5"
         style={{ paddingTop: 'max(0.375rem, env(safe-area-inset-top))' }}
       >
         <button
           onClick={() => navigate(home)}
           aria-label="Back to the agent"
           title="Back to the agent"
-          className="flex h-7 w-7 items-center justify-center rounded-full text-p-text-secondary transition-colors hover:bg-p-surface-hover hover:text-p-text"
+          className="flex h-7 w-7 items-center justify-center rounded-full text-secondary transition-colors hover:bg-surface-hover hover:text-primary"
         >
           <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
           </svg>
         </button>
-        <h1 className="min-w-0 flex-1 truncate text-sm font-medium text-p-text">{title}</h1>
-        <span className={`hidden text-[10px] uppercase tracking-wide sm:inline ${app.granted || app.placement ? 'text-p-accent-teal' : app.scope === 'shared' ? 'text-p-accent-purple' : 'text-brand'}`}>
+        <h1 className="min-w-0 flex-1 truncate text-sm font-medium text-primary">{title}</h1>
+        <span className={`hidden text-3xs uppercase tracking-wide sm:inline ${app.granted || app.placement ? 'text-status-info-fg' : app.scope === 'shared' ? 'text-accent-agent-fg' : 'text-link'}`}>
           {app.granted || app.placement ? 'shared with you' : app.scope === 'shared' ? 'shared' : 'personal'}
         </span>
         <AppMenu
@@ -177,32 +194,35 @@ export default function AppPage() {
         />
       </header>
       {confirmDelete && (
-        <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-red-500/40 bg-red-500/5 px-3 py-2.5 text-xs" data-testid="app-delete-confirm">
-          <span className="text-p-text">
+        <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-card border border-status-danger-border bg-status-danger-bg px-3 py-2.5 text-xs" data-testid="app-delete-confirm">
+          <span className="text-primary">
             Delete “{title}” with its data? The app, its releases and its database are removed
             for good. The folder goes to the recover bin. Type <code className="font-mono">{app.slug}</code> to confirm.
           </span>
-          <input
+          <Input
+            compact
             value={deleteTyped}
             onChange={(e) => setDeleteTyped(e.target.value)}
             placeholder={app.slug}
-            aria-label="Type the app's slug to confirm"
-            className="w-36 rounded-md border border-p-border-light bg-p-bg px-2 py-1 font-mono text-p-text"
+            aria-label="Type the app's ID to confirm"
+            className="max-w-36 font-mono"
           />
           <div className="ml-auto flex shrink-0 items-center gap-2">
-            <button
+            <Button
+              variant="danger"
+              size="xs"
               disabled={deleteTyped.trim().toLowerCase() !== app.slug || purge.isPending}
-              onClick={() => { setConfirmDelete(false); purge.mutate({ appId: app.id, confirm: deleteTyped.trim() }); navigate(`/chat/${app.agent}`) }}
-              className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700 disabled:opacity-50"
+              onClick={() => {
+                setConfirmDelete(false)
+                purge.mutateAsync({ appId: app.id, confirm: deleteTyped.trim() }).catch(toastError('The app was not deleted'))
+                navigate(`/chat/${app.agent}`)
+              }}
             >
               Delete app and its data
-            </button>
-            <button
-              onClick={() => setConfirmDelete(false)}
-              className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
-            >
+            </Button>
+            <Button size="xs" onClick={() => setConfirmDelete(false)}>
               Cancel
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -233,17 +253,23 @@ export default function AppPage() {
       {confirmUnpin && (
         <UnpinConfirm
           app={app}
-          onConfirm={() => { setConfirmUnpin(false); unpin.mutate(app.id); navigate(`/chat/${app.agent}`) }}
+          onConfirm={() => {
+            setConfirmUnpin(false)
+            unpin.mutateAsync(app.id).catch(toastError('The app was not unpinned'))
+            navigate(`/chat/${app.agent}`)
+          }}
           onCancel={() => setConfirmUnpin(false)}
         />
       )}
       {confirmRemove && app.placement?.kind === GRANTEE_KIND.PERSON && app.placement.share_id === confirmRemove && (
-        <div className="mx-3 mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-p-border-light bg-p-surface px-3 py-2.5 text-xs" data-testid="app-remove-confirm">
-          <span className="text-p-text">
+        <div className={`mx-3 mt-2 flex flex-wrap items-center gap-2 px-3 py-2.5 text-xs ${CARD}`} data-testid="app-remove-confirm">
+          <span className="text-primary">
             Remove “{title}” from your apps? {app.placement.shared_by_name || 'The person who shared it'} can share it again.
           </span>
           <div className="ml-auto flex shrink-0 items-center gap-2">
-            <button
+            <Button
+              variant="danger"
+              size="xs"
               onClick={() => {
                 setConfirmRemove(null)
                 // The page leaves at once: a refusal shows as a toast there.
@@ -251,16 +277,12 @@ export default function AppPage() {
                   .catch(toastError(`“${title}” was not removed`))
                 navigate(home)
               }}
-              className="rounded-md bg-red-600 px-2.5 py-1 font-medium text-white transition-colors hover:bg-red-700"
             >
               Remove for me
-            </button>
-            <button
-              onClick={() => setConfirmRemove(null)}
-              className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface-hover"
-            >
+            </Button>
+            <Button size="xs" onClick={() => setConfirmRemove(null)}>
               Cancel
-            </button>
+            </Button>
           </div>
         </div>
       )}

@@ -16,11 +16,12 @@ import time
 from aiohttp import web
 
 import config
-from telephony.ami_client import AMIClient, AMIError
+from background import spawn
 from calls import pin_failures
 from calls.call_manager import CallManager, CallStatus
 from calls.call_registry import registry as call_registry
 from config_manager import ConfigManager
+from telephony.ami_client import AMIClient, AMIError
 from validation import ValidationError, validate_outbound_call, validate_register
 
 logger = logging.getLogger("http_api")
@@ -130,7 +131,7 @@ class OutboundCallAPI:
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.cfg.http_api_host, port)
         await site.start()
-        logger.info(f"HTTP API listening on port {port}")
+        logger.info("HTTP API listening on port %s", port)
         # Both call surfaces are fail-closed: a missing secret rejects (401), it
         # does not open the endpoint. Warn loudly so a misprovisioned install is
         # visible rather than silently rejecting every call.
@@ -176,7 +177,7 @@ class OutboundCallAPI:
 
         try:
             body = await request.json()
-        except Exception:
+        except (ValueError, LookupError):
             return web.json_response({"error": "invalid JSON"}, status=400)
 
         try:
@@ -206,7 +207,7 @@ class OutboundCallAPI:
         """
         try:
             body = await request.json()
-        except Exception:
+        except (ValueError, LookupError):
             return web.json_response(
                 {"error": "invalid JSON"}, status=400,
             )
@@ -283,9 +284,11 @@ class OutboundCallAPI:
         # 2026-08-14 live test burned an hour proving a misconfigured MCP
         # instance had picked the FreePBX route instead of the Twilio one.
         logger.info(
-            f"Call {call.call_id}: route {route.id or '(default)'} "
-            f"(server {getattr(route, 'phone_server_id', None)}, "
-            f"{'twilio' if twilio_server else 'ami'})"
+            "Call %s: route %s "
+            "(server %s, "
+            "%s)",
+            call.call_id, route.id or '(default)', getattr(route, 'phone_server_id', None),
+            'twilio' if twilio_server else 'ami'
         )
         try:
             if twilio_server:
@@ -294,8 +297,8 @@ class OutboundCallAPI:
                 self.call_manager.update_status(call.call_id, CallStatus.DIALING)
             else:
                 await self._originate_call(call.call_id, route)
-        except Exception as e:
-            logger.error(f"Originate failed for {call.call_id}: {e}")
+        except Exception as e:  # noqa: BLE001  # the dialer answers 502 whatever Twilio or the AMI link raised
+            logger.error("Originate failed for %s: %s", call.call_id, e)
             self.call_manager.update_status(
                 call.call_id, CallStatus.FAILED, error=str(e),
             )
@@ -308,10 +311,11 @@ class OutboundCallAPI:
             return web.json_response(call.to_dict(), status=502)
 
         # Start dial timeout watchdog
-        asyncio.create_task(
+        spawn(
             self._dial_timeout_watchdog(
                 call.call_id, timeout=75.0 if twilio_server else 45.0,
-            )
+            ),
+            name="dial_timeout", owner="calls",
         )
 
         if wait:
@@ -363,7 +367,7 @@ class OutboundCallAPI:
 
         try:
             body = await request.json()
-        except Exception:
+        except (ValueError, LookupError):
             return web.json_response({"error": "invalid JSON"}, status=400)
 
         answer = body.get("answer")
@@ -474,19 +478,19 @@ class OutboundCallAPI:
         try:
             ws_ok = await client.connect()
             if not ws_ok:
-                logger.warning(f"Caller pre-warmup: WS connect failed for call {call_id}")
+                logger.warning("Caller pre-warmup: WS connect failed for call %s", call_id)
                 return
 
             # Step 1: Warmup session
             session_id = await client.warmup_session()
             if not session_id:
-                logger.warning(f"Caller pre-warmup: warmup failed for call {call_id}")
+                logger.warning("Caller pre-warmup: warmup failed for call %s", call_id)
                 return
 
             call.warmup_session_id = session_id
             logger.info(
-                f"Caller session pre-warmed for call {call_id} "
-                f"(session={session_id})"
+                "Caller session pre-warmed for call %s "
+                "(session=%s)", call_id, session_id
             )
 
             # Step 2: Pre-generate the opening text via LLM
@@ -534,16 +538,16 @@ class OutboundCallAPI:
                 call.warmup_client = client
                 stored = True
                 logger.debug(
-                    f"Pre-generated opening for call {call_id} "
-                    f"({len(clean)} chars): {clean[:100]}..."
+                    "Pre-generated opening for call %s "
+                    "(%s chars): %s...", call_id, len(clean), clean[:100]
                 )
             else:
                 logger.warning(
-                    f"Pre-generated opening was empty for call {call_id}"
+                    "Pre-generated opening was empty for call %s", call_id
                 )
 
-        except Exception as e:
-            logger.warning(f"Caller warmup/opening error: {e}")
+        except Exception as e:  # noqa: BLE001  # the caller warmup runs as a background task: its error would vanish
+            logger.warning("Caller warmup/opening error: %s", e)
         finally:
             # If the client wasn't handed to the call (failure / empty opening /
             # cancellation), close it so the proxy session + socket don't leak.
@@ -591,7 +595,7 @@ class OutboundCallAPI:
         await asyncio.sleep(timeout)
         call = self.call_manager.get_call(call_id)
         if call and call.status == CallStatus.DIALING:
-            logger.warning(f"Call {call_id} dial timeout ({timeout}s) — no answer")
+            logger.warning("Call %s dial timeout (%ss) — no answer", call_id, timeout)
             self.call_manager.update_status(
                 call_id, CallStatus.FAILED,
                 error="no answer (dial timeout)",

@@ -61,7 +61,7 @@ describe('handleAddFolder', () => {
     expect(reserveMock).toHaveBeenCalledWith('ag', 'mesitis', expect.any(AbortSignal))
     expect(chip()).toMatchObject({
       fileCount: 2, size: 7, uploading: false, filesDone: 2,
-      uploadedPath: 'users/u/workspace/uploads/files/mesitis', note: '1 folder left out (.git)',
+      uploadedPath: 'users/u/workspace/uploads/files/mesitis', note: '1 folder left out: .git',
     })
   })
 

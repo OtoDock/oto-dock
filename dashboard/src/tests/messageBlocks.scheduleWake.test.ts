@@ -56,4 +56,18 @@ describe('schedule_wake history replay', () => {
       ['text'], ['schedulewake', 'text'], ['schedulewake', 'text'],
     ])
   })
+
+  it("the platform's resume after the agent's move keeps its source", () => {
+    const msgs = dbMessagesToDisplay(
+      [
+        row('assistant', 'Moving to drill-sat.'),
+        row('event', '', 'schedule_wake', { prompt: 'You now run on drill-sat. Continue the work.', source: 'move' }),
+        row('assistant', 'Picked up on drill-sat.'),
+      ],
+      [],
+    )
+    expect(msgs[1].blocks[0]).toEqual({
+      type: 'schedulewake', prompt: 'You now run on drill-sat. Continue the work.', source: 'move',
+    })
+  })
 })

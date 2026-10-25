@@ -10,6 +10,8 @@ import { useState } from 'react'
 import { useAuth } from '../../contexts/AuthContext'
 import { isAdmin } from '../../lib/permissions'
 import { RELEASE_BANNER_DISMISSED, UPGRADE_GUIDE_URL, useReleaseNotice } from './releaseNotice'
+import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT } from '../ui/classes'
+import { BANNER_STRIP, BANNER_TONE } from './bannerStrip'
 
 function readDismissed(): string {
   try { return localStorage.getItem(RELEASE_BANNER_DISMISSED) ?? '' } catch { return '' }
@@ -29,16 +31,16 @@ export function ReleaseBanner() {
   }
 
   return (
-    <div role="status" className="bg-brand/10 dark:bg-brand/15 border-b border-brand/30 px-4 py-2.5 flex items-start justify-between gap-3 relative z-50">
-      <div className="flex items-start gap-2 text-sm text-p-text min-w-0">
-        <svg className="w-4 h-4 shrink-0 mt-0.5 text-brand" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+    <div role="status" className={`${BANNER_STRIP} ${BANNER_TONE.info}`}>
+      <div className="flex items-start gap-2 text-sm text-primary min-w-0">
+        <svg className="w-4 h-4 shrink-0 mt-0.5 text-status-info-fg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v12m0 0l-4-4m4 4l4-4M4 20h16" />
         </svg>
         <span>
           <strong>OtoDock {data.latest} is available.</strong>{' '}
           This install runs {data.running || 'an unknown version'}.{' '}
           {data.url && (
-            <a href={data.url} target="_blank" rel="noopener noreferrer" className="underline text-brand hover:text-brand-hover">
+            <a href={data.url} target="_blank" rel="noopener noreferrer" className="underline font-medium text-status-info-fg">
               Release notes
             </a>
           )}
@@ -49,7 +51,7 @@ export function ReleaseBanner() {
           href={UPGRADE_GUIDE_URL}
           target="_blank"
           rel="noopener noreferrer"
-          className="px-3 py-1 text-xs font-medium rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors"
+          className={`${BUTTON_BASE} ${BUTTON_VARIANT.primary} ${BUTTON_SIZE.xs}`}
         >
           How to upgrade
         </a>
@@ -57,7 +59,7 @@ export function ReleaseBanner() {
           type="button"
           onClick={dismiss}
           aria-label="Dismiss"
-          className="p-1 rounded text-p-text-secondary hover:bg-brand/10"
+          className="p-1 rounded-control text-secondary hover:bg-surface-hover hover:text-primary"
         >
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />

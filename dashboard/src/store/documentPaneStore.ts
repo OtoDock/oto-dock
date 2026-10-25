@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { createJSONStorage, persist } from 'zustand/middleware'
+import { isRecord } from '../lib/json/guards'
 
 /**
  * The document pane's state per chat (FEATURES.md "Document pane"): which
@@ -324,17 +325,18 @@ export function notePushedDocument(chatId: string, doc: PushedDocument): void {
 
 /** A pushed frame from the wire (`document_preview`, or a terminal chat's
  * `pty_artifact` event). */
-export function pushedDocumentFromFrame(evt: any): PushedDocument | null {
-  if (!evt?.file_id) return null
+export function pushedDocumentFromFrame(evt: unknown): PushedDocument | null {
+  const e = isRecord(evt) ? evt : {}
+  if (!e.file_id) return null
   return {
-    fileId: evt.file_id,
-    filename: evt.filename || '',
-    wopiUrl: evt.wopi_url || '',
-    accessToken: evt.access_token || undefined,
-    accessTokenTtl: evt.access_token_ttl || undefined,
-    downloadUrl: evt.download_url || '',
-    snapshotId: evt.snapshot_id || undefined,
-    version: evt.version || undefined,
-    generation: typeof evt.generation === 'number' && evt.generation > 0 ? evt.generation : Date.now(),
+    fileId: String(e.file_id),
+    filename: String(e.filename || ''),
+    wopiUrl: String(e.wopi_url || ''),
+    accessToken: e.access_token ? String(e.access_token) : undefined,
+    accessTokenTtl: Number(e.access_token_ttl) || undefined,
+    downloadUrl: String(e.download_url || ''),
+    snapshotId: e.snapshot_id ? String(e.snapshot_id) : undefined,
+    version: Number(e.version) || undefined,
+    generation: typeof e.generation === 'number' && e.generation > 0 ? e.generation : Date.now(),
   }
 }

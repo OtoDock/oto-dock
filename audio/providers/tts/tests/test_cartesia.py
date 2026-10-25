@@ -84,3 +84,34 @@ def test_repr_redacts_api_key():
     r = repr(tts)
     assert "super-secret-token" not in r
     assert "v-en" in r
+
+
+class _Ctx:
+    """The SDK context's surface the provider drives."""
+
+    def __init__(self):
+        self.pushed = []
+        self.sent = []
+        self.ended = 0
+
+    async def push(self, text):
+        self.pushed.append(text)
+
+    async def send(self, **kw):
+        self.sent.append(kw)
+
+    async def no_more_inputs(self):
+        self.ended += 1
+
+
+async def test_flush_is_the_base_no_op():
+    # Cartesia keeps the base no-op flush: it starts generating at closing
+    # punctuation, and a vendor error on an empty-transcript flush would end
+    # the context and silence the rest of the reply.
+    tts = CartesiaTTS(api_key="x", voice_id="v-en")
+    tts._ctx = _Ctx()
+    await tts.send_text_chunk("Goodbye.")
+    await tts.flush()
+    assert tts._ctx.sent == [] and tts._ctx.pushed == ["Goodbye."]
+    await tts.send_text_chunk("Thanks.", is_last=True)
+    assert tts._ctx.ended == 1

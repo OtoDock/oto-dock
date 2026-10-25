@@ -2,8 +2,8 @@
 
 ``resolve_under`` follows symlinks and confines the RESULT; ``join_under``
 is lexical (never touches the filesystem) and refuses anything that lands on
-or above the root; ``safe_agent_dir`` is ``config.get_agent_dir`` behind
-that lexical gate.
+or above the root; ``config.get_agent_dir`` joins an agent name behind that
+lexical gate.
 """
 
 import os
@@ -13,7 +13,10 @@ import pytest
 
 import config
 from services.infra.path_confinement import (
-    PathOutsideRoot, join_under, normalize_rel_path, resolve_under, safe_agent_dir,
+    PathOutsideRoot,
+    join_under,
+    normalize_rel_path,
+    resolve_under,
 )
 
 
@@ -66,12 +69,16 @@ def test_join_under_does_not_follow_symlinks(tmp_path):
     assert join_under(root, "up", "x") == root / "up" / "x"
 
 
-def test_safe_agent_dir_matches_config_and_refuses_escape(monkeypatch, tmp_path):
+def test_get_agent_dir_joins_a_slug_and_refuses_anything_else(monkeypatch, tmp_path):
+    """Every slug a released install can have joins as ``AGENTS_DIR / name``
+    always did (no shape rule beyond one segment); an empty, absolute,
+    multi-segment or escaping name is refused before any path is built."""
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
-    assert safe_agent_dir("my-agent") == config.get_agent_dir("my-agent")
-    for bad in ("", "..", "../other", "/tmp/x", "a/../.."):
+    for slug in ("my-agent", "My_Agent.v2", "x" * 90, "agent.."):
+        assert config.get_agent_dir(slug) == tmp_path / "agents" / slug
+    for bad in ("", ".", "..", "../other", "/tmp/x", "a/../..", "a/b", "a\\b", "x/.."):
         with pytest.raises(PathOutsideRoot):
-            safe_agent_dir(bad)
+            config.get_agent_dir(bad)
 
 
 def test_normalize_rel_path_is_the_segment_guard():
@@ -89,3 +96,23 @@ def test_normalize_rel_path_is_the_segment_guard():
     assert normalize_rel_path("/workspace/x") != "/workspace/x"
     # Unlike join_under, an interior ``..`` is refused, not collapsed.
     assert join_under("/root", "a/../b") == Path("/root/b")
+
+
+def test_a_name_that_cannot_be_an_agent_folder_answers_404_not_500():
+    """An admin passes ``require_agent_access`` for any string; a name the
+    barrier refuses then reaches no folder and the app answers 404."""
+    from fastapi.testclient import TestClient
+
+    from app import app
+    from auth import roles
+    from auth.providers import UserContext, get_current_user
+    admin = UserContext(sub="user-admin", email="a@t.com", name="A", role=roles.ADMIN, agents=[])
+    app.dependency_overrides[get_current_user] = lambda: admin
+    try:
+        client = TestClient(app)
+        for bad in ("../x", "..", "a/b", ""):
+            r = client.post("/v1/media/token", json={"agent": bad, "path": "workspace/a.mp4"})
+            assert r.status_code == 404, (bad, r.status_code, r.text)
+            assert r.json()["detail"] == "Agent not found"
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)

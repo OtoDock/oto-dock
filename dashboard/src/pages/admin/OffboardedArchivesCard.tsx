@@ -1,7 +1,13 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '../../api/auth'
-import { SavedBadge, formatBytes } from './PlatformPage.shared'
+import { SaveState, SettingRow } from '../../components/ui/SettingsControls'
+import type { SaveStatus } from '../../hooks/useSaveState'
+import { formatBytes } from './PlatformPage.format'
+import { apiJson, withMessage } from '../../lib/http/apiJson'
+import { useDialogs } from '../../components/ui/dialogs'
+import { Input } from '../../components/ui/Field'
+import { CARD } from '../../components/ui/classes'
 
 // The archive of removed people (Setup → System Settings): when a person is
 // deleted, their folders on every agent move into the archive. The sweep
@@ -28,9 +34,7 @@ function useOffboardedArchives() {
   return useQuery({
     queryKey: ['offboarded-archives'],
     queryFn: async (): Promise<OffboardedList> => {
-      const res = await apiFetch('/v1/admin/offboarded')
-      if (!res.ok) throw new Error('Failed to list the archive')
-      return res.json()
+      return apiJson<OffboardedList>('/v1/admin/offboarded').catch(withMessage('Could not load the archive. Try again in a minute.'))
     },
   })
 }
@@ -38,17 +42,18 @@ function useOffboardedArchives() {
 const day = (iso: string) => (iso ? new Date(iso).toLocaleDateString() : '')
 
 export default function OffboardedArchivesCard({
-  enabled, days, onEnabledChange, onDaysChange, onSaveDays, savedField, daysError, forcedKeys,
+  enabled, days, onEnabledChange, onDaysChange, onSaveDays, stateOf, forcedKeys,
 }: {
   enabled: boolean
   days: string
   onEnabledChange: (v: boolean) => void
   onDaysChange: (v: string) => void
   onSaveDays: () => void
-  savedField: string
-  daysError: string | null
+  /** The tab's save state per setting (`useSaveState().stateOf`). */
+  stateOf: (key: string) => SaveStatus
   forcedKeys: string[]
 }) {
+  const dialogs = useDialogs()
   const qc = useQueryClient()
   const { data, isLoading, error } = useOffboardedArchives()
   const [notice, setNotice] = useState<string | null>(null)
@@ -56,11 +61,11 @@ export default function OffboardedArchivesCard({
     mutationFn: async (username: string) => {
       const res = await apiFetch(`/v1/admin/offboarded/${encodeURIComponent(username)}`, { method: 'DELETE' })
       const body = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(body.detail || 'Purge failed')
+      if (!res.ok) throw new Error(body.detail || 'The archive was not deleted. Try again.')
       return body as { username: string; bytes: number }
     },
     onSuccess: (r) => {
-      setNotice(`Deleted the archive of ${r.username} (${formatBytes(r.bytes)})`)
+      setNotice(`Deleted the archive of ${r.username}. It freed ${formatBytes(r.bytes)}.`)
       qc.invalidateQueries({ queryKey: ['offboarded-archives'] })
       qc.invalidateQueries({ queryKey: ['storage-usage'] })
     },
@@ -68,93 +73,97 @@ export default function OffboardedArchivesCard({
   })
   // Each row's "deleted after" date follows the settings: re-read the list
   // once a change to them is saved.
+  const settingsSaved = stateOf('offboarded_retention_enabled') === 'saved'
+    || stateOf('offboarded_retention_days') === 'saved'
   useEffect(() => {
-    if (savedField === 'offboarded_retention_enabled' || savedField === 'offboarded_retention_days') {
-      qc.invalidateQueries({ queryKey: ['offboarded-archives'] })
-    }
-  }, [savedField, qc])
+    if (settingsSaved) qc.invalidateQueries({ queryKey: ['offboarded-archives'] })
+  }, [settingsSaved, qc])
   const enabledForced = forcedKeys.includes('offboarded_retention_enabled')
   const daysForced = forcedKeys.includes('offboarded_retention_days')
 
   return (
-    <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-5 space-y-5">
-      <h3 className="text-sm font-semibold text-p-text">Archive of removed people</h3>
+    <div className={`${CARD} p-5 space-y-5`}>
+      <h3 className="text-sm font-semibold text-primary">Archive of removed people</h3>
 
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex-1">
-          <label className="block text-sm font-medium text-p-text mb-0.5">Delete old archives</label>
-          <p className="text-xs text-p-text-light">
-            When a person is removed, their folders on every agent move into an archive only an
-            admin reaches. With this on, the daily cleanup deletes an archive once it is older
-            than the period below.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            aria-label="Delete old archives"
-            checked={enabled}
-            disabled={enabledForced}
-            onChange={(e) => onEnabledChange(e.target.checked)}
-            className="h-4 w-4 text-brand rounded-sm focus:ring-2 focus:ring-brand/30"
-          />
-          <SavedBadge show={savedField === 'offboarded_retention_enabled'} />
-        </div>
-      </div>
+      <SettingRow
+        label="Delete old archives"
+        htmlFor="offboarded-retention-enabled"
+        save={stateOf('offboarded_retention_enabled')}
+        description="With this on, the daily cleanup deletes archives older than the period below."
+        info={<>
+          When a person is removed, their folders on every agent move into an archive.
+          Only an admin can reach it.
+        </>}
+      >
+        <input
+          id="offboarded-retention-enabled"
+          type="checkbox"
+          aria-label="Delete old archives"
+          checked={enabled}
+          disabled={enabledForced}
+          onChange={(e) => onEnabledChange(e.target.checked)}
+          className="h-4 w-4 accent-action"
+        />
+      </SettingRow>
 
       <div className="flex items-center justify-between gap-4">
         <div className="flex-1 min-w-0">
-          <label className="block text-sm font-medium text-p-text mb-0.5">Keep archives for (days)</label>
-          <p className="text-xs text-p-text-light">0 keeps every archive for ever.</p>
-          {daysError && <p className="text-xs text-p-accent-red mt-0.5">{daysError}</p>}
+          <p className="text-sm font-medium text-primary mb-0.5">
+            <label>Days to keep archives</label><SaveState state={stateOf('offboarded_retention_days')} />
+          </p>
+          <p className="text-xs text-tertiary">0 keeps every archive for ever.</p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <input
+          <Input
             type="number"
-            aria-label="Keep archives for (days)"
+            aria-label="Days to keep archives"
             value={days}
             onChange={(e) => onDaysChange(e.target.value)}
             onBlur={onSaveDays}
             min={0}
             max={3650}
             disabled={!enabled || daysForced}
-            className="w-20 px-2 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 text-right disabled:opacity-50"
+            className="max-w-20 text-right"
           />
-          <SavedBadge show={savedField === 'offboarded_retention_days'} />
         </div>
       </div>
 
       <div>
-        <p className="text-sm font-medium text-p-text mb-2">Archived people</p>
+        <p className="text-sm font-medium text-primary mb-2">Archived people</p>
         {isLoading ? (
-          <p className="text-xs text-p-text-light">Loading…</p>
+          <p className="text-xs text-tertiary">Loading…</p>
         ) : error ? (
-          <p className="text-xs text-p-accent-red">{(error as Error).message}</p>
+          <p className="text-xs text-status-danger-fg">{(error as Error).message}</p>
         ) : !data?.archives.length ? (
-          <p className="text-xs text-p-text-light">No archives.</p>
+          <p className="text-xs text-tertiary">No archives.</p>
         ) : (
-          <ul className="divide-y divide-p-border-light">
+          <ul className="divide-y divide-subtle">
             {data.archives.map((a) => (
               <li key={a.username} className="flex items-center justify-between gap-3 py-2 text-xs">
                 <div className="min-w-0">
-                  <p className="text-sm text-p-text truncate">{a.username}</p>
-                  <p className="text-p-text-light truncate">
+                  <p className="text-sm text-primary truncate">{a.username}</p>
+                  <p className="text-tertiary truncate">
                     {a.agents.length} agent folder{a.agents.length === 1 ? '' : 's'} · {a.bytes == null ? 'size unknown' : formatBytes(a.bytes)}
                     {a.archived_at ? ` · archived ${day(a.archived_at)}`
-                      : a.retired_at ? ' · still being archived' : ' · undated (the person was restored)'}
+                      : a.retired_at ? ' · still being archived' : ' · undated, the person was restored'}
                     {' · '}{a.purge_after ? `deleted after ${day(a.purge_after)}` : 'kept'}
                   </p>
                 </div>
                 <button
-                  onClick={() => {
-                    if (window.confirm(`Delete the archive of ${a.username} now? Their files on every agent go for good.`)) {
+                  onClick={async () => {
+                    if (await dialogs.confirm({
+                      title: `Delete the archive of ${a.username} now?`,
+                      body: 'Their files on every agent go for good.',
+                      confirmLabel: 'Delete',
+                      tone: 'danger',
+                    })) {
                       setNotice(null)
                       purge.mutate(a.username)
                     }
                   }}
                   disabled={purge.isPending}
                   aria-label={`Delete the archive of ${a.username} now`}
-                  className="shrink-0 px-2.5 py-1 text-xs font-medium border border-red-300 text-red-600 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-50"
+                  className="shrink-0 px-2.5 py-1 text-xs font-medium border border-status-danger-border text-status-danger-fg rounded-control hover:bg-status-danger-bg disabled:opacity-50"
                 >
                   Delete now
                 </button>
@@ -162,7 +171,7 @@ export default function OffboardedArchivesCard({
             ))}
           </ul>
         )}
-        {notice && <p className="text-xs text-p-text-secondary mt-2">{notice}</p>}
+        {notice && <p className="text-xs text-secondary mt-2">{notice}</p>}
       </div>
     </div>
   )

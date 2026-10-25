@@ -6,6 +6,10 @@ import { groupRunsBySession, getTaskTypeLabel, getTaskTypeStyle, formatTrigger, 
 import StatusBadge from '../components/StatusBadge'
 import { formatRelativeTime, formatDuration } from '../lib/format'
 import { RUN_STATUS } from '../lib/status/run'
+import { Select } from '../components/ui/Field'
+import Button from '../components/ui/Button'
+import { BADGE_BASE, BADGE_TONE, CARD } from '../components/ui/classes'
+import { PAGE_TITLE } from '../components/ui/classes'
 
 // The filter's options: every stored run status (the route accepts any).
 const STATUSES = ['', ...Object.values(RUN_STATUS)]
@@ -44,51 +48,51 @@ export default function History() {
 
   return (
     <div className="space-y-4">
-      <h1 className="text-xl font-bold text-p-text">Task History</h1>
+      <h1 className={PAGE_TITLE}>Task History</h1>
 
       {/* Filters */}
       <div className="flex gap-3 items-center flex-wrap">
-        <select
+        <Select
           value={agent}
           onChange={(e) => { setAgent(e.target.value); setOffset(0) }}
-          className="text-sm border border-p-border-light rounded-sm px-2 py-1 bg-white dark:bg-p-surface text-p-text"
+          className="sm:w-auto"
         >
           <option value="">All agents</option>
           {agentNames.map((a) => (
             <option key={a} value={a}>{a}</option>
           ))}
-        </select>
-        <select
+        </Select>
+        <Select
           value={status}
           onChange={(e) => { setStatus(e.target.value); setOffset(0) }}
-          className="text-sm border border-p-border-light rounded-sm px-2 py-1 bg-white dark:bg-p-surface text-p-text"
+          className="sm:w-auto"
         >
           {STATUSES.map((s) => (
             <option key={s} value={s}>{s || 'All statuses'}</option>
           ))}
-        </select>
-        <select
+        </Select>
+        <Select
           value={userFilter}
           onChange={(e) => { setUserFilter(e.target.value); setOffset(0) }}
-          className="text-sm border border-p-border-light rounded-sm px-2 py-1 bg-white dark:bg-p-surface text-p-text"
+          className="sm:w-auto"
         >
           <option value="">All users</option>
           {(users ?? []).map((u) => (
             <option key={u.sub} value={u.sub}>{u.name}</option>
           ))}
-        </select>
-        <span className="text-xs text-p-text-secondary ml-auto">{total} total</span>
+        </Select>
+        <span className="text-xs text-secondary ml-auto">{total} total</span>
       </div>
 
       {/* Desktop table */}
-      <div className="hidden md:block bg-white dark:bg-p-surface rounded-xl border border-p-border-light overflow-hidden">
+      <div className={`${CARD} hidden md:block overflow-hidden`}>
         {isLoading ? (
-          <p className="text-sm text-p-text-secondary px-4 py-6">Loading...</p>
+          <p className="text-sm text-secondary px-4 py-6">Loading...</p>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="bg-p-bg text-left text-xs text-p-text-secondary uppercase tracking-wide border-b border-p-border-light">
+                <tr className="text-left text-xs text-secondary uppercase tracking-wide border-b border-subtle">
                   <th className="px-4 py-3">Run</th>
                   <th className="px-4 py-3">Task</th>
                   <th className="px-4 py-3">Agent</th>
@@ -107,34 +111,34 @@ export default function History() {
                     <tr
                       key={group.key}
                       onClick={() => navigate(`/runs/${run.id}`)}
-                      className="border-b border-p-border-light hover:bg-p-surface-hover cursor-pointer"
+                      className="border-b border-subtle hover:bg-surface-hover cursor-pointer"
                     >
-                      <td className="px-4 py-3 font-mono text-xs text-p-text-light">{run.id.slice(-8)}</td>
+                      <td className="px-4 py-3 font-mono text-xs text-tertiary">{run.id.slice(-8)}</td>
                       <td className="px-4 py-3">
                         <span className="font-medium">{run.task_id}</span>
                         {group.turnCount > 1 && (
-                          <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded-sm text-xs bg-brand-100 text-brand">
+                          <span className={`${BADGE_BASE} ${BADGE_TONE.info} ml-2`}>
                             {group.turnCount} turns
                           </span>
                         )}
                       </td>
-                      <td className="px-4 py-3 text-p-text-secondary">{run.agent}</td>
+                      <td className="px-4 py-3 text-secondary">{run.agent}</td>
                       <td className="px-4 py-3">
-                        <span className={`inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium ${getTaskTypeStyle(run.task_type)}`}>
+                        <span className={`${BADGE_BASE} ${getTaskTypeStyle(run.task_type)}`}>
                           {getTaskTypeLabel(run.task_type)}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-p-text-secondary text-xs">
+                      <td className="px-4 py-3 text-secondary text-xs">
                         {formatTrigger(run.trigger_type, run.trigger_source)}
                       </td>
                       <td className="px-4 py-3"><StatusBadge status={group.latestStatus} /></td>
-                      <td className="px-4 py-3 text-p-text-secondary text-xs">
+                      <td className="px-4 py-3 text-secondary text-xs">
                         {run.started_at ? formatRelativeTime(run.started_at) : '\u2014'}
                       </td>
-                      <td className="px-4 py-3 text-p-text-secondary text-xs">
+                      <td className="px-4 py-3 text-secondary text-xs">
                         {group.totalDuration ? formatDuration(group.totalDuration) : '\u2014'}
                       </td>
-                      <td className="px-4 py-3 text-p-text-secondary text-xs">
+                      <td className="px-4 py-3 text-secondary text-xs">
                         {group.totalCost ? `$${group.totalCost.toFixed(4)}` : '\u2014'}
                       </td>
                     </tr>
@@ -145,39 +149,39 @@ export default function History() {
           </div>
         )}
         {!isLoading && groups.length === 0 && (
-          <p className="text-sm text-p-text-secondary px-4 py-6">No runs found.</p>
+          <p className="text-sm text-secondary px-4 py-6">No runs found.</p>
         )}
       </div>
 
       {/* Mobile cards */}
       <div className="md:hidden space-y-3">
-        {isLoading && <p className="text-sm text-p-text-secondary py-4">Loading...</p>}
-        {!isLoading && groups.length === 0 && <p className="text-sm text-p-text-secondary py-4">No runs found.</p>}
+        {isLoading && <p className="text-sm text-secondary py-4">Loading...</p>}
+        {!isLoading && groups.length === 0 && <p className="text-sm text-secondary py-4">No runs found.</p>}
         {groups.map((group) => {
           const run = group.representative
           return (
             <div
               key={group.key}
               onClick={() => navigate(`/runs/${run.id}`)}
-              className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4 cursor-pointer hover:shadow-xs transition-shadow"
+              className={`${CARD} p-4 cursor-pointer hover:shadow-elevation-2 transition-shadow`}
             >
               <div className="flex items-start justify-between mb-2">
                 <div>
-                  <p className="text-sm font-medium text-p-text">
+                  <p className="text-sm font-medium text-primary">
                     {run.task_id}
                     {group.turnCount > 1 && (
-                      <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded-sm text-xs bg-brand-100 text-brand">
+                      <span className={`${BADGE_BASE} ${BADGE_TONE.info} ml-2`}>
                         {group.turnCount} turns
                       </span>
                     )}
                   </p>
-                  <p className="text-xs text-p-text-secondary">{run.agent}</p>
+                  <p className="text-xs text-secondary">{run.agent}</p>
                 </div>
                 <StatusBadge status={group.latestStatus} />
               </div>
-              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-p-text-secondary">
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-secondary">
                 <span>
-                  <span className={`inline-flex items-center px-1.5 py-0.5 rounded-sm font-medium ${getTaskTypeStyle(run.task_type)}`}>
+                  <span className={`${BADGE_BASE} ${getTaskTypeStyle(run.task_type)}`}>
                     {getTaskTypeLabel(run.task_type)}
                   </span>
                 </span>
@@ -185,7 +189,7 @@ export default function History() {
                 {group.totalDuration > 0 && <span>{formatDuration(group.totalDuration)}</span>}
                 {group.totalCost > 0 && <span>${group.totalCost.toFixed(4)}</span>}
               </div>
-              <p className="text-xs text-p-text-light font-mono mt-1">{run.id.slice(-8)}</p>
+              <p className="text-xs text-tertiary font-mono mt-1">{run.id.slice(-8)}</p>
             </div>
           )
         })}
@@ -194,23 +198,25 @@ export default function History() {
       {/* Pagination */}
       {total > limit && (
         <div className="flex items-center gap-3 text-sm">
-          <button
+          <Button
+            variant="secondary"
+            size="xs"
             disabled={offset === 0}
             onClick={() => setOffset(Math.max(0, offset - limit))}
-            className="px-3 py-1 rounded-sm border border-p-border-light disabled:opacity-40"
           >
             Previous
-          </button>
-          <span className="text-p-text-secondary">
+          </Button>
+          <span className="text-secondary">
             {offset + 1}–{Math.min(offset + limit, total)} of {total}
           </span>
-          <button
+          <Button
+            variant="secondary"
+            size="xs"
             disabled={offset + limit >= total}
             onClick={() => setOffset(offset + limit)}
-            className="px-3 py-1 rounded-sm border border-p-border-light disabled:opacity-40"
           >
             Next
-          </button>
+          </Button>
         </div>
       )}
     </div>

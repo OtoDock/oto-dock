@@ -11,11 +11,12 @@ import base64
 import hashlib
 import logging
 
+import psycopg
 import pytest
 
+from storage.database import get_conn
 from storage.identity import credential_store
 from storage.identity.credential_store import startup_key_canary
-from storage.database import get_conn
 
 
 def _foreign_ciphertext(value: str = "orphaned") -> str:
@@ -62,7 +63,7 @@ class TestStartupKeyCanary:
         # A DB error (e.g. mid-install, connection refused) must not take
         # the boot down — the canary is diagnosis only.
         def _boom():
-            raise RuntimeError("db is gone")
+            raise psycopg.OperationalError("db is gone")
         monkeypatch.setattr(credential_store, "get_conn", _boom)
         startup_key_canary()  # must not raise
 
@@ -114,6 +115,7 @@ class TestCredentialKey:
 
     def test_a_new_write_uses_the_configured_key_only(self, _key_setting):
         from cryptography.fernet import InvalidToken
+
         import config
         _key_setting(self.KEY)
         new = credential_store.encrypt_secret("after")
@@ -244,7 +246,7 @@ class TestSecretFloor:
         _floor(self.SHORT, users=False)
 
         def _boom():
-            raise RuntimeError("db is gone")
+            raise psycopg.OperationalError("db is gone")
         monkeypatch.setattr(credential_store, "get_conn", _boom)
         credential_store.judge_secret_floor()  # must not raise
 

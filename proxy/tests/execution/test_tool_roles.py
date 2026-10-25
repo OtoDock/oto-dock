@@ -14,7 +14,7 @@ from tests._paths import PROXY_DIR, REPO_ROOT
 if str(PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(PROXY_DIR))
 
-from core.events import tool_roles  # noqa: E402
+from core.events import tool_roles
 
 
 def test_every_name_has_a_role_a_payload_and_only_shells_a_dialect():

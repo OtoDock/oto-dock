@@ -6,6 +6,7 @@ import { useCollapsePref } from '../../hooks/useCollapsePref'
 import { useChatStore } from '../../store/chatStore'
 import { SOURCE_TYPE } from '../../lib/session/kind'
 import { CHAT_PHASE } from '../../lib/status/chat'
+import { GLASS } from '../ui/glass'
 
 interface Props {
   currentAgent?: string
@@ -15,8 +16,8 @@ interface Props {
   onSelect: (chatId: string) => void
   onNavigate?: () => void
   /** 'sidebar' (default): the compact section at the top of the chat list.
-      'home': the agent front page's live-sessions card — the platform panel
-      above the agent's dashboards, mirroring the project dock composition. */
+      'home': the strip on the empty chat page, never above the apps or the
+      workspace. */
   variant?: 'sidebar' | 'home'
   /** Sidebar only: which list renders BELOW the strip. The own-agent dedup
       is symmetric to it — chat view drops own chats and keeps own live
@@ -24,10 +25,10 @@ interface Props {
   tasksMode?: boolean
 }
 
-/** Cross-agent "Active now" section — sidebar top slot AND the agent home.
+/** Cross-agent "Active now" section — the sidebar's top slot AND the empty chat page.
  *
- * Every chat this user may see that is generating (pulse) or warming (amber
- * dot) RIGHT NOW, across all agents — one click from the conversation.
+ * Every chat this user may see that is generating (pulse) or warming (the
+ * warning dot) RIGHT NOW, across all agents — one click from the conversation.
  * Renders nothing when nothing is active. Live via the WS events the client
  * already receives (see useActiveChats); the currently-viewed chat is
  * excluded — viewing it IS watching it (same rule as ChatRow's precedence).
@@ -37,8 +38,9 @@ interface Props {
  * CHAT rows drop, own live TASKS stay in the strip (the task list isn't on
  * screen; the pulsing tasks toggle alone doesn't say WHICH task runs). Task
  * view lists tasks → own-agent TASK rows drop, own live chats stay.
- * Everything from other agents stays. The HOME variant keeps all rows — the
- * front page has no list to duplicate against.
+ * Everything from other agents stays. The HOME variant (the empty chat page,
+ * never above the apps) keeps all rows — there is no list to duplicate
+ * against.
  *
  * One orphan exemption: chat view, own-agent CHAT rows whose owner is shared
  * (`ownerIsShared` — legacy `agent::` rows a visibility flip left behind).
@@ -47,12 +49,11 @@ interface Props {
  * rows are never orphaned (the task list filters on task_runs scope, not chat
  * owner), so task mode keeps the plain symmetric rule.
  *
- * Space discipline (2026-08-15): the header is a persisted collapse toggle
- * (useCollapsePref — home starts COLLAPSED so the front page belongs to the
- * dashboards, sidebar starts OPEN; a pulsing dot on the collapsed header
- * still signals a generating session) and the rows sit in a height-capped
+ * Space discipline: the header is a persisted collapse toggle
+ * (useCollapsePref — both variants start OPEN; a pulsing dot on the
+ * collapsed header still signals a generating session) and the rows sit in a height-capped
  * inner-scroll container (~3 rows; the home variant goes two-up on md+ and
- * caps at ~2 grid rows). This replaced the old 6-row "+N more" expander.
+ * caps at ~2 grid rows).
  */
 export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect, onNavigate, variant = 'sidebar', tasksMode = false }: Props) {
   const navigate = useNavigate()
@@ -74,11 +75,11 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
       (tasksMode ? r.sourceType !== SOURCE_TYPE.TASK : r.sourceType === SOURCE_TYPE.TASK) ||
       keepOrphan(r)))
   // Persisted per surface and SHARED across mounted copies (the sidebar
-  // renders twice inside ResponsiveDrawer). Home starts collapsed — the
-  // front page is the dashboards' space; the sidebar starts open.
+  // renders twice inside ResponsiveDrawer). Both start open: the empty chat
+  // page and the sidebar have the room.
   const [open, toggleOpen] = useCollapsePref(
     variant === 'home' ? 'active-now-home' : 'active-now-sidebar',
-    variant !== 'home',
+    true,
   )
 
   if (rows.length === 0) return null
@@ -108,7 +109,7 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
         type="button"
         onClick={toggleOpen}
         aria-expanded={open}
-        className="w-full flex items-center gap-1.5 px-3 py-1 text-[10px] font-semibold text-p-text-light uppercase tracking-wider text-left cursor-pointer select-none transition-colors hover:text-p-text-secondary"
+        className="w-full flex items-center gap-1.5 px-3 py-1 text-3xs font-semibold text-tertiary uppercase tracking-wider text-left cursor-pointer select-none transition-colors hover:text-secondary"
       >
         <svg
           className={`w-3 h-3 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`}
@@ -118,7 +119,7 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
         </svg>
         Active now · {rows.length}
         {!open && anyLive && (
-          <span className="w-1.5 h-1.5 rounded-full bg-brand animate-pulse motion-reduce:animate-none shrink-0" />
+          <span className="w-1.5 h-1.5 rounded-full bg-action animate-pulse motion-reduce:animate-none shrink-0" />
         )}
       </button>
       {open && (
@@ -134,27 +135,27 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
       {rows.map((row) => {
         const meta = agentMeta.get(row.agent)
         const isTask = row.sourceType === SOURCE_TYPE.TASK
-        // Unified live language (operator ask, 2026-07-11 — same as the chat
-        // history rows): GENERATING = pulsing surface tint only, no dot;
+        // Unified live language (the same as the chat history rows):
+        // GENERATING = pulsing surface tint only, no dot;
         // FINISHED-UNREAD = the same tint held steady + a dot. The dot means
         // exactly one thing everywhere: "a result you haven't opened".
-        // Task rows keep their purple identity, chats the brand blue.
+        // Task rows keep the agent accent, chats the action tint.
         const phaseClass =
           row.phase === CHAT_PHASE.STREAMING
             ? isTask
-              ? 'oto-row-live-purple motion-reduce:animate-none bg-p-accent-purple/10 ring-1 ring-inset ring-p-accent-purple/40'
-              : 'oto-row-live motion-reduce:animate-none bg-brand-surface ring-1 ring-inset ring-brand/35'
+              ? 'oto-row-live-purple motion-reduce:animate-none bg-accent-agent-bg ring-1 ring-inset ring-accent-agent-border'
+              : 'oto-row-live motion-reduce:animate-none bg-action-subtle ring-1 ring-inset ring-action/40'
             : row.phase === CHAT_PHASE.WARMING
-              ? 'ring-1 ring-inset ring-amber-400/40'
+              ? 'ring-1 ring-inset ring-status-warning-border'
               : isTask
-                ? 'bg-p-accent-purple/10 ring-1 ring-inset ring-p-accent-purple/30'
-                : 'bg-brand-surface ring-1 ring-inset ring-brand/30'
+                ? 'bg-accent-agent-bg ring-1 ring-inset ring-accent-agent-border'
+                : 'bg-action-subtle ring-1 ring-inset ring-action/30'
         const phaseTitle =
           row.phase === CHAT_PHASE.STREAMING
             ? isTask ? 'Task running…' : 'Generating response…'
             : row.phase === CHAT_PHASE.WARMING
               ? 'Preparing session…'
-              : isTask ? 'Task finished' : 'Finished — not opened yet'
+              : isTask ? 'Task finished' : 'Finished, not opened yet'
         // Tasks never carry the unread dot (fire-and-forget — notifications
         // cover completion); the row itself lingers briefly, dot-free.
         const showDot = row.phase === CHAT_PHASE.WARMING || (row.phase === CHAT_PHASE.FINISHED && !isTask)
@@ -163,22 +164,22 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
             key={row.id}
             onClick={() => openRow(row)}
             title={phaseTitle}
-            className={`min-w-0 flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm mb-0.5 cursor-pointer
-                        transition-colors text-p-text-secondary hover:bg-p-surface-hover ${phaseClass}`}
+            className={`min-w-0 flex items-center gap-2 px-3 py-1.5 rounded-card text-sm mb-0.5 cursor-pointer
+                        transition-colors text-secondary hover:bg-surface-hover ${phaseClass}`}
           >
             {showDot && (
               <span
                 className={`inline-block w-2 h-2 rounded-full shrink-0 ${
                   row.phase === CHAT_PHASE.WARMING
-                    ? 'bg-amber-400 animate-pulse motion-reduce:animate-none'
+                    ? 'bg-status-warning-solid animate-pulse motion-reduce:animate-none'
                     : ''
                 }`}
-                style={row.phase === CHAT_PHASE.WARMING ? undefined : { backgroundColor: meta?.color || 'var(--color-brand)' }}
+                style={row.phase === CHAT_PHASE.WARMING ? undefined : { backgroundColor: meta?.color || 'var(--color-accent-agent-fill)' }}
               />
             )}
             <div className="min-w-0 flex-1">
               <p className="truncate text-xs font-medium">{row.title || 'New chat'}</p>
-              <p className="truncate text-[10px] text-p-text-light mt-[1px]">
+              <p className="truncate text-3xs text-tertiary mt-[1px]">
                 {meta?.display_name || row.agent}{isTask ? ' · task' : ''}
               </p>
             </div>
@@ -193,16 +194,16 @@ export default function ActiveChatsPanel({ currentAgent, activeChatId, onSelect,
   if (variant === 'home') {
     return (
       <div className="px-2 pt-14 shrink-0" data-testid="active-chats-home">
-        {/* Flat px-2 matches the AppsOverlay frame inset (p-2) below, so the
-            platform panel and the full-width app read as one page. */}
-        <div className="mt-2 rounded-xl border border-p-border-light bg-white dark:bg-p-surface px-2 pt-1.5 pb-1">
+        {/* Flat px-2: the strip sits inside the hero's frame, under the
+            floating top bar. */}
+        <div className={`mt-2 rounded-card ${GLASS} px-2 pt-1.5 pb-1`}>
           {body}
         </div>
       </div>
     )
   }
   return (
-    <div className="px-2 pt-2 pb-1 border-b border-p-border-light" data-testid="active-chats-panel">
+    <div className="px-2 pt-2 pb-1 border-b border-subtle" data-testid="active-chats-panel">
       {body}
     </div>
   )

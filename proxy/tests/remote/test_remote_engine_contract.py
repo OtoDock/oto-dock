@@ -14,12 +14,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from core.execution_layer import AgentConfig
+from core import placement
+from core.execution_layer import AgentConfig, ResumeVerdict
 from core.remote import remote_turn
 from core.remote.remote_execution import RemoteExecutionLayer, RemoteSessionInfo
-from core.remote.satellite_connection import SatelliteConnection, SatelliteConnectionManager
+from core.remote.satellite_connection import (
+    SatelliteConnection,
+    SatelliteConnectionManager,
+)
 from core.session.session_manager import get_layer_by_path
-from core import placement
 
 _FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -273,7 +276,7 @@ def _snapshot_cases(tmp_path: Path) -> dict[str, tuple[str, AgentConfig]]:
     mcp_toml.write_text(_MCP_TOML)
     judge_ctx = SimpleNamespace(mount_username="", username="", role="admin",
                                 read_only=True, placement=placement.PlacementCapabilities(allow_full_fs=True))
-    c = lambda **kw: _snapshot_config(tmp_path, **kw)  # noqa: E731
+    c = lambda **kw: _snapshot_config(tmp_path, **kw)
     return {
         "claude_oauth_dashboard": ("claude-code-cli", c(
             extra_env={"_CLAUDE_CREDS_BLOB": json.dumps(_CLAUDE_BLOB)},
@@ -302,10 +305,20 @@ def _snapshot_cases(tmp_path: Path) -> dict[str, tuple[str, AgentConfig]]:
         "codex_judge_full_fs": ("codex-cli", c(
             model="gpt-5.6-sol", effort="high", permission_mode="judge",
             security_context=judge_ctx)),
+        # A 0.5.156 satellite, the current words (``_sat156``: _snapshot_layer).
+        "claude_auto_review_sat156": ("claude-code-cli", c(
+            permission_mode="autoReview", extra_env={"_CLAUDE_CREDS_BLOB": json.dumps(_CLAUDE_BLOB)},
+            mcp_config_path=str(mcp_json))),
+        "claude_ask_interactive_sat156": ("claude-code-cli", c(
+            permission_mode="ask", interactive=True, interactive_first_prompt="hello",
+            use_native_permissions=True)),
+        "codex_auto_review_sat156": ("codex-cli", c(
+            model="gpt-5.6-sol", effort="high", permission_mode="autoReview",
+            extra_env={"_CODEX_AUTH_JSON": json.dumps(_CODEX_AUTH)}, mcp_config_path=str(mcp_toml))),
     }
 
 
-def _snapshot_layer() -> RemoteExecutionLayer:
+def _snapshot_layer(version: str = "0.5.123") -> RemoteExecutionLayer:
     lay = RemoteExecutionLayer(MagicMock())
     cm = lay._cm
     cm.satellite_supports_local_model_provider.return_value = True
@@ -313,8 +326,8 @@ def _snapshot_layer() -> RemoteExecutionLayer:
     cm.satellite_supports_codex_hooks_floor.return_value = True
     cm.satellite_supports_hook_parity.return_value = True
     cm.satellite_supports_checks.return_value = True
-    cm.satellite_supports_codex_attended_floor.return_value = False
-    cm.satellite_version.return_value = "0.5.123"
+    cm.satellite_supports_codex_attended_floor.return_value = version != "0.5.123"
+    cm.satellite_version.return_value = version
     cm.satellite_name.return_value = "drill-sat"
     return lay
 
@@ -342,7 +355,8 @@ async def test_start_payloads_match_the_pre_adapter_snapshot(tmp_path):
          patch("core.remote.remote_start_payload._load_hook_scripts",
                return_value={"permission_gate.py": "#gate"}):
         for name, (path, cfg) in cases.items():
-            plan = await _snapshot_layer()._build_start_payload("sess-1", cfg, path)
+            layer = _snapshot_layer("0.5.156" if name.endswith("_sat156") else "0.5.123")
+            plan = await layer._build_start_payload("sess-1", cfg, path)
             assert _comparable(plan.payload) == _comparable(expected[name]), name
             # The plan's own answers.
             file_keys = {"credentials_json", "auth_json"}
@@ -371,6 +385,28 @@ async def test_no_engine_ships_another_engines_private_variable(tmp_path):
     ))
     assert not private & set(plan.payload["env"]), private & set(plan.payload["env"])
     assert plan.credential_file_delivered is True   # its own blob became the file
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["claude-code-cli", "codex-cli"])
+async def test_a_remote_start_carries_the_shells_command_line_token(tmp_path, path):
+    """Every satellite overlays the payload env on the CLI's, so the token
+    the platform mints here reaches the remote shell, a 1.8 machine's too;
+    it mirrors the payload's final session token."""
+    from auth.session_token import validate_cli_token, validate_session_token
+    cfg = _snapshot_config(tmp_path, model="gpt-5.6-sol" if path == "codex-cli" else "claude-sonnet-5")
+    machine = {"capabilities": json.dumps({"local_tunnel_port": 18400, "os": "linux"}),
+               "pairing_scope": "admin"}
+    with patch("storage.remote_store.get_remote_machine", return_value=machine), \
+         patch("storage.database.get_user_sub_by_username", return_value="sub-alice"), \
+         patch("core.remote.remote_start_payload._load_hook_scripts", return_value={}):
+        plan = await _snapshot_layer()._build_start_payload("sess-1", cfg, path)
+    env = plan.payload["env"]
+    cli = validate_cli_token(env["OTO_CLI_TOKEN"])
+    session = validate_session_token(env["PROXY_API_KEY"])
+    assert cli["sid"] == session["sid"] == "sess-1"
+    assert cli["user_sub"] == session["user_sub"] == "sub-alice"
+    assert cli["iat"] == session["iat"] and cli["exp"] == session["exp"]
 
 
 # --- the frames: each engine's, sent through the adapter ----------------------
@@ -519,25 +555,27 @@ class TestCanResume:
         # compare sent them through Claude's JSONL probe and refused the
         # thread-id resume. The engine is resolved the way the spawn does.
         layer = _layer()
-        layer._cm.send_command = AsyncMock()
+        layer._cm.begin_command = AsyncMock()
         chat = {"agent": "codex-agent", "execution_path": "", "codex_thread_id": "thread-9",
                 "execution_target": "m-1"}
         with patch("storage.database.get_chat_by_session", return_value=chat), \
              patch("core.session.session_manager.resolve_execution_path",
                    return_value="codex-cli") as resolve:
-            assert await layer.can_resume_session("s-gone") is True
+            assert await layer.can_resume_session("s-gone") is ResumeVerdict.RESUMABLE
         resolve.assert_called_once_with("codex-agent", "")
-        layer._cm.send_command.assert_not_awaited()
+        layer._cm.begin_command.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_claude_chat_asks_the_machine_it_ran_on(self):
         layer = _layer()
         layer._cm.is_connected.return_value = True
-        layer._cm.send_command = AsyncMock(return_value={"resumable": True})
+        answered = asyncio.get_running_loop().create_future()
+        answered.set_result({"resumable": True})
+        layer._cm.begin_command = AsyncMock(return_value=("cid-1", answered))
         chat = {"agent": "pa", "execution_path": "claude-code-cli", "codex_thread_id": "",
                 "execution_target": "m-1"}
         with patch("storage.database.get_chat_by_session", return_value=chat):
-            assert await layer.can_resume_session("s-gone", username="alice") is True
-        msg = layer._cm.send_command.await_args.args[1]
+            assert await layer.can_resume_session("s-gone", username="alice") is ResumeVerdict.RESUMABLE
+        msg = layer._cm.begin_command.await_args.args[1]
         assert msg["type"] == "check_session_resumable"
         assert msg["agent_slug"] == "pa" and msg["username"] == "alice"

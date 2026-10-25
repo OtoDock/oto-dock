@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" color="#1d4f80">
+  <title>OtoDock</title>
+  <!-- The master of the OtoDock mark. 24-unit grid, 4 px per unit; filled
+       shapes only. Five states, one shown at a time: flat (shown), white,
+       small (the optical version for 16 and 24 px), glass and white-glass
+       (the lit state, 96 px and up on 2x displays). The flat and small
+       states fill with currentColor: the root's color is the mark's blue,
+       and a CSS color on an inline copy wins. README.md beside this file
+       has the rules; export.mjs renders every state. -->
+  <defs>
+    <path id="silhouette" fill-rule="evenodd" clip-rule="evenodd" d="M 46.5 12.77 A 5 5 0 1 1 49.5 12.77 L 49.5 20.031 A 36 36 0 0 1 81.941 44 L 88 44 A 4 4 0 0 1 92 48 L 92 60 A 4 4 0 0 1 88 64 L 83.1 64 A 36 36 0 0 1 12.9 64 L 8 64 A 4 4 0 0 1 4 60 L 4 48 A 4 4 0 0 1 8 44 L 14.059 44 A 36 36 0 0 1 46.5 20.031 Z M 28 38 L 68 38 A 10 10 0 0 1 78 48 L 78 54 A 10 10 0 0 1 68 64 L 54 64 A 2 2 0 0 0 52 66 A 2 2 0 0 1 50 68 L 28 68 A 10 10 0 0 1 18 58 L 18 48 A 10 10 0 0 1 28 38 Z M 32.4 44.98 L 32.6 42 L 35.4 42 L 35.6 44.98 A 7.2 7.2 0 0 1 37.832 45.905 L 40.081 43.939 L 42.061 45.919 L 40.095 48.168 A 7.2 7.2 0 0 1 41.02 50.4 L 44 50.6 L 44 53.4 L 41.02 53.6 A 7.2 7.2 0 0 1 40.095 55.832 L 42.061 58.081 L 40.081 60.061 L 37.832 58.095 A 7.2 7.2 0 0 1 35.6 59.02 L 35.4 62 L 32.6 62 L 32.4 59.02 A 7.2 7.2 0 0 1 30.168 58.095 L 27.919 60.061 L 25.939 58.081 L 27.905 55.832 A 7.2 7.2 0 0 1 26.98 53.6 L 24 53.4 L 24 50.6 L 26.98 50.4 A 7.2 7.2 0 0 1 27.905 48.168 L 25.939 45.919 L 27.919 43.939 L 30.168 45.905 A 7.2 7.2 0 0 1 32.4 44.98 Z M 30.4 52 A 3.6 3.6 0 1 0 37.6 52 A 3.6 3.6 0 1 0 30.4 52 Z M 57 52 A 5 5 0 1 1 67 52 A 5 5 0 1 1 57 52 Z"/>
+    <path id="silhouette-small" fill-rule="evenodd" clip-rule="evenodd" d="M 45 13.196 A 6 6 0 1 1 51 13.196 L 51 20.125 A 36 36 0 0 1 81.941 44 L 92 44 A 4 4 0 0 1 96 48 L 96 60 A 4 4 0 0 1 92 64 L 83.1 64 A 36 36 0 0 1 12.9 64 L 4 64 A 4 4 0 0 1 0 60 L 0 48 A 4 4 0 0 1 4 44 L 14.059 44 A 36 36 0 0 1 45 20.125 Z M 32 40 L 64 40 A 8 8 0 0 1 72 48 L 72 52 A 8 8 0 0 1 64 60 L 56 60 L 48 64 L 32 64 A 8 8 0 0 1 24 56 L 24 48 A 8 8 0 0 1 32 40 Z M 29 52 A 7 7 0 1 1 43 52 A 7 7 0 1 1 29 52 Z M 55 52 A 5 5 0 1 1 65 52 A 5 5 0 1 1 55 52 Z"/>
+    <path id="visor" d="M 28 38 L 68 38 A 10 10 0 0 1 78 48 L 78 54 A 10 10 0 0 1 68 64 L 54 64 A 2 2 0 0 0 52 66 A 2 2 0 0 1 50 68 L 28 68 A 10 10 0 0 1 18 58 L 18 48 A 10 10 0 0 1 28 38 Z"/>
+    <path id="gear" d="M 32.4 44.98 L 32.6 42 L 35.4 42 L 35.6 44.98 A 7.2 7.2 0 0 1 37.832 45.905 L 40.081 43.939 L 42.061 45.919 L 40.095 48.168 A 7.2 7.2 0 0 1 41.02 50.4 L 44 50.6 L 44 53.4 L 41.02 53.6 A 7.2 7.2 0 0 1 40.095 55.832 L 42.061 58.081 L 40.081 60.061 L 37.832 58.095 A 7.2 7.2 0 0 1 35.6 59.02 L 35.4 62 L 32.6 62 L 32.4 59.02 A 7.2 7.2 0 0 1 30.168 58.095 L 27.919 60.061 L 25.939 58.081 L 27.905 55.832 A 7.2 7.2 0 0 1 26.98 53.6 L 24 53.4 L 24 50.6 L 26.98 50.4 A 7.2 7.2 0 0 1 27.905 48.168 L 25.939 45.919 L 27.919 43.939 L 30.168 45.905 A 7.2 7.2 0 0 1 32.4 44.98 Z"/>
+    <clipPath id="glass-clip"><use href="#silhouette"/></clipPath>
+    <clipPath id="glass-dome"><circle cx="48" cy="56" r="36"/></clipPath>
+    <clipPath id="glass-ball"><circle cx="48" cy="8" r="5"/></clipPath>
+    <clipPath id="glass-pad-left"><rect x="4" y="44" width="12" height="20" rx="4"/></clipPath>
+    <clipPath id="glass-pad-right"><rect x="80" y="44" width="12" height="20" rx="4"/></clipPath>
+    <clipPath id="glass-gear"><use href="#gear"/></clipPath>
+    <clipPath id="glass-dot"><circle cx="62" cy="52" r="5"/></clipPath>
+    <mask id="glass-dome-edges"><rect width="96" height="96" fill="#fff"/><circle cx="48" cy="8" r="5" fill="#000"/><rect x="46.5" y="8" width="3" height="12.8" fill="#000"/><rect x="4" y="44" width="12" height="20" rx="4" fill="#000"/><rect x="80" y="44" width="12" height="20" rx="4" fill="#000"/></mask>
+    <mask id="glass-ball-edges"><rect width="96" height="96" fill="#fff"/><rect x="46.5" y="8" width="3" height="12.8" fill="#000"/></mask>
+    <mask id="glass-pad-edges"><rect width="96" height="96" fill="#fff"/><circle cx="48" cy="56" r="36" fill="#000"/></mask>
+    <mask id="glass-outside" maskUnits="userSpaceOnUse" x="-24" y="-24" width="144" height="144"><rect x="-24" y="-24" width="144" height="144" fill="#fff"/><use href="#silhouette" fill="#000"/></mask>
+    <filter id="glass-shadow-blur" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="3"/></filter>
+    <filter id="glass-rim-blur" x="-5%" y="-5%" width="110%" height="110%"><feGaussianBlur stdDeviation="0.3"/></filter>
+    <linearGradient id="glass-fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d4f80" stop-opacity="1"/>
+      <stop offset="1" stop-color="#174067" stop-opacity="1"/>
+    </linearGradient>
+    <linearGradient id="glass-rim" x1="0" y1="0" x2="0.5" y2="0.5">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="glass-rim-inside" x1="1" y1="1" x2="0.5" y2="0.5">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glass-sheen" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.07"/>
+      <stop offset="0.55" stop-color="#fff" stop-opacity="0.049"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="white-glass-fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.94"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.86"/>
+    </linearGradient>
+    <linearGradient id="white-glass-rim" x1="0" y1="0" x2="0.5" y2="0.5">
+      <stop offset="0" stop-color="#fff" stop-opacity="1"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="white-glass-rim-inside" x1="1" y1="1" x2="0.5" y2="0.5">
+      <stop offset="0" stop-color="#fff" stop-opacity="1"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="white-glass-sheen" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.1"/>
+      <stop offset="0.55" stop-color="#fff" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <g id="flat"><use href="#silhouette" fill="currentColor"/></g>
+  <g id="white" display="none"><use href="#silhouette" fill="#ffffff"/></g>
+  <g id="small" display="none"><use href="#silhouette-small" fill="currentColor"/></g>
+  <g id="glass" display="none">
+    <g clip-path="url(#glass-clip)">
+      <use href="#silhouette" fill="url(#glass-fill)"/>
+      <g transform="translate(-4 -4)" filter="url(#glass-shadow-blur)">
+        <rect x="-24" y="-24" width="144" height="144" fill="#102b46" fill-opacity="0.22" mask="url(#glass-outside)"/>
+      </g>
+      <g fill="none" stroke-width="4" stroke-linejoin="round" filter="url(#glass-rim-blur)">
+        <circle cx="48" cy="56" r="36" stroke="url(#glass-rim)" clip-path="url(#glass-dome)" mask="url(#glass-dome-edges)"/>
+        <circle cx="48" cy="8" r="5" stroke="url(#glass-rim)" clip-path="url(#glass-ball)" mask="url(#glass-ball-edges)"/>
+        <rect x="4" y="44" width="12" height="20" rx="4" stroke="url(#glass-rim)" clip-path="url(#glass-pad-left)" mask="url(#glass-pad-edges)"/>
+        <rect x="80" y="44" width="12" height="20" rx="4" stroke="url(#glass-rim)" clip-path="url(#glass-pad-right)" mask="url(#glass-pad-edges)"/>
+        <use href="#visor" stroke="url(#glass-rim-inside)"/>
+        <use href="#gear" stroke="url(#glass-rim)" stroke-width="2" clip-path="url(#glass-gear)"/>
+        <circle cx="62" cy="52" r="5" stroke="url(#glass-rim)" stroke-width="2" clip-path="url(#glass-dot)"/>
+      </g>
+      <ellipse cx="48" cy="32" rx="30" ry="12" fill="url(#glass-sheen)" clip-path="url(#glass-dome)"/>
+    </g>
+  </g>
+  <g id="white-glass" display="none">
+    <g clip-path="url(#glass-clip)">
+      <use href="#silhouette" fill="url(#white-glass-fill)"/>
+      <g transform="translate(-4 -4)" filter="url(#glass-shadow-blur)">
+        <rect x="-24" y="-24" width="144" height="144" fill="#0a1b2c" fill-opacity="0.25" mask="url(#glass-outside)"/>
+      </g>
+      <g fill="none" stroke-width="4" stroke-linejoin="round" filter="url(#glass-rim-blur)">
+        <circle cx="48" cy="56" r="36" stroke="url(#white-glass-rim)" clip-path="url(#glass-dome)" mask="url(#glass-dome-edges)"/>
+        <circle cx="48" cy="8" r="5" stroke="url(#white-glass-rim)" clip-path="url(#glass-ball)" mask="url(#glass-ball-edges)"/>
+        <rect x="4" y="44" width="12" height="20" rx="4" stroke="url(#white-glass-rim)" clip-path="url(#glass-pad-left)" mask="url(#glass-pad-edges)"/>
+        <rect x="80" y="44" width="12" height="20" rx="4" stroke="url(#white-glass-rim)" clip-path="url(#glass-pad-right)" mask="url(#glass-pad-edges)"/>
+        <use href="#visor" stroke="url(#white-glass-rim-inside)"/>
+        <use href="#gear" stroke="url(#white-glass-rim)" stroke-width="2" clip-path="url(#glass-gear)"/>
+        <circle cx="62" cy="52" r="5" stroke="url(#white-glass-rim)" stroke-width="2" clip-path="url(#glass-dot)"/>
+      </g>
+      <ellipse cx="48" cy="32" rx="30" ry="12" fill="url(#white-glass-sheen)" clip-path="url(#glass-dome)"/>
+    </g>
+  </g>
+</svg>

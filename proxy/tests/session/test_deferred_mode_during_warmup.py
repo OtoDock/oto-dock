@@ -73,7 +73,7 @@ async def test_deferred_mode_helper_applies_to_alive_session():
                 return
             try:
                 alive = await layer.is_session_alive(session_id)
-            except Exception:
+            except Exception:  # noqa: BLE001  # mirrors the warmup's guard: a failed probe reads as not alive
                 alive = False
             if not alive:
                 return
@@ -230,7 +230,7 @@ async def _frame(ws, kind: str, timeout: float = 3.0) -> dict:
 
 
 def test_a_pick_made_while_the_prewarm_spawns_is_the_mode_the_chat_runs(temp_db, monkeypatch):
-    """The new-chat page pre-warms in `default`; the person picks Don't Ask
+    """The new-chat page pre-warms in Ask; the person picks Don't Ask
     while that spawn is still running, then sends. The mint takes the pick
     into the chat's row and the warmup reuses the pre-warm: the session must
     run the pick, not the pre-warm's mode."""
@@ -244,7 +244,7 @@ def test_a_pick_made_while_the_prewarm_spawns_is_the_mode_the_chat_runs(temp_db,
     async def scenario():
         async with dashboard_connection(session_cookie()) as ws:
             await drain_startup(ws)
-            ws.client_send({"type": "pre_warmup", "agent": slug, "permission_mode": "default"})
+            ws.client_send({"type": "pre_warmup", "agent": slug, "permission_mode": "ask"})
             ws.client_send({"type": "mode_change", "mode": "dontAsk"})
             assert (await _frame(ws, "mode_changed"))["mode"] == "dontAsk"
             ws.client_send({"type": "warmup", "agent": slug})
@@ -259,7 +259,7 @@ def test_a_pick_made_while_the_prewarm_spawns_is_the_mode_the_chat_runs(temp_db,
     sid = ready["session_id"]
     # One spawn: the pre-warm, reused by the chat.
     assert [s for s, _cfg in layer.started] == [sid]
-    assert layer.started[0][1].permission_mode == "default"
+    assert layer.started[0][1].permission_mode == "ask"
     assert layer.mode_changes == [(sid, "dontAsk")]
     assert session_state.get_session_mode(sid) == "dontAsk"
     assert ready["mode"] == "dontAsk"
@@ -284,8 +284,8 @@ def test_a_refused_engine_mode_change_still_leaves_the_pick_to_the_hooks(temp_db
     async def scenario():
         async with dashboard_connection(session_cookie()) as ws:
             await drain_startup(ws)
-            ws.client_send({"type": "pre_warmup", "agent": slug, "permission_mode": "default"})
-            ws.client_send({"type": "mode_change", "mode": "acceptEdits"})
+            ws.client_send({"type": "pre_warmup", "agent": slug, "permission_mode": "ask"})
+            ws.client_send({"type": "mode_change", "mode": "autoReview"})
             await _frame(ws, "mode_changed")
             ws.client_send({"type": "warmup", "agent": slug})
             out["chat_id"] = (await _frame(ws, "warmup_started"))["chat_id"]
@@ -295,6 +295,25 @@ def test_a_refused_engine_mode_change_still_leaves_the_pick_to_the_hooks(temp_db
 
     run_ws_scenario(scenario)
     sid = out["ready"]["session_id"]
-    assert session_state.get_session_mode(sid) == "acceptEdits"
-    assert out["ready"]["mode"] == "acceptEdits"
-    assert temp_db.get_chat(out["chat_id"])["permission_mode"] == "acceptEdits"
+    assert session_state.get_session_mode(sid) == "autoReview"
+    assert out["ready"]["mode"] == "autoReview"
+    assert temp_db.get_chat(out["chat_id"])["permission_mode"] == "autoReview"
+
+
+def test_a_mode_the_chats_engine_lacks_drops_to_its_first(temp_db):
+    """The warm-up's one check: a new chat starts in Auto, a person's word
+    never names the unattended mode, and a stored Auto on a chat now on an
+    engine without its own review (Direct LLM) is written over as Ask."""
+    from ws.dashboard_chat_support import chat_mode_for_path, coerce_chat_mode
+    assert chat_mode_for_path("", "claude-code-cli") == "autoReview"
+    assert chat_mode_for_path("auto", "claude-code-cli") == "autoReview"
+    assert chat_mode_for_path("auto", "claude-code-cli", stored=True) == "auto"
+    assert chat_mode_for_path("judge", "codex-cli", stored=True) == "judge"
+    assert chat_mode_for_path("autoReview", "direct-llm") == "ask"
+    assert chat_mode_for_path("acceptEdits", "direct-llm") == "ask"
+    assert chat_mode_for_path("dontAsk", "direct-llm") == "dontAsk"
+    cid = "chat-mode-offered"
+    temp_db.create_chat(cid, "user-admin", "agent-a", "autoReview")
+    assert asyncio.run(coerce_chat_mode(cid, "autoReview", "direct-llm")) == "ask"
+    assert temp_db.get_chat(cid)["permission_mode"] == "ask"
+    assert asyncio.run(coerce_chat_mode(cid, "ask", "claude-code-cli")) == "ask"

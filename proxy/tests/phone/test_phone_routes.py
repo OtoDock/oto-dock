@@ -13,8 +13,8 @@ import uuid
 import pytest
 
 from storage.automation import trigger_store
-from storage.phone import phone_route_store
 from storage.pg import get_conn
+from storage.phone import phone_route_store
 
 
 def _make_agent(slug: str = "") -> str:
@@ -220,6 +220,7 @@ class TestBackgroundSound:
 
     def test_api_validator_rejects_unknown_template(self):
         from fastapi import HTTPException
+
         from api.phone.phone import _validate_background_sound
 
         _validate_background_sound("off")

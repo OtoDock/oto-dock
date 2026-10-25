@@ -22,7 +22,7 @@ from pathlib import Path
 _SHARED = Path(__file__).resolve().parents[3] / "mcps" / "_shared"
 sys.path.insert(0, str(_SHARED))
 
-import stream_sidecar as ss  # noqa: E402  (imports without aiohttp — it's lazy)
+import stream_sidecar as ss
 
 
 def _reset():
@@ -86,7 +86,7 @@ if __name__ == "__main__":
         try:
             fn()
             print(f"ok   {fn.__name__}")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001  # the script runner reports each failure and runs the rest
             failed += 1
             print(f"FAIL {fn.__name__}: {type(e).__name__}: {e}")
     print(f"\n{len(fns) - failed}/{len(fns)} passed")

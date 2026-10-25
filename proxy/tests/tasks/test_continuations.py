@@ -15,12 +15,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from auth.providers import UserContext, get_current_user
-from services.scheduler import scheduler
-from services.scheduler import firing
+from services.scheduler import firing, scheduler
 from services.scheduler.scheduler import TaskDefinition
-from storage.agents import agent_store
 from storage import database as task_store
-
+from storage.agents import agent_store
 
 AGENT = "pa"
 SESSION = "33333333-3333-3333-3333-333333333333"

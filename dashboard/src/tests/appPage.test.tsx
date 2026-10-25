@@ -27,11 +27,11 @@ vi.mock('@/api/apps', async (importOriginal) => ({
 }))
 const authUser = vi.hoisted(() => ({ current: { role: 'member', agents: ['dev'] } as any }))
 vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: authUser.current }) }))
-const hideShare = vi.hoisted(() => vi.fn())
+const hideShare = vi.hoisted(() => vi.fn(async () => ({})))
 const patchShare = vi.hoisted(() => vi.fn(async () => ({})))
 vi.mock('@/api/shares', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/shares')>()),
-  useHideShare: () => ({ mutate: hideShare }),
+  useHideShare: () => ({ mutate: hideShare, mutateAsync: hideShare }),
   usePatchShare: () => ({ mutate: patchShare, mutateAsync: patchShare }),
 }))
 

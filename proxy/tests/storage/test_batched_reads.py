@@ -12,9 +12,8 @@ Run: cd proxy && venv/bin/pytest tests/storage/test_batched_reads.py -v
 import uuid
 
 from storage import database as task_store
-from storage.automation import notification_store
+from storage.automation import db_tasks, notification_store
 from storage.chat import db_chats
-from storage.automation import db_tasks
 from storage.pg import get_conn
 
 AGENT = "agent-batched"

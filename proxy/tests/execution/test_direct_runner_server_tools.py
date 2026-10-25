@@ -7,12 +7,14 @@ such a tool and never stores a tool message for it.
 
 from __future__ import annotations
 
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import pytest
 
 from core.layers.providers.base import (
-    ProviderAdapter, ProviderStreamEvent, ProviderUsage,
+    ProviderAdapter,
+    ProviderStreamEvent,
+    ProviderUsage,
 )
 from core.layers.providers.registry import register_adapter
 

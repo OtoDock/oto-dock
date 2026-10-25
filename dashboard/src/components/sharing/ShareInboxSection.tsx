@@ -5,6 +5,7 @@ import { ROLE, canEditAgent, roleLabel } from '../../lib/permissions'
 import { isSharedOnly, modeOfAgent } from '../../lib/visibility'
 import { useAuth } from '../../contexts/AuthContext'
 import SwipeableRow from '../chat/notifications/SwipeableRow'
+import Button from '../ui/Button'
 
 /**
  * "Shared with you" (SHARING.md): the block at the top of the notifications
@@ -51,9 +52,9 @@ function DecisionRow({ item, agents, busy, onAccept, onDecline }: {
   const picked = choices.find((a) => a.name === pick)
   const forEveryone = !!picked && sharedOnly(picked)
   return (
-    <div className="border-l-[3px] border-l-p-accent-teal px-3 py-2.5" data-testid="share-inbox-decision">
-      <div className="text-sm font-medium text-p-text truncate">{item.title || 'an app'}</div>
-      <div className="text-[11px] text-p-text-light">
+    <div className="border-l-[3px] border-l-action px-3 py-2.5" data-testid="share-inbox-decision">
+      <div className="text-sm font-medium text-primary truncate">{item.title || 'An app'}</div>
+      <div className="text-2xs text-tertiary">
         {fromLine(item)}
         {item.role_cap !== ROLE.VIEWER && <> · as {roleLabel(item.role_cap).toLowerCase()}</>}
       </div>
@@ -63,30 +64,28 @@ function DecisionRow({ item, agents, busy, onAccept, onDecline }: {
             {/* A native select: the panel closes on a press outside it, and a
                 portaled list would count as outside. */}
             <select value={pick} onChange={(e) => setAgent(e.target.value)} aria-label="Place in"
-              className="min-w-0 flex-1 rounded-md border border-p-border-light bg-p-bg px-1.5 py-1 text-xs text-p-text focus:border-brand focus:outline-none">
+              className="min-w-0 flex-1 rounded-control border border-strong bg-surface-card px-1.5 py-1 text-xs text-primary focus:border-action focus:outline-none">
               {choices.map((a) => (
                 <option key={a.name} value={a.name}>
-                  {(a.display_name || a.name) + (sharedOnly(a) ? ' (for everyone there)' : '')}
+                  {(a.display_name || a.name) + (sharedOnly(a) ? ', for everyone there' : '')}
                 </option>
               ))}
             </select>
-            <button type="button" disabled={busy || !pick} onClick={() => onAccept(pick)}
-              className="rounded-md bg-brand px-2.5 py-1 text-xs font-medium text-white hover:bg-brand-hover disabled:opacity-50">
+            <Button size="xs" variant="primary" disabled={busy || !pick} onClick={() => onAccept(pick)}>
               {forEveryone ? 'Add for everyone' : 'Accept'}
-            </button>
+            </Button>
           </>
         ) : (
-          <span className="min-w-0 flex-1 text-[11px] text-p-text-light">Join an agent to place it. It opens from its page meanwhile.</span>
+          <span className="min-w-0 flex-1 text-2xs text-tertiary">Join an agent to place it. It opens from its page meanwhile.</span>
         )}
-        <button type="button" disabled={busy} onClick={onDecline}
-          className="rounded-md border border-p-border-light px-2 py-1 text-xs text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-50">
+        <Button size="xs" disabled={busy} onClick={onDecline}>
           Decline
-        </button>
+        </Button>
       </div>
       {forEveryone && (
-        <p className="mt-1 text-[11px] text-p-text-light" data-testid="share-inbox-for-everyone">
-          {picked.display_name || picked.name} is Shared only: its chats run as the agent, so the app goes
-          to its apps for everyone there, and {item.shared_by_name || 'the person who shared it'} is told.
+        <p className="mt-1 text-2xs text-tertiary" data-testid="share-inbox-for-everyone">
+          {picked.display_name || picked.name} is Shared only, so its chats run as the agent. The app goes
+          to its apps for everyone there. {item.shared_by_name || 'The person who shared it'} is told.
         </p>
       )}
     </div>
@@ -99,34 +98,34 @@ export default function ShareInboxSection({ items, agents = [], busyId, error, o
   const received = items.filter((i) => !takesDecision(i))
   return (
     <div data-testid="share-inbox">
-      <div className="px-3 py-1.5 text-[11px] font-medium uppercase tracking-wider text-p-accent-teal bg-p-accent-teal/5">
+      <div className="px-3 py-1.5 text-2xs font-medium uppercase tracking-wider text-link bg-action-subtle">
         Shared with you
       </div>
-      {error && <p className="px-3 py-1 text-[11px] text-red-600 dark:text-red-400" role="alert">{error}</p>}
+      {error && <p className="px-3 py-1 text-2xs text-status-danger-fg" role="alert">{error}</p>}
       {pending.map((item) => (
         <DecisionRow key={item.id} item={item} agents={agents} busy={busyId === item.id}
           onAccept={(agent) => onAccept(item, agent)} onDecline={() => onDecline(item)} />
       ))}
       {received.map((item) => (
         <SwipeableRow key={item.id} onSwipeDismiss={() => onHide(item)} resetKey={error}>
-          <div className="flex items-start gap-2 border-l-[3px] border-l-p-accent-teal/50 px-3 py-2.5 hover:bg-p-surface/50"
+          <div className="flex items-start gap-2 border-l-[3px] border-l-action/50 px-3 py-2.5 hover:bg-surface-hover"
             data-testid="share-inbox-received">
             <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium text-p-text truncate">{item.title || (item.kind === SHARE_TARGET.APP ? 'an app' : 'a chat')}</div>
-              <div className="text-[11px] text-p-text-light">
+              <div className="text-sm font-medium text-primary truncate">{item.title || (item.kind === SHARE_TARGET.APP ? 'An app' : 'A chat')}</div>
+              <div className="text-2xs text-tertiary">
                 {fromLine(item)}
                 {item.placed_agent && <> · in {agents.find((a) => a.name === item.placed_agent)?.display_name || item.placed_agent}</>}
               </div>
             </div>
             <div className="mt-0.5 flex shrink-0 flex-col items-center gap-1">
               <button type="button" onClick={() => onHide(item)} title="Hide"
-                className="flex h-5 w-5 items-center justify-center text-p-text-light transition-colors hover:text-p-text-secondary">
+                className="flex h-5 w-5 items-center justify-center text-tertiary transition-colors hover:text-secondary">
                 <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                 </svg>
               </button>
               <button type="button" onClick={() => onOpen(item)} title="Open"
-                className="flex h-5 w-5 items-center justify-center text-p-text-light transition-colors hover:text-brand">
+                className="flex h-5 w-5 items-center justify-center text-tertiary transition-colors hover:text-link">
                 <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
                 </svg>

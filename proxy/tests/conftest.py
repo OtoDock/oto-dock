@@ -7,8 +7,10 @@ IMPORTANT: Tests NEVER run against the production database.
 Set TEST_DATABASE_URL to override the test DB location.
 """
 
+import contextlib
 import os
 import sys
+import threading
 from pathlib import Path
 from urllib.parse import urlparse as _urlparse, urlunparse as _urlunparse
 
@@ -43,7 +45,7 @@ def _ensure_test_database(url: str) -> None:
             if not exists:
                 c.execute(f'CREATE DATABASE "{dbname}"')
             c.execute(f'ALTER DATABASE "{dbname}" SET synchronous_commit TO off')
-    except Exception:
+    except psycopg.Error:
         pass
 
 
@@ -68,7 +70,7 @@ _test_url = os.environ.get(
 # age-gate: connection-count alone is NOT enough protection — a sibling
 # run that is starting RIGHT NOW has a created-but-not-yet-pooled window
 # in which its DBs look droppable (that exact race hung a proof run).
-import time  # noqa: E402
+import time
 
 _xdist_worker = os.environ.get("PYTEST_XDIST_WORKER")
 _run_uid = os.environ.get("OTO_TEST_RUN_ID")
@@ -128,7 +130,7 @@ def _drop_run_databases(url: str, run_pat: str, min_age_s: float) -> None:
                 with contextlib.suppress(Exception):
                     # in-use by a live run → DROP refuses → leave it
                     c.execute(f'DROP DATABASE "{name}"')
-    except Exception:
+    except psycopg.Error:
         pass  # locked-down maintenance role — CI provisions out of band
 
 
@@ -168,8 +170,8 @@ os.environ["DATABASE_URL"] = _test_url
 # above — the per-test wipe deleted a concurrent run's files mid-rename).
 # Stale dirs from finished/killed runs are reaped by age; the 24h grace
 # can never touch a live run.
-import shutil  # noqa: E402
-import tempfile  # noqa: E402
+import shutil
+import tempfile
 
 _agents_dir_name = f"otodock-test-agents-{_run_uid}"
 if _xdist_worker:
@@ -186,10 +188,20 @@ if not _xdist_worker:
 
 _test_agents_root.mkdir(parents=True, exist_ok=True)
 
+# The folders config reads and writes at import (config.env with the secrets
+# it generates, sessions/, the preview and upload folders) are the run's own
+# too, beside the agents root: never a worktree's root, never the live
+# install's config.env in the main checkout. Assigned, not defaulted: an
+# xdist worker inherits the controller's value.
+_platform_dir = Path(tempfile.gettempdir()) / f"{_agents_dir_name}-platform"
+_platform_dir.mkdir(parents=True, exist_ok=True)
+os.environ["PLATFORM_CONFIG_DIR"] = os.environ["PLATFORM_DATA_DIR"] = str(_platform_dir)
+
 # Override config.AGENTS_DIR directly — relying on PLATFORM_DATA_DIR alone
 # doesn't help if config was already imported by another module's
 # side-effect (e.g. via pre-conftest registration in pytest collection).
-import config as _config  # noqa: E402
+import config as _config
+
 _config.AGENTS_DIR = _test_agents_root
 # The sessions dir (index.json, prompt files, per-user MCP configs) lives
 # BESIDE the agents root, never inside it: the suite must never rewrite the
@@ -206,6 +218,22 @@ if "core.session.session_state" in sys.modules:
     _ss = sys.modules["core.session.session_state"]
     _ss._SESSION_INDEX = _config.SESSIONS_DIR / "index.json"
     _ss._SECURITY_INDEX = _config.SESSIONS_DIR / "security_index.json"
+
+# Core reaches the permission authority through a door the authority's
+# module installs when imported (the app imports it before any session), so
+# every test process imports it here, as the call-time import used to. After
+# the redirection above: the import captures config.AGENTS_DIR in the path
+# policy.
+import api.hooks.permission  # noqa: F401
+import auth.path_policy as _path_policy
+
+assert _path_policy._AGENTS_DIR == _test_agents_root.resolve()
+
+# The stores' post-commit steps (an agent's repo and quota, a person's
+# folders and memory scope), installed as the app's start installs them.
+from services.agents import agent_provisioning
+
+agent_provisioning.install()
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -230,7 +258,7 @@ def pytest_sessionfinish(session, exitstatus):
                     fh.write("\n".join(_lines) + "\n")
             else:
                 print("\n[db-loop-guard] loop-side store calls:\n" + "\n".join(_lines))
-    except Exception:
+    except (ImportError, OSError):
         pass
     # Stop the run_db lanes, then close the pools: their worker threads are
     # non-daemon, so left open they stall interpreter exit (about 20 s per
@@ -240,7 +268,7 @@ def pytest_sessionfinish(session, exitstatus):
         from storage import pg as _pg
         _pg.shutdown_db_executor()
         _pg.close_pool(timeout=2.0)
-    except Exception:
+    except Exception:  # noqa: BLE001  # the session's teardown must not mask the run's own result
         pass
     if _xdist_worker:
         return
@@ -278,6 +306,41 @@ def _truncate_all_tables(conn):
 
 
 @pytest.fixture(autouse=True)
+def _no_remembered_resume_targets():
+    """The remote resume keeps the targets its probes resolved for two
+    minutes; tests reuse session ids with other rows behind them."""
+    from core.remote import remote_resume
+    remote_resume._resume_targets.clear()
+    yield
+    remote_resume._resume_targets.clear()
+
+
+@pytest.fixture(autouse=True)
+def _compose_runs_allowed():
+    """A test whose app shutdown ran (a lifespan client) stops every later
+    compose run of the process: each test starts with them allowed."""
+    from services.mcp import docker_manager
+    docker_manager._stopping.clear()
+    yield
+    docker_manager._stopping.clear()
+
+
+@pytest.fixture(autouse=True)
+def _platform_running():
+    """A test whose app shutdown ran marks the platform ending for the
+    process (pumps then keep a cut turn's open-turn record): each test
+    starts with it running."""
+    import sys
+    pump_module = sys.modules.get("core.events.stream_pump")
+    if pump_module is not None:
+        pump_module._platform_ending = False
+    yield
+    pump_module = sys.modules.get("core.events.stream_pump")
+    if pump_module is not None:
+        pump_module._platform_ending = False
+
+
+@pytest.fixture(autouse=True)
 def temp_db():
     """Provide a clean database for each test.
 
@@ -285,8 +348,7 @@ def temp_db():
     - Before each test: truncates all tables
     - Seeds minimal user data that most tests need
     """
-    from storage import pg as pg_pool
-    from storage import schema as pg_schema
+    from storage import pg as pg_pool, schema as pg_schema
 
     # Ensure schema exists (no-op if already created)
     with pg_pool.get_conn() as conn:
@@ -305,7 +367,7 @@ def temp_db():
     try:
         from storage.agents import agent_store as _agent_store
         _agent_store._invalidate_cache()
-    except Exception:
+    except Exception:  # noqa: BLE001  # the fixture's resets: one module's must not skip the others
         pass
 
     # The pool-cap readings are cached per pool for 30 s; a cap row or a
@@ -313,7 +375,7 @@ def temp_db():
     try:
         from services.billing import pool_caps as _pool_caps
         _pool_caps.clear_cache()
-    except Exception:
+    except Exception:  # noqa: BLE001  # the fixture's resets: one module's must not skip the others
         pass
 
     # The transfer registry is module-global and nothing in tests runs its
@@ -323,7 +385,7 @@ def temp_db():
     try:
         from core.remote import transfer_registry as _transfer_registry
         _transfer_registry._items.clear()
-    except Exception:
+    except Exception:  # noqa: BLE001  # the fixture's resets: one module's must not skip the others
         pass
 
     # The per-chat writer lanes are module-global and hold flusher tasks
@@ -332,7 +394,7 @@ def temp_db():
     try:
         from core.events import chat_writer as _chat_writer
         _chat_writer.reset_for_tests()
-    except Exception:
+    except Exception:  # noqa: BLE001  # the fixture's resets: one module's must not skip the others
         pass
 
     # The audience cache and the webhook dispatcher's counters are module
@@ -358,7 +420,7 @@ def temp_db():
         _pool._binding_writer = None
         _pool._binding_writes_closed = True
         _wd.reset_caches()
-    except Exception:
+    except Exception:  # noqa: BLE001  # the fixture's resets: one module's must not skip the others
         pass
 
     # Also wipe any agent directories left behind on the filesystem by
@@ -373,7 +435,7 @@ def temp_db():
                     shutil.rmtree(child, ignore_errors=True)
                 else:
                     child.unlink(missing_ok=True)
-    except Exception:
+    except OSError:
         pass
 
     from storage import database as db
@@ -390,7 +452,7 @@ def temp_db():
         _liveness.reset_liveness_for_tests()
         for _sid in _LIVE_TEST_SIDS:
             _liveness.mark_starting(_sid, _LIVE_TEST_TTL_S)
-    except Exception:
+    except Exception:  # noqa: BLE001  # the fixture's resets: one module's must not skip the others
         pass
 
     yield db
@@ -429,6 +491,34 @@ class _LoopDbGuard:
         from storage import pg
         return pg.loop_guard()
 
+    @contextlib.contextmanager
+    def recording(self):
+        """The guard for the CURRENT thread in record mode: every
+        ``get_conn()`` issued on it is noted, never refused, as the
+        ``(proxy-relative file, function)`` of its first caller outside
+        ``storage/`` (the count mode's frame). Yields the set; the inventory
+        tests (``tests/core/test_loop_store_inventory.py``) compare it with
+        their allowlist."""
+        from storage import pg
+        sites: set[tuple[str, str]] = set()
+        ident = threading.get_ident()
+        prior_check, prior_ident = pg._check_loop_guard, pg._guard_thread_ident
+
+        def _note() -> None:
+            if threading.get_ident() == ident:
+                where, _line, func = pg._caller_outside_storage()
+                sites.add((os.path.relpath(where, _PROXY_DIR), func))
+            else:
+                prior_check()
+
+        pg._check_loop_guard = _note
+        pg._guard_thread_ident = ident
+        try:
+            yield sites
+        finally:
+            pg._check_loop_guard = prior_check
+            pg._guard_thread_ident = prior_ident
+
 
 @pytest.fixture
 def loop_db_guard():
@@ -443,6 +533,7 @@ def loop_db_guard():
 def _seed_users():
     """Insert test users into the DB."""
     from datetime import datetime, timezone
+
     from storage.pg import get_conn
 
     now = datetime.now(timezone.utc).isoformat()

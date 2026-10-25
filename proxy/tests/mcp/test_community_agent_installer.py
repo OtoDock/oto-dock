@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -140,8 +141,10 @@ def _install_admin(template_dir: Path, target_slug: str = "demo-agent",
     # the shared orchestrator. Production code only uses
     # ``install_from_catalog`` (which fetches the tarball first); this helper
     # skips the fetch since the test owns the dir.
-    from services.community.community_agent_installer import install_from_extracted_template
-    from storage.agents.community_agent_template_store import load_template_from_dir
+    from services.community.community_agent_installer import (
+        install_from_extracted_template,
+    )
+    from services.community.community_agent_template_store import load_template_from_dir
     template = load_template_from_dir(template_dir)
     return asyncio.run(install_from_extracted_template(
         template=template, target_slug=target_slug,
@@ -156,7 +159,9 @@ def _install_admin(template_dir: Path, target_slug: str = "demo-agent",
 
 class TestTemplateLoading:
     def test_minimal_valid_template(self, tmp_path, temp_db):
-        from storage.agents.community_agent_template_store import load_template_from_dir
+        from services.community.community_agent_template_store import (
+            load_template_from_dir,
+        )
         tdir = _write_template(tmp_path)
         template = load_template_from_dir(tdir)
         assert template.slug == "demo-template"
@@ -166,8 +171,9 @@ class TestTemplateLoading:
         assert template.context_files == {}
 
     def test_missing_agent_json_raises(self, tmp_path, temp_db):
-        from storage.agents.community_agent_template_store import (
-            load_template_from_dir, TemplateValidationError,
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
         )
         tdir = tmp_path / "bad"
         tdir.mkdir()
@@ -178,8 +184,9 @@ class TestTemplateLoading:
             load_template_from_dir(tdir)
 
     def test_invalid_slug_in_agent_json(self, tmp_path, temp_db):
-        from storage.agents.community_agent_template_store import (
-            load_template_from_dir, TemplateValidationError,
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
         )
         tdir = tmp_path / "demo"
         tdir.mkdir()
@@ -193,8 +200,9 @@ class TestTemplateLoading:
             load_template_from_dir(tdir)
 
     def test_invalid_cron_in_tasks(self, tmp_path, temp_db):
-        from storage.agents.community_agent_template_store import (
-            load_template_from_dir, TemplateValidationError,
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
         )
         tdir = _write_template(tmp_path, tasks=[{
             "slug": "bad-task", "description": "x", "scope": "agent",
@@ -205,7 +213,9 @@ class TestTemplateLoading:
             load_template_from_dir(tdir)
 
     def test_valid_task_with_cron_schedule(self, tmp_path, temp_db):
-        from storage.agents.community_agent_template_store import load_template_from_dir
+        from services.community.community_agent_template_store import (
+            load_template_from_dir,
+        )
         tdir = _write_template(tmp_path, tasks=[{
             "slug": "good-task", "description": "Test",
             "scope": "user", "prompt": "echo",
@@ -217,14 +227,18 @@ class TestTemplateLoading:
         assert template.tasks[0].cron == "0 9 * * *"
 
     def test_setup_md_parsed_when_present(self, tmp_path, temp_db):
-        from storage.agents.community_agent_template_store import load_template_from_dir
+        from services.community.community_agent_template_store import (
+            load_template_from_dir,
+        )
         tdir = _write_template(tmp_path, setup_md="## Setup steps\n1. Do X\n")
         template = load_template_from_dir(tdir)
         assert template.setup_md is not None
         assert "Setup steps" in template.setup_md
 
     def test_context_collected(self, tmp_path, temp_db):
-        from storage.agents.community_agent_template_store import load_template_from_dir
+        from services.community.community_agent_template_store import (
+            load_template_from_dir,
+        )
         tdir = _write_template(tmp_path, context_files={
             "methodology.md": "## Methodology", "glossary.txt": "terms",
         })
@@ -243,8 +257,10 @@ class TestTemplateAppsAndChecks:
             "actions": [{"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}]}
 
     def test_both_folders_discovered_with_their_hashes(self, tmp_path, temp_db):
-        from storage.agents import template_sig
-        from storage.agents.community_agent_template_store import load_template_from_dir
+        from services.community import template_sig
+        from services.community.community_agent_template_store import (
+            load_template_from_dir,
+        )
         tdir = _write_template(
             tmp_path, agent_json_extra={"collaborative": True},
             apps={"board": {"title": "Board", "requires": {"mcps": ["github-mcp"]},
@@ -271,7 +287,7 @@ class TestTemplateAppsAndChecks:
         assert board.sig != home.sig
 
     def test_signature_pins_and_ignores_formatting(self, tmp_path, temp_db):
-        from storage.agents import template_sig
+        from services.community import template_sig
         doc = {"title": "X", "egress": ["api.open-meteo.com"]}
         assert template_sig.template_app_sig(doc, None, "abc") == \
             "b08d34904992bac762cdc2366e81dcbea1911fb932be03e8146ad17c6169c1a9"
@@ -298,10 +314,13 @@ class TestTemplateAppsAndChecks:
         # naming the same bytes) or a FIFO after the walk is refused, never
         # read through.
         import os
+
         from services.apps import releases
-        from storage.agents import template_sig
-        from storage.agents.community_agent_template_store import (
-            TemplateValidationError, load_template_from_dir)
+        from services.community import template_sig
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
+        )
         root = tmp_path / "pinned"
         (root / "client").mkdir(parents=True)
         (root / "server").mkdir()
@@ -342,7 +361,7 @@ class TestTemplateAppsAndChecks:
             load_template_from_dir(tdir)
 
     def test_owner_approval_predicate(self, temp_db):
-        from storage.agents.template_sig import needs_owner
+        from services.community.template_sig import needs_owner
         base = {"title": "H", "egress": ["a.example"], "exports": {"methods": {}},
                 "bindings": [{"name": "b", "agent": "x", "app": "y"}], "external": {"links": ["z"]},
                 "files": {"read": ["workspace/x/"]},
@@ -363,8 +382,10 @@ class TestTemplateAppsAndChecks:
             assert needs_owner({**base, **change}) is True, change
 
     def test_user_app_rules_and_mode(self, tmp_path, temp_db):
-        from storage.agents.community_agent_template_store import (
-            TemplateValidationError, load_template_from_dir)
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
+        )
         for slug, manifest, message in (
             ("inb", {**self.HOME, "inbound": {"s": {"verify": "stripe", "secret": "S", "handler": "h"}}},
              "inbound hooks"),
@@ -409,8 +430,10 @@ class TestTemplateAppsAndChecks:
         assert [a.visibility for a in load_template_from_dir(tdir).apps] == ["user"]
 
     def test_slug_clash_caps_and_missing_page(self, tmp_path, temp_db):
-        from storage.agents.community_agent_template_store import (
-            TemplateValidationError, load_template_from_dir)
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
+        )
         tdir = _write_template(tmp_path, slug="clash", apps={"home": {"title": "A"}},
                                user_apps={"home": self.HOME}, agent_json_extra={"collaborative": True})
         with pytest.raises(TemplateValidationError, match="used by another app"):
@@ -434,8 +457,10 @@ class TestTemplateAppsAndChecks:
 
     def test_checks_discovered_validated_and_hashed(self, tmp_path, temp_db):
         from services.checks import documents
-        from storage.agents.community_agent_template_store import (
-            TemplateValidationError, load_template_from_dir)
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
+        )
         tdir = _write_template(tmp_path, checks={"lint": self.CHECK,
                                                  "review": {"name": "review", "judge": {"rubric": "r"}}})
         template = load_template_from_dir(tdir)
@@ -465,10 +490,15 @@ class TestTemplateAppsAndChecks:
 
     def test_persisted_record_carries_apps_checks_and_the_baseline(self, tmp_path, temp_db):
         import hashlib
-        from storage.agents import template_sig
-        from storage.agents.community_agent_template_store import (
-            BASELINE_FORMAT, item_projection, load_template_from_dict, load_template_from_dir,
-            template_to_persistable_dict)
+
+        from services.community import template_sig
+        from services.community.community_agent_template_store import (
+            BASELINE_FORMAT,
+            item_projection,
+            load_template_from_dict,
+            load_template_from_dir,
+            template_to_persistable_dict,
+        )
         tdir = _write_template(
             tmp_path, agent_json_extra={"collaborative": True},
             apps={"board": {"title": "Board"}}, user_apps={"home": self.HOME},
@@ -495,7 +525,7 @@ class TestTemplateAppsAndChecks:
         assert template.checks[0].sig == template_sig.check_sig(
             {k: v for k, v in self.CHECK.items() if k != "_script"}, template.checks[0].script_sha256)
         assert data["consent"] == {"apps": {}, "checks": {}}
-        sha = lambda s: hashlib.sha256(s.encode()).hexdigest()  # noqa: E731
+        sha = lambda s: hashlib.sha256(s.encode()).hexdigest()
         base = data["baseline"]
         assert base["persona"] == sha("# Test Prompt\n")
         assert base["context"] == {"context/notes.md": sha("See /agents/my-agent/config")}
@@ -541,13 +571,17 @@ class TestTemplateAppSeeding:
         template_app_seeder._healed.clear()
         template_app_seeder._failure_told.clear()
         app_supervisor._instances.clear()
-        from api.apps import apps as apps_api
-        apps_api._deploy_locks.clear()
+        from services.apps import releases
+        releases._deploy_locks.clear()
 
     def _install(self, tmp_path, *, apps=None, user_apps=None, checks=None, consent=True,
                  slug="apptpl", target="app-agent", collaborative=True):
-        from storage.agents.community_agent_template_store import load_template_from_dir
-        from services.community.community_agent_installer import install_from_extracted_template
+        from services.community.community_agent_installer import (
+            install_from_extracted_template,
+        )
+        from services.community.community_agent_template_store import (
+            load_template_from_dir,
+        )
         _make_user(ADMIN_SUB, "admin@test.com", "admin")
         tdir = _write_template(tmp_path, slug=slug, apps=apps, user_apps=user_apps, checks=checks,
                                agent_json_extra={"collaborative": collaborative})
@@ -621,9 +655,13 @@ class TestTemplateAppSeeding:
         assert documents.load_checks("app-agent")[0].mandatory is False
 
     def test_a_wrong_signature_is_ignored_not_approved(self, tmp_path, temp_db):
+        from services.community.community_agent_installer import (
+            install_from_extracted_template,
+        )
+        from services.community.community_agent_template_store import (
+            load_template_from_dir,
+        )
         from storage import database as db
-        from storage.agents.community_agent_template_store import load_template_from_dir
-        from services.community.community_agent_installer import install_from_extracted_template
         _make_user(ADMIN_SUB, "admin@test.com", "admin")
         tdir = _write_template(tmp_path, slug="sigtpl", user_apps={"home": self.HOME},
                                agent_json_extra={"collaborative": False, "default_scope": "user"})
@@ -647,6 +685,7 @@ class TestTemplateAppSeeding:
         # write and a new egress host) must wait on the late joiner's card,
         # never ride the installer's consent.
         import json as _json
+
         import config as app_config
         from services.community import template_app_seeder
         from storage import database as db
@@ -680,6 +719,25 @@ class TestTemplateAppSeeding:
                 assert status == "failed"
         told = {c.kwargs["target"] for c in notes.call_args_list}
         assert "bob-sub" in told and notes.call_count == len(told)
+
+    def test_a_refused_copy_names_the_fail_rows_only(self, tmp_path, temp_db):
+        # The static checks warn on words and colours too; the reason a
+        # person reads names what refused the seed, never the warnings.
+        from services.apps import app_deploy
+        from services.community import template_app_seeder
+        from storage import database as db
+        self._install(tmp_path, user_apps={"home": self.HOME})
+        _make_user("bob-sub", "bob@test.com")
+        db.add_user_agent("bob-sub", "app-agent", "viewer", "test")
+        refused = {"status": app_deploy.RESULT_REFUSED, "findings": [
+            {"rule": "words.dash", "severity": "warn", "message": "A dash breaks this sentence."},
+            {"rule": "server.secret", "severity": "fail", "message": "This looks like a key or a password."},
+            {"rule": "client.palette", "severity": "warn", "message": "text-red-500 is a fixed colour."}]}
+        with patch("services.apps.app_blueprints.import_folder", new=AsyncMock(return_value=refused)), \
+                patch("services.notifications.notification_manager.fire_notification", new=AsyncMock()):
+            status, detail = asyncio.run(template_app_seeder.seed_user_copy("app-agent", "bob-sub", "home"))
+        assert (status, detail) == ("failed", "This looks like a key or a password.")
+        assert template_app_seeder._refusal_reason({"findings": [{"severity": "warn", "message": "x"}]}) == "refused"
 
     def test_owner_only_copies_wait_for_their_owner(self, tmp_path, temp_db):
         from storage import database as db
@@ -881,6 +939,38 @@ class TestTemplateAppSeeding:
 
 
 # ---------------------------------------------------------------------------
+# A failed install says what failed in plain words, the cause in the log
+# ---------------------------------------------------------------------------
+
+class TestInstallFailures:
+    def _refused(self, tdir) -> str:
+        from fastapi import HTTPException
+        with patch("services.mcp.mcp_registry.get_all_manifests", return_value={}), \
+                pytest.raises(HTTPException) as exc:
+            _install_admin(tdir)
+        assert exc.value.status_code == 500
+        return exc.value.detail
+
+    def test_a_folder_that_cannot_be_made(self, tmp_path, temp_db, caplog):
+        tdir = _write_template(tmp_path)
+        with patch("services.community.community_agent_installer._create_agent_folder",
+                   side_effect=PermissionError(13, "Permission denied", "/srv/agents/demo-agent")), \
+                caplog.at_level("ERROR", logger="otodock.community-agent-installer"):
+            detail = self._refused(tdir)
+        assert detail == "Could not create the agent's files. The server log has the details."
+        assert "/srv/agents" not in detail and "/srv/agents/demo-agent" in caplog.text
+
+    def test_a_record_that_cannot_be_saved(self, tmp_path, temp_db, caplog):
+        tdir = _write_template(tmp_path)
+        with patch("storage.agents.agent_store.create_agent",
+                   side_effect=RuntimeError("duplicate key value violates unique constraint")), \
+                caplog.at_level("ERROR", logger="otodock.community-agent-installer"):
+            detail = self._refused(tdir)
+        assert detail == "Could not save the new agent. The server log has the details."
+        assert "duplicate key" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # Pre-flight validation
 # ---------------------------------------------------------------------------
 
@@ -902,7 +992,7 @@ class TestPreflight:
 
     def test_mcp_in_catalog_passes_preflight(self, tmp_path, temp_db):
         from services.community.community_agent_installer import _preflight_check_mcps
-        from storage.agents.community_agent_template_store import McpRequirement
+        from services.community.community_agent_template_store import McpRequirement
 
         with patch(
             "services.community.community_catalog.fetch_registry",
@@ -913,6 +1003,35 @@ class TestPreflight:
         ):
             # Should not raise.
             asyncio.run(_preflight_check_mcps([McpRequirement(name="future-mcp")]))
+
+    def test_an_invalid_catalog_template_lists_its_problems(self, tmp_path, temp_db):
+        """A refused catalog template answers the shape the dashboard's
+        dialog lists: the sentence in ``message``, every finding in
+        ``problems``."""
+        from fastapi import HTTPException
+
+        from services.community.community_agent_installer import install_from_catalog
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
+        )
+        tdir = tmp_path / "fetched" / "broken-template"
+        tdir.mkdir(parents=True)
+        with pytest.raises(TemplateValidationError) as loaded:
+            load_template_from_dir(tdir)
+        with patch("services.community.community_agents_catalog.fetch_registry",
+                   new=AsyncMock(return_value={"mcps": [], "agents": []})), \
+                patch("services.community.community_agents_catalog.fetch_and_extract_template",
+                      new=AsyncMock(return_value=tdir)):
+            with pytest.raises(HTTPException) as exc:
+                asyncio.run(install_from_catalog(
+                    template_slug="broken-template", target_slug="broken",
+                    installer_user_sub=ADMIN_SUB, installer_role="admin"))
+        assert exc.value.status_code == 400
+        detail = exc.value.detail
+        assert detail["error"] == "invalid_template"
+        assert detail["message"] == f"Invalid catalog template: {loaded.value}"
+        assert detail["problems"] == loaded.value.problems and detail["problems"]
 
 
 # ---------------------------------------------------------------------------
@@ -935,6 +1054,7 @@ class TestSlugCollision:
 
     def test_install_collision_returns_409_with_suggestion(self, tmp_path, temp_db):
         from fastapi import HTTPException
+
         from storage.agents import agent_store
         agent_store.create_agent("demo-agent", "Existing")
         tdir = _write_template(tmp_path)
@@ -945,6 +1065,23 @@ class TestSlugCollision:
         assert isinstance(detail, dict)
         assert detail["error"] == "slug_taken"
         assert detail["suggested_slug"] == "demo-agent-2"
+
+    @pytest.mark.parametrize("slug", ["admin", "setup", "System"])
+    def test_a_reserved_slug_reads_as_taken_with_creations_sentence(self, tmp_path, temp_db, slug):
+        """A template install takes no slug agent creation refuses: the same
+        409 a taken slug gets, so the dialog offers the suggestion."""
+        from fastapi import HTTPException
+
+        import config as app_config
+        tdir = _write_template(tmp_path)
+        with pytest.raises(HTTPException) as exc:
+            _install_admin(tdir, target_slug=slug)
+        assert exc.value.status_code == 409
+        detail = exc.value.detail
+        assert detail["error"] == "slug_taken"
+        assert detail["message"] == f"'{slug.lower()}' is reserved by OtoDock. Pick another ID."
+        assert detail["suggested_slug"] == f"{slug.lower()}-2"
+        assert not (app_config.AGENTS_DIR / slug.lower()).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1252,8 +1389,8 @@ class TestNotificationBatching:
 
 class TestSeededCleanupInvariants:
     def test_delete_agent_removes_seeded_items(self, tmp_path, temp_db):
-        from storage.agents import agent_store
         from storage import database as db
+        from storage.agents import agent_store
 
         tdir = _write_template(tmp_path, tasks=[{
             "slug": "smoke-task", "description": "x", "scope": "agent",
@@ -1357,8 +1494,8 @@ class TestUserJoinHook:
         assert len(data["notifications"]) == 1
 
     def test_hook_seeds_items_for_late_joiner(self, tmp_path, temp_db):
-        from storage import database as db
         from services.community.community_agent_installer import on_user_added_to_agent
+        from storage import database as db
 
         agent_slug = _install_with_user_items(tmp_path)
         _make_user("user-bob", "bob@example.com")
@@ -1380,8 +1517,8 @@ class TestUserJoinHook:
         assert len(bob_user_tasks) == 1
 
     def test_hook_is_idempotent(self, tmp_path, temp_db):
-        from storage import database as db
         from services.community.community_agent_installer import on_user_added_to_agent
+        from storage import database as db
 
         agent_slug = _install_with_user_items(tmp_path)
         _make_user("user-bob", "bob@example.com")
@@ -1396,8 +1533,8 @@ class TestUserJoinHook:
 
     def test_hook_respects_role_filter(self, tmp_path, temp_db):
         """Item with ``roles: ["manager"]`` is NOT seeded for a viewer."""
-        from storage import database as db
         from services.community.community_agent_installer import on_user_added_to_agent
+        from storage import database as db
 
         tdir = _write_template(tmp_path, slug="rolefilter", tasks=[{
             "slug": "mgr-only", "description": "Manager-only",
@@ -1432,8 +1569,8 @@ class TestUserJoinHook:
     def test_hook_noop_for_non_community_agent(self, tmp_path, temp_db):
         """Agents not installed from a template have no template_data; hook
         returns empty counts without raising."""
-        from storage.agents import agent_store
         from services.community.community_agent_installer import on_user_added_to_agent
+        from storage.agents import agent_store
 
         agent_store.create_agent("native-agent", "Native Agent")
         counts = on_user_added_to_agent("native-agent", "user-anon", "viewer")
@@ -1442,8 +1579,8 @@ class TestUserJoinHook:
     def test_hook_skips_auto_create_for_new_users_false(self, tmp_path, temp_db):
         """Items where ``auto_create_for_new_users=False`` are NOT seeded for
         late joiners (only the installer's items at install time)."""
-        from storage import database as db
         from services.community.community_agent_installer import on_user_added_to_agent
+        from storage import database as db
 
         tdir = _write_template(tmp_path, slug="noauto", tasks=[{
             "slug": "no-auto", "description": "Don't auto-create",
@@ -1498,8 +1635,9 @@ class TestUserJoinHook:
         assert agent["default_for_new_users_role"] == ""
 
     def test_invalid_default_role_rejected_at_load(self, tmp_path, temp_db):
-        from storage.agents.community_agent_template_store import (
-            load_template_from_dir, TemplateValidationError,
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
         )
         tdir = _write_template(tmp_path, slug="badrole")
         agent_json_path = tdir / "agent.json"
@@ -1512,8 +1650,9 @@ class TestUserJoinHook:
     def test_core_mcps_field_parses_and_validates(self, tmp_path, temp_db):
         """``core_mcps``: absent → "all" (the default install behavior);
         "none" round-trips; anything else is a schema violation."""
-        from storage.agents.community_agent_template_store import (
-            load_template_from_dir, TemplateValidationError,
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
         )
         tdir = _write_template(tmp_path, slug="coreopt")
         assert load_template_from_dir(tdir).core_mcps == "all"
@@ -1570,8 +1709,9 @@ class TestSkillPackages:
         monkeypatch.setattr(mcp_registry, "get_manifest", _one)
 
     def test_skills_json_validation(self, tmp_path, temp_db):
-        from storage.agents.community_agent_template_store import (
-            load_template_from_dir, TemplateValidationError,
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
         )
         tdir = _write_template(tmp_path, skills=[{"name": "theme-factory"}])
         template = load_template_from_dir(tdir)
@@ -1626,6 +1766,7 @@ class TestSkillPackages:
 
     def test_admin_cascade_installs_assigns_and_seeds(self, tmp_path, temp_db):
         from types import SimpleNamespace
+
         from storage.mcp import mcp_store
         tdir = _write_template(
             tmp_path, skills=[{"name": "theme-factory", "skills": ["theme-factory"]}],
@@ -1669,6 +1810,7 @@ class TestSkillPackages:
 
     def test_skill_install_failure_never_aborts_agent(self, tmp_path, temp_db):
         from fastapi import HTTPException as HX
+
         from storage.agents import agent_store
         tdir = _write_template(
             tmp_path, slug="resilient", skills=[{"name": "theme-factory"}],
@@ -1744,8 +1886,8 @@ class TestDashboardSeeding:
 
     def test_user_dashboard_installer_and_late_joiner(self, tmp_path, temp_db):
         import config as app_config
-        from storage import database as db
         from services.community.community_agent_installer import on_user_added_to_agent
+        from storage import database as db
         result = self._install_dash(
             tmp_path,
             dashboards=[{"slug": "my-brief", "file": "brief.html",
@@ -1773,8 +1915,8 @@ class TestDashboardSeeding:
         assert len(rows) == 1
 
     def test_auto_pin_opt_out_skips_late_joiners(self, tmp_path, temp_db):
-        from storage import database as db
         from services.community.community_agent_installer import on_user_added_to_agent
+        from storage import database as db
         self._install_dash(
             tmp_path,
             dashboards=[{"slug": "opt", "file": "o.html", "visibility": "user",
@@ -1788,9 +1930,13 @@ class TestDashboardSeeding:
 
     def test_validation_mode_and_files(self, tmp_path, temp_db):
         import json as _json
+
         import pytest as _pytest
-        from storage.agents.community_agent_template_store import (
-            TemplateValidationError, load_template_from_dir)
+
+        from services.community.community_agent_template_store import (
+            TemplateValidationError,
+            load_template_from_dir,
+        )
         # visibility the template's mode doesn't offer → manifest error.
         tdir = _write_template(
             tmp_path, slug="po-tpl",
@@ -1815,9 +1961,11 @@ class TestDashboardSeeding:
 def test_the_installer_names_the_agent_as_the_dialog_said(tmp_path, temp_db):
     """The install dialog's display name is the agent's; empty means the
     template's own."""
+    from services.community.community_agent_installer import (
+        install_from_extracted_template,
+    )
+    from services.community.community_agent_template_store import load_template_from_dir
     from storage.agents import agent_store
-    from storage.agents.community_agent_template_store import load_template_from_dir
-    from services.community.community_agent_installer import install_from_extracted_template
     _make_user(ADMIN_SUB, "admin@test.com", "admin")
     template = load_template_from_dir(_write_template(tmp_path, slug="named-tpl"))
     with patch("services.community.community_agents_catalog.fetch_registry",
@@ -1856,3 +2004,152 @@ class TestInstallerManagerRow:
                        installer_role="manager")
         assert seen == [(MANAGER_SUB, "mgr-agent", "manager", MANAGER_SUB)]
         assert db.get_user_agent_roles(MANAGER_SUB)["mgr-agent"] == "manager"
+
+
+# ---------------------------------------------------------------------------
+# A template task's own model, engine and notification mode
+# ---------------------------------------------------------------------------
+
+def _pinned_task(**over) -> dict:
+    return {"slug": "weekly-brief", "description": "Weekly brief", "scope": "agent", "prompt": "brief",
+            "schedule": {"type": "cron", "cron": "0 8 * * 1"}, "default_state": "paused", **over}
+
+
+def _install_pinned(tmp_path, *tasks: dict) -> dict:
+    tdir = _write_template(tmp_path, slug="pin-template", tasks=list(tasks))
+    with patch(
+        "services.community.community_agents_catalog.fetch_registry",
+        new=AsyncMock(return_value={"mcps": []}),
+    ), patch(
+        "services.mcp.mcp_registry.get_all_manifests", return_value={},
+    ), patch(
+        "services.notifications.notification_manager.fire_notification", new=AsyncMock(),
+    ), patch(
+        # The engine the new agent gets: the pins below are judged against it.
+        "services.engines.subscription_pool.default_execution_layer_for_creator",
+        return_value="claude-code-cli",
+    ):
+        return _install_admin(tdir, target_slug="pin-agent")
+
+
+def _enabled_model(layer: str) -> str:
+    """A model the layer offers, enabled (the test database seeds none)."""
+    from storage.billing import subscription_store
+    subscription_store.add_model(layer, "pin-test-model", "Pin test model")
+    return "pin-test-model"
+
+
+class TestTaskPins:
+    def test_the_fields_parse_persist_and_read_back_and_an_old_record_has_none(self, tmp_path, temp_db):
+        from services.community.community_agent_template_store import (
+            load_template_from_dict,
+            load_template_from_dir,
+            template_to_persistable_dict,
+        )
+        tdir = _write_template(tmp_path, slug="pin-parse", tasks=[
+            _pinned_task(override_model="claude-fable-5-1", layer="claude-code-cli", notification_mode="none"),
+            _pinned_task(slug="plain-task")])
+        template = load_template_from_dir(tdir)
+        pinned, plain = template.tasks
+        assert (pinned.override_model, pinned.layer, pinned.notification_mode) == \
+            ("claude-fable-5-1", "claude-code-cli", "none")
+        assert (plain.override_model, plain.layer, plain.notification_mode) == (None, None, "manual")
+        again = load_template_from_dict(template_to_persistable_dict(template)).tasks
+        assert [(t.override_model, t.layer, t.notification_mode) for t in again] == \
+            [("claude-fable-5-1", "claude-code-cli", "none"), (None, None, "manual")]
+        # A record written before 1.9.0 carries none of the three keys.
+        record = template_to_persistable_dict(template)
+        for item in record["tasks"]:
+            for key in ("override_model", "layer", "notification_mode"):
+                item.pop(key)
+        old = load_template_from_dict(record).tasks
+        assert [(t.override_model, t.layer, t.notification_mode) for t in old] == [(None, None, "manual")] * 2
+
+    def test_a_pin_the_agent_runs_and_a_mode_reach_the_row(self, tmp_path, temp_db):
+        from storage import database as db
+        from storage.agents import agent_store
+        layer = "claude-code-cli"
+        model = _enabled_model(layer)
+        out = _install_pinned(tmp_path, _pinned_task(override_model=model, notification_mode="none"))
+        assert agent_store.get_agent("pin-agent")["execution_path"] == layer
+        assert out["task_pins_dropped"] == []
+        row = next(t for t in db.list_dynamic_tasks(agent="pin-agent")
+                   if t["community_template_item_slug"] == "weekly-brief")
+        assert (row["override_model"], row["override_execution_path"], row["notification_mode"]) == \
+            (model, "", "none")
+        record = agent_store.get_community_template_data("pin-agent")
+        assert record["tasks"][0]["override_model"] == model
+
+    def test_a_pair_the_agent_cannot_run_is_dropped_together_and_named(self, tmp_path, temp_db):
+        from storage import database as db
+        from storage.agents import agent_store
+        out = _install_pinned(tmp_path,
+                              _pinned_task(override_model="claude-fable-5-1", layer="no-such-engine"),
+                              _pinned_task(slug="other-brief", override_model="no-such-model"))
+        notes = out["task_pins_dropped"]
+        assert len(notes) == 2, notes
+        assert notes == [
+            "The task 'weekly-brief' runs on the agent's usual model and engine. "
+            "The engine it asks for is not turned on for this agent.",
+            "The task 'other-brief' runs on the agent's usual model and engine. "
+            "The model no-such-model is not turned on for Claude Code CLI.",
+        ]
+        rows = {t["community_template_item_slug"]: t for t in db.list_dynamic_tasks(agent="pin-agent")}
+        # Seeded all the same, on the agent's default.
+        for slug in ("weekly-brief", "other-brief"):
+            assert (rows[slug]["override_model"], rows[slug]["override_execution_path"]) == ("", "")
+        record = agent_store.get_community_template_data("pin-agent")
+        assert [(t["override_model"], t["layer"]) for t in record["tasks"]] == [(None, None), (None, None)]
+
+    def test_a_pin_note_names_a_known_engine_and_never_a_blank(self, temp_db, monkeypatch):
+        from services.community import community_agent_installer as inst
+        from storage.agents import agent_store
+        agent_store.create_agent("pin-blank", "Pin blank", execution_path="claude-code-cli")
+        assert inst.task_pin_problem("pin-blank", None, "codex-cli") == (
+            "OpenAI Codex is not turned on for this agent.")
+        monkeypatch.setattr(agent_store, "get_agent", lambda slug: {"execution_path": ""})
+        assert inst.task_pin_problem("pin-blank", "no-such-model", None) == (
+            "The model no-such-model is not turned on for this agent.")
+
+    def test_a_retired_model_pin_runs_on_its_successor(self, tmp_path, temp_db, monkeypatch):
+        import config
+        from storage import database as db
+        from storage.agents import agent_store
+        layer = "claude-code-cli"
+        model = _enabled_model(layer)
+        monkeypatch.setitem(config.MODEL_SUCCESSORS, "retired-test-model", model)
+        out = _install_pinned(tmp_path, _pinned_task(override_model="retired-test-model"))
+        assert agent_store.get_agent("pin-agent")["execution_path"] == layer
+        assert out["task_pins_dropped"] == []
+        row = db.list_dynamic_tasks(agent="pin-agent")[0]
+        assert row["override_model"] == model
+
+    def test_a_later_seed_drops_a_pin_the_agent_lost_and_never_adds_one(self, tmp_path, temp_db):
+        from services.community import community_agent_installer as inst
+        from services.community.community_agent_template_store import TaskItem
+        item = TaskItem(slug="t", description="", scope="agent", prompt="p", schedule_kind="cron",
+                        cron="0 8 * * *", interval_seconds=None, run_at=None, default_state="paused",
+                        auto_create_for_new_users=True, roles=None,
+                        override_model="no-such-model", layer=None)
+        _install_pinned(tmp_path, _pinned_task())
+        assert inst._seed_pins(item, "pin-agent") == ("", "")
+        plain = TaskItem(**{**item.__dict__, "override_model": None})
+        assert inst._seed_pins(plain, "pin-agent") == ("", "")
+
+
+def test_a_revalidated_empty_template_manifest_comes_from_the_cache(monkeypatch):
+    """A template whose agent.json is an empty object is cached like any
+    other: once the TTL lapses and the catalog answers 304, the cached
+    document is served again, never None."""
+    from services.community import community_agents_catalog as cat
+    monkeypatch.setattr(cat, "_manifest_cache", {})
+    sent: list = []
+
+    async def _get(url, etag):
+        sent.append(etag)
+        return ({}, "e1", 200) if etag is None else (None, etag, 304)
+    monkeypatch.setattr(cat, "_http_get_json", _get)
+    assert asyncio.run(cat.fetch_manifest("empty")) == {}
+    monkeypatch.setattr(cat, "MANIFEST_CACHE_TTL_SECONDS", -1)
+    assert asyncio.run(cat.fetch_manifest("empty")) == {}
+    assert sent == [None, "e1"]

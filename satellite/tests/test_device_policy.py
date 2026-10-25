@@ -6,10 +6,8 @@ cache (``satellite_policy``).
 import pytest
 
 from satellite import config as sat_config
-
-from satellite.sessions.session_manager import _detect_display
 from satellite.host import satellite_policy
-
+from satellite.sessions.session_manager import _detect_display
 
 # ---------------------------------------------------------------------------
 # _detect_display

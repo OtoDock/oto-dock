@@ -24,9 +24,9 @@ import logging
 
 from auth import roles
 from services.agents import shared_only_members
-from storage.agents import agent_store
-from storage import database as user_store
 from services.community import community_agent_installer
+from storage import database as user_store
+from storage.agents import agent_store
 
 logger = logging.getLogger("otodock.default-agent-assigner")
 
@@ -66,7 +66,9 @@ def assign_default_agents(user_sub: str) -> dict[str, str]:
                 user_sub, slug, role, assigned_by="system",
             )
             if inserted:
-                from services.notifications.notification_manager import invalidate_audience
+                from services.notifications.notification_manager import (
+                    invalidate_audience,
+                )
                 invalidate_audience(slug)
                 # Seed per-user template items for the freshly-attached pair.
                 # Failures here don't undo the attach — the user can still

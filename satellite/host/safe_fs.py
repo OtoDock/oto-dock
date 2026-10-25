@@ -381,12 +381,15 @@ def atomic_write_beneath(root, rel, data: bytes, *, mkdirs: bool = False,
                     _w_unlink(tmp)
 
 
-def open_append_beneath(root, rel, *, truncate: bool = False, mkdirs: bool = True) -> int:
-    """A descriptor to append to ``rel`` (created when absent; truncated first
-    when ``truncate``), a regular file reached without a link. The caller
-    closes it."""
+def open_append_beneath(root, rel, *, truncate: bool = False, mkdirs: bool = True,
+                        create: bool = True) -> int:
+    """A descriptor to append to ``rel`` (created when absent unless
+    ``create`` is off, when a missing file is ``FileNotFoundError``;
+    truncated first when ``truncate``), a regular file reached without a
+    link. The caller closes it."""
     parents, name, shown = _leaf(rel)
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if truncate else os.O_APPEND)
+    flags = (os.O_WRONLY | (os.O_CREAT if create else 0)
+             | (os.O_TRUNC if truncate else os.O_APPEND))
     with open_root(root) as r:
         if _posix():
             pfd = _parent_posix(r.fd, parents, mkdirs=mkdirs)

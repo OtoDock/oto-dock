@@ -14,7 +14,7 @@ import os
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("call-control-mcp")
@@ -50,6 +50,7 @@ async def list_tools() -> list[Tool]:
                     },
                 },
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
         ),
         Tool(
             name="transfer_call",
@@ -68,6 +69,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["target"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
         ),
     ]
     if ASK_BACK:
@@ -89,6 +91,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["question"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ))
     return tools
 

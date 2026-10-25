@@ -16,8 +16,10 @@ export function cleanForSpeech(text: string): string {
     .replace(/^\s*\|.*\|\s*$/gm, ' ')             // table rows
     .replace(/^[\s|:-]{3,}$/gm, ' ')              // table separators / hr
     .replace(/(\*\*\*|\*\*|\*|___|__|_|~~)/g, '') // bold / italic / strike
-    // emoji, dingbats, arrows, symbols, variation selectors, ZWJ
-    .replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}]/gu, '')
+    // emoji, dingbats, arrows, symbols, variation selectors, ZWJ (the two
+    // joining marks are alternatives: inside the class they would read as
+    // combined with the range before them)
+    .replace(/(?:[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}]|\u{FE0F}|\u{200D})/gu, '')
     .replace(/[ \t]{2,}/g, ' ')
     .replace(/\n{2,}/g, '\n')
     .trim()

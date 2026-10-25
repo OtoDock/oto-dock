@@ -9,14 +9,13 @@ is monkeypatched per test — it is a module singleton with real-time windows.
 import asyncio
 
 import pytest
+from pipeline_fakes import FakeCall, FakeCallManager, FakeConn, FakeLLM, make_route
 
 from calls import pin_failures
 from calls.call_manager import CallStatus
 from calls.pin_failures import PinFailureStore
 from config_manager import ConfigManager
 from transport.base import FRAME_AUDIO, FRAME_DTMF, FRAME_HANGUP, TransportError
-
-from pipeline_fakes import FakeCall, FakeCallManager, FakeConn, FakeLLM, make_route
 
 pytestmark = pytest.mark.asyncio
 

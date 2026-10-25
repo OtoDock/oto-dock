@@ -19,7 +19,11 @@ import json
 import pytest
 
 from core.events.common_events import (
-    CommonEvent, DONE, TOOL_INPUT, TOOL_RESULT, TOOL_USE,
+    DONE,
+    TOOL_INPUT,
+    TOOL_RESULT,
+    TOOL_USE,
+    CommonEvent,
 )
 from core.events.stream_pump import ChatStreamPump
 from storage import database as task_store

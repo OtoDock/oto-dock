@@ -17,9 +17,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.apps import apps as apps_api
-from api.apps import manifest as _mf
 from app import app
 from auth.providers import UserContext, get_current_user
+from services.apps import manifest as _mf
 from storage import database as task_store
 from ws import artifact_interactions as _ai
 

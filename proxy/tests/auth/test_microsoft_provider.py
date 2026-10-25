@@ -18,10 +18,10 @@ HTTP is mocked via httpx.AsyncClient. JWTs are minted via PyJWT.
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import jwt
+import pytest
 
 from auth.oauth_providers import get_provider
 from auth.oauth_providers.microsoft import MicrosoftOAuthProvider

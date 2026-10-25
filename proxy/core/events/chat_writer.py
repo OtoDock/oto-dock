@@ -32,7 +32,8 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from storage.pg import run_db
 
@@ -87,7 +88,7 @@ async def _flush(chat_id: str, lane: _Lane) -> None:
                     if not pending_fut.done():
                         pending_fut.cancel()
                 raise
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # the lane's per-job step: the error goes to its future, the rest run
                 logger.warning(
                     "chat-writer %s: %s failed: %s", chat_id[:8], label, e, exc_info=True,
                 )
@@ -131,7 +132,7 @@ async def drain(chat_id: str, timeout: float | None = None) -> bool:
         if task.cancelled():
             return False
         raise
-    except Exception:
+    except Exception:  # noqa: BLE001  # a flusher's death is logged where it died, drain reports landed
         pass  # the flusher's own failure is logged there
     return True
 

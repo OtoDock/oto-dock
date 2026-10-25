@@ -11,11 +11,13 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { apiFetch } from '../../api/auth'
 import { useAuth } from '../../contexts/AuthContext'
 import { isAdmin } from '../../lib/permissions'
 import { FORWARDING_CONSEQUENCE, forwardingAdvice } from './forwardingAdvice'
 import type { ForwardingWarning } from './forwardingAdvice'
+import { apiJson, withMessage } from '../../lib/http/apiJson'
+import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT } from '../ui/classes'
+import { BANNER_STRIP, BANNER_TONE } from './bannerStrip'
 
 const DISMISSED = 'otodock.forwardingBanner.dismissed'
 
@@ -29,9 +31,8 @@ export function ForwardingBanner() {
   const { data } = useQuery({
     queryKey: ['forwarding-warnings'],
     queryFn: async (): Promise<{ warnings: ForwardingWarning[] }> => {
-      const res = await apiFetch('/v1/admin/forwarding-warnings')
-      if (!res.ok) throw new Error('Failed to fetch')
-      return res.json()
+      return apiJson<{ warnings: ForwardingWarning[] }>('/v1/admin/forwarding-warnings')
+        .catch(withMessage('Failed to fetch'))
     },
     enabled,
     staleTime: 5 * 60_000,
@@ -50,8 +51,8 @@ export function ForwardingBanner() {
   const more = warnings.length - 1
 
   return (
-    <div role="alert" className="bg-amber-50 dark:bg-amber-900/20 border-b border-amber-200 dark:border-amber-800 px-4 py-2.5 flex items-start justify-between gap-3 relative z-50">
-      <div className="flex items-start gap-2 text-sm text-amber-800 dark:text-amber-300 min-w-0">
+    <div role="alert" className={`${BANNER_STRIP} ${BANNER_TONE.warning}`}>
+      <div className="flex items-start gap-2 text-sm text-status-warning-fg min-w-0">
         <svg className="w-4 h-4 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.268 16.5c-.77.833.192 2.5 1.732 2.5z" />
         </svg>
@@ -65,7 +66,7 @@ export function ForwardingBanner() {
       <div className="flex items-center gap-2 shrink-0">
         <Link
           to="/admin/platform?tab=security"
-          className="px-3 py-1 text-xs font-medium rounded-lg bg-amber-600 text-white hover:bg-amber-700 transition-colors"
+          className={`${BUTTON_BASE} ${BUTTON_VARIANT.primary} ${BUTTON_SIZE.xs}`}
         >
           Security settings
         </Link>
@@ -73,7 +74,7 @@ export function ForwardingBanner() {
           type="button"
           onClick={dismiss}
           aria-label="Dismiss"
-          className="p-1 rounded text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40"
+          className="p-1 rounded-control text-status-warning-fg hover:bg-surface-hover"
         >
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />

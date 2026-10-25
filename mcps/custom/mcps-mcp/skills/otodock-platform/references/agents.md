@@ -64,7 +64,7 @@ colleague's live interactive terminal you get read-only + a **Take over** button
 - A message typed while the agent works reaches a Claude Code or Codex turn at its next
   tool step (in the sandbox, on a paired machine, and in a delegated worker still
   working). When the turn cannot take it (a Direct LLM chat, a turn that is ending) it
-  waits as a faded bubble labelled "queued" at the end of the conversation: the waiting
+  waits as a bubble with a dashed edge labelled "queued" at the end of the conversation: the waiting
   messages belong to the chat, so every tab and a teammate on a shared chat see them,
   they survive a chat switch, a closed tab and a restart, and they go out together as
   the next turn, in order. The x on a waiting message takes it back (its author, or an
@@ -73,11 +73,47 @@ colleague's live interactive terminal you get read-only + a **Take over** button
 - A turn that ends short shows a card that says why: the model declined it, the usage
   limit was reached, the engine reported an error or its process exited, it stayed
   silent past the ceiling (10 minutes with no tool running, `TURN_SILENCE_S`), or its
-  machine was lost. For an error, an exit, a silence and a lost machine the card offers
-  **Send again**, which sends that turn's messages again as a new turn.
-- A chat's permission mode sits in its status bar (**Default**, **Accept Edits**,
-  **Plan**, **Don't Ask**); a Codex chat asks before commands and edits the way a Claude
-  chat does, and the platform's command floor holds on every engine and mode.
+  machine was lost. When the turn had started its work (an error, an exit, a silence, a
+  lost machine, a server restart), the card offers **Resume**: it asks the agent to carry
+  on from where it stopped, and after an exit, a silence or a lost machine it carries the
+  turn's photos and files again. When nothing of the turn ran (an error, an exit, a
+  silence or a lost machine), or the message met a stopped engine, the card offers **Send
+  again**, which sends that turn's messages again as a new turn. A decline, a usage limit
+  and a restart that cut nothing offer no button. The agent then sees the answer so far
+  but not the tools it called, so after either button a tool the turn already ran can run
+  a second time.
+- A chat's permission mode sits in its status bar:
+  - **Ask**: the agent reads freely and asks before anything else (editing files,
+    running most commands, using most tools).
+  - **Auto** (a new chat's mode; unrelated to the model picker's Auto): the ordinary work
+    runs (reading, editing files, the everyday tools) and the engine's own review judges
+    the rest. On Claude Code that is every other action. On Codex the review sees only
+    what reaches beyond the agent's workspace (a delete outside it, the network, a tool
+    that needs approval): a command inside the workspace runs without a check, even one
+    that deletes files there, just as in Codex's own Auto. When the review says no,
+    nothing pops up: the agent tells you what it wanted to do, and your reply lets it
+    try again. The commands the platform always blocks stay blocked.
+  - **Don't Ask**: everything runs without asking.
+  - **Plan**: the agent only reads and writes a plan; you then start it in Auto or Ask,
+    ask for changes, or cancel. This works the same on Claude Code and Codex.
+  Tools follow their own labels. A tool marked as only reading runs without asking, in
+  Ask too. Every other tool asks in Ask. In Auto, one that says it changes nothing it
+  cannot undo and stays inside its own service runs, and the engine's review judges the
+  rest. Don't Ask runs them all. A tool with no label counts as one that changes
+  something. Community tools follow the chat's mode like the rest. A device tool on a
+  computer whose owner granted it (computer, browser or app control, Blender's code tool
+  among them) runs without asking in Ask and Auto too.
+  Direct LLM offers Ask and Don't Ask only (a chat moved onto it from Auto opens in
+  Ask). A few tools always show OtoDock's card in a chat, in Ask, Auto and Don't Ask:
+  sharing knowledge, attaching or detaching a shared library, changing a department,
+  and creating or deleting a check. In Plan and in a task they are refused. In a Codex
+  terminal in Auto they are refused too, so use them from the chat. A Codex terminal
+  in Don't Ask runs them without the card.
+  The platform's command floor holds on every engine and mode.
+- In an interactive terminal the chat's mode is the terminal's: it starts in the mode
+  the chat shows, switching modes inside a Claude Code terminal (Shift+Tab) changes the
+  chat's mode too, and a badge in the terminal's corner shows it (Ask, Auto or Don't
+  Ask).
 - Claude Code and Codex read the instruction file at the top of each repository in the
   person's own workspace (`CLAUDE.md` for Claude Code, `AGENTS.md` for Codex), in that
   person's chats only: never in tasks, triggers or a Shared only agent's chats.
@@ -91,25 +127,38 @@ colleague's live interactive terminal you get read-only + a **Take over** button
 
 ## Tools (MCPs)
 
-Two switches gate every tool: **authorized** (admin — installed/configured platform
-level, sometimes via per-agent instances) and **enabled** (manager — Agent Settings →
-MCPs). Core tools (memory, tasks, delegation, triggers, notifications, meetings,
-display and apps, checks (for agents created since 1.7), files/documents, self-config,
-catalog browser) are on by default; optional and
-community tools are enabled per agent. Agents can list what's available and either
-enable directly (when the manager asks and it's allowed) or file an admin request.
-Integrations (GitHub, Notion, and more as the catalog grows) connect per user under
-**User Settings → Integrations**; shared agents get a **service account** — a manager
-binds one of their own connected accounts on Agent Settings → MCPs; beneath the
-binding the manager subscribes the agent to that vendor's events (needed before an
-agent trigger or a shared app can react to them). A hosted MCP server that signs
-people in itself (Notion, Linear) needs no OAuth app from an admin: the install
-registers itself with the vendor on first use, each person signs in on the vendor's
-page from Connected Accounts, and the token is added to the server's calls in transit,
-never handed to a session or a machine. An admin sees the registration on **Admin →
-MCP Servers** and can **Forget** it. A connected GitHub account reaches `git` and `gh`
-through a credential helper that fetches the token per command, so no session file or
-variable holds it.
+Two switches gate every tool: **authorized** (admin — installed/configured platform level,
+sometimes via per-agent instances) and **enabled** (manager — Agent Settings → MCPs). Core
+tools (memory, tasks, delegation, triggers, notifications, meetings, display and apps,
+checks (for agents created since 1.7), files/documents, self-config, catalog browser) are
+on by default; optional and community tools are enabled per agent. Agents can list what's
+available and either enable directly (when the manager asks and it's allowed) or file an
+admin request. Integrations (GitHub, Notion, and more as the catalog grows) connect per
+user under **User Settings → Integrations**; shared agents get a **service account** — a
+manager binds one of their own connected accounts on Agent Settings → MCPs (for a GitHub
+account connected through a GitHub App, one of its installations the manager owns: the
+agent's `git` and `gh` then reach only the repositories that installation covers); beneath
+the binding the manager subscribes the agent to that vendor's events (needed before an
+agent trigger or a shared app can react to them). A hosted MCP server that signs people in
+itself (Notion, Linear) needs no OAuth app from an admin: the install registers itself
+with the vendor on first use, each person signs in on the vendor's page from Connected
+Accounts, and the token is added to the server's calls in transit, never handed to a
+session or a machine. An admin sees the registration on **Admin → MCP Servers** and can
+**Forget** it. A connected GitHub account reaches `git` and `gh` through a credential
+helper that fetches the token per command, so no session file or variable holds it.
+**GitHub reach**: beneath the GitHub service account on Agent Settings → MCPs a manager
+picks the repositories the agent's own GitHub account reaches and **Read only**
+*(manager)*. That reach holds for the agent's own work: its agent-scope tasks, triggers,
+delegated runs and calls, and a Shared only agent's chats. A person's own chats use their
+own GitHub account: on their account card under User Settings → Integrations each person
+picks the repositories and **Read only** for an agent, and an account they never narrowed
+reaches everything it can. OtoDock refuses everything past the reach, in the GitHub tool
+and in `git` and `gh`. A token or GitHub sign-in account has no list, only Read only.
+
+**SSH hosts**: an admin adds each host (name, address, port, user, key) as an instance
+of the **SSH** MCP under Admin → MCP Servers and gives it to agents. The agent's
+managers and editors then reach it from the shell, on the server too, as the user the
+admin set. Viewers and contributors never get it.
 
 ## Skills
 
@@ -138,7 +187,7 @@ Three paths from the **Agents** page:
    (members approve theirs); a personal copy that acts as the member is always that
    member's own approval. Missing admin pieces (tool instances, skill packages) become
    pending to-dos, not failures. When the catalog carries a newer version of an
-   installed agent's template, the card and the agent's Config tab offer **Update**
+   installed agent's template, the card and the agent's Configuration section offer **Update**
    *(any manager of that agent, whatever their platform role — an admin manages every
    agent; an update also switches on the core tools the platform gained since the
    install)*: what nobody changed is replaced, what a manager edited is kept with the
@@ -161,6 +210,30 @@ Server sandbox by default (locked-down filesystem + network, per-service allowli
 An admin can set an agent's **Execution Target** to an admin-paired remote machine;
 users can run agents on their own paired machines. Device-control tools (browser,
 computer) exist only on remote machines with the matching grant.
+
+**Runs on.** Every chat shows where it runs in the **Runs on** pill, a computer icon
+beside the model; its tooltip names the place. Its menu lists the places the person may
+pick: the OtoDock platform, their own paired computers and, for an admin, the admin
+machines. An editor never runs a chat on an admin machine: an editor's message in a
+shared chat there first moves it to the OtoDock platform or the editor's own computer.
+A viewer or contributor on a Shared only agent sees the place with no menu, and a Direct
+LLM chat always runs on the platform. A pick asks for confirmation, then
+moves the chat, and the icon shows the copy's progress. The chat keeps its memory when
+both places are online. When the current place is offline it continues there from a
+summary of the conversation. Working files stay where they are. A move is refused while
+a turn runs, so finish or stop the turn first. On a new chat the same menu picks where
+it starts, before the first message. A person can also ask the agent to move the chat.
+Its `move_chat` tool lists the places, the move happens when the agent's turn ends, and
+the agent then continues on the new place by itself.
+
+A task or a delegated job can name its own machine too (see Automation). When that
+machine is offline at run time, the run uses the agent's usual place and says so.
+
+**Shared only agents.** A member with the editor role or above can move a shared chat
+to their own computer. While it runs there, everyone else sees it read only with "This chat is
+running on <name>'s computer." Once that session closes, the next person's message
+first moves the chat to that person's usual place. The agent's own accounts stay on the
+server, so tools that sign in with them are not available on a personal computer.
 
 In the server sandbox, packages installed into HOME vanish when the session ends. An
 agent keeps Python packages across sessions in a virtualenv inside its workspace

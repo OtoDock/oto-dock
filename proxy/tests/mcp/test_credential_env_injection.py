@@ -24,8 +24,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from services.oauth import credential_resolver
 from services.mcp.mcp_registry import _validate_oauth_services as _strict_validate
+from services.oauth import credential_resolver
 
 
 def _validate(raw, mcp_name="any"):

@@ -15,10 +15,12 @@ import logging
 import time
 import uuid
 from collections import Counter
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
 
+import config
 from core.events import turn_ending
-from core.events.common_events import CommonEvent, DONE, ERROR
+from core.events.common_events import DONE, ERROR, CommonEvent
 from core.remote import upload_inflight
 from core.remote.remote_session_info import RemoteSessionInfo
 from core.session import engine_prompts
@@ -26,7 +28,6 @@ from core.session.session_state import (
     get_session_user_tz,
     resolve_bg_command_frame,
 )
-import config
 
 logger = logging.getLogger("remote-layer")
 
@@ -49,7 +50,13 @@ def record_resume_handle(info: RemoteSessionInfo, handle: str) -> None:
         info.resume_handle = handle
 
 
-class RemoteTurnMixin:
+if TYPE_CHECKING:
+    from core.remote.remote_host import RemoteLayerHost as _Host
+else:
+    _Host = object
+
+
+class RemoteTurnMixin(_Host):
     # --- ExecutionLayer interface: one turn ---
 
     def engine_for(self, session_id: str) -> str:
@@ -145,7 +152,7 @@ class RemoteTurnMixin:
                 "execution_path": info.execution_path,
                 "inject_time": inject_time,
             }, command_id=command_id)
-        except Exception as e:
+        except RuntimeError as e:
             # If the satellite reports there's no live session to take the
             # message, flag it so the dashboard's auto-resume path spawns a
             # fresh one (resumed from the on-disk transcript) on the next
@@ -178,8 +185,8 @@ class RemoteTurnMixin:
                 if ("CLI process not running" in err_text and killed_before
                         and self.capabilities_for(session_id).runtime.hard_abort_kills_process):
                     reason = turn_ending.STOPPED
-                ending = turn_ending.TurnEnding(reason=reason, detail=err_text)
-                data = {"message": ending.line(), "ending": ending.as_dict()}
+                lost = turn_ending.TurnEnding(reason=reason, detail=err_text)
+                data = {"message": lost.line(), "ending": lost.as_dict()}
             yield CommonEvent(type=ERROR, data=data)
             yield CommonEvent(type=DONE)
             return

@@ -14,26 +14,25 @@ export function SetupBanner({ engines }: {
   engines: string[]
 }) {
   return (
-    <div className="rounded-xl border border-amber-300 bg-amber-50 dark:border-amber-900/40 dark:bg-amber-900/20 px-4 py-3">
+    <div className="rounded-card border border-status-warning-border bg-status-warning-bg px-4 py-3">
       <div className="flex items-start gap-3">
-        <svg className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <svg className="w-5 h-5 text-status-warning-fg shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4a2 2 0 00-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z" />
         </svg>
         <div>
-          <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">Finish setting up OtoDock</p>
-          <p className="text-sm text-amber-700 dark:text-amber-400/90 mt-0.5">
+          <p className="text-sm font-semibold text-status-warning-fg">Finish setting up OtoDock</p>
+          <p className="text-sm text-status-warning-fg mt-0.5">
             Connect at least one AI engine{engines.length > 0 && (
               <>
-                {' — '}
+                {': '}
                 {engines.map((name, i) => (
                   <span key={name}>
                     {i > 0 && (i === engines.length - 1 ? ' or ' : ', ')}
                     <span className="font-medium">{name}</span>
                   </span>
                 ))}
-                {' —'}
               </>
-            )} to unlock chat and agents for your team. Add an account or API key on its card below.
+            )}. That unlocks chat and agents for your team. Add an account or API key on its card below.
           </p>
         </div>
       </div>

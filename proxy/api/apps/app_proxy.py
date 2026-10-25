@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import http.cookiejar
 import json
 import logging
 import mimetypes
@@ -32,28 +31,34 @@ import websockets
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.requests import ClientDisconnect
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 import config
 from api.media.ui import (
-    _placeholder, _ui_response, inject_runtime, is_full_document, request_origin, wrap_fragment,
+    _placeholder,
+    _ui_response,
+    inject_runtime,
+    is_full_document,
+    request_origin,
+    wrap_fragment,
 )
+from auth import roles
 from auth.lan_check import get_client_ip
 from auth.providers import UserContext, get_current_user, require_auth, require_human
 from auth.request_path import has_traversal
 from auth.session_token import validate_session_token
 from services.apps import app_supervisor, app_tokens, releases
-from storage import database as task_store
+from services.apps.app_handlers import _inflight_checks
+from services.apps.app_supervisor import forward
+from storage import database as task_store, db_apps
 from storage.pg import run_db
-from storage import db_apps
-from auth import roles
 from ws import wire_events as wire
 
 logger = logging.getLogger("otodock.apps")
 router = APIRouter()
 
 MAX_BODY_BYTES = 1024 * 1024
-UPSTREAM_TIMEOUT_S = 30.0
 RATE_PER_ACTOR = 20.0
 RATE_PER_APP = 200.0
 WS_MAX_FRAME = 1024 * 1024
@@ -236,7 +241,7 @@ async def _agent_caller(payload: dict, row: dict) -> Caller:
     if allowed and row.get("username"):
         allowed = user is not None and (row.get("owner_sub") or "") == user.sub
     if allowed and (row.get("scope_chat_id") or row.get("scope_project_id")):
-        from api.apps.apps import _scope_access
+        from services.apps.audience import _scope_access
         allowed = user is not None and await run_db(_scope_access, row, user)
     if not allowed and placement is None:
         raise _refuse(404, "App not found")
@@ -391,37 +396,20 @@ def _unavailable(e: app_supervisor.AppUnavailable) -> JSONResponse:
                          "retry_after": max(1, e.retry_after)}, status_code=503, headers=headers)
 
 
-_client: httpx.AsyncClient | None = None
-
-
-class _NoCookieJar(http.cookiejar.CookieJar):
-    """A jar that keeps nothing: every app server lives on the same
-    loopback host, so a jar would replay one app's ``Set-Cookie`` to every
-    other app."""
-
-    def extract_cookies(self, response, request) -> None:  # noqa: ARG002
-        return None
-
-    def add_cookie_header(self, request) -> None:  # noqa: ARG002
-        return None
-
-
-def _http() -> httpx.AsyncClient:
-    global _client
-    if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT_S, follow_redirects=False)
-        _client.cookies.jar = _NoCookieJar()
-    return _client
-
-
 async def _read_body(request: Request) -> bytes:
     total = 0
     chunks: list[bytes] = []
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > MAX_BODY_BYTES:
-            raise _refuse(413, "request body larger than 1 MB")
-        chunks.append(chunk)
+    try:
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > MAX_BODY_BYTES:
+                raise _refuse(413, "request body larger than 1 MB")
+            chunks.append(chunk)
+    except ClientDisconnect:
+        # The browser cancelled the request (a page left mid-POST), or the
+        # body cap answered already: nobody reads this answer, and it is
+        # no server error to log.
+        raise _refuse(400, "the request was cancelled before its body arrived") from None
     return b"".join(chunks)
 
 
@@ -435,19 +423,6 @@ def _rest_path(request: Request, app_id: str, path: str, prefix: str = "") -> st
         rest = raw_s[len(prefix):]
         return rest if rest.startswith("/") else "/" + rest
     return "/" + path
-
-
-async def forward(inst: app_supervisor.Instance, method: str, path: str,
-                  headers: list[tuple[str, str]], body: bytes, *,
-                  timeout: float = UPSTREAM_TIMEOUT_S) -> httpx.Response:
-    """One request to a running instance over the shared client (no cookie
-    jar, no redirects), streamed — the caller reads and closes it. Shared by
-    the proxied routes, the handler fire (``services/apps/app_handlers.py``)
-    and the bindings broker."""
-    client = _http()
-    req = client.build_request(method, f"{inst.base_url}{path}", headers=headers,
-                               content=body, timeout=timeout)
-    return await client.send(req, stream=True)
 
 
 async def instance_for(row: dict, caller: Caller) -> app_supervisor.Instance:
@@ -485,7 +460,7 @@ async def proxy_request(row: dict, caller: Caller, request: Request, rest: str):
         upstream = await forward(inst, request.method, path, headers, body)
     except httpx.HTTPError as e:
         logger.warning("App %s: upstream error on %s: %s", row.get("slug"), rest, e)
-        raise _refuse(502, "the app's server did not answer")
+        raise _refuse(502, "the app's server did not answer") from e
     app_supervisor.touch(app_id)
     if 300 <= upstream.status_code < 400 and not _redirect_ok(
             upstream.headers.get("location", ""), app_id):
@@ -540,7 +515,7 @@ def _check_placed_export(row: dict, path: str, caller: Caller) -> None:
     alone (SHARING.md "Agents use a placed app"), as a brokered call does:
     the manifest approved, the first path segment an exported method, its
     floor met at the role the share gives."""
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     if not task_store.app_actions_approved(row):
         raise _refuse(404, "not available")
     entry = _mf.exported_method(row, path)
@@ -558,7 +533,7 @@ _ws_counts: dict[str, int] = {}
 # writing an app has no browser console, and a page that reconnects a
 # socket the runtime already reconnects burns through the cap in seconds:
 # this is how ``app_logs`` tells the author, instead of leaving them a
-# page that says "reconnecting" for ever (found live, 2026-09-13).
+# page that says "reconnecting" for ever.
 _ws_refused: dict[str, int] = {}
 
 
@@ -678,7 +653,7 @@ async def bridge_ws(websocket: WebSocket, row: dict, path: str, caller: Caller) 
         try:
             upstream = await websockets.connect(url, additional_headers=headers,
                                                 max_size=WS_MAX_FRAME, open_timeout=10)
-        except Exception as e:
+        except (OSError, TimeoutError, websockets.WebSocketException) as e:
             logger.info("App %s: upstream socket refused: %s", row.get("slug"), e)
             await _close(websocket, 1011, "the app's server did not accept the socket")
             return
@@ -749,7 +724,7 @@ async def bridge_ws(websocket: WebSocket, row: dict, path: str, caller: Caller) 
             # never bind a supervisor object to its own loop's lifetime.
             # The claim names its process: a preview or check socket watches
             # that instance, not the live one.
-            while app_supervisor.get(app_id, caller.instance) is inst and inst.state == app_supervisor.UP:
+            while app_supervisor.get(app_id, caller.instance) is inst and inst.state == app_supervisor.UP:  # noqa: ASYNC110  # polled on purpose: a bridge never binds the supervisor's state to its loop
                 await asyncio.sleep(1.0)
             await _close(websocket, 1012, "the app is restarting")
 
@@ -789,7 +764,7 @@ async def mint_viewer_token(app_id: str, preview: int = 0,
     gets a two-minute claim naming the check instance."""
     from api.apps.app_actions import _check_fire_rate
     from api.apps.apps import _can_approve_surface, _viewer_username, _visible_row
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     u = require_human(user)
     row = await run_db(_visible_row, app_id, u)
     if not row:
@@ -950,6 +925,25 @@ def _asset_path_ok(path: str) -> bool:
     return not path.lower().endswith(_NEVER_ASSETS)
 
 
+_FONT_TYPES = frozenset({"font/woff", "font/woff2", "font/ttf", "font/otf"})
+
+
+def _asset_headers(name: str, ctype: str) -> dict[str, str]:
+    """One release file's headers: never a document, cached by its hash. A
+    font gets the CORS header, because an ``@font-face`` fetch from the
+    frame's opaque origin is a CORS request and the file is public by its
+    hash already."""
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": f'attachment; filename="{name}"',
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "Cache-Control": "private, max-age=31536000, immutable",
+    }
+    if ctype in _FONT_TYPES:
+        headers["Access-Control-Allow-Origin"] = "*"
+    return headers
+
+
 def asset_response(row: dict, sha: str, path: str) -> Response:
     """One release file for the frame, or the 404 (shared with the link's
     twin). Sync."""
@@ -960,12 +954,7 @@ def asset_response(row: dict, sha: str, path: str) -> Response:
         raise HTTPException(status_code=404, detail="Not found")
     data, ctype = found
     name = path.rsplit("/", 1)[-1].replace('"', "")
-    return Response(content=data, media_type=ctype, headers={
-        "X-Content-Type-Options": "nosniff",
-        "Content-Disposition": f'attachment; filename="{name}"',
-        "Content-Security-Policy": "default-src 'none'; sandbox",
-        "Cache-Control": "private, max-age=31536000, immutable",
-    })
+    return Response(content=data, media_type=ctype, headers=_asset_headers(name, ctype))
 
 
 def _read_asset(app_id: str, sha: str, path: str) -> tuple[bytes, str] | None:
@@ -1007,12 +996,7 @@ async def client_asset(app_id: str, sha: str, path: str, request: Request, previ
         raise HTTPException(status_code=404, detail="Not found")
     data, ctype = found
     name = path.rsplit("/", 1)[-1].replace('"', "")
-    return Response(content=data, media_type=ctype, headers={
-        "X-Content-Type-Options": "nosniff",
-        "Content-Disposition": f'attachment; filename="{name}"',
-        "Content-Security-Policy": "default-src 'none'; sandbox",
-        "Cache-Control": "private, max-age=31536000, immutable",
-    })
+    return Response(content=data, media_type=ctype, headers=_asset_headers(name, ctype))
 
 
 # ── logs ────────────────────────────────────────────────────────────────────
@@ -1036,23 +1020,6 @@ async def read_logs(app_id: str, tail: int = 200,
 # ── platform methods and feeds for servers (APPS.md) ──────────────────────
 
 PLATFORM_RATE = 4.0
-
-
-# A check's handler wake (CHECKS.md "The handler kind") is a synchronous
-# POST with no delivery row: the run is registered here for its minute so
-# the handler's platform calls verify like a handler's.
-_inflight_checks: dict[str, dict] = {}
-
-
-def register_inflight_check(run_id: str, app_id: str, handler: str, event: str, *, ttl_s: int) -> None:
-    from storage import db_app_deliveries as deliveries
-    _inflight_checks[run_id] = {"id": run_id, "app_id": app_id, "handler": handler, "event": event,
-                                "status": deliveries.INFLIGHT, "payload": {},
-                                "expires": time.monotonic() + ttl_s}
-
-
-def unregister_inflight_check(run_id: str) -> None:
-    _inflight_checks.pop(run_id, None)
 
 
 async def inflight_delivery(claim: str, row: dict) -> dict:
@@ -1106,8 +1073,8 @@ async def _viewer_behind(request_headers, row: dict, caller: Caller):
     ``(principal, is_viewer, basis, floor role)``: an agent session, direct
     or relayed by the app's server, is judged at its per-agent row (the
     claim's role, viewer when it names none); None judges the principal."""
-    from api.apps import catalog
     from auth.providers import user_context_for_sub
+    from services.apps import catalog
     forwarded = request_headers.get("x-otodock-viewer", "") if caller.basis == "app" else ""
     if forwarded:
         claims = app_tokens.verify(forwarded, row["id"], app_tokens.PURPOSE_VIEWER)
@@ -1163,7 +1130,7 @@ async def _notify_from_handler(row: dict, args: dict) -> dict:
     if severity not in ("info", "success", "warning", "danger"):
         severity = "info"
     if not title:
-        return {"ok": False, "reason": "title is required"}
+        raise _refuse(400, "args.title is required")
     if not _take(f"{row['id']}|notify", NOTIFY_PER_HOUR / 3600.0, float(NOTIFY_PER_HOUR)):
         raise _refuse(429, "too many notifications this hour")
     personal = bool(row.get("username"))
@@ -1187,9 +1154,8 @@ async def platform_method(app_id: str, method: str, request: Request):
     """A platform method for an app's server or an agent: reads as the
     viewer behind the call when one is forwarded, else as the app identity;
     a write with no viewer is refused; four calls per second per caller."""
-    from api.apps import catalog
-    from api.apps import manifest as _mf
     from api.apps.apps import _catalog_entry, finish_platform_result
+    from services.apps import catalog, manifest as _mf
     row = await run_db(_row_or_404, app_id)
     stepping = await step_caller(request.headers, row)
     if stepping is not None:
@@ -1253,13 +1219,19 @@ async def platform_method(app_id: str, method: str, request: Request):
                                unattended=(basis == "platform" or own_notify or own_audience),
                                role=floor_role)
     except HTTPException as e:
-        raise _refuse(e.status_code, str(e.detail))
+        raise _refuse(e.status_code, str(e.detail)) from e
     body = await _read_body(request)
     try:
         doc = json.loads(body or b"{}")
-    except ValueError:
-        raise _refuse(400, "a JSON body is required")
+    except ValueError as exc:
+        raise _refuse(400, "a JSON body is required") from exc
     args = (doc or {}).get("args") if isinstance(doc, dict) else None
+    # A server that puts the fields at the top level gets a failure its
+    # `r.ok` sees, never a 200 it does not read. A method with no arguments
+    # is called with an empty body, and a page's own call always carries
+    # the key.
+    if not has_viewer and isinstance(doc, dict) and doc and "args" not in doc:
+        raise _refuse(400, 'the body is {"args": {...}}')
     if entry.get("args_schema"):
         validated, err = _mf.validate_args(entry["args_schema"], args)
         if err:
@@ -1270,10 +1242,12 @@ async def platform_method(app_id: str, method: str, request: Request):
         return JSONResponse(out, headers=dict(_CORS))
 
     def _run() -> dict:
+        from api.agents import files as files_api
         try:
             return {"ok": True, "result": catalog.run_method(method, row.get("agent") or "",
                                                               row, principal, args,
-                                                              role=floor_role)}
+                                                              role=floor_role,
+                                                              path_gate=files_api.safe_agent_path)}
         except (ValueError, PermissionError) as e:
             return {"ok": False, "reason": str(e)}
 
@@ -1304,7 +1278,7 @@ async def platform_ws(websocket: WebSocket, app_id: str):
     then ``catalog_subscribe`` / ``catalog_unsubscribe`` / ``catalog_snapshot``
     frames; deltas of the agent-scope slice arrive as ``catalog`` frames
     with a sequence per feed. Never counts as viewer activity."""
-    from api.apps import catalog
+    from services.apps import catalog
     await websocket.accept()
     try:
         row = await run_db(_row_or_404, app_id)
@@ -1425,8 +1399,8 @@ async def push_rest(app_id: str, request: Request):
     body = await _read_body(request)
     try:
         doc = json.loads(body or b"{}")
-    except ValueError:
-        raise _refuse(400, "a JSON body is required")
+    except ValueError as exc:
+        raise _refuse(400, "a JSON body is required") from exc
     from api.hooks import pins
     out = await pins.push_row(row, (doc or {}).get("payload") if isinstance(doc, dict) else None)
     return JSONResponse(out, headers=dict(_CORS))
@@ -1438,8 +1412,8 @@ async def state_rest(app_id: str, request: Request):
     body = await _read_body(request)
     try:
         doc = json.loads(body or b"{}")
-    except ValueError:
-        raise _refuse(400, "a JSON body is required")
+    except ValueError as exc:
+        raise _refuse(400, "a JSON body is required") from exc
     if not isinstance(doc, dict):
         raise _refuse(400, "a JSON object is required")
     from api.hooks import pins

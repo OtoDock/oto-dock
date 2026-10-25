@@ -15,7 +15,7 @@ const h = vi.hoisted(() => ({
 }))
 vi.mock('@/api/titleGeneration', () => ({
   useTitleGeneration: () => ({ data: h.status, isLoading: false }),
-  useSaveTitleGeneration: () => ({ mutate: vi.fn(), isPending: false }),
+  useSaveTitleGeneration: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false }),
   useCheckTitleGeneration: () => ({ mutate: h.check, isPending: false, isError: false, error: null }),
 }))
 vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: { role: 'admin', sub: 'a' } }) }))
@@ -66,7 +66,7 @@ describe('Chat Title Generation card', () => {
     h.status = { ...base, unlisted_pin: 'claude-haiku-4-5' }
     const first = card()
     expect(screen.getByTestId('title-gen-unlisted').textContent).toBe(
-      'The pinned model claude-haiku-4-5 is no longer offered; titles use Auto.')
+      'The pinned model claude-haiku-4-5 is no longer offered. Titles use Auto.')
     first.unmount()
     h.status = { ...base }
     card()

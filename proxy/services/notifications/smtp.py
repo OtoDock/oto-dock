@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+from cryptography.fernet import InvalidToken
+
 from storage import database as db
-from storage.identity.credential_store import _encrypt, _decrypt
+from storage.identity.credential_store import _decrypt, _encrypt
 
 logger = logging.getLogger("otodock")
 
@@ -40,7 +42,7 @@ def load_smtp_config() -> SmtpConfig | None:
     if password_enc:
         try:
             password = _decrypt(password_enc)
-        except Exception:
+        except (InvalidToken, UnicodeDecodeError):
             logger.error("Failed to decrypt SMTP password")
             return None
     from_addr = settings.get("smtp_from", user)
@@ -96,8 +98,8 @@ def send_email(to: str, subject: str, html_body: str,
         server.quit()
         logger.info("Email sent")
         return True
-    except Exception as e:
-        logger.error(f"Failed to send email: {e}")
+    except (smtplib.SMTPException, OSError, UnicodeError) as e:
+        logger.error("Failed to send email: %s", e)
         return False
 
 
@@ -130,7 +132,7 @@ def test_smtp_connection(host: str, port: int, user: str, password: str,
         return False, "Authentication failed — check username and password"
     except smtplib.SMTPConnectError:
         return False, f"Could not connect to {host}:{port}"
-    except Exception as e:
+    except (smtplib.SMTPException, OSError, UnicodeError) as e:
         return False, f"Connection failed: {str(e)}"
 
 

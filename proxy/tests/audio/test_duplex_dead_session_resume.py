@@ -18,6 +18,7 @@ import pytest
 import ws.duplex as ws_duplex
 import ws.duplex_attach as duplex_attach
 import ws.headless_resume as headless_resume
+from core.execution_layer import ResumeVerdict
 
 
 class FakeWebSocket:
@@ -250,9 +251,9 @@ class _SeamLayer:
         self.calls: list[str] = []
 
     async def can_resume_session(self, session_id, *, agent_name="",
-                                 username=""):
+                                 username="", external_home=""):
         self.calls.append(f"can_resume:{session_id}")
-        return self.resumable
+        return ResumeVerdict.RESUMABLE if self.resumable else ResumeVerdict.FRESH
 
     async def prepare_resume(self, session_id):
         self.calls.append(f"prepare:{session_id}")
@@ -410,6 +411,7 @@ async def test_seam_waits_for_an_inflight_wake_before_resuming(temp_db, monkeypa
     the heal reads it (the dashboard warmup's rule): the heal never renders
     a half-written turn or dual-writes the file."""
     import asyncio
+
     from core.session import session_delivery
     _make_chat(temp_db, model="model-x", execution_path="claude-code-cli")
     layer = _SeamLayer(resumable=True)
@@ -430,9 +432,10 @@ async def test_seam_waits_for_an_inflight_wake_before_resuming(temp_db, monkeypa
         await asyncio.sleep(0.05)
         order.append("wake_done")
         inflight.set()
-    asyncio.create_task(_finish_wake())
+    finisher = asyncio.create_task(_finish_wake())
     await headless_resume.resume_dead_session_headless(
         "chat-1", "sid-dead", layer, user_sub="user-admin")
+    await finisher
     assert order == ["wake_done", "resume_check"]
 
 
@@ -443,6 +446,7 @@ async def test_an_utterance_waits_for_another_starter_then_starts(temp_db, monke
     """A queued message's delivery holds the chat while it brings its turn
     up: the utterance waits for it, never a second turn beside it."""
     import asyncio
+
     from core.events import input_queue
     input_queue._registry.clear()
     _make_chat(temp_db)
@@ -482,3 +486,22 @@ async def test_an_utterance_the_chat_stays_busy_for_says_so(temp_db, monkeypatch
     assert q.claimed
     q.release(held)
     input_queue._registry.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,stored,runs", [
+    ("direct-llm", "autoReview", "ask"),       # Direct LLM offers no Auto
+    ("direct-llm", "acceptEdits", "ask"),
+    ("claude-code-cli", "autoReview", "autoReview"),
+    ("claude-code-cli", "auto", "auto"),       # an unattended chat keeps its word
+])
+async def test_seam_resumes_in_a_mode_the_chats_engine_offers(temp_db, monkeypatch, path, stored, runs):
+    temp_db.create_chat("chat-1", "user-admin", "agent-a", stored, execution_path=path)
+    temp_db.update_chat("chat-1", session_id="sid-dead")
+    captured, _slots = _patch_seam(monkeypatch, _SpawnLayer())
+    await headless_resume.resume_dead_session_headless(
+        "chat-1", "sid-dead", _SeamLayer(resumable=True), user_sub="user-admin")
+    assert captured["permission_mode"] == runs
+    from core.events import chat_writer
+    await chat_writer.drain("chat-1", timeout=5)
+    assert temp_db.get_chat("chat-1")["permission_mode"] == runs

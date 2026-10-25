@@ -93,21 +93,21 @@ export const MODE_LABEL: Record<VisibilityMode, string> = {
 /** One-line plain-English summary shown live under the mode selector. */
 export const MODE_SUMMARY: Record<VisibilityMode, string> = {
   personal_shared:
-    'Each person gets a private space; a shared team space is also available. Separate chats and memory per person.',
+    'Each person gets a private space. A shared team space is also available. Separate chats and memory per person.',
   shared_personal:
-    'Work lives in one shared team space; each person also keeps personal files. Separate chats and memory per person.',
+    'Work lives in one shared team space. Each person also keeps personal files. Separate chats and memory per person.',
   personal_only:
-    'Fully private to each person — no shared space at all. Separate chats and memory per person.',
+    'Fully private to each person, with no shared space at all. Separate chats and memory per person.',
   shared_only:
-    'One shared workspace and one shared chat history for everyone. No personal space; everyone sees the same conversations.',
+    'One shared workspace and one shared chat history for everyone. No personal space. Everyone sees the same conversations.',
 }
 
 /** Per-option helper text inside the grouped radio. */
 export const MODE_OPTION_HINT: Record<VisibilityMode, string> = {
-  personal_shared: 'each person has a private space; a shared team space is also available',
-  shared_personal: 'work lives in one shared space; each person also keeps personal files',
-  personal_only: 'fully private per person; no shared space; per user chats & memory',
-  shared_only: 'one shared workspace & one shared chat history for everyone; no personal space',
+  personal_shared: 'each person has a private space, plus a shared team space',
+  shared_personal: 'work lives in one shared space, and each person also keeps personal files',
+  personal_only: 'fully private for each person: no shared space, own chats and memory',
+  shared_only: 'one shared workspace and one shared chat history for everyone, with no personal space',
 }
 
 /**
@@ -115,8 +115,8 @@ export const MODE_OPTION_HINT: Record<VisibilityMode, string> = {
  * spaces available); group 2 = private (a single space only).
  */
 export const MODE_GROUPS: { label: string; modes: VisibilityMode[] }[] = [
-  { label: 'Collaborative — a team shares this agent', modes: ['personal_shared', 'shared_personal'] },
-  { label: 'Private — one space only', modes: ['personal_only', 'shared_only'] },
+  { label: 'Collaborative: a team shares this agent', modes: ['personal_shared', 'shared_personal'] },
+  { label: 'Private: one space only', modes: ['personal_only', 'shared_only'] },
 ]
 
 /** The synthetic owner of a Shared-only agent's chats (`chats.user_sub`) —

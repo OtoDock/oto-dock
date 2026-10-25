@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { classify, frameSrc, linkQuery, openAllowed, readConfig, resultMessage, sessionUrl, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, webUrl } from '@/sharehost/host'
+import { classify, frameSrc, linkQuery, openAllowed, pickTheme, readConfig, resultMessage, sessionUrl, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, webUrl } from '@/sharehost/host'
 
 // The external link's host is a smaller AppFrame: a link is a viewer of one
 // page. The pure half is pinned here; the DOM half is exercised on T1.
@@ -23,8 +23,20 @@ describe('share host', () => {
   it('addresses only the link\'s own routes', () => {
     expect(frameSrc(cfg, 'dark', 2)).toBe('/s/tok/html?theme=dark&v=2')
     expect(snapshotUrl(cfg)).toBe('/s/tok/snapshot')
-    expect(snapshotUiUrl(cfg, 'a b')).toBe('/s/tok/ui/a%20b')
+    expect(snapshotUiUrl(cfg, 'a b', 'dark')).toBe('/s/tok/ui/a%20b?theme=dark')
+    expect(snapshotUiUrl(cfg, 'a b', 'light')).toBe('/s/tok/ui/a%20b?theme=light')
     expect(snapshotMediaUrl(cfg, 'img-1')).toBe('/s/tok/media/img-1')
+  })
+
+  it("takes the dashboard's stored theme, else the device's, and nothing else", () => {
+    for (const prefersDark of [false, true]) {
+      const device = prefersDark ? 'dark' : 'light'
+      expect(pickTheme('light', prefersDark)).toBe('light')
+      expect(pickTheme('dark', prefersDark)).toBe('dark')
+      expect(pickTheme('system', prefersDark)).toBe(device)
+      expect(pickTheme(null, prefersDark)).toBe(device)
+      expect(pickTheme('dark x" onload', prefersDark)).toBe(device)
+    }
   })
 
   it('runs declared actions, sizes on content_height, and answers everything else as unavailable', () => {

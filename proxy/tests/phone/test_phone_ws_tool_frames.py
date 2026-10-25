@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from ws.phone import _pump_item_to_phone_ws
 from ws import duplex_attach
+from ws.phone import _pump_item_to_phone_ws
 
 
 def _item(etype: str, **data) -> dict:
@@ -44,6 +44,13 @@ class TestToolFrameTranslation:
         assert _pump_item_to_phone_ws(
             _item("text", content="hi"), 2)["data"]["content"] == "hi"
         assert _pump_item_to_phone_ws(_item("thinking", content="…"), 2) is None
+
+    def test_a_note_is_spoken_like_text_and_the_note_mark_says_nothing(self):
+        # A preamble streams as text (spoken as it arrives); the mark that
+        # folds it into a note on the page carries no words for the call.
+        assert _pump_item_to_phone_ws(
+            _item("text", content="Let me check.", note=True), 2)["data"] == {"content": "Let me check."}
+        assert _pump_item_to_phone_ws(_item("text", content="", note=True), 2) is None
 
 
 class TestTeardownResume:

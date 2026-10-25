@@ -177,13 +177,13 @@ def test_a_check_claim_reaches_the_check_instance_only_while_it_runs(tmp_path):
     assert r.status_code == 503 and r.headers.get("x-otodock-server") == "stopped", r.text
 
     class H(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
+        def do_GET(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"from the check instance")
 
-        def log_message(self, *a):  # noqa: D102
+        def log_message(self, *a):
             return
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()

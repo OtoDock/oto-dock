@@ -24,12 +24,12 @@ import logging
 import time
 from dataclasses import dataclass
 
+from auth import roles
 from core.session import external_identity
 from core.session.visibility import available_scopes_for
+from storage import database as task_store
 from storage.agents import agent_store
 from storage.phone import phone_route_store
-from storage import database as task_store
-from auth import roles
 
 logger = logging.getLogger("otodock")
 
@@ -155,7 +155,7 @@ def resolve_route_identity(
     - ``pin_verified`` counts only when the route actually has a PIN.
     - An external call ALWAYS runs in the local sandbox on the server, on
       every engine: the external principal's role is :data:`EXTERNAL_ROUTE_ROLE`
-      (viewer) and ``remote_store.resolve_execution_target`` forces every
+      (viewer) and ``remote_status.resolve_execution_target`` forces every
       non-owner role to local (a satellite has no bwrap isolation), whatever
       the agent's execution target says. Codex takes external calls there
       like every other engine (no shell tool + the PreToolUse floor). Only a

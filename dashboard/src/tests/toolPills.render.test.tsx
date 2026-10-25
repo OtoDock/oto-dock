@@ -4,8 +4,9 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import ToolActivity from '@/components/chat/ToolActivity'
 import SubagentInfo from '@/components/chat/SubagentInfo'
 import BgCommandInfo from '@/components/chat/BgCommandInfo'
-import DelegateTaskInfo, { DelegateResultFiles, resultFileLabel } from '@/components/chat/DelegateTaskInfo'
+import DelegateTaskInfo, { DelegateResultFiles } from '@/components/chat/DelegateTaskInfo'
 import { ChatFileProvider } from '@/components/chat/ChatFileContext'
+import { resultFileLabel } from '@/lib/chat/delegateFiles'
 
 // The files list opens through the DELEGATING chat's resolve-path; the
 // preview surface is mocked to what it receives.
@@ -124,6 +125,16 @@ describe('SubagentInfo — expandable agent pill', () => {
     )
     expect(container.querySelector('.cursor-pointer')).toBeNull()
   })
+
+  it('says Background in words: the colour is agent work either way', () => {
+    const { unmount } = render(
+      <SubagentInfo description="sweep the logs" subagentType="general-purpose" isActive={false} background />,
+    )
+    expect(screen.getByText('Background')).toBeTruthy()
+    unmount()
+    render(<SubagentInfo description="sweep the logs" subagentType="general-purpose" isActive={false} />)
+    expect(screen.queryByText('Background')).toBeNull()
+  })
 })
 
 describe('BgCommandInfo — merged background-command pill', () => {
@@ -180,7 +191,7 @@ describe('BgCommandInfo — merged background-command pill', () => {
 
 describe('DelegateTaskInfo — expandable delegate pill', () => {
   it('expands to the full prompt when present', () => {
-    render(
+    const { container } = render(
       <DelegateTaskInfo
         taskName="triage inbox"
         agent="support-bot"
@@ -189,9 +200,18 @@ describe('DelegateTaskInfo — expandable delegate pill', () => {
         prompt="Please triage the attached report and summarize the top issues."
       />,
     )
-    expect(screen.queryByText(/summarize the top issues/)).toBeNull()
+    expect(container.querySelector('pre')).toBeNull()
     fireEvent.click(screen.getByText('triage inbox'))
-    expect(screen.getByText(/summarize the top issues/)).toBeTruthy()
+    expect(container.querySelector('pre')?.textContent).toContain('summarize the top issues')
+  })
+
+  it('previews the task, not the platform\'s wrapper around it', () => {
+    const prompt = "[DELEGATED_WORK]\nDelegated by agent 'boss'. Write a report.\n[/DELEGATED_WORK]\n\nTriage the inbox."
+    render(
+      <DelegateTaskInfo taskName="triage" agent="a" promptPreview="[DELEGATED_WORK]\nDelegated by…" status="running" prompt={prompt} />,
+    )
+    expect(screen.getAllByText('Triage the inbox.').length).toBeGreaterThan(0)
+    expect(screen.queryByText(/Delegated by agent/)).toBeNull()
   })
 
   it('is not expandable on preview-only legacy rows', () => {
@@ -254,7 +274,7 @@ describe('DelegateResultFiles — the files a worker attached', () => {
       </ChatFileProvider>,
     )
     fireEvent.click(screen.getByText('Open ↗'))
-    await waitFor(() => expect(screen.getByText('not found')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('Not found')).toBeTruthy())
     expect(screen.queryByTestId('chat-file-preview')).toBeNull()
   })
 

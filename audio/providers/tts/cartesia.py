@@ -88,7 +88,7 @@ class CartesiaTTS(TTSProvider):
     # ── Factory / metadata ─────────────────────────────────────────
 
     @classmethod
-    def from_row(cls, row: dict, resolver: CredentialResolver) -> "CartesiaTTS":
+    def from_row(cls, row: dict, resolver: CredentialResolver) -> CartesiaTTS:
         return cls(
             api_key=resolver(row.get("credential_key", "")),
             voices=row.get("voices") or {},
@@ -158,7 +158,7 @@ class CartesiaTTS(TTSProvider):
         # The synthesized text is agent speech that can quote user-personal data —
         # route it through the transcript gate; keep only the byte count at INFO.
         log_transcript(logger, "TTS synthesize", text)
-        logger.info(f"TTS synthesized {len(result)} bytes")
+        logger.info("TTS synthesized %s bytes", len(result))
         return result
 
     # ── Streaming context (LLM → TTS bridge) ───────────────────────
@@ -204,9 +204,9 @@ class CartesiaTTS(TTSProvider):
                     self._t_first_send = time.monotonic()
             if is_last:
                 await self._ctx.no_more_inputs()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the Cartesia SDK raises whatever its socket does
             if not self._cancelled:
-                logger.error(f"TTS send error: {e}")
+                logger.error("TTS send error: %s", e)
 
     async def receive_audio(self):
         """Yield PCM audio chunks from the current streaming context."""
@@ -229,9 +229,9 @@ class CartesiaTTS(TTSProvider):
                                 self._sent_chars,
                             )
                     yield r.audio
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the Cartesia SDK raises whatever its socket does
             if not self._cancelled:
-                logger.error(f"TTS receive error: {e}")
+                logger.error("TTS receive error: %s", e)
 
     def cancel(self) -> None:
         """Cancel the current streaming context (for barge-in).

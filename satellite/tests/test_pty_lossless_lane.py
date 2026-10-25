@@ -127,7 +127,7 @@ async def test_unix_integration_lossless_backpressure():
         on_exit=lambda code: done.set(),
     )
     await asyncio.wait_for(done.wait(), timeout=60)
-    while not c._pty_send_queue.empty():
+    while not c._pty_send_queue.empty():  # noqa: ASYNC110  # the client's send queue drains without an event to await
         await asyncio.sleep(0.01)
     await asyncio.sleep(0.1)
     w.cancel()
@@ -191,7 +191,7 @@ async def test_windows_integration_lossless_backpressure():
     )
     handle._attach()  # starts the reader thread
     await asyncio.wait_for(done.wait(), timeout=60)
-    while not c._pty_send_queue.empty():
+    while not c._pty_send_queue.empty():  # noqa: ASYNC110  # the client's send queue drains without an event to await
         await asyncio.sleep(0.01)
     await asyncio.sleep(0.1)
     w.cancel()
@@ -257,7 +257,7 @@ if __name__ == "__main__":
         try:
             asyncio.run(_t())
             print(f"PASS {_t.__name__}")
-        except Exception:
+        except Exception:  # noqa: BLE001  # a standalone runner: one failing test must not stop the rest
             _fails += 1
             traceback.print_exc()
             print(f"FAIL {_t.__name__}")

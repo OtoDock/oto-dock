@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render, screen, fireEvent, act } from '@testing-library/react'
+import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 
@@ -29,17 +29,21 @@ const h = vi.hoisted(() => ({
   usersLoading: false,
   usersEnabled: [] as boolean[],
   dfnuMock: vi.fn(),
+  toast: vi.fn(),
 }))
 
+const updateAgent = vi.hoisted(() => ({ mutate: (...a: unknown[]) => h.updateMock(...a), mutateAsync: (v: unknown) => { h.updateMock(v); return Promise.resolve({}) } }))
 vi.mock('@/api/agents', async (importOriginal) => ({
   AgentUpdateError: (await importOriginal<typeof import('@/api/agents')>()).AgentUpdateError,
   useAgentInfo: () => ({ data: h.agentInfo, isLoading: false }),
-  useUpdateAgent: () => ({ mutate: h.updateMock, isPending: false }),
-  useDeleteAgent: () => ({ mutate: vi.fn(), isPending: false }),
+  // One function for every render, as TanStack's own: the page's save
+  // effects list it.
+  useUpdateAgent: () => ({ mutate: updateAgent.mutate, mutateAsync: updateAgent.mutateAsync, isPending: false }),
+  useDeleteAgent: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false }),
   useDelegationTargets: () => ({ data: undefined }),
-  useSetDelegationTargets: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetDelegationTargets: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
   useExecutionLayers: () => ({ data: h.layers }),
-  useSetDefaultForNewUsers: () => ({ mutate: h.dfnuMock }),
+  useSetDefaultForNewUsers: () => ({ mutate: h.dfnuMock, mutateAsync: (v: unknown) => Promise.resolve(h.dfnuMock(v)) }),
   useAgentUsers: (_name: string, opts?: { enabled?: boolean }) => {
     const enabled = opts?.enabled !== false
     h.usersEnabled.push(enabled)
@@ -49,12 +53,14 @@ vi.mock('@/api/agents', async (importOriginal) => ({
   },
   useKnowledgeAttachments: () => ({ data: undefined }),
   useKnowledgeLibraries: () => ({ data: undefined }),
-  useSetKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
-  useAttachKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
-  useDetachKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
+  useAttachKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
+  useDetachKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
   useAgentFiles: () => ({ data: undefined }),
 }))
-vi.mock('@/api/remoteMachines', () => ({ useRemoteMachines: () => ({ data: [] }) }))
+vi.mock('@/api/remoteMachines', async (orig) => ({
+  ...(await orig<typeof import('@/api/remoteMachines')>()), useRemoteMachines: () => ({ data: [] }),
+}))
 vi.mock('@/api/departments', () => ({ useDepartments: () => ({ data: [] }) }))
 vi.mock('@/api/memory', () => ({
   useAgentMemorySettings: () => ({
@@ -64,9 +70,10 @@ vi.mock('@/api/memory', () => ({
       master: { user_memory_enabled: true, agent_memory_enabled: true },
     },
   }),
-  useSetAgentMemoryToggle: () => ({ mutate: vi.fn() }),
-  useClearAgentMemory: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetAgentMemoryToggle: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})) }),
+  useClearAgentMemory: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
 }))
+vi.mock('@/lib/appToasts', () => ({ emitAppToast: h.toast, onAppToast: () => () => {} }))
 vi.mock('@/contexts/AuthContext', () => ({
   // Admin → canManageAgent is true → the selector renders editable.
   useAuth: () => ({ user: { role: 'admin', sub: 'u1', agent_roles: {} } }),
@@ -254,14 +261,14 @@ describe('AgentConfig — XHigh effort gating', () => {
     // the flagless "System Default" placeholder must not hide XHigh.
     renderConfig()
     expect(xhighOption()).toBeInTheDocument()
-    expect(autoOption()).toHaveTextContent('Auto — Fable 5 (1M context)')
+    expect(autoOption()).toHaveTextContent('Auto: Fable 5 (1M context)')
   })
 
   it('names the model Auto resolves to as the server says, not the first in the list', () => {
     h.layers!['claude-code-cli'].auto_model = 'claude-haiku-4-5'
     h.layers!['claude-code-cli'].auto_model_label = 'Haiku 4.5 (200K)'
     renderConfig()
-    expect(autoOption()).toHaveTextContent('Auto — Haiku 4.5 (200K)')
+    expect(autoOption()).toHaveTextContent('Auto: Haiku 4.5 (200K)')
     // Haiku has no xhigh flag, so Auto offers none — the list's first model is not consulted.
     expect(xhighOption()).not.toBeInTheDocument()
   })
@@ -270,7 +277,7 @@ describe('AgentConfig — XHigh effort gating', () => {
     h.layers!['claude-code-cli'].auto_model = 'claude-ghost-1'
     h.layers!['claude-code-cli'].auto_model_label = 'Ghost 1'
     renderConfig()
-    expect(autoOption()).toHaveTextContent('Auto — Ghost 1')
+    expect(autoOption()).toHaveTextContent('Auto: Ghost 1')
     expect(xhighOption()).not.toBeInTheDocument()
   })
 
@@ -299,7 +306,7 @@ describe('AgentConfig — XHigh effort gating', () => {
     h.agentInfo.default_effort = 'xhigh'
     renderConfig()
     expect(screen.getByRole('option', { name: 'High' })).toBeInTheDocument()
-    expect(h.updateMock).toHaveBeenCalledWith({ name: 'demo', default_effort: 'high' }, expect.anything())
+    expect(h.updateMock).toHaveBeenCalledWith({ name: 'demo', default_effort: 'high' })
   })
 })
 
@@ -334,7 +341,7 @@ describe('AgentConfig — the effort ladder follows the engines and the provider
     expect(option('XHigh')).toBeInTheDocument()
     expect(option('Max')).not.toBeInTheDocument()
     expect(option('Ultra')).not.toBeInTheDocument()
-    expect(h.updateMock).toHaveBeenCalledWith({ name: 'demo', default_effort: 'xhigh' }, expect.anything())
+    expect(h.updateMock).toHaveBeenCalledWith({ name: 'demo', default_effort: 'xhigh' })
   })
 
   it('a Groq model offers Low, Medium and High only', () => {
@@ -386,5 +393,36 @@ describe('AgentConfig — the effort ladder follows the engines and the provider
     renderConfig()
     expect(screen.queryByText('Default Effort')).not.toBeInTheDocument()
     expect(h.updateMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('AgentConfig — the save indication', () => {
+  const saved = () => screen.getAllByRole('status').filter((r) => r.textContent === 'Saved')
+
+  beforeEach(() => {
+    h.updateMock.mockReset()
+    h.toast.mockClear()
+    h.agentInfo.collaborative = true
+    h.agentInfo.default_scope = 'user'
+  })
+
+  it('a direct switch says Saved once, beside its row', async () => {
+    renderConfig()
+    fireEvent.click(radio(/Shared \+ personal/))
+    await waitFor(() => expect(saved()).toHaveLength(1))
+    const row = screen.getByText('Visibility and workspace').closest('p')!
+    expect([...row.querySelectorAll('[role=status]')].map((r) => r.textContent)).toContain('Saved')
+    expect(h.toast).not.toHaveBeenCalled()
+  })
+
+  it('a refused switch toasts its reason and puts the choice back', async () => {
+    h.updateMock.mockImplementationOnce(() => { throw new Error('The agent is busy.') })
+    renderConfig()
+    fireEvent.click(radio(/Shared \+ personal/))
+    await waitFor(() => expect(h.toast).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'The visibility mode was not saved', body: 'The agent is busy.',
+    })))
+    expect(radio(/Personal \+ shared/)).toBeChecked()
+    expect(saved()).toHaveLength(0)
   })
 })

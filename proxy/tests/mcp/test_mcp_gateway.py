@@ -14,15 +14,19 @@ import uuid
 import pytest
 
 from tests._paths import PROXY_DIR
+
 if str(PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(PROXY_DIR))
 
-import config  # noqa: E402
-from core.credentials import mcp_broker, mcp_gateway  # noqa: E402
-from core.credentials.mcp_gateway import (  # noqa: E402
-    GatewayCredential, Refusal, Resolved, TokenRef,
+import config
+from core.credentials import mcp_broker, mcp_gateway
+from core.credentials.mcp_gateway import (
+    GatewayCredential,
+    Refusal,
+    Resolved,
+    TokenRef,
 )
-from storage.identity import bearer_allowlist  # noqa: E402
+from storage.identity import bearer_allowlist
 
 
 @pytest.fixture(autouse=True)
@@ -264,6 +268,7 @@ def test_a_re_adoption_resolves_a_header_key_from_an_env_delivered_instance(monk
     does (the instance's value over the resolver's), not only from the
     resolver's per-MCP secrets."""
     from types import SimpleNamespace
+
     from services.mcp import mcp_registry
     from services.oauth import credential_resolver
     from storage.mcp import mcp_store

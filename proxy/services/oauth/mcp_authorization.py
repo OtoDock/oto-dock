@@ -32,6 +32,7 @@ import httpx
 
 import config
 from auth.oauth_providers.base import OAuthTokenError, TokenSet, UserInfo
+from services.infra import pinned_http
 
 logger = logging.getLogger("otodock.mcp-authorization")
 
@@ -96,6 +97,9 @@ class AuthorizationServer:
     token_endpoint_auth_methods: list[str] = field(default_factory=list)
     cimd_supported: bool = False
     iss_parameter_supported: bool = False
+    #: The MCP server itself sits on a public address, so its authorization
+    #: server must too: the calls that hold this record dial on ``public_only``.
+    public_resource: bool = False
     fetched_at: float = 0.0
 
 
@@ -177,7 +181,7 @@ def _resolve_addresses(host: str) -> list[str]:
         infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
     except OSError:
         return []
-    return sorted({info[4][0] for info in infos})
+    return sorted({info[4][0] for info in infos})  # type: ignore[misc]  # typeshed types getaddrinfo()[4][0] as str | int; it is a str for AF_INET and AF_INET6
 
 
 async def _host_is_private(host: str) -> bool:
@@ -193,12 +197,23 @@ def user_agent() -> str:
     return f"OtoDock/{getattr(config, 'PINNED_OTODOCK_VERSION', '') or 'dev'}"
 
 
-def _client() -> httpx.AsyncClient:
+def _policy_for(public_resource: bool) -> pinned_http.Policy:
+    """The dial policy of a flow: a public MCP's servers must stay public,
+    a private MCP (a homelab) may keep private ones; this machine's own
+    address space is refused either way."""
+    return pinned_http.public_only if public_resource else pinned_http.control_plane
+
+
+def _client(url: str, policy: pinned_http.Policy | None = None) -> httpx.AsyncClient:
     """One client per call: no redirects (a metadata URL that redirects is
     not where the document lives), the install's user agent (Notion's edge
     refuses plain python agents), a per-read timeout; the total deadline is
-    ``_deadline``'s."""
-    return httpx.AsyncClient(
+    ``_deadline``'s. The dial goes only to addresses that pass ``policy``
+    (``control_plane`` unless the caller knows the resource is public),
+    resolved at the connect, so a name that answers differently after the
+    pre-checks reaches nothing."""
+    return pinned_http.checked_client(
+        url, policy or pinned_http.control_plane,
         timeout=15, follow_redirects=False, headers={"User-Agent": user_agent()},
     )
 
@@ -206,8 +221,8 @@ def _client() -> httpx.AsyncClient:
 async def _deadline(coro):
     try:
         return await asyncio.wait_for(coro, CALL_DEADLINE_S)
-    except asyncio.TimeoutError:
-        raise TryAgainLater("the vendor did not answer in time")
+    except asyncio.TimeoutError as exc:
+        raise TryAgainLater("the vendor did not answer in time") from exc
 
 
 async def _read_capped(resp: httpx.Response) -> bytes:
@@ -235,21 +250,21 @@ class _Answer:
             return None
 
 
-async def _post_capped(url: str, **kw) -> _Answer:
+async def _post_capped(url: str, *, policy: pinned_http.Policy | None = None, **kw) -> _Answer:
     """POST and read at most ``DOC_BYTES_CAP`` bytes of the answer."""
-    async with _client() as client:
+    async with _client(url, policy) as client:
         async with client.stream("POST", url, **kw) as resp:
             body = await _read_capped(resp)
             return _Answer(resp.status_code, resp.headers, body)
 
 
-async def _get_json(url: str) -> dict | None:
+async def _get_json(url: str, policy: pinned_http.Policy | None = None) -> dict | None:
     """A 200 JSON object at ``url`` (https only), else None: anything else
     (a redirect, a 404, HTML) counts as absent."""
     _require_https(url, "a metadata URL")
 
     async def _fetch():
-        async with _client() as client:
+        async with _client(url, policy) as client:
             async with client.stream("GET", url, headers={"Accept": "application/json"}) as resp:
                 if resp.status_code != 200:
                     return None
@@ -313,7 +328,7 @@ async def _protected_resource(resource: str) -> tuple[dict, list[str]]:
     """The resource metadata document and the challenge's scopes."""
     urls = _well_known(resource, "oauth-protected-resource")
     places = ["path", "root"] if len(urls) == 2 else ["root"]
-    for url, found_at in zip(urls, places):
+    for url, found_at in zip(urls, places, strict=False):
         doc = await _get_json(url)
         if doc is None:
             continue
@@ -334,9 +349,9 @@ async def _protected_resource(resource: str) -> tuple[dict, list[str]]:
     )
 
 
-async def _server_metadata(issuer: str) -> dict:
+async def _server_metadata(issuer: str, policy: pinned_http.Policy | None = None) -> dict:
     """The authorization server's metadata (RFC 8414, then OpenID
-    discovery), whose ``issuer`` must equal ``issuer``."""
+    discovery), whose ``issuer`` must equal ``issuer``, fetched on ``policy``."""
     _require_https(issuer, "the authorization server")
     parts = urlsplit(issuer)
     candidates = _well_known(issuer, "oauth-authorization-server", issuer=True)[:1]
@@ -349,7 +364,7 @@ async def _server_metadata(issuer: str) -> dict:
             f"{_origin(issuer)}/.well-known/openid-configuration",
         ]
     for url in candidates:
-        doc = await _get_json(url)
+        doc = await _get_json(url, policy)
         if doc is None:
             continue
         if str(doc.get("issuer", "")).rstrip("/") != issuer.rstrip("/"):
@@ -404,7 +419,10 @@ async def discover(resource_url: str, *, issuer_override: str = "") -> Authoriza
             f"the authorization server {_host(issuer)} is on a private address"
         )
 
-    meta = await _server_metadata(issuer)
+    # The rule above holds at the dial too: a public MCP's issuer is fetched
+    # on public_only, so a name that turns private after the check (or a
+    # metadata candidate pointed at a LAN address) reaches nothing.
+    meta = await _server_metadata(issuer, _policy_for(not mcp_private))
     methods = [str(m) for m in (meta.get("code_challenge_methods_supported") or [])]
     if "S256" not in methods:
         raise AuthorizationError(f"{_host(issuer)} does not support PKCE S256")
@@ -423,6 +441,7 @@ async def discover(resource_url: str, *, issuer_override: str = "") -> Authoriza
         ],
         cimd_supported=bool(meta.get("client_id_metadata_document_supported")),
         iss_parameter_supported=bool(meta.get("authorization_response_iss_parameter_supported")),
+        public_resource=not mcp_private,
         fetched_at=_monotonic(),
     )
     _discovery[key] = server
@@ -590,10 +609,11 @@ async def _register(
 
     try:
         resp = await _deadline(_post_capped(
-            server.registration_endpoint, json=request, headers={"Accept": "application/json"},
+            server.registration_endpoint, policy=_policy_for(server.public_resource),
+            json=request, headers={"Accept": "application/json"},
         ))
-    except httpx.HTTPError:
-        raise TryAgainLater(f"{_host(server.issuer)} could not be reached for the registration")
+    except httpx.HTTPError as exc:
+        raise TryAgainLater(f"{_host(server.issuer)} could not be reached for the registration") from exc
     payload: Any = resp.json()
     if resp.status in (429,) or resp.status >= 500 or 300 <= resp.status < 400:
         raise TryAgainLater(
@@ -683,7 +703,7 @@ async def _token_request(
             token_endpoint, data=data, headers={"Accept": "application/json"}, **extra,
         ))
     except (httpx.HTTPError, TryAgainLater, AuthorizationError) as exc:
-        raise OAuthTokenError(provider_id, action, "unreachable", type(exc).__name__, 0)
+        raise OAuthTokenError(provider_id, action, "unreachable", type(exc).__name__, 0) from exc
     payload = resp.json()
     if not isinstance(payload, dict):
         payload = {}

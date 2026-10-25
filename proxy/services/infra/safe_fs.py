@@ -52,8 +52,8 @@ import secrets
 import shutil
 import stat
 import sys
-from collections.abc import Callable, Iterable, Iterator
-from typing import BinaryIO
+from collections.abc import Callable, Generator, Iterable, Iterator
+from typing import BinaryIO, cast
 
 __all__ = [
     "SafeFsError", "UnsafePathError", "SymlinkRefused", "EscapeRefused",
@@ -740,7 +740,7 @@ def _list_dir(fd: int, rel: str) -> WalkStep:
 
 
 def walk_beneath(root, rel: str = "", *,
-                 onerror: Callable[[OSError], None] | None = None) -> Iterator[WalkStep]:
+                 onerror: Callable[[OSError], None] | None = None) -> Generator[WalkStep, None, None]:
     """``os.walk`` beneath ``root``, top-down, holding one directory handle
     per level (a wide tree cannot run the process out of descriptors). A
     directory is entered from its parent's handle without following: one
@@ -935,7 +935,9 @@ def copytree_beneath(src_root, src_rel, dst_root, dst_rel, *,
                 with contextlib.suppress(OSError):
                     rmtree_beneath(dstfd, dst_rel)
                 if budget is not None:
-                    budget.entries_left, budget.bytes_left = budget_at_start
+                    # budget_at_start is the tuple taken when a budget was given.
+                    budget.entries_left, budget.bytes_left = cast(
+                        "tuple[int | None, int | None]", budget_at_start)
             raise
     return skipped
 

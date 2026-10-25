@@ -5,6 +5,7 @@ import UiArtifact from '@/components/chat/media/UiArtifact'
 import { emitFileUpdate } from '@/lib/fileUpdates'
 import { eventToBlock, liveBlockToMessageBlock } from '@/lib/messageBlocks'
 import { titleFor } from '@/hooks/useArtifactWindows'
+import { type AppActionFrame, type ArtifactInteractionFrame, type UiFrame } from '@/api/wireEvents'
 
 const PROPS = {
   token: 'tok-1',
@@ -125,7 +126,7 @@ describe('UiArtifact', () => {
 })
 
 describe('ui block mapping', () => {
-  const wire = {
+  const wire: UiFrame = {
     type: 'ui', token: 'tok-9', ui_url: '/v1/ui/tok-9',
     title: 'Chart', height: 380, path: 'workspace/generated-ui/c.html',
   }
@@ -150,7 +151,7 @@ describe('ui block mapping', () => {
   })
 
   it('artifact_interaction maps through both mappers', () => {
-    const wire2 = {
+    const wire2: ArtifactInteractionFrame = {
       type: 'artifact_interaction', token: 'tok-9', title: 'Chart',
       payload: { action: 'analyze', month: '2026-03' },
     }
@@ -163,7 +164,7 @@ describe('ui block mapping', () => {
   })
 
   it('app_action maps through both mappers', () => {
-    const wire3 = {
+    const wire3: AppActionFrame = {
       type: 'app_action', app_id: 'a-1', slug: 'brief', title: 'Brief',
       action_id: 'ask', label: 'Ask', prompt: 'Analyze May',
     }

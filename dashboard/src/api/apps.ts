@@ -6,6 +6,8 @@ import type { SiteKind } from '../lib/placement'
 import { appKind, type AppKindName } from '../lib/kinds/app'
 import type { DeployState } from '../lib/status/appDeploy'
 import type { AppServerState } from '../lib/status/appServer'
+import { isRecord } from '../lib/json/guards'
+import { withMessage, apiJson, apiOk, apiResponse, raiseApiError } from '../lib/http/apiJson'
 
 export interface AppArgsSchema {
   properties?: Record<string, { type?: string; description?: string; enum?: unknown[] }>
@@ -163,8 +165,9 @@ export interface PinnedApp {
   /** The server's state (lib/status/appServer.ts; the supervisor's words). */
   server?: AppServerState
   server_error?: string
-  /** The manifest's other blocks, for the approval card's words. */
-  files?: { read: string[]; write: string[] }
+  /** The manifest's other blocks, for the approval card's words; `create`
+   *  lists the folders the platform makes once the manifest is approved. */
+  files?: { read: string[]; write: string[]; create?: string[] }
   egress?: string[]
   handlers?: AppHandlers
   exports?: AppExports
@@ -206,16 +209,12 @@ export interface AppExternal {
  * (an approver looking at the working copy) names the preview copy's own
  * server, so the copy's page talks to the copy's data (APPS.md). */
 export async function mintViewerToken(appId: string, opts: { preview?: boolean } = {}): Promise<{ token: string; exp: number; ttl: number }> {
-  const res = await apiFetch(`/v1/apps/${appId}/viewer-token${opts.preview ? '?preview=1' : ''}`, { method: 'POST' })
-  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'viewer token refused')
-  return res.json()
+  return apiJson<{ token: string; exp: number; ttl: number }>(`/v1/apps/${appId}/viewer-token${opts.preview ? '?preview=1' : ''}`, { method: 'POST' }, 'Could not sign you in to the app')
 }
 
 /** The last lines of an app server's log (owner, editors, managers). */
 export async function fetchAppLogs(appId: string, tail = 200): Promise<{ log: string; server: AppServerState; error: string; retry_after: number }> {
-  const res = await apiFetch(`/v1/apps/${appId}/logs?tail=${tail}`)
-  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'logs unavailable')
-  return res.json()
+  return apiJson<{ log: string; server: AppServerState; error: string; retry_after: number }>(`/v1/apps/${appId}/logs?tail=${tail}`, {}, 'logs unavailable')
 }
 
 /** A folder app's deploy state: the live and pending releases and what the
@@ -246,9 +245,7 @@ export const useDeployStatus = (appId: string | undefined, enabled = true) =>
   useQuery({
     queryKey: ['app-deploy', appId],
     queryFn: async (): Promise<DeployStatus> => {
-      const res = await apiFetch(`/v1/apps/${appId}/deploy/status`)
-      if (!res.ok) throw new Error('deploy status unavailable')
-      return res.json()
+      return apiJson<DeployStatus>(`/v1/apps/${appId}/deploy/status`).catch(withMessage('deploy status unavailable'))
     },
     enabled: !!appId && enabled,
   })
@@ -266,11 +263,10 @@ const useDeployDecision = (agent: string, verb: 'approve' | 'reject') => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ appId, release, sig }: DeployDecision) => {
-      const res = await apiFetch(`/v1/apps/${appId}/deploy/${verb}`, {
+      await apiOk(`/v1/apps/${appId}/deploy/${verb}`, {
         method: 'POST',
         ...(verb === 'approve' ? { body: JSON.stringify({ release, sig }) } : {}),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || `${verb} failed`)
+      }, `${verb} failed`)
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['apps', agent] })
@@ -291,9 +287,9 @@ export const useAppSecrets = (appId: string | undefined, enabled = true) =>
   useQuery({
     queryKey: ['app-secrets', appId],
     queryFn: async (): Promise<{ secrets: AppSecret[]; waiting: string }> => {
-      const res = await apiFetch(`/v1/apps/${appId}/secrets`)
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'secrets unavailable')
-      const body = await res.json()
+      const body = await apiJson<{ secrets?: AppSecret[]; waiting?: string } | null>(
+        `/v1/apps/${appId}/secrets`, {}, 'secrets unavailable',
+      )
       return { secrets: body?.secrets ?? [], waiting: body?.waiting ?? '' }
     },
     enabled: !!appId && enabled,
@@ -313,10 +309,9 @@ export const useSetAppSecret = (agent: string) => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ appId, name, value }: { appId: string; name: string; value: string }) => {
-      const res = await apiFetch(`/v1/apps/${appId}/secrets/${encodeURIComponent(name)}`, {
+      await apiOk(`/v1/apps/${appId}/secrets/${encodeURIComponent(name)}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value }),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'the value was not saved')
+      }, 'the value was not saved')
     },
     onSettled: () => invalidateSecrets(qc, agent),
   })
@@ -326,8 +321,7 @@ export const useDeleteAppSecret = (agent: string) => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ appId, name }: { appId: string; name: string }) => {
-      const res = await apiFetch(`/v1/apps/${appId}/secrets/${encodeURIComponent(name)}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'the value was not removed')
+      await apiOk(`/v1/apps/${appId}/secrets/${encodeURIComponent(name)}`, { method: 'DELETE' }, 'the value was not removed')
     },
     onSettled: () => invalidateSecrets(qc, agent),
   })
@@ -339,10 +333,9 @@ export const usePurgeApp = (agent: string) => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ appId, confirm }: { appId: string; confirm: string }) => {
-      const res = await apiFetch(`/v1/apps/${appId}/purge`, {
+      await apiOk(`/v1/apps/${appId}/purge`, {
         method: 'POST', body: JSON.stringify({ confirm }),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'delete failed')
+      }, 'delete failed')
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['apps', agent] })
@@ -375,11 +368,8 @@ export interface ChatPins {
 export const useChatPins = (chatId: string | undefined) =>
   useQuery({
     queryKey: ['chat-pins', chatId],
-    queryFn: async (): Promise<ChatPins> => {
-      const res = await apiFetch(`/v1/chats/${chatId}/pins`)
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
-    },
+    queryFn: (): Promise<ChatPins> => apiJson<ChatPins>(`/v1/chats/${chatId}/pins`, {},
+      'Could not load the pinned items'),
     enabled: !!chatId,
     staleTime: 15_000,
   })
@@ -390,9 +380,9 @@ export const useApp = (appId: string | undefined) =>
   useQuery({
     queryKey: ['app', appId],
     queryFn: async (): Promise<(PinnedApp & { agent: string; chat_id: string }) | null> => {
-      const res = await apiFetch(`/v1/apps/${appId}`)
+      const res = await apiResponse(`/v1/apps/${appId}`, {}, 'Could not load the app')
       if (res.status === 404) return null
-      if (!res.ok) throw new Error(await res.text())
+      if (!res.ok) await raiseApiError(res, 'Could not load the app')
       return res.json()
     },
     enabled: !!appId,
@@ -418,11 +408,8 @@ const keepHigherRev = (old: unknown, next: unknown): unknown => {
 export const useAppState = (appId: string | undefined) =>
   useQuery({
     queryKey: ['app-state', appId],
-    queryFn: async (): Promise<AppState> => {
-      const res = await apiFetch(`/v1/apps/${appId}/state`)
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
-    },
+    queryFn: (): Promise<AppState> => apiJson<AppState>(`/v1/apps/${appId}/state`, {},
+      "Could not load the app's state"),
     enabled: !!appId,
     staleTime: Infinity,
     structuralSharing: keepHigherRev,
@@ -432,9 +419,8 @@ export const useApps = (agent: string) =>
   useQuery({
     queryKey: ['apps', agent],
     queryFn: async (): Promise<PinnedApp[]> => {
-      const res = await apiFetch(`/v1/apps?agent=${encodeURIComponent(agent)}`)
-      if (!res.ok) throw new Error(await res.text())
-      const data = await res.json()
+      const data = await apiJson<{ apps?: PinnedApp[] }>(`/v1/apps?agent=${encodeURIComponent(agent)}`, {},
+        'Could not load the apps')
       return data.apps ?? []
     },
     enabled: !!agent,
@@ -445,11 +431,10 @@ export const useApproveApp = (agent: string) => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ appId, sig }: { appId: string; sig: string }) => {
-      const res = await apiFetch(`/v1/apps/${appId}/approve`, {
+      await apiOk(`/v1/apps/${appId}/approve`, {
         method: 'POST',
         body: JSON.stringify({ sig }),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Approve failed')
+      }, 'Approve failed')
     },
     // 409 (manifest changed) also lands here — the refetch shows the new card.
     // Dock pins render off ['chat-pins'] — same approval endpoint, so both
@@ -466,8 +451,7 @@ export const useUnpinApp = (agent: string) => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (appId: string) => {
-      const res = await apiFetch(`/v1/apps/${appId}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Unpin failed')
+      await apiOk(`/v1/apps/${appId}`, { method: 'DELETE' }, 'Unpin failed')
     },
     // A standing app can also surface as a Dock pin row — keep both fresh.
     onSettled: () => {
@@ -483,8 +467,7 @@ export const useHideAppForMe = (agent: string) => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (appId: string) => {
-      const res = await apiFetch(`/v1/apps/${appId}/hide`, { method: 'POST' })
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Hide failed')
+      await apiOk(`/v1/apps/${appId}/hide`, { method: 'POST' }, 'Hide failed')
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['apps', agent] })
@@ -497,8 +480,7 @@ export const useUnhideAppForMe = (agent: string) => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (appId: string) => {
-      const res = await apiFetch(`/v1/apps/${appId}/unhide`, { method: 'POST' })
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Restore failed')
+      await apiOk(`/v1/apps/${appId}/unhide`, { method: 'POST' }, 'Restore failed')
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['apps', agent] })
@@ -515,9 +497,7 @@ export interface CatalogSnapshot {
 }
 
 export async function fetchCatalogFeed(appId: string, feed: string): Promise<CatalogSnapshot> {
-  const res = await apiFetch(`/v1/apps/${appId}/catalog/${encodeURIComponent(feed)}`)
-  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || `feed ${feed} unavailable`)
-  return res.json()
+  return apiJson<CatalogSnapshot>(`/v1/apps/${appId}/catalog/${encodeURIComponent(feed)}`, {}, `feed ${feed} unavailable`)
 }
 
 /** One platform method call as the viewer; the server judges the declared
@@ -562,9 +542,7 @@ export const useRollbackApp = (agent: string) => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (appId: string): Promise<RollbackResult> => {
-      const res = await apiFetch(`/v1/apps/${appId}/rollback`, { method: 'POST' })
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Roll back failed')
-      return res.json()
+      return apiJson<RollbackResult>(`/v1/apps/${appId}/rollback`, { method: 'POST' }, 'Roll back failed')
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['apps', agent] })
@@ -578,11 +556,10 @@ export const useReorderApps = (agent: string) => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (ids: string[]) => {
-      const res = await apiFetch('/v1/apps/order', {
+      await apiOk('/v1/apps/order', {
         method: 'PUT',
         body: JSON.stringify({ agent, ids }),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail || 'Reorder failed')
+      }, 'Reorder failed')
     },
     onSettled: () => qc.invalidateQueries({ queryKey: ['apps', agent] }),
   })
@@ -593,6 +570,11 @@ export interface AppActionResult {
   reason?: string
   result?: string
   run_id?: string
+}
+
+/** A streamed batch line: one call's result, keyed by its id. */
+function isActionLine(row: unknown): row is AppActionResult & { call_id: string } {
+  return isRecord(row) && typeof row.call_id === 'string'
 }
 
 export interface AppActionCall {
@@ -624,9 +606,9 @@ export async function fireAppActions(
   }
   const takeLine = (line: string) => {
     if (!line.trim()) return
-    let row: any
+    let row: unknown
     try { row = JSON.parse(line) } catch { return }
-    if (row && typeof row.call_id === 'string') settle(row.call_id, row)
+    if (isActionLine(row)) settle(row.call_id, row)
   }
   try {
     const res = await apiFetch(`/v1/apps/${appId}/actions/batch`, {
@@ -658,7 +640,7 @@ export async function fireAppActions(
     }
     failRest('no result')
   } catch {
-    failRest('Network error — the call may not have reached the server')
+    failRest('Network error. The call may not have reached the server.')
   }
 }
 

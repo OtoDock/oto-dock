@@ -9,11 +9,14 @@ interpreter + path so the proxy's local bwrap paths can reuse it.
 import sys
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
-from core.sandbox.interceptor_wrap import wrap_servers_json, wrap_toml_text  # noqa: E402
-
+from core.sandbox.interceptor_wrap import (
+    wrap_servers_json,
+    wrap_toml_text,
+)
 
 # --- JSON (Claude) -----------------------------------------------------------
 

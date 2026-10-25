@@ -8,10 +8,10 @@ is the authority: the per-session cap (``max_seconds`` for
 STT, ``max_chars`` for TTS) and ``provider_id`` are baked into the token, and
 ``jti`` is one-time-use (replay guard).
 
-Mirrors ``auth.totp.create_2fa_session_token`` — same ``JWT_SECRET``, HS256, and
-purpose-claim discipline. One mint/validate pair serves both
-modalities via ``purpose`` (default STT, so the existing STT call sites — incl.
-their tests — are unchanged).
+Each purpose is its own token kind (``auth/tokens.py``: a key and an
+audience per kind), so an STT token never opens the TTS or the duplex socket.
+One mint/validate pair serves both modalities via ``purpose`` (default STT,
+so the existing STT call sites — incl. their tests — are unchanged).
 """
 
 from __future__ import annotations
@@ -19,13 +19,13 @@ from __future__ import annotations
 import time
 import uuid
 
-import jwt
-
-import config
+from auth import tokens
 
 PURPOSE_STT = "audio_stt"
 PURPOSE_TTS = "audio_tts"
 PURPOSE_DUPLEX = "duplex_session"
+_KINDS = {PURPOSE_STT: tokens.AUDIO_STT, PURPOSE_TTS: tokens.AUDIO_TTS,
+          PURPOSE_DUPLEX: tokens.DUPLEX}
 _TTL = 300  # 5 minutes
 
 # One-time-use guard: jti → expiry. In-process (single proxy worker in v1);
@@ -54,7 +54,7 @@ def create_ws_audio_token(
         "iat": now,
         "exp": now + _TTL,
     }
-    token = jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
+    token = tokens.mint(_KINDS[purpose], payload)
     return {
         "ws_token": token,
         "expires_at": payload["exp"],
@@ -82,7 +82,7 @@ def create_duplex_token(sub: str, *, chat_id: str, max_seconds: int) -> dict:
         "iat": now,
         "exp": now + _TTL,
     }
-    token = jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
+    token = tokens.mint(tokens.DUPLEX, payload)
     return {
         "ws_token": token,
         "expires_at": payload["exp"],
@@ -97,13 +97,8 @@ def validate_ws_audio_token(token: str, *, purpose: str = PURPOSE_STT) -> dict |
     accepted the connection, so a validation that never opens a socket doesn't
     burn the token.
     """
-    try:
-        payload = jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-        return None
-    if payload.get("purpose") != purpose:
-        return None
-    return payload
+    kind = _KINDS.get(purpose)
+    return tokens.verify(token, kind) if kind is not None else None
 
 
 def consume_jti(jti: str) -> bool:

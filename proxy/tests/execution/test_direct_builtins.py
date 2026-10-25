@@ -7,8 +7,7 @@ from __future__ import annotations
 import pytest
 
 from auth.path_policy import SecurityContext
-from core.layers.direct import builtins as B
-from core.layers.direct import files as df
+from core.layers.direct import builtins as B, files as df
 from core.sandbox.sandbox import SandboxConfig
 from core.session.session_state import set_session_security
 
@@ -257,3 +256,98 @@ async def test_failures_become_result_text(tree):
     bare = _Session(None, "direct-bare")
     assert await B.execute(bare, "Read", {"file_path": "/workspace/notes.md"}) == \
         "Error: file tools are not available in this session (no sandbox)"
+
+
+# ---------------------------------------------------------------------------
+# The gate inside a meeting: a Direct participant is gated as every other
+# participant, by the host chat's mode through the one authority
+# ---------------------------------------------------------------------------
+
+_HOST = "direct-host-sess"
+_PUMP = "meeting-mdirect"
+
+
+@pytest.fixture
+def participant(monkeypatch):
+    from core.session import session_state
+    sid = "direct-part-sess"
+    session_state.register_session_state(sid, "auto", SecurityContext(
+        role="manager", username="", agent=AGENT, is_admin_agent=False, session_scope="agent",
+    ))
+    monkeypatch.setitem(session_state._sessions, sid, {"is_meeting": True, "client_type": "meeting"})
+    session_state.set_meeting_session_info(sid, _HOST, _PUMP, AGENT, "direct-host-chat")
+    yield sid
+    session_state.cleanup_meeting_session_info(sid)
+    session_state.cleanup_session_permission_state(sid)
+    session_state.cleanup_session_permission_state(_PUMP)
+    session_state._session_modes.pop(_HOST, None)
+
+
+@pytest.mark.asyncio
+async def test_a_session_outside_meetings_keeps_the_builtin_table(tree, monkeypatch):
+    from core.session import session_events
+    called = []
+
+    async def _pre(*a, **k):
+        called.append(a)
+        return {"decision": "allow"}
+    monkeypatch.setattr(session_events, "pre_tool", _pre)
+    s = _Session(_cfg(tree), "direct-plain")
+    set_session_security(s.session_id, _ctx())
+    write = {"name": "Write", "input": {"file_path": "/workspace/x.md", "content": "y"}}
+    assert await B.gate_for_session(s, write, "default") == B.gate(s, write, "default")
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_a_participants_builtin_goes_to_the_one_authority(tree, monkeypatch, participant):
+    from core.session import session_events
+    answers = iter([{"decision": "allow"}, {"decision": "deny", "reason": "Tool use denied by user."}])
+    called = []
+
+    async def _pre(sid, name, tool_input, **k):
+        called.append((sid, name, tool_input))
+        return next(answers)
+    monkeypatch.setattr(session_events, "pre_tool", _pre)
+    s = _Session(_cfg(tree), participant)
+    write = {"name": "Write", "input": {"file_path": "/workspace/x.md", "content": "y"}}
+    assert await B.gate_for_session(s, write, "auto") == ("allow", "")
+    assert await B.gate_for_session(s, write, "auto") == ("deny", "Tool use denied by user.")
+    assert called == [(participant, "Write", write["input"])] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_meeting_session_without_its_mapping_is_refused(tree, monkeypatch, participant):
+    from core.session import session_events, session_state
+
+    async def _pre(*a, **k):
+        raise AssertionError("an ended meeting asks nobody")
+    monkeypatch.setattr(session_events, "pre_tool", _pre)
+    session_state.cleanup_meeting_session_info(participant)
+    s = _Session(_cfg(tree), participant)
+    read = {"name": "Read", "input": {"file_path": "/workspace/notes.md"}}
+    assert await B.gate_for_session(s, read, "auto") == ("deny", B.MEETING_ENDED)
+
+
+@pytest.mark.asyncio
+async def test_a_participants_write_asks_in_the_host_chat_under_its_default_mode(tree, participant):
+    """The real authority: the host chat's default mode asks on the meeting
+    pump's queue with the speaker's badge, and the person's answer lets the
+    write through; after a routing tool even a read is refused."""
+    import asyncio
+
+    from core.session import session_state
+    session_state.set_session_mode(_HOST, "default")
+    s = _Session(_cfg(tree), participant)
+    write = {"name": "Write", "input": {"file_path": "/workspace/x.md", "content": "y"}}
+    gate = asyncio.ensure_future(B.gate_for_session(s, write, "auto"))
+    queue = session_state.get_permission_queue(_PUMP)
+    prompt = await asyncio.wait_for(queue.get(), timeout=5)
+    assert prompt["tool_name"] == "Write" and prompt["meeting_agent"] == AGENT
+    session_state.resolve_permission(prompt["request_id"], True)
+    assert await asyncio.wait_for(gate, timeout=5) == ("allow", "")
+
+    session_state.mark_meeting_turn_routed(participant, "direct_to")
+    outcome, reason = await B.gate_for_session(
+        s, {"name": "Read", "input": {"file_path": "/workspace/notes.md"}}, "auto")
+    assert outcome == "deny" and "direct_to" in reason

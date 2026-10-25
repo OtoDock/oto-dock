@@ -6,11 +6,10 @@ route actually has an ambience bed.
 """
 
 import numpy as np
+from pipeline_fakes import make_route
 
 import config
 from voice_texture import VoiceTexture
-from pipeline_fakes import make_route
-
 
 SAMPLES = config.FRAME_SIZE // config.SAMPLE_WIDTH  # 160 per 20ms frame
 

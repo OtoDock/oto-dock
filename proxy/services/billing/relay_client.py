@@ -7,12 +7,13 @@ the secret, performs the privileged call, and returns only the user's own
 tokens / data. This is the single chokepoint to the relay — nothing else in the
 app talks to ``api.otodock.io`` directly.
 
-The relay + website are NOT built yet. Until this install is connected (not
-``OTODOCK_AIR_GAPPED``) **and** ``OTODOCK_RELAY_BASE`` is set, every network
-method raises :class:`RelayNotConfigured` so the API layer surfaces a clean
-"Hosted via OtoDock isn't available yet" message. When the relay ships we
-implement the HTTP bodies here (against the contract documented per-method) —
-no other app changes. End-to-end testing waits for the relay.
+Until this install is connected (not ``OTODOCK_AIR_GAPPED``) **and**
+``OTODOCK_RELAY_BASE`` is set, every network method raises
+:class:`RelayNotConfigured` so the API layer surfaces a clean "Hosted via
+OtoDock isn't available yet" message. Every relay call goes through
+``pinned_http`` on ``control_plane``: it never dials this machine's loopback
+or link-local address (a base the environment's proxy carries keeps the
+plain client).
 
 RELAY ACCESS ≠ PAID LICENSE. Being connected (not ``OTODOCK_AIR_GAPPED``) and
 NOT holding an ``offline_term`` key means "this install may talk to the relay."
@@ -44,6 +45,8 @@ import ssl
 import threading
 import time
 
+import psycopg
+
 import config
 
 logger = logging.getLogger("otodock.relay-client")
@@ -71,55 +74,82 @@ class RelayError(RuntimeError):
 # 4xx so the operator knows exactly what to fix.
 RELAY_ERROR_MESSAGES = {
     "license_invalid": (
-        "Your OtoDock license is invalid or expired. Renew it in "
-        "Settings → Platform to keep using hosted features."
+        "This OtoDock license is not valid or has expired. "
+        "An admin can renew it in Setup, OtoDock."
     ),
     "seat_exceeded": (
-        "Your plan's user limit has been reached. Upgrade your OtoDock plan to "
-        "add more seats."
+        "This plan has reached its user limit. "
+        "An admin can upgrade the OtoDock plan to add people."
     ),
     "no_credit": (
-        "Out of OtoDock credits. Add credits at otodock.io/dashboard/credits to "
-        "keep using this hosted feature."
+        "The OtoDock credits are used up. "
+        "An admin can add credits in Setup, OtoDock."
     ),
     "not_connected": (
-        "This install isn't connected to an OtoDock account. Connect it in "
-        "Settings → Platform to use hosted credits."
+        "This install is not connected to an OtoDock account. "
+        "An admin can connect it in Setup, OtoDock."
     ),
     "token_install_mismatch": (
-        "This install's OtoDock connection is invalid — reconnect it in "
-        "Settings → Platform."
+        "This install's OtoDock connection no longer works. "
+        "An admin can connect it again in Setup, OtoDock."
     ),
     "link_revoked": (
-        "This install was disconnected from its OtoDock account — reconnect it in "
-        "Settings → Platform."
+        "This install was disconnected from its OtoDock account. "
+        "An admin can connect it again in Setup, OtoDock."
     ),
     "model_not_allowed": (
-        "This model isn't available on the OtoDock hosted relay — pick a hosted "
-        "model, or use your own API key (BYO) for it."
+        "OtoDock does not host this model. "
+        "Pick a hosted model, or use your own API key for it."
     ),
     "activation_limit_reached": (
-        "This OtoDock license is already active on another install — deactivate "
-        "it there first, or use 'Move license'."
+        "This license is already active on another install. "
+        "Deactivate it there first, or use Move license."
     ),
     "invalid_grant": (
-        "The vendor revoked this account's authorization — reconnect the "
-        "account in Settings → Integrations."
+        "The service no longer accepts this account. "
+        "Connect the account again in User Settings, Integrations."
     ),
     "events_provider_unsupported": (
-        "Hosted event delivery isn't available for this integration yet — "
-        "vendor-console (manual) webhook setup still works."
+        "OtoDock cannot deliver this service's events yet. "
+        "Set up its webhook in the service's own console instead."
     ),
     "bad_events_url": (
-        "The OtoDock relay rejected this install's events URL — "
-        "DASHBOARD_PUBLIC_URL must be a publicly reachable https address."
+        "OtoDock could not use this install's events address. "
+        "DASHBOARD_PUBLIC_URL must be a public https address."
+    ),
+    "events_host_changed": (
+        "OtoDock sends this install's events to the address it first used. "
+        "If the install moved, ask OtoDock support to reset it."
+    ),
+    "provider_not_app": (
+        "OtoDock's GitHub App is not available right now. Try again in a minute."
     ),
 }
+
+# A refusal whose code has no sentence of its own.
+_UNKNOWN_REFUSAL = "OtoDock could not do this right now. Try again later."
+
+# What a connect's callback page says for the codes the relay sends back to
+# this install (beside the service's own ``error``, passed through) and for
+# the person declining on the service's page; any other code is shown as is.
+CALLBACK_ERROR_MESSAGES = {
+    "provider_disabled": "This way to sign in is not available right now. Try again later.",
+    "exchange_failed": "The sign-in did not finish. Try again.",
+    "no_code": "The sign-in did not finish. Try again.",
+    "access_denied": "The sign-in was cancelled. Connect again to retry.",
+}
+
+# The relay's refusal of a call over one of its per-minute limits.
+RATE_LIMITED = "rate_limited"
 
 
 def relay_error_message(code: str, default: str = "") -> str:
     """Map a relay rejection code to a user-facing message."""
-    return RELAY_ERROR_MESSAGES.get(code, default or f"OtoDock relay error: {code}")
+    message = RELAY_ERROR_MESSAGES.get(code)
+    if message:
+        return message
+    logger.warning("The OtoDock relay refused with a code that has no sentence: %r", code)
+    return default or _UNKNOWN_REFUSAL
 
 
 # Where the install stores the relay's per-install event forward secret
@@ -199,7 +229,7 @@ def license_allows_relay() -> bool:
             return True
         # `lifetime` overrides the mode; only a non-lifetime offline_term blocks.
         return lic.lifetime or lic.license_mode != "offline_term"
-    except Exception:
+    except (ImportError, psycopg.Error):
         return True
 
 
@@ -228,12 +258,12 @@ def is_available() -> bool:
     return bool(relay_offered() and config.OTODOCK_RELAY_BASE)
 
 
+_NOT_CONFIGURED = "Hosted features are not available on this install yet."
+
+
 def _require_relay() -> None:
     if not is_available():
-        raise RelayNotConfigured(
-            "Hosted via OtoDock isn't available yet — the OtoDock relay is not "
-            "configured for this install."
-        )
+        raise RelayNotConfigured(_NOT_CONFIGURED)
 
 
 def api_relay_enabled() -> bool:
@@ -270,6 +300,7 @@ def get_install_id() -> str:
     enforcement to this install. Not a secret — it's an opaque correlation id.
     """
     import uuid
+
     from storage import database as db
 
     iid = db.get_platform_setting("install_id")
@@ -299,11 +330,86 @@ def _link_identity() -> dict:
     return {"install_id": get_install_id(), "account_token": get_account_token()}
 
 
+# The identity a push sends, cached so a fan-out reads the store once, off
+# the loop.
+_IDENTITY_TTL_S = 60.0
+
+
+class _RelayIdentity:
+    """``is_available()`` and ``_relay_identity()`` from one cache per
+    process: refreshed on ``run_db`` once older than the TTL, single-flighted
+    per loop (the pushes of a fan-out that miss together share one job; a
+    job that raises caches nothing), and reset by every licence write. The
+    generation keeps a reset honest: a refresh that started before it stores
+    nothing, and a caller that arrives after it starts a fresh refresh
+    instead of joining the one in flight."""
+
+    def __init__(self) -> None:
+        self.value: tuple[bool, dict] | None = None
+        self.at = 0.0
+        self.generation = 0
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.flight: asyncio.Future | None = None
+        self.flight_generation = -1
+
+    def reset(self) -> None:
+        self.value = None
+        self.generation += 1
+
+    async def get(self) -> tuple[bool, dict]:
+        if self.value is not None and time.monotonic() - self.at < _IDENTITY_TTL_S:
+            return self.value
+        loop = asyncio.get_running_loop()
+        if self.loop is not loop:
+            self.loop, self.flight = loop, None
+        if self.flight is None or self.flight_generation != self.generation:
+            self.flight = loop.create_task(self._refresh())
+            self.flight_generation = self.generation
+            self.flight.add_done_callback(self._landed)
+        return await asyncio.shield(self.flight)
+
+    def _landed(self, task) -> None:
+        if self.flight is task:
+            self.flight = None
+
+    async def _refresh(self) -> tuple[bool, dict]:
+        from storage.pg import run_db
+
+        generation = self.generation
+        value = await run_db(_read_identity)
+        if generation == self.generation:
+            self.value, self.at = value, time.monotonic()
+        return value
+
+
+def _read_identity() -> tuple[bool, dict]:
+    """The relay's availability and, when available, the identity a call
+    sends (the store reads; a ``run_db`` job)."""
+    available = is_available()
+    return available, (_relay_identity() if available else {})
+
+
+_identity = _RelayIdentity()
+
+
+async def relay_identity() -> tuple[bool, dict]:
+    """Whether the relay is available for this install and the identity a
+    push sends, from the cache (``_RelayIdentity``)."""
+    return await _identity.get()
+
+
+def reset_identity_cache() -> None:
+    """A licence write (``auth.license.set_license_key``): the next push
+    reads afresh. The account token is not part of the identity a push
+    sends, so its writes need no reset."""
+    _identity.reset()
+
+
 # ---------------------------------------------------------------------------
 # License activation + liveness — subscription keys bind once + check in.
 # Each attaches _relay_identity() and POSTs to the commercial license server
 # (``OTODOCK_RELAY_BASE`` = ``api.otodock.io``). The oauth_* / mint_session_token
-# methods further below are stubs — the hosted OAuth/API relay is not live yet.
+# methods further below call the same relay base.
 # ---------------------------------------------------------------------------
 
 # License calls are tiny + infrequent (one-time activate, weekly check); a short
@@ -320,7 +426,7 @@ class _RelayLoopState:
         self.client_lock: asyncio.Lock | None = None
         self.client = None
 
-    def current(self) -> "_RelayLoopState":
+    def current(self) -> _RelayLoopState:
         loop = asyncio.get_running_loop()
         if self.loop is not loop:
             self.loop = loop
@@ -347,8 +453,11 @@ def _build_ssl_context() -> ssl.SSLContext:
 async def _relay_http_client():
     """The SSL context is what makes a client construction cost several
     milliseconds on the loop: built once, in a thread, shared by every call
-    on the loop."""
-    import httpx
+    on the loop. The client connects only to addresses outside this
+    machine's own address space, resolved at the dial (``pinned_http``):
+    a relay on the same machine is reached through its LAN address or a
+    container name, never through loopback."""
+    from services.infra import pinned_http
 
     global _ssl_context
     state = _relay_state.current()
@@ -357,7 +466,8 @@ async def _relay_http_client():
             if state.client is None:
                 if _ssl_context is None:
                     _ssl_context = await asyncio.to_thread(_build_ssl_context)
-                state.client = httpx.AsyncClient(
+                state.client = pinned_http.checked_client(
+                    config.OTODOCK_RELAY_BASE, pinned_http.control_plane,
                     verify=_ssl_context, timeout=_RELAY_TIMEOUT_SECONDS)
     return state.client
 
@@ -473,11 +583,14 @@ async def push_send(*, platform: str, device_token: str, payload: dict) -> dict:
     (``_require_relay`` / the relay's offline gate). Raises ``RelayError`` on a
     relay rejection — notably ``token_invalid`` (the device token is no longer
     registered → the caller drops the subscription). **Web Push stays local and
-    never routes here.**
+    never routes here.** The availability and the identity come from the
+    cache (``relay_identity``): a fan-out reads the store once, off the loop.
     """
-    _require_relay()
+    available, identity = await relay_identity()
+    if not available:
+        raise RelayNotConfigured(_NOT_CONFIGURED)
     return await _relay_post("/v1/push/send", {
-        **_relay_identity(),
+        **identity,
         "platform": platform,
         "device_token": device_token,
         "payload": payload or {},
@@ -540,9 +653,113 @@ def _tokenset_from(data: dict):
     )
 
 
+_app_info_cache: dict[str, tuple[dict | RelayError, float]] = {}
+_app_info_lock = threading.Lock()
+_APP_INFO_TTL_S = 60.0
+
+
+def _relay_post_sync(path: str, payload: dict) -> dict:
+    """``_relay_post`` for a synchronous caller (a config build in a thread),
+    on the pinned sync client as ``mint_session_token`` uses."""
+    from services.infra import pinned_http
+
+    base = config.OTODOCK_RELAY_BASE.rstrip("/")
+    with pinned_http.checked_sync_client(
+            base, pinned_http.control_plane, timeout=_RELAY_TIMEOUT_SECONDS) as client:
+        resp = client.post(f"{base}{path}", json=payload)
+    if 400 <= resp.status_code < 500:
+        code = ""
+        with contextlib.suppress(Exception):
+            code = (resp.json() or {}).get("detail", "")
+        raise RelayError(code or f"http_{resp.status_code}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+def oauth_app_info(provider_id: str) -> dict:
+    """What OtoDock's hosted app for ``provider_id`` is: ``{slug, name,
+    app_id, kind}`` (a GitHub App's listings filter on the app id).
+    Synchronous, cached a minute per provider; raises
+    ``RelayNotConfigured`` when the relay is not available and ``RelayError``
+    on a refusal."""
+    _require_relay()
+    now = time.monotonic()
+    with _app_info_lock:
+        hit = _app_info_cache.get(provider_id)
+        if hit and hit[1] > now:
+            if isinstance(hit[0], RelayError):
+                raise hit[0]
+            return dict(hit[0])
+    try:
+        data = _relay_post_sync("/v1/oauth/app-info", {**_relay_identity(), "provider_id": provider_id})
+    except RelayError as exc:
+        # A refusal (a relay without the route answers 404) holds for the
+        # TTL too: a connect never pays the round trip twice a minute.
+        with _app_info_lock:
+            _app_info_cache[provider_id] = (exc, now + _APP_INFO_TTL_S)
+        raise
+    info = {k: data.get(k, "") for k in ("slug", "name", "app_id", "kind")}
+    with _app_info_lock:
+        _app_info_cache[provider_id] = (info, now + _APP_INFO_TTL_S)
+    return dict(info)
+
+
+def _forget_app_info(provider_id: str, exc: RelayError) -> None:
+    """A refusal saying the relay stopped offering its app: the answer
+    cached up to a minute ago still offers it, so the next integrations
+    list asks again instead of putting the app first."""
+    if exc.code == "provider_not_app":
+        with _app_info_lock:
+            _app_info_cache.pop(provider_id, None)
+
+
+def hosted_app_kind(provider_id: str) -> str:
+    """The kind of OtoDock's hosted app for ``provider_id``
+    (``storage/identity/oauth_app_kinds.py``): the OAuth App until the
+    relay says otherwise, or when it cannot be asked."""
+    import httpx
+
+    from storage.identity import oauth_app_kinds
+    try:
+        kind = str(oauth_app_info(provider_id).get("kind") or "")
+    except (RelayNotConfigured, RelayError, httpx.HTTPError, OSError, ValueError):
+        return oauth_app_kinds.KIND_OAUTH_APP
+    return kind if kind in oauth_app_kinds.KINDS else oauth_app_kinds.KIND_OAUTH_APP
+
+
+def oauth_app_install_url(*, provider_id: str, state: str, install_callback: str, user_sub: str = "") -> str:
+    """GitHub's install page of OtoDock's hosted GitHub App: the relay
+    records ``state`` with ``install_callback`` (this install's setup URL),
+    and GitHub's return reaches it through the relay's setup URL, once.
+    Synchronous (a caller on the loop runs it in a thread); ``RelayError`` on
+    a refusal (``provider_not_app``, ``bad_callback``, ``state_reused``,
+    ``rate_limited``)."""
+    _require_relay()
+    try:
+        data = _relay_post_sync("/v1/oauth/app-install-url", {
+            **_relay_identity(), "provider_id": provider_id, "state": state,
+            "install_callback": install_callback, "user_sub": user_sub,
+        })
+    except RelayError as exc:
+        _forget_app_info(provider_id, exc)
+        raise
+    return str(data.get("url") or "")
+
+
+def oauth_app_relist(*, provider_id: str, access_token: str) -> None:
+    """Ask the relay to re-read which installations of OtoDock's hosted
+    GitHub App this token's person owns (the relay forwards their events by
+    it). Synchronous; ``RelayError`` on a refusal (``token_invalid`` for
+    anything but a GitHub App user token, ``rate_limited``)."""
+    _require_relay()
+    _relay_post_sync("/v1/oauth/app-relist", {
+        **_relay_identity(), "provider_id": provider_id, "access_token": access_token,
+    })
+
+
 async def oauth_authorize_url(
     *, provider_id: str, scopes: list[str], state: str, install_callback: str,
-    user_sub: str = "",
+    user_sub: str = "", app_kind: str = "",
 ) -> str:
     """Return the vendor consent URL for a hosted OAuth connect.
 
@@ -554,17 +771,25 @@ async def oauth_authorize_url(
 
     ``user_sub`` (the connecting user) lets the relay enforce the license's seat
     cap: a new over-cap user is refused with
-    ``RelayError("seat_exceeded")``.
+    ``RelayError("seat_exceeded")``. ``app_kind`` names which of the
+    provider's apps signs the person in (GitHub's GitHub App or OAuth App);
+    empty lets the relay choose by the scopes, and a GitHub App it no longer
+    offers is refused with ``RelayError("provider_not_app")``.
     """
     _require_relay()
-    data = await _relay_post("/v1/oauth/authorize-url", {
-        **_relay_identity(),
-        "provider_id": provider_id,
-        "scopes": scopes,
-        "state": state,
-        "install_callback": install_callback,
-        "user_sub": user_sub,
-    })
+    try:
+        data = await _relay_post("/v1/oauth/authorize-url", {
+            **_relay_identity(),
+            "provider_id": provider_id,
+            "scopes": scopes,
+            "state": state,
+            "install_callback": install_callback,
+            "user_sub": user_sub,
+            "app_kind": app_kind,
+        })
+    except RelayError as exc:
+        _forget_app_info(provider_id, exc)
+        raise
     return data.get("url", "")
 
 
@@ -671,7 +896,7 @@ async def account_disconnect() -> None:
             await _relay_post("/v1/connect/disconnect", {
                 "install_id": get_install_id(), "account_token": token,
             })
-    except Exception:
+    except Exception:  # noqa: BLE001  # the relay's revoke may fail, the local token clears anyway
         logger.warning("relay link revoke failed; clearing local token anyway", exc_info=True)
     finally:
         clear_account_token()
@@ -717,10 +942,11 @@ def mint_session_token(user_sub: str) -> str:
             return hit[0]
 
     try:
-        import httpx
+        from services.infra import pinned_http
 
         base = config.OTODOCK_RELAY_BASE.rstrip("/")
-        with httpx.Client(timeout=_RELAY_TIMEOUT_SECONDS) as client:
+        with pinned_http.checked_sync_client(
+                base, pinned_http.control_plane, timeout=_RELAY_TIMEOUT_SECONDS) as client:
             resp = client.post(
                 f"{base}/v1/relay/session/mint",
                 json={**identity, "user_sub": user_sub or ""},
@@ -733,13 +959,15 @@ def mint_session_token(user_sub: str) -> str:
         resp.raise_for_status()
         token = (resp.json() or {}).get("token", "")
     except RelayError as e:
-        raise RelayNotConfigured(relay_error_message(e.code))
-    except Exception:
+        raise RelayNotConfigured(relay_error_message(e.code)) from e
+    except Exception as exc:
         raise RelayNotConfigured(
-            "OtoDock hosted relay is temporarily unavailable — try again shortly."
-        )
+            "OtoDock hosted features are not answering. Try again in a minute."
+        ) from exc
     if not token:
-        raise RelayNotConfigured("OtoDock hosted relay returned no session token.")
+        raise RelayNotConfigured(
+            "OtoDock hosted features did not answer properly. Try again in a minute."
+        )
 
     with _session_token_lock:
         _session_token_cache[cache_key] = (token, now + _SESSION_TOKEN_TTL_SECONDS)

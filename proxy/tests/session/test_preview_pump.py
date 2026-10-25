@@ -15,7 +15,7 @@ import asyncio
 
 import pytest
 
-from core.events.common_events import CommonEvent, DONE
+from core.events.common_events import DONE, CommonEvent
 from core.events.stream_pump import ChatStreamPump
 from services.media import preview_snapshots
 from storage import database as task_store

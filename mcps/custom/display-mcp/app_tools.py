@@ -10,7 +10,7 @@ file-size rule.
 import os
 
 import httpx
-from mcp.types import ImageContent, TextContent, Tool
+from mcp.types import ImageContent, TextContent, Tool, ToolAnnotations
 
 PROXY_URL = os.environ.get("PROXY_URL", "")
 PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
@@ -118,11 +118,13 @@ APP_TOOLS: list[Tool] = [
     Tool(
         name="pin_app",
         description=(
-            "Pin (or update — same slug upserts) a standing APP: an "
-            "HTML dashboard the user opens any time from the chat page's "
-            "apps button, outliving every chat. Use for recurring surfaces "
-            "(morning brief, project status, home dashboard) — for a "
-            "one-off visual in THIS conversation use display_ui instead. "
+            "Pin or update a standing APP. The same slug upserts. An app "
+            "is an HTML dashboard the user opens any time from the chat "
+            "page's apps button, and it outlives every chat. Use it for "
+            "recurring surfaces, like a morning brief, a project status or "
+            "a home dashboard, and for a deliverable someone opens from a "
+            "link, like an offer, a comparison or a form. For a one-off "
+            "visual in THIS conversation use display_ui instead. "
             "Same sandboxed rendering as display_ui (kit + Tailwind "
             "available; Tailwind + mobile-responsive layout are REQUIRED "
             "for apps — see the skill). Buttons may invoke DECLARED "
@@ -179,7 +181,8 @@ APP_TOOLS: list[Tool] = [
                         "on one of this agent's MCPs directly, no agent turn), feed? (data_feed — "
                         "subscribe the page to a read-only live platform feed via otodock.feed: "
                         "'active_chats', 'project_lanes', 'sessions', 'tasks', 'notifications', "
-                        "'trigger_fires', 'file_changes'), method? (platform — a request the page "
+                        "'trigger_fires', 'file_changes', 'checks', 'check_verdicts'), method? "
+                        "(platform — a request the page "
                         "makes via otodock.platform: 'viewer.me', 'integrations.status', "
                         "'tasks.run_result', 'notifications.create', 'app.audience' (who uses the "
                         "app: its members, the agents it is placed in and the people it is shared "
@@ -234,6 +237,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
     ),
     Tool(
         name="unpin_app",
@@ -253,6 +257,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
     ),
     Tool(
         name="list_apps",
@@ -269,6 +274,7 @@ APP_TOOLS: list[Tool] = [
             "before pin_app so slugs are reused deliberately."
         ),
         inputSchema={"type": "object", "properties": {}},
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
     Tool(
         name="app_push",
@@ -293,6 +299,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug", "payload"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="app_state",
@@ -326,6 +333,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
     ),
     Tool(
         name="open_app",
@@ -357,6 +365,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="rollback_app",
@@ -382,6 +391,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
     ),
     Tool(
         name="deploy_app",
@@ -415,6 +425,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
     ),
     Tool(
         name="check_app",
@@ -424,8 +435,11 @@ APP_TOOLS: list[Tool] = [
             "exports, bindings, requires, steps, secrets, inbound, external — the "
             "reply's `manifest` says which blocks parsed), the caps, client/index.html, "
             "and a SMOKE start of the server on a scratch port with scratch "
-            "data (the live database is never touched). Returns ok, or the "
-            "reason and the server's first log lines."
+            "data (the live database is never touched). Returns what would "
+            "refuse a deploy, the warnings under 'Worth fixing', and four "
+            "pictures of the page: phone, tablet and desktop, then the other "
+            "theme. Read them before you deploy. A server that does not "
+            "start returns the reason and its first log lines."
         ),
         inputSchema={
             "type": "object",
@@ -435,6 +449,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="deploy_status",
@@ -443,10 +458,10 @@ APP_TOOLS: list[Tool] = [
             "for approval and what it changes, the server's state (up, "
             "starting, backoff with the error, quota_full, static, secrets), "
             "whether the manifest is approved, each declared secret and "
-            "whether a person has set it (never the value — ask a manager or "
-            "the owner to set a missing one in the app's settings), and the "
-            "app's last ten wakes with their verdicts (read them when a "
-            "handler is not firing)."
+            "whether a person has set it, never the value. Ask a manager or "
+            "the owner to set a missing one in the app's Settings. It also "
+            "lists the app's last ten wakes with their verdicts: read them "
+            "when a handler is not firing."
         ),
         inputSchema={
             "type": "object",
@@ -456,14 +471,15 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
     Tool(
         name="describe_app",
         description=(
-            "What another app OFFERS to apps that bind to it (APPS.md 'Bindings'): "
+            "What another app OFFERS to apps that bind to it: "
             "its exported methods, snapshots and events with their descriptions "
             "and role floors, so you can build against it without reading its "
-            "code. Reachable: this agent's own apps, the apps of agents this "
+            "code. The app-authoring skill's 'Bindings' says more. Reachable: this agent's own apps, the apps of agents this "
             "agent delegates to, the apps of agents the current user is a "
             "member of, and the apps a share placed in this agent (list_apps "
             "names them); anything else is 'no app to bind to'. To use one "
@@ -485,15 +501,17 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
     Tool(
         name="export_app",
         description=(
             "Pack a folder app's WORKING folder as apps/<slug>.otoapp in the same "
-            "scope (APPS.md 'Blueprints'): the files a release would take, the "
+            "scope: the files a release would take, the "
             "app.json with its buttons by slug, and the tasks those buttons point "
             "at — never the database, never node_modules. Send it with send_file, "
-            "or drop it in another agent's workspace and import_app it there."
+            "or drop it in another agent's workspace and import_app it there. "
+            "The app-authoring skill's 'Blueprints' says more."
         ),
         inputSchema={
             "type": "object",
@@ -503,6 +521,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="import_app",
@@ -524,6 +543,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["path"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
     ),
     Tool(
         name="preview_app",
@@ -542,6 +562,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="screenshot_app",
@@ -566,6 +587,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="app_logs",
@@ -583,6 +605,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
     Tool(
         name="purge_app",
@@ -602,6 +625,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug", "confirm"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
     ),
     Tool(
         name="restart_app",
@@ -617,6 +641,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["slug"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="pin_file",
@@ -660,6 +685,7 @@ APP_TOOLS: list[Tool] = [
             },
             "required": ["path"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
     ),
     Tool(
         name="unpin_file",
@@ -676,6 +702,7 @@ APP_TOOLS: list[Tool] = [
                           "description": "Which Dock (default 'chat')."},
             },
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
     ),
 ]
 
@@ -687,7 +714,7 @@ def _findings_text(slug: str, data: dict, again: str) -> str:
     rows = data.get("findings") or []
     fails = [f for f in rows if f.get("severity") == "fail"]
     warns = [f for f in rows if f.get("severity") != "fail"]
-    line = lambda f: f"  {f.get('file')}:{f.get('line')} {f.get('rule')}: {f.get('message')}"  # noqa: E731
+    line = lambda f: f"  {f.get('file')}:{f.get('line')} {f.get('rule')}: {f.get('message')}"
     out = ""
     if fails:
         out = (f"'{slug}' is NOT ready: {len(fails)} problem(s) the sandbox would hit:\n"
@@ -695,6 +722,29 @@ def _findings_text(slug: str, data: dict, again: str) -> str:
     if warns:
         out += ("\n" if out else "") + "Worth fixing:\n" + "\n".join(line(f) for f in warns)
     return out
+
+
+def _folders_text(data: dict) -> str:
+    """The folders the manifest's ``files.create`` declares, in words: what a
+    deploy, an approval or a rollback made (``{created, kept, skipped}``) or,
+    from ``deploy_status``, how each stands now (``[{path, state}]``). Empty
+    when the answer carries no ``folders``."""
+    folders = data.get("folders")
+    if isinstance(folders, list):
+        said = {"present": "is there", "missing": "is missing, and the next approved release makes it again",
+                "blocked": "is blocked by a file or a link in the way"}
+        parts = [f"{f.get('path')} {said.get(f.get('state'), f.get('state'))}" for f in folders]
+        return ("Folders: " + ". ".join(parts) + ".") if parts else ""
+    if not isinstance(folders, dict):
+        return ""
+    parts = []
+    if folders.get("created"):
+        parts.append("Made " + ", ".join(folders["created"]))
+    if folders.get("kept"):
+        kept = folders["kept"]
+        parts.append(", ".join(kept) + (" was" if len(kept) == 1 else " were") + " already there")
+    parts += [f"Not made {s.get('path')}, because {s.get('reason')}" for s in folders.get("skipped") or []]
+    return ("Folders: " + ". ".join(parts) + ".") if parts else ""
 
 
 def _render_parts(data: dict) -> tuple[str, list[ImageContent]]:
@@ -749,7 +799,7 @@ async def _post_hook(path: str, payload: dict, *, read: float = 60.0) -> tuple[d
     except httpx.TimeoutException:
         return None, (f"no answer within {int(read)} s — the step may still finish on the "
                       "platform; read deploy_status before trying again")
-    except Exception as e:
+    except (httpx.HTTPError, ValueError) as e:
         return None, str(e) or type(e).__name__
 
 
@@ -926,10 +976,12 @@ async def _handle_app_hook(op: str, arguments: dict) -> list[TextContent]:
         else:
             tail = ("No copy of the database from before the release you left exists, so "
                     "the app keeps its current data.")
+        folders = _folders_text(data)
         return [TextContent(
             type="text",
             text=(f"'{payload['slug']}' now serves release {data.get('release')} again "
-                  f"({data.get('screens', 0)} open screen(s) reloaded). {tail}"),
+                  f"({data.get('screens', 0)} open screen(s) reloaded). {tail}"
+                  + (f"\n{folders}" if folders else "")),
         )]
     apps = data.get("apps", [])
     placed = data.get("placed", [])
@@ -947,7 +999,7 @@ async def _handle_app_hook(op: str, arguments: dict) -> list[TextContent]:
             f"- {a.get('slug')} [{a.get('scope')}{scope_tag}{_kind_tag(a)}] \"{a.get('title')}\" — "
             f"id {a.get('id')}, path {a.get('path')}, actions: {acts}"
             + ("" if acts == "none" else f" ({approved})")
-            + (f" — waiting: {a['waiting']}" if a.get("waiting") else "")
+            + (f". Waiting: {a['waiting']}" if a.get("waiting") else "")
             + (" — UNPINNED by the user; pin_app(slug) restores it"
                if a.get("unpinned") else "")
         )
@@ -1009,15 +1061,18 @@ def _deploy_reply(slug: str, data: dict, again: str) -> list[TextContent | Image
             text += f"\n{rendered}"
         return [TextContent(type="text", text=text), *pictures]
     warned = _findings_text(slug, data, "") if data.get("findings") else ""
-    tail = (f"\n{warned}" if warned else "") + (f"\n{rendered}" if rendered else "")
+    folders = _folders_text(data)
+    tail = ((f"\n{folders}" if folders else "") + (f"\n{warned}" if warned else "")
+            + (f"\n{rendered}" if rendered else ""))
     if data.get("status") == "pending approval":
         why = ("its app.json changed (or is new)" if data.get("manifest_changed")
                else "this app's deploys need approval")
         # A required secret without a value parks the release too (APPS.md
         # "Secrets"): say which, and who sets it — never ask for the value.
-        waiting = (f" waiting: {data['waiting']} — a manager (the owner of a personal app) "
-                   "sets it from the app's menu → Settings or the card's Set button, then "
-                   "approves; never ask for the value in the chat." if data.get("waiting") else "")
+        waiting = (f" Waiting: {data['waiting']}. A manager sets it in the app's Settings, from "
+                   "the app's menu, or with the card's Set button. On a personal app the owner "
+                   "does. Then they approve the release. Never ask for the value in the chat."
+                   if data.get("waiting") else "")
         # A deploy never lowers the per-app switch; the person's approval of
         # the release that says so does. Read as a boolean, like the card.
         lowers = (" This release turns approval off for every later deploy; a person "
@@ -1132,9 +1187,11 @@ async def _handle_deploy_hook(op: str, arguments: dict) -> list[TextContent | Im
                 said.append(f"{s.get('name')} ({'required' if s.get('required') else 'optional'}, "
                             f"{use}): {'set' if s.get('set') else 'NOT SET'}")
             lines.append("Secrets: " + "; ".join(said) + ".")
+        if _folders_text(data):
+            lines.append(_folders_text(data))
         if data.get("waiting"):
-            lines.append(f"waiting: {data['waiting']} — ask a manager (the owner of a personal app) "
-                         "to set it in the app's settings; you never see or set a value.")
+            lines.append(f"Waiting: {data['waiting']}. Ask a manager, or the owner of a personal app, "
+                         "to set it in the app's Settings. You never see or set a value.")
         wakes = data.get("wakes") or []
         if wakes:
             lines.append("Last wakes (newest first):")
@@ -1160,8 +1217,9 @@ async def _handle_deploy_hook(op: str, arguments: dict) -> list[TextContent | Im
             f"'{slug}' server: {data.get('server')}"
             + (f" ({data.get('error')})" if data.get("error") else "")
             + (f"\n{refused} live socket(s) refused since the proxy started: the page is asking for "
-               "more than a viewer may hold. otodock.ws reconnects by itself — a page must not "
-               'reconnect it as well (APPS.md "Apps with a server").' if refused else "")
+               "more than a viewer may hold. otodock.ws reconnects by itself, so the page must "
+               "not reconnect it as well. The app-authoring skill's \"Apps with a server\" says "
+               "how." if refused else "")
             + "\n" + (data.get("log") or "(no log yet)")))]
     return [TextContent(type="text", text=(
         f"'{slug}' restarted: server {data.get('server')}"

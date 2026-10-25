@@ -25,12 +25,14 @@ import sys
 import threading
 from pathlib import Path
 
-from . import config as satconfig  # the module: ``_main`` binds ``config`` to the loaded SatelliteConfig
+# the module: ``_main`` binds ``config`` to the loaded SatelliteConfig
+from . import config as satconfig
 from .config import (
     SATELLITE_VERSION,
     SHARED_APP_SERVER_CLIENT_HASH,
     SHARED_CODEX_APPROVALS_HASH,
     SHARED_LAYOUT_HASH,
+    SHARED_LOOP_WATCHDOG_HASH,
     SHARED_MCP_INSTALLER_HASH,
     SHARED_STDIO_INTERCEPTOR_HASH,
     SHARED_TERMINAL_QUERIES_HASH,
@@ -47,6 +49,14 @@ from .config import (
 
 logger = logging.getLogger("satellite")
 
+# The event-loop watchdog's cadence and thresholds on a machine (the proxy's
+# defaults are 2 s / 0.25 s / 50 ms / 25 ms): a laptop on battery wakes 14
+# times a second for it instead of 60.
+_WATCHDOG_THRESHOLD_S = 2.0
+_WATCHDOG_REPORT_S = 0.5
+_WATCHDOG_TICK_S = 0.25
+_WATCHDOG_WATCH_S = 0.1
+
 
 def _verify_installer_drift() -> None:
     """Fail-fast if the vendored shared mcp_installer has drifted from the
@@ -61,6 +71,7 @@ def _verify_installer_drift() -> None:
         ("stdio_path_interceptor", SHARED_STDIO_INTERCEPTOR_HASH),
         ("terminal_queries", SHARED_TERMINAL_QUERIES_HASH),
         ("layout", SHARED_LAYOUT_HASH),
+        ("loop_watchdog", SHARED_LOOP_WATCHDOG_HASH),
     ):
         try:
             mod = __import__(f"satellite._vendored.{mod_name}", fromlist=[mod_name])
@@ -380,7 +391,7 @@ def _install_crash_diagnostics() -> None:
             "Crash diagnostics active (pid=%d, v%s); native faults → %s",
             os.getpid(), SATELLITE_VERSION, fault_path,
         )
-    except Exception:
+    except OSError:
         # Strictly additive observability — never let it break boot.
         log.debug("crash-diagnostics setup skipped", exc_info=True)
 
@@ -428,7 +439,7 @@ def _ensure_otodock_on_path() -> None:
             return  # a real file the user owns — leave it alone
         link.symlink_to(wrapper)
         log.info("otodock CLI linked onto PATH: %s → %s", link, wrapper)
-    except Exception:
+    except OSError:
         log.debug("otodock PATH symlink (best-effort) failed", exc_info=True)
 
 
@@ -463,7 +474,7 @@ def _ensure_otodock_on_path_windows() -> None:
             _remove_from_user_path_windows(str(stale_bindir), log)
 
         _add_to_user_path_windows(str(real_bindir), log)
-    except Exception:
+    except OSError:
         log.debug("otodock PATH shim (best-effort) failed", exc_info=True)
 
 
@@ -551,7 +562,7 @@ def _broadcast_env_change() -> None:
             HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment",
             SMTO_ABORTIFHUNG, 5000, ctypes.byref(result),
         )
-    except Exception:
+    except Exception:  # noqa: BLE001  # a ctypes call into user32 raises by the platform's own rules
         pass
 
 
@@ -559,9 +570,9 @@ async def _main(config_path: Path | None = None) -> None:
     # Heavy subpackage imports are deferred to here (NOT module top) so the boot
     # guard in main() can roll back a broken update before these would crash on a
     # missing/renamed module. See the module docstring.
-    from .transport.http_tunnel import LocalTunnelServer
-    from .terminal.local_socket import LocalControlServer
     from .sessions.session_manager import SessionManager
+    from .terminal.local_socket import LocalControlServer
+    from .transport.http_tunnel import LocalTunnelServer
     from .transport.ws_client import SatelliteWSClient
 
     _verify_installer_drift()
@@ -573,7 +584,7 @@ async def _main(config_path: Path | None = None) -> None:
     from .host import service_unit
     try:
         await asyncio.to_thread(service_unit.ensure_oom_policy)
-    except Exception:
+    except OSError:
         logger.warning("OOM policy check failed", exc_info=True)
 
     # CLIs installed via the reconcile's per-user npm-prefix fallback
@@ -626,12 +637,23 @@ async def _main(config_path: Path | None = None) -> None:
     except Exception:
         logger.exception("session-secrets sweep failed (non-fatal)")
 
+    # A session move's staging a day old is from a move that never ended (a
+    # daemon stopped between its push and its commit).
+    try:
+        from .sessions import session_move
+        swept = await asyncio.to_thread(session_move.sweep_all_staging, sm.config.agents_dir)
+        if swept:
+            logger.info("session move: %d day-old staging folder(s) swept", swept)
+    except Exception:  # noqa: BLE001  # a start-time sweep never stops the start
+        logger.warning("session move staging sweep failed (non-fatal)", exc_info=True)
+
     # Reconcile MCP runtimes that lag this host's interpreter/node (e.g. after a
     # Python 3.10→3.13 or Node 22→24 bump from a satellite update). Best-effort —
     # never blocks startup; the common case (nothing stale) returns immediately.
     try:
         from .sessions.mcp_install_support import (
-            reconcile_mcp_runtimes, _uv_bin_if_present,
+            _uv_bin_if_present,
+            reconcile_mcp_runtimes,
         )
         reconciled = await reconcile_mcp_runtimes(sm.config.mcps_dir, _uv_bin_if_present())
         if reconciled:
@@ -682,6 +704,16 @@ async def _main(config_path: Path | None = None) -> None:
     if satconfig.HOST.posix:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, _signal_handler)
+
+    # The event-loop watchdog (the proxy's module, vendored): a late tick logs
+    # the loop thread's stack, a freeze of the whole process its own line, so
+    # a starved daemon names its cause instead of the heartbeat's clock-jump
+    # guess. A laptop's cadence: a 250 ms tick, a 100 ms watch.
+    from ._vendored import loop_watchdog
+    loop_watchdog.start(
+        _WATCHDOG_THRESHOLD_S, _WATCHDOG_REPORT_S,
+        tick_s=_WATCHDOG_TICK_S, watch_s=_WATCHDOG_WATCH_S,
+    )
 
     # Windows system-tray icon (headless-safe: None off-Windows / no pystray).
     # asyncio keeps THIS main thread; the tray runs on its own daemon thread.
@@ -744,23 +776,23 @@ async def _main(config_path: Path | None = None) -> None:
             await consumer_task
 
     # Shutdown: close all sessions
-    logger.info(f"Closing {len(sm.sessions)} active session(s)...")
+    logger.info("Closing %s active session(s)...", len(sm.sessions))
     for sid, session in list(sm.sessions.items()):
         try:
             await session.close()
         except Exception:
-            logger.exception(f"Error closing session {sid}")
+            logger.exception("Error closing session %s", sid)
     sm.sessions.clear()
 
     # Also reap interactive PTY sessions (the -p `sessions` dict above
     # never held them) so their child processes don't survive a satellite stop.
     if getattr(sm, "pty_sessions", None):
-        logger.info(f"Closing {len(sm.pty_sessions)} interactive PTY session(s)...")
+        logger.info("Closing %s interactive PTY session(s)...", len(sm.pty_sessions))
         for sid, session in list(sm.pty_sessions.items()):
             try:
                 await session.close()
             except Exception:
-                logger.exception(f"Error closing PTY session {sid}")
+                logger.exception("Error closing PTY session %s", sid)
         sm.pty_sessions.clear()
 
     # Shut down the tunnel server before cancelling tasks so subprocesses
@@ -782,6 +814,10 @@ async def _main(config_path: Path | None = None) -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+    # The watchdog's thread is flagged before its tick task goes, so the
+    # shutdown never reads as a stall.
+    loop_watchdog.stop()
 
     logger.info("Satellite shutdown complete")
 

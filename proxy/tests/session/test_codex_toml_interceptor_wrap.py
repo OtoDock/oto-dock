@@ -9,10 +9,11 @@ import sys
 import pytest
 
 from tests._paths import REPO_ROOT as _REPO_ROOT
+
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from satellite.sessions.mcp_interceptor import (  # noqa: E402
+from satellite.sessions.mcp_interceptor import (
     wrap_interceptor_in_mcp_config_toml,
 )
 

@@ -9,13 +9,13 @@
     {
       "name": "STRIPE_SECRET_KEY",
       "required": true,
-      "description": "a restricted Stripe key that may create Checkout Sessions (Developers → API keys → restricted key, write on Checkout Sessions)",
+      "description": "A restricted Stripe key that can create Checkout Sessions. Stripe lists its keys under Developers.",
       "sends_to": {"host": "api.stripe.com", "header": "Authorization", "prefix": "Bearer "}
     },
     {
       "name": "STRIPE_WEBHOOK_SECRET",
       "required": true,
-      "description": "the signing secret of the Stripe webhook endpoint that points at this app's inbound address (Developers → Webhooks; send checkout.session.completed and checkout.session.expired)"
+      "description": "The signing secret of the Stripe webhook that points at this app. Stripe shows it on the Webhooks page."
     }
   ],
   "inbound": {

@@ -23,7 +23,7 @@ export default function AgentGuard() {
 
   // Grant-direction drift detected (live list has it, snapshot doesn't):
   // heal the snapshot ONCE per slug — `user.agent_roles` rides the same
-  // /auth/me payload and drives the manage UI (Configuration tab etc.), so
+  // /auth/me payload and drives the manage UI (the Configuration section etc.), so
   // without this a freshly granted manager gets a viewer-looking page until
   // a full reload. The latch never refires if /auth/me still lacks the slug
   // (grant revoked mid-flight — the existence gate bounces on a later poll).

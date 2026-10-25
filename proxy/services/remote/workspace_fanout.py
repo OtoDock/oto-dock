@@ -57,14 +57,16 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import cast
+
+import psycopg
 
 import config
-from core import layout
-from core import placement
+from core import layout, placement
+from core.background import spawn
 from services.infra import safe_fs
 from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
 from storage.pg import run_db
-from core.background import spawn
 
 logger = logging.getLogger("otodock.workspace-fanout")
 
@@ -84,14 +86,14 @@ def _interactive_remote_sessions(agent_slug: str) -> list[tuple[str, str, str, s
     — nothing to push, excluded like local headless sessions."""
     try:
         from core.session import interactive_session as _isess
-    except Exception:
+    except ImportError:
         return []
     out: list[tuple[str, str, str, str]] = []
     for sid, s in list(getattr(_isess, "_sessions", {}).items()):
         try:
             if s.agent_name == agent_slug and s.alive and not placement.is_local(s.target):
                 out.append((sid, s.target, s.username or "", s.role or ""))
-        except Exception:
+        except AttributeError:
             continue
     return out
 
@@ -137,7 +139,7 @@ def fanout_targets(
     try:
         from core.session.session_manager import _get_remote_layer
         layer = _get_remote_layer()
-    except Exception:
+    except ImportError:
         return []
     sessions = getattr(layer, "_sessions", None) or {}
 
@@ -188,7 +190,7 @@ def _active_machine_ids(agent_slug: str) -> set[str]:
     try:
         from core.session.session_manager import _get_remote_layer
         layer = _get_remote_layer()
-    except Exception:
+    except ImportError:
         return set()
     sessions = getattr(layer, "_sessions", None) or {}
     out: set[str] = set()
@@ -226,7 +228,7 @@ def has_fanout_candidates(
     try:
         from core.remote.satellite_connection import get_connection_manager
         cm = get_connection_manager()
-    except Exception:
+    except ImportError:
         return False
     active = _active_machine_ids(agent_slug)
     for mid in cm.get_connected_machines():
@@ -308,7 +310,7 @@ async def idle_connected_targets(
             if should_sync_to_target(rel_path, target_username, target_role):
                 out.append(mid)
         return out
-    except Exception:
+    except Exception:  # noqa: BLE001  # the idle fan-out is best effort, the active machines got the write
         logger.debug(
             "idle_connected_targets failed for %s/%s", agent_slug, rel_path,
             exc_info=True,
@@ -344,14 +346,14 @@ async def mark_fan_out_targets(
             remote_file_flow.note_platform_ahead(mid, agent_slug, rel_path, *stat,
                                                  in_flight_s=in_flight_s)
         return {mid: stat for mid in machines}
-    except Exception:
+    except Exception:  # noqa: BLE001  # marking fan-out targets spans db, disk and machines: the save stands
         logger.warning("marking the fan-out targets of %s/%s failed", agent_slug, rel_path,
                        exc_info=True)
         return None
 
 
 async def fan_out_write(
-    agent_slug: str, rel_path: str, source: "bytes | Path", *,
+    agent_slug: str, rel_path: str, source: bytes | Path, *,
     exclude_machine_id: str | None = None, include_idle: bool = False,
     transfer_kind: str = "sync", transfer_id: str | None = None,
     origin_user_sub: str = "", only_machine_id: str | None = None,
@@ -383,7 +385,7 @@ async def fan_out_write(
 
 
 async def _fan_out_write(
-    agent_slug: str, rel_path: str, source: "bytes | Path", *,
+    agent_slug: str, rel_path: str, source: bytes | Path, *,
     exclude_machine_id: str | None, include_idle: bool,
     transfer_kind: str, transfer_id: str | None,
     origin_user_sub: str, only_machine_id: str | None,
@@ -444,7 +446,7 @@ async def _fan_out_write(
             if not config.is_safe_agent_name(agent_slug):
                 raise PathOutsideRoot(agent_slug)
             rel = f"{agent_slug}/{normalize_rel_path(rel_path)}"
-            if safe_fs.rel_under(source, config.AGENTS_DIR) != rel:
+            if safe_fs.rel_under(cast("Path", source), config.AGENTS_DIR) != rel:
                 raise safe_fs.EscapeRefused(errno.EXDEV, "not the platform copy", str(source))
         except (OSError, PathOutsideRoot) as exc:
             logger.warning(
@@ -456,7 +458,7 @@ async def _fan_out_write(
     if not machines:
         size = 0
         if not from_path:
-            size = len(source)
+            size = len(cast("bytes", source))
         else:
             with contextlib.suppress(OSError):
                 size = (await asyncio.to_thread(
@@ -487,11 +489,11 @@ async def _fan_out_write(
             return []
         size, base_mtime = st.st_size, st.st_mtime
         platform_stat: tuple[int, int] | None = (st.st_size, st.st_mtime_ns)
-        content_hash = await asyncio.to_thread(_hash_fd, src_fd)
-        source = Path(safe_fs.fd_path(src_fd))
+        content_hash = await asyncio.to_thread(_hash_fd, cast("int", src_fd))
+        source = Path(safe_fs.fd_path(cast("int", src_fd)))
     else:
-        size = len(source)
-        content_hash = "sha256:" + hashlib.sha256(source).hexdigest()
+        size = len(cast("bytes", source))
+        content_hash = "sha256:" + hashlib.sha256(cast("bytes", source)).hexdigest()
         # The platform copy these bytes were written to (the callers write
         # it first, under the path lock they still hold).
         try:
@@ -522,7 +524,7 @@ def _hash_fd(fd: int) -> str:
 
 
 async def _fan_out_pushes(
-    agent_slug: str, rel_path: str, source: "bytes | Path", machines: list[str],
+    agent_slug: str, rel_path: str, source: bytes | Path, machines: list[str],
     size: int, content_hash: str, base_mtime: float, *,
     transfer_kind: str, transfer_id: str | None, origin_user_sub: str, max_chunk: int,
     platform_stat: tuple[int, int] | None = None,
@@ -543,6 +545,12 @@ async def _fan_out_pushes(
         )
 
     from core.remote import transfer_gate
+
+    # The targets whose push the machine refused as stale, with the stat
+    # their ack reported (the mark's baseline below, no probe), and the
+    # record each push took (a missed target's fallback baseline).
+    stale_by_machine: dict[str, dict] = {}
+    records: dict[str, dict | None] = {}
 
     async def _push_one(mid: str) -> bool:
         cb = None
@@ -566,6 +574,7 @@ async def _fan_out_pushes(
 
         # The machine's outbound gate (Feature F): only ≥threshold pushes contend;
         # a machine waiting on a slot shows 'queued' in the progress popup.
+        stale: dict = {}
         async with transfer_gate.slot(
             mid, agent_slug, rel_path, size, on_state=on_state,
         ):
@@ -573,10 +582,16 @@ async def _fan_out_pushes(
                 # The in-flight mark counts from the slot, not the queue.
                 remote_file_flow.note_platform_ahead(mid, agent_slug, rel_path, *platform_stat,
                                                      in_flight_s=in_flight_s)
+            # The push expects the copy last pulled, probed or pushed there
+            # (the record goes first; the ack re-records the committed copy).
+            records[mid] = remote_file_flow.take_push_record(mid, agent_slug, rel_path)
             ok = await cm.push_file(
                 mid, ref, source, agent_slug=agent_slug, progress_cb=cb,
                 content_hash=content_hash,
+                expect=remote_file_flow.push_expectation_of(records[mid]), stale_out=stale,
             )
+        if stale:
+            stale_by_machine[mid] = stale
         if tid:
             if ok:
                 await transfer_registry.progress(tid, mid, size, size)
@@ -584,7 +599,9 @@ async def _fan_out_pushes(
             else:
                 await transfer_registry.set_state(
                     tid, mid, "failed",
-                    error="push failed (machine offline?) — retries at next sync",
+                    error=("The file is being changed on the machine. It was left as it is."
+                           if stale
+                           else "push failed (machine offline?) — retries at next sync"),
                 )
         return ok
 
@@ -608,7 +625,7 @@ async def _fan_out_pushes(
     if tid:
         # A raised (not returned-False) push never hit _push_one's outcome
         # code — close its row defensively so the item can complete.
-        for mid, res in zip(machines, results):
+        for mid, res in zip(machines, results, strict=False):
             if isinstance(res, Exception):
                 await transfer_registry.set_state(
                     tid, mid, "failed", error=f"push error: {res}",
@@ -619,7 +636,7 @@ async def _fan_out_pushes(
     # taken from the source before the pushes (a Path source: from the very
     # descriptor the pushes read), so the base names the bytes each target got.
     acked = [
-        mid for mid, res in zip(machines, results)
+        mid for mid, res in zip(machines, results, strict=False)
         if not isinstance(res, Exception) and res is not False
     ]
     if acked:
@@ -638,12 +655,17 @@ async def _fan_out_pushes(
                         sync_state_store.record_one, mid, agent_slug, rel_path,
                         content_hash, base_mtime,
                     )
-                except Exception:
+                except psycopg.Error:
                     logger.debug("fan_out_write base-advance failed for %s", mid[:8])
-    for mid, res in zip(machines, results):
+    for mid, res in zip(machines, results, strict=False):
         if isinstance(res, Exception):
             logger.warning(
                 "fan_out_write %s -> %s failed: %s", rel_path, mid[:8], res,
+            )
+        elif res is False and mid in stale_by_machine:
+            logger.info(
+                "fan_out_write %s -> %s held: the file is being changed there",
+                rel_path, mid[:8],
             )
         elif res is False:
             logger.debug(
@@ -652,13 +674,22 @@ async def _fan_out_pushes(
     # Each target that missed the bytes holds an older copy than the
     # platform's: a read there must not pull it over them
     # (remote_file_flow's platform-ahead marker). An acked push clears it.
-    missed = [mid for mid, res in zip(machines, results) if isinstance(res, Exception) or res is False]
+    # A target changing the file told its stat in the stale ack: that is
+    # the mark's baseline, no probe.
+    missed = [mid for mid, res in zip(machines, results, strict=False) if isinstance(res, Exception) or res is False]
     for mid in acked:
         remote_file_flow.clear_platform_ahead(mid, agent_slug, rel_path, stat=platform_stat)
     if missed and platform_stat is not None:
+        for mid in missed:
+            if mid in stale_by_machine:
+                remote_file_flow.note_platform_ahead(
+                    mid, agent_slug, rel_path, *platform_stat,
+                    machine=remote_file_flow.stale_machine_stat(stale_by_machine[mid]),
+                    stale=True)
         await asyncio.gather(*(
-            remote_file_flow.note_push_failed(cm, mid, agent_slug, rel_path, *platform_stat)
-            for mid in missed
+            remote_file_flow.note_push_failed(cm, mid, agent_slug, rel_path, *platform_stat,
+                                              fallback=records.get(mid))
+            for mid in missed if mid not in stale_by_machine
         ), return_exceptions=True)
 
 
@@ -704,7 +735,7 @@ async def fan_out_delete(
             await asyncio.to_thread(
                 sync_state_store.clear_one, mid, agent_slug, rel_path,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # one machine's delete push must not stop the others
             logger.warning(
                 "fan_out_delete %s -> %s failed: %s", rel_path, mid[:8], e,
             )
@@ -762,7 +793,7 @@ def _schedule_save_fan_out(agent_slug: str, rel_path: str,
         return
     if marked is not None and not marked:
         return  # no machine runs a session that may see the path
-    entry = {"marked": dict(marked or {}), "machines": set(marked or ())}
+    entry: dict = {"marked": dict(marked or {}), "machines": set(marked or ())}
     from core.remote import upload_inflight
     task = upload_inflight.track(agent_slug, _save_fan_out(key, entry),
                                  machines=None if marked is None else entry["machines"])
@@ -865,12 +896,11 @@ async def propagate_write(
         # and ``writer`` (the editing user's slug, if known) becomes its author for
         # cross-user conflict attribution. Best-effort.
         try:
-            from storage.files import file_tombstones_store
-            from storage.files import file_author_store
+            from storage.files import file_author_store, file_tombstones_store
             await asyncio.to_thread(file_tombstones_store.drop, agent_slug, rel_path)
             if writer:
                 await asyncio.to_thread(file_author_store.record, agent_slug, rel_path, writer)
-        except Exception:
+        except Exception:  # noqa: BLE001  # a landed save's bookkeeping must not fail the save
             logger.warning("the bookkeeping of a save of %s/%s failed", agent_slug, rel_path,
                            exc_info=True)
         marked = await mark_fan_out_targets(agent_slug, rel_path,

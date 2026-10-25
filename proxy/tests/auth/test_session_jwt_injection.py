@@ -313,6 +313,7 @@ class TestDirectA2:
         drop them, 401ing vendor MCPs and breaking file-tools). The session-JWT
         sentinel is swapped for a real JWT before forwarding."""
         import asyncio
+
         from core.layers.direct.mcp import MCPServerConnection
 
         conn = MCPServerConnection(
@@ -358,6 +359,7 @@ class TestDirectA2:
 
     def _start_with(self, auth: str, session_id: str) -> dict:
         import asyncio
+
         from core.layers.direct.mcp import MCPServerConnection
 
         conn = MCPServerConnection(

@@ -15,8 +15,8 @@ fitz = pytest.importorskip("fitz")
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import pdf as pdf_mod  # noqa: E402
-import shared  # noqa: E402
+import pdf as pdf_mod
+import shared
 
 
 async def _async_ident(p, writing=False, **kw):
@@ -226,7 +226,7 @@ def test_ocr_raster_dpi_caps_at_source(tmp_path):
 def _tessdata_available() -> bool:
     try:
         return bool(fitz.get_tessdata())
-    except Exception:
+    except Exception:  # noqa: BLE001  # PyMuPDF raises its own error when no tessdata is installed
         return False
 
 

@@ -38,7 +38,7 @@ import websockets
 from audio.capabilities import STTCapabilities
 from audio.providers.credential_resolver import CredentialResolver
 from audio.providers.model_succession import DEFAULT_MODELS
-from audio.providers.stt.base import LanguageGuess, STTProvider, TranscriptResult, Word
+from audio.providers.stt.base import STTProvider, TranscriptResult, Word
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,31 @@ _GATE_HANGOVER_S = 0.6
 # it didn't inspect.
 _MIN_VOICED_ARM_S = 0.12
 
+# Scribe commits on its own after about 36 s of voice with no pause its VAD
+# takes, and the segment after that commit transcribes again audio the last
+# one already held (fast Greek: 114 words written twice, 3 runs of 3). Our
+# own commit at the first dip between words past this much voice (quiet
+# under the gate for ``_COMMIT_QUIET_S``: fast speech has no pause the gate's
+# hangover outlasts) keeps every segment shorter.
+_COMMIT_AFTER_VOICED_S = 20.0
+_COMMIT_QUIET_S = 0.08
+
+
+# Scribe's batch endpoint answers ISO 639-3 codes; the platform speaks base
+# codes everywhere else (the six shipped languages, and the bibliographic
+# variants of the same ones).
+_ISO_639_3 = {
+    "eng": "en", "ell": "el", "gre": "el", "deu": "de", "ger": "de",
+    "spa": "es", "fra": "fr", "fre": "fr", "ita": "it",
+}
+
+
+def _base_lang(code: str | None) -> str:
+    """A language code as the platform's base code (``ell`` → ``el``,
+    ``en-US`` → ``en``); an unknown three-letter code is kept as given."""
+    base = (code or "").strip().lower().split("-", 1)[0]
+    return _ISO_639_3.get(base, base)
+
 
 def _to_elevenlabs_lang(tag: str | None) -> str | None:
     """BCP-47 → ISO 639-1 (``el-GR`` → ``el``); ``multi``/``auto``/empty →
@@ -108,6 +133,10 @@ class ElevenLabsSTT(STTProvider):
         supports_endpointing=True,
         supports_word_timestamps=True,
         is_local=False,
+        # The realtime frames carry no word confidence on the scale the
+        # language rule compares: automatic detection runs on the acoustic
+        # rule alone with this provider.
+        reports_confidence=False,
     )
 
     def __init__(
@@ -131,6 +160,7 @@ class ElevenLabsSTT(STTProvider):
         self._gate_hangover_left = 0.0
         self._voiced_since_commit = False
         self._voiced_time_since_commit = 0.0
+        self._quiet_run_s = 0.0
         self._ws: websockets.ClientConnection | None = None
         self._reader_task: asyncio.Task | None = None
         self._transcript_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -144,11 +174,12 @@ class ElevenLabsSTT(STTProvider):
         self._interim_results = False
         self._endpointing_override: int | None = None
         self._send_skips = 0  # closed-connection sends since last open (one WARNING per incident)
+        self._started = False
 
     # ── Factory / metadata ─────────────────────────────────────────
 
     @classmethod
-    def from_row(cls, row: dict, resolver: CredentialResolver) -> "ElevenLabsSTT":
+    def from_row(cls, row: dict, resolver: CredentialResolver) -> ElevenLabsSTT:
         advanced = row.get("advanced") or {}
         return cls(
             api_key=resolver(row.get("credential_key", "")),
@@ -248,38 +279,12 @@ class ElevenLabsSTT(STTProvider):
             probability = 0.0
         return TranscriptResult(
             text=text,
-            language=doc.get("language_code") or (lang or "en"),
+            language=_base_lang(doc.get("language_code")) or (lang or "en"),
             audio_seconds=duration,
             words=words,
             provider_used="elevenlabs",
             language_confidence=probability if not lang else 0.0,
         )
-
-    async def identify_language(self, audio_wav: bytes) -> LanguageGuess | None:
-        """One utterance through the batch endpoint with no language: Scribe
-        names the language and its probability."""
-        result = await self.transcribe_file(audio_wav, language=None)
-        lang = (result.language or "").split("-", 1)[0].lower()
-        if not lang:
-            return None
-        return LanguageGuess(language=lang, confidence=result.language_confidence, text=result.text)
-
-    async def restart(self, language: str) -> bool:
-        """Reopen the stream in ``language`` with the stored rate, interims
-        and endpointing (the language lock mid-call)."""
-        with contextlib.suppress(Exception):
-            await self.close()
-        try:
-            await self.start(
-                language=language, sample_rate=self._active_rate,
-                interim_results=self._interim_results,
-                endpointing_ms=self._endpointing_override,
-            )
-        except Exception as e:
-            logger.warning(f"ElevenLabs STT restart in {language} failed: {e}")
-            return False
-        logger.info(f"ElevenLabs STT restarted in {language}")
-        return True
 
     # ── Streaming surface ──────────────────────────────────────────
 
@@ -314,6 +319,7 @@ class ElevenLabsSTT(STTProvider):
         self._gate_hangover_left = 0.0
         self._voiced_since_commit = False
         self._voiced_time_since_commit = 0.0
+        self._quiet_run_s = 0.0
         self._fatal_error = None
         self._transcript_queue = asyncio.Queue()
         self._transcript_ready.clear()
@@ -331,6 +337,7 @@ class ElevenLabsSTT(STTProvider):
             max_size=2 ** 23,
         )
         self._is_open = True
+        self._started = True
         self._send_skips = 0
         self._reader_task = asyncio.get_running_loop().create_task(self._read_loop(self._ws))
         logger.info("ElevenLabs STT connection opened")
@@ -357,6 +364,12 @@ class ElevenLabsSTT(STTProvider):
                     voiced = self._voiced_since_commit
                     self._voiced_since_commit = False  # commit consumed the buffer
                     self._voiced_time_since_commit = 0.0
+                    # A commit is the whole segment since the last one (never
+                    # a time slice of the partial), so the only way painted
+                    # words die is an EMPTY commit after them: dictation keeps
+                    # what the composer showed (partials surface only over
+                    # voiced audio).
+                    painted = self._shown_partial() if self.dictation_mode and not text else ""
                     if text and not voiced:
                         # The dropped text is still a transcript (Rule #1) —
                         # only the DEBUG-gated policy path may carry it.
@@ -371,25 +384,37 @@ class ElevenLabsSTT(STTProvider):
                         self._transcript_queue.put_nowait(text)
                         self._transcript_ready.set()
                         self._emit_partial_final(text)
+                    elif painted:
+                        logger.info("ElevenLabs STT empty commit — the shown partial committed (%d words)",
+                                    len(painted.split()))
+                        self._log_transcript("Scribe empty commit, shown partial committed", painted)
+                        self._latest_interim = ""
+                        self._last_interim_sent = ""
+                        self._transcript_queue.put_nowait(painted)
+                        self._transcript_ready.set()
                 elif mtype == "session_started":
                     logger.debug("Scribe session started")
                 elif mtype:
                     # Error frames (auth_error, quota_exceeded, rate_limited, …)
                     if "error" in mtype or msg.get("error"):
                         detail = str(msg.get("error") or msg)[:200]
-                        logger.error(f"ElevenLabs STT {mtype}: {detail}")
+                        logger.error("ElevenLabs STT %s: %s", mtype, detail)
                         self._fatal_error = (
                             f"ElevenLabs speech-to-text {mtype.replace('_', ' ')}: {detail}"
                         )
         except websockets.ConnectionClosed:
             pass
-        except Exception as e:
-            logger.error(f"ElevenLabs STT reader error: {e}")
+        except Exception as e:  # noqa: BLE001  # the reader task's last line: the stream ends, the call does not
+            logger.error("ElevenLabs STT reader error: %s", e)
         finally:
             if ws is self._ws:
                 self._is_open = False
 
     async def _send_chunk(self, audio_bytes: bytes, *, commit: bool) -> None:
+        # The audio clock counts here, not in ``send_audio``: the keepalive's
+        # zeros and the commit's silence frame bypass it and are audio too.
+        if self._started:
+            self._count_offered(len(audio_bytes), self._active_rate)
         if not self._ws or not self._is_open:
             if self._ws:
                 # One WARNING per death incident, not one per 20 ms frame (a
@@ -408,8 +433,8 @@ class ElevenLabsSTT(STTProvider):
         }
         try:
             await self._ws.send(json.dumps(frame))
-        except Exception as e:
-            logger.error(f"ElevenLabs STT send error: {e}")
+        except Exception as e:  # noqa: BLE001  # a frame lost to a closing stream must not end the call
+            logger.error("ElevenLabs STT send error: %s", e)
 
     def _gate_silence(self, chunk: bytes) -> bytes:
         """Zero sub-threshold frames (see ``_SILENCE_GATE_RMS``). Keeps every
@@ -435,18 +460,27 @@ class ElevenLabsSTT(STTProvider):
         duration_s = len(samples) / float(self._active_rate)
         rms = math.sqrt(sum(x * x for x in samples) / len(samples))
         if rms >= self._silence_gate_rms:
+            self._quiet_run_s = 0.0
             self._gate_hangover_left = _GATE_HANGOVER_S
             self._voiced_time_since_commit += duration_s
             if self._voiced_time_since_commit >= _MIN_VOICED_ARM_S:
                 self._voiced_since_commit = True
             return chunk
+        self._quiet_run_s += duration_s
         if self._gate_hangover_left > 0:
             self._gate_hangover_left -= duration_s
             return chunk
         return b"\x00" * len(chunk)
 
     async def send_audio(self, audio_bytes: bytes) -> None:
-        await self._send_chunk(self._gate_silence(audio_bytes), commit=False)
+        chunk = self._gate_silence(audio_bytes)
+        commit = (self._voiced_time_since_commit >= _COMMIT_AFTER_VOICED_S
+                  and self._quiet_run_s >= _COMMIT_QUIET_S)
+        if commit:
+            logger.info("ElevenLabs STT: committed at a pause after %.0f s of voice",
+                        self._voiced_time_since_commit)
+            self._voiced_time_since_commit = 0.0
+        await self._send_chunk(chunk, commit=commit)
 
     async def force_endpoint(self) -> None:
         """Commit whatever Scribe has buffered — one 20 ms silence frame with
@@ -473,6 +507,12 @@ class ElevenLabsSTT(STTProvider):
         if transcript:
             self._log_transcript("STT drain", transcript)
         return transcript
+
+    def _shown_partial(self) -> str:
+        """The richer of the newest partial and the last one sent: what the
+        composer shows, or is about to."""
+        latest, sent = self._latest_interim, self._last_interim_sent
+        return sent if len(sent.split()) > len(latest.split()) else latest
 
     def pop_interim(self) -> str | None:
         """Latest live partial if it changed since the last call (the chat WS
@@ -517,7 +557,7 @@ class ElevenLabsSTT(STTProvider):
         # to the barge-in pause monitor (audit A5, 2026-08-24).
         self._latest_interim = ""
         if discarded:
-            logger.info(f"STT queue cleared ({discarded} items discarded)")
+            logger.info("STT queue cleared (%s items discarded)", discarded)
 
     async def finish(self) -> str | None:
         """Commit pending audio, give the final a moment to arrive, close.
@@ -531,10 +571,18 @@ class ElevenLabsSTT(STTProvider):
                 await asyncio.wait_for(self._transcript_ready.wait(), timeout=1.5)
             except asyncio.TimeoutError:
                 pass
-            except Exception as e:
-                logger.error(f"ElevenLabs STT finish error: {e}")
+            except Exception as e:  # noqa: BLE001  # the stream's finish on a path that is already ending
+                logger.error("ElevenLabs STT finish error: %s", e)
         await self.close()
-        return self.drain_transcript()
+        text = self.drain_transcript()
+        if self.dictation_mode:
+            # A partial the composer showed and no commit consumed (the commit
+            # missed the bound): the stream is over, it commits whole.
+            leftover = self._shown_partial()
+            if leftover:
+                self._latest_interim = self._last_interim_sent = ""
+                text = f"{text} {leftover}" if text else leftover
+        return text
 
     async def close(self) -> None:
         self._is_open = False
@@ -581,12 +629,12 @@ class ElevenLabsSTT(STTProvider):
                 endpointing_ms=self._endpointing_override,
             )
             logger.info(
-                "ElevenLabs STT reconnected mid-call"
-                + (f" ({skipped} frames dropped while dead)" if skipped else "")
+                "ElevenLabs STT reconnected mid-call%s",
+                f" ({skipped} frames dropped while dead)" if skipped else "",
             )
             return True
-        except Exception as e:
-            logger.warning(f"ElevenLabs STT reconnect failed: {e}")
+        except Exception as e:  # noqa: BLE001  # an STT provider raises whatever its SDK and socket do
+            logger.warning("ElevenLabs STT reconnect failed: %s", e)
             return False
 
     @property

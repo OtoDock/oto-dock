@@ -34,9 +34,9 @@ from auth.request_path import has_traversal
 _ALLOWLIST: list[tuple[re.Pattern, frozenset[str]]] = [
     (re.compile(r"^/v1/internal/fire-task$"), frozenset({"POST"})),
     (re.compile(r"^/v1/internal/fire-notification$"), frozenset({"POST"})),
-    (re.compile(r"^/v1/sessions/warmup$"), frozenset({"POST"})),
     (re.compile(r"^/v1/sessions/[^/]+$"), frozenset({"DELETE"})),  # close session
     (re.compile(r"^/v1/phone/usage/turn-classifier$"), frozenset({"POST"})),
+    (re.compile(r"^/v1/phone/usage/relisten$"), frozenset({"POST"})),  # a call's second-listen seconds
     (re.compile(r"^/v1/phone/calls/report$"), frozenset({"POST"})),  # call-log rows at teardown
     (re.compile(r"^/v1/phone/calls/transfer-outcome$"), frozenset({"POST"})),  # a transfer's Dial ended without the colleague
     (re.compile(r"^/v1/phone/pin-failures$"), frozenset({"GET"})),  # the PIN lockout after a restart

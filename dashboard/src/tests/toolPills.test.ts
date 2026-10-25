@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { eventToBlock, pairBgCommandBlocks } from '../lib/messageBlocks'
-import { getToolDetail } from '../components/chat/ToolActivity'
+import { getToolDetail } from '../lib/tools/detail'
 import type { MessageBlock } from '../components/chat/types'
 
 describe('getToolDetail — collapsed pill title', () => {

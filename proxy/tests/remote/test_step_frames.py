@@ -16,7 +16,10 @@ from unittest.mock import patch
 
 import pytest
 
-from core.remote.satellite_connection import SatelliteConnection, SatelliteConnectionManager
+from core.remote.satellite_connection import (
+    SatelliteConnection,
+    SatelliteConnectionManager,
+)
 from core.remote.satellite_http_tunnel import _is_allowed_path
 from services.apps import app_steps
 from tests._paths import REPO_ROOT

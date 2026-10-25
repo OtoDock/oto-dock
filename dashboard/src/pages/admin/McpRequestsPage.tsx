@@ -24,18 +24,22 @@ import {
 } from '../../api/community'
 import { useMcpInstances } from '../../api/mcps'
 import { MCP_REQUEST_STATUS } from '../../lib/status/mcpRequest'
+import Dialog from '../../components/ui/Dialog'
+import Button from '../../components/ui/Button'
+import { Select } from '../../components/ui/Field'
+import { BADGE_BASE, BADGE_TONE, CARD, CARD_BORDERED, DIALOG_PANEL, FIELD, FIELD_BORDER, FIELD_REGULAR } from '../../components/ui/classes'
+import { PAGE_TITLE } from '../../components/ui/classes'
 
-const NEEDS_INSTANCE_TONE =
-  'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400'
+const NEEDS_INSTANCE_TONE = BADGE_TONE.warning
 
 const STATUS_TONE: Record<RequestStatus, string> = {
-  pending:        'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400',
-  approved:       'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400',
-  installing:     'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400',
-  installed:      'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400',
-  install_failed: 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400',
-  rejected:       'bg-gray-200 dark:bg-gray-800 text-p-text-light',
-  cancelled:      'bg-gray-200 dark:bg-gray-800 text-p-text-light',
+  pending:        BADGE_TONE.warning,
+  approved:       BADGE_TONE.info,
+  installing:     BADGE_TONE.info,
+  installed:      BADGE_TONE.success,
+  install_failed: BADGE_TONE.danger,
+  rejected:       BADGE_TONE.neutral,
+  cancelled:      BADGE_TONE.neutral,
 }
 
 const STATUS_LABEL: Record<RequestStatus, string> = {
@@ -104,7 +108,7 @@ export default function McpRequestsPage() {
     setError(null)
     const opts = {
       onSuccess: () => setResolving(null),
-      onError: (e: Error) => setError(e?.message || 'Action failed'),
+      onError: (e: Error) => setError(e?.message || 'The request was not updated. Try again.'),
     }
     if (resolving.action === 'approve') {
       approve.mutate({ id: resolving.req.id, admin_note: note, instance_id: instanceId }, opts)
@@ -123,40 +127,40 @@ export default function McpRequestsPage() {
     }
     setError(null)
     approve.mutate({ id: req.id, admin_note: '' }, {
-      onError: e => setError((e as Error)?.message || 'Retry failed'),
+      onError: e => setError((e as Error)?.message || 'The install was not retried. Try again.'),
     })
   }
 
   return (
     <div>
       <div className="flex flex-wrap items-center gap-2 sm:gap-3 mb-4">
-        <h1 className="text-lg font-bold text-p-text">MCP Requests</h1>
+        <h1 className={PAGE_TITLE}>MCP Requests</h1>
         {data?.pending_count ? (
-          <span className="text-xs px-2 py-0.5 rounded-lg bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 font-medium">
+          <span className={`${BADGE_BASE} ${BADGE_TONE.warning}`}>
             {data.pending_count} pending
           </span>
         ) : null}
         <div className="flex-1 min-w-0" />
-        <label className="text-xs text-p-text-secondary flex items-center gap-1.5">
+        <label className="text-xs text-secondary flex items-center gap-1.5">
           <input
             type="checkbox"
             checked={openOnly}
             onChange={e => setOpenOnly(e.target.checked)}
-            className="w-3.5 h-3.5 rounded-sm border-gray-300 text-brand focus:ring-brand accent-brand"
+            className="w-3.5 h-3.5 accent-action"
           />
           Open only
         </label>
       </div>
 
       {error && (
-        <div className="mb-3 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 p-3 text-sm text-red-700 dark:text-red-400">
+        <div className="mb-3 rounded-card border border-status-danger-border bg-status-danger-bg p-3 text-sm text-status-danger-fg">
           {error}
         </div>
       )}
 
-      {isLoading && <div className="text-sm text-p-text-light">Loading requests...</div>}
+      {isLoading && <div className="text-sm text-tertiary">Loading requests...</div>}
       {!isLoading && requests.length === 0 && (
-        <div className="text-sm text-p-text-light">No requests.</div>
+        <div className="text-sm text-tertiary">No requests.</div>
       )}
 
       <div className="space-y-2">
@@ -222,40 +226,43 @@ function BatchCard({
   const requester = rows[0]
   const agent = rows[0].agent_slug
   return (
-    <div className="rounded-lg border border-brand/30 bg-brand/5 dark:bg-brand/10 overflow-hidden">
+    <div className={`${CARD} overflow-hidden`}>
       <button
+        type="button"
+        aria-expanded={!collapsed}
         onClick={() => setCollapsed(c => !c)}
-        className="w-full flex items-center justify-between px-3 py-2 text-left hover:bg-brand/10"
+        className="w-full flex items-center justify-between px-3 py-2 text-left hover:bg-surface-hover"
       >
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-[10px] uppercase font-semibold text-brand">Batch</span>
-          <span className="text-sm font-medium text-p-text">
+          <span className="text-3xs uppercase font-semibold text-tertiary">Batch</span>
+          <span className="text-sm font-medium text-primary">
             Community-agent install for{' '}
-            <span className="text-brand">{agent}</span>
+            <span className="text-primary">{agent}</span>
           </span>
-          <span className="text-xs text-p-text-secondary">
-            ({installed}/{total} done
+          <span className="text-xs text-secondary">
+            {installed}/{total} done
             {failed > 0 ? `, ${failed} failed` : ''}
             {needsInst > 0 ? `, ${needsInst} need instance` : ''}
-            {open > 0 ? `, ${open} pending` : ''})
+            {open > 0 ? `, ${open} pending` : ''}
           </span>
-          <span className="text-[11px] text-p-text-light">
+          <span className="text-2xs text-tertiary">
             · by {requester.requested_by_name || requester.requested_by_email || requester.requested_by}
           </span>
         </div>
         <svg
-          className={`w-4 h-4 text-p-text-light transition-transform ${collapsed ? '' : 'rotate-180'}`}
+          className={`w-4 h-4 text-tertiary transition-transform ${collapsed ? '' : 'rotate-180'}`}
           fill="none" stroke="currentColor" viewBox="0 0 24 24"
         >
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
         </svg>
       </button>
       {!collapsed && (
-        <div className="border-t border-brand/20 p-2 space-y-2 bg-white/40 dark:bg-p-surface/40">
+        <div className="border-t border-subtle p-2 space-y-2">
           {rows.map(r => (
             <Row
               key={r.id}
               req={r}
+              inGroup
               onApprove={() => onApprove(r)}
               onReject={() => onReject(r)}
               onRetry={() => onRetry(r)}
@@ -273,9 +280,10 @@ function BatchCard({
 // ---------------------------------------------------------------------------
 
 function Row({
-  req, onApprove, onReject, onRetry, pending,
+  req, onApprove, onReject, onRetry, pending, inGroup = false,
 }: {
   req: McpRequest
+  inGroup?: boolean
   onApprove: () => void
   onReject: () => void
   onRetry: () => void
@@ -290,38 +298,34 @@ function Row({
   // feature have no `kind` and default to 'mcp'.
   const kind = req.kind ?? 'mcp'
   return (
-    <div className="rounded-lg border border-p-border-light bg-white dark:bg-p-surface p-3">
+    <div className={`${inGroup ? CARD_BORDERED : CARD} p-3`}>
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5 flex-wrap">
             <span
-              className={`text-[10px] px-1.5 py-0.5 rounded-sm font-medium ${
-                kind === 'skill'
-                  ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400'
-                  : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400'
-              }`}
+              className={`${BADGE_BASE} ${BADGE_TONE.info}`}
               title={kind === 'skill' ? 'Community skill package request' : 'Community MCP request'}
             >
               {kind === 'skill' ? 'Skill' : 'MCP'}
             </span>
-            <span className="text-sm font-medium text-p-text">{req.mcp_name}</span>
-            <span className="text-xs text-p-text-light">for</span>
-            <span className="text-sm font-medium text-brand">{req.agent_slug}</span>
-            <span className={`text-[10px] px-1.5 py-0.5 rounded-sm ${needsInstance ? NEEDS_INSTANCE_TONE : STATUS_TONE[req.status]}`}>
+            <span className="text-sm font-medium text-primary">{req.mcp_name}</span>
+            <span className="text-xs text-tertiary">for</span>
+            <span className="text-sm font-medium text-primary">{req.agent_slug}</span>
+            <span className={`${BADGE_BASE} ${needsInstance ? NEEDS_INSTANCE_TONE : STATUS_TONE[req.status]}`}>
               {needsInstance ? 'Needs instance' : STATUS_LABEL[req.status]}
             </span>
             {isPending && !!req.needs_instance && (
               <span
-                className={`text-[10px] px-1.5 py-0.5 rounded-sm ${NEEDS_INSTANCE_TONE}`}
-                title="Explicit-mode MCP with no instance covering this agent — approval will ask you to pick or create one."
+                className={`${BADGE_BASE} ${NEEDS_INSTANCE_TONE}`}
+                title="This MCP has no instance for this agent yet. Approving asks you to pick or create one."
               >
-                needs instance
+                Needs instance
               </span>
             )}
           </div>
-          <p className="text-[11px] text-p-text-light mt-1">
+          <p className="text-2xs text-tertiary mt-1">
             Requested by{' '}
-            <span className="text-p-text-secondary" title={req.requested_by_email || req.requested_by}>
+            <span className="text-secondary" title={req.requested_by_email || req.requested_by}>
               {req.requested_by_name || req.requested_by_email || req.requested_by}
             </span>
             {' · '}{new Date(req.created_at).toLocaleString()}
@@ -332,7 +336,7 @@ function Row({
                 {req.resolved_by_name && (
                   <>
                     {' by '}
-                    <span className="text-p-text-secondary" title={req.resolved_by_email || req.resolved_by || ''}>
+                    <span className="text-secondary" title={req.resolved_by_email || req.resolved_by || ''}>
                       {req.resolved_by_name}
                     </span>
                   </>
@@ -341,24 +345,24 @@ function Row({
             )}
           </p>
           {req.reason && (
-            <p className="text-xs text-p-text-secondary mt-1.5">
-              <span className="text-p-text-light">Reason:</span> {req.reason}
+            <p className="text-xs text-secondary mt-1.5">
+              <span className="text-tertiary">Reason:</span> {req.reason}
             </p>
           )}
           {req.admin_note && (
-            <p className="text-xs text-p-text-secondary mt-1.5">
-              <span className="text-p-text-light">Admin note:</span> {req.admin_note}
+            <p className="text-xs text-secondary mt-1.5">
+              <span className="text-tertiary">Admin note:</span> {req.admin_note}
             </p>
           )}
           {(isFailed || req.status === MCP_REQUEST_STATUS.INSTALLED) && req.install_log && (
             <details className="mt-1.5">
-              <summary className="text-[11px] text-p-text-light cursor-pointer">Install log</summary>
-              <pre className={`mt-1 text-[10px] rounded-sm p-2 overflow-x-auto max-h-40 whitespace-pre-wrap ${
+              <summary className="text-2xs text-tertiary cursor-pointer">Install log</summary>
+              <pre className={`mt-1 text-3xs rounded-control p-2 overflow-x-auto max-h-40 whitespace-pre-wrap ${
                 needsInstance
-                  ? 'text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20'
+                  ? 'text-status-warning-fg bg-status-warning-bg'
                   : isFailed
-                    ? 'text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-900/20'
-                    : 'text-p-text-secondary bg-p-surface-hover'
+                    ? 'text-status-danger-fg bg-status-danger-bg'
+                    : 'text-secondary bg-surface-muted'
               }`}>{req.install_log}</pre>
             </details>
           )}
@@ -367,30 +371,18 @@ function Row({
         <div className="flex items-center gap-1.5 shrink-0">
           {isPending && (
             <>
-              <button
-                onClick={onApprove}
-                disabled={pending}
-                className="text-xs px-2 py-1 rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
-              >
+              <Button variant="primary" size="xs" onClick={onApprove} disabled={pending}>
                 Approve
-              </button>
-              <button
-                onClick={onReject}
-                disabled={pending}
-                className="text-xs px-2 py-1 rounded-sm border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-40 transition-colors"
-              >
+              </Button>
+              <Button size="xs" onClick={onReject} disabled={pending}>
                 Reject
-              </button>
+              </Button>
             </>
           )}
           {isFailed && (
-            <button
-              onClick={onRetry}
-              disabled={pending}
-              className="text-xs px-2 py-1 rounded-sm border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 disabled:opacity-40 transition-colors"
-            >
+            <Button variant="secondary" size="xs" onClick={onRetry} disabled={pending}>
               {needsInstance ? 'Assign instance…' : 'Retry install'}
-            </button>
+            </Button>
           )}
         </div>
       </div>
@@ -425,23 +417,21 @@ function ResolveModal({
   const instances = instData?.instances ?? []
   const title = action === 'approve' ? 'Approve request' : 'Reject request'
   const submitLabel = action === 'approve' ? 'Approve' : 'Reject'
-  const submitColor = action === 'approve'
-    ? 'bg-brand text-white hover:bg-brand-hover'
-    : 'bg-red-600 text-white hover:bg-red-700'
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
-      <div
-        className="bg-white dark:bg-gray-800 rounded-xl shadow-xl border border-p-border-light w-full max-w-md mx-4"
-        onClick={e => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-p-border-light">
-          <h3 className="text-base font-semibold text-p-text">{title}</h3>
-          <button onClick={onClose} className="text-p-text-light hover:text-p-text text-lg leading-none">&times;</button>
+    <Dialog
+      onClose={onClose}
+      busy={submitting}
+      aria-label={title}
+      panelClassName={`${DIALOG_PANEL} max-w-md`}
+    >
+        <div className="flex items-center justify-between px-5 py-4 border-b border-subtle">
+          <h3 className="text-base font-semibold text-primary">{title}</h3>
+          <button onClick={onClose} className="text-tertiary hover:text-primary text-lg leading-none">&times;</button>
         </div>
         <div className="p-5 space-y-3">
           <label className="block">
-            <span className="text-xs text-p-text-secondary">
+            <span className="text-xs text-secondary">
               {action === 'approve'
                 ? 'Optional note shown to the requester.'
                 : 'Optional reason shown to the requester.'}
@@ -450,60 +440,52 @@ function ResolveModal({
               value={note}
               onChange={e => onChangeNote(e.target.value)}
               rows={3}
-              className="mt-1 w-full text-sm px-3 py-2 rounded-lg border border-p-border-light bg-white dark:bg-gray-900 text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/50"
-              placeholder={action === 'approve' ? 'e.g. Enabled — Google Maps API key is set under Integrations.' : 'e.g. Use the existing email-server instead — same functionality.'}
+              className={`${FIELD} ${FIELD_REGULAR} ${FIELD_BORDER} mt-1`}
+              placeholder={action === 'approve' ? 'e.g. Enabled. The Google Maps API key is set under Integrations.' : 'e.g. Use the existing email-server instead. It does the same.'}
             />
           </label>
           {wantsInstanceUi && instances.length > 0 && (
             <label className="block">
-              <span className="text-xs text-p-text-secondary">
+              <span className="text-xs text-secondary">
                 Instance to authorize <span className="font-medium">{req.agent_slug}</span> on
               </span>
-              <select
+              <Select
                 value={instanceId === null ? '' : String(instanceId)}
                 onChange={e => onChangeInstanceId(e.target.value === '' ? null : Number(e.target.value))}
-                className="mt-1 w-full text-sm px-3 py-2 rounded-lg border border-p-border-light bg-white dark:bg-gray-900 text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/50"
+                className="mt-1"
               >
-                <option value="">Automatic (catch-all or first instance)</option>
+                <option value="">Automatic: the catch-all or the first instance</option>
                 {instances.map(i => (
                   <option key={i.id} value={String(i.id)}>
                     {i.instance_name}{i.assigned_to_all ? ' · all agents' : ''}
                   </option>
                 ))}
-              </select>
+              </Select>
             </label>
           )}
           {wantsInstanceUi && instances.length === 0 && (
-            <p className={`text-[11px] rounded-lg p-2 ${NEEDS_INSTANCE_TONE}`}>
+            <p className={`text-2xs rounded-card p-2 ${NEEDS_INSTANCE_TONE}`}>
               <span className="font-medium">{req.mcp_name}</span> has no instances yet.
-              You can approve now — the request is held as “Needs instance” — then create one under{' '}
-              <Link to="/admin/mcp-servers" className="underline">MCP Servers</Link>{' '}
-              → {req.mcp_name} → Instances; the request completes automatically once an instance covers the agent.
+              You can approve now. The request then waits as “Needs instance”.
+              Create an instance in Admin,{' '}
+              <Link to="/admin/mcp-servers" className="underline">MCP Servers</Link>,{' '}
+              {req.mcp_name}, Instances. The request completes once an instance covers the agent.
             </p>
           )}
           {action === 'approve' && !wantsInstanceUi && (
-            <p className="text-[11px] text-p-text-light">
+            <p className="text-2xs text-tertiary">
               Approval will install the MCP if needed and enable it for the requesting agent.
             </p>
           )}
         </div>
-        <div className="flex justify-end gap-2 px-5 py-3 border-t border-p-border-light bg-gray-50/50 dark:bg-gray-900/30">
-          <button
-            onClick={onClose}
-            disabled={submitting}
-            className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors disabled:opacity-40"
-          >
+        <div className="flex justify-end gap-2 px-5 py-3 border-t border-subtle">
+          <Button onClick={onClose} disabled={submitting}>
             Cancel
-          </button>
-          <button
-            onClick={onSubmit}
-            disabled={submitting}
-            className={`px-3 py-1.5 text-sm rounded-lg transition-colors disabled:opacity-40 ${submitColor}`}
-          >
+          </Button>
+          <Button variant={action === 'approve' ? 'primary' : 'danger'} onClick={onSubmit} disabled={submitting}>
             {submitting ? '...' : submitLabel}
-          </button>
+          </Button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }

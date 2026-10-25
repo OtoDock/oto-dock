@@ -16,7 +16,7 @@
   "config": [
     {
       "key": "MAX_PARALLEL_SPAWNS",
-      "label": "Max parallel meeting participants per user",
+      "label": "Max parallel meeting participants per user (0 allows no meeting)",
       "input_type": "number",
       "default": "4",
       "user_overridable": false

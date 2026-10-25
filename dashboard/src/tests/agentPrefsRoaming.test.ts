@@ -2,9 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   useAgentPrefsStore,
   hydrateLastInteractiveFromServer,
+  migratePrefs,
   __resetUiPrefsRoamingForTests,
 } from '@/store/agentPrefsStore'
 import * as authApi from '@/api/auth'
+import { seedMode } from '@/lib/engines/modes'
 
 // ─── agentPrefsStore server roaming (Item 5d-3): hydration merge semantics +
 //     the debounced full-map write-through on setLastInteractive ─────────────
@@ -72,5 +74,18 @@ describe('setLastInteractive write-through', () => {
     vi.useFakeTimers()
     useAgentPrefsStore.getState().setLastInteractive('a', '-p')
     expect(useAgentPrefsStore.getState().lastInteractive).toEqual({ a: '-p' })
+  })
+})
+
+describe('the remembered modes from before 1.9', () => {
+  it('read as the current words, and a new chat starts in Auto when none is kept', () => {
+    const kept = { lastModel: {}, lastMode: { a: 'default', b: 'acceptEdits', c: 'dontAsk', d: 'plan' },
+                   lastInteractive: {}, __user_sub: 'u' }
+    expect(migratePrefs(kept, 0).lastMode).toEqual({ a: 'ask', b: 'autoReview', c: 'dontAsk', d: 'plan' })
+    expect(migratePrefs({ ...kept, lastMode: { a: 'ask' } }, 1).lastMode).toEqual({ a: 'ask' })
+    expect(seedMode(undefined)).toBe('autoReview')
+    expect(seedMode('acceptEdits')).toBe('autoReview')
+    useAgentPrefsStore.getState().setLastMode('x', 'default')
+    expect(useAgentPrefsStore.getState().lastMode.x).toBe('ask')
   })
 })

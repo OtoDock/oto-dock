@@ -24,15 +24,22 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncIterator
+from typing import TYPE_CHECKING, cast
 
+from core.background import spawn
 from core.events import turn_ending, turn_life
-from core.events.common_events import CommonEvent, DONE, ERROR, METADATA, PLAN_MODE
+from core.events.common_events import DONE, ERROR, METADATA, CommonEvent
 from core.execution_layer import (
-    AgentConfig, RemoteEngineAdapter, RemoteStartContext, RemoteStartPlan,
+    AgentConfig,
+    RemoteEngineAdapter,
+    RemoteStartContext,
+    RemoteStartPlan,
+    ResumeVerdict,
 )
+from core.layers.cli.remote import _lost_events, _satellite_error_events
 from core.layers.codex.helpers import (
     LOCAL_ENDPOINT_KEY_ENV,
     LOCAL_ENDPOINT_STREAM_IDLE_TIMEOUT_MS,
@@ -42,18 +49,26 @@ from core.layers.codex.helpers import (
     will_retry,
     with_local_provider_note,
 )
-from core.layers.codex.layer import CodexCLIExecutionLayer
+from core.layers.codex.layer import (
+    PLAN_ITEM,
+    CodexCLIExecutionLayer,
+    queue_plan_review,
+    with_tool_approvals,
+)
 from core.layers.codex.local_model_catalog import (
-    LOCAL_MODEL_ROWS_ENV, local_model_catalog_json, parse_local_model_rows,
+    LOCAL_MODEL_ROWS_ENV,
+    local_model_catalog_json,
+    parse_local_model_rows,
 )
 from core.layers.codex.session import _TOOL_ITEM_TYPES, CodexEvent
 from core.layers.codex.translator import CodexEventTranslator
-from core.layers.cli.remote import _lost_events, _satellite_error_events
+from core.permission_modes import ASK_MODE, JUDGE_MODE, PLAN_MODE as PLAN_MODE_WORD
 from core.session import session_kind
-from core.background import spawn
 
 if TYPE_CHECKING:
+    from auth.path_policy import SecurityContext
     from core.remote.remote_session_info import RemoteSessionInfo
+    from core.remote.satellite_connection import SatelliteConnectionManager
 
 logger = logging.getLogger("remote-layer")
 
@@ -115,7 +130,18 @@ class CodexRemoteState:
     open_items: set = field(default_factory=set)
 
 
-def _silence_ends(info: "RemoteSessionInfo", open_items: set) -> bool:
+async def _reseed_after_revive(session_id: str) -> None:
+    """The chat of a session whose revive opened a new Codex thread: its next
+    turn restores the history (``history_seed.mark_resume_refused``)."""
+    from core.session.history_seed import mark_resume_refused
+    from storage import database as task_store
+    from storage.pg import run_db
+    chat = await run_db(task_store.get_chat_by_session, session_id)
+    if chat:
+        await run_db(mark_resume_refused, chat.get("id") or "")
+
+
+def _silence_ends(info: RemoteSessionInfo, open_items: set) -> bool:
     """Whether the remote Codex turn's silence (since its own last stream
     event) ends it now, with its open tool items as its life."""
     return turn_life.ends(
@@ -138,7 +164,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
     # --- spawn ---------------------------------------------------------------
 
     def start_payload(self, base: dict, ctx: RemoteStartContext) -> RemoteStartPlan:
-        config, env, payload, cm = ctx.config, ctx.env, base, ctx.cm
+        config, env, payload, cm = ctx.config, ctx.env, base, cast("SatelliteConnectionManager", ctx.cm)
         machine_id = ctx.machine_id
         start_timeout_s = 60.0
         payload[CONFIG_DIR_PAYLOAD_KEY] = (
@@ -189,10 +215,11 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                 )
             else:
                 logger.warning(
-                    f"Remote Codex on a local model: {cm.satellite_name(machine_id)} "
-                    f"runs satellite {cm.satellite_version(machine_id) or 'unknown'} "
+                    "Remote Codex on a local model: %s "
+                    "runs satellite %s "
                     "(< 0.5.117) — no deferred MCP tools, Codex's 5-minute idle timeout "
-                    "and the old MCP warm gate until it updates at its next reconnect"
+                    "and the old MCP warm gate until it updates at its next reconnect",
+                    cm.satellite_name(machine_id), cm.satellite_version(machine_id) or 'unknown'
                 )
             if local_api_key:
                 env[LOCAL_ENDPOINT_KEY_ENV] = local_api_key
@@ -210,11 +237,13 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         payload["codex_hooks_floor"] = floor
         if floor and not cm.satellite_supports_codex_hooks_floor(machine_id):
             logger.warning(
-                f"Remote Codex {config.client_type} session {ctx.session_id[:8]}: "
-                f"{cm.satellite_name(machine_id)} runs satellite "
-                f"{cm.satellite_version(machine_id) or 'unknown'} "
+                "Remote Codex %s session %s: "
+                "%s runs satellite "
+                "%s "
                 "(< 0.5.118) — no PreToolUse permission floor for this unattended "
-                "session until it updates at its next reconnect"
+                "session until it updates at its next reconnect",
+                config.client_type, ctx.session_id[:8], cm.satellite_name(machine_id),
+                cm.satellite_version(machine_id) or 'unknown'
             )
         # An attended app-server chat (satellite >= 0.5.143) runs the same
         # hook on every thread, judging the turns Codex runs under `never`
@@ -226,12 +255,14 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         attended_floor_supported = cm.satellite_supports_codex_attended_floor(machine_id)
         if attended_floor and not attended_floor_supported:
             logger.warning(
-                f"Remote Codex chat {ctx.session_id[:8]}: "
-                f"{cm.satellite_name(machine_id)} runs satellite "
-                f"{cm.satellite_version(machine_id) or 'unknown'} "
+                "Remote Codex chat %s: "
+                "%s runs satellite "
+                "%s "
                 "(< 0.5.143) — no permission floor in Don't Ask and auto, and "
                 "none outside plan mode on a machine paired with full access, "
-                "until it updates at its next reconnect"
+                "until it updates at its next reconnect",
+                ctx.session_id[:8], cm.satellite_name(machine_id),
+                cm.satellite_version(machine_id) or 'unknown'
             )
         if local_model_provider:
             payload["local_model_provider"] = local_model_provider
@@ -259,14 +290,17 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         # read-only IN the plan collaboration mode (that satellite ties
         # the two); it gets the ordinary sandbox there and the gate alone
         # enforces — the honest state a machine has anyway.
-        _mode_for_sandbox = config.permission_mode
-        if _mode_for_sandbox == "judge" and not cm.satellite_supports_checks(machine_id):
-            _mode_for_sandbox = "default"
+        # A satellite before 1.9 gets the words before 1.9 and today's
+        # sandbox for them (wire_mode): it runs today's Ask and Accept Edits.
+        from core.remote.remote_start_payload import wire_mode
+        _mode_for_sandbox = wire_mode(cm, machine_id, config.permission_mode)
+        if _mode_for_sandbox == JUDGE_MODE and not cm.satellite_supports_checks(machine_id):
+            _mode_for_sandbox = wire_mode(cm, machine_id, ASK_MODE)
         payload["sandbox_mode"] = permission_to_sandbox(
             _mode_for_sandbox,
             allow_full_fs=bool(
                 config.security_context is not None
-                and config.security_context.placement.allow_full_fs
+                and cast("SecurityContext", config.security_context).placement.allow_full_fs
             ),
         )
         # The satellite's plan collaboration mode follows a shipped
@@ -279,7 +313,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         if attended_floor_supported:
             payload["permission_mode"] = _mode_for_sandbox
         else:
-            payload["permission_mode"] = "judge" if _mode_for_sandbox == "judge" else ""
+            payload["permission_mode"] = JUDGE_MODE if _mode_for_sandbox == JUDGE_MODE else ""
         # The ChatGPT login's auth.json (popped from env; the satellite writes
         # it verbatim into the session's CODEX_HOME).
         delivered = False
@@ -302,7 +336,9 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
             try:
                 mcp_path = Path(config.mcp_config_path)
                 if mcp_path.exists():
-                    from core.remote.remote_mcp_rewrite import _rewrite_mcp_toml_for_remote
+                    from core.remote.remote_mcp_rewrite import (
+                        _rewrite_mcp_toml_for_remote,
+                    )
                     payload[MCP_CONFIG_PAYLOAD_KEY] = _rewrite_mcp_toml_for_remote(
                         mcp_path.read_text(), ctx.sat_port,
                         target_os=ctx.target_os, session_id=ctx.session_id,
@@ -312,6 +348,10 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                     )
             except Exception:
                 logger.exception("Codex MCP TOML build failed")
+        # Codex's tool approvals (layer.with_tool_approvals), headless only:
+        # a terminal's own prompt is its gate.
+        if payload.get(MCP_CONFIG_PAYLOAD_KEY) and not config.interactive:
+            payload[MCP_CONFIG_PAYLOAD_KEY] = with_tool_approvals(payload[MCP_CONFIG_PAYLOAD_KEY])
         # Enable request_user_input in DEFAULT collaboration mode for remote
         # HEADLESS dashboard chats (plan mode gets it natively). The shipped
         # headless remote config carries only [mcp_servers.*] sections, so a
@@ -359,7 +399,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
 
     # --- per-session state ---------------------------------------------------
 
-    def init_session(self, info: "RemoteSessionInfo", config: AgentConfig, cm) -> None:
+    def init_session(self, info: RemoteSessionInfo, config: AgentConfig, cm) -> None:
         """One translator for the session's life (cumulative token deltas
         live in it; the thread id is emitted once) and the router — the SOLE
         consumer of ``info.event_queue`` — demuxing main-thread events to the
@@ -369,7 +409,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         turn (that landed in 0.5.18, far below ``MIN_SATELLITE_VERSION``)."""
         self._build_state(info, config.model, cm)
 
-    def adopt_state(self, info: "RemoteSessionInfo", cm) -> None:
+    def adopt_state(self, info: RemoteSessionInfo, cm) -> None:
         """An idle session the satellite kept across a proxy restart: the
         same state a start builds, on the model and the thread the adoption
         put on ``info``. What ran in the old process's background is not
@@ -389,7 +429,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
             spawn(self.control_request(
                 info, cm, "set_model", model=info.model), name="control_request", owner="remote")
 
-    def _build_state(self, info: "RemoteSessionInfo", model: str, cm) -> None:
+    def _build_state(self, info: RemoteSessionInfo, model: str, cm) -> None:
         state = CodexRemoteState(translator=CodexEventTranslator(
             model=model, supervised_bg=True,
             session_id=info.session_id, supervised_bg_commands=True,
@@ -402,11 +442,11 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
             name=f"remote-codex-router-{info.session_id[:8]}",
         )
 
-    async def close_state(self, info: "RemoteSessionInfo") -> None:
+    async def close_state(self, info: RemoteSessionInfo) -> None:
         """Cancel the router + every bg supervisor and resolve their registry
         entries (so close / offline can't leave the _bg_agent_monitor waiting on
         a dead sub-agent). Idempotent. Mirrors the LOCAL _teardown_bg."""
-        state: CodexRemoteState | None = info.engine_state
+        state = cast("CodexRemoteState | None", info.engine_state)
         if state is None:
             return
         if state.router_task is not None:
@@ -439,7 +479,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
 
     # --- turns ---------------------------------------------------------------
 
-    async def begin_turn(self, info: "RemoteSessionInfo", settle_after_result: int) -> None:
+    async def begin_turn(self, info: RemoteSessionInfo, settle_after_result: int) -> None:
         # Per-turn bg-command registry prune (mirrors the LOCAL session's
         # send_message). reset() PRESERVES still-pending terminals; without it
         # `unsurfaced` never clears remotely and task_producer's cohort math
@@ -450,10 +490,10 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         # no main-thread stragglers to drain (a prior turn's leftovers either
         # went to a bg buffer or the now-discarded prior consumer). Register a
         # fresh main-turn consumer for the router to feed.
-        state: CodexRemoteState = info.engine_state
+        state = cast("CodexRemoteState", info.engine_state)
         state.default_consumer = asyncio.Queue()
 
-    async def stream_turn(self, info: "RemoteSessionInfo", cm) -> AsyncIterator[CommonEvent]:
+    async def stream_turn(self, info: RemoteSessionInfo, cm) -> AsyncIterator[CommonEvent]:
         """Stream one Codex turn to the pump using the shared translator: the
         router feeds this turn's MAIN-thread events to the consumer
         ``begin_turn`` registered; at turn end the still-running background
@@ -467,17 +507,17 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
             # send_message finally).
             self._handoff_bg_subagents(info)
 
-    async def _stream_main_turn(self, info: "RemoteSessionInfo", cm) -> AsyncIterator[CommonEvent]:
-        state: CodexRemoteState = info.engine_state
+    async def _stream_main_turn(self, info: RemoteSessionInfo, cm) -> AsyncIterator[CommonEvent]:
+        state = cast("CodexRemoteState", info.engine_state)
         expected_cmd_id = info.current_send_command_id
         turn_start = time.monotonic()
-        # Plan mode: mirror the local layer's synthetic implement-card. Codex
-        # delivers the plan as the turn's final agentMessage (no ExitPlanMode on
-        # the -p path), so a completed plan-mode turn synthesizes a `plan_mode
-        # exit` right before DONE — the SAME event the local codex layer emits,
-        # rendered by the same PlanView card. `info.mode == "plan"` is the
-        # read-only plan signal (set by change_mode / at session start).
-        in_plan = info.mode == "plan"
+        # Plan mode: mirror the local layer — a completed plan turn's `plan`
+        # item (else its last agent message) becomes a plan review right before
+        # DONE (layer.queue_plan_review; no plan file on the machine: the
+        # reviewed rows are a remote session's plans). `info.mode == "plan"`
+        # is the read-only plan signal (set by change_mode / at session start).
+        in_plan = info.mode == PLAN_MODE_WORD
+        plan_text = ""
         final_plan_msg = ""
         turn_interrupted = False
 
@@ -489,13 +529,10 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         for ev in state.translator.thread_id_metadata(info.resume_handle):
             yield ev
 
-        def _plan_card() -> "CommonEvent | None":
-            if in_plan and not turn_interrupted and final_plan_msg.strip():
-                return CommonEvent(type=PLAN_MODE, data={
-                    "action": "exit", "synthetic": True,
-                    "tool_input": {"plan": final_plan_msg},
-                })
-            return None
+        async def _plan_review() -> None:
+            plan = (plan_text or final_plan_msg).strip()
+            if in_plan and not turn_interrupted and plan:
+                await queue_plan_review(info.session_id, plan, None)
 
         q = state.default_consumer
         assert q is not None  # invariant: begin_turn registered the consumer
@@ -520,14 +557,9 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                     "Remote session %s: no notification for %.0fs with nothing running — "
                     "ending the turn (codex)", info.session_id[:8], silent_for,
                 )
-                try:
-                    await cm.send_fire_and_forget(info.machine_id, {
-                        "type": "abort", "session_id": info.session_id,
-                    })
-                except Exception:
-                    logger.warning(
-                        "codex silence abort send failed for %s", info.session_id[:8],
-                    )
+                await cm.send_fire_and_forget(info.machine_id, {
+                    "type": "abort", "session_id": info.session_id,
+                })
                 ending = turn_ending.TurnEnding(
                     reason=turn_ending.SILENT, detail=f"no output for {int(silent_for)} s",
                 )
@@ -569,9 +601,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                     for event in _lost_events("the machine ended the turn before its result"):
                         yield event
                     return
-                card = _plan_card()
-                if card:
-                    yield card
+                await _plan_review()
                 yield CommonEvent(type=DONE)
                 return
 
@@ -584,14 +614,17 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                 if _iid and _item.get("type") in _TOOL_ITEM_TYPES:
                     (open_items.add if _m == "item/started" else open_items.discard)(_iid)
 
-            # Plan-mode capture (mirrors codex/layer.py): the last agentMessage
-            # is the plan; a `turn/completed` interrupted status suppresses the
-            # card. Read the raw notification before translation.
+            # Plan-mode capture (mirrors codex/layer.py): the `plan` item, else
+            # the last agentMessage, is the plan; a `turn/completed` interrupted
+            # status suppresses the review. Read the raw notification before
+            # translation.
             if in_plan:
                 _method = raw.get("method", "")
                 if _method == "item/completed":
                     _item = (raw.get("params") or {}).get("item") or {}
-                    if _item.get("type") == "agentMessage" and _item.get("text"):
+                    if _item.get("type") == PLAN_ITEM and _item.get("text"):
+                        plan_text = _item["text"]
+                    elif _item.get("type") == "agentMessage" and _item.get("text"):
                         final_plan_msg = _item["text"]
                 elif _method == "turn/completed":
                     if ((raw.get("params") or {}).get("turn") or {}).get("status") == "interrupted":
@@ -605,9 +638,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                 if event.type == METADATA and "cost_usd" in event.data:
                     event.data["duration_ms"] = int((time.monotonic() - turn_start) * 1000)
                 if event.type == DONE:
-                    card = _plan_card()
-                    if card:
-                        yield card
+                    await _plan_review()
                     # A revive on a new thread announced it during this turn.
                     for ev in state.translator.thread_id_metadata(info.resume_handle):
                         yield ev
@@ -615,7 +646,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                 if event.type == DONE:
                     return
 
-    async def drain_bg_commands(self, info: "RemoteSessionInfo", cm, *, budget: float) -> bool:
+    async def drain_bg_commands(self, info: RemoteSessionInfo, cm, *, budget: float) -> bool:
         """Between turns, reconcile pending background-terminal registry entries
         against the satellite's ``codex_bg_terminals`` RPC (which proxies
         ``thread/backgroundTerminals/list``) and resolve any whose PTY is gone.
@@ -628,7 +659,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         completions there). NEVER touches info.event_queue — the router owns it."""
         from core.events.bg_command_state import get_bg_command_registry
         from core.session.session_state import resolve_bg_command
-        state: CodexRemoteState | None = info.engine_state
+        state = cast("CodexRemoteState | None", info.engine_state)
         if state is None or not cm.supports_codex_bg_terminals(info.machine_id):
             return False
         reg = get_bg_command_registry(info.session_id)
@@ -649,7 +680,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                     "type": BG_TERMINALS_FRAME,
                     "session_id": info.session_id,
                 }, timeout=min(budget, 5.0))
-            except Exception:
+            except RuntimeError:
                 return False  # satellite unreachable/slow — nothing resolved
             if not ack.get("ok"):
                 return False  # satellite couldn't list — fail-closed
@@ -677,7 +708,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
     def soft_interrupt_frame(self) -> str:
         return SOFT_INTERRUPT_FRAME
 
-    async def control_request(self, info: "RemoteSessionInfo", cm, subtype: str, **kwargs) -> bool:
+    async def control_request(self, info: RemoteSessionInfo, cm, subtype: str, **kwargs) -> bool:
         """The app-server has no stdin control channel; the satellite's
         ``CodexSession.send_control_request`` applies ``set_model`` and
         ``set_permission_mode`` as per-turn overrides on the next
@@ -690,7 +721,8 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         if subtype == "set_model":
             frame_kwargs = {"model": kwargs.get("model", "")}
         elif subtype == "set_permission_mode":
-            mode = kwargs.get("mode", "")
+            from core.remote.remote_start_payload import wire_mode
+            mode = wire_mode(cm, info.machine_id, kwargs.get("mode", ""))
             frame_kwargs = {"sandbox_mode": permission_to_sandbox(
                 mode, allow_full_fs=info.allow_full_fs,
             )}
@@ -706,7 +738,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         })
         return True
 
-    async def steer(self, info: "RemoteSessionInfo", cm, text: str) -> bool:
+    async def steer(self, info: RemoteSessionInfo, cm, text: str) -> bool:
         """Mid-turn steering — tunnel twin of the local layer's ``turn/steer``.
         Version-gated: an old satellite would silently drop the frame, so
         return False immediately and let the caller take today's queue
@@ -714,7 +746,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         — the exactly-once contract the steer-vs-queue branch depends on."""
         if not text:
             return False
-        state: CodexRemoteState | None = info.engine_state
+        state = cast("CodexRemoteState | None", info.engine_state)
         if state is not None and info.turn_active and _silence_ends(info, state.open_items):
             # The turn is about to end silent: the caller queues the input.
             return False
@@ -739,7 +771,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
             return False
         return bool(ack.get("steered"))
 
-    async def compact(self, info: "RemoteSessionInfo", cm) -> dict | None:
+    async def compact(self, info: RemoteSessionInfo, cm) -> dict | None:
         """Manual context compaction — tunnel twin of the local layer's
         ``thread/compact/start`` flow. The satellite runs the whole wait loop
         (up to ~125s) and acks ``{ok, post_tokens|reason}``; version-gated
@@ -769,13 +801,13 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
 
     async def can_resume(
         self, cm, *, machine_id: str, session_id: str, agent_name: str,
-        username: str, resume_handle: str,
-    ) -> bool:
+        username: str, resume_handle: str, external_home: str = "",
+    ) -> ResumeVerdict:
         """Codex resumes by THREAD id: the thread and its rollout persist under
         the satellite's CODEX_HOME independently of the daemon, and the
         satellite's own session guards a missing rollout at spawn. No RPC —
         the handle is the answer."""
-        return bool(resume_handle)
+        return ResumeVerdict.RESUMABLE if resume_handle else ResumeVerdict.FRESH
 
     # --- the router and the background sub-agent supervision -----------------
     # Proxy-side mirror of core/layers/codex/session.py's router/supervisor,
@@ -784,7 +816,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
     # _bg_agent_monitor + wait_for_bg_subagents, so a delegated REMOTE Codex
     # agent waits for its bg subs exactly like a local one.
 
-    async def _route_notifications(self, info: "RemoteSessionInfo") -> None:
+    async def _route_notifications(self, info: RemoteSessionInfo) -> None:
         """Sole consumer of info.event_queue.
 
         Demultiplexes by ``threadId``: MAIN-thread codex events (plus the
@@ -794,8 +826,9 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         buffer so a background sub keeps streaming to the proxy after the main
         turn ends. Runs for the session's lifetime; cancelled by close_state.
         Mirrors the LOCAL _route_notifications."""
-        state: CodexRemoteState = info.engine_state
+        state = cast("CodexRemoteState", info.engine_state)
         q = info.event_queue
+        cq: asyncio.Queue | None
         while True:
             try:
                 raw = await q.get()
@@ -827,6 +860,11 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
                     if handle and info.resume_handle and handle != info.resume_handle:
                         state.translator._emitted_thread_id = False
                     record_resume_handle(info, handle)
+                    if raw.get("resumed") is False:
+                        # A revive whose thread would not open: the turn under
+                        # way runs without the memory, the next one restores it.
+                        spawn(_reseed_after_revive(info.session_id),
+                              name="codex-revive-reseed", owner="codex-remote")
                     continue
                 # Other markers (_turn_ended / satellite error) → the active turn.
                 if state.default_consumer is not None:
@@ -873,7 +911,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
             # else: between turns, a main-thread straggler with no active
             # consumer — drop it (the daemon is idle on the main thread).
 
-    def _handoff_bg_subagents(self, info: "RemoteSessionInfo") -> None:
+    def _handoff_bg_subagents(self, info: RemoteSessionInfo) -> None:
         """At main-turn end: register + arm a supervisor for each background
         sub-agent still active (read from the translator, which saw the main
         thread's collabAgentToolCall states), drop buffers for foreground subs
@@ -881,7 +919,7 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         per-session SubagentRegistry so the shared _bg_agent_monitor nudges and
         wait_for_bg_subagents covers remote delegated agents. Sync (mirrors the
         LOCAL _handoff_bg_subagents)."""
-        state: CodexRemoteState | None = info.engine_state
+        state = cast("CodexRemoteState | None", info.engine_state)
         if state is None:
             return
         state.default_consumer = None  # stop feeding the finished main turn
@@ -919,12 +957,12 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
             "→ supervising %s", info.session_id[:8], len(pending), sorted(pending_ids),
         )
 
-    async def _supervise_bg_subagent(self, info: "RemoteSessionInfo", sub_tid: str) -> None:
+    async def _supervise_bg_subagent(self, info: RemoteSessionInfo, sub_tid: str) -> None:
         """Drain ONE background sub-agent's thread buffer until it terminates,
         then resolve it. Runs concurrently with user/nudge turns (never blocks a
         turn). The ceiling backstops a lost terminal. Mirrors the LOCAL
         _supervise_bg_subagent."""
-        state: CodexRemoteState = info.engine_state
+        state = cast("CodexRemoteState", info.engine_state)
         start = time.monotonic()
         q = state.thread_consumers.get(sub_tid)
         try:
@@ -953,12 +991,12 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
         finally:
             self._resolve_bg_subagent(info, sub_tid)
 
-    def _resolve_bg_subagent(self, info: "RemoteSessionInfo", sub_tid: str) -> None:
+    def _resolve_bg_subagent(self, info: RemoteSessionInfo, sub_tid: str) -> None:
         """Mark a remote background sub-agent done + clear its badge via the shared
         resolve_bg_subagent (one source of truth with the local path). Sync +
         idempotent; pops our own per-thread bookkeeping first."""
         from core.session.session_state import resolve_bg_subagent
-        state: CodexRemoteState | None = info.engine_state
+        state = cast("CodexRemoteState | None", info.engine_state)
         translator = None
         if state is not None:
             state.thread_consumers.pop(sub_tid, None)
@@ -966,14 +1004,14 @@ class CodexRemoteAdapter(RemoteEngineAdapter):
             translator = state.translator
         resolve_bg_subagent(info.session_id, sub_tid, translator)
 
-    def _translate(self, info: "RemoteSessionInfo", raw_event: dict) -> list[CommonEvent]:
+    def _translate(self, info: RemoteSessionInfo, raw_event: dict) -> list[CommonEvent]:
         """Translate a forwarded Codex app-server notification to CommonEvents.
 
         The satellite forwards each ``codex app-server`` notification verbatim
         as ``{"method": ..., "params": ...}`` (the same NDJSON the local layer
         sees); the shared :class:`CodexEventTranslator` keys on the method.
         """
-        state: CodexRemoteState | None = info.engine_state
+        state = cast("CodexRemoteState | None", info.engine_state)
         if state is None:
             return []
         # Seed the multi-agent demux with the AUTHORITATIVE main thread id (the

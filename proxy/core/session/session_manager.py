@@ -7,14 +7,13 @@ Provides a single entry point for session lifecycle management.
 import logging
 from typing import TYPE_CHECKING
 
-from storage.agents import agent_store
 from core import placement
-from core.execution_layer import (
-    DEFAULT_EXECUTION_PATH, ExecutionLayer, LayerCapabilities,
-)
+from core.execution_layer import ExecutionLayer, LayerCapabilities
 from core.layers.cli import CLIExecutionLayer
-from core.layers.direct import DirectLLMExecutionLayer
 from core.layers.codex import CodexCLIExecutionLayer
+from core.layers.direct import DirectLLMExecutionLayer
+from storage.agents import agent_store
+from storage.agents.schema import DEFAULT_EXECUTION_PATH
 
 if TYPE_CHECKING:
     from core.remote.remote_execution import RemoteExecutionLayer
@@ -175,8 +174,8 @@ def get_execution_layer(
             # have said) and the caller's job here is almost always to CLOSE
             # something, which must not raise.
             logger.warning(
-                f"Agent '{agent_name}' not found, assuming "
-                f"{DEFAULT_EXECUTION_PATH}"
+                "Agent '%s' not found, assuming "
+                "%s", agent_name, DEFAULT_EXECUTION_PATH
             )
             execution_path = DEFAULT_EXECUTION_PATH
         else:
@@ -192,9 +191,10 @@ def get_execution_layer(
     # building its config. Returns (target, fallback_reason). Skipping
     # re-resolution avoids re-running user/role logic the caller may not
     # replicate; the isolation guards below run on the passed target either way.
+    from services.remote import remote_status
     from storage import remote_store
     if not execution_target:
-        execution_target, _reason = remote_store.resolve_execution_target(
+        execution_target, _reason = remote_status.resolve_execution_target(
             agent_name, user_sub, role,
         )
     if placement.is_offline_sentinel(execution_target):
@@ -291,7 +291,7 @@ def get_layer_by_path(execution_path: str) -> ExecutionLayer:
 def register_layer(execution_path: str, layer: ExecutionLayer) -> None:
     """Register a new execution layer (for plugins / future layers)."""
     _LAYERS[execution_path] = layer
-    logger.info(f"Registered execution layer: {execution_path} -> {type(layer).__name__}")
+    logger.info("Registered execution layer: %s -> %s", execution_path, type(layer).__name__)
 
 
 def get_all_layers() -> dict[str, ExecutionLayer]:

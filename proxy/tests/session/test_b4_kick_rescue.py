@@ -70,6 +70,7 @@ async def test_task_result_prompt_is_parked_off_loop(monkeypatch):
     closing socket's person at their role on the chat's agent, read there
     too."""
     import threading
+
     from auth import providers
     from storage import database as task_store
 

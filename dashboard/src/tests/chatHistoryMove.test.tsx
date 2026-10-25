@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, act } from '@testing-library/react'
+import { personClick } from './dialogsHarness'
 
 // ─── ChatHistory kebab — the target-mismatch move row ───────────────────────
 // The banner's permanent home after dismissal: rendered only when the chat's
@@ -22,6 +23,14 @@ vi.mock('@/api/chats', async (importOriginal) => {
 
 vi.mock('@/hooks/useActiveChats', () => ({ useActiveChats: () => [] }))
 
+// The OPEN chat's places (the "Runs on" chip's query): asked for the open
+// row only, never per row.
+const targetsMock = vi.fn((_chatId: string | null): { data: unknown } => ({ data: undefined }))
+vi.mock('@/api/remoteMachines', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/api/remoteMachines')>(),
+  useChatTargets: (chatId: string | null) => targetsMock(chatId),
+}))
+
 // The Active-now strip has its own tests — stub it out of this composition.
 vi.mock('@/components/chat/ActiveChatsPanel', () => ({ default: () => null }))
 
@@ -39,7 +48,7 @@ function chat(id: string, title: string): Chat {
 
 const MISMATCH = {
   pinnedTarget: 'local',
-  pinnedLabel: 'local sandbox',
+  pinnedLabel: 'the OtoDock platform',
   resolvedTarget: 'm-attic',
   resolvedLabel: 'Attic PC',
 }
@@ -80,8 +89,23 @@ function renderHistory(over: Partial<Parameters<typeof ChatHistory>[0]> = {}) {
 
 beforeEach(() => {
   searchMock.mockReturnValue({ data: null, isFetching: false })
+  targetsMock.mockReset()
+  targetsMock.mockReturnValue({ data: undefined })
   useChatStore.setState({ byChat: {} })
 })
+
+/** The open chat's targets answer, its place chosen or not. */
+function targetsAnswer(placeChosen: boolean, currentReachable = true) {
+  return {
+    current: { target: 'm-old', label: 'Old box', pairing: 'user', state: currentReachable ? 'online' : 'disconnected', owner: '' },
+    default_target: 'm-attic',
+    targets: [
+      { target: 'm-old', label: 'Old box', pairing: 'user', state: currentReachable ? 'online' : 'disconnected',
+        reachable: currentReachable, is_default: false, is_current: true, pickable: true, why_not: '', allowed: true },
+    ],
+    can_move: true, refusal: '', lock: null, moving: null, place_chosen: placeChosen,
+  }
+}
 
 describe('ChatHistory — target-mismatch move row', () => {
   it('no mismatch data → the dropdown has only Delete', () => {
@@ -95,7 +119,7 @@ describe('ChatHistory — target-mismatch move row', () => {
     seedSlice('c1')
     renderHistory()
     fireEvent.click(screen.getByTitle('Options'))
-    expect(screen.getByText('Runs on local sandbox — move to Attic PC')).toBeTruthy()
+    expect(screen.getByText('Runs on the OtoDock platform. Move to Attic PC')).toBeTruthy()
   })
 
   it('clicking the row opens the confirm; "Move chat" fires onMoveChat', () => {
@@ -103,11 +127,11 @@ describe('ChatHistory — target-mismatch move row', () => {
     const onMoveChat = vi.fn()
     renderHistory({ onMoveChat })
     fireEvent.click(screen.getByTitle('Options'))
-    fireEvent.click(screen.getByText('Runs on local sandbox — move to Attic PC'))
-    expect(screen.getByText('Move chat to Attic PC?')).toBeTruthy()
-    fireEvent.click(screen.getByText('Move chat'))
+    fireEvent.click(screen.getByText('Runs on the OtoDock platform. Move to Attic PC'))
+    expect(screen.getByText('Move this chat to Attic PC?')).toBeTruthy()
+    personClick(screen.getByText('Move chat'))
     expect(onMoveChat).toHaveBeenCalledTimes(1)
-    expect(screen.queryByText('Move chat to Attic PC?')).toBeNull()
+    expect(screen.queryByText('Move this chat to Attic PC?')).toBeNull()
   })
 
   it('Cancel closes the confirm without firing the op', () => {
@@ -115,25 +139,73 @@ describe('ChatHistory — target-mismatch move row', () => {
     const onMoveChat = vi.fn()
     renderHistory({ onMoveChat })
     fireEvent.click(screen.getByTitle('Options'))
-    fireEvent.click(screen.getByText('Runs on local sandbox — move to Attic PC'))
-    fireEvent.click(screen.getByText('Cancel'))
+    fireEvent.click(screen.getByText('Runs on the OtoDock platform. Move to Attic PC'))
+    personClick(screen.getByText('Cancel'))
     expect(onMoveChat).not.toHaveBeenCalled()
-    expect(screen.queryByText('Move chat to Attic PC?')).toBeNull()
+    expect(screen.queryByText('Move this chat to Attic PC?')).toBeNull()
+  })
+
+  it('a turn starting closes the move confirm for good: it does not come back when the turn ends', () => {
+    seedSlice('c1')
+    renderHistory()
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Runs on the OtoDock platform. Move to Attic PC'))
+    expect(screen.getByText('Move this chat to Attic PC?')).toBeTruthy()
+    act(() => { seedSlice('c1', 'streaming') })
+    expect(screen.queryByText('Move this chat to Attic PC?')).toBeNull()
+    act(() => { seedSlice('c1') })
+    expect(screen.queryByText('Move this chat to Attic PC?')).toBeNull()
   })
 
   it('the move row is disabled while that chat streams', () => {
     seedSlice('c1', 'streaming')
     renderHistory()
     fireEvent.click(screen.getByTitle('Options'))
-    const row = screen.getByText('Runs on local sandbox — move to Attic PC') as HTMLButtonElement
+    const row = screen.getByText('Runs on the OtoDock platform. Move to Attic PC') as HTMLButtonElement
     expect(row.disabled).toBe(true)
+  })
+
+  it('the confirm names where the chat goes', () => {
+    seedSlice('c1')
+    renderHistory()
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Runs on the OtoDock platform. Move to Attic PC'))
+    expect(screen.getByText('Move this chat to Attic PC?')).toBeTruthy()
+    expect(screen.getByText('The chat continues on Attic PC.')).toBeTruthy()
+  })
+
+  it("the confirm says a summary goes when the open chat's machine is offline", () => {
+    seedSlice('c1')
+    targetsMock.mockImplementation((id) => ({ data: id ? targetsAnswer(false, false) : undefined }))
+    renderHistory()
+    fireEvent.click(screen.getByTitle('Options'))
+    fireEvent.click(screen.getByText('Runs on the OtoDock platform. Move to Attic PC'))
+    expect(screen.getByText(
+      'Old box is offline, so the chat continues on Attic PC from a summary of the conversation.',
+    )).toBeTruthy()
+  })
+
+  it('a place a person chose hides the move on the OPEN chat (the pin stays stated)', () => {
+    seedSlice('c1')
+    targetsMock.mockImplementation((id) => ({ data: id ? targetsAnswer(true) : undefined }))
+    renderHistory()
+    fireEvent.click(screen.getByTitle('Options'))
+    expect(screen.queryByText(/Move to Attic PC/)).toBeNull()
+    expect(screen.getByText('Runs on the OtoDock platform')).toBeTruthy()
+  })
+
+  it('the places are asked for the open chat only', () => {
+    seedSlice('c1')
+    renderHistory({ chats: [chat('c1', 'Fix the tests'), chat('c2', 'Other')] })
+    const asked = new Set(targetsMock.mock.calls.map(([id]) => id))
+    expect(asked).toEqual(new Set(['c1', null]))
   })
 
   it('a NON-open chat with mismatch data gets a plain info row (no move action)', () => {
     seedSlice('c1')
     renderHistory({ activeChatId: null })
     fireEvent.click(screen.getByTitle('Options'))
-    expect(screen.getByText('Runs on local sandbox')).toBeTruthy()
-    expect(screen.queryByText(/move to Attic PC/)).toBeNull()
+    expect(screen.getByText('Runs on the OtoDock platform')).toBeTruthy()
+    expect(screen.queryByText(/Move to Attic PC/)).toBeNull()
   })
 })

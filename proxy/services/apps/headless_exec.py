@@ -43,6 +43,8 @@ import time
 import uuid
 from typing import TYPE_CHECKING
 
+import psycopg
+
 import config
 from core import placement
 from core.layers.direct.mcp import AgentMCPManager
@@ -77,7 +79,7 @@ _SWEEP_INTERVAL_S = 60
 
 class _Entry:
     __slots__ = ("manager", "session_id", "scope_key", "mcps", "last_used",
-                 "busy", "sem", "idle_s", "pinned_until")
+                 "_busy", "idle", "sem", "idle_s", "pinned_until")
 
     def __init__(self, manager: AgentMCPManager, session_id: str, scope_key: str,
                  mcps: frozenset[str]):
@@ -86,10 +88,25 @@ class _Entry:
         self.scope_key = scope_key
         self.mcps = mcps
         self.last_used = time.monotonic()
-        self.busy = 0
+        self._busy = 0
+        self.idle = asyncio.Event()        # set while no call runs on the entry
+        self.idle.set()
         self.sem = asyncio.Semaphore(CALL_CONCURRENCY)
         self.idle_s: float | None = None   # None → the platform idle timeout
         self.pinned_until = 0.0            # monotonic; LRU skips while pinned
+
+    @property
+    def busy(self) -> int:
+        """The calls running on the entry's manager."""
+        return self._busy
+
+    @busy.setter
+    def busy(self, count: int) -> None:
+        self._busy = count
+        if count:
+            self.idle.clear()
+        else:
+            self.idle.set()
 
 
 PoolKey = tuple[str, str, str]
@@ -157,8 +174,12 @@ def _build_session_parts(agent: str, row: dict, mcps: frozenset[str], session_id
     binds and secret bundles cover only what this manager starts."""
     from auth.path_policy import SecurityContext
     from core.config.task_config_builder import resolve_task_identity
-    from core.sandbox.sandbox import SandboxBuilder, SandboxMount, resolve_sandbox_config
     from core.layers.cli.config_dir import ensure_persistent_claude_dir
+    from core.sandbox.sandbox import (
+        SandboxBuilder,
+        SandboxMount,
+        resolve_sandbox_config,
+    )
     from core.session.visibility import resolve_visibility
     from services import path_roles
     from services.mcp import mcp_registry
@@ -278,7 +299,9 @@ async def _create_entry(agent: str, row: dict, scope_key: str,
     # session JWT (minted in build_session_env) and their hook callbacks
     # (resolve-path, display, …) resolve through this context.
     from core.session.session_state import (
-        set_session_security, _record_session_use, mark_headless_live,
+        _record_session_use,
+        mark_headless_live,
+        set_session_security,
     )
     set_session_security(session_id, ctx)
     mark_headless_live(session_id)
@@ -300,9 +323,10 @@ async def _create_entry(agent: str, row: dict, scope_key: str,
         await _dispose(_Entry(mgr, session_id, scope_key, mcps))
         raise
     logger.info(
-        f"Headless MCP manager started: agent={agent}, "
-        f"scope={'personal' if scope_key else 'shared'}, "
-        f"mcps={_mcps_key(mcps)}, session={session_id}"
+        "Headless MCP manager started: agent=%s, "
+        "scope=%s, "
+        "mcps=%s, session=%s",
+        agent, 'personal' if scope_key else 'shared', _mcps_key(mcps), session_id
     )
     return _Entry(mgr, session_id, scope_key, mcps)
 
@@ -312,7 +336,9 @@ async def _dispose(entry: _Entry) -> None:
     → permission-state cleanup (security ctx + brokered secrets). Each step
     best-effort so one failure never strands the rest."""
     from core.session.session_state import (
-        cleanup_session_permission_state, clear_headless_live, mark_closing,
+        cleanup_session_permission_state,
+        clear_headless_live,
+        mark_closing,
     )
     mark_closing(entry.session_id)
     clear_headless_live(entry.session_id)
@@ -364,7 +390,7 @@ async def _get_entry(agent: str, row: dict, mcps: frozenset[str]) -> tuple[_Entr
             oldest_key = min(unpinned or idle or _pool,
                              key=lambda k: _pool[k].last_used)
             oldest = _pool.pop(oldest_key)
-            logger.info(f"Evicting headless MCP manager (pool cap): {oldest_key}")
+            logger.info("Evicting headless MCP manager (pool cap): %s", oldest_key)
             await _dispose(oldest)
         entry = await _create_entry(agent, row, key[1], mcps)
         _pool[key] = entry
@@ -386,8 +412,16 @@ async def _wait_idle(entry: _Entry) -> None:
     manager allows): a self-heal rebuild must never dispose a manager under
     a sibling's running tool."""
     deadline = time.monotonic() + entry.manager.tool_timeout + 30
-    while entry.busy and time.monotonic() < deadline:
-        await asyncio.sleep(0.1)
+    # A call can start between the last one's end and this wake: the count is
+    # read again after every wake.
+    while entry.busy:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            await asyncio.wait_for(entry.idle.wait(), remaining)
+        except TimeoutError:
+            return
 
 
 def _ensure_sweeper() -> None:
@@ -414,7 +448,7 @@ async def _sweep_once() -> None:
             if current is not entry or entry.busy:
                 continue
             _pool.pop(key, None)
-        logger.info(f"Reaping idle headless MCP manager: {key}")
+        logger.info("Reaping idle headless MCP manager: %s", key)
         await _dispose(entry)
 
 
@@ -500,21 +534,21 @@ async def execute_app_tool(row: dict, action: dict, merged_args: dict) -> dict:
                 if now - _selfheal_at.get(key, 0.0) >= _SELF_HEAL_COOLDOWN_S:
                     _selfheal_at[key] = now
                     logger.info(
-                        f"app exec: self-heal rebuild for {key} "
-                        f"(missing {namespaced})"
+                        "app exec: self-heal rebuild for %s "
+                        "(missing %s)", key, namespaced
                     )
                     await _wait_idle(entry)
                     if _pool.get(key) is entry:
                         await _drop_entry(key)
                     entry, _ = await _get_entry(agent, row, entry.mcps | mcps)
         except Exception as e:
-            logger.exception(f"app exec: manager start failed for {agent}")
+            logger.exception("app exec: manager start failed for %s", agent)
             return {"status": "error", "reason": f"Could not start the tool's MCP: {e}"}
         if not entry.manager.has_tool(namespaced):
             logger.warning(
-                f"app exec: tool unavailable: app={row.get('slug')}, "
-                f"tool={namespaced} (its MCP likely failed to start — "
-                f"see mcp-manager errors above)"
+                "app exec: tool unavailable: app=%s, "
+                "tool=%s (its MCP likely failed to start — "
+                "see mcp-manager errors above)", row.get('slug'), namespaced
             )
             return {"status": "error",
                     "reason": f"Tool '{action.get('tool')}' is not available on MCP '{action.get('mcp')}'"}
@@ -538,7 +572,7 @@ async def execute_app_tool(row: dict, action: dict, merged_args: dict) -> dict:
                         timeout=entry.manager.tool_timeout + 30,
                     )
             except asyncio.TimeoutError:
-                logger.error(f"app exec: dispatch timed out for {namespaced}")
+                logger.error("app exec: dispatch timed out for %s", namespaced)
                 return {"status": "error", "reason": "The tool call timed out"}
             finally:
                 entry.busy -= 1
@@ -548,14 +582,14 @@ async def execute_app_tool(row: dict, action: dict, merged_args: dict) -> dict:
             # after a quiet stretch is not the one that fails.
             if attempt == 1 and not created and not entry.manager.has_tool(namespaced):
                 key = (agent, entry.scope_key, _mcps_key(entry.mcps))
-                logger.info(f"app exec: {namespaced} died under the call, rebuilding {key} once")
+                logger.info("app exec: %s died under the call, rebuilding %s once", namespaced, key)
                 try:
                     await _wait_idle(entry)
                     if _pool.get(key) is entry:
                         await _drop_entry(key)
                     entry, created = await _get_entry(agent, row, mcps)
                 except Exception:
-                    logger.exception(f"app exec: rebuild after a dead call failed for {agent}")
+                    logger.exception("app exec: rebuild after a dead call failed for %s", agent)
                     break
                 if entry.manager.has_tool(namespaced):
                     continue
@@ -564,8 +598,9 @@ async def execute_app_tool(row: dict, action: dict, merged_args: dict) -> dict:
         if len(text) > RESULT_MAX_CHARS:
             text = text[:RESULT_MAX_CHARS] + "\n… (result truncated)"
         logger.info(
-            f"App tool fired: app={row.get('slug')}, action={action_id}, "
-            f"tool={namespaced}, scope={'personal' if row.get('username') else 'shared'}"
+            "App tool fired: app=%s, action=%s, "
+            "tool=%s, scope=%s",
+            row.get('slug'), action_id, namespaced, 'personal' if row.get('username') else 'shared'
         )
         return {"status": "done", "result": text}
     finally:
@@ -606,7 +641,7 @@ def connected_account(mcp_name: str, agent: str, user_sub: str) -> str:
         return ""
     try:
         accounts = credential_store.list_user_accounts(ref.owner_sub, mcp_name) or []
-    except Exception:
+    except psycopg.Error:
         accounts = []
     match = next((a for a in accounts if a.get("account_label") == ref.label), None)
     return str((match or {}).get("display_email") or ref.label)

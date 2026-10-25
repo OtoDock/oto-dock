@@ -4,8 +4,8 @@ Manages the state of outbound AI calls from registration through
 completion, including transcript recording and blocking waits.
 """
 
-import contextlib
 import asyncio
+import contextlib
 import enum
 import logging
 import time
@@ -151,7 +151,7 @@ class CallManager:
         self._uuid_index[audio_uuid] = call_id
         # The dialed number is personal data: it lives on the call record,
         # never in the log line.
-        logger.info(f"Registered call {call_id} (audio_uuid={audio_uuid})")
+        logger.info("Registered call %s (audio_uuid=%s)", call_id, audio_uuid)
         return call
 
     def get_call(self, call_id: str) -> OutboundCall | None:
@@ -173,7 +173,7 @@ class CallManager:
     ) -> None:
         call = self._calls.get(call_id)
         if not call:
-            logger.warning(f"update_status: unknown call_id {call_id}")
+            logger.warning("update_status: unknown call_id %s", call_id)
             return
 
         old_status = call.status
@@ -198,7 +198,7 @@ class CallManager:
             if old_status not in (CallStatus.COMPLETED, CallStatus.FAILED):
                 self._report_terminal(call)
 
-        logger.info(f"Call {call_id}: {old_status.value} → {status.value}")
+        logger.info("Call %s: %s → %s", call_id, old_status.value, status.value)
 
     def _report_terminal(self, call: OutboundCall) -> None:
         """Fire-and-forget outbound call-log row. Twilio surfaces no-answer /
@@ -283,7 +283,7 @@ class CallManager:
         call.question_answer = None
         call._answer_ready.clear()
         call._question_ready.set()
-        logger.debug(f"Call {call_id}: question posted: {text[:80]}")
+        logger.debug("Call %s: question posted: %s", call_id, text[:80])
         return True
 
     def post_answer(self, call_id: str, text: str) -> bool:
@@ -298,7 +298,7 @@ class CallManager:
         })
         call.pending_question = None
         call._answer_ready.set()
-        logger.debug(f"Call {call_id}: answer posted: {text[:80]}")
+        logger.debug("Call %s: answer posted: %s", call_id, text[:80])
         return True
 
     async def wait_for_event(
@@ -383,7 +383,7 @@ class CallManager:
         try:
             await asyncio.wait_for(call._answer_ready.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            logger.warning(f"Call {call_id}: answer wait timed out ({timeout}s)")
+            logger.warning("Call %s: answer wait timed out (%ss)", call_id, timeout)
             return None
         return call.question_answer
 
@@ -391,7 +391,7 @@ class CallManager:
         call = self._calls.pop(call_id, None)
         if call:
             self._uuid_index.pop(call.audio_uuid, None)
-            logger.info(f"Cleaned up call {call_id}")
+            logger.info("Cleaned up call %s", call_id)
 
     def active_count(self) -> int:
         """Number of non-terminal (in-flight) calls — for the outbound cap."""

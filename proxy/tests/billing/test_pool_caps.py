@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -221,8 +222,8 @@ class TestThresholds:
         assert s.hit_text() == "the week is at 52% of the 50% cap"
         assert s.blocked_message() == (
             "The agent pool's Claude subscription cap is reached: the week is at "
-            "52% of the 50% cap. It clears as the accounts' windows reset; change "
-            "the cap in Setup → Usage.")
+            "52% of the 50% cap. It clears when the accounts' windows reset. An "
+            "admin can change the cap in Admin, Usage.")
         assert s.short_reason() == "Subscription pool cap reached (the week is at 52% of the 50% cap)"
 
     def test_warning_at_eighty_percent_of_a_cap(self, temp_db):
@@ -238,8 +239,8 @@ class TestThresholds:
         assert s.hit_text() == "the week is at $5.00 of the $5 cap"
         assert "Your ChatGPT" not in s.blocked_message()
         assert s.blocked_message(no_key=True).endswith(
-            "There is no API key to continue on. Connect one in User Settings → "
-            "AI Engines, or change the cap in User Settings → Usage.")
+            "There is no API key to continue on. Connect one in User Settings, "
+            "AI Engines. You can change the cap in User Settings, Usage.")
 
     def test_unknown_readings_never_hit(self, temp_db):
         _oauth("user-admin")

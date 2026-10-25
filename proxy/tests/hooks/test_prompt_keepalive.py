@@ -146,6 +146,7 @@ def _retired(request_id: str, *, gone: bool = False) -> dict:
 @pytest.fixture
 def prompt_session(monkeypatch):
     from unittest.mock import AsyncMock
+
     from auth.path_policy import SecurityContext
     sid = "sess-retire-test"
     monkeypatch.setattr(permission, "verify_session_match_async", AsyncMock(return_value=None))

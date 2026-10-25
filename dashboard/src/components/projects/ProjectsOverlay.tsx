@@ -3,12 +3,15 @@ import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '../../api/auth'
 import MarkdownContent from '../chat/MarkdownContent'
 import AppFrame from '../apps/AppFrame'
-import AppApprovalCard, { appNeedsApproval } from '../apps/AppApprovalCard'
+import AppApprovalCard from '../apps/AppApprovalCard'
 import { useChatStore } from '../../store/chatStore'
 import type { ChatPins, PinnedApp } from '../../api/apps'
 import PinnedFileRow from './PinnedFileRow'
 import { parseBoard, type BoardLane } from './projectBoard'
 import { LANE_STATUS, laneStatusOf, type LaneStatus } from '../../lib/status/chat'
+import { appNeedsApproval } from '../apps/AppApprovalCard.helpers'
+import { apiJson, withMessage } from '../../lib/http/apiJson'
+import { CARD } from '../ui/classes'
 
 // The Dock — the chat's unified panel surface, opened from the composer's
 // dock toggle. Panels compose by what the anchor chat carries:
@@ -75,13 +78,13 @@ function findBoardPath(nodes: TreeNode[], suffix: string): string | null {
   return null
 }
 
-// awaiting_user is ORANGE, not amber: the dock's identity accents (header
-// badge, orchestrator card) are amber now, and the needs-attention chip must
-// stay readable as its own signal beside them.
+// awaiting_user is the one warning: the dock's identity accents (header
+// badge, orchestrator card) read the information colour, so the
+// needs-attention chip stays readable as its own signal beside them.
 const STATUS_STYLE: Record<LaneStatus, string> = {
-  generating: 'bg-brand/10 text-brand border-brand/30',
-  awaiting_user: 'bg-orange-100 text-orange-700 border-orange-300 dark:bg-orange-900/30 dark:text-orange-300 dark:border-orange-700/50',
-  idle: 'bg-p-surface text-p-text-secondary border-p-border-light',
+  generating: 'bg-action-subtle text-link',
+  awaiting_user: 'bg-status-warning-bg text-status-warning-fg',
+  idle: 'bg-surface-muted text-secondary',
 }
 
 function StatusChip({ status }: { status: string }) {
@@ -90,28 +93,28 @@ function StatusChip({ status }: { status: string }) {
   // No dot inside the generating chip: in the unified live language the CARD
   // pulses while generating and a dot means only "finished, not opened yet".
   return (
-    <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-medium border ${style}`}>
+    <span className={`px-1.5 py-0.5 rounded-full text-3xs font-medium ${style}`}>
       {label}
     </span>
   )
 }
 
 // Unified live-card language (same as the sidebar rows / Active-now widget):
-// generating = pulsing brand-surface tint, no dot; finished-unread = the tint
+// generating = pulsing action-subtle tint, no dot; finished-unread = the tint
 // held steady + a dot beside the title; otherwise the plain card surface.
 function laneCardStateClass(status: string, unread: boolean): string {
   if (status === LANE_STATUS.GENERATING) {
-    return 'oto-row-live motion-reduce:animate-none bg-brand-surface ring-1 ring-inset ring-brand/35'
+    return 'oto-row-live motion-reduce:animate-none bg-action-subtle ring-1 ring-inset ring-action/35'
   }
-  if (unread) return 'bg-brand-surface ring-1 ring-inset ring-brand/30'
-  return 'bg-white dark:bg-p-surface'
+  if (unread) return 'bg-action-subtle ring-1 ring-inset ring-action/30'
+  return 'bg-surface-card'
 }
 
 function UnreadDot() {
   return (
     <span
-      title="New response — not opened yet"
-      className="inline-block w-1.5 h-1.5 rounded-full bg-brand shrink-0"
+      title="New response, not opened yet"
+      className="inline-block w-1.5 h-1.5 rounded-full bg-action shrink-0"
     />
   )
 }
@@ -153,9 +156,8 @@ export default function ProjectsOverlay({
   const { data: graph } = useQuery({
     queryKey: ['chat-project', chatId],
     queryFn: async () => {
-      const res = await apiFetch(`/v1/chats/${chatId}/project`)
-      if (!res.ok) throw new Error('Failed to fetch project')
-      return res.json() as Promise<{ project_id: string; chats: LaneRow[] }>
+      return apiJson<{ project_id: string; chats: LaneRow[] }>(`/v1/chats/${chatId}/project`)
+        .catch(withMessage('Failed to fetch project'))
     },
     enabled: isProjectChat,
     refetchInterval: 10_000,
@@ -246,8 +248,8 @@ export default function ProjectsOverlay({
   // section in BOTH dock flavors.
   const filePinsSection = filePins.length > 0 ? (
     <div className="mb-4">
-      <div className="border-t border-p-border-light/60 mb-3" />
-      <p className="text-[10px] font-semibold text-p-text-light uppercase tracking-wider mb-1.5">Pinned files</p>
+      <div className="border-t border-subtle mb-3" />
+      <p className="text-3xs font-semibold text-tertiary uppercase tracking-wider mb-1.5">Pinned files</p>
       <div className="space-y-1.5">
         {filePins.map((f) => <PinnedFileRow key={f.id} pin={f} />)}
       </div>
@@ -257,14 +259,14 @@ export default function ProjectsOverlay({
   // ── Chat dock (non-project chat): the pinned app IS the overlay ──────────
   if (!isProjectChat) {
     return (
-      <div className="flex-1 min-h-0 flex flex-col bg-p-bg pt-14" data-testid="projects-overlay">
+      <div className="flex-1 min-h-0 flex flex-col bg-surface-page pt-14" data-testid="projects-overlay">
         <div className="flex items-center justify-between px-4 py-1">
-          <h2 className="text-sm font-semibold text-p-text truncate">
+          <h2 className="text-sm font-semibold text-primary truncate">
             {chatApp?.title || chatApp?.slug || 'Chat dock'}
           </h2>
           <button
             onClick={onClose}
-            className="w-7 h-7 rounded-lg flex items-center justify-center text-p-text-light hover:text-p-text hover:bg-p-surface-hover transition-colors"
+            className="w-7 h-7 rounded-control flex items-center justify-center text-tertiary hover:text-primary hover:bg-surface-hover transition-colors"
             title="Close chat dock"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -278,7 +280,7 @@ export default function ProjectsOverlay({
           <div className="flex-1 min-h-0 overflow-y-auto">
             <div className="px-2 pb-8">
               {chatApp && (
-                <div className="rounded-xl border border-p-border-light overflow-hidden bg-white dark:bg-p-surface mb-4">
+                <div className={`${CARD} overflow-hidden mb-4`}>
                   <AppPanel key={chatApp.id} app={chatApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} testId="dock-chat-app" autoHeight />
                 </div>
               )}
@@ -288,7 +290,7 @@ export default function ProjectsOverlay({
         ) : chatApp ? (
           <AppPanel key={chatApp.id} app={chatApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} testId="dock-chat-app" />
         ) : (
-          <div className="flex-1 flex items-center justify-center text-sm text-p-text-light">
+          <div className="flex-1 flex items-center justify-center text-sm text-tertiary">
             Nothing docked to this chat.
           </div>
         )}
@@ -305,15 +307,15 @@ export default function ProjectsOverlay({
       <button
         key={c.id}
         onClick={() => onSelectChat(c.id)}
-        className={`w-full text-left px-3 py-2 rounded-xl border border-p-border-light hover:bg-p-surface-hover transition-colors flex items-center justify-between gap-2 ${
+        className={`w-full text-left px-3 py-2 rounded-card shadow-elevation-1 hover:bg-surface-hover transition-colors flex items-center justify-between gap-2 ${
           laneCardStateClass(status, unread)
         }`}
       >
         <span className="min-w-0 flex items-center gap-1.5">
           {unread && status !== LANE_STATUS.GENERATING && <UnreadDot />}
           <span className="min-w-0">
-            <span className="block text-xs font-medium text-p-text truncate">{c.title || c.id.slice(0, 8)}</span>
-            <span className="block text-[10px] text-p-text-light">{c.delegate_role === 'orchestrator' ? 'orchestrator' : 'lane'} · {c.agent}</span>
+            <span className="block text-xs font-medium text-primary truncate">{c.title || c.id.slice(0, 8)}</span>
+            <span className="block text-3xs text-secondary">{c.delegate_role === 'orchestrator' ? 'orchestrator' : 'lane'} · {c.agent}</span>
           </span>
         </span>
         <StatusChip status={status} />
@@ -329,18 +331,18 @@ export default function ProjectsOverlay({
     <div className="px-2 pt-14 pb-3">
       {/* Header */}
       <div className="flex items-center justify-between mb-1">
-        <h2 className="text-lg font-semibold text-p-text truncate">
+        <h2 className="text-lg font-display font-semibold text-primary truncate">
           {board?.title || projectId || 'Project'}
         </h2>
         <div className="flex items-center gap-2">
           {board?.status && (
-            <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wide bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-200 dark:border-amber-700/50">
+            <span className="px-2 py-0.5 rounded-full text-3xs font-semibold uppercase tracking-wide bg-status-info-bg text-status-info-fg">
               {board.status}
             </span>
           )}
           <button
             onClick={onClose}
-            className="w-7 h-7 rounded-lg flex items-center justify-center text-p-text-light hover:text-p-text hover:bg-p-surface-hover transition-colors"
+            className="w-7 h-7 rounded-control flex items-center justify-center text-tertiary hover:text-primary hover:bg-surface-hover transition-colors"
             title="Close project dock"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -349,21 +351,21 @@ export default function ProjectsOverlay({
           </button>
         </div>
       </div>
-      {/* Orchestrator card — amber, the delegating session's accent */}
+      {/* Orchestrator card — the information edge, the delegating session's accent */}
       {orchestrator && (
         <button
           onClick={() => onSelectChat(orchestrator.id)}
-          className={`w-full text-left mb-3 px-3 py-2 rounded-xl border-l-2 border-l-amber-500 dark:border-l-amber-400 border border-p-border-light hover:bg-p-surface-hover transition-colors flex items-center justify-between gap-2 ${
+          className={`w-full text-left mb-3 px-3 py-2 rounded-card shadow-elevation-1 border-l-2 border-l-status-info-solid hover:bg-surface-hover transition-colors flex items-center justify-between gap-2 ${
             laneCardStateClass(liveStatus(orchestrator.id, orchestrator.status), laneUnread(orchestrator.id))
           }`}
         >
           <span className="min-w-0 flex items-center gap-1.5">
             {laneUnread(orchestrator.id) && liveStatus(orchestrator.id, orchestrator.status) !== LANE_STATUS.GENERATING && <UnreadDot />}
             <span className="min-w-0">
-              <span className="block text-xs font-semibold text-p-text truncate">
+              <span className="block text-xs font-semibold text-primary truncate">
                 {orchestrator.title || 'Orchestrator'}
               </span>
-              <span className="block text-[10px] text-p-text-light">orchestrator · {orchestrator.agent}</span>
+              <span className="block text-3xs text-secondary">orchestrator · {orchestrator.agent}</span>
             </span>
           </span>
           <StatusChip status={liveStatus(orchestrator.id, orchestrator.status)} />
@@ -372,9 +374,9 @@ export default function ProjectsOverlay({
 
       {/* Lanes — the LIVE worker chats (the pulse cards). The board's own
           lane rows live in the board block below, never between these. */}
-      <p className="text-[10px] font-semibold text-p-text-light uppercase tracking-wider mb-1.5">Lanes</p>
+      <p className="text-3xs font-semibold text-tertiary uppercase tracking-wider mb-1.5">Lanes</p>
       {laneChats.length === 0 && (
-        <p className="text-xs text-p-text-light mb-3">No lanes yet.</p>
+        <p className="text-xs text-tertiary mb-3">No lanes yet.</p>
       )}
       <div className="space-y-1.5 mb-4">
         {laneChats.map(laneCard)}
@@ -384,7 +386,7 @@ export default function ProjectsOverlay({
           accretes them over time) — present but out of the way. */}
       {otherLanes.length > 0 && (
         <details className="mb-4">
-          <summary className="text-[10px] font-semibold text-p-text-light uppercase tracking-wider cursor-pointer select-none">
+          <summary className="text-3xs font-semibold text-tertiary uppercase tracking-wider cursor-pointer select-none">
             Other project lanes ({otherLanes.length})
           </summary>
           <div className="space-y-1.5 mt-1.5">
@@ -398,25 +400,25 @@ export default function ProjectsOverlay({
           Decisions/Hand-offs, and the collapsible full document. ── */}
       {(board || boardMd) && (
         <div className="mb-4">
-          <div className="border-t border-p-border-light/60 mb-3" />
-          <p className="text-[10px] font-semibold text-p-text-light uppercase tracking-wider mb-1.5">Board</p>
+          <div className="border-t border-subtle mb-3" />
+          <p className="text-3xs font-semibold text-tertiary uppercase tracking-wider mb-1.5">Board</p>
           {board?.goal && (
-            <p className="text-xs text-p-text-secondary mb-2">{board.goal}</p>
+            <p className="text-xs text-secondary mb-2">{board.goal}</p>
           )}
           {board && board.lanes.length > 0 && (
             <div className="space-y-1 mb-3">
               {board.lanes.map((lane: BoardLane, i: number) => (
                 <div
                   key={`${lane.name}-${i}`}
-                  className="px-3 py-1.5 rounded-lg border border-p-border-light/70 bg-white dark:bg-p-surface flex items-center justify-between gap-2"
+                  className={`px-3 py-1.5 ${CARD} flex items-center justify-between gap-2`}
                 >
                   <span className="min-w-0 flex items-center gap-2">
-                    <span className={`inline-block w-3.5 h-3.5 rounded border text-[9px] leading-[13px] text-center shrink-0 ${
+                    <span className={`inline-block w-3.5 h-3.5 rounded-sm border text-3xs leading-[13px] text-center shrink-0 ${
                       lane.done
-                        ? 'bg-emerald-500 border-emerald-500 text-white'
-                        : 'border-p-border bg-transparent text-transparent'
+                        ? 'bg-status-success-bg border-status-success-border text-status-success-fg'
+                        : 'border-default bg-transparent text-transparent'
                     }`}>✓</span>
-                    <span className="block text-xs text-p-text-secondary truncate">{lane.name}</span>
+                    <span className="block text-xs text-secondary truncate">{lane.name}</span>
                   </span>
                   <StatusChip status={lane.done ? 'idle' : lane.status || 'idle'} />
                 </div>
@@ -428,17 +430,17 @@ export default function ProjectsOverlay({
           {board && (board.decisions.length > 0 || board.handoffs.length > 0) && (
             <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-3 mb-3">
               {board.decisions.length > 0 && (
-                <div className="px-3 py-2 rounded-xl border border-p-border-light bg-white dark:bg-p-surface">
-                  <p className="text-[10px] font-semibold text-p-text-light uppercase tracking-wider mb-1">Decisions</p>
-                  <ul className="text-xs text-p-text-secondary space-y-1 list-disc list-inside">
+                <div className={`px-3 py-2 ${CARD}`}>
+                  <p className="text-3xs font-semibold text-tertiary uppercase tracking-wider mb-1">Decisions</p>
+                  <ul className="text-xs text-secondary space-y-1 list-disc list-inside">
                     {board.decisions.map((d, i) => <li key={i}>{d}</li>)}
                   </ul>
                 </div>
               )}
               {board.handoffs.length > 0 && (
-                <div className="px-3 py-2 rounded-xl border border-p-border-light bg-white dark:bg-p-surface">
-                  <p className="text-[10px] font-semibold text-p-text-light uppercase tracking-wider mb-1">Hand-offs</p>
-                  <ul className="text-xs text-p-text-secondary space-y-1 list-disc list-inside">
+                <div className={`px-3 py-2 ${CARD}`}>
+                  <p className="text-3xs font-semibold text-tertiary uppercase tracking-wider mb-1">Hand-offs</p>
+                  <ul className="text-xs text-secondary space-y-1 list-disc list-inside">
                     {board.handoffs.map((d, i) => <li key={i}>{d}</li>)}
                   </ul>
                 </div>
@@ -448,8 +450,8 @@ export default function ProjectsOverlay({
 
           {/* Full board document for everything the structured view skips. */}
           {boardMd && (
-            <details className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface px-3 py-2">
-              <summary className="text-[10px] font-semibold text-p-text-light uppercase tracking-wider cursor-pointer select-none">
+            <details className={`${CARD} px-3 py-2`}>
+              <summary className="text-3xs font-semibold text-tertiary uppercase tracking-wider cursor-pointer select-none">
                 Board file
               </summary>
               <div className="mt-2 text-sm">
@@ -467,7 +469,7 @@ export default function ProjectsOverlay({
       {/* The anchor chat's own docked dashboard rides below the lanes —
           content-height, the page scroll owns it. */}
       {chatApp && (
-        <div className="mt-4 rounded-xl border border-p-border-light overflow-hidden bg-white dark:bg-p-surface">
+        <div className={`mt-4 ${CARD} overflow-hidden`}>
           <AppPanel key={chatApp.id} app={chatApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} projectLanes={laneFeedRows} testId="dock-chat-app" autoHeight />
         </div>
       )}
@@ -477,7 +479,7 @@ export default function ProjectsOverlay({
   if (!projectApp) {
     // Lanes-only — one scroll container.
     return (
-      <div className="flex-1 min-h-0 overflow-y-auto bg-p-bg" data-testid="projects-overlay">
+      <div className="flex-1 min-h-0 overflow-y-auto bg-surface-page" data-testid="projects-overlay">
         {lanesPanel}
       </div>
     )
@@ -489,13 +491,13 @@ export default function ProjectsOverlay({
   // natural content height. No inner scroll containers: the frame adopts the
   // app's reported height, so the user scrolls the page, never a panel.
   return (
-    <div className="flex-1 min-h-0 bg-p-bg overflow-y-auto" data-testid="projects-overlay">
+    <div className="flex-1 min-h-0 bg-surface-page overflow-y-auto" data-testid="projects-overlay">
       {lanesPanel}
       {/* Same full-bleed px-2 inset as the lanes — the platform section and
           the dashboard read as one page, edges aligned on every breakpoint
           (operator ask; full width 2026-08-13). */}
       <div className="px-2 pb-8">
-        <div className="border-t border-p-border-light/60 mb-3" />
+        <div className="border-t border-subtle mb-3" />
         <AppPanel key={projectApp.id} app={projectApp} fallbackAgent={agent} onSendPrompt={onSendPrompt} projectLanes={laneFeedRows} testId="dock-project-app" autoHeight />
       </div>
     </div>

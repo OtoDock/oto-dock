@@ -33,7 +33,7 @@ vi.mock('../api/agents', () => ({
     }],
     isLoading: false,
   }),
-  useSetDefaultAgent: () => ({ mutate: vi.fn() }),
+  useSetDefaultAgent: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()) }),
   useUpdateAgent: () => ({ mutate: vi.fn() }),
 }))
 
@@ -50,7 +50,7 @@ vi.mock('../api/departments', () => ({
 
 vi.mock('../api/userUiPrefs', () => ({
   useMyUiPrefs: () => ({ data: {} }),
-  useUpdateMyUiPrefs: () => ({ mutate: vi.fn() }),
+  useUpdateMyUiPrefs: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()) }),
 }))
 
 // The map never reports WebGL unavailable here, so the page stays in map view.
@@ -84,7 +84,7 @@ describe('AgentsPage top bar over the map', () => {
     expect(screen.getByTestId('map-stub')).toBeInTheDocument()
     const bar = screen.getByTestId('agents-top-bar')
     expect(classesOf(bar)).toContain('dark')
-    expect(classesOf(bar)).toContain('bg-p-bg')
+    expect(classesOf(bar)).toContain('bg-surface-page')
     expect(bar).toContainElement(screen.getByRole('button', { name: 'Map' }))
 
     fireEvent.click(screen.getByRole('button', { name: 'Grid' }))

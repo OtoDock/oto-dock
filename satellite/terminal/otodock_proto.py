@@ -50,7 +50,7 @@ def encode_json(ftype: int, obj) -> bytes:
     return encode(ftype, json.dumps(obj).encode("utf-8"))
 
 
-async def read_frame(reader: "asyncio.StreamReader") -> "tuple[int, bytes] | None":
+async def read_frame(reader: asyncio.StreamReader) -> tuple[int, bytes] | None:
     """Read one frame. Returns ``(type, payload)``, or ``None`` on clean EOF.
     Raises ``ValueError`` on a malformed/oversized frame."""
     try:

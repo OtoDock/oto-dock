@@ -10,10 +10,14 @@
  * knobs remain.
  */
 
-import { useState } from 'react'
 import { useAudioSettings, useSaveAudioSettings, useAudioPolicy, useUpdateAudioPolicy } from '../../api/audio'
 import { usePhoneSettings, useSavePhoneSettings } from '../../api/phone'
-import { SectionCard, SettingRow, Toggle, SavedBadge } from '../ui/SettingsControls'
+import { SaveState, SectionCard, SettingRow } from '../ui/SettingsControls'
+import Switch from '../ui/Switch'
+import { useSaveState } from '../../hooks/useSaveState'
+import { useDialogs } from '../ui/dialogs'
+import Button from '../ui/Button'
+import { Input } from '../ui/Field'
 
 const AUDIO_ADV_DEFAULTS: Record<string, string> = {
   vad_threshold: '0.40', vad_silence_duration_ms: '350', vad_speech_pad_ms: '64',
@@ -31,104 +35,108 @@ const PHONE_ADV_DEFAULTS: Record<string, string> = {
 }
 
 function AdvancedSection() {
+  const dialogs = useDialogs()
   const { data: audioSettings } = useAudioSettings()
   const { data: phoneSettings } = usePhoneSettings()
   const saveAudio = useSaveAudioSettings()
   const savePhone = useSavePhoneSettings()
-  const [savedField, setSavedField] = useState('')
+  const { stateOf, run } = useSaveState()
 
-  const flash = (k: string) => { setSavedField(k); setTimeout(() => setSavedField(''), 2000) }
   const valueOf = (domain: 'audio' | 'phone', key: string) =>
     (domain === 'audio' ? audioSettings : phoneSettings)?.[key] ?? ''
-  const saveKey = (domain: 'audio' | 'phone', key: string, value: string) => {
-    const mut = domain === 'audio' ? saveAudio : savePhone
-    mut.mutate({ [key]: value }, { onSuccess: () => flash(key) })
-  }
 
-  const numField = (domain: 'audio' | 'phone', key: string, label: string, desc?: string) => (
-    <SettingRow key={key} label={label} description={desc}>
-      <input type="number" step="any" defaultValue={valueOf(domain, key)}
-        onBlur={e => { if (e.target.value !== valueOf(domain, key)) saveKey(domain, key, e.target.value) }}
-        className="w-20 px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text text-right" />
-      <SavedBadge show={savedField === key} />
+  // A refused value (the server names the key and its rule) is shown as a
+  // toast and the field returns to the stored value.
+  const numField = (domain: 'audio' | 'phone', key: string, label: string, info?: string, hint?: string) => (
+    <SettingRow key={key} label={label} description={hint} info={info} htmlFor={`adv-${key}`} save={stateOf(key)}>
+      <Input id={`adv-${key}`} type="number" step="any" defaultValue={valueOf(domain, key)}
+        onBlur={e => {
+          const input = e.target
+          if (input.value === valueOf(domain, key)) return
+          const mut = domain === 'audio' ? saveAudio : savePhone
+          void run(key, () => mut.mutateAsync({ [key]: input.value }), {
+            failTitle: `${label} was not saved`,
+            revert: () => { input.value = valueOf(domain, key) },
+          })
+        }}
+        className="max-w-20 text-right" />
     </SettingRow>
   )
 
-  const restore = () => {
-    if (!confirm('Restore all experimental tuning to defaults?')) return
-    saveAudio.mutate(AUDIO_ADV_DEFAULTS)
-    savePhone.mutate(PHONE_ADV_DEFAULTS, { onSuccess: () => flash('_all') })
+  const restore = async () => {
+    if (!(await dialogs.confirm({ title: 'Restore all experimental tuning to its defaults?', confirmLabel: 'Restore' }))) return
+    void run('_all', () => Promise.all([saveAudio.mutateAsync(AUDIO_ADV_DEFAULTS), savePhone.mutateAsync(PHONE_ADV_DEFAULTS)]),
+      { failTitle: 'The defaults were not restored' })
   }
 
   return (
     <div className="space-y-5">
       <div>
-        <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider mb-2">Voice Activity Detection</h4>
+        <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Voice Activity Detection</h4>
         <div className="space-y-2">
-          {numField('audio', 'vad_threshold', 'VAD Threshold', 'Speech probability threshold (0-1)')}
-          {numField('audio', 'vad_silence_duration_ms', 'Silence Duration (ms)', 'Silence before SPEECH_END')}
-          {numField('audio', 'vad_speech_pad_ms', 'Speech Pad (ms)', 'Speech confirmation period')}
+          {numField('audio', 'vad_threshold', 'VAD Threshold', undefined, 'Speech probability threshold, from 0 to 1')}
+          {numField('audio', 'vad_silence_duration_ms', 'Silence Duration in ms', 'Silence before SPEECH_END')}
+          {numField('audio', 'vad_speech_pad_ms', 'Speech Pad in ms', 'Speech confirmation period')}
           {numField('audio', 'vad_min_energy_rms', 'Min Energy RMS', 'Minimum RMS to accept as speech')}
-          {numField('audio', 'vad_silence_offset_ms', 'Silence Offset (ms)', 'Added to STT endpointing')}
+          {numField('audio', 'vad_silence_offset_ms', 'Silence Offset in ms', 'Added to STT endpointing')}
         </div>
       </div>
       <div>
-        <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider mb-2">Smart Turn (local)</h4>
-        <p className="text-[11px] text-p-text-light mb-2">
-          Local ONNX prosody model. Always available — pick Smart Turn vs the text classifier
-          per language under <span className="font-medium">Languages → Turn Classifier</span>.
+        <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Smart Turn</h4>
+        <p className="text-2xs text-tertiary mb-2">
+          A local model that hears when a speaker has finished. It's always available. Choose
+          it or the text classifier for each language in <span className="font-medium">Languages, Turn Classifier</span>.
         </p>
         <div className="space-y-2">
           {numField('audio', 'smart_turn_threshold', 'Smart Turn Threshold')}
           {numField('audio', 'smart_turn_onnx_threads', 'ONNX Threads')}
-          {numField('audio', 'smart_turn_audio_window_s', 'Audio Window (s)')}
+          {numField('audio', 'smart_turn_audio_window_s', 'Audio Window in s')}
         </div>
       </div>
       <div>
-        <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider mb-2">Barge-In (calls)</h4>
+        <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Barge-In on Calls</h4>
         <div className="space-y-2">
           {numField('phone', 'bargein_threshold', 'Threshold', 'Speech threshold during TTS')}
-          {numField('phone', 'bargein_debounce_ms', 'Debounce (ms)', 'Sliding window size')}
+          {numField('phone', 'bargein_debounce_ms', 'Debounce in ms', 'Sliding window size')}
           {numField('phone', 'bargein_chunk_ratio', 'Chunk Ratio', 'Required speech ratio in window')}
-          {numField('phone', 'bargein_silence_duration_ms', 'Silence Duration (ms)', 'Silence before SPEECH_END during barge-in')}
-          {numField('phone', 'bargein_timer_s', 'Min Speech (s)', 'Shorter speech over playback is ignored (acks, coughs)')}
-          {numField('phone', 'bargein_confirm_timeout_s', 'Confirm Timeout (s)', 'Paused playback resumes if no transcript by then')}
-          {numField('phone', 'bargein_resume_grace_s', 'Resume Grace (s)', 'Wait for the final transcript after speech ends')}
+          {numField('phone', 'bargein_silence_duration_ms', 'Silence Duration in ms', 'Silence before SPEECH_END during barge-in')}
+          {numField('phone', 'bargein_timer_s', 'Min Speech in s', 'Shorter speech over playback, like acks or coughs, is ignored')}
+          {numField('phone', 'bargein_confirm_timeout_s', 'Confirm Timeout in s', 'Paused playback resumes if no transcript by then')}
+          {numField('phone', 'bargein_resume_grace_s', 'Resume Grace in s', 'Wait for the final transcript after speech ends')}
         </div>
       </div>
       <div>
-        <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider mb-2">Turn Timing (calls)</h4>
+        <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Turn Timing on Calls</h4>
         <div className="space-y-2">
-          {numField('phone', 'turn_complete_timeout_s', 'Complete Timeout (s)', 'Timeout for complete sentences')}
-          {numField('phone', 'turn_incomplete_timeout_s', 'Incomplete Timeout (s)', 'Timeout for incomplete sentences')}
-          {numField('phone', 'turn_classifier_grace_s', 'Grace Period (s)', 'After "complete" classification')}
+          {numField('phone', 'turn_complete_timeout_s', 'Complete Timeout in s', 'Timeout for complete sentences')}
+          {numField('phone', 'turn_incomplete_timeout_s', 'Incomplete Timeout in s', 'Timeout for incomplete sentences')}
+          {numField('phone', 'turn_classifier_grace_s', 'Grace Period in s', 'After "complete" classification')}
         </div>
       </div>
       <div>
-        <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider mb-2">TTS Buffering (calls)</h4>
+        <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">TTS Buffering on Calls</h4>
         <div className="space-y-2">
           {numField('phone', 'tts_buffer_chars', 'Buffer Chars', 'Min chars before flushing to TTS')}
-          {numField('phone', 'tts_response_gap_s', 'Response Gap (s)', 'Pause between consecutive responses')}
+          {numField('phone', 'tts_response_gap_s', 'Response Gap in s', 'Pause between consecutive responses')}
         </div>
       </div>
       <div>
-        <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider mb-2">Fillers (calls)</h4>
-        <p className="text-[11px] text-p-text-light mb-2">
-          Backchannel sounds and thinking fillers are turned on or off per phone route
-          (Routes → edit). These are their timing knobs when enabled.
+        <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Fillers on Calls</h4>
+        <p className="text-2xs text-tertiary mb-2">
+          Each phone route turns backchannel sounds and thinking fillers on or off,
+          in Routes, Edit. These settings time them when they are on.
         </p>
         <div className="space-y-2">
           {numField('phone', 'backchannel_min_segments', 'Min Segments', 'Play after Nth segment')}
-          {numField('phone', 'backchannel_min_gap_s', 'Min Gap (s)', 'Minimum silence before playing')}
-          {numField('phone', 'thinking_filler_delay_s', 'Thinking Delay (s)', 'Delay before playing filler')}
+          {numField('phone', 'backchannel_min_gap_s', 'Min Gap in s', 'Minimum silence before playing')}
+          {numField('phone', 'thinking_filler_delay_s', 'Thinking Delay in s', 'Delay before playing filler')}
         </div>
       </div>
-      <div className="pt-2 border-t border-p-border-light">
-        <button onClick={restore} disabled={saveAudio.isPending || savePhone.isPending}
-          className="px-3 py-1.5 text-xs rounded-lg border border-p-border-light text-p-text-secondary hover:bg-gray-50 dark:hover:bg-gray-800">
+      <div className="pt-2 border-t border-subtle">
+        <Button variant="secondary" size="xs" onClick={restore} disabled={saveAudio.isPending || savePhone.isPending}>
           Restore Defaults
-        </button>
-        <SavedBadge show={savedField === '_all'} />
+        </Button>
+        <SaveState state={stateOf('_all')} />
       </div>
     </div>
   )
@@ -137,13 +145,14 @@ function AdvancedSection() {
 export function AdvancedTuningCard() {
   const { data: policy } = useAudioPolicy()
   const update = useUpdateAudioPolicy()
+  const { stateOf, run } = useSaveState()
   const show = policy?.show_experimental ?? false
   return (
     <SectionCard title="Advanced" defaultOpen={false}>
-      <SettingRow label="Show experimental tuning" description="VAD, smart-turn, barge-in, turn timing, fillers">
-        <Toggle checked={show} onChange={v => update.mutate({ show_experimental: v })} />
+      <SettingRow label="Show experimental tuning" info="VAD, smart-turn, barge-in, turn timing, fillers" save={stateOf('show_experimental')}>
+        <Switch aria-label="Show experimental tuning" checked={show} onChange={v => { void run('show_experimental', () => update.mutateAsync({ show_experimental: v }), { failTitle: 'The setting was not saved' }) }} />
       </SettingRow>
-      {show && <div className="pt-3 border-t border-p-border-light"><AdvancedSection /></div>}
+      {show && <div className="pt-3 border-t border-subtle"><AdvancedSection /></div>}
     </SectionCard>
   )
 }

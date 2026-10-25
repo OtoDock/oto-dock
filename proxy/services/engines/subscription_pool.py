@@ -40,18 +40,22 @@ All functions are synchronous (call via asyncio.to_thread).
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future, ThreadPoolExecutor
 import contextlib
 import dataclasses
 import logging
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import cast
 
-from core.execution_layer import DEFAULT_EXECUTION_PATH, SubscriptionHandle
+import psycopg
+
 from core import placement
-from storage.billing import subscription_status, subscription_store
+from core.execution_layer import SubscriptionHandle
 from services.billing import pool_caps as _pool_caps
 from services.engines import subscription_windows as _windows
+from storage.agents.schema import DEFAULT_EXECUTION_PATH
+from storage.billing import subscription_status, subscription_store
 
 logger = logging.getLogger(__name__)
 
@@ -284,7 +288,7 @@ def _session_registered_live(session_id: str) -> bool | None:
             return True
         from core.session.session_manager import find_layer_for_session
         return find_layer_for_session(session_id) is not None
-    except Exception:
+    except ImportError:
         return None
 
 
@@ -314,7 +318,7 @@ def mark_subscription_throttled(session_id: str, *, cooldown_s: int = _THROTTLE_
     if not sub_id:
         return
     if _rest_account(sub_id, time.time() + cooldown_s):
-        logger.info(f"Pool: throttled subscription {sub_id[:8]} for {cooldown_s}s (limit hit)")
+        logger.info("Pool: throttled subscription %s for %ss (limit hit)", sub_id[:8], cooldown_s)
     if cooldown_s >= _THROTTLE_COOLDOWN_S:
         _throttled_hard.add(sub_id)
         schedule_rebalance("provider limit")
@@ -407,12 +411,14 @@ def _rest_until_reset(session_id: str, ending) -> bool:
         held = _scoped_rests.get((sub_id, scope))
         if held is None or held[0] < until:
             _scoped_rests[(sub_id, scope)] = (until, now)
-        logger.info(f"Pool: subscription {sub_id[:8]} rests for {scope} until its window "
-                    f"resets ({int(until - now)}s, usage limit)")
+        logger.info("Pool: subscription %s rests for %s until its window "
+                    "resets (%ss, usage limit)",
+                    sub_id[:8], scope, int(until - now))
     else:
         if _rest_account(sub_id, until, window=window):
-            logger.info(f"Pool: subscription {sub_id[:8]} rests until its {window} window "
-                        f"resets ({int(until - now)}s, usage limit)")
+            logger.info("Pool: subscription %s rests until its %s window "
+                        "resets (%ss, usage limit)",
+                        sub_id[:8], window, int(until - now))
         _throttled_hard.add(sub_id)
     schedule_rebalance("provider limit")
     return True
@@ -432,14 +438,14 @@ def clear_rests_with_headroom(sub_id: str, reading) -> None:
             _throttled_until.pop(sub_id, None)
             _throttled_hard.discard(sub_id)
             _window_rests.pop(sub_id, None)
-            logger.info(f"Pool: subscription {sub_id[:8]} has {window} headroom again "
-                        f"(rest ended)")
+            logger.info("Pool: subscription %s has %s headroom again "
+                        "(rest ended)", sub_id[:8], window)
     for (rested_sub, scope), (_until, rested_at) in list(_scoped_rests.items()):
         if (rested_sub == sub_id and observed > rested_at
                 and _windows.has_headroom(reading, f"scoped:{scope}")):
             _scoped_rests.pop((rested_sub, scope), None)
-            logger.info(f"Pool: subscription {sub_id[:8]} has {scope} headroom again "
-                        f"(rest ended)")
+            logger.info("Pool: subscription %s has %s headroom again "
+                        "(rest ended)", sub_id[:8], scope)
 
 
 def throttle_from_cli_error(session_id: str, error_text: str) -> None:
@@ -544,7 +550,7 @@ def _window_readings(candidates: list[dict], now=None) -> dict:
         return {}
     try:
         readings = _windows.latest_readings(subscription_store, oauth, now)
-    except Exception:
+    except (psycopg.Error, ValueError):
         logger.debug("Pool: window sample read failed", exc_info=True)
         return {}
     return readings if isinstance(readings, dict) else {}
@@ -588,7 +594,7 @@ def _group_model(session_ids: list[str]) -> str:
     for sid in session_ids:
         try:
             row = task_store.get_chat_by_session(sid)
-        except Exception:
+        except psycopg.Error:
             continue
         model = (row or {}).get("model") or ""
         if model:
@@ -682,9 +688,10 @@ def _select(
         fallback = True
         if exhausted:
             logger.warning(
-                f"Pool: every candidate is out of window for {model or 'this spawn'} "
-                f"({', '.join(sorted(s[:8] for s in exhausted))}) — using the one "
-                f"that frees first; the provider may refuse until it resets"
+                "Pool: every candidate is out of window for %s "
+                "(%s) — using the one "
+                "that frees first; the provider may refuse until it resets",
+                model or 'this spawn', ', '.join(sorted(s[:8] for s in exhausted))
             )
     if not pool:
         return None
@@ -730,13 +737,16 @@ def _select(
         if handle.api_key or handle.oauth_access_token or handle.endpoint_url or handle.auth_type == "relay":
             subscription_store.increment_active_sessions(chosen["id"])
             logger.info(
-                f"Pool: acquired subscription {chosen['id'][:8]} for layer={chosen['layer']} "
-                f"(provider={chosen['provider']}, auth={handle.auth_type}, "
-                f"sessions={chosen['active_sessions'] + 1})"
+                "Pool: acquired subscription %s for layer=%s "
+                "(provider=%s, auth=%s, "
+                "sessions=%s)",
+                chosen['id'][:8], chosen['layer'], chosen['provider'], handle.auth_type,
+                chosen['active_sessions'] + 1
             )
             return handle
         logger.warning(
-            f"Pool: subscription {chosen['id'][:8]} has no usable credentials, trying next"
+            "Pool: subscription %s has no usable credentials, trying next",
+            chosen['id'][:8]
         )
     return None
 
@@ -786,20 +796,20 @@ def _sticky_subscription_id(scope_key: str) -> str | None:
     if time.monotonic() - _BOOT_MONOTONIC < _LIVENESS_BOOT_GRACE_S:
         try:
             sub = subscription_store.get_scope_binding(scope_key)
-        except Exception:
+        except psycopg.Error:
             return None
         return sub if isinstance(sub, str) and sub else None
     try:
         rows = list(subscription_store.list_scope_bindings(scope_key) or [])
-    except Exception:
+    except psycopg.Error:
         return None
     for row in rows:  # newest first
         sid = row.get("session_id") or ""
         if sid and _session_registered_live(sid) is False:
             _queue_write("dropping a ghost binding", subscription_store.delete_session_binding, sid)
             logger.info(
-                f"Pool: dropped ghost binding of dead session {sid[:8]} "
-                f"(scope no longer pinned by it)"
+                "Pool: dropped ghost binding of dead session %s "
+                "(scope no longer pinned by it)", sid[:8]
             )
             continue
         sub = row.get("subscription_id")
@@ -846,16 +856,17 @@ def _select_sticky(
         ]
         if others:
             logger.info(
-                f"Pool: scope-sticky account {pinned[:8]} is out of window for "
-                f"{model or 'this spawn'} — spawning on the pool's pick and moving the scope"
+                "Pool: scope-sticky account %s is out of window for "
+                "%s — spawning on the pool's pick and moving the scope",
+                pinned[:8], model or 'this spawn'
             )
             schedule_rebalance("sticky account exhausted")
             return None
     handle = _select(match, allowed_auth=allowed_auth, model=model)
     if handle:
         logger.info(
-            f"Pool: scope-sticky reuse of subscription {pinned[:8]} "
-            f"(scope already holds its credential file)"
+            "Pool: scope-sticky reuse of subscription %s "
+            "(scope already holds its credential file)", pinned[:8]
         )
     return handle
 
@@ -869,7 +880,7 @@ def _cap_status(layer: str, user_sub: str | None):
         if user_sub:
             return _pool_caps.evaluate("user", user_sub, layer)
         return _pool_caps.evaluate("platform", "", layer)
-    except Exception:
+    except Exception:  # noqa: BLE001  # a failed cap evaluation lets the spawn proceed uncapped
         logger.warning("Pool: cap evaluation failed, spawn proceeds uncapped", exc_info=True)
         return None
 
@@ -930,13 +941,14 @@ def acquire_subscription(
         scope_name = "user" if user_sub else "platform"
         if cap.on_reached != "continue":
             logger.info(
-                f"Pool: {scope_name} pool cap reached on layer={layer} "
-                f"({cap.hit_text()}) — spawn refused"
+                "Pool: %s pool cap reached on layer=%s "
+                "(%s) — spawn refused", scope_name, layer, cap.hit_text()
             )
             raise NoSubscriptionError("pool_cap", cap.blocked_message())
         logger.info(
-            f"Pool: {scope_name} pool cap reached on layer={layer} "
-            f"({cap.hit_text()}) — OAuth accounts excluded, continuing on a key"
+            "Pool: %s pool cap reached on layer=%s "
+            "(%s) — OAuth accounts excluded, continuing on a key",
+            scope_name, layer, cap.hit_text()
         )
         drop_oauth = True
 
@@ -951,7 +963,7 @@ def acquire_subscription(
         if not handle:
             # 2. Platform fallback, gated by the per-user Platform Auth toggle
             if not subscription_store.get_user_allow_platform_auth(user_sub):
-                logger.info(f"Pool: user {user_sub[:8]} has platform auth disabled, no subscription available")
+                logger.info("Pool: user %s has platform auth disabled, no subscription available", user_sub[:8])
             else:
                 # 3. Borrow ONLY admin API-type credentials — never an admin OAuth sub
                 platform = subscription_store.list_platform_pool(layer, provider or None)
@@ -964,7 +976,7 @@ def acquire_subscription(
                         f"user-scope acquired non-borrowable auth_type={handle.auth_type}"
                     )
                 else:
-                    logger.warning(f"Pool: no borrowable platform credentials for user {user_sub[:8]}, layer={layer}")
+                    logger.warning("Pool: no borrowable platform credentials for user %s, layer=%s", user_sub[:8], layer)
     else:
         # AGENT-SCOPE: the full platform pool (OAuth subscriptions allowed)
         platform = subscription_store.list_platform_pool(layer, provider or None)
@@ -976,8 +988,9 @@ def acquire_subscription(
     if handle is None:
         if drop_oauth:
             # ``continue`` with nothing to continue on: say so, rather than
-            # the generic "connect an account" classification.
-            raise NoSubscriptionError("pool_cap", cap.blocked_message(no_key=True))
+            # the generic "connect an account" classification (only a reached
+            # cap sets drop_oauth, above).
+            raise NoSubscriptionError("pool_cap", cast("_pool_caps.CapStatus", cap).blocked_message(no_key=True))
         return None
 
     if sticky_scope:
@@ -1279,7 +1292,7 @@ def release_subscription(session_id: str) -> None:
     # (the startup TTL prune is the backstop for a write that fails).
     _queue_write("releasing a session binding", _release_rows, session_id, sub_id)
     if sub_id:
-        logger.info(f"Pool: released subscription {sub_id[:8]} for session {session_id[:8]}")
+        logger.info("Pool: released subscription %s for session %s", sub_id[:8], session_id[:8])
 
 
 def release_unbound_seat(subscription_id: str, sticky_scope: str = "") -> None:
@@ -1303,8 +1316,8 @@ def release_unbound_seat(subscription_id: str, sticky_scope: str = "") -> None:
     _queue_write("releasing an unbound seat", subscription_store.decrement_active_sessions,
                  subscription_id)
     logger.info(
-        f"Pool: released unbound seat on subscription {subscription_id[:8]} "
-        f"(spawn abandoned before bind)"
+        "Pool: released unbound seat on subscription %s "
+        "(spawn abandoned before bind)", subscription_id[:8]
     )
 
 
@@ -1336,7 +1349,7 @@ def live_session_count(sub_id: str) -> int:
     if within_boot_grace():
         try:
             live_ids |= set(subscription_store.list_binding_session_ids(sub_id))
-        except Exception:
+        except psycopg.Error:
             logger.debug("live_session_count: persisted bindings unreadable", exc_info=True)
     return len(live_ids) + claims
 
@@ -1354,8 +1367,8 @@ def reconcile_active_sessions(sub_id: str) -> tuple[int, int]:
     live = live_session_count(sub_id)
     if stored > live and subscription_store.lower_active_sessions(sub_id, live):
         logger.info(
-            f"Pool: reconciled active_sessions of subscription {sub_id[:8]} "
-            f"{stored} → {live} (no live session backed the difference)"
+            "Pool: reconciled active_sessions of subscription %s "
+            "%s → %s (no live session backed the difference)", sub_id[:8], stored, live
         )
     return stored, live
 
@@ -1434,10 +1447,23 @@ def bind_session(
 
     if prior_sub:
         logger.info(
-            f"Pool: re-bound session {session_id[:8]} "
-            f"{prior_sub[:8]} → {subscription_id[:8]} (replaced seat released)"
+            "Pool: re-bound session %s "
+            "%s → %s (replaced seat released)",
+            session_id[:8], prior_sub[:8], subscription_id[:8]
         )
     return _queue_write("persisting a session binding", _persist)
+
+
+def bound_attribution(session_id: str) -> tuple[str | None, str | None]:
+    """The subscription and the payer the IN-MEMORY maps hold for a session,
+    ``None`` for each they do not know (a session outside the pool, or one
+    bound before a restart and not re-adopted); no store read. The
+    read-through twins are :func:`get_session_subscription` and
+    :func:`get_session_payer_sub`."""
+    with _session_maps_lock:
+        sub = _session_subscriptions.get(session_id) or None
+        ctx = _session_binding_ctx.get(session_id)
+    return sub, ((ctx[1] or "") if ctx is not None else None)
 
 
 def get_session_subscription(session_id: str) -> str | None:
@@ -1454,7 +1480,7 @@ def get_session_subscription(session_id: str) -> str | None:
         return sub
     try:
         row = subscription_store.get_session_binding(session_id)
-    except Exception:
+    except psycopg.Error:
         return None
     if isinstance(row, dict):
         return row.get("subscription_id") or None
@@ -1475,7 +1501,7 @@ def session_cost_billed(session_id: str) -> bool:
         return True
     try:
         row = subscription_store.get_subscription(sub_id)
-    except Exception:
+    except psycopg.Error:
         logger.debug("cost_billed: subscription lookup failed", exc_info=True)
         return True
     if not isinstance(row, dict):
@@ -1539,7 +1565,7 @@ def get_session_payer_sub(session_id: str) -> str:
         return ctx[1] or ""
     try:
         row = subscription_store.get_session_binding(session_id)
-    except Exception:
+    except psycopg.Error:
         return ""
     if isinstance(row, dict):
         return row.get("user_sub") or ""
@@ -1697,7 +1723,7 @@ def _move_seat(old_sub: str, new_sub: str, session_id: str = "") -> None:
         if session_id:
             try:
                 subscription_store.update_session_binding_sub(session_id, new_sub)
-            except Exception as e:
+            except psycopg.Error as e:
                 # persisted mirror only; memory is authoritative live
                 logger.debug("session binding rebind: %s", e)
     # The writer keeps it in order with the session's bind and release.
@@ -1823,13 +1849,12 @@ def _move_scope_group(
         _move_seat(_old, _new, sid)
         moved.append(sid)
         logger.info(
-            f"Pool: re-homed session {sid[:8]} onto subscription {_new[:8]} "
-            f"(was {_old[:8]}, {cause}"
-            + (f"; {reason}" if reason else "") + ")"
+            "Pool: re-homed session %s onto subscription %s (was %s, %s%s)",
+            sid[:8], _new[:8], _old[:8], cause, f"; {reason}" if reason else "",
         )
 
     token_fanout.fan_out(
-        deliverable, layer=layer, payload=payload,
+        deliverable, layer=layer, payload=cast("dict", payload),  # deliverable is empty without one
         on_written=_on_written, expected_sub_id=old_sub,
     )
 
@@ -1853,7 +1878,7 @@ def _rebind_delisted_sessions(*, reason: str) -> int:
             groups.setdefault((old_sub, layer, scope_sub), []).append(sid)
 
         moved: list[str] = []
-        replacements: dict[tuple[str, str, str], SubscriptionHandle | None] = {}
+        replacements: dict[tuple[str, str, str, str], SubscriptionHandle | None] = {}
         # A user action (reason set) logs stuck sessions loudly once; the
         # 5-minute worker pass retries the same situation quietly.
         stuck_log = logger.info if reason else logger.debug
@@ -2001,8 +2026,8 @@ def _rebalance_scopes(*, reason: str) -> int:
             # offline) must not retry at full tick rate.
             _scope_rebalance_last[scope_key] = now_mono
             logger.info(
-                f"Pool: rebalancing scope of {len(sids)} session(s) off "
-                f"subscription {old_sub[:8]} ({cause})"
+                "Pool: rebalancing scope of %s session(s) off "
+                "subscription %s (%s)", len(sids), old_sub[:8], cause
             )
             _move_scope_group(
                 old_sub, layer, scope_sub, sids,
@@ -2040,7 +2065,7 @@ def relay_llm_credentials(layer: str, provider: str, user_sub: str | None) -> tu
     try:
         token = relay_client.mint_session_token(user_sub or "")
     except relay_client.RelayNotConfigured as e:
-        logger.warning(f"Hosted LLM unavailable (provider={provider}): {e}")
+        logger.warning("Hosted LLM unavailable (provider=%s): %s", provider, e)
         return None
     base = app_config.OTODOCK_RELAY_BASE.rstrip("/")
     return token, f"{base}{path}"
@@ -2168,8 +2193,9 @@ def _log_refresh_failure(sub_id: str, vendor: str, out) -> None:
     elif out.error:
         detail = f" ({out.error})"
     logger.error(
-        f"{vendor} OAuth refresh failed for {sub_id[:8]}: "
-        f"{out.status or 'no response'}{detail}"
+        "%s OAuth refresh failed for %s: "
+        "%s%s",
+        vendor, sub_id[:8], out.status or 'no response', detail
     )
     if auth_shaped:
         first, count = _auth_fail_streaks.get(sub_id) or (time.time(), 0)
@@ -2187,11 +2213,13 @@ def _sustained_auth_dead(sub_id: str) -> bool:
     flips within ~2 h instead of retrying every 10 minutes forever
     (observed: OpenAI answering 401 invalid_request_error 118+ times)."""
     first, count = _auth_fail_streaks.get(sub_id) or (0.0, 0)
-    return (
+    # A recorded streak's first stamp is a time.time() value, never 0.0, so
+    # the chain ends on a comparison.
+    return cast("bool", (
         count >= _AUTH_STREAK_MIN_ATTEMPTS
         and first
         and time.time() - first >= _AUTH_STREAK_MIN_SPAN_S
-    )
+    ))
 
 
 def clear_refresh_backoff(sub_id: str) -> None:
@@ -2247,8 +2275,8 @@ def _refresh_oauth_token(
         if stored is None:
             stored = subscription_store.get_credential_data(sub_id)
         out = layer.refresh_oauth(refresh_token, stored)
-    except Exception as e:
-        logger.error(f"OAuth refresh for {sub_id[:8]} could not run: {e}")
+    except Exception as e:  # noqa: BLE001  # an engine's OAuth refresh raises whatever its vendor client does
+        logger.error("OAuth refresh for %s could not run: %s", sub_id[:8], e)
         return None, False
     if out.oauth_token is None:
         _log_refresh_failure(sub_id, vendor, out)
@@ -2259,7 +2287,7 @@ def _refresh_oauth_token(
     )
     new_cred.update(out.extra)
     subscription_store.update_credential_data(sub_id, new_cred)
-    logger.info(f"{vendor} OAuth token refreshed for {sub_id[:8]}")
+    logger.info("%s OAuth token refreshed for %s", vendor, sub_id[:8])
     _fan_out_rotated_token(sub)
     return out.oauth_token.get("accessToken"), False
 
@@ -2314,8 +2342,9 @@ def _fan_out_rotated_token(sub: dict) -> None:
         payload = layer.credential_file_payload(token, new_expiry, cred) if token else None
         if payload is None:
             logger.info(
-                f"Token fan-out for {sub_id[:8]}: no credential file to rewrite "
-                f"({len(sessions)} bound session(s) keep their current file)"
+                "Token fan-out for %s: no credential file to rewrite "
+                "(%s bound session(s) keep their current file)",
+                sub_id[:8], len(sessions)
             )
             return
 
@@ -2334,7 +2363,7 @@ def _fan_out_rotated_token(sub: dict) -> None:
             on_written=_on_written, expected_sub_id=sub_id,
         )
     except Exception:
-        logger.exception(f"Token fan-out failed for {sub_id[:8]}")
+        logger.exception("Token fan-out failed for %s", sub_id[:8])
 
 
 def fan_out_current_token(sub_id: str) -> None:
@@ -2443,7 +2472,8 @@ def _resolve_oauth_access_token(
             wait = min(60 * (2 ** (attempts - 1)), 600)
             if now_s - fail_time < wait:
                 logger.debug(
-                    f"OAuth refresh skipped for {sub_id[:8]} (backoff {wait}s, attempt {attempts})"
+                    "OAuth refresh skipped for %s (backoff %ss, attempt %s)",
+                    sub_id[:8], wait, attempts
                 )
                 return (token, expires_at) if usable else (None, 0)
 
@@ -2476,8 +2506,8 @@ def _resolve_oauth_access_token(
             )
             if stored_now.get("refreshToken") != refresh_token:
                 logger.info(
-                    f"OAuth refresh failure for {sub_id[:8]} discarded — "
-                    f"credential was replaced mid-attempt"
+                    "OAuth refresh failure for %s discarded — "
+                    "credential was replaced mid-attempt", sub_id[:8]
                 )
                 # The replacement may not have gone through the reconnect
                 # exchange (clear_refresh_backoff) — drop the dead grant's
@@ -2501,9 +2531,9 @@ def _resolve_oauth_access_token(
         attempts = (backoff_entry[1] + 1) if backoff_entry else 1
         _refresh_backoff[sub_id] = (now_s, attempts)
         logger.warning(
-            f"OAuth refresh failed for {sub_id[:8]} (attempt {attempts}); "
-            + (f"using stored token ({max(0, (expires_at - time.time() * 1000)) / 60000:.0f} min runway)"
-               if usable else "no usable token")
+            "OAuth refresh failed for %s (attempt %s); %s", sub_id[:8], attempts,
+            f"using stored token ({max(0, (expires_at - time.time() * 1000)) / 60000:.0f} min runway)"
+            if usable else "no usable token",
         )
         return (token, expires_at) if usable else (None, 0)
 
@@ -2525,11 +2555,11 @@ def _auto_expire_subscription(sub_id: str, reason: str = "invalid_grant (login g
         _refresh_backoff.pop(sub_id, None)
         _auth_fail_streaks.pop(sub_id, None)
         logger.error(
-            f"OAuth subscription {sub_id[:8]} expired: {reason}. The owner "
-            f"must reconnect the same account to revive it."
+            "OAuth subscription %s expired: %s. The owner "
+            "must reconnect the same account to revive it.", sub_id[:8], reason
         )
-    except Exception as e:
-        logger.error(f"Failed to auto-expire subscription {sub_id[:8]}: {e}")
+    except psycopg.Error as e:
+        logger.error("Failed to auto-expire subscription %s: %s", sub_id[:8], e)
 
 
 # ---------------------------------------------------------------------------

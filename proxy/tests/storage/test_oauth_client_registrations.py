@@ -6,8 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from storage.identity import credential_store
-from storage.identity import oauth_client_registrations as regs
+from storage.identity import credential_store, oauth_client_registrations as regs
 from storage.pg import get_conn
 
 ISSUER = "https://mcp.example.com"

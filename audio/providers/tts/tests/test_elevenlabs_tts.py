@@ -8,7 +8,6 @@ import json
 import httpx
 import pytest
 import websockets
-
 from audio.providers.tts import elevenlabs as el_mod
 from audio.providers.tts.base import UnsupportedProviderOperation
 from audio.providers.tts.elevenlabs import (
@@ -587,3 +586,106 @@ async def test_add_library_voice(monkeypatch):
     vid = await tts.add_library_voice("own1", "v9", name="Nikos")
     assert vid == "v9"
     assert "/v1/voices/add/own1/v9" in seen["url"]
+
+
+# ── Mid-utterance flush ────────────────────────────────────────────
+
+
+def _frames(fake_ws):
+    return [f for conn in fake_ws.frames for f in conn]
+
+
+async def test_flush_frames_without_a_close_and_the_later_is_last_closes(fake_ws):
+    """A complete sentence under the first-generation threshold: ``flush()``
+    sends the flush frame alone, the context stays open for more text, the
+    fake's final frame on that flush is ignored (the input is not done), and
+    the ``is_last`` later flushes again and closes once."""
+    tts = _provider()
+    await tts.connect()
+    tts.start_streaming_context()
+    await tts.send_text_chunk("Goodbye.")
+    await tts.flush()
+    receiving = asyncio.create_task(_collect(tts))
+    await asyncio.sleep(0.3)
+    assert not receiving.done()                       # the final on the flush did not end it
+    await tts.send_text_chunk("Thanks.", is_last=True)
+    chunks = await asyncio.wait_for(receiving, timeout=5)
+    await tts.close()
+    assert chunks == AUDIO_CHUNKS + AUDIO_CHUNKS       # both flushes spoke
+    frames = _frames(fake_ws)
+    flushes = [i for i, f in enumerate(frames) if f.get("flush")]
+    closes = [i for i, f in enumerate(frames) if f.get("close_context")]
+    assert len(flushes) == 2 and len(closes) == 1
+    assert frames[flushes[0] + 1]["text"] == "Thanks. "   # text followed the flush, no close between
+    assert closes[0] == flushes[1] + 1                     # the close rides the end of input only
+
+
+async def _collect(tts):
+    return [c async for c in tts.receive_audio()]
+
+
+async def test_flush_guards(fake_ws):
+    """No frame on the HTTP models, before the context was initialised, after
+    a cancel, after the end of input, and when nothing was sent since the
+    last flush; a second ``is_last`` sends nothing either."""
+    http = _provider(model_id="eleven_v3")
+    http.start_streaming_context()
+    await http.send_text_chunk("Hello.")
+    await http.flush()
+    assert fake_ws.frames == []
+
+    tts = _provider()
+    await tts.connect()
+    tts.start_streaming_context()
+    await tts.flush()                                   # nothing sent yet: no init, no flush
+    assert _frames(fake_ws) == []
+    await tts.send_text_chunk("Hello.")
+    await tts.flush()
+    await tts.flush()                                   # nothing new since the last flush
+    await asyncio.sleep(0.1)                            # the fake records what arrived
+    assert len([f for f in _frames(fake_ws) if f.get("flush")]) == 1
+    await tts.send_text_chunk("", is_last=True)
+    await asyncio.sleep(0.1)
+    before = len(_frames(fake_ws))
+    await tts.flush()                                   # after the end of input
+    await tts.send_text_chunk("", is_last=True)         # a second is_last
+    await tts.send_text_chunk("late", is_last=False)    # a late chunk
+    await asyncio.sleep(0.1)
+    assert len(_frames(fake_ws)) == before
+    assert await asyncio.wait_for(_collect(tts), timeout=5) == AUDIO_CHUNKS
+
+    tts.start_streaming_context()
+    await tts.send_text_chunk("Again.")
+    tts.cancel()
+    before = len(_frames(fake_ws))
+    await tts.flush()
+    await asyncio.sleep(0.1)
+    assert [f for f in _frames(fake_ws)[before:] if f.get("flush")] == []
+    await tts.close()
+
+
+async def test_text_after_a_mid_utterance_flush_defers_the_close_to_its_first_audio(fake_ws):
+    """The text after a flush starts a new generation: the close must not
+    ride the end-of-input flush (the server would restart the new text
+    mid-word, as on a fresh context) but wait for that generation's first
+    audio frame."""
+    tts = _provider()
+    await tts.connect()
+    tts.start_streaming_context()
+    await tts.send_text_chunk("First part.")
+    await tts.flush()
+    receiving = asyncio.create_task(_collect(tts))
+    await asyncio.sleep(0.3)                      # the flushed audio arrived: audio_started
+    ctx = tts._ctx
+    assert ctx.audio_started and ctx.flushed_open
+    await tts.send_text_chunk("Second part.")
+    assert not ctx.audio_started and not ctx.flushed_open
+    await tts.send_text_chunk("", is_last=True)
+    assert not ctx.close_sent                     # deferred: the new generation has no audio yet
+    chunks = await asyncio.wait_for(receiving, timeout=5)
+    await tts.close()
+    assert chunks == AUDIO_CHUNKS + AUDIO_CHUNKS
+    frames = _frames(fake_ws)
+    assert ctx.close_sent and frames[-1].get("close_context")   # after its first audio, once
+    assert sum(1 for f in frames if f.get("flush")) == 2
+    assert sum(1 for f in frames if f.get("close_context")) == 1

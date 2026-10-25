@@ -11,7 +11,6 @@ import pytest
 from services.mcp import mcp_autoupdate as au
 from storage.mcp import mcp_autoupdate_store as log_store
 
-
 # --- stand-in manifests --------------------------------------------------
 
 class _Srv:

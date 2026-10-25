@@ -27,15 +27,16 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from services.scheduler.scheduler_triggers import (  # noqa: E402
-    apscheduler_dow_to_standard,
+from services.scheduler.scheduler_triggers import (
     build_cron_trigger,
     standard_dow_to_apscheduler,
 )
+from storage.schema import apscheduler_dow_to_standard
 
 UTC = zoneinfo.ZoneInfo("UTC")
 
@@ -97,9 +98,9 @@ class TestBuildCronTriggerStandardDow:
         assert nxt.hour == 6
 
     def test_malformed_fields_still_raise(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError):
             build_cron_trigger("0 9 * * 8", UTC)
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError):
             build_cron_trigger("not a cron", UTC)
 
 
@@ -192,8 +193,7 @@ def _get_schedule(table: str, row_id: str) -> str | None:
 
 
 def _run_migrations():
-    from storage import pg as pg_pool
-    from storage import schema as pg_schema
+    from storage import pg as pg_pool, schema as pg_schema
     with pg_pool.get_conn() as conn:
         pg_schema.run_migrations(conn)
         conn.commit()

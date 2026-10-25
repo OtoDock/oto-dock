@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from telephony.dtmf_detect import DtmfDetector, _COL_FREQS, _DIGITS, _ROW_FREQS
+from telephony.dtmf_detect import _COL_FREQS, _DIGITS, _ROW_FREQS, DtmfDetector
 
 RATE = 8000
 

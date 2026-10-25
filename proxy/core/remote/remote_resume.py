@@ -13,27 +13,73 @@ import asyncio
 import contextlib
 import logging
 import time
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
 
-from core.events.common_events import CommonEvent, DONE, ERROR, TEXT
-from core.events import turn_ending
+import psycopg
+
 from core import placement
+from core.events import turn_ending
+from core.events.bg_command_state import reset_bg_command_registry
+from core.events.common_events import DONE, ERROR, TEXT, CommonEvent
+from core.execution_layer import RECONNECT_WAIT_S, MachineReach, ResumeVerdict
 from core.remote.remote_session_info import RemoteSessionInfo
 from core.session.session_state import (
     _record_session_use,
+    clear_starting,
+    mark_closing,
     reset_subagent_registry,
-    clear_starting, mark_closing, restore_session_state,
+    restore_session_state,
 )
-from core.events.bg_command_state import reset_bg_command_registry
-from core.execution_layer import RECONNECT_WAIT_S
 
 logger = logging.getLogger("remote-layer")
+
+#: A recovery adoption's first event when the satellite begins its replay
+#: (never forwarded to a viewer): ``{"truncated"}``, the satellite dropped
+#: the turn's start. The recovery deletes the rows the turn saved early only
+#: when the replay writes the whole turn again (``run_recovery``).
+REPLAY_BEGIN = "replay_begin"
 
 # How often a turn start waiting on a reconnecting machine looks again.
 _RECONNECT_POLL_S = 0.25
 
 
-class RemoteResumeMixin:
+# The resolved targets of the sessions a resume is probing (session id →
+# (when, target)): a settle asks where the machine stands between its probe
+# rounds and its watcher asks for the probe's future, all on the loop, so
+# they read what the probe resolved instead of the store.
+_resume_targets: dict[str, tuple[float, object]] = {}
+_RESUME_TARGET_TTL_S = 120.0
+_RESUME_TARGETS_MAX = 2048
+
+
+def _remember_resume_target(session_id: str, target) -> None:
+    # A store error (UNKNOWN) is not remembered: the next round asks again.
+    if target is ResumeVerdict.UNKNOWN:
+        return
+    now = time.monotonic()
+    if len(_resume_targets) >= _RESUME_TARGETS_MAX:
+        for sid, (at, _t) in list(_resume_targets.items()):
+            if now - at >= _RESUME_TARGET_TTL_S:
+                del _resume_targets[sid]
+        while len(_resume_targets) >= _RESUME_TARGETS_MAX:
+            del _resume_targets[next(iter(_resume_targets))]
+    _resume_targets[session_id] = (now, target)
+
+
+def forget_resume_target(session_id: str) -> None:
+    """Drop the session's cached resume target (a chat move changed where
+    the session lives: the next probe asks the store again)."""
+    _resume_targets.pop(session_id, None)
+
+
+if TYPE_CHECKING:
+    from core.remote.remote_host import RemoteLayerHost as _Host
+else:
+    _Host = object
+
+
+class RemoteResumeMixin(_Host):
     # --- Adopt, resume, liveness ---
 
     @staticmethod
@@ -232,16 +278,10 @@ class RemoteResumeMixin:
 
         # Ask the satellite to replay. Fire-and-forget: the replay arrives as
         # session_event frames on the queue we just created.
-        try:
-            await self._cm.send_fire_and_forget(machine_id, {
-                "type": "resume_session_stream",
-                "session_id": session_id,
-            })
-        except Exception as e:
-            logger.warning(
-                "adopt_session: resume_session_stream send failed for %s: %s",
-                session_id[:8], e,
-            )
+        await self._cm.send_fire_and_forget(machine_id, {
+            "type": "resume_session_stream",
+            "session_id": session_id,
+        })
 
         info.turn_active = True
         try:
@@ -265,6 +305,8 @@ class RemoteResumeMixin:
                     continue
                 if isinstance(raw, dict) and raw.get("type") == "_resume_replay_begin":
                     began = True
+                    yield CommonEvent(type=REPLAY_BEGIN,
+                                      data={"truncated": bool(raw.get("truncated"))})
                     if raw.get("truncated"):
                         yield CommonEvent(type=TEXT, data={
                             "content": "\n⚠ stream interrupted — earlier "
@@ -319,7 +361,7 @@ class RemoteResumeMixin:
         if not self.is_session_grace_held(session_id):
             return False
         deadline = time.monotonic() + timeout
-        while self.is_session_grace_held(session_id) and time.monotonic() < deadline:
+        while self.is_session_grace_held(session_id) and time.monotonic() < deadline:  # noqa: ASYNC110  # the grace ends in several owners of the link: a poll misses none
             await asyncio.sleep(_RECONNECT_POLL_S)
         return await self.is_session_alive(session_id)
 
@@ -346,7 +388,7 @@ class RemoteResumeMixin:
                 "session_id": session_id,
             }, timeout=5.0)
             return not bool(ack.get("alive", True))
-        except Exception:
+        except RuntimeError:
             return False
 
     def session_idle_seconds(self, session_id: str) -> float | None:
@@ -391,13 +433,98 @@ class RemoteResumeMixin:
 
     async def can_resume_session(
         self, session_id: str, *, agent_name: str = "", username: str = "",
-    ) -> bool:
+        external_home: str = "",
+    ) -> ResumeVerdict:
         """Decide whether to issue ``start_session(resume=True)`` for a
         dead/lost remote session — the ENGINE's answer
         (``RemoteEngineAdapter.can_resume``: Claude asks the satellite to
-        stat the session JSONL its CLI wrote, so a blind ``--resume``
+        read the session JSONL its CLI wrote, so a blind ``--resume``
         against a missing file cannot silently start a fresh session; Codex
-        answers from the thread id its rollout persists under).
+        answers from the thread id its rollout persists under). The target
+        comes from ``_resume_target``; a target that cannot be named now (a
+        store error, an offline machine) is UNKNOWN, never FRESH: the fresh
+        branch replaces the chat's context for good.
+        """
+        from core.session.session_manager import get_layer_by_path
+
+        # The store reads of the slow path run off the loop; the target is
+        # remembered for the probe's other questions (``resume_machine_reach``
+        # between the rounds, the watcher's future), which read nothing.
+        target = await asyncio.to_thread(self._resume_target, session_id, agent_name, username)
+        _remember_resume_target(session_id, target)
+        if isinstance(target, ResumeVerdict):
+            return target
+        machine_id, execution_path, resume_handle, agent_name = target
+        adapter = get_layer_by_path(execution_path).remote_adapter()
+        if adapter is None:
+            return ResumeVerdict.FRESH
+        return await adapter.can_resume(
+            self._cm, machine_id=machine_id, session_id=session_id,
+            agent_name=agent_name, username=username, resume_handle=resume_handle,
+            external_home=external_home,
+        )
+
+    def _resume_target_remembered(self, session_id: str, agent_name: str, username: str):
+        """The target ``can_resume_session`` resolved a moment ago, else the
+        slow resolve itself (a caller that asks before any probe)."""
+        held = _resume_targets.get(session_id)
+        if held is not None and time.monotonic() - held[0] < _RESUME_TARGET_TTL_S:
+            return held[1]
+        target = self._resume_target(session_id, agent_name, username)
+        _remember_resume_target(session_id, target)
+        return target
+
+    def resume_machine_reach(
+        self, session_id: str, *, agent_name: str = "", username: str = "",
+    ) -> MachineReach:
+        """Where the session's machine stands for an unanswered probe:
+        connected, dropped within the grace (worth a wait), or away past it
+        (refused at once). A session whose target cannot be named reads as
+        away; a local target as the platform's."""
+        target = self._resume_target_remembered(session_id, agent_name, username)
+        if target is ResumeVerdict.FRESH:
+            return MachineReach.LOCAL
+        if isinstance(target, ResumeVerdict):
+            return MachineReach.AWAY
+        machine_id = target[0]
+        if self._cm.is_connected(machine_id):
+            return MachineReach.CONNECTED
+        if self._cm.machine_dropped_recently(machine_id):
+            return MachineReach.AWAY_RECENT
+        return MachineReach.AWAY
+
+    def _resume_adapter(self, session_id: str, agent_name: str, username: str):
+        """``(adapter, machine_id)`` of the session's outstanding probe, or
+        None when the target names no machine or engine."""
+        from core.session.session_manager import get_layer_by_path
+        target = self._resume_target_remembered(session_id, agent_name, username)
+        if isinstance(target, ResumeVerdict):
+            return None
+        adapter = get_layer_by_path(target[1]).remote_adapter()
+        return (adapter, target[0]) if adapter is not None else None
+
+    def resume_probe_future(
+        self, session_id: str, *, agent_name: str = "", username: str = "",
+    ) -> asyncio.Future | None:
+        found = self._resume_adapter(session_id, agent_name, username)
+        if found is None:
+            return None
+        adapter, machine_id = found
+        return adapter.probe_future(self._cm, machine_id=machine_id, session_id=session_id)
+
+    def forget_resume_probe(
+        self, session_id: str, *, agent_name: str = "", username: str = "",
+    ) -> None:
+        found = self._resume_adapter(session_id, agent_name, username)
+        if found is not None:
+            adapter, machine_id = found
+            adapter.forget_probe(self._cm, machine_id=machine_id, session_id=session_id)
+
+    def _resume_target(
+        self, session_id: str, agent_name: str, username: str,
+    ) -> "tuple[str, str, str, str] | ResumeVerdict":
+        """``(machine_id, execution_path, resume_handle, agent_name)`` of a
+        dead or lost session, or the verdict when there is nothing to ask.
 
         Two paths to find the machine and the engine:
         1. Fast: ``_sessions[session_id]`` holds both.
@@ -411,10 +538,12 @@ class RemoteResumeMixin:
            dashboard uses (``user_remote_targets`` → ``agent_remote_targets``
            → ``local``), which is what the post-abort / post-reap auto-resume
            paths in ``ws/dashboard.py`` need to reach the right satellite.
+        A store error on the way is UNKNOWN (a blip must not empty a Codex
+        handle into a digest); no agent, a local target or no remote engine
+        is FRESH (nothing of the session exists on a machine); the offline
+        sentinel is UNKNOWN (the machine is away).
         """
-        from core.session.session_manager import (
-            get_layer_by_path, resolve_execution_path,
-        )
+        from core.session.session_manager import resolve_execution_path
         machine_id = ""
         execution_path = ""
         resume_handle = ""
@@ -430,8 +559,14 @@ class RemoteResumeMixin:
             try:
                 from storage.database import get_chat_by_session
                 chat = get_chat_by_session(session_id)
-            except Exception:
+            except ImportError:
                 chat = None
+            except psycopg.Error as e:
+                logger.warning(
+                    "can_resume_session: the chat of %s could not be read: %s",
+                    session_id[:8], e,
+                )
+                return ResumeVerdict.UNKNOWN
             stored_path = ""
             if chat:
                 agent_name = agent_name or chat.get("agent") or ""
@@ -448,35 +583,31 @@ class RemoteResumeMixin:
                 # admin-paired agents but may pick the wrong machine for
                 # user-paired sessions.
                 if not agent_name:
-                    return False
+                    return ResumeVerdict.FRESH
                 try:
-                    from storage import remote_store as _rs
+                    from services.remote import remote_status
                     from storage import database as _db
                     user_sub = (
                         _db.get_user_sub_by_username(username)
                         if username else None
                     )
-                    target, _reason = _rs.resolve_execution_target(
+                    target, _reason = remote_status.resolve_execution_target(
                         agent_name, user_sub,
                     )
-                except Exception as e:
+                except ImportError:
+                    return ResumeVerdict.FRESH
+                except psycopg.Error as e:
                     logger.warning(
                         "can_resume_session: target resolve failed for agent %r "
                         "user %r: %s",
                         agent_name, username, e,
                     )
-                    return False
-                if placement.is_local(target) or placement.is_offline_sentinel(target):
-                    # Not a remote target (or it's offline) — caller's layer
-                    # routing should already have skipped this codepath, but
-                    # be defensive.
-                    return False
+                    return ResumeVerdict.UNKNOWN
+                if placement.is_local(target):
+                    # Not a remote target — caller's layer routing should
+                    # already have skipped this codepath, but be defensive.
+                    return ResumeVerdict.FRESH
+                if placement.is_offline_sentinel(target):
+                    return ResumeVerdict.UNKNOWN
                 machine_id = target
-
-        adapter = get_layer_by_path(execution_path).remote_adapter()
-        if adapter is None:
-            return False
-        return await adapter.can_resume(
-            self._cm, machine_id=machine_id, session_id=session_id,
-            agent_name=agent_name, username=username, resume_handle=resume_handle,
-        )
+        return machine_id, execution_path, resume_handle, agent_name

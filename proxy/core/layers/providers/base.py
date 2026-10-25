@@ -7,11 +7,11 @@ loop provider-agnostic.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any
 
 import config as app_config
-
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -89,7 +89,7 @@ class ProviderAdapter(ABC):
         """Provider identifier: 'anthropic', 'openai', 'groq', etc."""
 
     @abstractmethod
-    async def stream_response(
+    def stream_response(
         self,
         *,
         api_key: str,
@@ -107,7 +107,6 @@ class ProviderAdapter(ABC):
         history, and SSE event emission. This method handles client creation,
         provider-specific formatting, streaming, and usage extraction.
         """
-        yield  # pragma: no cover  # make this an async generator
 
     @abstractmethod
     def format_tool_results(self, results: list[dict]) -> list[dict]:

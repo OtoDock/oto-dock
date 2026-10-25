@@ -110,13 +110,13 @@ def test_reap_task_sessions_noop_when_recent_or_non_task(monkeypatch):
 # loop, and synchronous at shutdown.
 # ---------------------------------------------------------------------------
 
-import asyncio  # noqa: E402
-import json  # noqa: E402
-import threading  # noqa: E402
+import asyncio
+import json
+import threading
 
-import pytest  # noqa: E402
+import pytest
 
-import config  # noqa: E402
+import config
 
 
 @pytest.fixture
@@ -226,6 +226,7 @@ def test_the_suite_writes_its_own_session_index():
     sessions dir, and so the two index files, under its scratch root."""
     import tempfile
     from pathlib import Path
+
     import config
     root = Path(tempfile.gettempdir())
     assert Path(config.SESSIONS_DIR).is_relative_to(root)

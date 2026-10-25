@@ -176,10 +176,10 @@ async def test_large_write_survives_busy_child():
 # proxy, and no more than SESSION_SPAWN_CONCURRENCY start at once.
 # ---------------------------------------------------------------------------
 
-import subprocess  # noqa: E402
+import subprocess
 
-import config  # noqa: E402
-from core.sandbox import pty_relay  # noqa: E402
+import config
+from core.sandbox import pty_relay
 
 
 async def _pty_output(argv, timeout=5.0) -> bytes:

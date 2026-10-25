@@ -1,7 +1,7 @@
 /**
  * Small dot-style badge indicating the live state of a remote satellite
- * connection or an agent's resolved execution target. Hover (desktop) or
- * tap (touch) reveals a detail tooltip.
+ * connection or an agent's resolved execution target. Hover (desktop), a
+ * tap or a long press (touch) and keyboard focus reveal the detail.
  *
  * Colour depends on state AND `scope`:
  *   online                      → green
@@ -13,24 +13,15 @@
  *
  * Renders nothing when `state` is null (local execution — no badge needed).
  *
- * The tooltip is rendered fixed-positioned and horizontally clamped to the
- * viewport, so it never bleeds past the screen edge on mobile.
+ * The detail is the shared Tooltip: portaled and clamped to the viewport,
+ * so neither the screen edge nor a transformed or blurred ancestor (the
+ * chat top bar's glass) misplaces it.
  */
 
-import { useEffect, useRef, useState } from 'react'
-import { PAIRING_SCOPE, type PairingScope } from '../lib/placement'
-import { MACHINE_STATE, isReachableMachine, type MachineState } from '../lib/status/machine'
-
-// The machine's live state (lib/status/machine.ts) plus the badge's own
-// word for a chat that fell back to the sandbox while its machine is away.
-// Exported for the callers that derive a badge state (TopBar).
-export const FELLBACK_LOCAL = 'fellback_local'
-export type BadgeState = MachineState | typeof FELLBACK_LOCAL | null
-
-// Which kind of target the dot represents. Drives severity colour: a user's
-// own machine going offline is a soft fallback (amber), an admin/platform
-// target going offline blocks everyone on the agent (red).
-type BadgeScope = PairingScope
+import Tooltip from './ui/Tooltip'
+import { PAIRING_SCOPE } from '../lib/placement'
+import { MACHINE_STATE, isReachableMachine } from '../lib/status/machine'
+import { FELLBACK_LOCAL, dotColorClass, type BadgeScope, type BadgeState } from './remoteBadgeDot'
 
 interface Props {
   state: BadgeState
@@ -52,21 +43,7 @@ const LABELS: Record<Exclude<BadgeState, null>, string> = {
   paused: 'Paused',
   disconnected: 'Disconnected',
   never_connected: 'Never connected',
-  fellback_local: 'Running locally (remote offline)',
-}
-
-// Fixed tooltip width (px). Fixed so we can clamp horizontally without a
-// measure pass; text wraps within it. Capped to the viewport in `place()`.
-const TIP_WIDTH = 224
-const TIP_MARGIN = 8
-
-function dotColorClass(state: Exclude<BadgeState, null>, scope?: BadgeScope): string {
-  if (state === MACHINE_STATE.ONLINE) return 'bg-green-500'
-  if (state === MACHINE_STATE.STALE || state === MACHINE_STATE.PAUSED || state === FELLBACK_LOCAL) return 'bg-amber-400'
-  // disconnected | never_connected
-  if (scope === PAIRING_SCOPE.USER) return 'bg-amber-400' // own machine → soft fallback
-  if (state === MACHINE_STATE.NEVER_CONNECTED) return 'bg-gray-400'
-  return 'bg-red-500' // admin/platform target offline → blocks everyone
+  fellback_local: 'Running locally while the remote machine is offline',
 }
 
 function formatAge(seconds: number): string {
@@ -102,28 +79,6 @@ export default function RemoteBadge({
   className = '',
   noTooltip = false,
 }: Props) {
-  const [showTip, setShowTip] = useState(false)
-  const [coords, setCoords] = useState<{ left: number; top: number; width: number } | null>(null)
-  const ref = useRef<HTMLSpanElement>(null)
-
-  // Close the tooltip on any outside interaction / scroll / resize so a
-  // tap-opened tooltip on mobile doesn't get stranded.
-  useEffect(() => {
-    if (!showTip) return
-    const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setShowTip(false)
-    }
-    const onMove = () => setShowTip(false)
-    document.addEventListener('mousedown', onDown)
-    window.addEventListener('scroll', onMove, true)
-    window.addEventListener('resize', onMove)
-    return () => {
-      document.removeEventListener('mousedown', onDown)
-      window.removeEventListener('scroll', onMove, true)
-      window.removeEventListener('resize', onMove)
-    }
-  }, [showTip])
-
   if (!state) return null
 
   const dotSize = size === 'xs' ? 'w-2 h-2' : 'w-2.5 h-2.5'
@@ -133,7 +88,7 @@ export default function RemoteBadge({
     return (
       <span className={`inline-flex items-center ${className}`}>
         <span
-          className={`inline-block ${dotSize} rounded-full ${colorClass} ring-1 ring-black/10 dark:ring-white/20`}
+          className={`inline-block ${dotSize} rounded-full ${colorClass}`}
           aria-label={LABELS[state]}
         />
       </span>
@@ -143,11 +98,11 @@ export default function RemoteBadge({
   // --- Tooltip content -----------------------------------------------------
   const reachable = isReachableMachine(state)
   const label = LABELS[state]
-  const parts: string[] = [machineName ? `${machineName} — ${label}` : label]
+  const parts: string[] = [machineName ? `${machineName}: ${label}` : label]
   if (state === MACHINE_STATE.ONLINE && heartbeatAgeS != null) {
     parts.push(`Last ping: ${formatAge(heartbeatAgeS)}`)
   } else if (state === MACHINE_STATE.STALE && heartbeatAgeS != null) {
-    parts.push(`Last ping: ${formatAge(heartbeatAgeS)} — likely disconnecting`)
+    parts.push(`Last ping: ${formatAge(heartbeatAgeS)}, likely disconnecting`)
   } else if ((state === MACHINE_STATE.DISCONNECTED || state === MACHINE_STATE.NEVER_CONNECTED
               || state === MACHINE_STATE.PAUSED) && lastSeenIso) {
     parts.push(`Last seen: ${formatIso(lastSeenIso)}`)
@@ -167,56 +122,28 @@ export default function RemoteBadge({
   }
   const tipText = parts.join(' · ')
 
-  // --- Positioning: fixed + clamped to the viewport (mobile-safe) ----------
-  const place = () => {
-    const el = ref.current
-    if (!el || typeof window === 'undefined') return
-    const r = el.getBoundingClientRect()
-    const width = Math.min(TIP_WIDTH, window.innerWidth - TIP_MARGIN * 2)
-    const center = r.left + r.width / 2
-    const left = Math.min(
-      Math.max(TIP_MARGIN, center - width / 2),
-      window.innerWidth - width - TIP_MARGIN,
-    )
-    setCoords({ left, top: r.bottom + 6, width })
-  }
-  const open = () => {
-    place()
-    setShowTip(true)
-  }
-
   return (
-    <span
-      ref={ref}
-      className={`relative inline-flex items-center ${className}`}
-      onMouseEnter={open}
-      onMouseLeave={() => setShowTip(false)}
-      onFocus={open}
-      onBlur={() => setShowTip(false)}
-      onClick={(e) => {
-        // Tap toggles on touch; stop the click from triggering an
-        // enclosing clickable row/card — the dot is its own affordance.
-        e.stopPropagation()
-        if (showTip) setShowTip(false)
-        else open()
-      }}
-      tabIndex={0}
-      role="button"
-      aria-label={tipText}
-    >
+    <Tooltip text={tipText} className={`relative inline-flex items-center ${className}`}>
       <span
-        className={`inline-block ${dotSize} rounded-full ${colorClass} ring-1 ring-black/10 dark:ring-white/20`}
-        aria-hidden="true"
-      />
-      {showTip && coords && (
-        <span
-          role="tooltip"
-          style={{ position: 'fixed', left: coords.left, top: coords.top, width: coords.width }}
-          className="z-[60] text-xs leading-snug px-2 py-1 rounded-sm break-words bg-p-text text-white dark:bg-p-surface dark:text-p-text border border-p-border-light shadow-lg"
-        >
-          {tipText}
-        </span>
-      )}
-    </span>
+        tabIndex={0}
+        role="button"
+        aria-label={tipText}
+        className="inline-flex items-center rounded-full"
+        onClick={(e) => {
+          // The dot is its own control inside a link or a clickable row: the
+          // click neither navigates nor opens what it sits in. A tap focuses
+          // the dot and the focus shows the detail; a dot that kept the focus
+          // after the detail closed (a scroll, Escape, an outside touch)
+          // shows it again.
+          e.preventDefault()
+          e.stopPropagation()
+          const dot = e.currentTarget
+          dot.blur()
+          dot.focus()
+        }}
+      >
+        <span className={`inline-block ${dotSize} rounded-full ${colorClass}`} aria-hidden="true" />
+      </span>
+    </Tooltip>
   )
 }

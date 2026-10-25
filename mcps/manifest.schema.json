@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.8.1/mcps/manifest.schema.json",
+  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.9.0/mcps/manifest.schema.json",
   "title": "OtoDock MCP package manifest",
   "description": "The catalog contract for the manifest.json of an OtoDock MCP package (OtoDock is a fair source project). It accepts every manifest the platform's parser (services/mcp/mcp_manifest_parse.py) and install gate (services/community/community_installer.py) accept, refuses what they refuse where JSON Schema can say it, and adds the community catalog's own rules: a git+ source pins a full commit, a remote source names its endpoint and a non-stdio transport. Unknown keys are allowed at the top level and in every block the parser leaves open: a catalog is additive.",
   "$comment": "Custom annotation keywords. x-otodock-since: the platform release that first reads the field; an entry that gives the field a value (not null, empty or false) needs platform_min_version at least that release. x-otodock-floors (on server.source): a list of {pattern, since}; a value matching the pattern needs that release. Validators ignore both keywords.",
@@ -163,11 +163,6 @@
     },
     "companion_app": {
       "$ref": "#/$defs/companionApp"
-    },
-    "device_high_risk_tools": {
-      "type": ["array", "null"],
-      "items": { "type": "string" },
-      "description": "Tools pinned to the critical permission tier. Not for community packages."
     },
     "replaces": {
       "type": ["array", "null"],
@@ -571,6 +566,12 @@
             "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
           },
           "description": "For a pypi: source, the distributions the installer may build from a source distribution when no wheel fits (SOURCE_BUILD_RE)."
+        },
+        "tool_timeout_sec": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600,
+          "description": "Seconds Codex gives one tool call of this server before it fails the call (Codex's own default is 60). For a server whose tools run for minutes: a media generation, a document conversion, an install. Claude Code keeps its own limit; a platform that does not read the key ignores it."
         }
       },
       "allOf": [
@@ -702,6 +703,32 @@
         "app_credential_fields": {
           "type": ["array", "null"],
           "items": { "$ref": "#/$defs/credentialField" }
+        },
+        "app_kinds": {
+          "type": ["object", "null"],
+          "description": "The kinds of vendor application an admin may register for the provider (an OAuth App, a GitHub App), each with its own admin fields, under a bundle key that records the kind in use; the first kind's fields must equal app_credential_fields (not expressible).",
+          "required": ["key", "kinds"],
+          "properties": {
+            "key": { "$ref": "#/$defs/envVarName" },
+            "kinds": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["kind", "label", "fields"],
+                "properties": {
+                  "kind": { "enum": ["oauth_app", "github_app"] },
+                  "label": { "$ref": "#/$defs/nonBlankString" },
+                  "mcp_token": { "enum": ["user", "installation"] },
+                  "fields": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "$ref": "#/$defs/credentialField" }
+                  }
+                }
+              }
+            }
+          }
         },
         "token_format": {
           "type": ["object", "null"],
@@ -944,7 +971,16 @@
       "type": ["object", "null"],
       "description": "A vendor webhook receiver (mcp_validate_webhooks). Validated only when available is true. When credentials.oauth is declared too, its provider_id must equal oauth.provider_id (not expressible).",
       "properties": {
-        "available": { "type": "boolean" }
+        "available": { "type": "boolean" },
+        "app_webhook": {
+          "type": ["object", "null"],
+          "description": "A GitHub App's one webhook: the app-level secret's bundle key and the payload path of the installation a delivery belongs to (routed on /v1/webhooks/<provider>/app; excludes workspace_id_path).",
+          "required": ["secret_credential_key", "installation_id_path"],
+          "properties": {
+            "secret_credential_key": { "$ref": "#/$defs/envVarName" },
+            "installation_id_path": { "type": "string", "pattern": "^body\\." }
+          }
+        }
       },
       "if": {
         "required": ["available"],

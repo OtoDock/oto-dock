@@ -12,14 +12,15 @@ Environment variables (set by core/sandbox/env_builder.py in the CLI's subproces
 """
 
 import contextlib
+import http.client
 import json
 import os
 import re
 import sys
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 # The platform's tool vocabulary by ROLE — a byte twin of
 # ``core/events/tool_roles.py:TOOL_ROLES`` (this script runs inside the CLI's
@@ -62,6 +63,15 @@ TOOL_ROLES = {
     "request_user_input": "question",
     "CodexEscalation": "escalation",
     "CodexTerminalInput": "escalation",
+    "view_image": "read",
+    "spawn_agent": "subagent",
+    "send_input": "subagent",
+    "resume_agent": "subagent",
+    "wait_agent": "subagent",
+    "close_agent": "subagent",
+    "list_mcp_resources": "discovery",
+    "list_mcp_resource_templates": "discovery",
+    "read_mcp_resource": "discovery",
 }
 
 # Roles whose calls already have dedicated rich rendering (the question
@@ -121,7 +131,8 @@ def _binary_blocks(tool_result) -> list:
             continue
         kind = block.get("type")
         if kind == _IMAGE_BLOCK:
-            src = block.get("source") if isinstance(block.get("source"), dict) else {}
+            source = block.get("source")
+            src = source if isinstance(source, dict) else {}
             data = src.get("data") or block.get("data") or ""
             mime = src.get("media_type") or block.get("mimeType") or ""
         elif kind == _RESOURCE_BLOCK and isinstance(block.get(_RESOURCE_BLOCK), dict):
@@ -190,15 +201,15 @@ def _extract_summary(tool_name: str, tool_input: dict, result_text: str) -> str:
     if role == "search":
         if not result_text.strip():
             return "no matches"
-        lines = [l for l in result_text.strip().splitlines() if l.strip()]
-        return f"{len(lines)} results"
+        found = [l for l in result_text.strip().splitlines() if l.strip()]
+        return f"{len(found)} results"
 
     # A glob: file count
     if role == "glob":
         if not result_text.strip():
             return "no files"
-        lines = [l for l in result_text.strip().splitlines() if l.strip()]
-        return f"{len(lines)} files"
+        found = [l for l in result_text.strip().splitlines() if l.strip()]
+        return f"{len(found)} files"
 
     # A read: line count
     if role == "read":
@@ -428,7 +439,7 @@ def _post(proxy_url: str, api_key: str, payload: bytes, *, timeout: float) -> di
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read() or b"{}")
             return body if isinstance(body, dict) else {}
-    except Exception:
+    except (OSError, http.client.HTTPException, ValueError):
         return {}
 
 

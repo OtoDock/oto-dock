@@ -88,7 +88,7 @@ class TransportHarness:
         self._conn_ready.set()
         # Keep the handler alive until the transport closes (production
         # awaits run_call here).
-        while not self.conn.is_closed:
+        while not self.conn.is_closed:  # noqa: ASYNC110  # the transport's closed flag: the connection has no closed event
             await asyncio.sleep(0.01)
         await asyncio.sleep(0.05)  # let close() finish with the socket
         self._handler_done.set()

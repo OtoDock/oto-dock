@@ -18,8 +18,7 @@ from api.mcp import credentials as credentials_api
 from auth.providers import UserContext, get_current_user
 from services.mcp import mcp_manifest_parse, mcp_registry
 from services.oauth import mcp_authorization as ma, oauth_account_store
-from storage.identity import credential_store
-from storage.identity import oauth_client_registrations as regs
+from storage.identity import credential_store, oauth_client_registrations as regs
 from storage.pg import get_conn
 from tests.auth.test_mcp_authorization_discovery import ISSUER, RESOURCE
 from tests.auth.test_oauth_mcp_authorization_flow import MCP, PROVIDER, _manifest_data

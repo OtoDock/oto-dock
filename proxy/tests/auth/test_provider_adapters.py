@@ -15,7 +15,6 @@ Ollama, LiteLLM via ``OpenAIAdapter`` inheritance) get the default for free.
 
 import asyncio
 
-
 _SAMPLE_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/wcAAwAB/epv2AIAAAAASUVORK5CYII="
 
 
@@ -85,7 +84,10 @@ def test_ollama_inherits_openai_format():
 # the non-reasoning case is a registry-less id the flag lookup answers False for.
 
 from core.layers.providers import anthropic_adapter
-from core.layers.providers.anthropic_adapter import AnthropicAdapter, _with_history_breakpoint
+from core.layers.providers.anthropic_adapter import (
+    AnthropicAdapter,
+    _with_history_breakpoint,
+)
 
 
 class _FakeMsg:
@@ -543,7 +545,9 @@ def test_anthropic_server_tool_result_block_yields_tool_result(monkeypatch):
 
 from core.layers.providers import openai_adapter as _oa_mod
 from core.layers.providers.openai_compat_adapter import (
-    GroqAdapter, OllamaAdapter, OpenAICompatibleAdapter,
+    GroqAdapter,
+    OllamaAdapter,
+    OpenAICompatibleAdapter,
 )
 
 _TOOL = [{"name": "t", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
@@ -1006,7 +1010,7 @@ def test_responses_history_replays_web_search_items_within_the_turn_only():
 
 def test_calculate_cost_adds_the_web_search_fee(monkeypatch):
     from core.layers.providers.base import ProviderUsage
-    monkeypatch.setattr(_oa_mod.app_config, "get_model_pricing",
+    monkeypatch.setattr("configuration.models.get_model_pricing",
                         lambda m, p="": (1.0, 2.0, 0.0, 0.0))
     monkeypatch.setattr(_oa_mod.app_config, "WEB_SEARCH_USD_PER_REQUEST", 0.01, raising=False)
     cost = OpenAIAdapter().calculate_cost(

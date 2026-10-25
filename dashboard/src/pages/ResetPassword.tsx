@@ -1,6 +1,9 @@
 import { useState } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { resetPassword } from '../api/auth'
+import { errorText } from '../lib/http/apiJson'
+import Button from '../components/ui/Button'
+import { Input } from '../components/ui/Field'
 
 export default function ResetPassword() {
   const [searchParams] = useSearchParams()
@@ -15,13 +18,13 @@ export default function ResetPassword() {
 
   if (!token) {
     return (
-      <div className="flex items-center justify-center min-h-screen bg-p-bg">
+      <div className="flex items-center justify-center min-h-screen bg-hero-bg">
         <div className="w-full max-w-sm mx-4">
-          <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-6 shadow-xs text-center">
-            <h1 className="text-xl font-semibold text-p-text mb-2">Invalid Link</h1>
-            <p className="text-sm text-p-text-secondary mb-4">This password reset link is invalid or has expired.</p>
+          <div className="bg-surface-overlay text-primary rounded-hero shadow-elevation-4 p-6 text-center">
+            <h1 className="font-display text-xl font-semibold text-primary mb-2">Invalid Link</h1>
+            <p className="text-sm text-secondary mb-4">This password reset link is invalid or has expired.</p>
             <button onClick={() => navigate('/')}
-              className="px-4 py-2 text-sm font-medium text-brand hover:underline">
+              className="px-4 py-2 text-sm font-medium text-link hover:underline">
               Go to login
             </button>
           </div>
@@ -41,8 +44,8 @@ export default function ResetPassword() {
     try {
       await resetPassword(token, newPassword)
       setSuccess(true)
-    } catch (err: any) {
-      setError(err.message || 'Password reset failed')
+    } catch (err) {
+      setError(errorText(err) || 'Password reset failed')
     } finally {
       setLoading(false)
     }
@@ -50,17 +53,16 @@ export default function ResetPassword() {
 
   if (success) {
     return (
-      <div className="flex items-center justify-center min-h-screen bg-p-bg">
+      <div className="flex items-center justify-center min-h-screen bg-hero-bg">
         <div className="w-full max-w-sm mx-4">
-          <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-6 shadow-xs text-center">
-            <h1 className="text-xl font-semibold text-p-text mb-2">Password Reset</h1>
-            <p className="text-sm text-green-600 dark:text-green-400 mb-4">
+          <div className="bg-surface-overlay text-primary rounded-hero shadow-elevation-4 p-6 text-center">
+            <h1 className="font-display text-xl font-semibold text-primary mb-2">Password Reset</h1>
+            <p className="text-sm text-status-success-fg mb-4">
               Your password has been reset successfully.
             </p>
-            <button onClick={() => navigate('/')}
-              className="px-4 py-2 text-sm font-medium text-white bg-brand hover:bg-brand-hover rounded-lg">
+            <Button variant="primary" size="md" onClick={() => navigate('/')}>
               Sign In
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -68,33 +70,31 @@ export default function ResetPassword() {
   }
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-p-bg">
+    <div className="flex items-center justify-center min-h-screen bg-hero-bg">
       <div className="w-full max-w-sm mx-4">
-        <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-6 shadow-xs">
-          <h1 className="text-xl font-semibold text-p-text mb-1">Set New Password</h1>
-          <p className="text-sm text-p-text-secondary mb-6">Choose a strong password for your account.</p>
+        <div className="bg-surface-overlay text-primary rounded-hero shadow-elevation-4 p-6">
+          <h1 className="font-display text-xl font-semibold text-primary mb-1">Set New Password</h1>
+          <p className="text-sm text-secondary mb-6">Choose a strong password for your account.</p>
 
-          {error && <div className="text-sm text-p-accent-red mb-4">{error}</div>}
+          {error && <div className="text-sm text-status-danger-fg mb-4">{error}</div>}
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
-              <label className="block text-xs font-medium text-p-text-secondary mb-1">New Password</label>
-              <input type="password" value={newPassword}
+              <label className="block text-xs font-medium text-secondary mb-1">New Password</label>
+              <Input type="password" value={newPassword}
                 onChange={e => setNewPassword(e.target.value)}
-                required autoComplete="new-password" autoFocus
-                className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+                required autoComplete="new-password" autoFocus className="h-control-lg" />
             </div>
             <div>
-              <label className="block text-xs font-medium text-p-text-secondary mb-1">Confirm Password</label>
-              <input type="password" value={confirmPassword}
+              <label className="block text-xs font-medium text-secondary mb-1">Confirm Password</label>
+              <Input type="password" value={confirmPassword}
                 onChange={e => setConfirmPassword(e.target.value)}
-                required autoComplete="new-password"
-                className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+                required autoComplete="new-password" className="h-control-lg" />
             </div>
-            <button type="submit" disabled={loading}
-              className="w-full px-4 py-2 text-sm font-medium text-white bg-brand hover:bg-brand-hover rounded-lg disabled:opacity-50 transition-colors">
+            <Button variant="primary" size="lg" type="submit" disabled={loading}
+              className="w-full">
               {loading ? 'Resetting...' : 'Reset Password'}
-            </button>
+            </Button>
           </form>
         </div>
       </div>

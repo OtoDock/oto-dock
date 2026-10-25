@@ -12,32 +12,33 @@ import contextlib
 import logging
 import time
 
-import config
-
-from transport.base import FRAME_AUDIO, FRAME_HANGUP, MediaTransport, TransportError
+from audio.providers.tts.base import TTSProvider
 from audio.providers.vad.base import VadEvent, VadState
 from audio.providers.vad.silero import SileroVad
-from audio.providers.tts.base import TTSProvider
 from audio.streaming.lang import base_lang
+
+import config
 from ambience import load_ambience
+from background import spawn
 from breath import load_breath
-from voice_texture import VoiceTexture
-from proxy.llm_factory import create_llm_backend
-from proxy.client import report_turn_classifier_usage
 from config_manager import ConfigManager, PhoneRoute
 from fillers import filler_cache
+from proxy.client import report_relisten_usage, report_turn_classifier_usage
+from proxy.llm_factory import create_llm_backend
+from transport.base import FRAME_AUDIO, FRAME_HANGUP, MediaTransport, TransportError
+from voice_texture import VoiceTexture
 
-from .state import CallState
 from .audio_tap import OutgoingAudioTap
-from .providers import build_stt, build_tts, build_turn_classifier, filler_key_for
-from .vad_serial import SerializedVad
-from .playback import PlaybackMixin
-from .turn import TurnMixin
-from .outbound import OutboundMixin
-from .llm import LlmStreamingMixin
-from .pin_gate import PinGateMixin
 from .call_control import CallControlMixin
 from .language import LanguageMixin
+from .llm import LlmStreamingMixin
+from .outbound import OutboundMixin
+from .pin_gate import PinGateMixin
+from .playback import PlaybackMixin
+from .providers import build_stt, build_tts, build_turn_classifier, filler_key_for
+from .state import CallState
+from .turn import TurnMixin
+from .vad_serial import SerializedVad
 
 logger = logging.getLogger("pipeline")
 
@@ -86,14 +87,24 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
         self._audiosocket_uuid = audiosocket_uuid or (conn.call_uuid or "")
         self._caller_info: dict = caller_info or {}
 
-        # A call is locked to one language (the route's). Normalise to a base
-        # code (en/el/de) — the form the voices map, STT, and fillers all use.
+        # A call starts in the route's language; a route that detects moves it
+        # to the caller's (pipeline/language.py). Normalise to a base code
+        # (en/el/de) — the form the voices map, STT, and fillers all use.
         self._locked_language: str = base_lang(self.route.language)
 
         # Resolve the route's STT/TTS providers (route override → call default)
         # + the effective filler toggles, then build one of each for this call.
         self._route_settings = self.cfg.resolve_route_settings(self.route)
-        self.stt = build_stt(self.cfg, self._route_settings.stt_provider)
+
+        def build_route_stt():
+            return build_stt(self.cfg, self._route_settings.stt_provider)
+        # A route that follows the caller's language gets the streams and
+        # the tracker (pipeline/language.py) unless detection is off,
+        # unavailable or not loaded yet; any other the plain provider.
+        if getattr(self.route, "language_detect", False):
+            self.stt = self._language_stt(build_route_stt, self._locked_language, self._rate_in)
+        else:
+            self.stt = build_route_stt()
         # Silero rides one worker thread: inference off the event loop (its
         # p99 spikes stalled the paced TTS sender — the crackle) and mode
         # swaps serialized against it (audit F11). See vad_serial.py.
@@ -166,16 +177,17 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
         # each other.  Collaborators (conn/cfg/route/stt/vad/tts/llm/providers)
         # stay as direct attributes above.
         self.state = CallState()
-        # The route's language is the call's unless the route identifies the
-        # caller's (pipeline/language.py locks it on the first utterance).
-        self.state._language_locked = not getattr(self.route, "language_detect", False)
+        # The route's language is the call's unless the tracker reads the
+        # caller's (pipeline/language.py; final after a few seconds of speech).
+        self.state._language_locked = self._language_tracker is None
 
     async def run(self) -> None:
         """Run the full call pipeline until hangup or timeout."""
         self.state._running = True
         logger.info(
-            f"[{self.conn.peer_addr}] Pipeline started "
-            f"(agent={self.agent_model}, outbound={self._is_outbound})"
+            "[%s] Pipeline started "
+            "(agent=%s, outbound=%s)",
+            self.conn.peer_addr, self.agent_model, self._is_outbound
         )
 
         # The debug switch: every outgoing frame of this call, saved as a
@@ -221,8 +233,8 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                     backchannel_phrases=self.cfg.backchannel_phrases,
                     thinking_phrases=self.cfg.thinking_phrases,
                 )
-            except Exception as e:
-                logger.warning(f"[{self.conn.peer_addr}] Filler cache init failed: {e}")
+            except Exception as e:  # noqa: BLE001  # fillers are optional, the call runs without them
+                logger.warning("[%s] Filler cache init failed: %s", self.conn.peer_addr, e)
 
             # The turn classifier, built in the background: the Smart Turn
             # load runs off the loop (seconds on a process's first load) and
@@ -238,9 +250,9 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 try:
                     await self.stt.start(language=self._locked_language, sample_rate=self._rate_in, interim_results=True)
                     self.state._stt_active = True
-                    logger.info(f"[{self.conn.peer_addr}] STT pre-connected")
-                except Exception as e:
-                    logger.warning(f"[{self.conn.peer_addr}] STT pre-connect failed: {e}")
+                    logger.info("[%s] STT pre-connected", self.conn.peer_addr)
+                except Exception as e:  # noqa: BLE001  # an STT provider raises whatever its SDK and socket do
+                    logger.warning("[%s] STT pre-connect failed: %s", self.conn.peer_addr, e)
 
             # STT liveness guard: keepalive through send starvation + reconnect
             # on mid-call death. Runs for the whole call regardless of how STT
@@ -284,9 +296,11 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
             # pre-warm client answered them for the opening until now).
             self._install_call_control()
             logger.info(
-                f"[{self.conn.peer_addr}] LLM backend: "
-                f"{'direct' if self._is_direct else 'proxy'} "
-                f"({self.llm.__class__.__name__})"
+                "[%s] LLM backend: "
+                "%s "
+                "(%s)",
+                self.conn.peer_addr, 'direct' if self._is_direct else 'proxy',
+                self.llm.__class__.__name__
             )
 
             if self._is_outbound:
@@ -299,8 +313,8 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                     self.state._warmup_task = asyncio.create_task(self._warmup_session())
                     await self.state._warmup_done.wait()
                     logger.info(
-                        f"[{self.conn.peer_addr}] Using pre-warmed session "
-                        f"{call.warmup_session_id}"
+                        "[%s] Using pre-warmed session "
+                        "%s", self.conn.peer_addr, call.warmup_session_id
                     )
                 else:
                     # No pre-warmup: warmup now
@@ -324,24 +338,25 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 self.state._warmup_task = asyncio.create_task(self._warmup_session())
                 await self._play_greeting()
         except TransportError as e:
-            logger.info(f"[{self.conn.peer_addr}] AudioSocket closed: {e}")
+            logger.info("[%s] AudioSocket closed: %s", self.conn.peer_addr, e)
             self._note_remote_hangup()
             # Finalize outbound call on remote hangup (callee hung up)
             if self._is_outbound:
                 try:
                     await self._adopt_before_finalize()
                     await self._finalize_outbound_call()
-                except Exception as fin_err:
+                except Exception as fin_err:  # noqa: BLE001  # the outbound call's summary is best effort, the call already ended
                     logger.error(
-                        f"[{self.conn.peer_addr}] Finalize after hangup failed: {fin_err}"
+                        "[%s] Finalize after hangup failed: %s",
+                        self.conn.peer_addr, fin_err
                     )
         except Exception as e:
-            logger.error(f"[{self.conn.peer_addr}] Pipeline error: {e}", exc_info=True)
+            logger.exception("[%s] Pipeline error: %s", self.conn.peer_addr, e)
             if self._is_outbound:
                 try:
                     await self._adopt_before_finalize()
                     await self._finalize_outbound_call()
-                except Exception as fin_err:
+                except Exception as fin_err:  # noqa: BLE001  # the outbound call's summary is best effort, the call already ended
                     logger.debug("Finalize after pipeline error failed: %s", fin_err)
         finally:
             await self._cleanup()
@@ -379,7 +394,7 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
         )
         greeting = self.route.greeting or fallback
         self._select_tts(self._locked_language)
-        logger.info(f"[{self.conn.peer_addr}] Playing greeting (voice: {self._locked_language})")
+        logger.info("[%s] Playing greeting (voice: %s)", self.conn.peer_addr, self._locked_language)
 
         # Start greeting via streaming TTS (same path as _process_utterance)
         self.tts.start_streaming_context(
@@ -428,7 +443,7 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
             return
         fatal = self.stt.pop_fatal_error()
         if fatal:
-            logger.warning(f"[{self.conn.peer_addr}] STT fatal: {fatal}")
+            logger.warning("[%s] STT fatal: %s", self.conn.peer_addr, fatal)
         if fatal or not self.stt.is_open:
             await self._stt_reconnect()
             return
@@ -442,9 +457,10 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
             self.state._stt_unheard_speech_s = 0.0
         elif self.state._stt_unheard_speech_s >= self.cfg.stt_mute_reconnect_s:
             logger.warning(
-                f"[{self.conn.peer_addr}] STT mute session: "
-                f"{self.state._stt_unheard_speech_s:.1f}s of speech with "
-                f"zero results — reconnecting"
+                "[%s] STT mute session: "
+                "%.1fs of speech with "
+                "zero results — reconnecting",
+                self.conn.peer_addr, self.state._stt_unheard_speech_s
             )
             self.state._stt_unheard_speech_s = 0.0
             await self._stt_reconnect()
@@ -452,8 +468,8 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
         if time.monotonic() - self.state._stt_last_fed >= 3.0:
             try:
                 await self.stt.keepalive()
-            except Exception as e:
-                logger.warning(f"[{self.conn.peer_addr}] STT keepalive error: {e}")
+            except Exception as e:  # noqa: BLE001  # an STT provider raises whatever its SDK and socket do
+                logger.warning("[%s] STT keepalive error: %s", self.conn.peer_addr, e)
             self.state._stt_last_fed = time.monotonic()
 
     async def _stt_reconnect(self) -> None:
@@ -475,15 +491,15 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 try:
                     ok = await self.stt.ensure_alive(
                         self._locked_language, clear_queue=False)
-                except Exception as e:
-                    logger.warning(f"[{self.conn.peer_addr}] STT ensure_alive error: {e}")
+                except Exception as e:  # noqa: BLE001  # an STT provider raises whatever its SDK and socket do
+                    logger.warning("[%s] STT ensure_alive error: %s", self.conn.peer_addr, e)
                     ok = False
                 if ok:
                     self.state._stt_last_fed = time.monotonic()
                     return
             logger.error(
-                f"[{self.conn.peer_addr}] STT reconnect failed after retries — "
-                f"will retry on the next guard tick"
+                "[%s] STT reconnect failed after retries — "
+                "will retry on the next guard tick", self.conn.peer_addr
             )
         except asyncio.CancelledError:
             raise
@@ -504,7 +520,7 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
             # instead of being cut off. The hangup sets _running=False once the
             # farewell has played (see the [CALL_COMPLETE] block in llm.py).
             if time.monotonic() - self.state._last_activity > self.cfg.idle_timeout_s:
-                logger.info(f"[{self.conn.peer_addr}] Idle timeout ({self.cfg.idle_timeout_s}s)")
+                logger.info("[%s] Idle timeout (%ss)", self.conn.peer_addr, self.cfg.idle_timeout_s)
                 break
 
             try:
@@ -516,7 +532,7 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 continue
 
             if frame_type == FRAME_HANGUP:
-                logger.info(f"[{self.conn.peer_addr}] Hangup received")
+                logger.info("[%s] Hangup received", self.conn.peer_addr)
                 self._note_remote_hangup()
                 break
 
@@ -524,6 +540,8 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 continue
 
             self.state._last_activity = time.monotonic()
+            # The language tracker's events from the last frames, on the loop.
+            self._language_poll()
             event = await self.vad.aprocess(payload)
 
             # Accumulate raw audio while speaking (for Smart Turn)
@@ -532,9 +550,6 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 # Cap at max window size
                 if len(self.state._speech_audio_buf) > self._speech_audio_max_bytes:
                     self.state._speech_audio_buf = self.state._speech_audio_buf[-self._speech_audio_max_bytes:]
-                    # A language identification of this buffer hears the
-                    # turn's tail only: its text never replaces the turn's.
-                    self.state._speech_audio_truncated = True
                 # Mute-session evidence for the STT guard: speech time the
                 # provider has heard but not answered (guard resets this the
                 # moment any result arrives). A paused playback feeds the
@@ -563,24 +578,25 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                         and not self.state._playback_paused
                         and since_speech_end < 0.5):
                     logger.info(
-                        f"[{self.conn.peer_addr}] Speech start ignored "
-                        f"(cooldown {since_speech_end*1000:.0f}ms after speech end)"
+                        "[%s] Speech start ignored "
+                        "(cooldown %.0fms after speech end)",
+                        self.conn.peer_addr, since_speech_end*1000
                     )
                     continue
 
-                logger.info(f"[{self.conn.peer_addr}] Speech start")
+                logger.info("[%s] Speech start", self.conn.peer_addr)
                 self.state._user_silent.clear()  # user is speaking
 
                 # Clear audio buffer if starting a fresh turn (no prior segments)
                 if not self.state._turn_segments:
                     self.state._speech_audio_buf.clear()
-                    self.state._speech_audio_truncated = False
 
                 # Cancel turn continuation timer — user is still talking
                 if self.state._turn_timer and not self.state._turn_timer.done():
                     self._cancel_turn_timer()
                     logger.info(
-                        f"[{self.conn.peer_addr}] Turn timer cancelled — user continuing"
+                        "[%s] Turn timer cancelled — user continuing",
+                        self.conn.peer_addr
                     )
 
                 # Cancel backchannel if playing — user resumed speaking
@@ -629,11 +645,11 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                     await self.stt.start(language=self._locked_language, sample_rate=self._rate_in, interim_results=True)
                     self.state._stt_active = True
 
-                await self._stt_feed(payload)
+                await self._stt_feed(payload, voiced=True)
                 self.state._stt_last_fed = time.monotonic()
 
             elif event == VadEvent.SPEECH_END:
-                logger.info(f"[{self.conn.peer_addr}] Speech end")
+                logger.info("[%s] Speech end", self.conn.peer_addr)
                 await self._process_speech_end()
 
             elif event == VadEvent.SPEECH_PROBABLE:
@@ -641,13 +657,13 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 # Unmute STT to capture the beginning of speech if the provider
                 # benefits from it.  Do NOT cancel TTS yet — barge-in needs
                 # full confirmation from the sliding window.
-                logger.info(f"[{self.conn.peer_addr}] Speech probable (early STT unmute)")
+                logger.info("[%s] Speech probable (early STT unmute)", self.conn.peer_addr)
                 if not self.state._stt_active:
                     await self.stt.start(language=self._locked_language, sample_rate=self._rate_in, interim_results=True)
                     self.state._stt_active = True
                 if self.stt.supports_early_unmute:
                     self.state._stt_early_unmuted = True
-                await self._stt_feed(payload)
+                await self._stt_feed(payload, voiced=True)
                 self.state._stt_last_fed = time.monotonic()
                 # Also capture audio for Smart Turn (onset prosody during barge-in)
                 self.state._speech_audio_buf.extend(payload)
@@ -682,10 +698,6 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
         # End-to-end stamp: written ONLY here (see state.py note) —
         # dispatch captures the latest one for the turn line.
         self.state._t_speech_end = self.state._speech_end_time
-        # The caller's language, once (pipeline/language.py): the buffered
-        # utterance goes to the identification when it is long enough.
-        if not synthetic:
-            self._consider_language_identification()
 
         # Barge-in pause: the speech episode over a paused playback
         # just ended. A SHORT episode (< bargein_timer_s — the same
@@ -711,8 +723,9 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 transcript = self.stt.drain_transcript()
                 if transcript and self._is_interim_fallback_dup(transcript):
                     logger.info(
-                        f"[{self.conn.peer_addr}] Drained final duplicates "
-                        f"the interim-dispatched tail — dropped: {transcript}"
+                        "[%s] Drained final duplicates "
+                        "the interim-dispatched tail — dropped: %s",
+                        self.conn.peer_addr, transcript
                     )
                     transcript = None
 
@@ -723,48 +736,48 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                     all_text = " ".join(self.state._turn_segments)
                     self.state._turn_segments.clear()
                     self._cancel_turn_timer()
-                    # The turn is taken: a language identification of its
-                    # audio that lands later keeps nothing for a later turn.
+                    # The turn is taken: the language streams move on.
                     self._note_turn_taken()
                     logger.info(
-                        f"[{self.conn.peer_addr}] Queuing speech "
-                        f"(LLM busy): {all_text}"
+                        "[%s] Queuing speech "
+                        "(LLM busy): %s", self.conn.peer_addr, all_text
                     )
                     self.state._queued_speech.append(all_text)
                     self._interrupt_for_queued_speech()
                 elif transcript:
                     logger.info(
-                        f"[{self.conn.peer_addr}] Queuing speech "
-                        f"(LLM busy): {transcript}"
+                        "[%s] Queuing speech "
+                        "(LLM busy): %s", self.conn.peer_addr, transcript
                     )
+                    self._note_turn_taken()
                     self.state._queued_speech.append(transcript)
                     self._interrupt_for_queued_speech()
                 else:
                     # STT may not have finalized yet —
                     # schedule a delayed retry to queue it.
                     logger.info(
-                        f"[{self.conn.peer_addr}] Empty transcript "
-                        f"(LLM busy), scheduling delayed queue retry"
+                        "[%s] Empty transcript "
+                        "(LLM busy), scheduling delayed queue retry", self.conn.peer_addr
                     )
-                    asyncio.create_task(
-                        self._delayed_queue_retry()
-                    )
+                    spawn(self._delayed_queue_retry(), name="delayed_queue_retry", owner="call")
             else:
                 # LLM free — drain transcript (keep STT open
                 # so connecting words aren't lost between segments)
                 transcript = self.stt.drain_transcript()
                 if transcript and self._is_interim_fallback_dup(transcript):
                     logger.info(
-                        f"[{self.conn.peer_addr}] Drained final duplicates "
-                        f"the interim-dispatched tail — dropped: {transcript}"
+                        "[%s] Drained final duplicates "
+                        "the interim-dispatched tail — dropped: %s",
+                        self.conn.peer_addr, transcript
                     )
                     transcript = None
 
                 if transcript:
                     self._append_turn_segment(transcript)
                     logger.info(
-                        f"[{self.conn.peer_addr}] Turn segment "
-                        f"{len(self.state._turn_segments)}: {transcript}"
+                        "[%s] Turn segment "
+                        "%s: %s",
+                        self.conn.peer_addr, len(self.state._turn_segments), transcript
                     )
                     # Got transcript — start/restart classification timer
                     joined = " ".join(self.state._turn_segments)
@@ -787,13 +800,12 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                     # without this segment's transcript.
                     self._cancel_turn_timer()
                     logger.info(
-                        f"[{self.conn.peer_addr}] Empty transcript, "
-                        f"scheduling delayed drain retry "
-                        f"(segments={len(self.state._turn_segments)})"
+                        "[%s] Empty transcript, "
+                        "scheduling delayed drain retry "
+                        "(segments=%s)",
+                        self.conn.peer_addr, len(self.state._turn_segments)
                     )
-                    asyncio.create_task(
-                        self._delayed_drain_retry()
-                    )
+                    spawn(self._delayed_drain_retry(), name="delayed_drain_retry", owner="call")
 
         # Signal silence AFTER transcript is queued, so consumers
         # waiting on _user_silent see the complete queue.
@@ -802,7 +814,7 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
     async def _cleanup(self) -> None:
         """Clean up all resources for this call."""
         self.state._running = False
-        logger.info(f"[{self.conn.peer_addr}] Pipeline cleanup")
+        logger.info("[%s] Pipeline cleanup", self.conn.peer_addr)
 
         # A transfer whose request went out as the media leg closed under
         # it: its outcome is recorded before anything is cancelled.
@@ -835,8 +847,8 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
             try:
                 clf_in, clf_out = self._turn_clf.drain_usage()
                 clf_model = self._turn_clf.classifier_model()
-            except Exception as e:
-                logger.warning(f"[{self.conn.peer_addr}] Turn-classifier drain failed: {e}")
+            except Exception as e:  # noqa: BLE001  # the classifier's usage report is best effort at the call's end
+                logger.warning("[%s] Turn-classifier drain failed: %s", self.conn.peer_addr, e)
 
         # Cancel warmup if still running
         if self.state._warmup_task and not self.state._warmup_task.done():
@@ -845,15 +857,16 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 await self.state._warmup_task
             self.state._warmup_task = None
 
-        # A call action raised between turns and not yet completed, and a
-        # language identification still in flight
-        for attr in ("_control_between_turns", "_language_task"):
-            task = getattr(self.state, attr)
-            if task is not None and not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-                setattr(self.state, attr, None)
+        # A call action raised between turns and not yet completed
+        task = self.state._control_between_turns
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+            self.state._control_between_turns = None
+
+        # The language tracker and a candidate stream still opening
+        await self._language_cleanup()
 
         # Stop the VAD inference worker (no-op for bare fakes in tests)
         if hasattr(self.vad, "shutdown"):
@@ -870,7 +883,6 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
         self._cancel_turn_timer()
         self.state._turn_segments.clear()
         self.state._speech_audio_buf.clear()
-        self.state._speech_audio_truncated = False
 
         # Cancel barge-in pause machinery (confirm backstop + resume grace).
         # A paused playback keeps _tts_playing True, so the _cancel_tts below
@@ -893,7 +905,7 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
             self.state._thinking_filler_task = None
         self.state._thinking_filler_done.set()
 
-        if self.state._tts_playing:
+        if self.state._tts_playing or self.state._tts_idle:
             await self._cancel_tts()
 
         # Cancel parallel LLM if still running (may not be caught by _cancel_tts
@@ -918,7 +930,16 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
         results = await asyncio.gather(*cleanup_tasks, return_exceptions=True)
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                logger.warning(f"Cleanup error [{i}]: {result}")
+                logger.warning("Cleanup error [%s]: %s", i, result)
+
+        # The call's audio for the record: what streamed, and what the second
+        # listen bought on top through the batch endpoint (its own usage row).
+        streamed = getattr(self.stt, "billed_seconds", None)
+        if streamed is None:
+            streamed = getattr(self.stt, "audio_offered_s", 0.0)
+        relistened = float(getattr(self.stt, "relisten_seconds", 0.0) or 0.0)
+        logger.info("[%s] call closed: %.1f s streamed, %.1f s listened again",
+                    self.conn.peer_addr, float(streamed or 0.0), relistened)
 
         # The debug tap's file, written off the loop once the transport is
         # closed; a failure is logged and nothing else of the call is affected.
@@ -930,18 +951,28 @@ class CallPipeline(PinGateMixin, CallControlMixin, LanguageMixin, PlaybackMixin,
                 path = await asyncio.wait_for(asyncio.to_thread(
                     tap.write, config.BASE_DIR / "debug-audio",
                     self._audiosocket_uuid or self.conn.peer_addr), timeout=15.0)
-                logger.info(f"[{self.conn.peer_addr}] Outgoing audio saved: "
-                            f"{path} ({tap.frame_count} frames)")
-            except Exception as e:
-                logger.warning(f"[{self.conn.peer_addr}] Outgoing audio save failed: {e}")
+                logger.info("[%s] Outgoing audio saved: "
+                            "%s (%s frames)",
+                            self.conn.peer_addr, path, tap.frame_count)
+            except Exception as e:  # noqa: BLE001  # the debug audio tap is best effort at the call's end
+                logger.warning("[%s] Outgoing audio save failed: %s", self.conn.peer_addr, e)
 
-        # Report the call's turn-classifier spend (one row per call). Awaited with a
-        # tight timeout and all errors swallowed inside the helper — never blocks or
-        # fails teardown beyond the timeout. Runs after the gather so it can't delay
-        # freeing the audiosocket/STT/LLM.
+        # Report the call's turn-classifier spend and its second listen's seconds
+        # (one row each per call), together. Awaited with a tight timeout and all
+        # errors swallowed inside the helpers — never blocks or fails teardown
+        # beyond the timeout. Runs after the gather so it can't delay freeing the
+        # audiosocket/STT/LLM. ``relisten_seconds`` is not zeroed by the report:
+        # ``_cleanup`` runs once per call.
+        session_id = getattr(self.llm, "session_id", "") or self._audiosocket_uuid or ""
+        reports = []
         if clf_in or clf_out:
-            session_id = getattr(self.llm, "session_id", "") or self._audiosocket_uuid or ""
-            await report_turn_classifier_usage(
+            reports.append(report_turn_classifier_usage(
                 agent=self.route.agent, model=clf_model,
                 input_tokens=clf_in, output_tokens=clf_out, session_id=session_id,
-            )
+            ))
+        if relistened > 0:
+            provider = (self._route_settings.stt_provider or {}).get("provider_name", "deepgram")
+            reports.append(report_relisten_usage(agent=self.route.agent, provider=provider,
+                                                 seconds=relistened, session_id=session_id))
+        if reports:
+            await asyncio.gather(*reports)

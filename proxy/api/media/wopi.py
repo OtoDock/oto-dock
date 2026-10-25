@@ -22,18 +22,24 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
-import jwt
+import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import config
-from api.media.media import HOST_CACHE_SEGMENT, FdFileResponse
-from auth.providers import get_current_user, require_auth, UserContext
-from services.infra import safe_fs
-from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path, resolve_under, safe_agent_dir
-from auth import roles, token_holder
+from api.media import wopi_proof
+from api.media.media import FdFileResponse
+from auth import roles, token_holder, tokens
+from auth.providers import UserContext, get_current_user, require_auth
 from core import layout
+from services.infra import safe_fs
+from services.infra.path_confinement import (
+    PathOutsideRoot,
+    normalize_rel_path,
+    resolve_under,
+)
+from services.media.media_pipeline import HOST_CACHE_SEGMENT
 from storage.pg import run_db
 
 logger = logging.getLogger("otodock")
@@ -128,10 +134,9 @@ def create_wopi_token(
     now = int(time.time())
     exp = now + _WOPI_TOKEN_TTL
     payload = {
-        # Purpose discriminator: WOPI_SECRET defaults to JWT_SECRET, which
-        # also signs session/audio/broker tokens — without this claim the
-        # verifier below would accept ANY platform JWT whose claim shape
-        # happens to fit (and vice versa).
+        # The 1.8 discriminator, kept in the payload: a token signed before
+        # 1.9 is told from the platform's other kinds by it
+        # (``auth/tokens.WOPI``'s legacy claim).
         "purpose": "wopi",
         "file_path": file_path,
         "generation": generation,
@@ -146,21 +151,13 @@ def create_wopi_token(
         payload["display_name"] = display_name
     if chat_id:
         payload["chat_id"] = chat_id
-    token = jwt.encode(payload, config.WOPI_SECRET, algorithm="HS256")
+    token = tokens.mint(tokens.WOPI, payload)
     return token, exp * 1000  # expiry in milliseconds for Collabora
 
 
 def validate_wopi_token(token: str) -> dict | None:
     """Validate and decode a WOPI access token. Returns claims or None."""
-    try:
-        claims = jwt.decode(token, config.WOPI_SECRET, algorithms=["HS256"])
-    except jwt.ExpiredSignatureError:
-        return None
-    except jwt.InvalidTokenError:
-        return None
-    if claims.get("purpose") != "wopi":
-        return None
-    return claims
+    return tokens.verify(token, tokens.WOPI)
 
 
 def _wopi_path_of(file_id: str, claims: dict) -> str:
@@ -173,8 +170,8 @@ def _wopi_path_of(file_id: str, claims: dict) -> str:
     the 4 h it lasts (a document open across the upgrade keeps saving)."""
     try:
         rel_path, generation = decode_wopi_id(file_id)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Token/file mismatch") from exc
     if claims.get("file_path") != rel_path:
         raise HTTPException(status_code=403, detail="Token/file mismatch")
     claimed = claims.get("generation")
@@ -217,9 +214,9 @@ _holder_reads: dict[tuple[str, int], asyncio.Task] = {}
 # the change that caused the forget, so it keeps nothing (token_holder's rule).
 _holder_generation: dict[str, int] = {}
 _holder_failure_logged = 0.0
-# The subs of the principals that are no person: the agent's own token (a
-# push of a turn with no person) and the master key's, a no-user session's,
-# a render principal's. Judged as no person only when no users row bears
+# The subs of the principals that are no person: the agent's own token
+# (minted before 1.9.0 for a push of a turn with no person; nothing mints
+# it now) and the master key's, a no-user session's, a render principal's. Judged as no person only when no users row bears
 # the sub (an identity provider's raw sub could spell one of them).
 _NO_PERSON_SUBS = frozenset({"agent", "api-key"})
 
@@ -246,7 +243,7 @@ async def _read_holder(key: tuple[str, int]) -> bool | None:
     generation = _holder_generation.get(key[0], 0)
     try:
         ok = bool(await run_db_fast(_person_holds_now, *key))
-    except Exception as exc:
+    except psycopg.Error as exc:
         now = time.monotonic()
         if now - _holder_failure_logged >= 60.0:
             _holder_failure_logged = now
@@ -307,12 +304,22 @@ async def person_holds(sub: str, iat) -> bool:
 
 
 async def _wopi_claims(request: Request, access_token: str) -> dict:
-    """The claims of the request's WOPI token: valid, and its person still
-    holding (``person_holds``: a sign out everywhere ends the token too,
-    whatever reaches the WOPI host, Collabora's own exit save included).
-    401 otherwise."""
-    claims = validate_wopi_token(request_wopi_token(request, access_token))
-    if not claims or not await person_holds(claims.get("user_sub") or "", claims.get("iat")):
+    """The claims of the request's WOPI token: signed by the platform's
+    Collabora (``wopi_proof``: a token copied from its log opens nothing),
+    valid, and its person still holding (``person_holds``: a sign out
+    everywhere ends the token too, whatever reaches the WOPI host,
+    Collabora's own exit save included). 401 otherwise, 503 while
+    Collabora's key cannot be read. The order keeps the costly steps for a
+    holder of a valid token: the proof headers parsed, the token checked,
+    the signature verified (which may read Collabora's discovery again),
+    then the person read."""
+    proof = wopi_proof.read_headers(request)
+    token = request_wopi_token(request, access_token)
+    claims = validate_wopi_token(token)
+    if not claims:
+        raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
+    await wopi_proof.check(request, token, proof)
+    if not await person_holds(claims.get("user_sub") or "", claims.get("iat")):
         raise HTTPException(status_code=401, detail="Invalid or expired WOPI token")
     return claims
 
@@ -346,13 +353,13 @@ def _open_wopi_regular(file_id: str, claims: dict, *,
         root, rel = config.AGENTS_DIR, rel_path
     try:
         fd, st = safe_fs.open_regular_for_read(root, rel)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="File not found")
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail="File not found") from err
     except OSError as exc:
         logger.warning("WOPI read refused for %s: %s", rel_path, type(exc).__name__)
         if unreadable is not None:
             raise unreadable(type(exc).__name__) from exc
-        raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="File not found") from exc
     return fd, st, rel.rsplit("/", 1)[-1]
 
 
@@ -581,6 +588,7 @@ def _refresh_version(claims: dict, file_id: str, body: bytes, digest: str | None
     if digest is not None and saved[2] is not None and saved[2] != digest:
         return
     import functools
+
     from core.events import chat_writer, stream_pump
     from services.media import preview_snapshots
     chat_writer.submit(chat_id, functools.partial(
@@ -759,8 +767,8 @@ async def wopi_put_file(
             raise PathOutsideRoot(rel)
         if agent_slug != HOST_CACHE_SEGMENT and not config.is_safe_agent_name(agent_slug):
             raise PathOutsideRoot(rel)
-    except PathOutsideRoot:
-        raise HTTPException(status_code=403, detail="Token/file mismatch")
+    except PathOutsideRoot as err:
+        raise HTTPException(status_code=403, detail="Token/file mismatch") from err
 
     # Check lock (if locked by someone else, reject)
     lock_header = request.headers.get("X-WOPI-Lock", "")
@@ -804,7 +812,7 @@ async def wopi_put_file(
             prev = await asyncio.to_thread(_host_cache_write, rel, body)
         except OSError as exc:
             logger.warning("WOPI PutFile (host-cache) refused for %s: %s", rel, type(exc).__name__)
-            raise HTTPException(status_code=403, detail="Token/file mismatch")
+            raise HTTPException(status_code=403, detail="Token/file mismatch") from exc
         from core.remote import remote_file_flow
         ok = await remote_file_flow.push_back_host_path(session_id, str(config.AGENTS_DIR / rel))
         if not ok:
@@ -872,7 +880,8 @@ async def wopi_put_file(
     # preview / workspace tree refreshes. source="collabora": a peer with the
     # SAME doc open in Collabora is already live-merged (won't force-reload);
     # a non-Collabora view still refreshes. Exclude the saving person (the
-    # token's user_sub: "agent" only for a push of a turn with no person).
+    # token's user_sub; a push of a turn with no person carries no token
+    # since 1.9.0).
     from services.notifications import notification_manager
     await notification_manager.broadcast_file_updated(
         agent_slug, tree_rel, source="collabora",
@@ -1045,10 +1054,10 @@ def _workspace_mint(req: WopiUrlRequest, user: UserContext) -> tuple[str, str]:
     # passes can_access_agent for any string — so confine it to the agents
     # tree before the file path is confined to the agent.
     try:
-        agent_root = Path(os.path.realpath(safe_agent_dir(req.agent)))
+        agent_root = Path(os.path.realpath(config.get_agent_dir(req.agent)))
         full_path = resolve_under(agent_root / req.file_path, agent_root)
-    except PathOutsideRoot:
-        raise HTTPException(status_code=403, detail="Path must be within agent workspace or users directory")
+    except PathOutsideRoot as exc:
+        raise HTTPException(status_code=403, detail="Path must be within agent workspace or users directory") from exc
     agent_rel = full_path.relative_to(agent_root).as_posix()
 
     # Security: must be within agent workspace or users directory
@@ -1139,7 +1148,7 @@ def _chat_for_mint(u: UserContext, chat_id: str) -> dict:
     chat = task_store.get_chat(chat_id)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
-    from api.agents.chats import can_access_chat
+    from core.session.visibility import can_access_chat
     if not can_access_chat(u, chat):
         raise HTTPException(status_code=403, detail="Access denied")
     return chat
@@ -1177,8 +1186,8 @@ def _snapshot_mint(u: UserContext, chat_id: str, snapshot_id: str) -> tuple[dict
     and a path probe: run it through ``run_db``; its ``HTTPException``
     reaches the client unchanged."""
     chat = _chat_for_mint(u, chat_id)
-    from storage import database as task_store
     from services.media import preview_snapshots
+    from storage import database as task_store
     for owner in _page_chat_ids(chat_id):
         event = task_store.get_preview_event_by_snapshot(owner, snapshot_id)
         if event is None:
@@ -1206,8 +1215,8 @@ async def generate_preview_wopi_url(
     files go through the agent-tree write matrix; a host-cache mirror (a file
     on the remote machine's own disk) is editable only within the chat's own
     session, by that session's person with a write-capable role
-    (``live_permissions``). 404 tells the pane to use a pushed token when it
-    has one, else that the file is gone."""
+    (``live_permissions``). 404 tells the pane to use a pushed token naming
+    the requester when it has one, else that the file is gone."""
     u = require_auth(user)
 
     if not config.COLLABORA_URL:
@@ -1253,8 +1262,8 @@ def _preview_mint(u: UserContext, chat_id: str, file_id: str) -> tuple[str, str,
 
     try:
         rel_path = decode_file_id(file_id)
-    except (ValueError, UnicodeDecodeError):
-        raise HTTPException(status_code=404, detail="Preview not found")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=404, detail="Preview not found") from exc
     # Preview events only ever reference agent-tree files; the snapshot
     # namespace has its own endpoint (with snapshot-specific display naming).
     if rel_path.startswith(_SNAPSHOT_NS + "/"):
@@ -1306,8 +1315,8 @@ def _row_document_generation(event: dict) -> int:
 def live_permissions(tree_rel: str, role: str, username: str, agent: str, *,
                      host_cache: bool, session_person: str = "") -> str:
     """``"edit"`` or ``"view"``: what one person's token for a chat's live
-    document allows (the pane's mint and the push's token for the person
-    the turn runs as). A host-cache mirror (a file on the session's own
+    document allows (the pane's mint and the push's token for the one
+    person the push reaches). A host-cache mirror (a file on the session's own
     machine) is editable only by the session's own person
     (``session_person``, the session's authenticated username) with a
     write-capable role, PutFile pushing the bytes back to the real file,
@@ -1347,8 +1356,8 @@ def _chat_documents(u: UserContext, chat_id: str) -> list[dict]:
     stats: run it through ``run_db``; its ``HTTPException`` reaches the
     client unchanged."""
     _chat_for_mint(u, chat_id)
-    from storage import database as task_store
     from services.media import preview_snapshots
+    from storage import database as task_store
     by_file: dict[str, dict] = {}
     for row in task_store.get_chat_preview_listing_rows(_page_chat_ids(chat_id)):
         data = row["data"]

@@ -18,12 +18,12 @@ import pytest
 from PIL import Image
 
 from tests._paths import CUSTOM_MCPS
+
 MCP_DIR = CUSTOM_MCPS / "display-mcp"
 if str(MCP_DIR) not in sys.path:
     sys.path.insert(0, str(MCP_DIR))
 
-import display_server as d  # noqa: E402
-
+import display_server as d
 
 # ───────────────────────────── helpers ──────────────────────────────────────
 

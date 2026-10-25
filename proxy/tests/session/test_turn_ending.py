@@ -36,6 +36,7 @@ def test_a_payload_without_the_new_fields_reads_as_before():
     (te.SILENT, ("went silent", "Send the message again")),
     (te.LOST, ("connection to the machine", "lost mid-turn", "Send the message again")),
     (te.STOPPED, ("stopped before this message ran", "Send it again")),
+    (te.RESTARTED, ("cut short when the platform restarted", "Send a message to continue")),
     (te.DECLINED, ("safety classifier declined", "another model")),
     (te.LIMIT, ("Usage limit reached",)),
 ])
@@ -53,7 +54,8 @@ def test_the_error_line_carries_the_engines_words():
     assert text in ending.callback_note("chat-1")
 
 
-@pytest.mark.parametrize("reason", (te.ERROR, te.EXITED, te.SILENT, te.LOST, te.STOPPED))
+@pytest.mark.parametrize("reason", (te.ERROR, te.EXITED, te.SILENT, te.LOST, te.STOPPED,
+                                    te.RESTARTED))
 def test_the_summary_and_the_callback_name_the_reason_not_the_limit(reason):
     ending = te.TurnEnding(reason, detail="why")
     assert "usage limit" not in ending.summary().lower()
@@ -77,3 +79,14 @@ def test_a_stopped_message_stamps_the_flags_the_send_consumed():
     assert te.TurnEnding(te.STOPPED).abort_stamps() == stamps
     assert te.TurnEnding(te.LOST).abort_stamps() == stamps
     assert te.TurnEnding(te.ERROR).abort_stamps() is None
+
+
+def test_a_restart_cut_is_its_own_ending():
+    """The closing row of a reply the restart cut: the process went with the
+    platform but the engine's own record holds the turn (the next message
+    repeats none of it), and the card offers no Send again (the work so far
+    is in the chat)."""
+    ending = te.TurnEnding(te.RESTARTED)
+    assert ending.abort_stamps() == {"last_turn_aborted": True, "last_abort_graceful": True}
+    assert te.RESTARTED not in te.RESEND and te.RESTARTED not in te.KILLS_PROCESS
+    assert ending.summary() == "Cut short when the platform restarted."

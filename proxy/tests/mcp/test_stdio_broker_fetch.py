@@ -12,14 +12,13 @@ Pure logic — no real MCP spawn, no network (``_fetch_mcp_credentials`` /
 import sys
 import urllib.error
 
-
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from core import stdio_path_interceptor as itc  # noqa: E402
-
+from core import stdio_path_interceptor as itc
 
 # ── _pop_ci ────────────────────────────────────────────────────────────────
 

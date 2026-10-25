@@ -22,7 +22,8 @@ vi.mock('@/api/auth', async (importOriginal) => ({
 
 import AppDeployCard from '@/components/apps/AppDeployCard'
 import AppMenu from '@/components/apps/AppMenu'
-import { appNeedsApproval } from '@/components/apps/AppApprovalCard'
+import { appNeedsApproval } from '@/components/apps/AppApprovalCard.helpers'
+
 
 function mkApp(over: Partial<PinnedApp> = {}): PinnedApp {
   return {
@@ -53,7 +54,7 @@ describe('AppDeployCard', () => {
     }
     renderIn(<AppDeployCard app={mkApp()} agent="dev" />)
     expect(screen.getByTestId('app-deploy-card').textContent).toContain('Release 2 of “Kanban” is waiting for approval')
-    expect(screen.getByTestId('app-deploy-card').textContent).toContain('viewers keep release 1')
+    expect(screen.getByTestId('app-deploy-card').textContent).toContain('Viewers keep release 1')
     // The plain list opens with the counts; the names and the groups sit
     // behind Details.
     await waitFor(() => expect(screen.getByTestId('deploy-changes').textContent).toBe('Adds 1 file and changes 2'))
@@ -80,7 +81,7 @@ describe('AppDeployCard', () => {
       changes: { added: ['app.json'], changed: [], removed: [] },
     }
     renderIn(<AppDeployCard app={mkApp({ actions_approved: true, release: 0, pending_release: 1 })} agent="dev" />)
-    expect(screen.getByTestId('app-deploy-card').textContent).toContain('nothing serves until then')
+    expect(screen.getByTestId('app-deploy-card').textContent).toContain('The app is not live until then')
     await waitFor(() => expect(screen.getByText(/Deploys of this app always wait/)).toBeTruthy())
     fireEvent.click(screen.getByText('Reject'))
     await waitFor(() => expect(calls.some((c) => c.path === '/v1/apps/app-1/deploy/reject')).toBe(true))
@@ -130,17 +131,17 @@ describe('AppDeployCard', () => {
     renderIn(<AppDeployCard app={mkApp({ actions_approved: true, release: 0, pending_release: 1, egress: ['api.example.test'] })} agent="dev" />)
     await waitFor(() => expect(screen.getByTestId('deploy-waiting')).toBeTruthy())
     expect(screen.getByTestId('deploy-waiting').textContent).toContain('Waiting for a secret: STRIPE_SECRET_KEY is not set')
-    expect(screen.getByText(/The manifest is approved\. A secret it needs has no value yet\./)).toBeTruthy()
+    expect(screen.getByText(/What the app may do is approved\. A secret it needs has no value yet\./)).toBeTruthy()
     const approve = screen.getByText('Approve and go live') as HTMLButtonElement
     expect(approve.disabled).toBe(true)
     // An approved manifest is not said again: the secrets line alone, then
     // the Secrets group behind Details.
-    expect(screen.getByTestId('summary-secrets').textContent).toBe('Needs the secrets STRIPE_SECRET_KEY (not set) and SMTP_PASSWORD (set)Set')
+    expect(screen.getByTestId('summary-secrets').textContent).toBe('Needs the secrets STRIPE_SECRET_KEY, not set and SMTP_PASSWORD, setSet')
     expect(screen.queryByTestId('summary-data')).toBeNull()
     fireEvent.click(screen.getByTestId('details-toggle'))
     const lines = screen.getAllByTestId('secret-line').map((n) => n.textContent || '')
-    expect(lines[0]).toContain('needs the secret STRIPE_SECRET_KEY')
-    expect(lines[0]).toContain('not set — required')
+    expect(lines[0]).toContain('Needs the secret STRIPE_SECRET_KEY')
+    expect(lines[0]).toContain('Not set, required')
     expect(lines[1]).toContain('SMTP_PASSWORD')
     expect(screen.queryByTestId('manifest-blocks')).toBeNull()
     fireEvent.click(screen.getByTestId('deploy-set-secrets'))

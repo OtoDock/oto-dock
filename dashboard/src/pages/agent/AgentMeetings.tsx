@@ -8,6 +8,9 @@ import MarkdownContent from '../../components/chat/MarkdownContent'
 import { ScopeFilterSelect, type ScopeFilterValue } from '../../components/ScopeFilterSelect'
 import { isTaskChatId, runIdOfChat } from '../../lib/session/kind'
 import { MEETING_STATUS } from '../../lib/status/meeting'
+import Button from '../../components/ui/Button'
+import { Select } from '../../components/ui/Field'
+import { BADGE_BASE, BADGE_TONE, CARD } from '../../components/ui/classes'
 
 // The filter's options: every stored meeting status (the route accepts any).
 const STATUSES = ['', ...Object.values(MEETING_STATUS)]
@@ -56,34 +59,34 @@ export default function AgentMeetings() {
 
   return (
     <div className="space-y-4">
-      <h1 className="text-xl font-bold text-p-text">Meetings</h1>
+      <h1 className="text-xl font-bold font-display text-primary">Meetings</h1>
 
       {/* Filters */}
       <div className="flex gap-3 items-center flex-wrap">
-        <select
+        <Select
           value={status}
           onChange={(e) => { setStatus(e.target.value); setOffset(0) }}
-          className="text-sm border border-p-border-light rounded-sm px-2 py-1 bg-white dark:bg-p-surface text-p-text"
+          className="max-w-max"
         >
           {STATUSES.map((s) => (
             <option key={s} value={s}>{s || 'All statuses'}</option>
           ))}
-        </select>
+        </Select>
         <ScopeFilterSelect value={scopeFilter} onChange={setScopeFilter} />
-        <span className="text-xs text-p-text-secondary ml-auto">{total} total</span>
+        <span className="text-xs text-secondary ml-auto">{total} total</span>
       </div>
 
       {/* Meeting cards */}
       <div className="space-y-3">
-        {isLoading && <p className="text-sm text-p-text-secondary py-4">Loading...</p>}
-        {!isLoading && meetings.length === 0 && <p className="text-sm text-p-text-secondary py-4">No meetings found.</p>}
+        {isLoading && <p className="text-sm text-secondary py-4">Loading...</p>}
+        {!isLoading && meetings.length === 0 && <p className="text-sm text-secondary py-4">No meetings found.</p>}
         {meetings.map((m) => {
           const participants = parseParticipants(m)
           const expanded = expandedId === m.id
           return (
             <div
               key={m.id}
-              className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light overflow-hidden transition-shadow hover:shadow-xs"
+              className={`${CARD} overflow-hidden transition-shadow hover:shadow-elevation-2`}
             >
               {/* Collapsed header — always visible */}
               <button
@@ -92,24 +95,22 @@ export default function AgentMeetings() {
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0 flex-1">
-                    <p className="text-sm font-medium text-p-text truncate">{m.topic}</p>
-                    <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5 text-xs text-p-text-secondary">
+                    <p className="text-sm font-medium text-primary truncate">{m.topic}</p>
+                    <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1.5 text-xs text-secondary">
                       <span>{m.created_at ? formatRelativeTime(m.created_at) : '\u2014'}</span>
                       {m.cost_usd > 0 && <span>${m.cost_usd.toFixed(4)}</span>}
                       <span className="inline-flex items-center gap-1">
                         <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
                         {participants.length}
                       </span>
-                      <span className={`px-1.5 py-0.5 rounded-sm text-[10px] font-medium ${
-                        m.scope === 'agent'
-                          ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300'
-                          : 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300'
+                      <span className={`${BADGE_BASE} ${
+                        m.scope === 'agent' ? BADGE_TONE.agent : BADGE_TONE.info
                       }`}>{m.scope}</span>
                     </div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     <StatusBadge status={m.status} />
-                    <svg className={`w-4 h-4 text-p-text-light transition-transform ${expanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg className={`w-4 h-4 text-tertiary transition-transform ${expanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
                     </svg>
                   </div>
@@ -118,10 +119,10 @@ export default function AgentMeetings() {
 
               {/* Expanded detail */}
               {expanded && (
-                <div className="border-t border-p-border-light px-4 pb-4 space-y-3">
+                <div className="border-t border-subtle px-4 pb-4 space-y-3">
                   {/* Participants */}
                   <div className="pt-3">
-                    <p className="text-xs font-medium text-p-text-secondary uppercase tracking-wide mb-2">Participants</p>
+                    <p className="text-xs font-medium text-secondary uppercase tracking-wide mb-2">Participants</p>
                     <div className="flex flex-wrap gap-2">
                       {participants.map((slug) => {
                         const agent = agentMap[slug]
@@ -129,13 +130,13 @@ export default function AgentMeetings() {
                         return (
                           <span
                             key={slug}
-                            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs bg-p-bg border border-p-border-light"
+                            className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs bg-surface-muted"
                           >
                             {agent?.color && (
                               <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: agent.color }} />
                             )}
-                            <span className="font-medium text-p-text">{agent?.display_name || slug}</span>
-                            {isMod && <span className="text-[10px] text-p-text-light">(mod)</span>}
+                            <span className="font-medium text-primary">{agent?.display_name || slug}</span>
+                            {isMod && <span className="text-3xs text-tertiary">Moderator</span>}
                           </span>
                         )
                       })}
@@ -145,8 +146,8 @@ export default function AgentMeetings() {
                   {/* Summary */}
                   {m.summary && (
                     <div>
-                      <p className="text-xs font-medium text-p-text-secondary uppercase tracking-wide mb-2">Summary</p>
-                      <div className="text-sm text-p-text bg-p-bg rounded-lg p-3 max-h-64 overflow-y-auto">
+                      <p className="text-xs font-medium text-secondary uppercase tracking-wide mb-2">Summary</p>
+                      <div className="text-sm text-primary bg-surface-sunken rounded-card p-3 max-h-64 overflow-y-auto">
                         <MarkdownContent>{m.summary}</MarkdownContent>
                       </div>
                     </div>
@@ -154,11 +155,11 @@ export default function AgentMeetings() {
 
                   {/* Navigate + metadata */}
                   <div className="flex items-center justify-between pt-1">
-                    <span className="text-xs text-p-text-light font-mono">{m.id}</span>
+                    <span className="text-xs text-tertiary font-mono">{m.id}</span>
                     {m.parent_chat_id && (
                       <button
                         onClick={(e) => { e.stopPropagation(); handleNavigate(m) }}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-brand hover:bg-brand/10 transition-colors"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-control text-xs font-medium text-link hover:text-link-hover hover:bg-surface-hover transition-colors"
                       >
                         <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
@@ -177,23 +178,21 @@ export default function AgentMeetings() {
       {/* Pagination */}
       {total > limit && (
         <div className="flex items-center gap-3 text-sm">
-          <button
+          <Button
             disabled={offset === 0}
             onClick={() => setOffset(Math.max(0, offset - limit))}
-            className="px-3 py-1 rounded-sm border border-p-border-light disabled:opacity-40"
           >
             Previous
-          </button>
-          <span className="text-p-text-secondary">
+          </Button>
+          <span className="text-secondary">
             {offset + 1}&ndash;{Math.min(offset + limit, total)} of {total}
           </span>
-          <button
+          <Button
             disabled={offset + limit >= total}
             onClick={() => setOffset(offset + limit)}
-            className="px-3 py-1 rounded-sm border border-p-border-light disabled:opacity-40"
           >
             Next
-          </button>
+          </Button>
         </div>
       )}
     </div>

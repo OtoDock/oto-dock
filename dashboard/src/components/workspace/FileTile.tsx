@@ -1,9 +1,10 @@
-import { useRef, useState } from 'react'
+import { useState } from 'react'
 import type { FileNode } from '../../api/agents'
 import { getFileKind, formatFileSize } from '../../lib/fileTypes'
 import { toSandboxVirtualPath } from '../../lib/paths'
 import { useFileThumbnail } from '../../hooks/useFileThumbnail'
 import FileIcon, { FolderIcon } from './FileIcon'
+import { useLongPress } from '../../hooks/useLongPress'
 
 interface Props {
   agent: string
@@ -40,8 +41,6 @@ interface Props {
 const INTERNAL_PATHS_MIME = 'application/x-otodock-paths'
 const INTERNAL_PATH_MIME = 'application/x-otodock-path'
 
-const LONG_PRESS_MS = 500
-
 export default function FileTile({
   agent,
   node,
@@ -69,36 +68,21 @@ export default function FileTile({
   const [dragDepth, setDragDepth] = useState(0)
   const isDragHover = dragDepth > 0
 
-  const pressTimerRef = useRef<number | null>(null)
-  const startedAtRef = useRef<{ x: number; y: number } | null>(null)
-
-  const cancelLongPress = () => {
-    if (pressTimerRef.current !== null) {
-      window.clearTimeout(pressTimerRef.current)
-      pressTimerRef.current = null
-    }
-    startedAtRef.current = null
-  }
-
-  const handleTouchStart = (e: React.TouchEvent) => {
-    if (!onLongPress) return
-    const t = e.touches[0]
-    if (!t) return
-    startedAtRef.current = { x: t.clientX, y: t.clientY }
-    pressTimerRef.current = window.setTimeout(() => {
-      onLongPress()
-      pressTimerRef.current = null
-    }, LONG_PRESS_MS)
-  }
-
-  const handleTouchMove = (e: React.TouchEvent) => {
-    if (!startedAtRef.current) return
-    const t = e.touches[0]
-    if (!t) return
-    const dx = Math.abs(t.clientX - startedAtRef.current.x)
-    const dy = Math.abs(t.clientY - startedAtRef.current.y)
-    if (dx > 8 || dy > 8) cancelLongPress()
-  }
+  // The platform's long press (hooks/useLongPress): the click that follows a
+  // held touch is swallowed (it would toggle the tile it just selected) and
+  // so is Android's contextmenu during the hold (it would open the menu over
+  // the selection mode). Only a tile that takes a long press listens.
+  const longPress = useLongPress(() => onLongPress?.())
+  const touch = onLongPress
+    ? {
+        onTouchStart: longPress.onTouchStart,
+        onTouchMove: longPress.onTouchMove,
+        onTouchEnd: longPress.onTouchEnd,
+        onTouchCancel: longPress.onTouchCancel,
+        onPointerDown: longPress.onPointerDown,
+        onClickCapture: longPress.onClickCapture,
+      }
+    : {}
 
   const handleDragStart = (e: React.DragEvent) => {
     if (!isDesktop) return
@@ -177,20 +161,20 @@ export default function FileTile({
         // strict-target check so right-clicks in the flex-wrap gaps still
         // trigger the empty menu; that only works if tile clicks don't
         // bubble through.
-        e.preventDefault()
         e.stopPropagation()
+        if (onLongPress) longPress.onContextMenu(e)
+        // The long press took it: no menu over the selection mode.
+        if (e.defaultPrevented) return
+        e.preventDefault()
         onContextMenu({ clientX: e.clientX, clientY: e.clientY })
       }}
-      onTouchStart={handleTouchStart}
-      onTouchMove={handleTouchMove}
-      onTouchEnd={cancelLongPress}
-      onTouchCancel={cancelLongPress}
-      className={`group relative flex flex-col w-24 h-24 p-1 rounded-lg cursor-pointer select-none transition-colors ${
+      {...touch}
+      className={`group relative flex flex-col w-24 h-24 p-1 rounded-card cursor-pointer select-none transition-colors ${
         selected
-          ? 'bg-brand-surface ring-1 ring-brand'
+          ? 'bg-action-subtle ring-1 ring-action'
           : isDragHover
-            ? 'bg-brand/10 ring-2 ring-brand'
-            : 'hover:bg-p-surface-hover'
+            ? 'bg-action-subtle ring-2 ring-action'
+            : 'hover:bg-surface-hover'
       } ${cutPending ? 'opacity-50' : ''}`}
       style={{
         WebkitTouchCallout: 'none',
@@ -221,7 +205,7 @@ export default function FileTile({
             renameSlot
           ) : (
             <span
-              className="block w-full text-center text-[11px] leading-tight text-p-text truncate"
+              className="block w-full text-center text-2xs leading-tight text-primary truncate"
               title={`${node.name}${!isDir && node.size > 0 ? ` — ${formatFileSize(node.size)}` : ''}`}
             >
               {node.name}
@@ -235,7 +219,7 @@ export default function FileTile({
               const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
               onContextMenu({ clientX: rect.right, clientY: rect.bottom })
             }}
-            className="shrink-0 w-4 h-4 flex items-center justify-center rounded-sm text-p-text-light hover:text-p-text-secondary opacity-100 md:opacity-0 md:group-hover:opacity-100"
+            className="shrink-0 w-4 h-4 flex items-center justify-center rounded-sm text-secondary hover:text-primary opacity-100 md:opacity-0 md:group-hover:opacity-100"
           >
             <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16">
               <circle cx="8" cy="3" r="1.4" /><circle cx="8" cy="8" r="1.4" /><circle cx="8" cy="13" r="1.4" />

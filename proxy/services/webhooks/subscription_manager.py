@@ -18,6 +18,7 @@ calls ``record_event_received`` after fan-out.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -26,9 +27,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+import psycopg
 
 import config
 from services.mcp import mcp_registry
+from services.oauth import credential_resolver
 from services.oauth.oauth_account_store import (
     MCP_AUTHORIZATION_FLOW,
     _read_oauth_token,
@@ -36,16 +39,16 @@ from services.oauth.oauth_account_store import (
     get_token_dir,
 )
 from services.webhooks import vendor_http
-from services.webhooks.webhook_template import (  # noqa: F401  (re-exported for callers/tests)
+from services.webhooks.webhook_template import (
     _TOKEN_RE,
     _build_substitutions,
     _substitute_string,
     _substitute_value,
     _walk_dot_path,
 )
-from storage.identity import credential_store
 from storage import database as task_store
 from storage.automation import webhook_subscription_store
+from storage.identity import credential_store, oauth_app_kinds
 
 logger = logging.getLogger("otodock.subscription-manager")
 
@@ -165,6 +168,35 @@ async def create_subscription(
                 detail={"bound_account_label": ref.label},
             )
 
+    # An installation of a GitHub-App account as the target: the app's own
+    # webhook delivers, nothing is registered at the vendor, the app's
+    # permissions decide (no scope check). An older client that sends no
+    # kind for such an account means this one.
+    account_meta = _account_meta(scope=scope, owner=user_sub, agent=agent, mcp_name=mcp_name,
+                                 account_label=account_label)
+    if not target_kind and webhooks_block.get("app_webhook") and oauth_app_kinds.is_github_app_meta(account_meta):
+        target_kind = oauth_app_kinds.INSTALLATION_TARGET_KIND
+    installation_target = target_kind == oauth_app_kinds.INSTALLATION_TARGET_KIND
+    if installation_target:
+        if not webhooks_block.get("app_webhook"):
+            raise SubscriptionError("this MCP has no app webhook", status=400)
+        standing = oauth_app_kinds.installation_standing(account_meta, vendor_target)
+        if standing:
+            raise SubscriptionError(
+                f"installation {vendor_target!r} cannot be subscribed to: "
+                f"{_installation_sentence(standing, account_meta)}", status=400,
+            )
+        if scope == "service":
+            bound = credential_resolver.pick_account(mcp_name, agent or "")
+            if bound is None or not oauth_app_kinds.binding_covers(
+                    bound.installation_id, account_meta, vendor_target):
+                raise SubscriptionError(
+                    f"installation {vendor_target!r} is not the identity bound to agent "
+                    f"{agent!r}: subscribe with the bound installation",
+                    status=400,
+                    detail={"bound_installation_id": bound.installation_id if bound else ""},
+                )
+
     # 1. Validate selected_events are in catalog.
     catalog_keys = {entry["key"] for entry in catalog}
     invalid = [e for e in (selected_events or []) if e not in catalog_keys]
@@ -190,7 +222,7 @@ async def create_subscription(
     #     with a clear message.
     by_key = {e.get("key"): e for e in catalog if isinstance(e, dict)}
     gated = [by_key.get(evk) or {} for evk in selected_events]
-    for evk, entry in zip(selected_events, gated):
+    for evk, entry in zip(selected_events, gated, strict=False):
         if entry.get("admin_only") and not (caller_is_admin and scope == "service"):
             raise SubscriptionPermissionError(
                 f"event {evk!r} is admin-only: it requires an admin creating "
@@ -204,7 +236,7 @@ async def create_subscription(
             account_label=account_label,
         )
         if bot_extra.get("token_kind") != "bot":
-            bot_keys = [k for k, e in zip(selected_events, gated)
+            bot_keys = [k for k, e in zip(selected_events, gated, strict=False)
                         if e.get("delivery", "user") == "bot"]
             raise SubscriptionError(
                 f"events {bot_keys} are delivered to the company bot and need "
@@ -216,13 +248,14 @@ async def create_subscription(
     # 2. Cross-check required_scopes against the bound account. Skipped
     # for PATs (granted_scopes returns None — we trust the user's PAT
     # scope selection; the vendor surfaces the real permission problem
-    # via 403 on the subscribe call if scopes are insufficient).
-    kind_entry = resolve_target_kind(webhooks_block, target_kind)
+    # via 403 on the subscribe call if scopes are insufficient) and for an
+    # installation target (the app's permissions, not the token's scopes).
+    kind_entry = {} if installation_target else resolve_target_kind(webhooks_block, target_kind)
     required_scopes = _gather_required_scopes(selected_events, catalog)
     required_scopes |= {
         s for s in kind_entry.get("required_scopes") or [] if isinstance(s, str) and s
     }
-    granted_scopes = _read_granted_scopes(
+    granted_scopes = None if installation_target else _read_granted_scopes(
         scope=scope, owner=user_sub, agent=agent,
         provider_id=provider_id, mcp_name=mcp_name, account_label=account_label,
     )
@@ -271,7 +304,7 @@ async def create_subscription(
     # string sent as an organization (the modal's regex is advisory). A
     # manifest without kinds keeps the client-side check alone: MS Graph's
     # `${account.extra.*}` targets never matched a pattern here.
-    if (webhooks_block.get("vendor_target_spec") or {}).get("target_kinds"):
+    if kind_entry and (webhooks_block.get("vendor_target_spec") or {}).get("target_kinds"):
         pattern = kind_entry.get("validation_regex") or ""
         if pattern and not re.search(pattern, vendor_target):
             raise SubscriptionError(
@@ -289,7 +322,7 @@ async def create_subscription(
     effective_mode = _effective_registration_mode(
         webhooks_block=webhooks_block, scope=scope,
         owner=user_sub, agent=agent, mcp_name=mcp_name,
-        account_label=account_label,
+        account_label=account_label, target_kind=target_kind,
     )
     if effective_mode == "relay":
         from services.billing import relay_client
@@ -305,7 +338,7 @@ async def create_subscription(
                 # 502 bodies with their own HTML page, hiding the message.
                 raise SubscriptionError(
                     relay_client.relay_error_message(e.code), status=422,
-                )
+                ) from e
         except SubscriptionError:
             raise
         except Exception as e:
@@ -320,14 +353,15 @@ async def create_subscription(
     sig_block = webhooks_block.get("signature", {})
     per_sub_secret = sig_block.get("per_subscription_secret", False)
     uv_kind = (webhooks_block.get("url_verification") or {}).get("kind", "none")
-    if per_sub_secret and delivery_mode != "relay" \
+    if per_sub_secret and delivery_mode != "relay" and not installation_target \
             and uv_kind != "verification_token_capture":
         signing_secret = secrets.token_urlsafe(32)
     else:
         # Platform-wide secret lives in infra_credentials; the row stores
         # "" and the dispatcher resolves at verify time. Token-capture vendors
         # (Notion) DICTATE the secret — the row starts empty and the
-        # dispatcher's capture fills it on the vendor's setup POST.
+        # dispatcher's capture fills it on the vendor's setup POST. An
+        # installation target is verified with the app's own secret.
         signing_secret = ""
 
     # Optional manifest-declared lifetime.
@@ -355,10 +389,9 @@ async def create_subscription(
         target_kind=target_kind,
     )
 
-    if effective_mode == "relay":
-        # Relay delivery: no vendor call — the relay forwards events for the
-        # account's (workspace, user) binding as soon as they arrive; the row
-        # is ready to receive immediately.
+    if effective_mode == "relay" or effective_mode == oauth_app_kinds.REGISTRATION_MODE_APP:
+        # Relay delivery, or the app's own webhook: no vendor call, the row
+        # is ready to receive at once.
         webhook_subscription_store.update_subscription_status(
             row["id"], webhook_subscription_store.ACTIVE, clear_last_error=True,
         )
@@ -424,47 +457,70 @@ async def create_subscription(
 
 def resolve_effective_registration_mode(
     *, mcp_name: str, scope: str, owner: str, agent: str | None = None,
-    account_label: str,
+    account_label: str, target_kind: str = "",
 ) -> str:
     """The registration mode subscribe will actually use ('relay' | 'auto' |
-    'manual') — consumed by the catalog endpoint so the UI shows the right
-    copy before the user subscribes."""
+    'manual' | the app's) — consumed by the catalog endpoint so the UI
+    shows the right copy before the user subscribes."""
     manifest = mcp_registry.get_manifest(mcp_name)
     if manifest is None:
         return "manual"
     webhooks_block = (manifest.credentials.webhooks or {}) if manifest.credentials else {}
     return _effective_registration_mode(
         webhooks_block=webhooks_block, scope=scope, owner=owner,
-        agent=agent, mcp_name=mcp_name, account_label=account_label,
+        agent=agent, mcp_name=mcp_name, account_label=account_label, target_kind=target_kind,
     )
 
 
 def _effective_registration_mode(
     *, webhooks_block: dict, scope: str, owner: str, agent: str | None,
-    mcp_name: str, account_label: str,
+    mcp_name: str, account_label: str, target_kind: str = "",
 ) -> str:
     """'relay' when ALL of: the OtoDock relay is configured, the manifest
     declares ``workspace_id_path`` (the fan-in key), and the bound account was
     relay-exchanged (``extra.via_relay`` — only relay-exchanged accounts have
     a routing binding on the relay). Self-managed accounts keep the
-    manifest's own mode."""
+    manifest's own mode. An installation target takes the app's own webhook
+    (the relay's forward of it for a hosted account); the manifest's
+    repository and organization kinds are never switched by it."""
     manifest_mode = (webhooks_block.get("registration") or {}).get("mode", "manual")
-    if not webhooks_block.get("workspace_id_path"):
-        return manifest_mode
+    if target_kind == oauth_app_kinds.INSTALLATION_TARGET_KIND:
+        if not webhooks_block.get("app_webhook"):
+            return manifest_mode
+        hosted_mode: str = oauth_app_kinds.REGISTRATION_MODE_APP
+        routing_path = "app_webhook"
+    else:
+        if not webhooks_block.get("workspace_id_path"):
+            return manifest_mode
+        hosted_mode = manifest_mode
+        routing_path = "workspace_id_path"
     from services.billing import relay_client
     if not relay_client.is_available():
-        return manifest_mode
+        return manifest_mode if routing_path == "workspace_id_path" else hosted_mode
     try:
         extra = _resolve_account_extra(
             provider_id=webhooks_block.get("provider_id", ""),
             scope=scope, owner=owner, agent=agent, mcp_name=mcp_name,
             account_label=account_label,
         )
-    except Exception:
-        return manifest_mode
+    except (OSError, ValueError, psycopg.Error):
+        return hosted_mode
     if not extra.get("via_relay"):
-        return manifest_mode
+        return hosted_mode
     return "relay"
+
+
+_register_lock: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
+
+
+def _register_lock_now() -> asyncio.Lock:
+    """The registration lock of the running loop (the test suite runs
+    several loops in one process, and a lock with waiters is bound to one)."""
+    global _register_lock
+    loop = asyncio.get_running_loop()
+    if _register_lock is None or _register_lock[0] is not loop:
+        _register_lock = (loop, asyncio.Lock())
+    return _register_lock[1]
 
 
 async def _relay_register_events(*, provider_id: str) -> None:
@@ -484,21 +540,24 @@ async def _relay_register_events(*, provider_id: str) -> None:
     events_url = (
         f"{config.DASHBOARD_PUBLIC_URL.rstrip('/')}/v1/webhooks/relay/{provider_id}"
     )
-    have_secret = bool(
-        (credential_store.get_infra_credentials(
-            relay_client.EVENTS_FORWARD_SECRET_SLUG) or {})
-        .get(relay_client.EVENTS_FORWARD_SECRET_KEY)
-    )
-    out = await relay_client.events_register(
-        provider_id=provider_id, events_url=events_url, enabled=True,
-        rotate_secret=not have_secret,
-    )
-    fresh = (out or {}).get("forward_secret")
-    if fresh:
-        credential_store.set_infra_credentials(
-            relay_client.EVENTS_FORWARD_SECRET_SLUG,
-            {relay_client.EVENTS_FORWARD_SECRET_KEY: fresh},
+    # Two first registrations at once (a hosted connect beside a subscribe)
+    # would each ask for a new secret and could store the older one last.
+    async with _register_lock_now():
+        have_secret = bool(
+            (credential_store.get_infra_credentials(
+                relay_client.EVENTS_FORWARD_SECRET_SLUG) or {})
+            .get(relay_client.EVENTS_FORWARD_SECRET_KEY)
         )
+        out = await relay_client.events_register(
+            provider_id=provider_id, events_url=events_url, enabled=True,
+            rotate_secret=not have_secret,
+        )
+        fresh = (out or {}).get("forward_secret")
+        if fresh:
+            credential_store.set_infra_credentials(
+                relay_client.EVENTS_FORWARD_SECRET_SLUG,
+                {relay_client.EVENTS_FORWARD_SECRET_KEY: fresh},
+            )
 
 
 async def _maybe_disable_relay_events(provider_id: str) -> None:
@@ -514,14 +573,23 @@ async def _maybe_disable_relay_events(provider_id: str) -> None:
         return
     from services.billing import relay_client
     try:
-        events_url = (
-            f"{(config.DASHBOARD_PUBLIC_URL or '').rstrip('/')}"
-            f"/v1/webhooks/relay/{provider_id}"
-        )
-        await relay_client.events_register(
-            provider_id=provider_id, events_url=events_url, enabled=False,
-        )
-    except Exception as e:
+        # Under the registration's lock: a hosted connect registering now
+        # has written its account before it asked the relay.
+        async with _register_lock_now():
+            # A hosted GitHub-App account needs the forwarding with no
+            # subscription at all: its installations' changes reach its
+            # card through it.
+            names = [m.name for m in (mcp_registry.get_mcps_by_provider(provider_id) or [])]
+            if await asyncio.to_thread(credential_store.any_hosted_app_account, names):
+                return
+            events_url = (
+                f"{(config.DASHBOARD_PUBLIC_URL or '').rstrip('/')}"
+                f"/v1/webhooks/relay/{provider_id}"
+            )
+            await relay_client.events_register(
+                provider_id=provider_id, events_url=events_url, enabled=False,
+            )
+    except Exception as e:  # noqa: BLE001  # the relay's event registration is best effort, the switch stands
         logger.info("relay events disable skipped (%s): %s", provider_id, e)
 
 
@@ -549,7 +617,7 @@ async def delete_subscription(*, subscription_id: str) -> tuple[bool, bool]:
         return deleted, True
     try:
         detached = await _vendor_delete(row) is not False
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # a vendor's delete raises whatever its client does, the row goes anyway
         detached = False
         logger.warning(
             "vendor delete failed for subscription %s (provider=%s): %s. "
@@ -664,7 +732,7 @@ async def _cleanup_rows(rows: list[dict], *, token_owner_sub: str = "") -> int:
     for row in rows:
         try:
             await _vendor_delete(row, token_owner_sub=token_owner_sub)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # a vendor's delete raises whatever its client does, the row goes anyway
             logger.warning(
                 "cleanup: vendor delete failed for subscription %s (provider=%s): %s",
                 row["id"], row.get("provider_id"), e,
@@ -1020,7 +1088,7 @@ def _resolve_account_extra(
             return {}
         extra = payload.get("extra")
         return extra if isinstance(extra, dict) else {}
-    except Exception as e:
+    except (SubscriptionError, OSError, ValueError, psycopg.Error) as e:
         logger.warning(
             "could not read account.extra for %s/%s: %s",
             provider_id, account_label, e,
@@ -1068,10 +1136,42 @@ def _read_granted_scopes(
             return None
         scopes = payload.get("scopes", [])
         return {s for s in scopes if isinstance(s, str)}
-    except Exception as e:
+    except (SubscriptionError, OSError, ValueError, psycopg.Error) as e:
         logger.warning("could not read granted scopes for %s/%s: %s",
                        provider_id, account_label, e)
         return set()
+
+
+def _account_meta(*, scope: str, owner: str, agent: str | None, mcp_name: str, account_label: str) -> dict:
+    """The bound account's vendor meta (``{}`` when none or unresolvable)."""
+    from storage.identity import credential_store
+    try:
+        owner_sub = owner
+        if scope == "service":
+            ref = credential_resolver.pick_account(mcp_name, agent or "")
+            if ref is None:
+                return {}
+            owner_sub = ref.owner_sub
+        return credential_store.get_account_meta(owner_sub, mcp_name, account_label)
+    except psycopg.Error:
+        return {}
+
+
+def _installation_sentence(standing: str, account_meta: dict) -> str:
+    """Why an installation cannot be subscribed to, with the ones that can
+    (a target that is no installation id at all, as an older client's
+    ``owner/repo``, reads as a gone one)."""
+    from services.oauth import github_apps
+    owned = [
+        f"{i.get('id')} ({i.get('account', '')}, {github_apps.reach_label(i)})"
+        for i in oauth_app_kinds.installations_of(account_meta)
+        if i.get("admin") and not i.get("suspended_at")
+    ]
+    choice = (
+        f"pick one of the account's installations: {', '.join(owned)}" if owned
+        else "install the app on GitHub first (the account owns no installation)"
+    )
+    return f"{credential_resolver.bind_wording(standing)}; {choice}"
 
 
 def resolve_target_kind(webhooks_block: dict, key: str) -> dict:
@@ -1080,8 +1180,12 @@ def resolve_target_kind(webhooks_block: dict, key: str) -> dict:
     A manifest without ``vendor_target_spec.target_kinds`` has one kind: the
     flat spec itself (and only the empty key names it). With kinds, the
     empty key is the first entry — every row created before kinds existed
-    stores ``''`` and was registered the way the first kind registers.
+    stores ``''`` and was registered the way the first kind registers. An
+    installation target (a GitHub-App account's) is no vendor registration:
+    its entry is empty.
     """
+    if key == oauth_app_kinds.INSTALLATION_TARGET_KIND:
+        return {}
     spec = webhooks_block.get("vendor_target_spec") or {}
     kinds = [k for k in spec.get("target_kinds") or [] if isinstance(k, dict)]
     if not kinds:
@@ -1100,6 +1204,8 @@ def registration_call(webhooks_block: dict, target_kind: str, call: str) -> dict
     """The ``registration.<call>`` block a target kind runs: the top-level
     block with the kind's own keys laid over it. A kind restates only what
     differs (GitHub's organization kind: the URL) and inherits the rest."""
+    if target_kind == oauth_app_kinds.INSTALLATION_TARGET_KIND:
+        return {}
     base = (webhooks_block.get("registration") or {}).get(call) or {}
     if not (webhooks_block.get("vendor_target_spec") or {}).get("target_kinds"):
         return base

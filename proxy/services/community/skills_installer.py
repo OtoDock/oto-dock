@@ -36,11 +36,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 import tempfile
 from pathlib import Path
-
-import logging
+from typing import cast
 
 from fastapi import HTTPException
 
@@ -56,8 +56,7 @@ from services.community.community_installer import (
     _rollback_extracted_files,
 )
 from services.infra.path_confinement import PathOutsideRoot, resolve_under
-from services.mcp import mcp_registry
-from services.mcp import mcp_manifest_types as _mt
+from services.mcp import mcp_manifest_types as _mt, mcp_registry
 from services.mcp.mcp_manifest_types import SKILL_ID_MAX_LEN, SKILL_ID_RE
 from storage.mcp import mcp_store
 
@@ -170,7 +169,7 @@ async def install_skill_package_from_extracted(
     try:
         data = json.loads(manifest_path.read_text())
     except json.JSONDecodeError as e:
-        raise HTTPException(400, f"Invalid manifest.json: {e}")
+        raise HTTPException(400, f"Invalid manifest.json: {e}") from e
 
     errors = _validate_skill_package(data, pkg_root)
     if errors:
@@ -188,8 +187,8 @@ async def install_skill_package_from_extracted(
     existing = mcp_registry.get_manifest(name)
     is_update = existing is not None
     old_version = existing.version if existing else None
-    prior_enabled = _existing_enabled_state(name) if is_update else None
-    folder_name = existing.mcp_dir.name if is_update else name
+    prior_enabled = await _existing_enabled_state(name) if is_update else None
+    folder_name = cast("_mt.McpManifest", existing).mcp_dir.name if is_update else name
     target_dir = target_parent / folder_name
 
     await _emit(progress_cb, "install", 60, "Applying package files")
@@ -202,7 +201,7 @@ async def install_skill_package_from_extracted(
         await asyncio.to_thread(
             _apply_extracted_files, pkg_root, target_dir, is_update, backup_dir,
         )
-        await asyncio.to_thread(mcp_registry.scan_manifests)
+        await mcp_registry.rescan()
         if is_update and prior_enabled is not None:
             await asyncio.to_thread(mcp_store.set_mcp_enabled, name, prior_enabled)
         else:
@@ -214,7 +213,7 @@ async def install_skill_package_from_extracted(
             await asyncio.to_thread(
                 _rollback_extracted_files, target_dir, backup_dir,
             )
-            await asyncio.to_thread(mcp_registry.scan_manifests)
+            await mcp_registry.rescan()
         raise
     finally:
         if backup_dir is not None and backup_dir.exists():
@@ -236,6 +235,21 @@ async def install_skill_package_from_extracted(
     }
 
 
+def _bare_skill_problems(fm: dict) -> list[str]:
+    """The skill schema's findings on a bare folder's ``name`` and
+    ``description`` (the two rules a bare folder is held to)."""
+    from storage import catalog_schema
+    try:
+        schema = catalog_schema.load_schema(catalog_schema.SKILL_SCHEMA)
+    except (OSError, ValueError) as exc:
+        logger.exception("The skill schema could not be read")
+        raise HTTPException(
+            500, "This OtoDock cannot read its own skill rules. The server log has the details.",
+        ) from exc
+    named = {k: fm[k] for k in ("name", "description") if k in fm}
+    return catalog_schema.skill_problems(named, schema, "SKILL.md front matter")
+
+
 async def install_bare_skill_folder(
     skill_root: Path, *, progress_cb: ProgressCb = None,
 ) -> dict:
@@ -244,27 +258,31 @@ async def install_bare_skill_folder(
 
     SKILL.md IS the manifest per the Agent Skills spec — its frontmatter
     ``name`` + ``description`` are authoritative (a zip's wrapping folder
-    name is not trusted). The folder is restaged into the package layout
-    (``manifest.json`` + ``skills/<name>/…``) and handed to the normal
-    installer, which validates, collision-checks, and scrubs as usual.
+    name is not trusted), held to the skill schema's rules for the two
+    (``mcps/skill.schema.json``; the other keys stay as lenient as the
+    package path is, the scrub keeps what it keeps). The folder is restaged
+    into the package layout (``manifest.json`` + ``skills/<name>/…``) and
+    handed to the normal installer, which validates, collision-checks, and
+    scrubs as usual.
     """
-    from services.mcp.skill_format import parse_frontmatter
+    from services.mcp.skill_format import FrontMatterError, load_frontmatter
 
     skill_md = skill_root / "SKILL.md"
     if not skill_md.is_file():
         raise HTTPException(400, "SKILL.md not found in skill folder")
-    fm, _body = parse_frontmatter(skill_md.read_text())
-    name = str(fm.get("name") or "").strip()
-    description = str(fm.get("description") or "").strip()
-    if not SKILL_ID_RE.fullmatch(name or "") or len(name) > SKILL_ID_MAX_LEN:
+    try:
+        fm = load_frontmatter(skill_md.read_text())
+    except FrontMatterError as exc:
+        raise HTTPException(400, f"SKILL.md front matter is {exc}") from exc
+    if fm is None:
         raise HTTPException(
-            400,
-            "SKILL.md frontmatter must carry a spec-valid `name` (lowercase "
-            f"letters/digits/hyphens, ≤{SKILL_ID_MAX_LEN} chars); got: {name!r}",
-        )
-    if not description:
-        raise HTTPException(
-            400, "SKILL.md frontmatter must carry a `description`")
+            400, "SKILL.md has no front matter: it must open with a --- block "
+                 "that carries name and description")
+    problems = _bare_skill_problems(fm)
+    if problems:
+        raise HTTPException(400, f"Invalid SKILL.md: {'; '.join(problems)}")
+    name = str(fm["name"])
+    description = str(fm["description"]).strip()
 
     meta = fm.get("metadata") or {}
     version = (str(meta.get("version") or "").strip()
@@ -314,7 +332,7 @@ async def install_skill_package_from_catalog(
             (e for e in registry.get("skills", []) if e.get("name") == name),
             None,
         )
-    except Exception:
+    except (AttributeError, TypeError):
         _entry = None
     if _entry is not None:
         community_catalog.require_platform_compat(

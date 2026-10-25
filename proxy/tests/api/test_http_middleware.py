@@ -26,8 +26,8 @@ import config
 import middleware
 from app import app
 from auth.providers import create_session_jwt
-from tests.conftest import live_session_token
 from storage import pg
+from tests.conftest import live_session_token
 
 CHUNK = 64 * 1024
 
@@ -139,11 +139,19 @@ def test_a_small_unauthenticated_body_still_reaches_the_route():
     assert status not in (401, 413)
 
 
-def test_a_wopi_token_lifts_the_tier_on_wopi_only():
+def test_a_wopi_token_lifts_the_tier_on_wopi_only(monkeypatch):
     # WOPI PutFile carries only its access_token. The declared length is
     # judged before the app runs (the route itself reads no body without a
-    # valid token).
+    # valid token). The calls here are unsigned: the route takes them as
+    # from a Collabora with no key under WOPI_ACCEPT_UNSIGNED, so what is
+    # judged is the cap, not the signature (tests/media/test_wopi_proof.py).
+    import time as _time
+
+    from api.media import wopi_proof
     from api.media.wopi import create_wopi_token, encode_file_id
+    monkeypatch.setattr(config, "WOPI_ACCEPT_UNSIGNED", True, raising=False)
+    monkeypatch.setattr(wopi_proof, "_held", wopi_proof.Keys(
+        current=None, old=None, editor_scheme="", read_at=_time.monotonic()))
     rel = "agent-x/workspace/doc.docx"
     token, _ = create_wopi_token(rel, "user-admin", "Admin", "edit", "agent-x")
     path = f"/wopi/files/{encode_file_id(rel)}/contents"
@@ -406,6 +414,7 @@ _PERIM_1_ROUTES = [
     ("PUT", "/v1/users/me/integrations/x/default-account"),
     ("PUT", "/v1/users/me/integrations/x/agent-binding"),
     ("DELETE", "/v1/users/me/integrations/x/agent-binding/y"),
+    ("GET", "/v1/users/me/integrations/x/repositories"),
     ("GET", "/v1/agents/x/mcps/y/service-account-options"),
     ("PUT", "/v1/agents/x/mcps/y/service-binding"),
     ("DELETE", "/v1/agents/x/mcps/y/service-binding"),
@@ -608,6 +617,7 @@ def test_a_forwarded_host_counts_only_from_a_trusted_hop(monkeypatch):
 
 def test_a_csp_report_is_logged_once_and_extensions_are_dropped(caplog):
     import json as _json
+
     from api.auth import csp
     csp._seen.clear()
     csp._window.update(started=0.0, suppressed=0)
@@ -629,6 +639,7 @@ def test_a_csp_report_is_logged_once_and_extensions_are_dropped(caplog):
 
 def test_a_csp_report_logs_one_line_with_a_numeric_line_number(caplog):
     import json as _json
+
     from api.auth import csp
     csp._seen.clear()
     csp._window.update(started=0.0, suppressed=0)

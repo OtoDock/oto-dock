@@ -19,9 +19,9 @@ from fastapi.testclient import TestClient
 
 import config
 from app import app
+from auth import rate_limiter, tokens
 from auth.password import verify_password
 from auth.providers import UserContext, get_current_user, validate_session_jwt
-from auth import rate_limiter
 from auth.rate_limiter import clear_rate_limit
 from storage import database as db
 
@@ -64,7 +64,7 @@ def test_create_without_password_returns_invite_link(monkeypatch):
     assert "temp_password" not in data
     assert data["invite_url"].startswith("https://dash.example.com/accept-invite?token=")
 
-    payload = pyjwt.decode(_token_of(data["invite_url"]), config.JWT_SECRET, algorithms=["HS256"])
+    payload = tokens.decode(_token_of(data["invite_url"]), tokens.INVITE)
     assert payload["purpose"] == "invite"
     assert payload["exp"] - payload["iat"] == 48 * 3600
 
@@ -191,7 +191,7 @@ def test_send_invite_emails_the_tokenized_link(monkeypatch):
     assert data["invite_sent"] is True
     assert sent["to"] == "invitee@t.com"
     assert sent["url"] == data["invite_url"]
-    payload = pyjwt.decode(_token_of(sent["url"]), config.JWT_SECRET, algorithms=["HS256"])
+    payload = tokens.decode(_token_of(sent["url"]), tokens.INVITE)
     assert payload["purpose"] == "invite"
 
 

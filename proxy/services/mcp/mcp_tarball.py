@@ -79,6 +79,11 @@ class TarballResult:
     size_bytes: int
 
 
+class TreeChanged(RuntimeError):
+    """The MCP's folder changed while its tarball was built (an install
+    rewriting it): nothing from that build is cached or shipped."""
+
+
 # --- Helpers ---
 
 
@@ -176,15 +181,24 @@ def build_tarball(mcp_name: str) -> TarballResult:
         )
 
     content = _build_bytes(mcp_dir, _data_dir_names(manifest))
+    # The build runs in a worker thread, beside an install that may be
+    # rewriting the tree: bytes from a tree that changed under it would ship
+    # under the old hash. Nothing is cached or shipped; the caller builds again.
+    if mcp_installer.compute_version_hash(mcp_dir) != version_hash:
+        raise TreeChanged(f"{mcp_name} changed while its tarball was built")
+    import os
+    import threading
+    # Atomic via a .partial → rename, one partial per writer: two machines
+    # syncing at once build the same entry in two threads.
+    partial = cache_path.with_suffix(
+        f"{cache_path.suffix}.{os.getpid()}.{threading.get_ident()}.partial")
     try:
-        # Atomic via .partial → rename to avoid half-written cache entries
-        # visible to concurrent readers.
-        import os
-        partial = cache_path.with_suffix(cache_path.suffix + ".partial")
         partial.write_bytes(content)
         os.replace(partial, cache_path)
     except OSError as e:
         logger.warning("tarball cache write failed: %s", e)
+        with contextlib.suppress(OSError):
+            partial.unlink()
     return TarballResult(
         tarball_b64=base64.b64encode(content).decode(),
         version_hash=version_hash,
@@ -203,7 +217,7 @@ def invalidate(mcp_name: str) -> None:
     from services.mcp import mcp_registry
     try:
         valid_hashes = set()
-        for name, m in mcp_registry.get_all_manifests().items():
+        for _name, m in mcp_registry.get_all_manifests().items():
             valid_hashes.add(mcp_installer.compute_version_hash(m.mcp_dir))
         fmt_suffix = f".{_TARBALL_FORMAT}"
         for entry in _cache_dir().iterdir():
@@ -250,7 +264,7 @@ def gc() -> int:
     total = sum(e[2] for e in entries)
     if total > MAX_CACHE_BYTES:
         entries.sort(key=lambda x: x[0])  # oldest first
-        for mtime, path, size in entries:
+        for _mtime, path, size in entries:
             if total <= MAX_CACHE_BYTES:
                 break
             try:

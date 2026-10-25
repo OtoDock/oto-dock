@@ -1,0 +1,79 @@
+<p class="muted">A strip of tabs that scrolls sideways when it does not fit. The active tab is lifted on the card surface. Arrows appear only when the strip overflows and go quiet at each end. Use it for views inside one page. The days of a week, the columns of a report, the states of a list. Each tab names its own panel, so two strips on one page stay apart. For whole pages use the app shell instead.</p>
+
+<div class="tabs" id="tabs">
+  <button type="button" class="btn ghost sm tabs-arrow" data-dir="-1" aria-label="Scroll the tabs left" hidden>‹</button>
+  <div class="tabs-track" role="tablist" aria-label="Report sections">
+    <button type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="panel-summary">Summary</button>
+    <button type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="panel-sales">Sales by region</button>
+    <button type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="panel-costs">Costs</button>
+    <button type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="panel-people">People</button>
+    <button type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="panel-forecast">Forecast for next quarter</button>
+    <button type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="panel-notes">Notes</button>
+  </div>
+  <button type="button" class="btn ghost sm tabs-arrow" data-dir="1" aria-label="Scroll the tabs right" hidden>›</button>
+</div>
+<div class="card" style="margin-top: 12px">
+  <div role="tabpanel" id="panel-summary"><p>The quarter in one paragraph.</p></div>
+  <div role="tabpanel" id="panel-sales" hidden><p>Sales by region.</p></div>
+  <div role="tabpanel" id="panel-costs" hidden><p>Costs.</p></div>
+  <div role="tabpanel" id="panel-people" hidden><p>People.</p></div>
+  <div role="tabpanel" id="panel-forecast" hidden><p>The forecast.</p></div>
+  <div role="tabpanel" id="panel-notes" hidden><p>Notes.</p></div>
+</div>
+
+<style>
+.tabs { display: flex; align-items: center; gap: 4px; }
+.tabs-track { display: flex; gap: 4px; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: none; padding: 4px; border-radius: var(--p-radius); background: var(--p-bg); }
+.tabs-track::-webkit-scrollbar { display: none; }
+.tabs-track [role="tab"] { flex: none; min-height: var(--p-control-sm); padding: 0 12px; border: 0; border-radius: var(--p-radius-sm); background: transparent; color: var(--p-text-secondary); font: 500 var(--p-font-size-sm)/var(--p-line-height-sm) var(--p-font); white-space: nowrap; cursor: pointer; transition: color var(--p-duration-fast) var(--p-ease-standard); }
+.tabs-track [role="tab"]:hover { color: var(--p-text); }
+.tabs-track [role="tab"][aria-selected="true"] { background: var(--p-card); color: var(--p-text); box-shadow: var(--p-elevation-1); }
+.tabs-arrow { flex: none; }
+@media (prefers-reduced-motion: reduce) { .tabs-track [role="tab"] { transition: none; } }
+</style>
+
+<script>
+(function () {
+  var root = document.getElementById('tabs')
+  var track = root.querySelector('.tabs-track')
+  var tabs = Array.prototype.slice.call(track.querySelectorAll('[role="tab"]'))
+  var arrows = root.querySelectorAll('.tabs-arrow')
+  function select(tab, focus) {
+    tabs.forEach(function (t) {
+      var on = t === tab
+      t.setAttribute('aria-selected', String(on))
+      t.tabIndex = on ? 0 : -1
+      // Each tab names its own panel, so a second strip on the page keeps its panels.
+      var panel = document.getElementById(t.getAttribute('aria-controls'))
+      if (panel) panel.hidden = !on
+    })
+    tab.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+    if (focus) tab.focus()
+  }
+  function arrowsState() {
+    var overflow = track.scrollWidth > track.clientWidth + 2
+    arrows.forEach(function (a) {
+      a.hidden = !overflow
+      var dir = Number(a.dataset.dir)
+      a.disabled = dir < 0 ? track.scrollLeft <= 1 : track.scrollLeft + track.clientWidth >= track.scrollWidth - 1
+    })
+  }
+  tabs.forEach(function (t) { t.addEventListener('click', function () { select(t, false) }) })
+  track.addEventListener('keydown', function (e) {
+    var i = tabs.indexOf(document.activeElement)
+    if (i < 0) return
+    if (e.key === 'ArrowRight') select(tabs[(i + 1) % tabs.length], true)
+    else if (e.key === 'ArrowLeft') select(tabs[(i - 1 + tabs.length) % tabs.length], true)
+    else if (e.key === 'Home') select(tabs[0], true)
+    else if (e.key === 'End') select(tabs[tabs.length - 1], true)
+    else return
+    e.preventDefault()
+  })
+  arrows.forEach(function (a) {
+    a.addEventListener('click', function () { track.scrollBy({ left: Number(a.dataset.dir) * track.clientWidth * 0.6, behavior: 'smooth' }) })
+  })
+  track.addEventListener('scroll', arrowsState)
+  new ResizeObserver(arrowsState).observe(track)
+  arrowsState()
+})()
+</script>

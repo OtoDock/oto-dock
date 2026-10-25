@@ -17,8 +17,8 @@ import httpx
 import jwt
 
 import config
-from auth.providers.base import AuthProvider, AuthResult
 from auth import roles
+from auth.providers.base import AuthProvider, AuthResult
 
 logger = logging.getLogger("otodock")
 
@@ -65,15 +65,16 @@ async def ensure_oidc_discovery() -> None:
                 )
                 resp.raise_for_status()
                 meta = resp.json()
-        except Exception as e:
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as e:
             # The guard timestamp already advanced — a down IdP logs one line
             # per retry window, not one per click.
             logger.warning(
-                f"OIDC discovery retry failed for {config.OIDC_DISCOVERY_URL}: {e}"
+                "OIDC discovery retry failed for %s: %s",
+                config.OIDC_DISCOVERY_URL, e
             )
             return
         config.apply_oidc_discovery(meta)
-        logger.info(f"OIDC discovery recovered: authorize={config.OIDC_AUTHORIZE_URL}")
+        logger.info("OIDC discovery recovered: authorize=%s", config.OIDC_AUTHORIZE_URL)
 
 
 # --- the ID token -------------------------------------------------------------
@@ -137,8 +138,8 @@ async def _issuer_and_jwks(token_iss: str) -> tuple[str, str]:
             "(or OIDC_ISSUER and OIDC_JWKS_URL) in config.env.", "issuer_unknown")
     try:
         meta = await _get_json(token_iss.rstrip("/") + "/.well-known/openid-configuration")
-    except Exception as e:
-        logger.warning(f"OIDC: discovery at the token's issuer failed: {e}")
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as e:
+        logger.warning("OIDC: discovery at the token's issuer failed: %s", e)
         raise OIDCRefused("The identity provider's signing keys could not be read.",
                           "jwks_unavailable") from None
     if meta.get("issuer") != token_iss or not (jwks or meta.get("jwks_uri")):
@@ -155,8 +156,8 @@ async def _jwks_keys(url: str, *, refresh: bool) -> list[dict]:
         return _jwks["keys"]
     try:
         doc = await _get_json(url)
-    except Exception as e:
-        logger.warning(f"OIDC: the JWKS at {url} could not be read: {e}")
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as e:
+        logger.warning("OIDC: the JWKS at %s could not be read: %s", url, e)
         if _jwks["url"] == url and _jwks["keys"]:
             return _jwks["keys"]
         raise OIDCRefused("The identity provider's signing keys could not be read.",
@@ -181,7 +182,7 @@ async def _signing_key(url: str, kid: str | None, alg: str):
             try:
                 return jwt.PyJWK(match[0], algorithm=alg).key
             except jwt.PyJWTError as e:
-                logger.warning(f"OIDC: an unusable signing key ({e})")
+                logger.warning("OIDC: an unusable signing key (%s)", e)
                 break
     raise OIDCRefused("The sign-in was signed with a key the identity provider does not publish.",
                       "bad_signature")
@@ -267,18 +268,18 @@ class OIDCAuthProvider(AuthProvider):
             tokens = await self._exchange_code(code, redirect_uri,
                                                request_data.get("code_verifier", ""))
         except httpx.HTTPStatusError as e:
-            logger.error(f"OIDC token exchange failed: {e}")
+            logger.error("OIDC token exchange failed: %s", e)
             reason = ""
             try:
                 body = e.response.json()
                 reason = str(body.get("error_description") or body.get("error") or "")[:200]
-            except Exception:
+            except (ValueError, AttributeError):
                 pass
             return AuthResult(success=False, error_code="token_exchange_failed",
                               error=(f"The identity provider refused the sign-in ({reason})."
                                      if reason else "Authentication failed"))
-        except Exception as e:
-            logger.error(f"OIDC token exchange error: {e}")
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as e:
+            logger.error("OIDC token exchange error: %s", e)
             return AuthResult(success=False, error="Authentication failed",
                               error_code="token_exchange_failed")
 
@@ -294,14 +295,14 @@ class OIDCAuthProvider(AuthProvider):
         try:
             claims = await verify_id_token(id_token, nonce=request_data.get("nonce", ""))
         except OIDCRefused as e:
-            logger.warning(f"OIDC sign-in refused ({e.code}): {e.message}")
+            logger.warning("OIDC sign-in refused (%s): %s", e.code, e.message)
             return AuthResult(success=False, error=e.message, error_code=e.code)
 
         # Fetch user info
         try:
             userinfo = await self._fetch_userinfo(access_token)
-        except Exception as e:
-            logger.error(f"OIDC userinfo fetch failed: {e}")
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as e:
+            logger.error("OIDC userinfo fetch failed: %s", e)
             return AuthResult(success=False, error="Failed to fetch user info",
                               error_code="userinfo_failed")
 

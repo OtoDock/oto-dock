@@ -81,9 +81,9 @@ describe('AI Engines settings card', () => {
     expect(screen.getByText('Reconnect Needed')).toBeInTheDocument()
     expect(screen.getByText('Reconnect')).toBeInTheDocument()
     expect(screen.getByLabelText('Personal use')).toBeDisabled()
-    expect(screen.getByText(/reconnect the same account to revive/)).toBeInTheDocument()
+    expect(screen.getByText(/Reconnect the same account to revive/)).toBeInTheDocument()
     // The section button never says "Connect Different Account" anymore.
-    expect(screen.getByText('Add Another Account')).toBeInTheDocument()
+    expect(screen.getByText('Add another account')).toBeInTheDocument()
   })
 
   it('disabled row: admin note, no Reconnect', () => {
@@ -130,7 +130,7 @@ describe('AI Engines settings card', () => {
 
   it('"Use an API key instead" posts the key to the user endpoint, out of the pool', () => {
     renderCard([])
-    expect(screen.getByText('Connect Your Claude Account')).toBeInTheDocument()
+    expect(screen.getByText('Connect your Claude account')).toBeInTheDocument()
     fireEvent.click(screen.getByText('Use an API key instead'))
     // The engine's vendor is fixed on the user card: no provider select.
     expect(screen.queryByRole('combobox')).toBeNull()

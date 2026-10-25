@@ -4,11 +4,11 @@ digests) cannot start every CLI + sandbox in the same second."""
 
 import asyncio
 
+import psycopg
 import pytest
 
 import config
-from services.scheduler import scheduler
-from services.scheduler import firing
+from services.scheduler import firing, scheduler
 
 
 @pytest.fixture(autouse=True)
@@ -134,7 +134,7 @@ def test_a_failed_creator_lookup_still_fires(monkeypatch):
     monkeypatch.setattr(config, "TASK_SPAWN_SPACING_SECONDS", 10)
 
     def boom(task_id):
-        raise RuntimeError("database down")
+        raise psycopg.OperationalError("database down")
 
     monkeypatch.setattr(firing.task_store, "get_dynamic_task", boom)
 
@@ -161,9 +161,9 @@ def test_spacing_off_jitters_each_fire(monkeypatch):
 # and the row is read again after the wait.
 # ---------------------------------------------------------------------------
 
-from services.scheduler import runner, shared  # noqa: E402
-from storage import database as task_store  # noqa: E402
-from storage.agents import agent_store  # noqa: E402
+from services.scheduler import runner, shared
+from storage import database as task_store
+from storage.agents import agent_store
 
 
 @pytest.fixture
@@ -181,7 +181,7 @@ def spaced(monkeypatch, temp_db):
     async def fake_sleep(seconds):
         slept.append(seconds)
     monkeypatch.setattr(firing.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(config, "get_cli_model", lambda agent, layer=None: "test-model")
+    monkeypatch.setattr("configuration.models.get_cli_model", lambda agent, layer=None: "test-model")
     yield slept
     firing._spacing_pending.clear()
     shared._active_task_ids.clear()

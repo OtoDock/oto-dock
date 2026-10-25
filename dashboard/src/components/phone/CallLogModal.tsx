@@ -8,22 +8,25 @@ import { useState } from 'react'
 import { usePhoneRouteCallLog, PHONE_INBOUND, type PhoneRoute } from '@/api/phone'
 import { formatRelativeTime } from '@/lib/format'
 import { Badge } from '@/components/ui/SettingsControls'
+import Dialog from '../ui/Dialog'
+import { DIALOG_PANEL } from '../ui/classes'
+import Button from '../ui/Button'
 
 const PAGE_SIZE = 25
 
-const OUTCOME_TONE: Record<string, 'default' | 'green' | 'amber' | 'blue' | 'red'> = {
-  completed: 'green',
-  hangup: 'default',
-  pin_failed: 'red',
-  pin_cooldown: 'amber',
-  pin_timeout: 'amber',
-  rejected_capacity: 'amber',
-  no_answer: 'default',
-  busy: 'default',
-  failed: 'red',
-  error: 'red',
-  transferred: 'blue',
-  transfer_failed: 'red',
+const OUTCOME_TONE: Record<string, 'neutral' | 'success' | 'warning' | 'info' | 'danger'> = {
+  completed: 'success',
+  hangup: 'neutral',
+  pin_failed: 'danger',
+  pin_cooldown: 'warning',
+  pin_timeout: 'warning',
+  rejected_capacity: 'warning',
+  no_answer: 'neutral',
+  busy: 'neutral',
+  failed: 'danger',
+  error: 'danger',
+  transferred: 'info',
+  transfer_failed: 'danger',
 }
 
 const OUTCOME_LABEL: Record<string, string> = {
@@ -50,12 +53,12 @@ function fmtDuration(s: number | null): string {
 // The identity label stamped at warmup (`caller:<id>` / `caller-pin:<id>` /
 // `ephemeral` / `shared` / `user:<username>`); the number itself is in the
 // Number column, so the cell says WHO the session ran as.
-export function fmtIdentity(label: string): string {
+function fmtIdentity(label: string): string {
   if (!label) return '—'
   const [kind, rest] = label.includes(':') ? [label.slice(0, label.indexOf(':')), label.slice(label.indexOf(':') + 1)] : [label, '']
   switch (kind) {
     case 'caller': return 'Caller'
-    case 'caller-pin': return 'Caller (PIN)'
+    case 'caller-pin': return 'Caller with PIN'
     case 'ephemeral': return 'Anonymous'
     case 'shared': return 'Shared'
     case 'user': return rest ? `User ${rest}` : 'User'
@@ -64,7 +67,7 @@ export function fmtIdentity(label: string): string {
 }
 
 // `mcp__memory-mcp__memory` → `memory-mcp/memory`; built-ins stay as-is.
-export function fmtTool(name: string): string {
+function fmtTool(name: string): string {
   const m = /^mcp__(.+?)__(.+)$/.exec(name)
   return m ? `${m[1]}/${m[2]}` : name
 }
@@ -79,33 +82,33 @@ export default function CallLogModal({ route, onClose }: {
   const total = data?.total ?? 0
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
-      <div
-        className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light max-w-3xl w-full max-h-[85vh] overflow-auto"
-        onClick={e => e.stopPropagation()}
-      >
-        <div className="px-4 py-3 border-b border-p-border-light flex items-center justify-between">
+    <Dialog
+      onClose={onClose}
+      aria-label="Call log"
+      panelClassName={`${DIALOG_PANEL} max-w-3xl max-h-[85vh] overflow-auto`}
+    >
+        <div className="px-4 py-3 border-b border-subtle flex items-center justify-between">
           <div>
-            <h2 className="font-semibold text-p-text">Call log</h2>
-            <p className="text-xs text-p-text-light">
-              {route.name || route.id} — kept for the caller-data window, refreshes automatically
+            <h2 className="font-semibold text-primary">Call log</h2>
+            <p className="text-xs text-tertiary">
+              {route.name || route.id} · Kept as long as caller data. Refreshes on its own.
             </p>
           </div>
-          <button onClick={onClose} className="text-p-text-secondary hover:text-p-text text-xl leading-none">&times;</button>
+          <button onClick={onClose} className="text-secondary hover:text-primary text-xl leading-none">&times;</button>
         </div>
 
         <div className="p-4">
           {isLoading ? (
-            <div className="text-center py-10 text-p-text-light text-sm">Loading…</div>
+            <div className="text-center py-10 text-tertiary text-sm">Loading…</div>
           ) : calls.length === 0 ? (
-            <div className="text-center py-10 text-p-text-light text-sm">
-              No calls recorded yet. Rows appear here as calls end — including
-              callers who failed the PIN.
+            <div className="text-center py-10 text-tertiary text-sm">
+              No calls recorded yet. A row appears here when a call ends.
+              Callers who failed the PIN show too.
             </div>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full min-w-[760px] text-sm">
-                <thead className="bg-p-bg text-left text-xs text-p-text-secondary uppercase tracking-wide border-b border-p-border-light">
+                <thead className="bg-surface-sunken text-left text-xs text-secondary uppercase tracking-wide border-b border-subtle">
                   <tr>
                     <th className="px-3 py-2">When</th>
                     <th className="px-3 py-2">Direction</th>
@@ -118,34 +121,34 @@ export default function CallLogModal({ route, onClose }: {
                 </thead>
                 <tbody>
                   {calls.map(c => (
-                    <tr key={c.id} className="border-b border-p-border-light last:border-0 hover:bg-p-surface-hover transition-colors">
-                      <td className="px-3 py-2 whitespace-nowrap text-p-text-secondary" title={c.started_at}>
+                    <tr key={c.id} className="border-b border-subtle last:border-0 hover:bg-surface-hover transition-colors">
+                      <td className="px-3 py-2 whitespace-nowrap text-secondary" title={c.started_at}>
                         {formatRelativeTime(c.started_at)}
                       </td>
                       <td className="px-3 py-2">
-                        <Badge variant={c.direction === PHONE_INBOUND ? 'blue' : 'default'}>{c.direction}</Badge>
+                        <Badge variant={c.direction === PHONE_INBOUND ? 'info' : 'neutral'}>{c.direction}</Badge>
                       </td>
-                      <td className="px-3 py-2 font-mono text-p-text">
-                        {(c.direction === PHONE_INBOUND ? c.from_number : c.to_number) || '(unknown)'}
+                      <td className="px-3 py-2 font-mono text-primary">
+                        {(c.direction === PHONE_INBOUND ? c.from_number : c.to_number) || 'Unknown'}
                       </td>
-                      <td className="px-3 py-2 text-p-text-secondary whitespace-nowrap" title={c.identity || undefined}>
+                      <td className="px-3 py-2 text-secondary whitespace-nowrap" title={c.identity || undefined}>
                         {fmtIdentity(c.identity)}
                       </td>
                       <td className="px-3 py-2">
-                        <Badge variant={OUTCOME_TONE[c.outcome] ?? 'default'}>
+                        <Badge variant={OUTCOME_TONE[c.outcome] ?? 'neutral'}>
                           {OUTCOME_LABEL[c.outcome] ?? c.outcome}
                         </Badge>
                         {c.pin_attempts > 0 && c.outcome.startsWith('pin_') && (
-                          <span className="ml-1.5 text-xs text-p-text-light">
+                          <span className="ml-1.5 text-xs text-tertiary">
                             {c.pin_attempts} {c.pin_attempts === 1 ? 'attempt' : 'attempts'}
                           </span>
                         )}
                       </td>
-                      <td className="px-3 py-2 text-xs text-p-text-secondary max-w-[220px] truncate"
+                      <td className="px-3 py-2 text-xs text-secondary max-w-[220px] truncate"
                         title={(c.tools_run ?? []).map(fmtTool).join(', ') || undefined}>
-                        {(c.tools_run ?? []).length ? (c.tools_run ?? []).map(fmtTool).join(', ') : <span className="text-p-text-light">—</span>}
+                        {(c.tools_run ?? []).length ? (c.tools_run ?? []).map(fmtTool).join(', ') : <span className="text-tertiary">—</span>}
                       </td>
-                      <td className="px-3 py-2 text-right text-p-text-secondary whitespace-nowrap">
+                      <td className="px-3 py-2 text-right text-secondary whitespace-nowrap">
                         {fmtDuration(c.duration_s)}
                       </td>
                     </tr>
@@ -156,24 +159,21 @@ export default function CallLogModal({ route, onClose }: {
           )}
 
           {total > PAGE_SIZE && (
-            <div className="flex items-center justify-between mt-3 text-xs text-p-text-secondary">
+            <div className="flex items-center justify-between mt-3 text-xs text-secondary">
               <span>{offset + 1}–{Math.min(offset + PAGE_SIZE, total)} of {total}</span>
               <div className="space-x-2">
-                <button
+                <Button
                   disabled={offset === 0}
                   onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
-                  className="px-2 py-1 rounded-sm border border-p-border-light disabled:opacity-40 hover:bg-p-surface-hover"
-                >Previous</button>
-                <button
+                >Previous</Button>
+                <Button
                   disabled={offset + PAGE_SIZE >= total}
                   onClick={() => setOffset(offset + PAGE_SIZE)}
-                  className="px-2 py-1 rounded-sm border border-p-border-light disabled:opacity-40 hover:bg-p-surface-hover"
-                >Next</button>
+                >Next</Button>
               </div>
             </div>
           )}
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }

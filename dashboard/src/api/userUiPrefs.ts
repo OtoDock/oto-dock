@@ -7,9 +7,9 @@
 
 import { useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './auth'
 import { hydrateLastInteractiveFromServer } from '../store/agentPrefsStore'
 import { setFocusSharing } from '../lib/focus'
+import { apiJson, withMessage } from '../lib/http/apiJson'
 
 export interface UiPrefs {
   // agent slug → 'interactive' | '-p'
@@ -28,9 +28,7 @@ export function useMyUiPrefs() {
   return useQuery({
     queryKey: ['my-ui-prefs'],
     queryFn: async (): Promise<UiPrefs> => {
-      const res = await apiFetch('/v1/users/me/ui-prefs')
-      if (!res.ok) throw new Error('Failed to fetch UI preferences')
-      return res.json()
+      return apiJson<UiPrefs>('/v1/users/me/ui-prefs').catch(withMessage('Failed to fetch UI preferences'))
     },
   })
 }
@@ -41,14 +39,13 @@ export function useUpdateMyUiPrefs() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (data: UiPrefs) => {
-      const res = await apiFetch('/v1/users/me/ui-prefs', {
+      // The server's sentence when it gave one, so the toast says why.
+      return apiJson('/v1/users/me/ui-prefs', {
         method: 'PUT',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error('Failed to save UI preferences')
-      return res.json()
+      }, 'Your settings were not saved. Try again.')
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['my-ui-prefs'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['my-ui-prefs'] }),
   })
 }
 

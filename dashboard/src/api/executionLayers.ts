@@ -9,6 +9,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
 import type { EngineDescriptor } from './engineDescriptor'
 import type { EngineSubscriptionStatus } from '../lib/status/engineSubscription'
+import { apiJson, withMessage } from '../lib/http/apiJson'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -128,7 +129,7 @@ export interface UserLayerInfo {
 const ENGINE_QUERY_KEYS = ['admin-execution-layers', 'user-execution-layers', 'execution-layers'] as const
 
 function invalidateEngineQueries(qc: ReturnType<typeof useQueryClient>) {
-  for (const key of ENGINE_QUERY_KEYS) qc.invalidateQueries({ queryKey: [key] })
+  return Promise.all(ENGINE_QUERY_KEYS.map((key) => qc.invalidateQueries({ queryKey: [key] })))
 }
 
 /** One self-hosted OpenAI-compatible endpoint, listed once across the engines
@@ -149,9 +150,8 @@ interface AdminEnginesPayload {
 }
 
 const fetchAdminEngines = async (): Promise<AdminEnginesPayload> => {
-  const res = await apiFetch('/v1/admin/execution-layers')
-  if (!res.ok) throw new Error('Failed to fetch execution layers')
-  const data = await res.json()
+  const data = await apiJson<Partial<AdminEnginesPayload>>('/v1/admin/execution-layers')
+    .catch(withMessage('Could not load the AI engines'))
   return { layers: data.layers ?? [], local_endpoints: data.local_endpoints ?? [] }
 }
 
@@ -179,15 +179,10 @@ export function useAddLocalEndpoint() {
       api_key?: string
       layers: string[]
     }) => {
-      const res = await apiFetch('/v1/admin/execution-layers/local-endpoints', {
+      return apiJson<LocalEndpointGroup>('/v1/admin/execution-layers/local-endpoints', {
         method: 'POST',
         body: JSON.stringify(body),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to add local endpoint')
-      }
-      return res.json() as Promise<LocalEndpointGroup>
+      }, 'Could not add the local server')
     },
     onSuccess: () => invalidateEngineQueries(qc),
   })
@@ -197,15 +192,10 @@ export function useSetLocalEndpointEngine() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ group, layer, enabled }: { group: string; layer: string; enabled: boolean }) => {
-      const res = await apiFetch(`/v1/admin/execution-layers/local-endpoints/${encodeURIComponent(group)}`, {
+      return apiJson<LocalEndpointGroup>(`/v1/admin/execution-layers/local-endpoints/${encodeURIComponent(group)}`, {
         method: 'PUT',
         body: JSON.stringify({ layer, enabled }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to update local endpoint')
-      }
-      return res.json() as Promise<LocalEndpointGroup>
+      }, 'Could not update the local server')
     },
     onSuccess: () => invalidateEngineQueries(qc),
   })
@@ -221,7 +211,7 @@ export function useDeleteLocalEndpoint() {
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        throw Object.assign(new Error(err.detail || 'Failed to remove local endpoint'), { status: res.status })
+        throw Object.assign(new Error(err.detail || 'Could not remove the local server'), { status: res.status })
       }
       return res.json()
     },
@@ -245,15 +235,10 @@ export function useAddSubscription() {
       use_personal?: boolean
       contribute_platform?: boolean
     }) => {
-      const res = await apiFetch(`/v1/admin/execution-layers/${layer}/subscriptions`, {
+      return apiJson(`/v1/admin/execution-layers/${layer}/subscriptions`, {
         method: 'POST',
         body: JSON.stringify(body),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to add subscription')
-      }
-      return res.json()
+      }, 'Failed to add subscription')
     },
     onSuccess: () => invalidateEngineQueries(qc),
   })
@@ -270,16 +255,14 @@ export function useUpdateSubscription() {
       layer: string
       id: string
       label?: string
-      status?: string
+      status?: EngineSubscriptionStatus
       use_personal?: boolean
       contribute_platform?: boolean
     }) => {
-      const res = await apiFetch(`/v1/admin/execution-layers/${layer}/subscriptions/${id}`, {
+      return apiJson(`/v1/admin/execution-layers/${layer}/subscriptions/${id}`, {
         method: 'PUT',
         body: JSON.stringify(body),
-      })
-      if (!res.ok) throw new Error('Failed to update subscription')
-      return res.json()
+      }).catch(withMessage('Failed to update subscription'))
     },
     // Optimistic: reflect the toggle instantly in User Settings (the user-scope
     // query it reads from), then reconcile. Without this the row only updated
@@ -288,17 +271,17 @@ export function useUpdateSubscription() {
     onMutate: async (vars) => {
       await qc.cancelQueries({ queryKey: ['user-execution-layers'] })
       const prev = qc.getQueryData(['user-execution-layers'])
-      qc.setQueryData(['user-execution-layers'], (old: any) =>
+      qc.setQueryData<UserLayerInfo[]>(['user-execution-layers'], (old) =>
         Array.isArray(old)
-          ? old.map((l: any) => ({
+          ? old.map((l) => ({
               ...l,
-              user_subscriptions: (l.user_subscriptions ?? []).map((s: any) =>
+              user_subscriptions: (l.user_subscriptions ?? []).map((s) =>
                 s.id === vars.id ? { ...s, ...vars } : s),
             }))
           : old)
       return { prev }
     },
-    onError: (_e, _vars, ctx: any) => {
+    onError: (_e, _vars, ctx) => {
       if (ctx?.prev !== undefined) qc.setQueryData(['user-execution-layers'], ctx.prev)
     },
     onSettled: () => invalidateEngineQueries(qc),
@@ -322,29 +305,27 @@ export function useUserUpdateSubscription() {
       use_personal?: boolean
       contribute_platform?: boolean
     }) => {
-      const res = await apiFetch(`/v1/users/me/execution-layers/${layer}/subscriptions/${id}`, {
+      return apiJson(`/v1/users/me/execution-layers/${layer}/subscriptions/${id}`, {
         method: 'PUT',
         body: JSON.stringify(body),
-      })
-      if (!res.ok) throw new Error('Failed to update subscription')
-      return res.json()
+      }).catch(withMessage('Failed to update subscription'))
     },
     // Same optimistic pattern as useUpdateSubscription — reflect the toggle
     // instantly in the user-scope query User Settings renders from.
     onMutate: async (vars) => {
       await qc.cancelQueries({ queryKey: ['user-execution-layers'] })
       const prev = qc.getQueryData(['user-execution-layers'])
-      qc.setQueryData(['user-execution-layers'], (old: any) =>
+      qc.setQueryData<UserLayerInfo[]>(['user-execution-layers'], (old) =>
         Array.isArray(old)
-          ? old.map((l: any) => ({
+          ? old.map((l) => ({
               ...l,
-              user_subscriptions: (l.user_subscriptions ?? []).map((s: any) =>
+              user_subscriptions: (l.user_subscriptions ?? []).map((s) =>
                 s.id === vars.id ? { ...s, ...vars } : s),
             }))
           : old)
       return { prev }
     },
-    onError: (_e, _vars, ctx: any) => {
+    onError: (_e, _vars, ctx) => {
       if (ctx?.prev !== undefined) qc.setQueryData(['user-execution-layers'], ctx.prev)
     },
     onSettled: () => invalidateEngineQueries(qc),
@@ -395,15 +376,10 @@ export function useAddModel() {
       supports_reasoning?: boolean
       supports_xhigh?: boolean
     }) => {
-      const res = await apiFetch(`/v1/admin/execution-layers/${layer}/models`, {
+      return apiJson(`/v1/admin/execution-layers/${layer}/models`, {
         method: 'POST',
         body: JSON.stringify(body),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to add model')
-      }
-      return res.json()
+      }, 'Failed to add model')
     },
     onSuccess: () => invalidateEngineQueries(qc),
   })
@@ -432,12 +408,10 @@ export function useUpdateModel() {
       tier?: number | null
       good_at?: string
     }) => {
-      const res = await apiFetch(`/v1/admin/execution-layers/${layer}/models/${id}`, {
+      return apiJson(`/v1/admin/execution-layers/${layer}/models/${id}`, {
         method: 'PUT',
         body: JSON.stringify(body),
-      })
-      if (!res.ok) throw new Error('Failed to update model')
-      return res.json()
+      }).catch(withMessage('Failed to update model'))
     },
     onSuccess: () => invalidateEngineQueries(qc),
   })
@@ -447,14 +421,9 @@ export function useDeleteModel() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ layer, id }: { layer: string; id: number }) => {
-      const res = await apiFetch(`/v1/admin/execution-layers/${layer}/models/${id}`, {
+      return apiJson(`/v1/admin/execution-layers/${layer}/models/${id}`, {
         method: 'DELETE',
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to delete model')
-      }
-      return res.json()
+      }, 'Failed to delete model')
     },
     onSuccess: () => invalidateEngineQueries(qc),
   })
@@ -478,15 +447,10 @@ export function useDiscoverModels() {
       layer: string
       subscriptionId: string
     }): Promise<{ models: DiscoveredModel[]; provider: string }> => {
-      const res = await apiFetch(`/v1/admin/execution-layers/${layer}/discover-models`, {
+      return apiJson<{ models: DiscoveredModel[]; provider: string }>(`/v1/admin/execution-layers/${layer}/discover-models`, {
         method: 'POST',
         body: JSON.stringify({ subscription_id: subscriptionId }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to discover models')
-      }
-      return res.json()
+      }, 'Failed to discover models')
     },
   })
 }
@@ -505,15 +469,10 @@ export function useBulkAddModels() {
       provider: string
       layers?: string[]
     }) => {
-      const res = await apiFetch(`/v1/admin/execution-layers/${layer}/models/bulk`, {
+      return apiJson(`/v1/admin/execution-layers/${layer}/models/bulk`, {
         method: 'POST',
         body: JSON.stringify({ models, provider, ...(layers?.length ? { layers } : {}) }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to add models')
-      }
-      return res.json()
+      }, 'Failed to add models')
     },
     onSuccess: () => invalidateEngineQueries(qc),
   })
@@ -527,12 +486,10 @@ export function useSetPlatformAuth() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ userSub, allowed }: { userSub: string; allowed: boolean }) => {
-      const res = await apiFetch(`/v1/admin/users/${userSub}/platform-auth`, {
+      return apiJson(`/v1/admin/users/${userSub}/platform-auth`, {
         method: 'PUT',
         body: JSON.stringify({ allowed }),
-      })
-      if (!res.ok) throw new Error('Failed to update platform auth')
-      return res.json()
+      }).catch(withMessage('Could not change the Platform API access.'))
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-users'] }),
   })
@@ -545,15 +502,10 @@ export function useSetPlatformAuth() {
 export function useStartClaudeOAuth() {
   return useMutation({
     mutationFn: async ({ layer, ownerType }: { layer: string; ownerType: 'platform' | 'user' }) => {
-      const res = await apiFetch('/v1/oauth/claude/start', {
+      return apiJson<{ url: string; state: string }>('/v1/oauth/claude/start', {
         method: 'POST',
         body: JSON.stringify({ layer, owner_type: ownerType }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to start OAuth')
-      }
-      return res.json() as Promise<{ url: string; state: string }>
+      }, 'Failed to start OAuth')
     },
   })
 }
@@ -602,14 +554,15 @@ export function useExchangeClaudeOAuth() {
 /** The sentence both connect forms show above the code box: the popup's
  * session decides which account is connected. */
 export const CLAUDE_SECOND_ACCOUNT_HINT =
-  'The popup signs you in on platform.claude.com; to add a second account, sign out of your Claude account there first or use a private window.'
+  'The popup signs you in on platform.claude.com. To add a second account, sign out of your Claude account there first. ' +
+  'You can also use a private window.'
 
 /** The message when a paste matched an account that is already connected. */
 export function alreadyConnectedMessage(email: string): string {
   return (
-    `That is the account you already connected (${email || 'the same account'}). ` +
+    `That is the account you already connected: ${email || 'the same account'}. ` +
     'Its login was refreshed and no new account was added. To add a different account, ' +
-    'sign out of platform.claude.com in this browser first, or use a private window, then start again.'
+    'sign out of platform.claude.com in this browser first. You can also use a private window. Then start again.'
   )
 }
 
@@ -620,15 +573,10 @@ export function alreadyConnectedMessage(email: string): string {
 export function useStartOpenAIOAuth() {
   return useMutation({
     mutationFn: async ({ layer, ownerType }: { layer: string; ownerType: 'platform' | 'user' }) => {
-      const res = await apiFetch('/v1/oauth/openai/start', {
+      return apiJson<{ url: string; user_code: string; login_id: string }>('/v1/oauth/openai/start', {
         method: 'POST',
         body: JSON.stringify({ layer, owner_type: ownerType }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to start OpenAI login')
-      }
-      return res.json() as Promise<{ url: string; user_code: string; login_id: string }>
+      }, 'Failed to start OpenAI login')
     },
   })
 }
@@ -636,12 +584,7 @@ export function useStartOpenAIOAuth() {
 export function useOpenAIOAuthStatus() {
   return useMutation({
     mutationFn: async ({ loginId }: { loginId: string }) => {
-      const res = await apiFetch(`/v1/oauth/openai/status?login_id=${encodeURIComponent(loginId)}`)
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Status check failed')
-      }
-      return res.json() as Promise<{ status: 'pending' | 'completed' | 'failed'; message?: string }>
+      return apiJson<{ status: 'pending' | 'completed' | 'failed'; message?: string }>(`/v1/oauth/openai/status?login_id=${encodeURIComponent(loginId)}`, {}, 'Status check failed')
     },
   })
 }
@@ -657,15 +600,10 @@ export function useFinishOpenAIOAuth() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ loginId, layer, label }: { loginId: string; layer: string; label?: string }) => {
-      const res = await apiFetch('/v1/oauth/openai/finish', {
+      return apiJson<{ subscription?: Subscription; created?: boolean }>('/v1/oauth/openai/finish', {
         method: 'POST',
         body: JSON.stringify({ login_id: loginId, layer, label }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to finish OpenAI login')
-      }
-      return res.json()
+      }, 'Failed to finish OpenAI login')
     },
     onSuccess: () => invalidateEngineQueries(qc),
   })
@@ -679,9 +617,8 @@ export const useUserExecutionLayers = () =>
   useQuery({
     queryKey: ['user-execution-layers'],
     queryFn: async (): Promise<UserLayerInfo[]> => {
-      const res = await apiFetch('/v1/users/me/execution-layers')
-      if (!res.ok) throw new Error('Failed to fetch execution layers')
-      const data = await res.json()
+      const data = await apiJson<{ layers?: UserLayerInfo[] }>('/v1/users/me/execution-layers')
+        .catch(withMessage('Could not load the AI engines'))
       return data.layers ?? []
     },
   })
@@ -703,15 +640,10 @@ export function useUserAddSubscription() {
       api_key?: string
       contribute_platform?: boolean
     }) => {
-      const res = await apiFetch(`/v1/users/me/execution-layers/${layer}/subscriptions`, {
+      return apiJson(`/v1/users/me/execution-layers/${layer}/subscriptions`, {
         method: 'POST',
         body: JSON.stringify(body),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to add the API key')
-      }
-      return res.json()
+      }, 'Failed to add the API key')
     },
     onSuccess: () => invalidateEngineQueries(qc),
   })
@@ -721,11 +653,9 @@ export function useUserDeleteSubscription() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ layer, id }: { layer: string; id: string }) => {
-      const res = await apiFetch(`/v1/users/me/execution-layers/${layer}/subscriptions/${id}`, {
+      return apiJson(`/v1/users/me/execution-layers/${layer}/subscriptions/${id}`, {
         method: 'DELETE',
-      })
-      if (!res.ok) throw new Error('Failed to delete subscription')
-      return res.json()
+      }).catch(withMessage('Failed to delete subscription'))
     },
     onSuccess: () => invalidateEngineQueries(qc),
   })

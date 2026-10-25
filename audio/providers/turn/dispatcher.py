@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 import numpy as np
 
@@ -32,8 +31,8 @@ class TurnClassifierDispatcher:
 
     def __init__(
         self,
-        smart_turn: Optional[SmartTurnClassifier],
-        groq: Optional[GroqTurnClassifier],
+        smart_turn: SmartTurnClassifier | None,
+        groq: GroqTurnClassifier | None,
         lang_map: dict[str, str],
         default_backend: str,
     ) -> None:
@@ -42,10 +41,11 @@ class TurnClassifierDispatcher:
         self._lang_map = lang_map
         self._default_backend = default_backend
         logger.info(
-            f"Turn classifier dispatcher: lang_map={lang_map}, "
-            f"default={default_backend}, "
-            f"smart_turn={'yes' if smart_turn else 'no'}, "
-            f"groq={'yes' if groq else 'no'}"
+            "Turn classifier dispatcher: lang_map=%s, "
+            "default=%s, "
+            "smart_turn=%s, "
+            "groq=%s",
+            lang_map, default_backend, 'yes' if smart_turn else 'no', 'yes' if groq else 'no'
         )
 
     def backend_for_language(self, lang: str) -> str:
@@ -72,8 +72,8 @@ class TurnClassifierDispatcher:
         text: str,
         context: str,
         language: str,
-        audio_16k: Optional[np.ndarray] = None,
-    ) -> Optional[bool]:
+        audio_16k: np.ndarray | None = None,
+    ) -> bool | None:
         """Classify turn completeness. Routes to the right backend.
 
         Returns True (complete), False (incomplete), or None (use heuristic).
@@ -132,7 +132,7 @@ def build_dispatcher(
     default_backend: str,
     model_path: str | None = None,
     groq_base_url: str | None = None,
-) -> Optional[TurnClassifierDispatcher]:
+) -> TurnClassifierDispatcher | None:
     """Build a dispatcher from explicit settings (pure — no ConfigManager).
 
     The caller maps its config/credentials to these kwargs. Groq is enabled
@@ -157,10 +157,10 @@ def build_dispatcher(
                     num_threads=smart_turn_onnx_threads,
                     audio_window_s=smart_turn_audio_window_s,
                 )
-            except Exception as e:
-                logger.error(f"Failed to load Smart Turn classifier: {e}")
+            except Exception as e:  # noqa: BLE001  # onnxruntime loading or running a model raises anything
+                logger.error("Failed to load Smart Turn classifier: %s", e)
         else:
-            logger.warning(f"Smart Turn model not found: {path}")
+            logger.warning("Smart Turn model not found: %s", path)
 
     if groq_api_key:
         groq = GroqTurnClassifier(groq_api_key, base_url=groq_base_url)

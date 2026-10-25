@@ -18,7 +18,6 @@ import config
 from core.config import deployment
 from services.mcp import compose_rewrite
 
-
 # --- a camoufox-shaped build-from-context compose (the real shape we rewrite) ---
 CAMOUFOX_COMPOSE = {
     "services": {

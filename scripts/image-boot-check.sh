@@ -8,9 +8,11 @@
 #   scripts/image-boot-check.sh PROXY_IMAGE FILE_TOOLS_IMAGE PHONE_IMAGE
 #
 # In order, on one throwaway network: a Postgres at VERSIONS.md's
-# POSTGRES_IMAGE; the proxy with the security options the compose file gives
-# it, until /health answers (a first boot builds the bundled MCP venvs and
-# migrates); the phone service pointed at that proxy, until its own /health
+# POSTGRES_IMAGE; the proxy with the security options and the tun device the
+# compose file gives it, until /health answers (a first boot builds the bundled MCP venvs and
+# migrates), whose pasta must be VERSIONS.md's PASST_VERSION and must run the
+# sandbox's shape (the netns launcher wrapping bwrap with a fresh /proc); the
+# phone service pointed at that proxy, until its own /health
 # answers (it serves only once the proxy pushed its configuration); the file
 # tools, until /health answers with the headless browser present. Each image's
 # org.opencontainers.image.version label must equal VERSIONS.md's
@@ -33,7 +35,17 @@ PROXY_WAIT_S="${OTODOCK_BOOT_WAIT_S:-900}"
 SERVICE_WAIT_S="${OTODOCK_BOOT_SERVICE_WAIT_S:-180}"
 POSTGRES_IMAGE="$(bash "$ROOT/scripts/versions.sh" POSTGRES_IMAGE)"
 VERSION="$(bash "$ROOT/scripts/versions.sh" OTODOCK_VERSION)"
-[ -n "$POSTGRES_IMAGE" ] && [ -n "$VERSION" ] || { echo "POSTGRES_IMAGE or OTODOCK_VERSION missing from VERSIONS.md" >&2; exit 2; }
+PASST_PIN="$(bash "$ROOT/scripts/versions.sh" PASST_VERSION)"
+[ -n "$POSTGRES_IMAGE" ] && [ -n "$VERSION" ] && [ -n "$PASST_PIN" ] \
+    || { echo "POSTGRES_IMAGE, OTODOCK_VERSION or PASST_VERSION missing from VERSIONS.md" >&2; exit 2; }
+# pasta sets up the sandbox's tap through /dev/net/tun, which the compose file
+# maps into the proxy: a host without it cannot run the image the way an
+# install does, and docker run would fail with an opaque device error.
+[ -c /dev/net/tun ] || {
+    echo "this host has no /dev/net/tun: the proxy needs it mapped in (docker-compose.yml: devices: /dev/net/tun)." >&2
+    echo "Load the tun module (sudo modprobe tun) or run the check on a host that has the device." >&2
+    exit 2
+}
 
 SUFFIX="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 NET="otodock-boot-$SUFFIX"
@@ -148,7 +160,7 @@ say "Postgres ($POSTGRES_IMAGE) accepts connections"
 STARTED+=("$PROXY")
 docker run -d --name "$PROXY" --network "$NET" --user 1000:1000 \
     --security-opt seccomp=unconfined --security-opt "apparmor=$APPARMOR" \
-    --security-opt systempaths=unconfined \
+    --security-opt systempaths=unconfined --device /dev/net/tun \
     -e RUNNING_IN_DOCKER=true -e PLATFORM_DATA_DIR=/opt/otodock -e PROXY_PORT=8400 \
     -e DATABASE_URL="postgresql://otodock:$PG_PASSWORD@$PG:5432/otodock" \
     -e PROXY_API_KEY="$API_KEY" \
@@ -156,10 +168,42 @@ docker run -d --name "$PROXY" --network "$NET" --user 1000:1000 \
 wait_for "$PROXY_WAIT_S" "the proxy" "$PROXY" http://127.0.0.1:8400/health status=ok
 # A boot that answered but warned (a probe that timed out, a pin that
 # drifted) is worth reading here: the warnings are the only trace it leaves.
-if docker logs "$PROXY" 2>&1 | grep -q -E ' (WARNING|ERROR) '; then
+# No pipe into a reader that may close first: under pipefail a writer killed
+# by a broken pipe is a failed pipeline, which hides the warnings or ends the
+# script.
+warnings="$(docker logs "$PROXY" 2>&1 | grep -E ' (WARNING|ERROR) ' || true)"
+if [ -n "$warnings" ]; then
     say "the proxy's warnings:"
-    docker logs "$PROXY" 2>&1 | grep -E ' (WARNING|ERROR) ' | head -20
+    head -20 <<<"$warnings"
 fi
+# The pinned pasta, then the shape every local session runs under it: the
+# netns launcher wrapping one bwrap level with the sessions' pid, ipc and uts
+# namespaces and a fresh /proc, as the proxy's own boot check runs it
+# (proxy/core/sandbox/sandbox.py, _sandbox_shape). A pasta change
+# breaks this part (the 2026 builds clone the command into new mount and pid
+# namespaces and mount /proc themselves), and /health never reaches it. The
+# proxy's own nested probe (bwrap in bwrap) stays a warning: a GitHub arm64
+# runner cannot start the second level. pasta prints several lines, and on an
+# AVX2 host without the passt.avx2 build a warning line comes first ("Can't
+# run AVX2 build, using non-AVX2 version"), so the version is the line that
+# starts with "pasta ". The whole output is read and the line picked in the
+# shell: a reader that closes early kills the writer with a broken pipe, and
+# pipefail makes that the script's own exit.
+got="$(docker exec "$PROXY" pasta --version 2>&1)"
+got="$(awk '/^pasta /{print; exit}' <<<"$got")"
+[ "$got" = "pasta $PASST_PIN" ] || fail "the proxy image's pasta says '$got', VERSIONS.md pins $PASST_PIN"
+if ! out="$(timeout 60 docker exec "$PROXY" /opt/otodock/proxy/scripts/oto-sandbox-net --block-private -- \
+        bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --share-net \
+        --unshare-user --uid 1000 --gid 1000 --ro-bind / / --dev /dev --proc /proc -- true 2>&1)"; then
+    fail "the sandbox shape (pasta wrapping bwrap) does not run in the proxy image: ${out:-timed out or no output}"
+fi
+say "pasta $PASST_PIN runs the sandbox shape in the proxy image"
+
+# The kit file check_app measures a client's brand against, where the
+# proxy serves it from: without it every brand check measures nothing.
+docker exec "$PROXY" test -s /opt/otodock/dashboard/dist/ui-kit/otodock-tokens.css \
+    || fail "the proxy image carries no dashboard/dist/ui-kit/otodock-tokens.css"
+say "the kit file is in the proxy image"
 
 STARTED+=("$PHONE")
 docker run -d --name "$PHONE" --network "$NET" --user 1000:1000 \

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
+import { personClick, pressEscape } from './dialogsHarness'
 
 // ─── ChatHistory task mode (the sidebar's Task history view) ────────────────
 
@@ -27,6 +28,12 @@ vi.mock('@/hooks/useActiveChats', () => ({
 
 // The Active-now strip has its own tests — stub it out of this composition.
 vi.mock('@/components/chat/ActiveChatsPanel', () => ({ default: () => null }))
+
+// The open chat's places (the row menu's move, chatHistoryMove.test.tsx).
+vi.mock('@/api/remoteMachines', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/api/remoteMachines')>(),
+  useChatTargets: () => ({ data: undefined }),
+}))
 
 import ChatHistory from '@/components/chat/ChatHistory'
 import type { Chat, TaskChat } from '@/api/chats'
@@ -134,8 +141,8 @@ describe('ChatHistory — Task history view', () => {
     // Chat titles ride in the subtitle line (task_name owns the title slot).
     const delegated = screen.getByText(/delegated lane/).closest('div.group') as HTMLElement
     const plain = screen.getByText(/plain schedule/).closest('div.group') as HTMLElement
-    expect(delegated.className).toContain('violet')
-    expect(plain.className).not.toContain('violet')
+    expect(delegated.className).toContain('border-l-accent-agent-solid')
+    expect(plain.className).not.toContain('accent-agent')
     expect(plain.className).toContain('border-l-transparent')
   })
 
@@ -306,7 +313,7 @@ describe('ChatHistory — task kebab + inline rename (server-flag driven)', () =
     renderHistory({ activeChatId: 'c1', onNew })
     fireEvent.click(screen.getByTitle('Options'))
     fireEvent.click(screen.getByText('Delete'))
-    fireEvent.click(last(screen.getAllByText('Delete')))
+    personClick(last(screen.getAllByText('Delete')))
     expect(deleteMutateMock).toHaveBeenCalledWith('c1', expect.anything())
     expect(onNew).toHaveBeenCalledTimes(1)
 
@@ -315,7 +322,7 @@ describe('ChatHistory — task kebab + inline rename (server-flag driven)', () =
     renderHistory({ activeChatId: 'other', onNew })
     fireEvent.click(last(screen.getAllByTitle('Options')))
     fireEvent.click(last(screen.getAllByText('Delete')))
-    fireEvent.click(last(screen.getAllByText('Delete')))
+    personClick(last(screen.getAllByText('Delete')))
     expect(deleteMutateMock).toHaveBeenCalledWith('c1', expect.anything())
     expect(onNew).not.toHaveBeenCalled()
   })
@@ -328,25 +335,69 @@ describe('ChatHistory — task kebab + inline rename (server-flag driven)', () =
   })
 })
 
+describe('ChatHistory — the focus around the row menu', () => {
+  it("a confirm opened from the row's menu gives the focus back to the menu's button", () => {
+    renderHistory()
+    const kebab = screen.getByTitle('Options')
+    fireEvent.click(kebab)
+    fireEvent.click(screen.getByText('Delete'))
+    expect(screen.getByRole('alertdialog')).toBeTruthy()
+    pressEscape()
+    expect(screen.queryByRole('alertdialog')).toBeNull()
+    expect(document.activeElement).toBe(kebab)
+    expect(deleteMutateMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("ChatHistory — the row's options button at desktop width", () => {
+  // jsdom computes no Tailwind, so the classes are the contract: display:
+  // none (`hidden`) would drop the button from the Tab order at md and up,
+  // a zero-width clipped wrapper keeps it there and gives the title the row.
+  const tokens = (el: HTMLElement) => el.className.split(/\s+/).filter(Boolean)
+
+  it('stays in the Tab order and takes no width until the row is hovered or focused', () => {
+    renderHistory()
+    const wrapper = screen.getByTestId('chat-row-menu')
+    expect(tokens(wrapper).filter((t) => t === 'hidden' || t.endsWith(':hidden'))).toEqual([])
+    expect(tokens(wrapper)).toEqual(expect.arrayContaining([
+      'md:w-0', 'md:overflow-hidden',
+      'md:group-hover:w-auto', 'md:group-hover:overflow-visible',
+      'md:group-focus-within:w-auto', 'md:group-focus-within:overflow-visible',
+    ]))
+    const kebab = screen.getByTitle('Options')
+    expect(kebab.tagName).toBe('BUTTON')
+    expect(kebab.getAttribute('tabindex')).toBeNull()
+    expect(wrapper.contains(kebab)).toBe(true)
+    // The title's column is the one that grows: the wrapper never claims a share.
+    expect(screen.getByText('Fix the tests').closest('.min-w-0.flex-1')).toBeTruthy()
+  })
+
+  it('an open menu pins the wrapper at its full width', () => {
+    renderHistory()
+    fireEvent.click(screen.getByTitle('Options'))
+    expect(tokens(screen.getByTestId('chat-row-menu'))).toEqual(['relative'])
+  })
+})
+
 describe('ChatHistory — delete failure surfacing', () => {
   function confirmDeleteFirstRow() {
     fireEvent.click(screen.getByTitle('Options'))
     fireEvent.click(screen.getByText('Delete'))
     // Menu is closed now — the only remaining Delete button is the confirm.
-    fireEvent.click(screen.getByText('Delete'))
+    personClick(screen.getByText('Delete'))
   }
 
   it('a failed delete shows the backend error inline', () => {
     deleteMutateMock.mockImplementation((_id: string, opts?: { onError?: (e: Error) => void }) => {
-      opts?.onError?.(new Error('Failed to delete chat (HTTP 500)'))
+      opts?.onError?.(new Error('Could not delete the chat'))
     })
     renderHistory()
     confirmDeleteFirstRow()
     expect(deleteMutateMock).toHaveBeenCalledWith('c1', expect.anything())
-    expect(screen.getByText('Failed to delete chat (HTTP 500)')).toBeTruthy()
+    expect(screen.getByText('Could not delete the chat')).toBeTruthy()
     // Dismissable.
     fireEvent.click(screen.getByLabelText('Dismiss'))
-    expect(screen.queryByText('Failed to delete chat (HTTP 500)')).toBeNull()
+    expect(screen.queryByText('Could not delete the chat')).toBeNull()
   })
 
   it('a successful delete shows nothing', () => {

@@ -19,11 +19,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import config
+from services.infra import safe_fs
 
 logger = logging.getLogger("otodock.media")
 
@@ -185,7 +187,7 @@ def _probe_sync(path: Path) -> dict | None:
         if r.returncode != 0:
             return None
         data = json.loads(r.stdout or b"{}")
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
         logger.warning("ffprobe failed for %s: %s", path, e)
         return None
     v = a = ""
@@ -272,7 +274,7 @@ def _transcode_sync(
 
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=600)
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         logger.warning("ffmpeg transcode error for %s: %s", path, e)
         out.unlink(missing_ok=True)
         return None, mime
@@ -336,7 +338,7 @@ def _faststart_remux_sync(path: Path, dest_dir: Path | None = None) -> Path | No
            "-movflags", "+faststart", str(out)]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=600)
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         logger.warning("faststart remux error for %s: %s", path, e)
         out.unlink(missing_ok=True)
         return None
@@ -400,3 +402,47 @@ def sweep_host_media_cache(ttl_seconds: int = 7200) -> int:
         except OSError:
             pass
     return removed
+
+
+# The lazy-pull cache for satellite-host files sits inside the agents tree
+# (``core/remote/remote_file_flow._host_cache_root``), one folder per session.
+HOST_CACHE_SEGMENT = ".remote-host-cache"
+
+
+class MediaUnserveable(Exception):
+    """The row's path is under no serving root or fails its binding; the
+    client gets the same 404 as for a missing file."""
+
+
+def _serve_roots() -> tuple[str, str, str]:
+    """``(agents, media cache, host media cache)`` as absolute paths."""
+    return (
+        os.path.abspath(os.fspath(config.AGENTS_DIR)),
+        os.path.abspath(os.fspath(_CACHE_DIR)),
+        os.path.abspath(os.fspath(_HOST_CACHE_DIR)),
+    )
+
+
+def locate_media_row(info: dict) -> tuple[str, str]:
+    """``(root, rel)`` for a ``media_tokens`` row: the closest of the three
+    roots holding its ``abs_path`` and the path below it. Under the agents
+    root the first segment is bound to the row's agent (a legacy row with
+    ``agent=''`` is bound to the slug the path names) or, for a lazy-pull
+    cache path, to the row's session. Raises ``MediaUnserveable``."""
+    abs_path = (info.get("abs_path") or "").strip()
+    roots = _serve_roots()
+    try:
+        root, rel = safe_fs.split_under(abs_path, roots)
+    except OSError as exc:
+        raise MediaUnserveable(f"path outside every serving root: {exc}") from None
+    if root == roots[0]:
+        first, _, rest = rel.partition("/")
+        if first == HOST_CACHE_SEGMENT:
+            session = rest.partition("/")[0]
+            if not session or session != (info.get("session_id") or ""):
+                raise MediaUnserveable("host-cache path bound to another session")
+        else:
+            agent = (info.get("agent") or "").strip()
+            if not config.is_safe_agent_name(first) or (agent and first != agent):
+                raise MediaUnserveable("agent segment does not match the row")
+    return root, rel

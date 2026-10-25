@@ -10,6 +10,7 @@ agent tree is treated as an unknown agent.
 from __future__ import annotations
 
 import config as app_config
+from configuration import prompts
 
 
 class TestIsSafeAgentName:
@@ -33,7 +34,7 @@ class TestPromptBuildRejectsTraversal:
         outside = tmp_path / "outside" / "config"
         outside.mkdir(parents=True)
         (outside / "prompt.md").write_text("SECRET PROMPT")
-        assert app_config._read_agent_files("../outside") == []
+        assert prompts._read_agent_files("../outside") == []
 
     def test_build_agent_prompt_none_for_unsafe_name(self, tmp_path, monkeypatch):
         monkeypatch.setattr(app_config, "AGENTS_DIR", tmp_path / "agents")

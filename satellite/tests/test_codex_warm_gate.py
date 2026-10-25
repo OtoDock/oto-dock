@@ -10,7 +10,9 @@ from types import SimpleNamespace
 import pytest
 
 from satellite._vendored.app_server_client import (
-    MCP_STARTUP_METHOD, mcp_server_names_from_toml, wait_for_mcp_startup,
+    MCP_STARTUP_METHOD,
+    mcp_server_names_from_toml,
+    wait_for_mcp_startup,
 )
 from satellite.sessions import codex_session as mod
 from satellite.sessions.codex_session import CodexSession

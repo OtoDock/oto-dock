@@ -17,8 +17,7 @@ import json
 
 import pytest
 
-from services.media import audio_service
-from services.media import ws_audio_token
+from services.media import audio_service, ws_audio_token
 from ws.audio import ws_audio_tts_handler
 
 

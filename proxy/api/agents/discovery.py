@@ -7,21 +7,32 @@ browser-origin allow-lists. Attaches to the shared package router."""
 import asyncio
 import logging
 
+import httpx
 from fastapi import Depends, HTTPException, Query
 from pydantic import BaseModel
 
 import config
-from core import placement
-from auth.providers import UserContext, get_current_user, require_agent_access, require_auth, require_human
-from storage.agents import agent_store
+from api.agents._common import (
+    _get_agent_dir,
+    json_body,
+    json_response,
+)
+from api.agents._router import router
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_agent_access,
+    require_auth,
+    require_human,
+)
+from core import layout, placement
+from core.execution_layer import PROVIDER_LOCAL
 from storage import database as task_store
+from storage.agents import agent_store
+from storage.agents.agent_store import _get_execution_paths
+from storage.agents.schema import DEFAULT_EXECUTION_PATH
 from storage.automation import trigger_store
 from storage.pg import run_db
-
-from api.agents._common import _get_agent_dir, _get_execution_paths
-from api.agents._router import router
-from core.execution_layer import DEFAULT_EXECUTION_PATH, PROVIDER_LOCAL
-from core import layout
 
 logger = logging.getLogger("otodock.agents")
 
@@ -247,13 +258,19 @@ async def list_agents(
     Pass ?all=true to skip admin checkbox filtering (for admin pages).
     """
     u = require_auth(user)
-    return await run_db(_list_agents_sync, u, all)
+    return json_response(await run_db(_list_agents_sync, u, all))
 
 
-def _list_agents_sync(u: UserContext, all: bool) -> dict:
-    """The listing as ONE executor job: the counts, the bulk MCP view and
-    one model resolution per engine, so its cost no longer grows with the
-    agent count on the loop (every visible dashboard polls it)."""
+def _list_agents_sync(u: UserContext, all: bool) -> bytes:
+    """The listing as ONE executor job, its answer encoded there too: the
+    counts, the bulk MCP view, one model resolution per engine and the JSON
+    bytes, so nothing of it runs on the loop (every visible dashboard polls
+    it)."""
+    return json_body({"agents": _list_agents_rows(u, all)})
+
+
+def _list_agents_rows(u: UserContext, all: bool) -> list[dict]:
+    """The rows of the listing (``_list_agents_sync`` encodes them)."""
     # Bulk DB counts (avoids N queries-per-agent in the loop below). The
     # schedule/trigger numbers must reflect what THIS caller can see — agent-scoped
     # (shared) + their OWN user-scoped — and never leak other users' private items,
@@ -326,7 +343,7 @@ def _list_agents_sync(u: UserContext, all: bool) -> dict:
             "department_level_id": (agent_data.get("department_level_id", "") if agent_data else "") or "",
         })
 
-    return {"agents": agents}
+    return agents
 
 
 @router.get("/v1/agents/{name}/info")
@@ -335,31 +352,48 @@ async def get_agent_info(name: str, user: UserContext | None = Depends(get_curre
     u = require_auth(user)
     require_agent_access(u, name)
 
-    def _read() -> tuple[list[str], bool, dict | None, bool, list[str]]:
+    def _read() -> tuple[dict, bytes, dict | None]:
         agent_dir = _get_agent_dir(name)
         _, mcp_names = _get_mcp_info(name)
-        return (mcp_names, (agent_dir / layout.WORKSPACE).is_dir(),
-                agent_store.get_agent(name), agent_store.is_admin_only(name),
-                agent_store.get_delegation_targets(name))
+        agent_data = agent_store.get_agent(name)
+        payload = _agent_info(
+            name, agent_data, mcp_names, (agent_dir / layout.WORKSPACE).is_dir(),
+            agent_store.is_admin_only(name), agent_store.get_delegation_targets(name),
+        )
+        return payload, json_body(payload), agent_data
 
-    # The store reads as one executor job; the registry fetch below is an
-    # awaited HTTP call and stays on the loop.
-    mcp_names, has_workspace, agent_data, admin_only, delegation_targets = await run_db(_read)
+    # The store reads and the answer's encoding as one executor job; the
+    # registry fetch below is an awaited HTTP call and stays on the loop,
+    # and the one field it fills is re-encoded there (a kilobyte).
+    payload, body, agent_data = await run_db(_read)
 
     # A template install's catalog state for the Config tab's banner
     # (COMMUNITY-AGENTS-REGISTRY.md "Updates"); the registry is cached, an
     # unreachable one leaves the field out rather than slowing the page.
-    template_update = None
     provenance = str((agent_data or {}).get("community_template") or "")
     if provenance and not provenance.startswith("local:"):
+        template_update = None
         try:
-            from services.community import community_agent_updater, community_agents_catalog
+            from services.community import (
+                community_agent_updater,
+                community_agents_catalog,
+            )
             registry = await community_agents_catalog.fetch_registry()
             entry = next((e for e in registry.get("agents", []) if e.get("slug") == provenance), None)
             template_update = community_agent_updater.detect(agent_data, entry)
-        except Exception:
+        except (ImportError, httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError):
             template_update = None
+        if template_update is not None:
+            payload["template_update"] = template_update
+            body = json_body(payload)
+    return json_response(body)
 
+
+def _agent_info(name: str, agent_data: dict | None, mcp_names: list[str], has_workspace: bool,
+                admin_only: bool, delegation_targets: list[str]) -> dict:
+    """The info route's answer, ``template_update`` unset (the route fills
+    it after its registry fetch)."""
+    template_update = None
     return {
         "name": name,
         "display_name": agent_data["display_name"] if agent_data else name,

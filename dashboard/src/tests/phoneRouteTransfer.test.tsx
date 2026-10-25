@@ -10,6 +10,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import * as authApi from '@/api/auth'
 import PhoneServersTab from '@/pages/admin/PhoneServersTab'
+import { renderWithDialogs } from './dialogsHarness'
 
 const fetchSpy = vi.spyOn(authApi, 'apiFetch')
 
@@ -47,7 +48,7 @@ function mockApi(routes: unknown[]) {
 
 function renderTab() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}><PhoneServersTab /></QueryClientProvider>)
+  return renderWithDialogs(<QueryClientProvider client={qc}><PhoneServersTab /></QueryClientProvider>)
 }
 
 function routePut() {
@@ -55,8 +56,7 @@ function routePut() {
 }
 
 describe('route transfer targets', () => {
-  beforeEach(() => { vi.stubGlobal('alert', vi.fn()); vi.stubGlobal('confirm', vi.fn(() => true)) })
-  afterEach(() => { fetchSpy.mockReset(); vi.unstubAllGlobals() })
+  afterEach(() => { fetchSpy.mockReset() })
 
   it('lists the targets, adds one and saves the list', async () => {
     mockApi([makeRoute()])

@@ -18,31 +18,37 @@ import asyncio
 import collections
 import contextlib
 import json
-from core.events import tool_roles
-from core import placement
 import logging
 import time
 import uuid
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
+import psycopg
 from fastapi import WebSocket, WebSocketDisconnect
 
+from auth import roles
+from auth.providers import (
+    acting_role_of,
+    auth_gate,
+    session_cookie_current,
+    validate_session_jwt,
+)
+from core import placement
+from core.background import spawn
+from core.events import tool_roles
+from core.events.input_queue import _connections_by_user
+from services.notifications import notification_manager
 from storage import database as task_store
 from storage.automation import notification_store, run_status
-from services.notifications import notification_manager
-from auth.providers import acting_role_of, auth_gate, validate_session_jwt, session_cookie_current
-from auth import roles
 from ws import wire_events as wire
-from core.background import spawn
+from ws.socket_gone import GONE, GONE_WHILE_OPENING, closed_socket_error
 
 # A dashboard socket outlives a single request; re-validate its session +
 # re-read the user's role/agents at most this often, on client activity and
 # on the connection's own tick, so a change of standing takes effect within
 # the window on an idle socket too.
 _AUTHZ_REVALIDATE_S = 60
-# The open connections per person, for a re-check on demand.
-_connections_by_user: dict[str, set["DashboardConnection"]] = {}
 # Strong refs for the queue drops a revalidation close schedules.
 _refusal_tasks: set[asyncio.Task] = set()
 
@@ -65,23 +71,23 @@ def register_offboarding() -> None:
     """Subscribe the sockets to the offboarding event (called by the lifespan)."""
     from services.agents import offboarding
     offboarding.subscribe("dashboard-sockets", _on_offboard, priority=15)
+from core import execution_mode
+from core.config.task_config_builder import (
+    resolve_task_identity,
+    run_allows_knowledge_rw,
+)
+from core.events.common_events import TurnInput
+from core.events.stream_pump import (
+    _active_pumps,
+    store_chat_wake,
+)
+from core.execution_layer import ExecutionLayer
+from core.remote import install_registry
+from core.session import session_kind, visibility as _vis, warmup_registry
+from core.session.session_manager import get_execution_layer
 from core.session.session_state import (
     _dashboard_notify_queues,
 )
-from core.execution_layer import ExecutionLayer
-from core.session.session_manager import get_execution_layer
-from core.config.task_config_builder import (
-    resolve_task_identity, run_allows_knowledge_rw,
-)
-from core.events.stream_pump import (
-    _active_pumps, store_chat_wake,
-)
-from core.events.common_events import TurnInput
-from core.remote import install_registry
-from core.session import warmup_registry
-from core.session import visibility as _vis
-from core import execution_mode
-from core.session import session_kind
 
 logger = logging.getLogger("otodock")
 
@@ -195,30 +201,6 @@ def _role_and_layer(
     return role, layer
 
 
-def _task_continue_allowed(run: dict, *, effective_role: str, user_sub: str) -> bool:
-    """Whether a user may CONTINUE (drive a new session for) a task run.
-
-    A continued task is an interactive chat in the task's stored scope, so
-    the gate matches the CREATE gate:
-
-    - **Agent-scoped** task → editor+ on the agent (``can_edit_agent``: the
-      same tier that may create agent-scope tasks). Continuing drives an
-      agent-scope ``/workspace``-RW session, which a viewer must never do —
-      even the original creator, if since demoted to viewer.
-    - **User-scoped** task → the creator or a platform admin.
-
-    ``effective_role`` is the live per-agent role from
-    ``acting_role_of`` ("admin" for platform admins, which is why the
-    user-scope branch needs no separate admin check beyond it).
-
-    NOTE: this gates CONTINUING. Read-only VIEWING of an agent-scoped run
-    (history load) follows the broader REST ``_check_run_access`` rule.
-    """
-    if (run.get("scope") or _vis.SCOPE_AGENT) == _vis.SCOPE_USER:
-        return run.get("created_by") == user_sub or roles.is_admin(effective_role)
-    return roles.can_edit(effective_role)
-
-
 # Pasted photos: the longest side kept, and the pixel count past which a
 # format that must be decoded whole (anything but JPEG, which decodes at a
 # reduced scale through draft()) is refused.
@@ -263,17 +245,18 @@ def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
     """
     import base64
     import io
+
     from PIL import Image, ImageOps
 
     try:
         # Parse: data:image/png;base64,iVBOR...
         header, b64data = data_url.split(",", 1)
         raw_bytes = base64.b64decode(b64data)
-        img = Image.open(io.BytesIO(raw_bytes))  # reads the header only
+        img: Image.Image = Image.open(io.BytesIO(raw_bytes))  # reads the header only
         w, h = img.size
         source_format = img.format
-    except Exception as e:
-        logger.error(f"Failed to save image: {e}")
+    except Exception as e:  # noqa: BLE001  # Pillow on a user's upload raises anything from a decoder
+        logger.error("Failed to save image: %s", e)
         return None
     if source_format not in ("JPEG", "MPO") and w * h > _MAX_FULL_DECODE_PIXELS:
         from ws.dashboard_chat_support import AttachmentsRefused
@@ -286,8 +269,8 @@ def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
         # thumbnail() first: on a JPEG it decodes at a reduced scale. The
         # orientation is applied to the small image afterwards.
         if max(w, h) > _MAX_IMAGE_DIM:
-            img.thumbnail((_MAX_IMAGE_DIM, _MAX_IMAGE_DIM), Image.LANCZOS)
-            logger.info(f"Resized image from {w}x{h} to {img.size[0]}x{img.size[1]}")
+            img.thumbnail((_MAX_IMAGE_DIM, _MAX_IMAGE_DIM), Image.LANCZOS)  # type: ignore[attr-defined]  # Pillow serves the old constant at run time; its stubs name only Image.Resampling
+            logger.info("Resized image from %sx%s to %sx%s", w, h, img.size[0], img.size[1])
         else:
             img.load()
         img = ImageOps.exif_transpose(img)
@@ -305,7 +288,8 @@ def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
             extra = {"icc_profile": icc} if icc else {}
             if transparency is not None:
                 extra["transparency"] = transparency
-            img.save(buf, format="PNG", **extra)
+            # PNG holds 16 bits at most and Pillow refuses mode I there: clip it.
+            (img.convert("I;16") if img.mode == "I" else img).save(buf, format="PNG", **extra)
         else:
             ext, media_type = "jpg", "image/jpeg"
             if img.mode != "RGB" and img.mode != "L":
@@ -322,16 +306,17 @@ def _save_base64_image(data_url: str, save_dir: Path) -> dict | None:
         filepath = save_dir / filename
         filepath.write_bytes(out_bytes)
         logger.info(
-            f"Saved image: {filepath} ({w}x{h} -> {img.size[0]}x{img.size[1]}, "
-            f"{original_size} -> {len(out_bytes)} bytes)"
+            "Saved image: %s (%sx%s -> %sx%s, "
+            "%s -> %s bytes)",
+            filepath, w, h, img.size[0], img.size[1], original_size, len(out_bytes)
         )
         return {
             "path": str(filepath),
             "base64": base64.b64encode(out_bytes).decode("ascii"),
             "media_type": media_type,
         }
-    except Exception as e:
-        logger.error(f"Failed to save image: {e}")
+    except Exception as e:  # noqa: BLE001  # Pillow on a user's upload raises anything from a decoder
+        logger.error("Failed to save image: %s", e)
         return None
 
 
@@ -383,13 +368,14 @@ async def _extract_server_kicks(queue: asyncio.Queue, *, person: str = "") -> li
         try:
             stored = await run_db(_park_delegate_result, item, person)
             logger.info(
-                f"WS dashboard close-rescue: delegate result for "
-                f"chat={_cid[:8]} {'parked as wake' if stored else 'NOT parked'}"
+                "WS dashboard close-rescue: delegate result for "
+                "chat=%s %s",
+                _cid[:8], 'parked as wake' if stored else 'NOT parked'
             )
-        except Exception:
+        except (psycopg.Error, ValueError):
             logger.warning(
-                f"WS dashboard close-rescue: failed to park delegate "
-                f"result for chat={_cid[:8]}", exc_info=True,
+                "WS dashboard close-rescue: failed to park delegate "
+                "result for chat=%s", _cid[:8], exc_info=True,
             )
     return kicks
 
@@ -458,7 +444,7 @@ def _model_allowed_for_path(model: str, exec_path: str) -> bool:
             (m.get("model_id") or "") == model
             for m in subscription_store.list_models(exec_path)
         )
-    except Exception:
+    except psycopg.Error:
         return True
 
 
@@ -489,10 +475,12 @@ async def chat_process_alive(chat: dict) -> bool:
         return False
     try:
         from core.session.session_manager import (
-            _remote_layer, find_layer_for_session, resolve_execution_path,
+            _remote_layer,
+            find_layer_for_session,
+            resolve_execution_path,
         )
         holder = find_layer_for_session(sid)
-        if holder is not None and holder is _remote_layer:
+        if holder is _remote_layer and holder is not None:
             if await holder.is_session_alive(sid):
                 return True
             return holder.is_session_grace_held(sid)
@@ -517,7 +505,7 @@ async def chat_process_alive(chat: dict) -> bool:
                 execution_target=chat.get("execution_target") or "",
             )
             return bool(await layer.is_session_alive(sid))
-    except Exception:
+    except Exception:  # noqa: BLE001  # a liveness probe across engines and machines: a failure reads as dead
         logger.debug("chat_process_alive: liveness probe failed for %s",
                      sid[:8], exc_info=True)
     return False
@@ -538,8 +526,8 @@ def task_run_active(chat_id: str) -> bool:
     try:
         run = (task_store.get_run(session_kind.run_id_of_chat(chat_id))
                or task_store.get_run_for_chat(chat_id))
-        return bool(run) and run_status.is_live(run.get("status"))
-    except Exception:
+        return bool(run) and run_status.is_live(cast("dict", run).get("status"))
+    except psycopg.Error:
         logger.debug("task_run_active: lookup failed for %s", chat_id,
                      exc_info=True)
         return False
@@ -720,16 +708,20 @@ async def ws_dashboard_handler(websocket: WebSocket):
 
 # The controller mixins import helpers back from this module, so they are
 # imported AFTER those helpers are defined (safe intra-unit cycle).
-from ws.dashboard_warmup import WarmupController  # noqa: E402
-from ws.dashboard_chat import ChatController  # noqa: E402
-from ws.dashboard_pty import PtyViewerController  # noqa: E402
-from ws.dashboard_server_events import ServerNotificationController, result_event_from_notify  # noqa: E402
-from ws.dashboard_dispatch import ClientMessageDispatcher  # noqa: E402
+from ws.dashboard_chat import ChatController
+from ws.dashboard_dispatch import ClientMessageDispatcher
+from ws.dashboard_prompts import PromptController
+from ws.dashboard_pty import PtyViewerController
+from ws.dashboard_server_events import (
+    ServerNotificationController,
+    result_event_from_notify,
+)
+from ws.dashboard_warmup import WarmupController
 
 
 class DashboardConnection(
     WarmupController, ChatController, PtyViewerController,
-    ServerNotificationController, ClientMessageDispatcher,
+    ServerNotificationController, ClientMessageDispatcher, PromptController,
 ):
     """One dashboard WebSocket connection: state + handlers.
 
@@ -777,8 +769,15 @@ class DashboardConnection(
         self.user_role = self.user["role"]
         self._last_authz_check = time.time()
 
-        await self.websocket.accept()
-        logger.info(f"WebSocket dashboard connection accepted for user={self.user_sub}")
+        try:
+            await self.websocket.accept()
+        except GONE_WHILE_OPENING as e:
+            # The page left during the handshake (a reload): nothing is
+            # registered yet, so there is nothing to clean up.
+            logger.info("WebSocket dashboard: the client left during the handshake (%s)",
+                        type(e).__name__)
+            return
+        logger.info("WebSocket dashboard connection accepted for user=%s", self.user_sub)
 
         self.session_id: str | None = None
         self.chat_id: str | None = None
@@ -795,7 +794,6 @@ class DashboardConnection(
         # or "" on the new-chat page (the chat the warmup mints). A pick
         # applies only to its own chat's session.
         self.deferred_for: str = ""
-        self.pre_plan_mode_holder = ["default"]  # mutable container to track mode before plan mode
         self.implementing_plan: str = ""  # filename of plan being implemented (set on accept, cleared on done)
         self.chat_plan_filename: str = ""  # reused across pumps so edits update same plan
         # Chat for which _handle_resume_chat promised a pump attach ("active pump
@@ -811,12 +809,13 @@ class DashboardConnection(
         self._pre_warmed_exec_path: str = ""      # execution path of pre-warmed session
         self._pre_warmed_model: str = ""          # model the pre-warmed session was spawned with
         self._pre_warmed_role: str = ""           # per-agent role at pre-warm time — invalidates if user reassigns role
+        self._pre_warmed_place: str = ""          # the page's place pick it was made for ("" = the default)
         self._pre_warmed_at: float = 0.0          # monotonic pre-warm time — logged as the reuse delta
         # Background task handle for an in-flight pre_warmup. Kept so resume_chat
         # / warmup / future pre_warmups can interact correctly even though
         # pre_warmup itself runs off the WS dispatcher loop (so a 5–10s remote
         # session start doesn't stall the dashboard's next click).
-        self._pre_warmup_task: "asyncio.Task | None" = None
+        self._pre_warmup_task: asyncio.Task | None = None
         # Handle for the BACKGROUNDED session spawn from a
         # warmup-on-send. The slow start_session runs off the WS loop so the
         # connection stays responsive (chat-switch / abort during the spawn).
@@ -824,7 +823,12 @@ class DashboardConnection(
         # close — instead `_ws_gone` flips and the spawn finishes + runs its first
         # turn HEADLESS so it still lands in the DB (preserves the
         # refresh-during-spawn durability).
-        self._warmup_task: "asyncio.Task | None" = None
+        self._warmup_task: asyncio.Task | None = None
+        # The chat the backgrounded spawn brought up, until its kick is taken
+        # (or none comes): a Stop on it is this socket's own warmup's (the
+        # kick skipped, every author's sends back); on any other chat getting
+        # ready this socket is a joined page.
+        self._warmup_chat_id: str | None = None
         self._ws_gone: bool = False
         # Abort-during-spawn. Cancelling a half-started CLI/satellite
         # process can't reliably stop it (codex/claude keep running and then answer
@@ -832,7 +836,7 @@ class DashboardConnection(
         # in-flight warmup the user aborted. _spawn_tail (and the _server_kick
         # handler, for the just-finished-spawn race) then kill the spawned session +
         # suppress the first turn. Reset at the start of each _do_warmup.
-        self._warmup_abort_chat: "str | None" = None
+        self._warmup_abort_chat: str | None = None
         self.layer: ExecutionLayer | None = None   # resolved on warmup, used by producer + handlers
         self.session_execution_target: str = placement.LOCAL    # surfaced in warmup_ready for badge rendering
         self.session_fallback_reason: str | None = None  # non-None iff target differs from intent
@@ -881,10 +885,158 @@ class DashboardConnection(
             self.user_sub, self.notify_connection_id, self.notify_queue, platform="web",
             live_queue=self.live_queue,
         )
-        # Send initial unread count so bell badge shows immediately
-        _initial_count = await run_db(notification_store.get_unread_count, self.user_sub)
-        await self.websocket.send_json({"type": wire.NOTIFICATION_COUNT, "count": _initial_count})
+        try:
+            # Send initial unread count so bell badge shows immediately
+            _initial_count = await run_db(notification_store.get_unread_count, self.user_sub)
+            await self.websocket.send_json({"type": wire.NOTIFICATION_COUNT, "count": _initial_count})
 
+            await self._replay_connect_state()
+
+            # Which build the server serves — LAST of the connect-time frames on
+            # purpose: a page that is stale reloads on receipt, i.e. closes this
+            # socket, and the frames above have all been sent by then (a close
+            # earlier is a disconnect the ``try`` ends like any other). Every
+            # deploy restarts the proxy, so every client reconnects and sees
+            # this.
+            # Registered for a re-check on demand and ticking only from here: the
+            # ``finally`` below is what unregisters and cancels them, so a connect
+            # phase that raises above leaves neither behind (the send below
+            # cannot raise).
+            _connections_by_user.setdefault(self.user_sub, set()).add(self)
+            self._ticker = asyncio.create_task(self._revalidation_ticker())
+            try:
+                await self.websocket.send_json(self._server_info_frame())
+            except Exception:
+                logger.exception("server_info on connect failed")
+
+            ws_closing = False
+            while not ws_closing:
+                # Multiplex: wait for client message, server notification, or task pump poll
+                recv_task = asyncio.create_task(self._receive_client_text())
+                notify_task = asyncio.create_task(self.notify_queue.get())
+                live_task = asyncio.create_task(self.live_queue.get())
+
+                wait_tasks: set[asyncio.Task] = {recv_task, notify_task, live_task}
+                # Periodic poll for a pump that APPEARS on the viewed chat while the
+                # socket is idle between turns — so resume mid-turn shows live
+                # generation. Covers task/meeting turns AND a regular
+                # chat's server-kicked first turn or a bg-nudge review turn that
+                # starts after the user reconnected. _task_pump_poll re-attaches a
+                # healthy pump and (via _handle_resume_chat) reaps a wedged one.
+                poll_task: asyncio.Task | None = None
+                if self.chat_id and not self.streaming:
+                    poll_task = asyncio.create_task(asyncio.sleep(3))
+                    wait_tasks.add(poll_task)
+
+                done, pending = await asyncio.wait(
+                    wait_tasks, return_when=asyncio.FIRST_COMPLETED,
+                )
+                done = await self._collect_late_results(done, pending)
+
+                for t in done:
+                    if t is recv_task:
+                        verdict = await self._on_client_text(t)
+                        if verdict is not None:
+                            ws_closing = True
+                            if verdict == "now":
+                                break
+                    elif t is notify_task:
+                        notification = t.result()
+                        if self.notify_queue.stale:
+                            notification = await self._resync_chat_status(notification)
+                        if notification is not None:
+                            await self._handle_server_notification(notification)
+                    elif t is live_task:
+                        await self._send(t.result())
+                        await self._drain_live_queue()
+                    elif t is poll_task:
+                        await self._task_pump_poll()
+
+        except GONE:
+            logger.info("WebSocket dashboard disconnected: session=%s, chat=%s", self.session_id, self.chat_id)
+        except RuntimeError as e:
+            # Starlette throws RuntimeError("WebSocket is not connected. Need
+            # to call 'accept' first.") when ``receive_text`` (or send_json)
+            # runs on a socket whose state already flipped to DISCONNECTED.
+            # This happens when the browser closes the WS in the small window
+            # between ``websocket.accept()`` returning and the next receive —
+            # common during page reload, multi-tab fanout, or our own
+            # pre_warmup-then-warmup back-to-back dance. It is semantically
+            # the same as ``WebSocketDisconnect`` (the connection is gone;
+            # uvloop's closed transport raises one too, ``ws.socket_gone``)
+            # and must not crash the handler: an unhandled exception here
+            # leaks the satellite-side session that warmup already spawned,
+            # which then orphans any subsequent message the user sends on
+            # what their browser still thinks is a live socket.
+            if closed_socket_error(e):
+                logger.info(
+                    "WebSocket dashboard disconnected (mid-receive): "
+                    "session=%s, chat=%s",
+                    self.session_id, self.chat_id
+                )
+            else:
+                logger.exception("WebSocket dashboard error: %s", e)
+        except Exception as e:
+            logger.exception("WebSocket dashboard error: %s", e)
+        finally:
+            self._ended.set()
+            if self._ticker is not None:
+                self._ticker.cancel()
+            conns = _connections_by_user.get(self.user_sub)
+            if conns is not None:
+                conns.discard(self)
+                if not conns:
+                    _connections_by_user.pop(self.user_sub, None)
+            # Mark the connection gone so a still-running
+            # backgrounded warmup spawn (_warmup_task) drives its first turn HEADLESS
+            # instead of enqueuing a _server_kick to this (now-dead) notify queue —
+            # the spawn + first turn stay durable across a refresh/navigate during
+            # the spawn window. We deliberately do NOT cancel _warmup_task here
+            # (unlike _pre_warmup_task): it owns a real chat's first turn.
+            self._ws_gone = True
+            await self._rescue_queued_kicks()
+            # A typed message this connection queued stays in its chat's
+            # queue, delivered as its author at that chat's next turn; the
+            # interactions go (an app's interaction replayed later could act
+            # on state that moved on).
+            self.artifact_queue.clear()
+            self.implement_queue.clear()
+            # Cancel any background pre_warmup task so it doesn't keep mutating
+            # this WS handler's closure (and writing to _pre_warmed_* slots) after
+            # the connection is gone. We await briefly so an in-progress
+            # start_session can roll back its concurrency-slot acquisition.
+            if self._pre_warmup_task and not self._pre_warmup_task.done():
+                self._pre_warmup_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._pre_warmup_task
+            # Detach from any in-flight warmups this WS was listening to so the
+            # registry stops fanning future events to a closed socket. The
+            # warmup itself keeps running and will emit through any other
+            # listener attached (e.g. a reconnected WS via resume_chat).
+            for _wcid in list(self._attached_warmups):
+                await warmup_registry.detach_listener(_wcid, self._send)
+            self._attached_warmups.clear()
+            # Detach any interactive PTY viewer: removes this socket's output
+            # listener only — the PtyProcess keeps running (reconnect replays the
+            # scrollback ring; the idle reaper reclaims it if never re-viewed).
+            self._detach_pty_viewer()
+            # Install events need no per-connection detach: they are delivered via
+            # the per-user broadcaster, and notification_manager.unregister_user_connection
+            # below removes this connection from that fan-out cleanly.
+            self._unregister_notify_queue()
+            notification_manager.unregister_user_connection(self.user_sub, self.notify_connection_id)
+            await self._close_orphan_prewarm()
+            # No release for self.session_id: its process outlives the socket,
+            # so its reservation does too. The path that ends the session
+            # releases it (layer close, reapers, the reconciler backstop).
+            logger.info("WS dashboard cleanup: session=%s, chat=%s", self.session_id, self.chat_id)
+
+
+    async def _replay_connect_state(self) -> None:
+        """The connect-time catch-up, in order: the in-flight MCP installs,
+        the workspace transfers, the satellite updates, the chats streaming
+        now."""
+        from storage.pg import run_db
         # Replay in-flight MCP-install progress this user participates in, so a tab
         # opened (or transparently reconnected) mid-install renders the bar at the
         # current state instead of waiting for the next live event. Live events
@@ -953,208 +1105,88 @@ class DashboardConnection(
         except Exception:
             logger.exception("chat-status snapshot on connect failed")
 
-        # Which build the server serves — LAST of the connect-time frames on
-        # purpose: a page that is stale reloads on receipt, i.e. closes this
-        # socket, and the frames above have all been sent by then (a close
-        # earlier in this unguarded region would leak the notify-queue
-        # registration until the cleanup below runs). Every deploy restarts
-        # the proxy, so every client reconnects and sees this.
-        # Registered for a re-check on demand and ticking only from here: the
-        # ``finally`` below is what unregisters and cancels them, so a connect
-        # phase that raises above leaves neither behind (the send below
-        # cannot raise).
-        _connections_by_user.setdefault(self.user_sub, set()).add(self)
-        self._ticker = asyncio.create_task(self._revalidation_ticker())
+
+    async def _on_client_text(self, task: asyncio.Task) -> str | None:
+        """One client message: decoded, the session re-validated, dispatched.
+        Answers None to go on, "close" to end the socket after this round's
+        other tasks, "now" to end it before them (the session no longer
+        holds)."""
         try:
-            await self.websocket.send_json(self._server_info_frame())
-        except Exception:
-            logger.exception("server_info on connect failed")
-
+            raw = task.result()
+        except RuntimeError:
+            # Starlette raises 'Cannot call "receive" once a
+            # disconnect message has been received' when the
+            # disconnect landed on a receive task that a previous
+            # iteration cancelled/consumed (browser refresh
+            # mid-multiplex). Same close as a clean disconnect —
+            # without the ERROR traceback noise.
+            raise WebSocketDisconnect(code=1006) from None
         try:
-            ws_closing = False
-            while not ws_closing:
-                # Multiplex: wait for client message, server notification, or task pump poll
-                recv_task = asyncio.create_task(self._receive_client_text())
-                notify_task = asyncio.create_task(self.notify_queue.get())
-                live_task = asyncio.create_task(self.live_queue.get())
-
-                wait_tasks: set[asyncio.Task] = {recv_task, notify_task, live_task}
-                # Periodic poll for a pump that APPEARS on the viewed chat while the
-                # socket is idle between turns — so resume mid-turn shows live
-                # generation. Covers task/meeting turns AND a regular
-                # chat's server-kicked first turn or a bg-nudge review turn that
-                # starts after the user reconnected. _task_pump_poll re-attaches a
-                # healthy pump and (via _handle_resume_chat) reaps a wedged one.
-                poll_task: asyncio.Task | None = None
-                if self.chat_id and not self.streaming:
-                    poll_task = asyncio.create_task(asyncio.sleep(3))
-                    wait_tasks.add(poll_task)
-
-                done, pending = await asyncio.wait(
-                    wait_tasks, return_when=asyncio.FIRST_COMPLETED,
-                )
-                done = await self._collect_late_results(done, pending)
-
-                for t in done:
-                    if t is recv_task:
-                        try:
-                            raw = t.result()
-                        except RuntimeError:
-                            # Starlette raises 'Cannot call "receive" once a
-                            # disconnect message has been received' when the
-                            # disconnect landed on a receive task that a previous
-                            # iteration cancelled/consumed (browser refresh
-                            # mid-multiplex). Same close as a clean disconnect —
-                            # without the ERROR traceback noise.
-                            raise WebSocketDisconnect(code=1006) from None
-                        try:
-                            msg = json.loads(raw)
-                        except json.JSONDecodeError:
-                            await self._send_error("Invalid JSON")
-                            continue
-                        # A client message must be a JSON object — a list/scalar
-                        # would make the handlers' `.get(...)`/`msg["..."]` raise
-                        # and tear down the socket. Reject cleanly instead.
-                        if not isinstance(msg, dict):
-                            await self._send_error("Invalid message")
-                            continue
-                        # Periodically re-validate the session + refresh role
-                        # (demotion / logout / password change / expiry) before
-                        # acting on a client message on this long-lived socket.
-                        if not await self._session_still_holds():
-                            ws_closing = True
-                            break
-                        try:
-                            result = await self._dispatch_client_message(msg)
-                        except RuntimeError as e:
-                            # `config.resolve_agent_model` raises RuntimeError when
-                            # no enabled model exists for the agent (fresh install
-                            # before admin configures a model). Surface as a WS
-                            # error so the user sees the actionable message instead
-                            # of a silent WS close.
-                            logger.warning(f"WS dashboard model resolution failed: {e}")
-                            await self._send_error(str(e))
-                            result = None
-                        if result == "close" or self._closed_by_revalidation:
-                            ws_closing = True
-                    elif t is notify_task:
-                        notification = t.result()
-                        if self.notify_queue.stale:
-                            notification = await self._resync_chat_status(notification)
-                        if notification is not None:
-                            await self._handle_server_notification(notification)
-                    elif t is live_task:
-                        await self._send(t.result())
-                        await self._drain_live_queue()
-                    elif t is poll_task:
-                        await self._task_pump_poll()
-
-        except WebSocketDisconnect:
-            logger.info(f"WebSocket dashboard disconnected: session={self.session_id}, chat={self.chat_id}")
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            await self._send_error("Invalid JSON")
+            return None
+        # A client message must be a JSON object — a list/scalar
+        # would make the handlers' `.get(...)`/`msg["..."]` raise
+        # and tear down the socket. Reject cleanly instead.
+        if not isinstance(msg, dict):
+            await self._send_error("Invalid message")
+            return None
+        # Periodically re-validate the session + refresh role
+        # (demotion / logout / password change / expiry) before
+        # acting on a client message on this long-lived socket.
+        if not await self._session_still_holds():
+            return "now"
+        try:
+            result = await self._dispatch_client_message(msg)
         except RuntimeError as e:
-            # Starlette throws RuntimeError("WebSocket is not connected. Need
-            # to call 'accept' first.") when ``receive_text`` (or send_json)
-            # runs on a socket whose state already flipped to DISCONNECTED.
-            # This happens when the browser closes the WS in the small window
-            # between ``websocket.accept()`` returning and the next receive —
-            # common during page reload, multi-tab fanout, or our own
-            # pre_warmup-then-warmup back-to-back dance. It is semantically
-            # the same as ``WebSocketDisconnect`` (the connection is gone)
-            # and must not crash the handler: an unhandled exception here
-            # leaks the satellite-side session that warmup already spawned,
-            # which then orphans any subsequent message the user sends on
-            # what their browser still thinks is a live socket.
-            msg = str(e)
-            if "not connected" in msg or "accept" in msg or "disconnect message" in msg:
-                logger.info(
-                    f"WebSocket dashboard disconnected (mid-receive): "
-                    f"session={self.session_id}, chat={self.chat_id}"
-                )
-            else:
-                logger.error(f"WebSocket dashboard error: {e}", exc_info=True)
-        except Exception as e:
-            logger.error(f"WebSocket dashboard error: {e}", exc_info=True)
-        finally:
-            self._ended.set()
-            if self._ticker is not None:
-                self._ticker.cancel()
-            conns = _connections_by_user.get(self.user_sub)
-            if conns is not None:
-                conns.discard(self)
-                if not conns:
-                    _connections_by_user.pop(self.user_sub, None)
-            # Mark the connection gone so a still-running
-            # backgrounded warmup spawn (_warmup_task) drives its first turn HEADLESS
-            # instead of enqueuing a _server_kick to this (now-dead) notify queue —
-            # the spawn + first turn stay durable across a refresh/navigate during
-            # the spawn window. We deliberately do NOT cancel _warmup_task here
-            # (unlike _pre_warmup_task): it owns a real chat's first turn.
-            self._ws_gone = True
-            await self._rescue_queued_kicks()
-            # A typed message this connection queued stays in its chat's
-            # queue, delivered as its author at that chat's next turn; the
-            # interactions go (an app's interaction replayed later could act
-            # on state that moved on).
-            self.artifact_queue.clear()
-            self.implement_queue.clear()
-            # Cancel any background pre_warmup task so it doesn't keep mutating
-            # this WS handler's closure (and writing to _pre_warmed_* slots) after
-            # the connection is gone. We await briefly so an in-progress
-            # start_session can roll back its concurrency-slot acquisition.
-            if self._pre_warmup_task and not self._pre_warmup_task.done():
-                self._pre_warmup_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await self._pre_warmup_task
-            # Detach from any in-flight warmups this WS was listening to so the
-            # registry stops fanning future events to a closed socket. The
-            # warmup itself keeps running and will emit through any other
-            # listener attached (e.g. a reconnected WS via resume_chat).
-            for _wcid in list(self._attached_warmups):
-                await warmup_registry.detach_listener(_wcid, self._send)
-            self._attached_warmups.clear()
-            # Detach any interactive PTY viewer: removes this socket's output
-            # listener only — the PtyProcess keeps running (reconnect replays the
-            # scrollback ring; the idle reaper reclaims it if never re-viewed).
-            self._detach_pty_viewer()
-            # Install events need no per-connection detach: they are delivered via
-            # the per-user broadcaster, and notification_manager.unregister_user_connection
-            # below removes this connection from that fan-out cleanly.
-            self._unregister_notify_queue()
-            notification_manager.unregister_user_connection(self.user_sub, self.notify_connection_id)
-            # Clean up orphaned pre-warmed session (user left without sending a message)
-            if self._pre_warmed_sid:
-                orphan_sid = self._pre_warmed_sid
-                orphan_exec_path = self._pre_warmed_exec_path
-                self._pre_warmed_sid = None
-                self._pre_warmed_agent = None
-                self._pre_warmed_exec_path = ""
-                self._pre_warmed_model = ""
-                self._pre_warmed_role = ""
-                # Ours to close only while the registry still holds it (another
-                # tab may have claimed it; the reaper closes what it took).
-                from core.session import prewarm_session_registry as _prewarm
-                if await _prewarm.claim(orphan_sid):
-                    try:
-                        from core.session.session_manager import layer_for_prewarm
-                        orphan_layer = layer_for_prewarm(orphan_sid, orphan_exec_path)
-                        if orphan_layer:
-                            await orphan_layer.close_session(orphan_sid)
-                        logger.info(f"WS dashboard: closed orphaned pre-warmed session {orphan_sid[:8]}")
-                    except Exception:
-                        pass
-                    from core.concurrency import release_chat_slot
-                    release_chat_slot(orphan_sid)
-            # No release for self.session_id: its process outlives the socket,
-            # so its reservation does too. The path that ends the session
-            # releases it (layer close, reapers, the reconciler backstop).
-            logger.info(f"WS dashboard cleanup: session={self.session_id}, chat={self.chat_id}")
+            # `config.resolve_agent_model` raises RuntimeError when
+            # no enabled model exists for the agent (fresh install
+            # before admin configures a model). Surface as a WS
+            # error so the user sees the actionable message instead
+            # of a silent WS close.
+            logger.warning("WS dashboard model resolution failed: %s", e)
+            await self._send_error(str(e))
+            result = None
+        if result == "close" or self._closed_by_revalidation:
+            return "close"
+        return None
+
+
+    async def _close_orphan_prewarm(self) -> None:
+        """A pre-warmed session nobody claimed closes with the socket, ours
+        only while the registry still holds it."""
+        # Clean up orphaned pre-warmed session (user left without sending a message)
+        if self._pre_warmed_sid:
+            orphan_sid = self._pre_warmed_sid
+            orphan_exec_path = self._pre_warmed_exec_path
+            self._pre_warmed_sid = None
+            self._pre_warmed_agent = None
+            self._pre_warmed_exec_path = ""
+            self._pre_warmed_model = ""
+            self._pre_warmed_role = ""
+            self._pre_warmed_place = ""
+            # Ours to close only while the registry still holds it (another
+            # tab may have claimed it; the reaper closes what it took).
+            from core.session import prewarm_session_registry as _prewarm
+            if await _prewarm.claim(orphan_sid):
+                try:
+                    from core.session.session_manager import layer_for_prewarm
+                    orphan_layer = layer_for_prewarm(orphan_sid, orphan_exec_path)
+                    if orphan_layer:
+                        await orphan_layer.close_session(orphan_sid)
+                    logger.info("WS dashboard: closed orphaned pre-warmed session %s", orphan_sid[:8])
+                except Exception:  # noqa: BLE001  # closing an orphaned pre-warmed session nobody will use
+                    pass
+                from core.concurrency import release_chat_slot
+                release_chat_slot(orphan_sid)
 
 
     async def _send(self, data: dict):
         try:
             async with self._send_lock:
                 await self.websocket.send_json(data)
-        except Exception:
+        except Exception:  # noqa: BLE001  # the ASGI server's send raises by implementation once the socket is gone
             pass
 
     async def _send_text(self, text: str) -> bool:
@@ -1164,7 +1196,7 @@ class DashboardConnection(
             async with self._send_lock:
                 await self.websocket.send_text(text)
             return True
-        except Exception:
+        except Exception:  # noqa: BLE001  # the ASGI server's send raises by implementation once the socket is gone
             return False
 
     async def _rescue_queued_kicks(self) -> None:
@@ -1188,9 +1220,9 @@ class DashboardConnection(
                 if _k_layer and _ksid:
                     try:
                         await _k_layer.abort(_ksid)
-                    except Exception:
+                    except Exception:  # noqa: BLE001  # an abort during teardown: the chat is being released anyway
                         logger.warning(
-                            f"close-rescue: abort teardown failed for chat={_kcid[:8]}"
+                            "close-rescue: abort teardown failed for chat=%s", _kcid[:8]
                         )
                 # No first turn: what a teammate sent while it got ready goes
                 # out on its own.
@@ -1198,8 +1230,8 @@ class DashboardConnection(
                 input_queue.first_turn_not_run(_kcid)
                 continue
             logger.info(
-                f"close-rescue: WS died with a queued server kick — running "
-                f"first turn headless for chat={_kcid[:8]}"
+                "close-rescue: WS died with a queued server kick — running "
+                "first turn headless for chat=%s", _kcid[:8]
             )
             spawn(self._run_kick_headless(
                 _kcid, _ksid, _kick.get("text", ""),
@@ -1347,7 +1379,7 @@ class DashboardConnection(
         chat = await run_db(task_store.get_chat, self.chat_id)
         if not chat:
             return True
-        from api.agents.chats import can_access_chat
+        from core.session.visibility import can_access_chat
         return bool(await run_db(can_access_chat, self._viewer_context(), chat))
 
     def _refuse_further_work(self, *, chat_lost: str = "") -> None:
@@ -1398,7 +1430,7 @@ class DashboardConnection(
         self._held_gate = auth_gate(user)
         return True
 
-    def _register_notify_queue(self, *, replaces: str = ""):
+    def _register_notify_queue(self, *, replaces: str | None = ""):
         """Register/update the notification queue for the current session_id.
 
         ``replaces`` names the session id this registration supersedes — a
@@ -1417,7 +1449,7 @@ class DashboardConnection(
             return
         if self.session_id:
             _dashboard_notify_queues[self.session_id] = self.notify_queue
-            logger.info(f"WS dashboard: registered notify queue for session={self.session_id[:8]} (dict_id={id(_dashboard_notify_queues)}, len={len(_dashboard_notify_queues)})")
+            logger.info("WS dashboard: registered notify queue for session=%s (dict_id=%s, len=%s)", self.session_id[:8], id(_dashboard_notify_queues), len(_dashboard_notify_queues))
 
     def _unregister_notify_queue(self):
         """Remove notification queue for all session_ids pointing to our queue."""
@@ -1449,8 +1481,8 @@ class DashboardConnection(
                 role=role,
                 execution_target=rec.get("execution_target") or placement.LOCAL,
             )
-        except Exception as e:
-            logger.warning(f"WS dashboard: cannot resolve layer for chat {cid}: {e}")
+        except Exception as e:  # noqa: BLE001  # a chat whose layer cannot be built is skipped, the socket serves on
+            logger.warning("WS dashboard: cannot resolve layer for chat %s: %s", cid, e)
             return None
 
     async def _resolve_layer_for_chat_async(self, cid: str) -> "ExecutionLayer | None":
@@ -1466,8 +1498,8 @@ class DashboardConnection(
         turns and interactive turns) this viewer may see, their rows read in
         ONE batched job (a connect storm of N sockets at M streaming chats
         must cost N reads, not N x M)."""
-        from core.session.session_state import streaming_chat_ids as _pump_streaming
         from core.session import interactive_session as _isess
+        from core.session.session_state import streaming_chat_ids as _pump_streaming
         from core.session.visibility import is_shared_chat_owner as _is_shared_owner
         from storage.pg import run_db
         cids = list(dict.fromkeys(

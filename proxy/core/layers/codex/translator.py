@@ -12,9 +12,23 @@ import config as app_config
 from core.events import turn_ending
 from core.events.bg_command_state import get_bg_command_registry, shorten_label
 from core.events.common_events import (
-    CommonEvent, TEXT, THINKING, TOOL_USE, TOOL_INPUT, TOOL_RESULT,
-    SUBAGENT_START, SUBAGENT_END, BG_COMMAND_START, BG_COMMAND_END,
-    METADATA, DONE, ERROR, TODO_UPDATE, GOAL_UPDATE, CONTEXT_COMPACT,
+    BG_COMMAND_END,
+    BG_COMMAND_START,
+    CONTEXT_COMPACT,
+    DONE,
+    ERROR,
+    GOAL_UPDATE,
+    METADATA,
+    SUBAGENT_END,
+    SUBAGENT_START,
+    TEXT,
+    THINKING,
+    TODO_UPDATE,
+    TOOL_INPUT,
+    TOOL_RESULT,
+    TOOL_USE,
+    CommonEvent,
+    note_mark,
 )
 from core.layers.codex import tool_names
 from core.layers.codex.helpers import will_retry
@@ -131,11 +145,19 @@ _SUPPRESSED_METHODS = frozenset({
     # 0.152+: the daemon announces a provider auth refresh (token rotation)
     # — housekeeping, nothing for the chat.
     "modelProvider/authRecoveryStarted", "modelProvider/authRecoveryCompleted",
+    # 0.163+, experimental: the thread's unread marker after every turn.
+    "thread/readState/changed",
 })
 
 
+# ``MessagePhase`` of an agentMessage written between steps (the preamble
+# before a tool call): shown as a progress note. Codex fills the phase when
+# the backend does ("callers must treat None as phase unknown").
+_COMMENTARY = "commentary"
+
+
 # ``TurnError.codexErrorInfo`` values that end a turn for a reason the
-# platform names (app-server schema of Codex 0.160.0 and 0.162.1): (reason, detail).
+# platform names (app-server schema of Codex 0.160.0 to 0.163.0): (reason, detail).
 _ENDING_INFO = {
     "usageLimitExceeded": (turn_ending.LIMIT, ""),
     "cyberPolicy": (turn_ending.DECLINED, "cyber"),
@@ -217,6 +239,15 @@ class CodexEventTranslator:
         # item/completed fallback only fires when nothing streamed.
         self._streamed_text: set[str] = set()
         self._streamed_reasoning: set[str] = set()
+        # Reasoning items whose start was seen and whose end was not, and
+        # the summary part each last streamed (a new part gets a paragraph
+        # break: the parts carry none).
+        self._open_reasoning: set[str] = set()
+        self._reasoning_part: dict[str, int] = {}
+        # agentMessage ids that started as commentary: their text streams as
+        # a progress note (TEXT with ``note``), still text for every reader.
+        self._note_items: set[str] = set()
+        self._late_phase_logged = False
         self._emitted_thread_id = False
         # Collab sub-agents seen this turn: agentId -> {started, ended, desc}.
         # Diffed from collabAgentToolCall ``agentsStates`` (0.5).
@@ -270,13 +301,19 @@ class CodexEventTranslator:
                 # open ⇒ the model yielded past it (unified_exec yield window):
                 # light its badge now, not at the turn-end sweep.
                 return self._start_open_bg_commands() + [
-                    CommonEvent(type=TEXT, data={"content": delta})]
+                    self._text_event(delta, note=item_id in self._note_items)]
             return []
 
         if method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
             item_id = params.get("itemId", "")
             delta = params.get("delta", "")
             if delta:
+                part = params.get("summaryIndex")
+                if isinstance(part, int) and not isinstance(part, bool):
+                    last = self._reasoning_part.get(item_id)
+                    self._reasoning_part[item_id] = part
+                    if last is not None and part > last and item_id in self._streamed_reasoning:
+                        delta = "\n\n" + delta
                 self._streamed_reasoning.add(item_id)
                 return self._start_open_bg_commands() + [
                     CommonEvent(type=THINKING, data={"phase": "delta", "text": delta})]
@@ -391,15 +428,16 @@ class CodexEventTranslator:
         if method in _SUPPRESSED_METHODS:
             return []
 
-        logger.debug(f"Codex translator: unhandled notification {method}")
+        logger.debug("Codex translator: unhandled notification %s", method)
         return []
 
     def _error_event(self, err: dict, fallback: str) -> CommonEvent:
         """The turn's ERROR: a typed ending when ``codexErrorInfo`` names a
         usage limit or a policy decline, a plain error otherwise."""
         message = err.get("message") or fallback
-        reason, detail = _ENDING_INFO.get(err.get("codexErrorInfo") if isinstance(
-            err.get("codexErrorInfo"), str) else "", ("", ""))
+        error_info = err.get("codexErrorInfo")
+        reason, detail = _ENDING_INFO.get(error_info if isinstance(
+            error_info, str) else "", ("", ""))
         if not reason:
             # The engine's own error: the daemon stays warm, the ending
             # names the reason and carries Codex's words.
@@ -416,7 +454,8 @@ class CodexEventTranslator:
 
     def _record_rate_limits(self, params) -> None:
         if isinstance(params, dict):
-            snapshot = params.get("rateLimits") if isinstance(params.get("rateLimits"), dict) else params
+            rate_limits = params.get("rateLimits")
+            snapshot = rate_limits if isinstance(rate_limits, dict) else params
             reached = [w for w in (snapshot.get("primary"), snapshot.get("secondary"))
                        if isinstance(w, dict) and (w.get("usedPercent") or 0) >= 100]
             if reached:
@@ -430,9 +469,9 @@ class CodexEventTranslator:
         if not self._session_id or not isinstance(params, dict):
             return
         from core.layers.codex.usage import record_snapshot_async
-        snapshot = params.get("rateLimits")
+        rate_limits = params.get("rateLimits")
         record_snapshot_async(
-            self._session_id, snapshot if isinstance(snapshot, dict) else params)
+            self._session_id, rate_limits if isinstance(rate_limits, dict) else params)
 
     def _on_goal_updated(self, params) -> list[CommonEvent]:
         """``thread/goal/updated`` → GOAL_UPDATE. Wire shape verified live vs
@@ -466,7 +505,7 @@ class CodexEventTranslator:
             if not self._goal_warned:
                 self._goal_warned = True
                 logger.warning(
-                    f"Codex translator: unrecognized thread/goal/updated shape ({e}); ignoring")
+                    "Codex translator: unrecognized thread/goal/updated shape (%s); ignoring", e)
             return []
         return [CommonEvent(type=GOAL_UPDATE, data=data)]
 
@@ -484,9 +523,14 @@ class CodexEventTranslator:
             return []
 
         if item_type == "agentMessage":
-            return []  # text streams via item/agentMessage/delta
+            # Text streams via item/agentMessage/delta; a commentary message's
+            # as a progress note.
+            if item.get("phase") == _COMMENTARY:
+                self._note_items.add(item_id)
+            return []
 
         if item_type == "reasoning":
+            self._open_reasoning.add(item_id)
             return [CommonEvent(type=THINKING, data={"phase": "start"})]
 
         if item_type in tool_names.TOOL_ITEM_TYPES:
@@ -549,7 +593,7 @@ class CodexEventTranslator:
         if item_type == "plan":
             return []  # prose plan; the checklist arrives via turn/plan/updated
 
-        logger.debug(f"Codex translator: unhandled item.started type={item_type!r}")
+        logger.debug("Codex translator: unhandled item.started type=%r", item_type)
         return []
 
     def _on_item_completed(self, item: dict) -> list[CommonEvent]:
@@ -569,17 +613,10 @@ class CodexEventTranslator:
             })]
 
         if item_type == "agentMessage":
-            # Fallback: emit the full text only if nothing streamed via deltas.
-            if item_id not in self._streamed_text:
-                text = item.get("text", "")
-                if text:
-                    return [CommonEvent(type=TEXT, data={"content": text})]
-            self._streamed_text.discard(item_id)
-            return []
+            return self._on_message_completed(item_id, item)
 
         if item_type == "reasoning":
-            self._streamed_reasoning.discard(item_id)
-            return [CommonEvent(type=THINKING, data={"phase": "end", "text": ""})]
+            return self._on_reasoning_completed(item_id, item)
 
         if item_type in tool_names.TOOL_ITEM_TYPES:
             data = {"name": tool_names.canonical(item_type), "tool_id": item_id}
@@ -641,8 +678,62 @@ class CodexEventTranslator:
         if item_type == "plan":
             return []
 
-        logger.debug(f"Codex translator: unhandled item.completed type={item_type!r}")
+        logger.debug("Codex translator: unhandled item.completed type=%r", item_type)
         return []
+
+    @staticmethod
+    def _text_event(content: str, *, note: bool) -> CommonEvent:
+        """A TEXT event; a progress note carries ``note`` (text for every
+        reader, drawn faint by the page)."""
+        data: dict = {"content": content}
+        if note:
+            data["note"] = True
+        return CommonEvent(type=TEXT, data=data)
+
+    def _on_message_completed(self, item_id: str, item: dict) -> list[CommonEvent]:
+        """An agentMessage's end: the full text only when nothing streamed
+        (the fallback), as a note when it started or ends as commentary.
+        Commentary known only now went out as plain text: the note mark
+        folds it into a note (the pump's open segment, the page's last text
+        block)."""
+        opened_as_note = item_id in self._note_items
+        self._note_items.discard(item_id)
+        streamed = item_id in self._streamed_text
+        self._streamed_text.discard(item_id)
+        phase = item.get("phase")
+        if streamed and opened_as_note and phase != _COMMENTARY:
+            logger.warning("Codex [%s]: a message that started as commentary ended as %r",
+                           self._session_id[:8], phase)
+        elif streamed and not opened_as_note and phase == _COMMENTARY:
+            if not self._late_phase_logged:
+                self._late_phase_logged = True
+                logger.info("Codex [%s]: commentary phase arrived only at completion; "
+                            "the preamble is folded into a note", self._session_id[:8])
+            return [note_mark()]
+        text = item.get("text", "")
+        if streamed or not text:
+            return []
+        return [self._text_event(text, note=opened_as_note or phase == _COMMENTARY)]
+
+    def _on_reasoning_completed(self, item_id: str, item: dict) -> list[CommonEvent]:
+        """A reasoning item's end. Its summary (else its raw content) is sent
+        here only when nothing streamed, so a streamed summary never doubles."""
+        events: list[CommonEvent] = []
+        if item_id not in self._streamed_reasoning:
+            parts = [p for p in (item.get("summary") or []) if isinstance(p, str) and p]
+            if not parts:
+                parts = [p for p in (item.get("content") or []) if isinstance(p, str) and p]
+            if parts:
+                if item_id not in self._open_reasoning:
+                    events.append(CommonEvent(type=THINKING, data={"phase": "start"}))
+                events.append(CommonEvent(type=THINKING, data={
+                    "phase": "delta", "text": "\n\n".join(parts)}))
+        self._streamed_reasoning.discard(item_id)
+        self._reasoning_part.pop(item_id, None)
+        if item_id in self._open_reasoning or events:
+            self._open_reasoning.discard(item_id)
+            events.append(CommonEvent(type=THINKING, data={"phase": "end", "text": ""}))
+        return events
 
     def _record_tool(self, tool_name: str, item_id: str, item: dict, is_error: bool) -> None:
         """The Codex app-server placement's ONE ``post_tool`` source
@@ -782,7 +873,14 @@ class CodexEventTranslator:
         # Without one (remote path) sweep them as before so a badge can't hang.
         # Foreground (waited) sub-agents are terminal by main-turn end either way
         # (``ended`` set in _handle_collab), so they are never in the sweep.
-        sweep: list[CommonEvent] = []
+        # A reasoning item still open (an interrupt) ends here, so the pump
+        # saves what streamed instead of carrying it into the next turn.
+        sweep: list[CommonEvent] = [
+            CommonEvent(type=THINKING, data={"phase": "end", "text": ""})
+            for _ in self._open_reasoning]
+        self._open_reasoning.clear()
+        self._reasoning_part.clear()
+        self._note_items.clear()
         if self._supervised_bg:
             self._subagents = {
                 aid: rec for aid, rec in self._subagents.items()

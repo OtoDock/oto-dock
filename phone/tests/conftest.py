@@ -18,8 +18,7 @@ for _p in (_PHONE, _HERE):
         sys.path.insert(0, _p)
 
 import pytest
-
-from pipeline_fakes import FakeConn, FakeSTT, FakeVAD, FakeTTS, make_route
+from pipeline_fakes import FakeConn, FakeSTT, FakeTTS, FakeVAD, make_route
 
 
 @pytest.fixture
@@ -31,10 +30,8 @@ def make_pipeline(monkeypatch):
     wires fakes instead of loading ONNX models, provider SDKs, or hitting the
     network. Returns a constructor.
     """
-    from pipeline import CallPipeline
-    from pipeline import core as plcore
-    from pipeline import providers as plproviders
     from config_manager import ConfigManager
+    from pipeline import CallPipeline, core as plcore, providers as plproviders
 
     # VAD is constructed in pipeline.core; the STT/TTS classes are resolved via
     # get_provider_class in pipeline.providers (build_stt/build_tts).

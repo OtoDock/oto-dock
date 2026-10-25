@@ -5,6 +5,8 @@
  * mirroring the filter already on the Triggers page.
  */
 
+import { Select } from './ui/Field'
+
 export type ScopeFilterValue = 'all' | 'user' | 'agent'
 
 export function ScopeFilterSelect({
@@ -17,14 +19,15 @@ export function ScopeFilterSelect({
   className?: string
 }) {
   return (
-    <select
+    <Select
+      compact
       value={value}
       onChange={(e) => onChange(e.target.value as ScopeFilterValue)}
-      className={`text-sm border border-p-border-light rounded-sm px-2 py-1 bg-white dark:bg-p-surface text-p-text ${className}`}
+      className={`w-max ${className}`}
     >
       <option value="all">All scopes</option>
-      <option value="user">Mine (user)</option>
+      <option value="user">Mine</option>
       <option value="agent">Agent</option>
-    </select>
+    </Select>
   )
 }

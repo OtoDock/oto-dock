@@ -1,0 +1,184 @@
+{
+ "calls": [
+  {
+   "args": [
+    "char-agent",
+    null
+   ],
+   "call": "build_session_mcp_config",
+   "kwargs": {
+    "delegation_targets": [
+     "char-peer"
+    ],
+    "extra_mcps": [
+     "meetings-mcp"
+    ],
+    "mcp_config_format": "json",
+    "meeting_mode": true,
+    "placement": {},
+    "session_id": "s-meet",
+    "target_browser": {},
+    "task_mode": true,
+    "task_owner": "",
+    "task_scope": "agent",
+    "task_username": ""
+   }
+  },
+  {
+   "args": [
+    "char-agent",
+    [
+     "char-files",
+     "phone-mcp"
+    ]
+   ],
+   "call": "get_dynamic_contexts",
+   "kwargs": {
+    "delegation_roster": {
+     "char-peer": [
+      {
+       "catalog": [
+        {
+         "good_at": "",
+         "model_id": "claude-char-1",
+         "tier": 2,
+         "tier_label": "strong"
+        }
+       ],
+       "default_model": "claude-char-1",
+       "is_default": true,
+       "local_only": false,
+       "models": [
+        "claude-char-1"
+       ],
+       "more": 0,
+       "path": "claude-code-cli",
+       "tiers": {
+        "claude-char-1": 2
+       }
+      }
+     ]
+    },
+    "delegation_targets": [
+     "char-peer"
+    ],
+    "meetings_access": [],
+    "nouser_reads": true,
+    "user_role": "manager",
+    "user_sub": ""
+   }
+  },
+  {
+   "args": [
+    "char-agent"
+   ],
+   "call": "build_agent_prompt",
+   "kwargs": {
+    "client_type": "meeting",
+    "dynamic_contexts": null,
+    "excluded_mcps": null,
+    "execution_path": "claude-code-cli",
+    "mount_shared": true,
+    "placement": {},
+    "role": "manager",
+    "sandboxed": true,
+    "username": ""
+   }
+  },
+  {
+   "args": [
+    {
+     "agent": "char-agent",
+     "config_visible": false,
+     "is_admin_agent": false,
+     "role": "manager",
+     "session_scope": "agent",
+     "username": ""
+    }
+   ],
+   "call": "build_permission_context",
+   "kwargs": {
+    "assigned_mcp_names": [
+     "char-files",
+     "phone-mcp"
+    ],
+    "execution_path": "claude-code-cli"
+   }
+  },
+  {
+   "args": [
+    "claude-code-cli",
+    null
+   ],
+   "call": "resolve_subscription_env",
+   "kwargs": {
+    "agent_info": {
+     "admin_only": false,
+     "collaborative": true,
+     "color": "",
+     "community_template": null,
+     "community_template_data": {},
+     "community_template_version": null,
+     "created_at": "<stamp>",
+     "created_by": "",
+     "default_effort": "",
+     "default_execution_mode": "",
+     "default_for_new_users_role": "",
+     "default_model": "",
+     "default_scope": "user",
+     "department_id": "",
+     "department_level_id": "",
+     "description": "",
+     "display_name": "Char Agent",
+     "execution_path": "claude-code-cli",
+     "execution_paths": "",
+     "execution_target": "local",
+     "setup_completed_at": null,
+     "slug": "char-agent",
+     "updated_at": "<stamp>"
+    },
+    "model": "claude-char-1"
+   }
+  },
+  {
+   "args": [
+    "char-agent"
+   ],
+   "call": "ensure_persistent_agent_dir",
+   "kwargs": {
+    "execution_path": "claude-code-cli",
+    "scope": "agent",
+    "username": ""
+   }
+  }
+ ],
+ "config": {
+  "agent_name": "char-agent",
+  "client_type": "meeting",
+  "credential_env": {
+   "MCP_CRED": "1",
+   "PROXY_API_KEY": "<session-token>"
+  },
+  "effort": "high",
+  "execution_path": "claude-code-cli",
+  "extra_env": {
+   "SUB_ENV": "1"
+  },
+  "model": "claude-char-1",
+  "permission_mode": "auto",
+  "sandbox_host_claude_dir": "/char/.claude",
+  "security_context": {
+   "agent": "char-agent",
+   "config_visible": false,
+   "is_admin_agent": false,
+   "role": "manager",
+   "session_scope": "agent",
+   "username": ""
+  },
+  "subscription_id": "sub-char",
+  "subscription_user_sub": "",
+  "system_prompt": "PROMPT\n\nPERMISSIONS\n\n---\n\n## Meeting Agent Rules\n\nYou are participating in a multi-agent meeting (no interactive user prompts).\n\n- **Be concise** — each response should be 1-3 paragraphs max. Provide data, not filler.\n- **ALWAYS call `direct_to(agents=[...])` exactly ONCE, as the LAST action of your response, then END your turn immediately** — no further text and no repeat calls (repeats only waste slow round-trips; the last call wins). Text written after the call is discarded.\n- **A turn is: gather what you need with tools, write your message, route, stop.** The agents you address speak only AFTER your turn ends, and their replies reach you as transcript in your NEXT turn. Never wait for a reply inside your turn — no polling, no `sleep`, no peeking at their sessions or tasks. The platform denies every tool call that follows a routing call in the same turn.\n- **Write your full message as normal response text BEFORE calling `direct_to`.** The tool only routes — its arguments are NOT shown to the other agents; anything you put in them is lost.\n  If you don't call direct_to, your response broadcasts to ALL participants and they ALL respond — avoid this unless the moderator explicitly wants input from everyone.\n- **The other participants receive ONLY the response text you write.** They can NOT see your tool results or your thinking. After gathering data with tools you MUST write the findings out as plain response text before routing — otherwise the others receive nothing and the meeting stalls on a restatement round.\n- **As participant**: After delivering your report or answering a question, **always direct back to the moderator** — not to other participants. Only direct to another participant if the moderator explicitly asked you to coordinate with them.\n- **As participant**: When you have nothing more to add, call `propose_conclude` or `leave_meeting` immediately — do NOT say \"nothing further\" without using one of these tools.\n- **As moderator**: Direct to specific agents with clear questions. Use `end_meeting` to conclude — write the summary as response text, then call it, then stop (memory writes are the one tool still allowed after a routing call).\n- **Do NOT** repeat or summarize information already shared by other participants.\n- **Do NOT** respond just to acknowledge — only speak when you have new information or a question.\n- **Do NOT** use the Agent tool, background subagents, or delegate_task during meetings.\n",
+  "token_minted_at": "<now>",
+  "user_sub": "user-manager"
+ }
+}

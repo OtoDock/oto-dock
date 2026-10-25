@@ -19,7 +19,6 @@ from app import app
 from auth.path_policy import SecurityContext
 from core.session import session_state
 
-
 client = TestClient(app)
 
 

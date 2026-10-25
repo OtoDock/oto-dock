@@ -1,0 +1,28 @@
+{
+ "calls": [
+  {
+   "args": [
+    "char-shared",
+    null
+   ],
+   "call": "build_session_mcp_config",
+   "kwargs": {
+    "delegation_targets": [
+     "char-shared"
+    ],
+    "mcp_config_format": "json",
+    "only_mcps": null,
+    "placement": {},
+    "session_id": "s-task",
+    "target_browser": {},
+    "task_mode": true,
+    "task_owner": "",
+    "task_scope": "agent",
+    "task_username": "",
+    "user_role": "viewer",
+    "username": ""
+   }
+  }
+ ],
+ "raised": "AgentStateRefused"
+}

@@ -207,8 +207,8 @@ def _read_beneath(res: Resolved, limit: int) -> bytes:
     root, rel = _mount_rel(res)
     try:
         canonical = safe_fs.canonical_rel(root, rel)
-    except safe_fs.EscapeRefused:
-        raise FileToolError("path leaves the session folder (symlink); refused")
+    except safe_fs.EscapeRefused as exc:
+        raise FileToolError("path leaves the session folder (symlink); refused") from exc
     fd, _st = safe_fs.open_regular_for_read(root, canonical)
     with os.fdopen(fd, "rb") as fh:
         return fh.read(limit)
@@ -341,10 +341,10 @@ def edit_text(res: Resolved, old: str, new: str, replace_all: bool = False) -> i
     try:
         root, rel = _mount_rel(res)
         data = safe_fs.read_bytes_beneath(root, rel, max_size=WRITE_MAX_BYTES)
-    except safe_fs.FileTooLarge:
+    except safe_fs.FileTooLarge as exc:
         raise FileToolError(
             f"{res.virtual} is larger than {WRITE_MAX_BYTES // 1024} KB — Edit works on text files up to that size"
-        )
+        ) from exc
     except OSError as e:
         raise FileToolError(f"cannot read {res.virtual}: {_fs_reason(e)}") from e
     if b"\x00" in data[:8192]:

@@ -650,3 +650,151 @@ class TestInjectionHooks:
         assert seen == ["the earlier answer"]
         assert pings == [False]
         assert not s._prompt_queue                       # and the prompt still went in
+
+
+def _record_writes(s):
+    """Every write the session makes to its PTY, in order."""
+    writes: list[bytes] = []
+    real = s.pty.write
+
+    def _write(data):
+        writes.append(bytes(data))
+        return real(data)
+
+    s.pty.write = _write
+    return writes
+
+
+def _park(s):
+    """The fold of a question the CLI shows (the hook park sets the same flag)."""
+    s._apply_turn_signal("end_turn", question_pending=True)
+
+
+PASTE = b"\x1b[200~hello\nworld\x1b[201~\r"
+
+
+@pytest.mark.asyncio
+class TestHeldComposerSend:
+    """A composer send that lands while a question shows is held (typed in,
+    it would answer the dialog) as a steer carrying the page's own bytes: the
+    answer that unparks the turn types it into the running turn at once, as
+    the page sent it, never at the turn's end. Keys that answer the dialog
+    leave the composer flag as the park found it, and no Enter is pressed
+    into a dialog that opened after its text."""
+
+    async def test_the_answer_reopening_the_turn_types_the_held_send_at_once(self):
+        s = await _register("sid-held-steer")
+        _make_idle(s)
+        s._submitted_once = False            # a session driven by typed keys only
+        s._turn_open = True
+        _park(s)
+        s.deliver_dashboard_input(PASTE, composer=True)
+        (item,) = s._prompt_queue
+        assert item["steer"] is True and item["raw"] == PASTE
+        writes = _record_writes(s)
+        await _drain_and_settle(s)
+        assert writes == [] and len(s._prompt_queue) == 1     # parked: held
+        s.last_activity = time.monotonic()                    # the turn streams
+        s._apply_turn_signal("tool_use")                      # the answer
+        await asyncio.sleep(0.4)
+        assert not s._prompt_queue and s._turn_open is True
+        # The page's bracketed paste, then the warm Enter (not the 12 s settle).
+        assert writes[:2] == [PASTE[:-1], b"\r"]
+
+    async def test_a_question_dismissed_with_esc_delivers_it_as_the_next_prompt(self):
+        s = await _register("sid-held-esc")
+        received = bytearray()
+        s.add_output_listener(received.extend)
+        _make_idle(s)
+        s._turn_open = True
+        _park(s)
+        s.deliver_dashboard_input(PASTE, composer=True)
+        s.write_input(b"\x1b")                                # Esc on the dialog
+        assert s._composer_dirty is False
+        s._apply_turn_signal("end_turn")                      # the interrupt marker
+        await asyncio.sleep(0.3)                              # the unpark's own drain ran
+        assert s._last_held_reason == "not_quiet"             # the Esc was just typed
+        s.last_activity = time.monotonic() - 10
+        await _drain_and_settle(s)
+        assert not s._prompt_queue and b"hello" in bytes(received)
+
+    async def test_dialog_keys_keep_the_flag_and_a_draft_still_holds_the_send(self):
+        s = await _register("sid-held-dirty")
+        _make_idle(s)
+        s._turn_open = True
+        s.write_input(b"draft")                               # in the TUI's box
+        assert s._composer_dirty is True
+        _park(s)
+        s.deliver_dashboard_input(PASTE, composer=True)
+        s.write_input(b"\x1b[B")
+        s.write_input(b"2")
+        s.write_input(b"\r")                                  # the dialog's Enter
+        assert s._composer_dirty is True                      # the draft is still there
+        s._apply_turn_signal("tool_use")
+        await _drain_and_settle(s)
+        assert len(s._prompt_queue) == 1                      # not pasted onto the draft
+
+    async def test_free_text_answered_with_enter_does_not_hold_the_send(self):
+        s = await _register("sid-held-free")
+        received = bytearray()
+        s.add_output_listener(received.extend)
+        _make_idle(s)
+        s._turn_open = True
+        _park(s)
+        s.deliver_dashboard_input(PASTE, composer=True)
+        s.write_input(b"green")                               # the dialog's free text
+        assert s._composer_dirty is True
+        s.write_input(b"\r")
+        assert s._composer_dirty is False                     # it went to the dialog
+        s.write_input(b"new")                                 # typed after the answer
+        assert s._composer_dirty is True                      # may be a draft: kept
+        s._apply_turn_signal("tool_use")
+        await _drain_and_settle(s)
+        assert len(s._prompt_queue) == 1
+
+    async def test_no_enter_goes_into_a_dialog_that_opened_after_its_text(self):
+        s = await _register("sid-held-enter")
+        _make_idle(s)
+        s._submitted_once = True
+        s._turn_open = True
+        writes = _record_writes(s)
+        s.write_input(b"steer this\r")
+        _park(s)                                              # within the Enter's gap
+        await asyncio.sleep(0.3)
+        assert writes == [b"steer this"]
+        assert s._composer_dirty is True                      # the text sits in the box
+        s.queue_prompt("a delegate result", "delegate_result", steer=True)
+        s.write_input(b"\x1b[B")                             # the person answers the dialog
+        s.write_input(b"\r")
+        assert s._composer_dirty is True                      # still the held text
+        answered = len(writes)                                # the text and the person's keys
+        s._apply_turn_signal("tool_use")                      # the answer reopens
+        await asyncio.sleep(0.4)
+        assert writes[answered] == b"\r"                      # the held Enter, pressed
+        assert b"a delegate result" in b"".join(writes[answered + 1:])
+
+    async def test_a_dialog_already_open_keeps_the_enter_of_its_own_answer(self):
+        s = await _register("sid-held-own")
+        _make_idle(s)
+        s._submitted_once = True
+        _park(s)
+        writes = _record_writes(s)
+        s.write_input(b"my answer\r")
+        _park(s)                                              # a fold re-asserting it
+        await asyncio.sleep(0.3)
+        assert writes == [b"my answer", b"\r"]
+
+    async def test_the_settle_enter_is_held_too(self):
+        s = await _register("sid-held-settle")
+        _make_idle(s)
+        s._submitted_once = True
+        s._turn_open = True
+        writes = _record_writes(s)
+        s.submit_prompt("a delegate's long result", settle=True)
+        _park(s)
+        s._fire_submit()
+        assert b"\r" not in writes
+        s.write_input(b"\r")                                 # the person answers the dialog
+        assert writes[-1] == b"\r" and len(writes) == 2      # their own Enter only
+        s._apply_turn_signal("tool_use")
+        assert writes[-1] == b"\r" and len(writes) == 3      # the held Enter, pressed

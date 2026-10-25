@@ -29,17 +29,23 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import config
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+import config
 from api.media.access import can_serve_token
-from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_agent_access,
+    require_auth,
+)
 from services.infra import safe_fs
 from services.media import media_pipeline
-from storage.agents import agent_store
+from services.media.media_pipeline import MediaUnserveable, locate_media_row
 from storage import database as task_store
+from storage.agents import agent_store
 from storage.pg import run_db
 
 logger = logging.getLogger("otodock.media")
@@ -48,15 +54,6 @@ router = APIRouter()
 # Workspace-minted tokens self-expire (reaped by the TTL sweep). Chat-display
 # tokens minted by the hook pass expires_at="" (durable until chat delete).
 _WORKSPACE_TOKEN_TTL = 24 * 3600
-
-# The lazy-pull cache for satellite-host files sits inside the agents tree
-# (``core/remote/remote_file_flow._host_cache_root``), one folder per session.
-HOST_CACHE_SEGMENT = ".remote-host-cache"
-
-
-class MediaUnserveable(Exception):
-    """The row's path is under no serving root or fails its binding; the
-    client gets the same 404 as for a missing file."""
 
 
 class FdFileResponse(FileResponse):
@@ -91,40 +88,6 @@ class FdFileResponse(FileResponse):
         fd, self._fd = self._fd, -1
         if fd >= 0:
             os.close(fd)
-
-
-def _serve_roots() -> tuple[str, str, str]:
-    """``(agents, media cache, host media cache)`` as absolute paths."""
-    return (
-        os.path.abspath(os.fspath(config.AGENTS_DIR)),
-        os.path.abspath(os.fspath(media_pipeline._CACHE_DIR)),
-        os.path.abspath(os.fspath(media_pipeline._HOST_CACHE_DIR)),
-    )
-
-
-def locate_media_row(info: dict) -> tuple[str, str]:
-    """``(root, rel)`` for a ``media_tokens`` row: the closest of the three
-    roots holding its ``abs_path`` and the path below it. Under the agents
-    root the first segment is bound to the row's agent (a legacy row with
-    ``agent=''`` is bound to the slug the path names) or, for a lazy-pull
-    cache path, to the row's session. Raises ``MediaUnserveable``."""
-    abs_path = (info.get("abs_path") or "").strip()
-    roots = _serve_roots()
-    try:
-        root, rel = safe_fs.split_under(abs_path, roots)
-    except OSError as exc:
-        raise MediaUnserveable(f"path outside every serving root: {exc}") from None
-    if root == roots[0]:
-        first, _, rest = rel.partition("/")
-        if first == HOST_CACHE_SEGMENT:
-            session = rest.partition("/")[0]
-            if not session or session != (info.get("session_id") or ""):
-                raise MediaUnserveable("host-cache path bound to another session")
-        else:
-            agent = (info.get("agent") or "").strip()
-            if not config.is_safe_agent_name(first) or (agent and first != agent):
-                raise MediaUnserveable("agent segment does not match the row")
-    return root, rel
 
 
 def open_media_row(info: dict) -> tuple[int, os.stat_result, str]:
@@ -176,11 +139,11 @@ async def _open_or_repull(token: str, info: dict) -> tuple[int, os.stat_result, 
     except MediaUnserveable as exc:
         logger.warning("media token %s (%s) refused: %s", token[:8],
                        info.get("media_kind") or "?", exc)
-        raise HTTPException(status_code=404, detail="media not found or expired")
+        raise HTTPException(status_code=404, detail="media not found or expired") from exc
     except (safe_fs.SafeFsError, OSError) as exc:
         logger.warning("media token %s (%s) refused: %s", token[:8],
                        info.get("media_kind") or "?", type(exc).__name__)
-        raise HTTPException(status_code=404, detail="media not found or expired")
+        raise HTTPException(status_code=404, detail="media not found or expired") from exc
     # Satellite-host (Desktop/Downloads) media isn't retained on the
     # platform: re-pull it from the laptop on demand if it's connected.
     result = await _repull_satellite_media(token, info)
@@ -196,8 +159,8 @@ async def _open_or_repull(token: str, info: dict) -> tuple[int, os.stat_result, 
     info = {**info, "abs_path": str(served), "mime": repulled_mime}
     try:
         fd, st, rel = await asyncio.to_thread(open_media_row, info)
-    except (OSError, MediaUnserveable):
-        raise HTTPException(status_code=404, detail="media file no longer exists")
+    except (OSError, MediaUnserveable) as err:
+        raise HTTPException(status_code=404, detail="media file no longer exists") from err
     return fd, st, rel, info
 
 

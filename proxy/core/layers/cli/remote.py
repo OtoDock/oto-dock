@@ -23,15 +23,20 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncIterator
+from typing import TYPE_CHECKING, cast
 
 import config as app_config
 from core.events import turn_ending, turn_life
-from core.events.common_events import CommonEvent, DONE, ERROR
+from core.events.common_events import DONE, ERROR, CommonEvent
 from core.execution_layer import (
-    AgentConfig, RemoteEngineAdapter, RemoteStartContext, RemoteStartPlan,
+    AgentConfig,
+    RemoteEngineAdapter,
+    RemoteStartContext,
+    RemoteStartPlan,
+    ResumeVerdict,
 )
 from core.layers.cli import usage as claude_usage
 from core.layers.cli.layer import CLIExecutionLayer, cli_chunk_to_events
@@ -45,6 +50,7 @@ from core.layers.cli.settle import (
     is_foreign_result,
 )
 from core.layers.cli.translator import ClaudeCLIEventTranslator
+from core.permission_modes import ASK_MODE, AUTO_REVIEW_MODE, cli_mode
 
 if TYPE_CHECKING:
     from core.remote.remote_session_info import RemoteSessionInfo
@@ -62,7 +68,23 @@ SOFT_INTERRUPT_FRAME = "interrupt_turn"     # control_request {interrupt} into t
 STOP_TURN_FRAME = "stop_turn"               # exit the satellite's stdout read loop
 CONTROL_REQUEST_FRAME = "control_request"   # set_model / set_permission_mode → CLI stdin
 STEER_FRAME = "steer_turn"                  # a user frame into the live turn's stdin (satellite ≥ 0.5.128)
-RESUME_PROBE_FRAME = "check_session_resumable"  # stat the session JSONL on the machine
+RESUME_PROBE_FRAME = "check_session_resumable"  # read the session JSONL on the machine
+# One call of ``can_resume`` waits this long for the probe's answer; the probe
+# itself stays outstanding across calls (``_probes``).
+_PROBE_WAIT_S = 5.0
+
+
+@dataclass
+class _OutstandingProbe:
+    """A resume probe sent and not yet answered: the connection it went out
+    on (a new connection means a new probe), its command id and its ack."""
+
+    conn: object
+    command_id: str
+    future: asyncio.Future
+
+
+_probes: dict[tuple[str, str], _OutstandingProbe] = {}
 
 
 @dataclass
@@ -140,7 +162,9 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
             try:
                 mcp_path = Path(config.mcp_config_path)
                 if mcp_path.exists():
-                    from core.remote.remote_mcp_rewrite import _rewrite_mcp_json_for_remote
+                    from core.remote.remote_mcp_rewrite import (
+                        _rewrite_mcp_json_for_remote,
+                    )
                     payload[MCP_CONFIG_PAYLOAD_KEY] = _rewrite_mcp_json_for_remote(
                         json.loads(mcp_path.read_text()), ctx.sat_port,
                         target_os=ctx.target_os, session_id=ctx.session_id,
@@ -173,12 +197,12 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
 
     # --- per-session state ---------------------------------------------------
 
-    def init_session(self, info: "RemoteSessionInfo", config: AgentConfig, cm) -> None:
+    def init_session(self, info: RemoteSessionInfo, config: AgentConfig, cm) -> None:
         # The translator and settle controller are per TURN (begin_turn);
         # nothing lives across turns for this engine.
         info.engine_state = None
 
-    def adopt_state(self, info: "RemoteSessionInfo", cm=None) -> None:
+    def adopt_state(self, info: RemoteSessionInfo, cm=None) -> None:
         """Mode C: the replayed turn streams through a fresh translator and an
         interactive settle (the buffered turn's sentinel / turn_ended closes
         it)."""
@@ -190,7 +214,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
 
     # --- turns ---------------------------------------------------------------
 
-    async def begin_turn(self, info: "RemoteSessionInfo", settle_after_result: int) -> None:
+    async def begin_turn(self, info: RemoteSessionInfo, settle_after_result: int) -> None:
         from core.events.bg_command_state import reset_bg_command_registry
         from core.session.session_state import reset_subagent_registry
         reset_subagent_registry(info.session_id)
@@ -201,7 +225,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
             settle=SettleController(info.session_id, settle_after_result, translator),
         )
 
-    async def stream_turn(self, info: "RemoteSessionInfo", cm) -> AsyncIterator[CommonEvent]:
+    async def stream_turn(self, info: RemoteSessionInfo, cm) -> AsyncIterator[CommonEvent]:
         """Stream one CLI turn to the pump using the shared translator + settle.
 
         The satellite is a dumb pipe: it forwards every NDJSON line as a
@@ -218,13 +242,14 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
             if not turn["closed"]:
                 _stop_turn_in_background(cm, info)
 
-    async def _stream_turn(self, info: "RemoteSessionInfo", cm, turn: dict) -> AsyncIterator[CommonEvent]:
+    async def _stream_turn(self, info: RemoteSessionInfo, cm, turn: dict) -> AsyncIterator[CommonEvent]:
         from core.events import wake_capture
         from core.session import engine_prompts
         from core.session.session_state import (
-            reconcile_background_snapshot, resolve_bg_command_frame,
+            reconcile_background_snapshot,
+            resolve_bg_command_frame,
         )
-        state: ClaudeRemoteState = info.engine_state
+        state = cast("ClaudeRemoteState", info.engine_state)
         assert state is not None  # invariant: begin_turn / adopt_state ran
         translator, settle = state.translator, state.settle
 
@@ -460,7 +485,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
                 # Task settle mode: translator resets parsing state, keeps counters.
                 settle.enter_settle()
 
-    async def drain_bg_commands(self, info: "RemoteSessionInfo", cm, *, budget: float) -> bool:
+    async def drain_bg_commands(self, info: RemoteSessionInfo, cm, *, budget: float) -> bool:
         """Resolve background bash-command completions between turns. The
         satellite forwards claude's stdout CONTINUOUSLY into the per-session
         ``event_queue`` (a persistent WS pipe), so post-turn
@@ -482,7 +507,8 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
             from core.remote.remote_bg_commands import queue_frame_reader
             from core.session import engine_prompts
             from core.session.session_state import (
-                reconcile_background_snapshot, resolve_bg_command_frame,
+                reconcile_background_snapshot,
+                resolve_bg_command_frame,
             )
             deadline = time.monotonic() + budget
             while time.monotonic() < deadline:
@@ -518,23 +544,25 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
     def soft_interrupt_frame(self) -> str:
         return SOFT_INTERRUPT_FRAME
 
-    def note_interrupt(self, info: "RemoteSessionInfo") -> None:
-        state = info.engine_state
+    def note_interrupt(self, info: RemoteSessionInfo) -> None:
+        state = cast("ClaudeRemoteState | None", info.engine_state)
         if state is not None:
             state.translator.interrupted = True
 
-    def turn_settled(self, info: "RemoteSessionInfo") -> bool:
-        state: ClaudeRemoteState | None = info.engine_state
+    def turn_settled(self, info: RemoteSessionInfo) -> bool:
+        state = cast("ClaudeRemoteState | None", info.engine_state)
         return state is not None and state.settle.settling
 
-    async def control_request(self, info: "RemoteSessionInfo", cm, subtype: str, **kwargs) -> bool:
-        """The CLI's stdin control channel, proxied by the satellite: the
-        subtype and kwargs must match what Claude Code expects (same as the
-        local ``CLIExecutionLayer.change_model`` / ``change_mode``)."""
+    async def control_request(self, info: RemoteSessionInfo, cm, subtype: str, **kwargs) -> bool:
+        """The CLI's stdin control channel, proxied by the satellite (every
+        released satellite writes the frame to the CLI verbatim): the subtype
+        and kwargs must match what Claude Code expects (same as the local
+        ``CLIExecutionLayer.change_model`` / ``change_mode``), so a platform
+        mode goes as the CLI's own word."""
         if subtype == "set_model":
             kwargs = {"model": kwargs.get("model", "")}
         elif subtype == "set_permission_mode":
-            kwargs = {"mode": kwargs.get("mode", "")}
+            kwargs = {"mode": cli_mode(kwargs.get("mode", ""))}
         await cm.send_fire_and_forget(info.machine_id, {
             "type": CONTROL_REQUEST_FRAME,
             "session_id": info.session_id,
@@ -543,7 +571,14 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
         })
         return True
 
-    async def steer(self, info: "RemoteSessionInfo", cm, text: str) -> bool:
+    async def reenter_review(self, info: RemoteSessionInfo, cm) -> bool:
+        """The CLI's pause cleared by leaving auto and coming back, two
+        control frames the satellite writes to its stdin."""
+        await self.control_request(info, cm, "set_permission_mode", mode=ASK_MODE)
+        await self.control_request(info, cm, "set_permission_mode", mode=AUTO_REVIEW_MODE)
+        return True
+
+    async def steer(self, info: RemoteSessionInfo, cm, text: str) -> bool:
         """Mid-turn steering — the tunnel twin of ``PersistentSession.steer``:
         the satellite writes the user frame into the live turn's stdin
         (``steer_turn``, satellite ≥ 0.5.128; an older one would drop the
@@ -554,7 +589,7 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
         that races the result is not lost: the frame becomes the CLI's next
         turn, which ``stream_turn`` reads through while an RPC is pending or
         a frame is written."""
-        state: ClaudeRemoteState | None = info.engine_state
+        state = cast("ClaudeRemoteState | None", info.engine_state)
         if not text or state is None or state.result_seen:
             return False
         if _silence_ends(info, state.translator):
@@ -595,42 +630,104 @@ class ClaudeRemoteAdapter(RemoteEngineAdapter):
 
     # --- resume --------------------------------------------------------------
 
+    def probe_future(self, cm, *, machine_id: str, session_id: str) -> asyncio.Future | None:
+        held = _probes.get((machine_id, session_id))
+        if held is None or held.conn is not cm.get_connection(machine_id):
+            return None
+        return held.future
+
+    def forget_probe(self, cm, *, machine_id: str, session_id: str) -> None:
+        held = _probes.pop((machine_id, session_id), None)
+        if held is not None:
+            cm.forget_command(held.command_id)
+
     async def can_resume(
         self, cm, *, machine_id: str, session_id: str, agent_name: str,
-        username: str, resume_handle: str,
-    ) -> bool:
+        username: str, resume_handle: str, external_home: str = "",
+    ) -> ResumeVerdict:
         """The satellite owns the CLI session JSONL
         (``~/<otodock>/agents/<slug>/users/<u>/.claude/projects/<hash>/
         <session_id>.jsonl``). After an ``abort()`` (or idle-reap) the
         subprocess exits but the file claude-code wrote during the turn
         remains on disk — ``--resume`` from a new subprocess picks it up.
-        Ask the machine to stat it: a blind ``--resume`` against a missing or
+        Ask the machine to read it: a blind ``--resume`` against a missing or
         empty file makes claude-code silently start a fresh session and the
-        chat memory evaporates."""
+        chat memory evaporates.
+
+        Only a definite answer decides: ``resumable: true`` is RESUMABLE,
+        ``false`` is FRESH (a 0.5.149 satellite answers it for a read error
+        too). A machine away, a probe unanswered within ``_PROBE_WAIT_S``,
+        a failed send or a 0.5.150 satellite's ``status: error`` (a read the
+        machine could not finish) is UNKNOWN: the fresh branch is
+        irreversible, and a chat with an intact transcript was once lost to
+        a 5 s timeout read as "no". ``settle_resume`` calls again while it
+        waits; the probe sent stays outstanding across those calls
+        (``_probes``: the frame goes out once per connection, never once per
+        call, so a slow machine is not asked to read the same file five
+        times), and a reconnect sends a new one. ``forget_probe`` drops it
+        when the caller gives up; ``probe_future`` hands it to a watcher."""
         if not cm.is_connected(machine_id):
-            # Satellite unreachable — can't validate. Refuse to resume so
-            # the dashboard takes the fresh-session branch instead of
-            # claude-code silently materializing an empty session.
-            return False
+            return ResumeVerdict.UNKNOWN
+        key = (machine_id, session_id)
+        conn = cm.get_connection(machine_id)
+        held = _probes.get(key)
+        future = None
+        if held is not None and held.conn is conn:
+            # Still waiting, or answered since the last call: the answer is
+            # read below. A probe that failed (the machine dropped and came
+            # back) or was cancelled is sent again.
+            answered = (held.future.done() and not held.future.cancelled()
+                        and held.future.exception() is None)
+            if not held.future.done() or answered:
+                future = held.future
+        if future is None:
+            if held is not None and not held.future.done():
+                cm.forget_command(held.command_id)
+            try:
+                command_id, future = await cm.begin_command(machine_id, {
+                    "type": RESUME_PROBE_FRAME,
+                    "session_id": session_id,
+                    "agent_slug": agent_name,
+                    "username": username,
+                })
+            except RuntimeError as e:
+                logger.warning(
+                    "check_session_resumable could not be sent for %s: %s",
+                    session_id[:8], e,
+                )
+                return ResumeVerdict.UNKNOWN
+            _probes[key] = _OutstandingProbe(conn, command_id, future)
         try:
-            ack = await cm.send_command(machine_id, {
-                "type": RESUME_PROBE_FRAME,
-                "session_id": session_id,
-                "agent_slug": agent_name,
-                "username": username,
-            }, timeout=5.0)
-        except Exception as e:
-            logger.warning(
-                "check_session_resumable RPC failed for %s: %s — refusing resume",
-                session_id[:8], e,
+            ack = await asyncio.wait_for(asyncio.shield(future), timeout=_PROBE_WAIT_S)
+        except asyncio.TimeoutError:
+            logger.info(
+                "check_session_resumable for %s: no answer in %.0fs, the probe stays out",
+                session_id[:8], _PROBE_WAIT_S,
             )
-            return False
-        return bool(ack.get("resumable"))
+            return ResumeVerdict.UNKNOWN
+        except RuntimeError as e:
+            # The connection manager failed the ack: the machine dropped. The
+            # next call sends a fresh probe on the new connection.
+            _probes.pop(key, None)
+            logger.warning(
+                "check_session_resumable for %s failed: %s", session_id[:8], e,
+            )
+            return ResumeVerdict.UNKNOWN
+        _probes.pop(key, None)
+        if ack.get("status") == "error":
+            logger.warning(
+                "check_session_resumable for %s: the machine could not read (%s)",
+                session_id[:8], ack.get("error", ""),
+            )
+            return ResumeVerdict.UNKNOWN
+        if ack.get("resumable"):
+            return ResumeVerdict.RESUMABLE
+        return ResumeVerdict.FRESH
 
 
 # --- helpers the turn stream uses --------------------------------------------
 
-async def _peek_after_result(info: "RemoteSessionInfo", expected_command_id: str) -> dict | None:
+async def _peek_after_result(info: RemoteSessionInfo, expected_command_id: str) -> dict | None:
     """The frame right after the driven result, or None when nothing follows
     within the steer grace (the satellite's loop is still forwarding). A
     stale ``_turn_ended`` from the previous turn is skipped like everywhere
@@ -658,7 +755,7 @@ async def _peek_after_result(info: "RemoteSessionInfo", expected_command_id: str
 _stop_turn_tasks: set[asyncio.Task] = set()
 
 
-def _stop_turn_in_background(cm, info: "RemoteSessionInfo") -> None:
+def _stop_turn_in_background(cm, info: RemoteSessionInfo) -> None:
     """``send_stop_turn`` from a turn generator's close: a closing generator
     must not await, so the frame goes out on its own task."""
     try:
@@ -669,7 +766,7 @@ def _stop_turn_in_background(cm, info: "RemoteSessionInfo") -> None:
     task.add_done_callback(_stop_turn_tasks.discard)
 
 
-async def send_stop_turn(cm, info: "RemoteSessionInfo") -> None:
+async def send_stop_turn(cm, info: RemoteSessionInfo) -> None:
     """Tell the satellite to exit its stdout read loop for this turn. If
     background work is still pending, ask the satellite to keep draining
     + forwarding stdout post-turn (``drain_bg``) so the completion frames
@@ -684,19 +781,14 @@ async def send_stop_turn(cm, info: "RemoteSessionInfo") -> None:
     from core.session.session_state import get_subagent_registry
     drain_bg = (get_bg_command_registry(info.session_id).has_pending
                 or get_subagent_registry(info.session_id).has_pending)
-    try:
-        await cm.send_fire_and_forget(info.machine_id, {
-            "type": STOP_TURN_FRAME,
-            "session_id": info.session_id,
-            "drain_bg": drain_bg,
-        })
-    except Exception as e:
-        logger.warning(
-            "Remote stop_turn send failed for session %s: %s", info.session_id[:8], e,
-        )
+    await cm.send_fire_and_forget(info.machine_id, {
+        "type": STOP_TURN_FRAME,
+        "session_id": info.session_id,
+        "drain_bg": drain_bg,
+    })
 
 
-def _silence_ends(info: "RemoteSessionInfo", translator) -> bool:
+def _silence_ends(info: RemoteSessionInfo, translator) -> bool:
     """Whether the remote turn's silence (since its own last stream event)
     ends it now, with the translator's open tool calls as its life."""
     return turn_life.ends(
@@ -727,7 +819,7 @@ def _satellite_error_events(raw: dict) -> list[CommonEvent]:
 
 
 async def drain_until_turn_ended(
-    info: "RemoteSessionInfo", *, timeout: float, expected_command_id: str = "",
+    info: RemoteSessionInfo, *, timeout: float, expected_command_id: str = "",
 ) -> None:
     """After sending stop_turn, drain any remaining queue events until
     ``_turn_ended`` arrives or ``timeout`` expires.

@@ -67,6 +67,7 @@ def _static(key, value="tok-1"):
 
 def test_the_capability_gate_needs_the_flag_and_the_version():
     from types import SimpleNamespace
+
     from core.remote.satellite_connection import SatelliteConnectionManager
     cm = SatelliteConnectionManager()
     cm._connections["m"] = SimpleNamespace(capabilities={"mcp_gateway": True}, satellite_version="0.5.132")
@@ -96,6 +97,20 @@ def test_a_push_carries_the_header_the_lease_and_the_token_hash_and_skips_sideca
                    "mcp": "vendor", "header": "Authorization", "value": "Bearer tok-1",
                    "expires_in": mcp_gateway.LEASE_S, "upstream": "https://mcp.example.com/mcp"}
     assert push.registered(sid)
+    mcp_broker.purge_session(sid)
+
+
+def test_a_narrowed_credential_is_never_pushed_to_a_machine():
+    sid = str(uuid.uuid4())
+    key = _allow()
+    narrowed = GatewayCredential(upstream="https://mcp.example.com", path="/mcp", allowlist_key=key,
+                                 value="ghu-real", reach={"repositories": ["octo/hello"], "read_only": False})
+    mcp_broker.provision(sid, {"github-mcp": mcp_broker.SecretBundle(gateway=narrowed)})
+    cm = _Cm()
+    assert asyncio.run(push.push_session(sid, "m-1", "h" * 64, cm=cm)) == 0
+    narrowed.value = "ghu-rotated"
+    assert asyncio.run(push.tick(cm=cm)) == 0
+    assert cm.sent == []
     mcp_broker.purge_session(sid)
 
 

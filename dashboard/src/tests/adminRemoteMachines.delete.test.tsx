@@ -9,6 +9,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
+import { findAlertDialog, personClick, renderWithDialogs } from './dialogsHarness'
 
 const USER_MACHINE = {
   id: 'm-user', name: 'Alice laptop', status: 'online', last_seen: null,
@@ -46,6 +47,17 @@ vi.mock('@/components/RemoteBadge', () => ({ default: () => null }))
 
 import RemoteMachinesPage from '@/pages/admin/RemoteMachinesPage'
 
+/** The text behind every info button named `About <label>`, each opened
+ *  and closed again by a keyboard click. */
+function infoTexts(label: string): string[] {
+  return screen.getAllByRole('button', { name: `About ${label}` }).map((button) => {
+    fireEvent.click(button, { detail: 0 })
+    const text = screen.getByRole('tooltip').textContent ?? ''
+    fireEvent.click(button, { detail: 0 })
+    return text
+  })
+}
+
 function mount() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
@@ -71,20 +83,20 @@ describe('Admin removes a user-paired machine', () => {
     expect(remove.className).toContain('shrink-0')
 
     fireEvent.click(remove)
-    const dialog = screen.getByRole('dialog')
+    const dialog = screen.getByRole('alertdialog')
     expect(within(dialog).getByText(/Remove Alice laptop\?/)).toBeInTheDocument()
     expect(within(dialog).getByText(/Alice <alice@example.com>/)).toBeInTheDocument()
-    expect(within(dialog).getByText(/uninstall itself/)).toBeInTheDocument()
+    expect(within(dialog).getByText(/uninstalls itself/)).toBeInTheDocument()
 
     // Cancel sends nothing.
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    personClick(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
     expect(h.del).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Remove Alice laptop' }))
-    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Remove machine' }))
+    personClick(within(screen.getByRole('alertdialog')).getByRole('button', { name: 'Remove machine' }))
     await waitFor(() => expect(h.del).toHaveBeenCalledWith('m-user'))
-    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument())
   })
 
   it('a failed delete keeps the dialog open with the error', async () => {
@@ -92,9 +104,9 @@ describe('Admin removes a user-paired machine', () => {
     mount()
     fireEvent.click(screen.getByRole('button', { name: /User-Paired Remote Machines/ }))
     fireEvent.click(await screen.findByRole('button', { name: 'Remove Alice laptop' }))
-    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Remove machine' }))
+    personClick(within(screen.getByRole('alertdialog')).getByRole('button', { name: 'Remove machine' }))
     expect(await screen.findByText('Failed to delete machine')).toBeInTheDocument()
-    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument()
   })
 })
 
@@ -114,22 +126,56 @@ describe('Admin machine filesystem-access texts', () => {
     mount()
     fireEvent.click(screen.getByText('Office PC'))
     expect(screen.getByText(
-      "Full filesystem access. Agents can read and write any path the OS user can reach, "
-      + "except the machine's own OtoDock folder.")).toBeInTheDocument()
+      'Full filesystem access. Agents can read and write any path the OS user can reach.')).toBeInTheDocument()
+    expect(infoTexts('Filesystem access')).toEqual(["The machine's own OtoDock folder stays off limits."])
     fireEvent.click(screen.getByText('Plotter PC'))
-    expect(screen.getByText(
-      "Home folder only. Agents are limited to the agent tree and the OS user's home folder, "
-      + 'a guardrail, not a sandbox.')).toBeInTheDocument()
+    expect(screen.getByText('Home folder only. This is a guardrail, not full isolation.')).toBeInTheDocument()
+    expect(infoTexts('Filesystem access')).toEqual(["Agents stay in their agent folders and the OS user's home folder."])
   })
 
   it('says the same in the pairing dialog', () => {
     mount()
     fireEvent.click(screen.getByRole('button', { name: 'Pair New Machine' }))
     expect(screen.getByText(
-      'When enabled, agents on this machine can read and write any path the OS user can reach '
-      + "(system files, services), except the machine's own OtoDock folder, which no session may "
-      + "touch. When disabled, agents stay inside the OS user's home folder. Agents run natively "
-      + 'as the OS user either way: the home folder setting is a guardrail, not a kernel sandbox, '
-      + 'so only pair machines you trust with the agent.')).toBeInTheDocument()
+      'The home folder limit is a guardrail, not full isolation. Only pair '
+      + 'machines you trust with the agent.')).toBeInTheDocument()
+    expect(infoTexts('Allow full filesystem access')).toEqual([
+      'When on, agents can read and write any path the OS user can reach. '
+      + "That includes system files and services. The machine's own OtoDock folder stays off "
+      + "limits. When off, agents stay inside the OS user's home folder. Either way, agents run "
+      + 'as the OS user.'])
+  })
+})
+
+// The device grant confirm says what the grant lets the assigned agents do.
+describe('Admin machine device grant confirm', () => {
+  beforeEach(() => {
+    h.machines = [{
+      ...USER_MACHINE, id: 'm-studio', name: 'Studio PC', pairing_scope: 'admin', allow_full_fs: false,
+      device_grants: [], registered_by: 'admin-sub', owner_display_name: null, owner_email: null,
+    }]
+    h.apiFetch.mockClear()
+  })
+
+  it('names App connectors for the assigned agents, and Cancel grants nothing', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    renderWithDialogs(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <RemoteMachinesPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+    fireEvent.click(screen.getByText('Studio PC'))
+    expect(infoTexts('App connectors')).toContain('Work in the applications on this computer')
+    fireEvent.click(screen.getByRole('checkbox', { name: 'App connectors' }))
+    const dialog = await findAlertDialog('Grant "App connectors" on Studio PC?')
+    expect(within(dialog).getByText(
+      'Assigned agents can work in the applications on this computer that have a connector, like Blender. '
+      + 'They can run code inside those applications. Turn it on only on a computer you trust them with.',
+    )).toBeInTheDocument()
+    personClick(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument())
+    expect(h.apiFetch.mock.calls.some(([path]) => String(path).includes('device-grants'))).toBe(false)
   })
 })

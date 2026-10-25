@@ -105,6 +105,10 @@ _ALLOWLIST_REGEXES = [
     # both endpoints are session-JWT gated proxy-side (spawn_authz et al.).
     re.compile(r"^/v1/delegation(/.*)?$"),
     re.compile(r"^/v1/continuations(/.*)?$"),
+    # delegation-mcp's move_chat (the chat the session runs in, satellite
+    # 0.5.157): session-token only proxy-side; never the person's
+    # /v1/chats/<id>/move.
+    re.compile(r"^/v1/chats/agent-move$"),
     re.compile(r"^/v1/meetings(/.*)?$"),
     re.compile(r"^/v1/triggers(/.*)?$"),
     # checks-mcp (CHECKS.md): what is attached to this session's chat, attach,
@@ -225,7 +229,7 @@ class LocalTunnelServer:
     async def stop(self) -> None:
         """Shut down the aiohttp server and reject all pending streams."""
         # Reject pending streams first so handlers wake up and return.
-        for stream_id, stream in list(self._streams.items()):
+        for _stream_id, stream in list(self._streams.items()):
             with contextlib.suppress(asyncio.QueueFull):
                 stream.response_queue.put_nowait({
                     "type": "http_response",
@@ -274,7 +278,7 @@ class LocalTunnelServer:
         Called when the WS reconnects — every in-flight tunneled request
         gets a clean failure rather than hanging until timeout.
         """
-        for stream_id, stream in list(self._streams.items()):
+        for _stream_id, stream in list(self._streams.items()):
             with contextlib.suppress(asyncio.QueueFull):
                 stream.response_queue.put_nowait({
                     "type": "http_response",
@@ -368,7 +372,7 @@ class LocalTunnelServer:
                     )
                     if rewritten != body_text:
                         body = rewritten.encode("utf-8")
-                except (UnicodeDecodeError, Exception):  # noqa: BLE001
+                except (UnicodeDecodeError, Exception):  # noqa: BLE001  # a body the rewrite cannot read is forwarded as it came
                     # Non-UTF-8 body or unexpected failure: forward as-is.
                     pass
 
@@ -532,7 +536,7 @@ class LocalTunnelServer:
         frame waits below poll this between slices."""
         try:
             transport = request.transport
-        except Exception:  # noqa: BLE001 — defensive: mocked requests in tests
+        except Exception:  # noqa: BLE001  # defensive: mocked requests in tests
             return False
         return transport is None or transport.is_closing()
 
@@ -565,7 +569,7 @@ class LocalTunnelServer:
                 "type": "http_abort",
                 "stream_id": stream_id,
             })
-        except Exception:  # noqa: BLE001 — never let cleanup raise
+        except Exception:  # noqa: BLE001  # never let cleanup raise
             logger.debug("tunnel: abort frame for %s not sent", stream_id[:8], exc_info=True)
 
     async def _send_request_frames(

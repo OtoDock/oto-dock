@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from storage.agents import agent_store
-from storage.agents import memory_store
-
+from storage.agents import agent_store, memory_store
 
 # ---------------------------------------------------------------------------
 # Singleton settings row

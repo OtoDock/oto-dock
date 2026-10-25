@@ -14,8 +14,10 @@ Covers:
 HTTP is mocked via httpx.AsyncClient.
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
 
 from auth.oauth_providers import get_provider
 from auth.oauth_providers.base import TokenSet, UserInfo
@@ -303,7 +305,7 @@ class TestSlackRevoke:
         mc = MagicMock()
         mc.__aenter__ = AsyncMock(return_value=mc)
         mc.__aexit__ = AsyncMock(return_value=None)
-        mc.post = AsyncMock(side_effect=Exception("network"))
+        mc.post = AsyncMock(side_effect=httpx.ConnectError("network"))
         with patch("auth.oauth_providers.slack.httpx.AsyncClient", return_value=mc):
             ok = await provider.revoke(token="t", client_id="c", client_secret="s")
         assert ok is False

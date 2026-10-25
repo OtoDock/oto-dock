@@ -14,7 +14,9 @@ by a small pump because providers expose ``latest_interim`` as a polled
 property), ``interim_final`` (a finalized piece of the still-accumulating
 utterance, pushed by the provider's ``on_partial_final`` callback — the
 browser ACCUMULATES these and overlays the partial, the same pair the
-dictation composer uses), ``final`` (the dispatched utterance), ``state``
+dictation composer uses), ``replace`` (a language switch on the Automatic
+pick: the caption's committed pieces become the new stream's words),
+``final`` (the dispatched utterance), ``state``
 (``thinking`` = dispatch→first audio, ``speaking`` = audio actually
 playing, ``listening`` = mic-live reality — including between TTS segments
 and during silent tool phases).
@@ -27,15 +29,23 @@ import contextlib
 import logging
 import time
 
-import config
+from audio.providers.lid.rule import LEAN
 from audio.providers.vad.silero import SileroVad
-from pipeline.vad_serial import SerializedVad
 from audio.streaming.lang import base_lang
+
+import config
+from background import spawn
 from config_manager import ConfigManager, PhoneRoute, RouteSettings
 from fillers import filler_cache
 from pipeline.core import CallPipeline
-from pipeline.providers import build_stt, build_tts, build_turn_classifier, filler_key_for
+from pipeline.providers import (
+    build_stt,
+    build_tts,
+    build_turn_classifier,
+    filler_key_for,
+)
 from pipeline.state import CallState
+from pipeline.vad_serial import SerializedVad
 from transport.base import TransportError
 
 from .llm_client import DuplexLlmClient
@@ -68,6 +78,14 @@ class _DuplexCfg:
 
 class DuplexSession(CallPipeline):
     """A duplex conversation bound to one dial-back connection."""
+
+    # Live voice follows the identifier's lean (the person watches the
+    # caption, a wrong early switch costs nothing once corrected) and may
+    # switch again until final; what is heard changes at the turn's take or
+    # the final, never at a lean (pipeline/language.py).
+    _language_switch_at = LEAN
+    _language_lean_at_take = False
+    _heard_follows_switch = False
 
     # Deliberately does NOT call CallPipeline.__init__: that constructor is
     # route-resolution (call defaults, ambience, outbound) — this one wires
@@ -102,7 +120,14 @@ class DuplexSession(CallPipeline):
             backchannel_enabled=False,     # listening sounds are telephony UX
             thinking_filler_enabled=True,  # CLI first-token latency cover
         )
-        self.stt = build_stt(self.cfg, stt_provider)
+        def build_session_stt():
+            return build_stt(self.cfg, stt_provider)
+        # A person dictating in "Automatic": the speaker's language is read
+        # from the audio as on a route that detects.
+        if session_cfg.get("language_detect"):
+            self.stt = self._language_stt(build_session_stt, lang, self._rate_in)
+        else:
+            self.stt = build_session_stt()
         # Same serialized-VAD wrapper as the telephony pipeline (P2.2/F11).
         self.vad = SerializedVad(SileroVad(
             threshold=self.cfg.vad_threshold,
@@ -134,9 +159,7 @@ class DuplexSession(CallPipeline):
             self.cfg.smart_turn_audio_window_s * self._rate_in * config.SAMPLE_WIDTH
         )
         self.state = CallState()
-        # A person dictating in "Automatic": the speaker's language is
-        # identified on the first utterance, as on a route that detects.
-        self.state._language_locked = not bool(session_cfg.get("language_detect"))
+        self.state._language_locked = self._language_tracker is None
         # Absolute-schedule pacing with catch-up (R5): the browser player
         # buffers a jitter lead, so late frames must burst-refill it — the
         # telephony default (0 = re-anchor on any lateness) let event-loop
@@ -196,14 +219,14 @@ class DuplexSession(CallPipeline):
             ok = await self.stt.ensure_alive(self._locked_language, clear_queue=True)
             if not ok:
                 logger.warning(
-                    f"[{self.conn.peer_addr}] STT reconnect on unmute failed "
-                    f"— next utterances may be lost until re-open")
+                    "[%s] STT reconnect on unmute failed "
+                    "— next utterances may be lost until re-open", self.conn.peer_addr)
             else:
                 self.state._stt_active = True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # an STT provider raises whatever its SDK and socket do
             logger.warning(
-                f"[{self.conn.peer_addr}] STT health check on unmute "
-                f"failed: {e}")
+                "[%s] STT health check on unmute "
+                "failed: %s", self.conn.peer_addr, e)
 
     def _turn_busy(self) -> bool:
         # The duplex TYPED-turn lane must count as busy everywhere the VAD
@@ -231,12 +254,16 @@ class DuplexSession(CallPipeline):
             return
         self.state._last_activity = time.monotonic()
         if self._turn_busy():
+            self._note_turn_taken()
+            self.state._typed_input_at = time.monotonic()
             self.state._queued_speech.append(text)
             logger.info(
-                f"[{self.conn.peer_addr}] Release: draft queued behind the "
-                f"busy turn ({len(text)} chars)")
+                "[%s] Release: draft queued behind the "
+                "busy turn (%s chars)", self.conn.peer_addr, len(text))
             return
         self._append_turn_segment(text)
+        # A typed seed survives a language switch's rewrite of the turn.
+        self.state._turn_typed.append(text)
         self._cancel_turn_timer()
         self.state._turn_timer = asyncio.create_task(
             self._turn_timeout_handler(text))
@@ -248,8 +275,8 @@ class DuplexSession(CallPipeline):
         # seed that is already in _turn_segments (it would double-queue it).
         self.conn.send_event({"type": "interim_final", "text": text})
         logger.info(
-            f"[{self.conn.peer_addr}] Release: draft seeded as the pending "
-            f"turn ({len(text)} chars) — listening resumed")
+            "[%s] Release: draft seeded as the pending "
+            "turn (%s chars) — listening resumed", self.conn.peer_addr, len(text))
 
     async def _on_hold(self) -> None:
         """Click-to-edit: the composer took ownership of the pending
@@ -265,7 +292,11 @@ class DuplexSession(CallPipeline):
         self.state._turn_segments.clear()
         self.state._speech_audio_buf.clear()
         self.stt.clear_queue()
-        logger.info(f"[{self.conn.peer_addr}] Hold: composer owns the turn")
+        # The held words are the composer's now: the language streams move
+        # past them too (their drained text dropped with them), so a later
+        # switch never rewrites the turn with words from before the hold.
+        self._note_turn_taken()
+        logger.info("[%s] Hold: composer owns the turn", self.conn.peer_addr)
 
     async def _on_typed_utterance(self, text: str) -> None:
         """The edited composer text dispatched as a SPOKEN-mode turn — the
@@ -297,25 +328,34 @@ class DuplexSession(CallPipeline):
         if busy:
             if text in self.state._queued_speech:
                 logger.info(
-                    f"[{self.conn.peer_addr}] Typed utterance already "
-                    f"queued — skipping duplicate")
+                    "[%s] Typed utterance already "
+                    "queued — skipping duplicate", self.conn.peer_addr)
                 return
+            self._note_turn_taken()
+            self.state._typed_input_at = time.monotonic()
             self.state._queued_speech.append(text)
             logger.info(
-                f"[{self.conn.peer_addr}] Typed utterance queued (turn busy)")
+                "[%s] Typed utterance queued (turn busy)", self.conn.peer_addr)
             self._interrupt_for_queued_speech()
             return
         logger.info(
-            f"[{self.conn.peer_addr}] Typed utterance dispatching "
-            f"({len(text)} chars)")
+            "[%s] Typed utterance dispatching "
+            "(%s chars)", self.conn.peer_addr, len(text))
+        self._note_turn_taken()
         self._typed_turn = asyncio.create_task(self._process_utterance(text))
 
     async def _on_manual_barge_in(self) -> None:
-        if self.state._tts_playing:
+        task = self.state._tts_task
+        if (self.state._tts_playing or self.state._tts_idle
+                or (task is not None and not task.done())):
+            # Playing, idle after a flushed sentence, or a context open
+            # with nothing played yet: the tap cuts the segment and ends
+            # the context (its receiver waits for an end of input that
+            # would never come otherwise) and aborts the turn.
             await self._cancel_tts()
             self.state._stt_early_unmuted = False
         else:
-            # Tap while THINKING: no TTS to cut yet — flag the in-flight
+            # Tap while THINKING with no context open: flag the in-flight
             # utterance so the token loop unwinds and the abort path fires.
             # Harmless while idle-listening: the flag is reset at the next
             # dispatch. The proactive abort below unblocks a loop parked on
@@ -332,8 +372,8 @@ class DuplexSession(CallPipeline):
     async def run(self) -> None:
         """Duplex lifecycle: no greeting, no outbound — straight to listening."""
         self.state._running = True
-        logger.info(f"[{self.conn.peer_addr}] Duplex session started "
-                    f"(lang={self._locked_language})")
+        logger.info("[%s] Duplex session started "
+                    "(lang=%s)", self.conn.peer_addr, self._locked_language)
         try:
             # 24 kHz prewarm: duplex streams _rate_out, not the 8 kHz default
             # — without the hint the first turn pays the rebind connect.
@@ -345,8 +385,8 @@ class DuplexSession(CallPipeline):
                     backchannel_phrases=self.cfg.backchannel_phrases,
                     thinking_phrases=self.cfg.thinking_phrases,
                 )
-            except Exception as e:
-                logger.warning(f"[{self.conn.peer_addr}] Filler init failed: {e}")
+            except Exception as e:  # noqa: BLE001  # fillers are optional, the call runs without them
+                logger.warning("[%s] Filler init failed: %s", self.conn.peer_addr, e)
 
             # Built in the background, the Smart Turn load off the loop
             # (TurnMixin._turn_classifier waits for it, bounded).
@@ -358,9 +398,10 @@ class DuplexSession(CallPipeline):
                         sample_rate=self._rate_in, interim_results=True,
                     )
                     self.state._stt_active = True
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001  # an STT provider raises whatever its SDK and socket do
                     logger.warning(
-                        f"[{self.conn.peer_addr}] STT pre-connect failed: {e}")
+                        "[%s] STT pre-connect failed: %s",
+                        self.conn.peer_addr, e)
 
             # STT liveness guard (same as the telephony run() — this override
             # must start it itself): keepalive through send starvation +
@@ -380,11 +421,10 @@ class DuplexSession(CallPipeline):
                 with contextlib.suppress(asyncio.CancelledError):
                     await interim_task
         except TransportError as e:
-            logger.info(f"[{self.conn.peer_addr}] Duplex stream closed: {e}")
+            logger.info("[%s] Duplex stream closed: %s", self.conn.peer_addr, e)
         except Exception as e:
-            logger.error(
-                f"[{self.conn.peer_addr}] Duplex session error: {e}",
-                exc_info=True)
+            logger.exception(
+                "[%s] Duplex session error: %s", self.conn.peer_addr, e)
         finally:
             await self._cleanup()
 
@@ -434,7 +474,7 @@ class DuplexSession(CallPipeline):
         # echo), or a final arriving just after the turn dispatched. The
         # sweep gives every VAD-driven consumer time to take it; whatever
         # is still queued afterwards would otherwise never dispatch.
-        asyncio.create_task(self._sweep_orphan_final())
+        spawn(self._sweep_orphan_final(), name="sweep_orphan_final", owner="duplex")
 
     async def _sweep_orphan_final(self) -> None:
         """Dispatch provider finals no VAD speech cycle ever drained (see
@@ -458,8 +498,8 @@ class DuplexSession(CallPipeline):
             return
         if self._is_interim_fallback_dup(text):
             logger.info(
-                f"[{self.conn.peer_addr}] Orphan final duplicates the "
-                f"interim-dispatched tail — dropped: {text}")
+                "[%s] Orphan final duplicates the "
+                "interim-dispatched tail — dropped: %s", self.conn.peer_addr, text)
             return
         busy = (
             (self.state._utterance_task and not self.state._utterance_task.done())
@@ -469,20 +509,27 @@ class DuplexSession(CallPipeline):
             if text in self.state._queued_speech:
                 return
             logger.info(
-                f"[{self.conn.peer_addr}] Orphan STT final while turn busy "
-                f"— queuing: {text}")
+                "[%s] Orphan STT final while turn busy "
+                "— queuing: %s", self.conn.peer_addr, text)
+            self._note_turn_taken()
             self.state._queued_speech.append(text)
             self._interrupt_for_queued_speech()
             return
         logger.info(
-            f"[{self.conn.peer_addr}] Orphan STT final — dispatching "
-            f"through the turn machinery: {text}")
+            "[%s] Orphan STT final — dispatching "
+            "through the turn machinery: %s", self.conn.peer_addr, text)
         self._append_turn_segment(text)
         joined = " ".join(self.state._turn_segments)
         self._cancel_turn_timer()
         self.state._turn_timer = asyncio.create_task(
             self._turn_timeout_handler(joined)
         )
+
+    def _on_language_replace(self, text: str) -> None:
+        """The identifier moved the shown transcript to another language:
+        the caption's committed pieces are the new stream's words."""
+        if not self.conn.is_closed and not self.conn.is_muted:
+            self.conn.send_event({"type": "replace", "text": text})
 
     def _on_turn_dispatch(self, text: str) -> None:
         """Fires per REAL dispatched turn — including continuation/queued

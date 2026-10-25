@@ -11,8 +11,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from services.community import community_catalog
-from services.mcp import mcp_autoupdate as au
-from services.mcp import mcp_updater
+from services.mcp import mcp_autoupdate as au, mcp_updater
 
 NOW = datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)
 
@@ -160,7 +159,7 @@ class TestWaitingFields:
 def _npm_manifest(tmp_path, version="1.0.0", name="pkg-mcp"):
     d = tmp_path / name
     d.mkdir(exist_ok=True)
-    (d / "manifest.json").write_text('{"name": "%s"}' % name)
+    (d / "manifest.json").write_text(f'{{"name": "{name}"}}')
     return NS(name=name, category="community", version=version, mcp_dir=str(d),
               server=NS(runtime="node", source=f"npm:pkg@{version}", version_constraint="",
                         image=""))
@@ -378,6 +377,7 @@ async def test_a_failed_git_build_is_recorded_and_the_run_goes_on(monkeypatch):
 @pytest.mark.asyncio
 async def test_update_one_builds_a_git_source_for_the_job_only_at_a_catalog_commit(monkeypatch):
     from fastapi import HTTPException
+
     from services.community import community_installer
     m = NS(name="blender", category="community",
            server=NS(runtime="python", source="git+https://h/r.git@abc", image=""))
@@ -474,3 +474,25 @@ async def test_no_rebuild_offer_without_a_catalog_entry(one_npm_mcp, doc, monkey
     monkeypatch.setattr(community_catalog, "fetch_registry", _registry)
     doc["doc"] = _pypi_doc({"1.0.0": [{"upload_time_iso_8601": _ago(60)}]}, "1.0.0")
     assert "pkg-mcp" not in (await mcp_updater.detect_available_updates())["updates"]
+
+
+@pytest.mark.asyncio
+async def test_a_probe_cancelled_on_its_own_drops_only_its_mcp(tmp_path, one_npm_mcp, monkeypatch):
+    """One registry probe ending in its own cancellation (a CancelledError
+    is a BaseException, not an Exception) loses that MCP's offer and keeps
+    the others; the check itself completes."""
+    import asyncio
+    gone = _npm_manifest(tmp_path, name="gone-mcp")
+    gone.server.source = "npm:gone@1.0.0"
+    both = {one_npm_mcp.name: one_npm_mcp, gone.name: gone}
+    monkeypatch.setattr(mcp_updater.mcp_registry, "get_all_manifests", lambda: both)
+    monkeypatch.setattr(mcp_updater, "_utcnow", lambda: NOW)
+
+    async def _doc(registry, package):
+        if package == "gone":
+            raise asyncio.CancelledError
+        return _npm_doc({"1.0.0": _ago(60), "1.1.0": _ago(30)}, "1.1.0")
+    monkeypatch.setattr(mcp_updater, "_registry_doc", _doc)
+    updates = (await mcp_updater.detect_available_updates())["updates"]
+    assert updates["pkg-mcp"]["latest"] == "1.1.0"
+    assert "gone-mcp" not in updates

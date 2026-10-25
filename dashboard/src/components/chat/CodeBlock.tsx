@@ -1,4 +1,5 @@
 import { lazy, Suspense, useState, useCallback, type CSSProperties } from 'react'
+import { CODE_BODY_STYLE } from '../../lib/chat/codeStyle'
 
 // The highlighter (react-syntax-highlighter with every Prism grammar) loads
 // on the first fenced block a chat renders; a chat without code never loads
@@ -6,19 +7,12 @@ import { lazy, Suspense, useState, useCallback, type CSSProperties } from 'react
 // changes colours, never layout.
 const CodeHighlighter = lazy(() => import('./CodeHighlighter'))
 
-// Shared by the highlighter (its customStyle) and the fallback <pre>.
-export const CODE_BODY_STYLE: CSSProperties = {
-  margin: 0,
-  borderRadius: 0,
-  padding: '1rem',
-  fontSize: '0.8125rem',
-  lineHeight: '1.5',
-}
-
 // vscDarkPlus's <pre>: background, text colour, mono stack, scrolling.
 const FALLBACK_STYLE: CSSProperties = {
   ...CODE_BODY_STYLE,
+  // eslint-disable-next-line otodock/no-raw-palette -- the syntax theme's own colours
   background: '#1e1e1e',
+  // eslint-disable-next-line otodock/no-raw-palette -- the syntax theme's own colours
   color: '#d4d4d4',
   fontFamily: 'Menlo, Monaco, Consolas, "Andale Mono", "Ubuntu Mono", "Courier New", monospace',
   whiteSpace: 'pre',
@@ -44,20 +38,20 @@ export default function CodeBlock({ language, children, inline }: Props) {
   // Inline code
   if (inline) {
     return (
-      <code className="px-1.5 py-0.5 rounded-sm bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-200 text-[0.85em] font-mono border border-gray-200 dark:border-gray-700">
+      <code className="px-1.5 py-0.5 rounded-sm bg-surface-muted text-primary text-[0.85em] font-mono">
         {children}
       </code>
     )
   }
 
   return (
-    <div className="code-block-wrapper group/code relative rounded-lg overflow-hidden my-3">
+    <div className="code-block-wrapper group/code relative rounded-card overflow-hidden my-3 border border-code-border">
       {/* Header bar */}
-      <div className="flex items-center justify-between px-4 py-1.5 bg-[#2d2d2d] text-gray-400 text-xs">
+      <div className="flex items-center justify-between px-4 py-1.5 bg-code-bg border-b border-code-fg/10 text-code-fg/70 text-xs">
         <span className="font-mono">{language || 'text'}</span>
         <button
           onClick={handleCopy}
-          className="flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-gray-400 hover:text-white hover:bg-[#404040] transition-colors"
+          className="flex items-center gap-1.5 px-2 py-0.5 rounded-sm text-code-fg/70 hover:text-code-fg hover:bg-code-fg/10 transition-colors"
         >
           {copied ? (
             <>

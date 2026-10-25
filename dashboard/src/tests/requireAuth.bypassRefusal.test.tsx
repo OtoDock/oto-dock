@@ -16,7 +16,7 @@ vi.mock('@/hooks/useBuildWatch', () => ({ useBuildWatch: () => {} }))
 vi.mock('@/hooks/useOpenAppToast', () => ({ useOpenAppToast: () => null }))
 vi.mock('@/components/WakeDiagBadge', () => ({ default: () => null }))
 
-import { AuthProvider } from '@/contexts/AuthContext'
+import { AuthProvider } from '@/contexts/AuthProvider'
 import RequireAuth from '@/components/RequireAuth'
 
 const DETAIL = 'Too many sign-ins started; try again in a few minutes.'
@@ -56,7 +56,7 @@ describe('RequireAuth in bypass mode', () => {
       </AuthProvider>,
     )
     const shown = await screen.findByText(new RegExp(DETAIL.replace(/[.;]/g, '\\$&')))
-    expect(shown.textContent).toContain('(retry in 2 minutes)')
+    expect(shown.textContent).toContain('Try again in 2 minutes.')
     expect(screen.queryByText(/Redirecting to login/)).toBeNull()
     expect(screen.getByRole('button', { name: /try again/i })).toBeTruthy()
     const starts = fetchMock.mock.calls.filter(([u]) => String(u).startsWith('/auth/login'))

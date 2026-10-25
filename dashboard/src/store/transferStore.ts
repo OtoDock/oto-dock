@@ -17,8 +17,10 @@ import { create } from 'zustand'
 
 import type { ScopeKey } from '../components/workspace/sections'
 import { HEAD, isPersonal, headOf } from '../lib/layout/tree'
+import { type TransferMachineWire } from '../api/wireEvents'
 
-export type MachinePushState = 'queued' | 'active' | 'done' | 'failed'
+const PUSH_STATES = ['queued', 'active', 'done', 'failed'] as const
+export type MachinePushState = (typeof PUSH_STATES)[number]
 
 export interface TransferMachineRow {
   machineId: string
@@ -101,20 +103,32 @@ export function isTransferActive(t: TransferItem, now = Date.now()): boolean {
   return true // phase 2 with no terminal stamp yet (e.g. awaiting first event)
 }
 
-interface WsMachineRow {
-  machine_id: string
-  name?: string
-  state?: MachinePushState
-  bytes_sent?: number
+/** What the store reads of the `transfer_*` frames (api/wireEvents.ts). */
+interface TransferMsg {
+  transfer_id: string
+  agent_slug: string
+  rel_path: string
+  filename?: string
+  kind?: string
   bytes_total?: number
-  error?: string
+  machines?: TransferMachineWire[]
+  done?: boolean
 }
 
-function rowFromWs(m: WsMachineRow): TransferMachineRow {
+interface TransferMachineMsg {
+  transfer_id: string
+  machine_id: string
+  state?: string
+  error?: string
+  bytes_sent?: number
+  bytes_total?: number
+}
+
+function rowFromWs(m: TransferMachineWire): TransferMachineRow {
   return {
     machineId: m.machine_id,
     name: m.name || m.machine_id.slice(0, 8),
-    state: m.state || 'queued',
+    state: PUSH_STATES.find((s) => s === m.state) ?? 'queued',
     bytesSent: m.bytes_sent ?? 0,
     bytesTotal: m.bytes_total ?? 0,
     ...(m.error ? { error: m.error } : {}),
@@ -134,11 +148,11 @@ interface TransferStoreState {
     transferId: string; relPath: string; remotePush: boolean
   }) => void
 
-  applyStarted: (msg: any) => void
-  applyMachineState: (msg: any) => void
-  applyProgress: (msg: any) => void
-  applyDone: (msg: any) => void
-  applySnapshot: (msg: any) => void
+  applyStarted: (msg: TransferMsg) => void
+  applyMachineState: (msg: TransferMachineMsg) => void
+  applyProgress: (msg: TransferMachineMsg) => void
+  applyDone: (msg: { transfer_id: string; agent_slug?: string; ok?: boolean }) => void
+  applySnapshot: (msg: TransferMsg) => void
 
   /** Stop a workspace upload batch: its loop sees the abort and ends it. */
   cancelBatch: (batchId: string) => void
@@ -146,7 +160,7 @@ interface TransferStoreState {
   clearInFlight: () => void
 }
 
-export const useTransferStore = create<TransferStoreState>((set, get) => ({
+export const useTransferStore = create<TransferStoreState>((set) => ({
   byId: {},
 
   beginLocalUpload: ({ clientId, agent, targetDir, filename, bytesTotal, batchId }) =>
@@ -303,7 +317,7 @@ export const useTransferStore = create<TransferStoreState>((set, get) => ({
           byId: {
             ...s.byId,
             [msg.transfer_id]: {
-              id: msg.transfer_id, agent: msg.agent_slug, relPath: '', filename: '',
+              id: msg.transfer_id, agent: msg.agent_slug ?? '', relPath: '', filename: '',
               kind: 'upload', phase: 2, uploadSent: 0, uploadTotal: 0,
               uploadFailed: false, machines: {}, startedAt: now, lastEventAt: now,
               doneAt: now,

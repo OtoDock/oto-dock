@@ -11,16 +11,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import get_current_user, require_human, UserContext, require_user
 from api.auth.openai_oauth import limit_connect_start
+from auth import roles
+from auth.providers import UserContext, get_current_user, require_human, require_user
 from core.layers.cli import oauth as claude_oauth
 from services.engines import subscription_pool
 from storage.billing import subscription_status, subscription_store
-from auth import roles
 
 logger = logging.getLogger(__name__)
 # No route here takes an anonymous caller (auth.providers.require_user).
@@ -164,7 +165,7 @@ async def oauth_exchange(
             claude_oauth.exchange_code, code, meta["code_verifier"], state=req.state,
         )
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
 
     access_token = token_data.get("access_token")
     refresh_token = token_data.get("refresh_token")
@@ -327,21 +328,21 @@ async def oauth_exchange(
 
         await asyncio.to_thread(_apply_reconnect)
         sub = await asyncio.to_thread(subscription_store.get_subscription, sub_id)
-        logger.info(f"Updated existing OAuth subscription {sub_id[:8]} with fresh tokens")
+        logger.info("Updated existing OAuth subscription %s with fresh tokens", sub_id[:8])
         # The exchange rotated the grant OUTSIDE the rotation chokepoint —
         # push the fresh token into live bound sessions' credential files.
         # Their pre-exchange token may be revoked by this rotation, and
         # 401-recovery re-reads the same stale file forever without this.
         await asyncio.to_thread(subscription_pool.fan_out_current_token, sub_id)
     else:
-        logger.info(f"Created new OAuth subscription {sub['id'][:8]}")
+        logger.info("Created new OAuth subscription %s", cast("dict", sub)['id'][:8])
 
     # A freshly (re)connected account may be the replacement that sessions
     # stuck on a delisted/removed subscription are waiting for.
     subscription_pool.schedule_rebind("claude oauth connect")
     # The account's window bars show right after the connect.
     from services.engines import subscription_windows
-    subscription_windows.schedule_poll(str(sub.get("id") or ""))
+    subscription_windows.schedule_poll(str(cast("dict", sub).get("id") or ""))
     return {
         "subscription": sub,
         "subscription_type": subscription_type,

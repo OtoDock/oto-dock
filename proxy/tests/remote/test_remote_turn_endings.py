@@ -280,6 +280,7 @@ async def test_silence_past_the_ceiling_ends_the_remote_turn_silent(monkeypatch)
 @pytest.mark.asyncio
 async def test_an_open_tool_keeps_the_silent_remote_turn(monkeypatch):
     import asyncio as _aio
+
     import config
     from core.layers.cli import settle as settle_mod
     monkeypatch.setattr(config, "TURN_SILENCE_S", 0.2)
@@ -318,6 +319,7 @@ async def test_a_refused_send_is_the_lost_ending():
 @pytest.mark.asyncio
 async def test_the_reconnect_grace_holds_the_silence_ceiling(monkeypatch):
     import asyncio as _aio
+
     import config
     from core.layers.cli import settle as settle_mod
     monkeypatch.setattr(config, "TURN_SILENCE_S", 0.2)
@@ -339,6 +341,7 @@ async def test_the_reconnect_grace_holds_the_silence_ceiling(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_remote_task_turn_keeps_its_silence_to_the_turn_ceiling(monkeypatch):
     import asyncio as _aio
+
     import config
     from core.layers.cli import settle as settle_mod
     monkeypatch.setattr(config, "TURN_SILENCE_S", 0.2)
@@ -360,6 +363,7 @@ async def test_a_remote_task_turn_keeps_its_silence_to_the_turn_ceiling(monkeypa
 @pytest.mark.asyncio
 async def test_a_remote_steer_neither_restarts_the_silence_nor_lands_past_it(monkeypatch):
     import time as _time
+
     import config
     monkeypatch.setattr(config, "TURN_SILENCE_S", 60)
     layer, info = _layer_and_info()

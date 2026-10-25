@@ -228,8 +228,13 @@ async def test_a_results_pictures_and_blobs_ride_beside_its_text():
     """``call_tool_blocks`` keeps an MCP result's image blocks and embedded
     resources (MCP JSON) for the result-files service; ``call_tool`` still
     answers the text alone, the picture as ``[binary data: …]``."""
-    from mcp.types import (BlobResourceContents, CallToolResult, EmbeddedResource,
-                           ImageContent, TextContent)
+    from mcp.types import (
+        BlobResourceContents,
+        CallToolResult,
+        EmbeddedResource,
+        ImageContent,
+        TextContent,
+    )
 
     class _Pictures:
         async def call_tool(self, name, arguments):
@@ -255,8 +260,8 @@ async def test_a_results_pictures_and_blobs_ride_beside_its_text():
 async def test_stdio_servers_start_below_the_proxys_priority(monkeypatch):
     """A Direct-LLM session's stdio MCPs run at the session priority,
     like every session process, so a busy MCP never starves the proxy."""
-    from core.sandbox import pty_relay, env_builder
     from core.credentials import mcp_broker
+    from core.sandbox import env_builder, pty_relay
     captured = {}
     streams_cm = _RecordingCM((object(), object()))
     session_cm = _RecordingCM(_FakeSession())
@@ -324,3 +329,140 @@ async def test_prebuilt_bundles_keep_the_builder_identity_files(monkeypatch, tmp
     await mgr._start_impl()
     [bundles] = provisioned
     assert bundles["gws"].env[cf.CREDENTIAL_FILES_ENV] == "OWNER-SCOPE"
+
+
+@pytest.mark.asyncio
+async def test_the_config_is_built_off_the_loop_one_build_at_a_time_per_identity(monkeypatch, tmp_path):
+    """The build, the token delivery and the read-back run in a worker
+    thread (no loop runs there, so an installation token can be minted),
+    one build at a time per build identity (two builds of one session id
+    serialize, another session's build runs beside them), and the lock map
+    is empty once every build is done."""
+    import threading
+    import time
+
+    from core.credentials import credential_files as cf, mcp_broker
+    monkeypatch.setattr(cf, "token_file_env", lambda agent, **kw: {})
+    monkeypatch.setattr(mcp_broker, "provision", lambda sid, bundles: None)
+    builds: list[tuple[str, int, bool, float, float]] = []
+
+    def _build(agent, user_sub, **kw):
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:
+            on_loop = False
+        t0 = time.monotonic()
+        time.sleep(0.3)
+        builds.append((kw["session_id"], threading.get_ident(), on_loop, t0, time.monotonic()))
+        return tmp_path / "absent.json", None, None, {}, None
+
+    monkeypatch.setattr("services.mcp.mcp_registry.build_session_mcp_config", _build)
+    first = mcpmod.AgentMCPManager("ag", session_id="s-a")
+    again = mcpmod.AgentMCPManager("ag", session_id="s-a")
+    other = mcpmod.AgentMCPManager("ag", session_id="s-b")
+    await asyncio.gather(first._start_impl(), again._start_impl(), other._start_impl())
+    assert len(builds) == 3
+    assert all(not on_loop and tid != threading.get_ident() for _, tid, on_loop, _, _ in builds)
+    same = sorted((t0, t1) for sid, _, _, t0, t1 in builds if sid == "s-a")
+    assert same[1][0] >= same[0][1]
+    [(other_start, _)] = [(t0, t1) for sid, _, _, t0, t1 in builds if sid == "s-b"]
+    assert other_start < same[0][1]
+    assert mcpmod._build_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_the_pool_forgets_a_manager_whose_start_failed(monkeypatch):
+    """A start that raises leaves no manager under the session id (the
+    next warm builds afresh) and the half-started manager is closed."""
+    pool = mcpmod.MCPPool()
+    closed: list[str] = []
+
+    async def _boom(self):
+        raise RuntimeError("no build")
+
+    async def _close(self):
+        closed.append(self.session_id)
+
+    monkeypatch.setattr(mcpmod.AgentMCPManager, "start", _boom)
+    monkeypatch.setattr(mcpmod.AgentMCPManager, "close", _close)
+    with pytest.raises(RuntimeError):
+        await pool.get_or_create("s-fail", "ag")
+    assert "s-fail" not in pool._managers and closed == ["s-fail"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_caller_during_a_start_shares_its_outcome(monkeypatch):
+    """Two callers for one session id while the first start runs: both get
+    the one started manager (one start), or both get the start's failure
+    and the pool is empty (nobody is handed a manager that was closed)."""
+    pool = mcpmod.MCPPool()
+    starts: list[str] = []
+    closed: list[str] = []
+    outcome = {"raise": True}
+
+    async def _slow_start(self):
+        starts.append(self.session_id)
+        await asyncio.sleep(0.05)
+        if outcome["raise"]:
+            raise RuntimeError("no build")
+
+    async def _close(self):
+        closed.append(self.session_id)
+
+    monkeypatch.setattr(mcpmod.AgentMCPManager, "start", _slow_start)
+    monkeypatch.setattr(mcpmod.AgentMCPManager, "close", _close)
+    results = await asyncio.gather(
+        pool.get_or_create("s-race", "ag"), pool.get_or_create("s-race", "ag"),
+        return_exceptions=True,
+    )
+    assert all(isinstance(r, RuntimeError) for r in results), results
+    assert "s-race" not in pool._managers and closed == ["s-race"] and starts == ["s-race"]
+
+    outcome["raise"] = False
+    first, second = await asyncio.gather(
+        pool.get_or_create("s-ok", "ag"), pool.get_or_create("s-ok", "ag"),
+    )
+    assert first is second and starts == ["s-race", "s-ok"]
+    assert pool._managers["s-ok"] is first and first.started.done()
+
+
+@pytest.mark.asyncio
+async def test_the_build_judges_the_audience_with_the_persons_role_and_scope(monkeypatch, tmp_path):
+    """A manifest's ``audience`` gates the Direct engine as it gates the
+    CLI engines: a viewer's user-scope session never starts an
+    editor-audience MCP, an editor's does, an agent-scope session is the
+    agent acting as itself, and a build that names no person filters
+    nothing (the builder's own rule, ``mcp_registry.audience_refusal``)."""
+    from core.credentials import credential_files as cf, mcp_broker
+    from tests.mcp.test_mcp_broker_activation import _FakeManifest, _stub_assembly
+
+    plain, gated = _FakeManifest("notes"), _FakeManifest("hosts")
+    gated.audience = "editor"
+    _stub_assembly(monkeypatch, [plain, gated], env_by_mcp={}, tmp_path=tmp_path)
+    monkeypatch.setattr(cf, "token_file_env", lambda agent, **kw: {})
+    monkeypatch.setattr(mcp_broker, "provision", lambda sid, bundles: None)
+
+    class _FakeConn:
+        def __init__(self, name, config, **kw):
+            self.name = name
+            self.config = config
+            self.tools = []
+            self.dead = False
+
+        async def start(self):
+            pass
+
+    monkeypatch.setattr(mcpmod, "MCPServerConnection", _FakeConn)
+
+    async def servers_for(role: str, scope: str, sid: str) -> set[str]:
+        mgr = mcpmod.AgentMCPManager("ag", session_id=sid, user_role=role, scope=scope)
+        await mgr._start_impl()
+        return set(mgr.servers)
+
+    assert await servers_for("viewer", "user", "s-viewer") == {"notes"}
+    assert await servers_for("contributor", "user", "s-contrib") == {"notes"}
+    assert await servers_for("editor", "user", "s-editor") == {"notes", "hosts"}
+    assert await servers_for("admin", "user", "s-admin") == {"notes", "hosts"}
+    assert await servers_for("viewer", "agent", "s-shared") == {"notes", "hosts"}
+    assert await servers_for("", "user", "s-nobody") == {"notes", "hosts"}

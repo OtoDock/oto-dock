@@ -177,6 +177,11 @@ def test_app_env_carries_only_what_the_server_needs(agent_tree):
     assert env["OTODOCK_PREVIEW"] == "1" and env["HOME"] == "/tmp"
     assert "OTODOCK_PREVIEW" not in app_sandbox.build_env(row, "t", "p")
     assert not any(k in env for k in ("JWT_SECRET", "PROXY_API_KEY", "DATABASE_URL"))
+    # Production mode, and an env secret cannot switch it back: the runtime's
+    # names win the merge (the validator refuses the declaration anyway).
+    assert env["NODE_ENV"] == "production"
+    live = app_sandbox.build_env(row, "t", "p", secrets={"NODE_ENV": "development", "SMTP_PASSWORD": "x"})
+    assert live["NODE_ENV"] == "production" and live["SMTP_PASSWORD"] == "x"
 
 
 def test_start_refuses_without_bun_or_approval(agent_tree, tmp_path, monkeypatch):
@@ -342,7 +347,7 @@ def _host_ip() -> str:
         out = subprocess.run(["ip", "-o", "route", "get", "1.1.1.1"],
                              capture_output=True, text=True, timeout=5).stdout.split()
         return out[out.index("src") + 1] if "src" in out else ""
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return ""
 
 

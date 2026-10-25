@@ -2,10 +2,11 @@
 // server for an app that faces the public through a link. Visitors register
 // and log in (the host keeps the login: the session token rides INSIDE the
 // verified claim, never in a header the page sets), pick a slot, and pay
-// through a Stripe Checkout Session the platform signs on the way out — the
+// through a Stripe Checkout Session the platform signs on the way out, so the
 // key never enters this sandbox. Stripe's event lands on /_handler/payment
 // through the app's inbound hook, already verified; the owner is told on
-// the app's own identity. The owner (an editor or above on the dashboard)
+// the app's own identity. When the person makes the Stripe webhook, tell them
+// to send checkout.session.completed and checkout.session.expired. The owner (an editor or above on the dashboard)
 // sets the service, the price and the hours from the same page and sees
 // every booking. Listen on 0.0.0.0:$PORT, answer GET /_health, write only
 // under $OTODOCK_DATA_DIR.
@@ -44,7 +45,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS bookings (
   paid_at TEXT NOT NULL DEFAULT ''
 )`);
 // A handler fire is retried with the SAME delivery id, so remember the ones
-// already done (APPS.md "Handlers").
+// already done (the app-authoring skill, "Handlers").
 db.exec(`CREATE TABLE IF NOT EXISTS handled (id TEXT PRIMARY KEY, at TEXT NOT NULL)`);
 
 // ── settings the owner edits from the page ─────────────────────────────────
@@ -74,26 +75,31 @@ function settings(): Record<string, string> {
 function zoneOk(tz: string): boolean {
   try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); return true; } catch { return false; }
 }
-// Each key checked on its own; a bad one is refused by name.
+// Each key checked on its own; a bad one is refused in words.
+const NUMBER_WORDS: Record<string, string> = {
+  slot_minutes: "Write the minutes per booking as a number.",
+  hold_minutes: "Write the minutes to hold a booking as a number.",
+  days_ahead: "Write the days ahead as a number.",
+};
 function saveSettings(body: Record<string, unknown>): string | null {
   const next: Record<string, string> = {};
   for (const k of Object.keys(DEFAULTS)) {
     if (!(k in body)) continue;
     const v = String(body[k] ?? "").trim();
-    if (k === "service_name" && (!v || v.length > 120)) return "service name: 1 to 120 characters";
-    if (k === "price_cents" && !/^\d{1,7}$/.test(v)) return "price: whole minor units (1250 for 12.50), at most 7 digits";
-    if (k === "currency" && !/^[a-z]{3}$/i.test(v)) return "currency: a three-letter code";
-    if ((k === "slot_minutes" || k === "hold_minutes" || k === "days_ahead") && !/^\d{1,3}$/.test(v)) return `${k}: a number`;
-    if (k === "slot_minutes" && (Number(v) < 5 || Number(v) > 480)) return "slot length: 5 to 480 minutes";
-    if (k === "hold_minutes" && (Number(v) < 10 || Number(v) > 720)) return "hold: 10 to 720 minutes";
-    if (k === "days_ahead" && (Number(v) < 1 || Number(v) > 90)) return "days ahead: 1 to 90";
-    if ((k === "open_from" || k === "open_to") && !/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) return `${k}: HH:MM`;
-    if (k === "weekdays" && !/^[1-7](,[1-7]){0,6}$/.test(v)) return "weekdays: ISO numbers, 1 (Monday) to 7 (Sunday)";
-    if (k === "timezone" && !zoneOk(v)) return "timezone: an IANA name such as Europe/Athens";
+    if (k === "service_name" && (!v || v.length > 120)) return "Write a service name of up to 120 characters.";
+    if (k === "price_cents" && !/^\d{1,7}$/.test(v)) return "Write the price in cents, like 1250 for 12.50.";
+    if (k === "currency" && !/^[a-z]{3}$/i.test(v)) return "Write the currency as three letters, like EUR.";
+    if ((k === "slot_minutes" || k === "hold_minutes" || k === "days_ahead") && !/^\d{1,3}$/.test(v)) return NUMBER_WORDS[k];
+    if (k === "slot_minutes" && (Number(v) < 5 || Number(v) > 480)) return "A booking lasts 5 to 480 minutes.";
+    if (k === "hold_minutes" && (Number(v) < 10 || Number(v) > 720)) return "Hold an unpaid booking for 10 to 720 minutes.";
+    if (k === "days_ahead" && (Number(v) < 1 || Number(v) > 90)) return "Show 1 to 90 days ahead.";
+    if ((k === "open_from" || k === "open_to") && !/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) return "Write the time as hours and minutes, like 09:00.";
+    if (k === "weekdays" && !/^[1-7](,[1-7]){0,6}$/.test(v)) return "Write the open days as numbers, from 1 for Monday to 7 for Sunday.";
+    if (k === "timezone" && !zoneOk(v)) return "Write the time zone as a region and a city, like Europe/Athens.";
     next[k] = k === "currency" ? v.toLowerCase() : v;
   }
   const from = next.open_from ?? setting("open_from"), to = next.open_to ?? setting("open_to");
-  if (from >= to) return "opening hours: from must be before to";
+  if (from >= to) return "The opening time must come before the closing time.";
   for (const [k, v] of Object.entries(next)) {
     db.run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [k, v]);
   }
@@ -173,14 +179,55 @@ function shapeBooking(b: any, owner: boolean) {
 }
 
 // ── who is calling ─────────────────────────────────────────────────────────
-// The proxy signs the claim; only the proxy can reach this port, so decoding
-// the payload is enough (verify with OTODOCK_APP_PUBLIC_KEY if you want to).
-type Claim = { principal?: string; role?: string; external?: boolean; session?: string; username?: string; handler?: string; delivery?: string; kind?: string };
-function claimOf(req: Request): Claim {
+// The proxy signs every claim with this app's own Ed25519 key and hands the
+// public half in OTODOCK_APP_PUBLIC_KEY. Only the proxy reaches this port,
+// so decoding alone would do. Verifying keeps the rule true wherever this
+// code is copied (the app-authoring skill, "Verify the claim").
+type Claim = {
+  principal?: string; role?: string; external?: boolean; session?: string; username?: string;
+  handler?: string; delivery?: string; purpose?: string; aud?: string; exp?: number;
+};
+const b64url = (s: string) => Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+let appKey: Promise<CryptoKey | null> | null = null;
+function publicKey(): Promise<CryptoKey | null> {
+  appKey ??= (async () => {
+    const raw = process.env.OTODOCK_APP_PUBLIC_KEY || "";
+    if (!raw) return null;
+    try {
+      return await crypto.subtle.importKey("raw", b64url(raw), { name: "Ed25519" }, false, ["verify"]);
+    } catch {
+      return null;
+    }
+  })();
+  return appKey;
+}
+// A viewer and a link visitor carry purpose app_viewer. The agent's own
+// sessions and handler wakes carry app_caller. No claim, or one that fails,
+// is an empty object: it is no customer and no owner.
+async function claimOf(req: Request): Promise<Claim> {
+  const [head, body, sig] = (req.headers.get("x-otodock-viewer") || "").split(".");
+  const key = await publicKey();
+  if (!head || !body || !sig || !key) return {};
   try {
-    const part = (req.headers.get("x-otodock-viewer") || "").split(".")[1] || "";
-    return JSON.parse(Buffer.from(part.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
-  } catch { return {}; }
+    const ok = await crypto.subtle.verify("Ed25519", key, b64url(sig), new TextEncoder().encode(`${head}.${body}`));
+    if (!ok) return {};
+    const c = JSON.parse(b64url(body).toString("utf8")) as Claim;
+    if (c.aud !== `app:${appId}`) return {};
+    if (c.purpose !== "app_viewer" && c.purpose !== "app_caller") return {};
+    if (!c.exp || c.exp * 1000 < Date.now()) return {};
+    return c;
+  } catch {
+    return {};
+  }
+}
+// Roles by rank. Any other word (agent, app, none) ranks lowest, below viewer.
+const RANK = new Map([["viewer", 1], ["contributor", 2], ["editor", 3], ["manager", 4], ["admin", 5]]);
+const rankOf = (role?: string) => RANK.get(String(role ?? "")) ?? 0;
+// A JSON body as a plain object. No body, bad JSON, null or an array is an
+// empty object, so a field check answers it in words.
+async function readBody(req: Request): Promise<Record<string, any>> {
+  const body = await req.json().catch(() => null);
+  return body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, any>) : {};
 }
 // A customer is a link visitor whose claim carries the session the page set
 // through the host (never a body field, never a header the page adds).
@@ -194,7 +241,7 @@ function customerOf(claim: Claim) {
 // above (the owner of a personal app is its manager). A link visitor never.
 function isOwner(claim: Claim, basis: string): boolean {
   if (claim.external || !(basis === "viewer" || basis === "agent")) return false;
-  return ["editor", "manager", "admin"].includes(String(claim.role || ""));
+  return rankOf(claim.role) >= rankOf("editor");
 }
 
 const SESSION_DAYS = 30;   // keep level with external.session_days in app.json
@@ -206,7 +253,8 @@ function newSession(accountId: number): string {
   return token;
 }
 // Wrong passwords pace per email, on top of the platform's per-visitor and
-// per-address limits.
+// per-address limits. Registering with a known email says the account
+// exists: a booking page usually wants that, so the visitor signs in.
 const failures = new Map<string, { n: number; until: number }>();
 function failedTooOften(email: string): boolean {
   const f = failures.get(email);
@@ -243,7 +291,7 @@ async function createCheckout(booking: any, origin: string, returnPath: string):
   form.set("mode", "payment");
   form.set("line_items[0][price_data][currency]", s.currency);
   form.set("line_items[0][price_data][unit_amount]", s.price_cents);
-  form.set("line_items[0][price_data][product_data][name]", `${s.service_name} — ${label(booking.starts_at, s.timezone)}`);
+  form.set("line_items[0][price_data][product_data][name]", `${s.service_name}, ${label(booking.starts_at, s.timezone)}`);
   form.set("line_items[0][quantity]", "1");
   form.set("client_reference_id", String(booking.id));
   form.set("metadata[booking_id]", String(booking.id));
@@ -260,12 +308,12 @@ async function createCheckout(booking: any, origin: string, returnPath: string):
     const doc = (await r.json().catch(() => ({}))) as any;
     if (!r.ok || !doc.url) {
       console.log(`checkout not created: ${r.status} ${String(doc?.error?.message || "").slice(0, 160)}`);
-      return { error: r.status === 401 ? "payments are not set up on this app yet" : "the payment page could not be created" };
+      return { error: r.status === 401 ? "Payments are not ready yet. Please try again later." : "Could not open the payment page. Try again in a moment." };
     }
     return { url: String(doc.url), id: String(doc.id) };
   } catch (e) {
     console.log("checkout not created: " + String(e).slice(0, 120));
-    return { error: "the payment page could not be created" };
+    return { error: "Could not open the payment page. Try again in a moment." };
   }
 }
 
@@ -289,7 +337,7 @@ Bun.serve({
     if (url.pathname === "/_health") return new Response("ok");
     if (url.pathname === "/live") {
       if (server.upgrade(req)) return undefined as unknown as Response;
-      return new Response("expected a websocket", { status: 400 });
+      return new Response("Open this page from the app.", { status: 400 });
     }
 
     // The platform wakes a declared handler here and nothing else can. The
@@ -297,9 +345,9 @@ Bun.serve({
     // already verified with the signing secret the platform holds.
     if (url.pathname.startsWith("/_handler/")) {
       const name = url.pathname.slice("/_handler/".length);
-      const body = (await req.json().catch(() => ({}))) as any;
-      const delivery = req.headers.get("x-otodock-delivery-id") || body.delivery_id || "";
-      const claim = claimOf(req);
+      const body = await readBody(req);
+      const delivery = req.headers.get("x-otodock-delivery-id") || String(body.delivery_id || "");
+      const claim = await claimOf(req);
       if (claim.principal !== "platform" || claim.handler !== name || claim.delivery !== delivery) {
         return json({ error: "not a platform claim for this handler" }, 400);
       }
@@ -327,7 +375,7 @@ Bun.serve({
     }
 
     const basis = req.headers.get("x-otodock-basis") || "viewer";
-    const claim = claimOf(req);
+    const claim = await claimOf(req);
     const me = customerOf(claim);
     const owner = isOwner(claim, basis);
     const s = settings();
@@ -344,26 +392,26 @@ Bun.serve({
     // Accounts: register (behind the bot check the manifest asks for on
     // /register), log in, log out. The page then hands the token to the host.
     if (req.method === "POST" && url.pathname === "/register") {
-      if (!claim.external) return json({ error: "customers register from the public link" }, 403);
-      const body = (await req.json().catch(() => ({}))) as any;
+      if (!claim.external) return json({ error: "Sign up from the public booking page." }, 403);
+      const body = await readBody(req);
       const email = String(body.email || "").trim().toLowerCase(), name = String(body.name || "").trim().slice(0, 80);
       const password = String(body.password || "");
-      if (!EMAIL_RE.test(email)) return json({ error: "a valid email is required" }, 400);
-      if (!name) return json({ error: "a name is required" }, 400);
-      if (password.length < 8 || password.length > 200) return json({ error: "a password of at least 8 characters" }, 400);
-      if (db.query("SELECT id FROM accounts WHERE email = ?").get(email)) return json({ error: "an account with this email exists — log in" }, 409);
+      if (!EMAIL_RE.test(email)) return json({ error: "Enter a valid email address." }, 400);
+      if (!name) return json({ error: "Enter your name." }, 400);
+      if (password.length < 8 || password.length > 200) return json({ error: "Use a password of 8 characters or more." }, 400);
+      if (db.query("SELECT id FROM accounts WHERE email = ?").get(email)) return json({ error: "This email already has an account. Sign in instead." }, 409);
       const hash = await Bun.password.hash(password);
       const r = db.run("INSERT INTO accounts (email, name, password_hash, created_at) VALUES (?, ?, ?, ?)", [email, name, hash, new Date().toISOString()]);
       return json({ token: newSession(Number(r.lastInsertRowid)), me: { name, email } });
     }
     if (req.method === "POST" && url.pathname === "/login") {
-      if (!claim.external) return json({ error: "customers log in from the public link" }, 403);
-      const body = (await req.json().catch(() => ({}))) as any;
+      if (!claim.external) return json({ error: "Sign in from the public booking page." }, 403);
+      const body = await readBody(req);
       const email = String(body.email || "").trim().toLowerCase(), password = String(body.password || "");
-      if (failedTooOften(email)) return json({ error: "too many attempts — try again in a while" }, 429);
+      if (failedTooOften(email)) return json({ error: "Too many tries. Wait 15 minutes and try again." }, 429);
       const acc = db.query("SELECT id, name, email, password_hash FROM accounts WHERE email = ?").get(email) as any;
       const ok = acc ? await Bun.password.verify(password, acc.password_hash) : false;
-      if (!ok) { noteFailure(email); return json({ error: "wrong email or password" }, 401); }
+      if (!ok) { noteFailure(email); return json({ error: "Wrong email or password." }, 401); }
       failures.delete(email);
       return json({ token: newSession(acc.id), me: { name: acc.name, email: acc.email } });
     }
@@ -380,11 +428,11 @@ Bun.serve({
       return json({ bookings: rows.map((b) => shapeBooking(b, false)) });
     }
     if (req.method === "POST" && url.pathname === "/bookings") {
-      if (!me) return json({ error: "log in to book" }, 401);
-      const body = (await req.json().catch(() => ({}))) as any;
+      if (!me) return json({ error: "Sign in to book." }, 401);
+      const body = await readBody(req);
       const at = String(body.starts_at || "");
-      if (!schedule().some((x) => x.starts_at === at)) return json({ error: "that slot is not offered" }, 400);
-      if (taken().has(at)) return json({ error: "that slot was just taken" }, 409);
+      if (!schedule().some((x) => x.starts_at === at)) return json({ error: "That time is not open. Pick another one." }, 400);
+      if (taken().has(at)) return json({ error: "Someone just took that time. Pick another one." }, 409);
       const status = service.price_cents > 0 ? "held" : "confirmed";
       const r = db.run("INSERT INTO bookings (account_id, starts_at, status, created_at, paid_at) VALUES (?, ?, ?, ?, ?)",
         [me.id, at, status, new Date().toISOString(), status === "confirmed" ? new Date().toISOString() : ""]);
@@ -398,13 +446,13 @@ Bun.serve({
     // back to the LINK (the page tells us its path; the origin is the
     // platform's own, from the forwarded headers) with ?paid=<id>.
     if (req.method === "POST" && url.pathname === "/checkout") {
-      if (!me) return json({ error: "log in to book" }, 401);
-      const body = (await req.json().catch(() => ({}))) as any;
+      if (!me) return json({ error: "Sign in to book." }, 401);
+      const body = await readBody(req);
       const b = bookingRow(Number(body.booking_id || 0));
-      if (!b || b.account_id !== me.id) return json({ error: "no such booking" }, 404);
-      if (b.status !== "held") return json({ error: `this booking is ${b.status}` }, 409);
+      if (!b || b.account_id !== me.id) return json({ error: "We could not find that booking." }, 404);
+      if (b.status !== "held") return json({ error: "This booking is already paid or cancelled." }, 409);
       const returnPath = String(body.return_path || "");
-      if (!/^\/s\/[A-Za-z0-9_-]{1,200}$/.test(returnPath)) return json({ error: "payments are made from the public link" }, 400);
+      if (!/^\/s\/[A-Za-z0-9_-]{1,200}$/.test(returnPath)) return json({ error: "Pay from the public booking page." }, 400);
       const origin = `${req.headers.get("x-forwarded-proto") || "https"}://${req.headers.get("x-forwarded-host") || ""}`;
       const out = await createCheckout(b, origin, returnPath);
       if ("error" in out) return json(out, 502);
@@ -414,10 +462,10 @@ Bun.serve({
 
     // The owner's view.
     if (url.pathname.startsWith("/owner/")) {
-      if (!owner) return json({ error: "the owner's view is for editors and managers on the dashboard" }, 403);
+      if (!owner) return json({ error: "Only editors and managers can open the owner's view." }, 403);
       if (req.method === "GET" && url.pathname === "/owner/settings") return json({ settings: s });
       if (req.method === "POST" && url.pathname === "/owner/settings") {
-        const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+        const body = await readBody(req);
         const err = saveSettings(body);
         if (err) return json({ error: err }, 400);
         changed();
@@ -432,12 +480,17 @@ Bun.serve({
       const cancel = url.pathname.match(/^\/owner\/bookings\/(\d+)\/cancel$/);
       if (req.method === "POST" && cancel) {
         const r = db.run("UPDATE bookings SET status = 'cancelled' WHERE id = ? AND status <> 'cancelled'", [Number(cancel[1])]);
-        if (!r.changes) return json({ error: "no such booking" }, 404);
+        if (!r.changes) return json({ error: "We could not find that booking." }, 404);
         changed();
         return json({ ok: true });
       }
     }
     return json({ error: "not found" }, 404);
+  },
+  // An uncaught error: one line for the log, plain words for the caller.
+  error(err) {
+    console.log("request failed: " + String(err).slice(0, 300));
+    return json({ error: "Something went wrong. Try again in a moment." }, 500);
   },
   websocket: {
     open(ws) { sockets.add(ws); },

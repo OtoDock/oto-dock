@@ -9,6 +9,7 @@ Does not spawn a real satellite or CLI — uses module-level patching to
 keep tests fast and deterministic.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -231,10 +232,18 @@ async def test_mcp_sync_invokes_plan_cb(monkeypatch):
         "services.mcp.mcp_registry.get_manifest",
         lambda name: fake_manifest if name == "file-tools" else None,
     )
-    monkeypatch.setattr(
-        "services.mcp.mcp_tarball.build_tarball",
-        lambda name: fake_tarball,
-    )
+    built_on_loop: list[bool] = []
+
+    def _build(name):
+        # The walk and the gzip run off the loop (over a second at a start).
+        try:
+            asyncio.get_running_loop()
+            built_on_loop.append(True)
+        except RuntimeError:
+            built_on_loop.append(False)
+        return fake_tarball
+
+    monkeypatch.setattr("services.mcp.mcp_tarball.build_tarball", _build)
     monkeypatch.setattr(
         "core.remote.satellite_connection.get_connection_manager",
         lambda: fake_cm,
@@ -252,6 +261,7 @@ async def test_mcp_sync_invokes_plan_cb(monkeypatch):
         "machine-1", "session-1", ["file-tools"], plan_cb=_plan_cb,
     )
 
+    assert built_on_loop == [False]
     assert len(plan_events) == 1
     assert plan_events[0]["mcps_to_install"] == ["file-tools"]
     assert plan_events[0]["mcps_to_update"] == []
@@ -636,9 +646,8 @@ _PROMPT = "\n".join([
 
 
 def _fold(adapter_cls, payload, reasons, monkeypatch):
-    import config
     bodies = {"music-gen-mcp": ["## Music\nCall generate_music."]}
-    monkeypatch.setattr(config, "_always_skill_bodies", lambda name: bodies.get(name, []))
+    monkeypatch.setattr("configuration.prompts._always_skill_bodies", lambda name: bodies.get(name, []))
     return adapter_cls.with_unavailable_mcps(adapter_cls, payload, reasons)
 
 
@@ -667,11 +676,11 @@ def test_an_excluded_mcp_leaves_the_prompt_catalog_for_unavailable(monkeypatch):
 
 
 def test_the_fold_joins_an_existing_unavailable_block(monkeypatch):
-    import config
+    from configuration import prompts
     from core.layers.codex.remote import CodexRemoteAdapter
     prompt = _PROMPT + "\n".join([
-        "", config._UNAVAILABLE_HEAD, config._unavailable_row("ads-mcp", "Excluded in task mode"),
-        config._UNAVAILABLE_TAIL, "\n## Permission context",
+        "", prompts._UNAVAILABLE_HEAD, prompts._unavailable_row("ads-mcp", "Excluded in task mode"),
+        prompts._UNAVAILABLE_TAIL, "\n## Permission context",
     ])
     payload = {"system_prompt": prompt, "agents_md_content": prompt}
     out = _fold(CodexRemoteAdapter, payload, {"music-gen-mcp": "could not be installed"}, monkeypatch)
@@ -720,6 +729,7 @@ def _platform(monkeypatch, folder: _McpFolder, shipped: dict[str, str]):
     """The platform ships ``shipped`` (name -> category); the connection
     manager talks to ``folder``."""
     from types import SimpleNamespace
+
     from services.mcp import mcp_sync
 
     manifests = {}
@@ -826,3 +836,721 @@ async def test_a_lifted_mcp_is_installed_with_the_session(monkeypatch):
     await mcp_sync.sync_mcps_for_session("m-1", "task-sess", ["file-x"],
                                          also_wanted={"image-gen-mcp"})
     assert folder.installed == {"file-x": "custom", "image-gen-mcp": "custom"}
+
+
+def _racing_build(monkeypatch, races: int) -> list[str]:
+    """``build_tarball`` meets an install rewriting the folder ``races``
+    times, then builds; returns the names built."""
+    from services.mcp import mcp_tarball
+    tb = MagicMock()
+    tb.tarball_b64 = ""
+    tb.version_hash = "h"
+    calls: list[str] = []
+
+    def _build(name):
+        calls.append(name)
+        if len(calls) <= races:
+            raise mcp_tarball.TreeChanged(f"{name} changed while its tarball was built")
+        return tb
+
+    monkeypatch.setattr("services.mcp.mcp_tarball.build_tarball", _build)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_a_tree_changed_under_the_build_is_built_once_more(monkeypatch, caplog):
+    from services.mcp import mcp_sync
+    folder = _McpFolder({}, "0.5.137")
+    _platform(monkeypatch, folder, _SHIPPED)
+    calls = _racing_build(monkeypatch, races=1)
+    with caplog.at_level("WARNING", logger=mcp_sync.logger.name):
+        await mcp_sync.sync_mcps_for_session("m-1", "s-1", ["file-x"])
+    assert calls == ["file-x", "file-x"]
+    assert folder.installed == {"file-x": "custom"}
+    assert [r for r in caplog.records if r.name == mcp_sync.logger.name
+            and r.levelname in ("WARNING", "ERROR")] == []
+
+
+@pytest.mark.asyncio
+async def test_a_tree_changed_twice_leaves_the_mcp_out_with_one_quiet_line(monkeypatch, caplog):
+    """An install rewriting the folder is an expected race: one WARNING with
+    no traceback, and the session goes on without that MCP."""
+    from services.mcp import mcp_sync
+    folder = _McpFolder({}, "0.5.137")
+    _platform(monkeypatch, folder, _SHIPPED)
+    calls = _racing_build(monkeypatch, races=2)
+    with caplog.at_level("WARNING", logger=mcp_sync.logger.name):
+        await mcp_sync.sync_mcps_for_session("m-1", "s-1", ["file-x"])
+    assert calls == ["file-x", "file-x"]
+    assert "file-x" not in folder.installed
+    lines = [r for r in caplog.records if r.name == mcp_sync.logger.name
+             and r.levelname in ("WARNING", "ERROR")]
+    assert [(r.levelname, r.getMessage(), r.exc_info) for r in lines] == [(
+        "WARNING",
+        "file-x changed while its tarball was built, twice: it is left out of this session's sync",
+        None,
+    )]
+
+
+
+# ---------------------------------------------------------------------------
+# A slow machine: each MCP judged by its own budget, the session started
+# early with the tools that are ready, the chat told what still installs.
+# The satellite installs a plan in order and names each MCP's own start and
+# end; its installer's own lines say "<name>.new".
+# ---------------------------------------------------------------------------
+
+class _Satellite:
+    """A satellite the test drives: the plan's progress through the
+    registered callback, the ack when the test says."""
+
+    def __init__(self):
+        from types import SimpleNamespace
+        self.cbs: dict = {}
+        self.sent: list = []
+        self.ack: asyncio.Future | None = None
+        self.cid = ""
+        self.lock = asyncio.Lock()
+        self.conn = SimpleNamespace(satellite_version="0.5.157")
+        self.sent_plan = asyncio.Event()
+
+    def is_connected(self, mid):
+        return True
+
+    def get_install_lock(self, mid):
+        return self.lock
+
+    def register_install_progress(self, cid, cb):
+        self.cbs[cid] = cb
+
+    def unregister_install_progress(self, cid):
+        self.cbs.pop(cid, None)
+
+    def get_connection(self, mid):
+        return self.conn
+
+    def _satellite_at_least(self, mid, version):
+        return True
+
+    async def send_command(self, mid, frame, *, timeout=30.0, command_id=None):
+        if frame["type"] != "sync_mcps":
+            return {"mcps": {}}
+        self.sent.append((frame, timeout))
+        self.cid = command_id
+        self.ack = asyncio.get_running_loop().create_future()
+        self.sent_plan.set()
+        return await asyncio.wait_for(self.ack, timeout)
+
+    async def started(self):
+        await self.sent_plan.wait()
+
+    async def say(self, mcp, phase, **extra):
+        await self.cbs[self.cid]({"command_id": self.cid, "mcp": mcp, "phase": phase,
+                                  "pct": 100, **extra})
+
+    def finish(self, results):
+        self.ack.set_result({"status": "ok", "results": results})
+
+
+@pytest.fixture
+def slow_machine(monkeypatch):
+    """Three MCPs to install (a, b, c), short budgets, a satellite the test
+    drives. Returns the satellite."""
+    from services.mcp import mcp_sync
+    sat = _Satellite()
+    names = ("mcp-a", "mcp-b", "mcp-c")
+
+    def _manifest(name):
+        if name not in names:
+            return None
+        m = MagicMock()
+        m.label = {"mcp-a": "Alpha", "mcp-b": "Beta", "mcp-c": "Gamma"}[name]
+        m.server.runtime = "python"
+        m.server.source = "pypi:x@1"
+        m.server.source_build = []
+        m.category = "custom"
+        for f in ("debian", "ubuntu", "rhel", "arch", "macos_brew"):
+            setattr(m.system_requirements, f, [])
+        m.system_requirements.node_min = ""
+        m.system_requirements.notes = ""
+        return m
+
+    async def _nothing_installed(cm, machine_id):
+        return {}
+
+    tb = MagicMock(tarball_b64="", version_hash="h")
+    fake_layer = MagicMock(_sessions={})
+    monkeypatch.setattr(mcp_sync, "_fetch_satellite_state", _nothing_installed)
+    monkeypatch.setattr("services.mcp.mcp_registry.get_manifest", _manifest)
+    monkeypatch.setattr("services.mcp.mcp_tarball.build_tarball", lambda name: tb)
+    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: sat)
+    monkeypatch.setattr("core.remote.remote_execution.get_remote_layer", lambda: fake_layer)
+    monkeypatch.setattr(mcp_sync, "_manifest_to_dict", lambda m: {"name": "x"})
+    monkeypatch.setattr(mcp_sync, "INSTALL_BUDGET_S", 0.8)
+    monkeypatch.setattr(mcp_sync, "VERIFY_BUDGET_S", 0.8)
+    mcp_sync._watches.clear()
+    yield sat
+    mcp_sync._watches.clear()
+
+
+_PLAN = ["mcp-a", "mcp-b", "mcp-c"]
+_ALL_OK = {n: {"status": "ok", "version_hash": "h"} for n in _PLAN}
+
+
+@pytest.mark.asyncio
+async def test_each_mcp_is_judged_by_its_own_budget(slow_machine):
+    """The plan takes longer than any one budget, every MCP inside its own:
+    all installed, nothing excluded (one ceiling for the plan failed this)."""
+    from services.mcp import mcp_sync
+    sat = slow_machine
+
+    async def drive():
+        await sat.started()
+        for name in _PLAN:
+            await sat.say(name, "deps")
+            await sat.say(f"{name}.new", "done")      # the installer's own line
+            await asyncio.sleep(0.5)
+            await sat.say(name, "done")
+        sat.finish(_ALL_OK)
+
+    driver = asyncio.ensure_future(drive())
+    result = await mcp_sync.sync_mcps_for_session("m-1", "s-1", list(_PLAN))
+    await driver
+    assert sorted(result.installed) == _PLAN and result.ok
+    assert not result.excluded_names and not result.still_installing
+    # The command's own timeout lies past every budget.
+    assert sat.sent[0][1] == pytest.approx(3 * 0.8 + 0.8)
+    assert not sat.cbs and not sat.lock.locked() and not mcp_sync._watches
+
+
+@pytest.mark.asyncio
+async def test_an_mcp_past_its_budget_reads_as_failed(slow_machine):
+    """The one installing runs past its own budget: it failed, the ones
+    queued behind it did not start; the listener and the lock are freed."""
+    from services.mcp import mcp_sync
+    sat = slow_machine
+
+    async def drive():
+        await sat.started()
+        await sat.say("mcp-a", "done")
+        await sat.say("mcp-b", "deps")      # then nothing more
+
+    driver = asyncio.ensure_future(drive())
+    result = await mcp_sync.sync_mcps_for_session("m-1", "s-1", list(_PLAN))
+    await driver
+    assert result.installed == ["mcp-a"] and not result.ok
+    assert result.failed == {"mcp-b": "did not finish installing in 0 minutes",
+                             "mcp-c": "did not start installing"}
+    assert result.excluded_names == {"mcp-b", "mcp-c"} and not result.still_installing
+    assert sat.ack.cancelled() and not sat.cbs and not sat.lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_a_budget_passed_after_the_start_tells_the_chat_nothing_it_does_not_know(slow_machine):
+    """Past the early start, the one installing runs past its budget: it
+    reads as failed, the one queued behind it never started (unknown), so
+    no line claims how it ended."""
+    from services.mcp import mcp_sync
+    sat = slow_machine
+    settled = asyncio.Event()
+
+    async def drive_start():
+        await sat.started()
+        await sat.say("mcp-a", "done")
+        await sat.say("mcp-b", "deps")
+
+    driver = asyncio.ensure_future(drive_start())
+    result = await mcp_sync.sync_mcps_for_session("m-1", "s-1", list(_PLAN), early_start_s=0.3)
+    await driver
+    result.watch.when_settled(lambda w: settled.set())
+    await asyncio.wait_for(settled.wait(), 3)
+    assert result.watch.outcome(["mcp-b", "mcp-c"]) == ([], ["mcp-b"], ["mcp-c"])
+    assert result.watch.result.failed["mcp-c"] == "did not start installing"
+    for _ in range(50):
+        if not sat.lock.locked():
+            break
+        await asyncio.sleep(0.01)
+    assert not sat.lock.locked() and sat.ack.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_install_is_excluded_with_its_reason(slow_machine):
+    from services.mcp import mcp_sync
+    sat = slow_machine
+
+    async def drive():
+        await sat.started()
+        await sat.say("mcp-a", "done")
+        await sat.say("mcp-b", "failed", error="RuntimeError: pip failed")
+        await sat.say("mcp-c", "done")
+        sat.finish({**_ALL_OK, "mcp-b": {"status": "error", "error": "RuntimeError: pip failed"}})
+
+    driver = asyncio.ensure_future(drive())
+    result = await mcp_sync.sync_mcps_for_session("m-1", "s-1", list(_PLAN), early_start_s=1.0)
+    await driver
+    assert sorted(result.installed) == ["mcp-a", "mcp-c"]
+    assert result.failed == {"mcp-b": "RuntimeError: pip failed"}
+    assert result.excluded_names == {"mcp-b"} and not result.still_installing
+
+
+@pytest.mark.asyncio
+async def test_the_session_starts_early_with_the_tools_that_are_ready(slow_machine):
+    """Past the early start the session gets what ended; the rest is still
+    installing (left out, never a failure). The plan goes on with the lock
+    and the listener, the session's progress callback hears no more, and
+    the watch tells the chat how it ended."""
+    from services.mcp import mcp_sync
+    sat = slow_machine
+    heard: list = []
+    settled = asyncio.Event()
+
+    async def drive_start():
+        await sat.started()
+        await sat.say("mcp-a", "done")
+        await sat.say("mcp-b", "deps")
+
+    driver = asyncio.ensure_future(drive_start())
+    result = await mcp_sync.sync_mcps_for_session(
+        "m-1", "s-1", list(_PLAN), progress_cb=heard.append, early_start_s=0.4)
+    await driver
+    assert result.installed == ["mcp-a"]
+    assert result.still_installing == {"mcp-b", "mcp-c"}
+    assert result.excluded_names == {"mcp-b", "mcp-c"} and not result.failed
+    assert mcp_sync.unavailable_reasons(result, _PLAN) == {
+        n: "still installing on this machine, a new chat here can use it once it is done"
+        for n in ("mcp-b", "mcp-c")}
+    # The plan holds the machine until it ends.
+    assert sat.lock.locked() and sat.cbs and mcp_sync._watches["m-1"] is result.watch
+    result.watch.when_settled(lambda w: settled.set())
+    before = len(heard)
+    await sat.say("mcp-b", "done")
+    await sat.say("mcp-c", "done")
+    sat.finish(_ALL_OK)
+    await asyncio.wait_for(settled.wait(), 2)
+    assert len(heard) == before                       # the session's bar is done
+    assert result.watch.outcome(["mcp-b", "mcp-c"]) == (["mcp-b", "mcp-c"], [], [])
+    for _ in range(50):
+        if not sat.lock.locked():
+            break
+        await asyncio.sleep(0.01)
+    assert not sat.lock.locked() and not sat.cbs and not mcp_sync._watches
+
+
+@pytest.mark.asyncio
+async def test_a_plan_done_before_the_early_start_returns_whole(slow_machine):
+    from services.mcp import mcp_sync
+    sat = slow_machine
+
+    async def drive():
+        await sat.started()
+        for name in _PLAN:
+            await sat.say(name, "done")
+        await sat.say("", mcp_sync.VERIFYING_PHASE)
+        sat.finish(_ALL_OK)
+
+    driver = asyncio.ensure_future(drive())
+    result = await mcp_sync.sync_mcps_for_session("m-1", "s-1", list(_PLAN), early_start_s=5.0)
+    await driver
+    assert sorted(result.installed) == _PLAN and not result.still_installing
+    assert result.watch is None and not sat.lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_a_start_beside_a_running_plan_installs_nothing(slow_machine, monkeypatch):
+    """A second session while the first's plan still holds the machine: it
+    waits the same short while for the lock, then starts with what the
+    satellite has, the running plan's MCPs still installing."""
+    from services.mcp import mcp_sync
+    sat = slow_machine
+
+    async def drive_start():
+        await sat.started()
+        await sat.say("mcp-a", "done")
+
+    driver = asyncio.ensure_future(drive_start())
+    first = await mcp_sync.sync_mcps_for_session("m-1", "s-1", list(_PLAN), early_start_s=0.3)
+    await driver
+
+    async def _has_a(cm, machine_id):
+        return {"mcp-a": {"version_hash": "h", "healthy": True}}
+
+    monkeypatch.setattr(mcp_sync, "_fetch_satellite_state", _has_a)
+    monkeypatch.setattr(mcp_sync, "version_hashes_for",
+                        AsyncMock(return_value={n: "h" for n in _PLAN}))
+    second = await mcp_sync.sync_mcps_for_session("m-1", "s-2", list(_PLAN), early_start_s=0.3)
+    assert len(sat.sent) == 1                            # no plan of its own
+    assert second.still_installing == {"mcp-b", "mcp-c"} and second.excluded_names == {"mcp-b", "mcp-c"}
+    assert second.watch is first.watch
+    sat.finish(_ALL_OK)
+    for _ in range(100):
+        if not sat.lock.locked():
+            break
+        await asyncio.sleep(0.01)
+    assert not sat.lock.locked()
+
+
+def test_the_lines_name_the_tools_in_words():
+    from services.mcp import mcp_sync
+    assert mcp_sync.installing_sentence(["Schedules", "Nextcloud", "Blender"], "my laptop") == (
+        "Three tools are still installing on my laptop: Schedules, Nextcloud and Blender. "
+        "Start a new chat on this machine once they are done to use them.")
+    assert mcp_sync.installing_sentence(["Blender"], "my laptop") == (
+        "One tool is still installing on my laptop: Blender. Start a new chat on this machine "
+        "once it is done to use it.")
+    assert mcp_sync.installing_sentence([f"T{i}" for i in range(12)], "rack").startswith(
+        "12 tools are still installing on rack: T0, T1")
+    assert mcp_sync.finished_sentence(["Schedules", "Nextcloud"], [], "my laptop") == (
+        "The tools finished installing on my laptop. Start a new chat on my laptop to use them.")
+    assert mcp_sync.finished_sentence(["Schedules"], [], "my laptop") == (
+        "The tool finished installing on my laptop. Start a new chat on my laptop to use it.")
+    assert mcp_sync.finished_sentence(["Schedules", "Nextcloud"], ["Blender"], "my laptop") == (
+        "Blender could not be installed on my laptop. Schedules and Nextcloud finished "
+        "installing. Start a new chat on my laptop to use them.")
+    assert mcp_sync.finished_sentence([], ["Blender"], "my laptop") == (
+        "Blender could not be installed on my laptop.")
+    for text in (mcp_sync.installing_sentence(["A", "B"], "x"),
+                 mcp_sync.finished_sentence(["A"], ["B"], "x")):
+        assert ";" not in text and "—" not in text and " - " not in text
+
+
+@pytest.mark.asyncio
+async def test_the_chat_is_told_at_the_start_and_when_the_tools_end(monkeypatch):
+    """One line when the session starts with tools still installing; a
+    second when the same plan's watch knows how each one ended; none when it
+    never learned (a budget passed, the link dropped)."""
+    from core.remote import remote_session_start as rss
+    from services.mcp import mcp_sync
+    rows: list[tuple[str, str]] = []
+
+    async def _row(chat_id, message):
+        rows.append((chat_id, message))
+
+    monkeypatch.setattr(rss, "_tools_row", _row)
+    monkeypatch.setattr(mcp_sync, "tool_labels", lambda names: [n.title() for n in names])
+    monkeypatch.setattr("storage.database.get_chat",
+                        lambda cid: {"id": cid, "execution_target": "m-1"})
+    watch = mcp_sync.InstallWatch("m-1", ["blender", "schedules"],
+                                  {"blender": 9.0, "schedules": 9.0}, {"blender"})
+    await rss._tell_tools_installing("c-1", "my laptop", ["blender", "schedules"], watch)
+    assert rows == [("c-1", "Two tools are still installing on my laptop: Blender and Schedules. "
+                            "Start a new chat on this machine once they are done to use them.")]
+    watch.settle(mcp_sync.SyncResult(installed=["blender"], updated=["schedules"]))
+    for _ in range(50):
+        if len(rows) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert rows[1] == ("c-1", "The tools finished installing on my laptop. Start a new chat "
+                              "on my laptop to use them.")
+
+    rows.clear()
+    unknown = mcp_sync.InstallWatch("m-1", ["blender"], {"blender": 9.0}, {"blender"})
+    await rss._tell_tools_installing("c-2", "my laptop", ["blender"], unknown)
+    unknown.settle(mcp_sync.SyncResult(ok=False, failed={"__transport__": "link lost"}))
+    await asyncio.sleep(0.05)
+    assert len(rows) == 1                                # the start line only
+
+
+@pytest.mark.asyncio
+async def test_a_remote_start_leaves_out_the_tools_still_installing(monkeypatch):
+    """The remote start asks for the early start, ships the session without
+    the tools still installing (its prompt names them), reports none of them
+    as failed, ends the install bar without "Install complete" and tells the
+    chat on the machine's name. A call starts sooner and writes no line."""
+    from auth.path_policy import SecurityContext
+    from core import placement
+    from core.execution_layer import AgentConfig, RemoteStartPlan
+    from core.remote import remote_session_start as rss
+    from core.remote.remote_execution import RemoteExecutionLayer
+    from services.mcp import mcp_sync
+
+    cm = MagicMock()
+    cm.is_connected.return_value = True
+    cm.machine_at_capacity.return_value = False
+    cm.satellite_engines.return_value = {"claude-code-cli"}
+    layer = RemoteExecutionLayer(cm)
+    servers = {n: {"command": "python", "args": [f"{n}.py"]} for n in ("memory", "blender", "schedules")}
+
+    async def _payload(session_id, config, execution_path):
+        return RemoteStartPlan(payload={"mcp_config": {"mcpServers": dict(servers)},
+                                        "system_prompt": "PROMPT"})
+
+    watch = mcp_sync.InstallWatch("m-1", ["blender", "schedules"],
+                                  {"blender": 9.0, "schedules": 9.0}, {"blender"})
+    seen: dict = {}
+
+    async def _sync(machine_id, session_id, assigned, **kw):
+        seen["assigned"], seen["kw"] = sorted(assigned), kw
+        await kw["plan_cb"]({"mcps_to_install": ["blender"], "mcps_to_update": ["schedules"]})
+        return mcp_sync.SyncResult(updated=["memory"], still_installing={"blender", "schedules"},
+                                   excluded_names={"blender", "schedules"}, watch=watch)
+
+    told: list = []
+
+    async def _tell(chat_id, place, installing, w):
+        told.append((chat_id, place, installing, w))
+
+    frames: list = []
+
+    async def _emit(machine_id, agent, ev):
+        frames.append(ev)
+
+    class _Stop(Exception):
+        pass
+
+    async def _gateway(session_id, config, payload, machine_id, plan):
+        seen["payload"] = payload
+        raise _Stop
+
+    monkeypatch.setattr(layer, "_build_start_payload", _payload)
+    monkeypatch.setattr(layer, "_initial_workspace_sync", AsyncMock())
+    monkeypatch.setattr(layer, "_provision_gateway", _gateway)
+    monkeypatch.setattr(mcp_sync, "sync_mcps_for_session", _sync)
+    monkeypatch.setattr(mcp_sync, "lifted_by_context", AsyncMock(return_value=set()))
+    monkeypatch.setattr(rss, "_tell_tools_installing", _tell)
+    monkeypatch.setattr("core.remote.install_registry.emit", _emit)
+    monkeypatch.setattr("storage.remote_store.get_remote_machine",
+                        lambda mid: {"id": mid, "pairing_scope": "admin", "capabilities": "{}"})
+    ctx = SecurityContext(role="manager", username="", agent="support", is_admin_agent=False,
+                          session_scope="agent",
+                          placement=placement.PlacementCapabilities(kind=placement.KIND_ADMIN_REMOTE,
+                                                                   machine_id="m-1",
+                                                                   label="my laptop"))
+    cfg = AgentConfig(agent_name="support", permission_mode="default", chat_id="c-1",
+                      execution_target="m-1", execution_path="claude-code-cli",
+                      security_context=ctx, sandbox_host_claude_dir="/tmp/x")
+    with pytest.raises(_Stop):
+        await layer.start_session("s-early", cfg)
+    assert seen["assigned"] == ["blender", "memory", "schedules"]
+    assert seen["kw"]["early_start_s"] == mcp_sync.EARLY_START_S
+    assert set(seen["payload"]["mcp_config"]["mcpServers"]) == {"memory"}
+    assert "still installing on this machine" in seen["payload"]["system_prompt"]
+    assert "mcp_install_failed" not in [f["type"] for f in frames]
+    done = [f for f in frames if f["type"] == "install_done"]
+    assert len(done) == 1 and done[0]["still_installing"] == ["blender", "schedules"]
+    assert told == [("c-1", "my laptop", ["blender", "schedules"], watch)]
+    # A phone call starts sooner, and nobody reads a line there: none is
+    # written, the prompt still names the tools left out.
+    from core.session import session_kind
+    told.clear()
+    cfg.client_type = session_kind.PHONE.name
+    with pytest.raises(_Stop):
+        await layer.start_session("s-call", cfg)
+    assert seen["kw"]["early_start_s"] == mcp_sync.PHONE_EARLY_START_S < mcp_sync.EARLY_START_S
+    assert "still installing on this machine" in seen["payload"]["system_prompt"]
+    assert told == []
+    # A run nobody watches (a task) waits for its whole plan.
+    cfg.client_type = session_kind.TASK.name
+    with pytest.raises(_Stop):
+        await layer.start_session("s-task", cfg)
+    assert seen["kw"]["early_start_s"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_tools_line_is_a_system_row_of_the_chat(temp_db, monkeypatch):
+    """The line is persisted in the chat (a reload shows it where it was
+    written) and sent to the chat's open tabs."""
+    import json
+    import uuid
+
+    from core.remote import remote_session_start as rss
+    from core.session import session_state
+    from storage import database as db
+    from ws import wire_events as wire
+    sent: list = []
+    monkeypatch.setattr(session_state, "broadcast_chat_frame",
+                        lambda chat_id, frame: sent.append((chat_id, frame)))
+    db.upsert_user("u-row", "u-row@t.io", "u-row", "member", display_name="u-row")
+    from tests.fixtures.ws_dashboard_harness import make_test_agent
+    cid = str(uuid.uuid4())
+    db.create_chat(cid, "u-row", make_test_agent(), "default")
+    await rss._tools_row(cid, "One tool is still installing on my laptop: Blender.")
+    rows = [r for r in db.get_chat_messages(cid) if r.get("event_type") == wire.SYSTEM]
+    block = {"type": wire.SYSTEM, "subtype": wire.SUBTYPE_TOOLS_INSTALLING,
+             "message": "One tool is still installing on my laptop: Blender."}
+    assert [json.loads(r["event_data"]) for r in rows] == [block]
+    assert sent == [(cid, {**block, "chat_id": cid})]
+
+
+@pytest.mark.asyncio
+async def test_a_start_beside_a_plan_promises_only_what_that_plan_installs(slow_machine, monkeypatch):
+    """A second session beside a running plan names as still installing only
+    what that plan installs; an MCP nobody installs is left out as not
+    installed yet (never in the tools line, never promised an end)."""
+    from services.mcp import mcp_sync
+    sat = slow_machine
+    monkeypatch.setattr(mcp_sync, "INSTALL_BUDGET_S", 30.0)   # the plan outlives the test's starts
+    driver = asyncio.ensure_future(sat.started())
+    first = await mcp_sync.sync_mcps_for_session("m-1", "s-1", ["mcp-a"], early_start_s=0.3)
+    await driver
+    assert first.still_installing == {"mcp-a"} and sat.lock.locked()
+    monkeypatch.setattr(mcp_sync, "version_hashes_for",
+                        AsyncMock(return_value={n: "h" for n in _PLAN}))
+    second = await mcp_sync.sync_mcps_for_session("m-1", "s-2", ["mcp-a", "mcp-b"],
+                                                  early_start_s=0.3)
+    assert len(sat.sent) == 1
+    assert second.still_installing == {"mcp-a"} and second.not_installed == {"mcp-b"}
+    assert second.excluded_names == {"mcp-a", "mcp-b"} and not second.failed
+    assert second.watch is first.watch
+    assert mcp_sync.unavailable_reasons(second, ["mcp-a", "mcp-b"]) == {
+        "mcp-a": "still installing on this machine, a new chat here can use it once it is done",
+        "mcp-b": "not installed yet on this machine, a new chat here installs it"}
+    # Nothing beside a plan that holds none of its MCPs: no watch to wait on.
+    third = await mcp_sync.sync_mcps_for_session("m-1", "s-3", ["mcp-b"], early_start_s=0.3)
+    assert third.not_installed == {"mcp-b"} and not third.still_installing
+    assert third.watch is None
+    sat.finish(_ALL_OK)
+    await asyncio.wait_for(_lock_freed(sat), 2)
+
+
+async def _lock_freed(sat):
+    async with sat.lock:      # acquired once the plan's tail lets it go
+        pass
+
+
+@pytest.mark.asyncio
+async def test_beside_a_plan_the_memo_and_the_deferral_answer_as_on_the_main_path(
+        slow_machine, monkeypatch):
+    """A memoized unsatisfiable install reads as that failure (memoized, no
+    frame), never as still installing; a recently deferred update keeps the
+    old version in the session."""
+    from services.mcp import mcp_sync
+    sat = slow_machine
+    monkeypatch.setattr(mcp_sync, "INSTALL_BUDGET_S", 30.0)
+    driver = asyncio.ensure_future(sat.started())
+    await mcp_sync.sync_mcps_for_session("m-1", "s-1", ["mcp-a"], early_start_s=0.3)
+    await driver
+
+    async def _old_b(cm, machine_id):
+        return {"mcp-b": {"version_hash": "old", "healthy": True}}
+
+    monkeypatch.setattr(mcp_sync, "_fetch_satellite_state", _old_b)
+    monkeypatch.setattr(mcp_sync, "version_hashes_for",
+                        AsyncMock(return_value={n: "h" for n in _PLAN}))
+    err = "No solution found when resolving dependencies"
+    monkeypatch.setitem(mcp_sync._unsatisfiable_installs, ("m-1", "mcp-c"),
+                        {"hash": "h", "error": err, "satellite_version": "0.5.157"})
+    mcp_sync._mark_update_deferred("m-1", "mcp-b")
+    try:
+        second = await mcp_sync.sync_mcps_for_session("m-1", "s-2", ["mcp-a", "mcp-b", "mcp-c"],
+                                                      early_start_s=0.3)
+    finally:
+        mcp_sync._deferred_updates.pop(("m-1", "mcp-b"), None)
+    assert second.still_installing == {"mcp-a"} and not second.not_installed
+    assert second.failed == {"mcp-c": err} and second.memoized == {"mcp-c"}
+    assert second.excluded_names == {"mcp-a", "mcp-c"}          # mcp-b runs its old version
+    sat.finish(_ALL_OK)
+    await asyncio.wait_for(_lock_freed(sat), 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("early", [None, 5.0])
+async def test_a_cancelled_start_leaves_nothing_behind(slow_machine, early):
+    """The person stops or closes a starting chat mid-plan: the ack, the
+    progress listener and the watch go with the start, so no later event of
+    the satellite reaches it (nor keeps it marked as starting), and the
+    machine's lock is free."""
+    from services.mcp import mcp_sync
+    sat = slow_machine
+    heard: list = []
+    start = asyncio.ensure_future(mcp_sync.sync_mcps_for_session(
+        "m-1", "s-1", list(_PLAN), progress_cb=heard.append, early_start_s=early))
+    await sat.started()
+    await sat.say("mcp-a", "done")
+    assert heard and sat.cid in sat.cbs and "m-1" in mcp_sync._watches
+    start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start
+    assert sat.cid not in sat.cbs
+    assert "m-1" not in mcp_sync._watches
+    assert sat.ack.cancelled() and not sat.lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_plan_tail_leaves_nothing_behind(slow_machine):
+    """The plan that went on after the early start, its tail cancelled (the
+    proxy shutting down): the listener, the watch and the ack go too."""
+    from core import background
+    from services.mcp import mcp_sync
+    sat = slow_machine
+    driver = asyncio.ensure_future(sat.started())
+    first = await mcp_sync.sync_mcps_for_session("m-1", "s-1", list(_PLAN), early_start_s=0.3)
+    await driver
+    assert first.still_installing and sat.cid in sat.cbs
+    tails = [t for t in background.running("mcp-sync") if t.get_name().endswith("plan-m-1")]
+    assert len(tails) == 1
+    tails[0].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tails[0]
+    assert sat.cid not in sat.cbs and "m-1" not in mcp_sync._watches
+    assert sat.ack.cancelled() and not sat.lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_the_chat_is_told_once_per_plan(monkeypatch):
+    """A restart, a resume or a warm-up of the same chat during the same plan
+    adds no second pair of lines; another chat, or a later plan, is told."""
+    from core.remote import remote_session_start as rss
+    from services.mcp import mcp_sync
+    rows: list[tuple[str, str]] = []
+
+    async def _row(chat_id, message):
+        rows.append((chat_id, message))
+
+    monkeypatch.setattr(rss, "_tools_row", _row)
+    monkeypatch.setattr(mcp_sync, "tool_labels", lambda names: [n.title() for n in names])
+    monkeypatch.setattr("storage.database.get_chat",
+                        lambda cid: {"id": cid, "execution_target": "m-1"})
+    watch = mcp_sync.InstallWatch("m-1", ["blender"], {"blender": 9.0}, {"blender"})
+    for _ in range(3):
+        await rss._tell_tools_installing("c-1", "my laptop", ["blender"], watch)
+    await rss._tell_tools_installing("c-2", "my laptop", ["blender"], watch)
+    assert [c for c, _ in rows] == ["c-1", "c-2"]
+    watch.settle(mcp_sync.SyncResult(installed=["blender"]))
+    for _ in range(50):
+        if len(rows) == 4:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    assert [c for c, _ in rows[:2]] == ["c-1", "c-2"] and sorted(c for c, _ in rows[2:]) == ["c-1", "c-2"]
+    later = mcp_sync.InstallWatch("m-1", ["blender"], {"blender": 9.0}, {"blender"})
+    await rss._tell_tools_installing("c-1", "my laptop", ["blender"], later)
+    assert len(rows) == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pin,told", [("m-1", True), (None, True), ("local", False),
+                                      ("m-2", False)])
+async def test_the_finished_line_waits_for_a_chat_still_on_the_machine(monkeypatch, pin, told):
+    """The chat moved off the machine mid-install: no finished line (its
+    place is no longer there). Still on it, or unpinned, the line names the
+    place."""
+    from core.remote import remote_session_start as rss
+    from services.mcp import mcp_sync
+    rows: list[str] = []
+
+    async def _row(chat_id, message):
+        rows.append(message)
+
+    monkeypatch.setattr(rss, "_tools_row", _row)
+    monkeypatch.setattr(mcp_sync, "tool_labels", lambda names: [n.title() for n in names])
+    monkeypatch.setattr("storage.database.get_chat",
+                        lambda cid: {"id": cid, "execution_target": pin})
+    watch = mcp_sync.InstallWatch("m-1", ["blender"], {"blender": 9.0}, {"blender"})
+    await rss._tell_tools_installing("c-1", "my laptop", ["blender"], watch)
+    watch.settle(mcp_sync.SyncResult(installed=["blender"]))
+    for _ in range(30):
+        if len(rows) == 2:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    assert rows[1:] == (["The tool finished installing on my laptop. Start a new chat on my "
+                         "laptop to use it."] if told else [])
+
+
+def test_each_kind_of_start_waits_its_own_while():
+    from core.session import session_kind
+    from services.mcp import mcp_sync
+    assert mcp_sync.early_start_for(session_kind.DASHBOARD.name) == mcp_sync.EARLY_START_S
+    assert mcp_sync.early_start_for(session_kind.PHONE.name) == mcp_sync.PHONE_EARLY_START_S == 45.0
+    for kind in (session_kind.TASK, session_kind.MEETING, session_kind.TRIGGER):
+        assert mcp_sync.early_start_for(kind.name) is None

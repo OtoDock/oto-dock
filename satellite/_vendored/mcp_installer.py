@@ -35,9 +35,10 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, cast
 
 logger = logging.getLogger("mcp-installer")
 
@@ -116,7 +117,7 @@ async def _reap_group(pgid: int) -> None:
     deadline = loop.time() + 1.0
     while True:
         try:
-            pid, _ = os.waitpid(-pgid, os.WNOHANG)
+            pid, _ = os.waitpid(-pgid, os.WNOHANG)  # noqa: ASYNC222  # WNOHANG: the wait never blocks
         except ChildProcessError:
             return
         if pid == 0:
@@ -164,7 +165,7 @@ async def _run_bounded(
     caller is cancelled, the child and every process it started are killed
     and reaped (``_kill_tree``); the timeout is raised as
     ``asyncio.TimeoutError`` naming the command, for the caller's rollback."""
-    kwargs = {} if sys.platform == "win32" else {"start_new_session": True}
+    kwargs: dict[str, Any] = {} if sys.platform == "win32" else {"start_new_session": True}
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cwd, env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -179,7 +180,8 @@ async def _run_bounded(
     except asyncio.CancelledError:
         await _kill_tree(proc)
         raise
-    return proc.returncode, (out or b"").decode(errors="replace")
+    # communicate() waits for the exit, so the code is set.
+    return cast("int", proc.returncode), (out or b"").decode(errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -731,7 +733,7 @@ def _python_installed_version(venv_dir: Path, dist: str) -> str:
     try:
         for found in metadata.Distribution.discover(name=dist, path=paths):
             return str(found.version or "")
-    except Exception:
+    except (OSError, ValueError):
         return ""
     return ""
 
@@ -806,7 +808,7 @@ async def _create_venv(
     ``UV_PYTHON_INSTALL_DIR``; when that fails too the first venv is made
     again and the log says so."""
     global _managed_failed_at
-    uv = uv_bin if uv_bin and os.path.isfile(uv_bin) else None
+    uv = uv_bin if uv_bin and os.path.isfile(uv_bin) else None  # noqa: ASYNC240  # one stat of the uv binary before a minutes-long install
     if uv is None:
         if floor:
             return False, f"python {floor} required but uv not available", ""
@@ -1088,7 +1090,7 @@ async def install_mcp(
             """Create the venv: on ``floor`` when uv asked for one, else on
             the caller's pin."""
             want = floor or python_spec
-            uv_here = bool(uv_bin and os.path.isfile(uv_bin))
+            uv_here = bool(uv_bin and os.path.isfile(uv_bin))  # noqa: ASYNC240  # one stat of the uv binary before a minutes-long install
             msg = (f"uv venv{' --python ' + want if want else ''}" if uv_here
                    else "python -m venv")
             await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10, "message": msg})
@@ -1107,7 +1109,7 @@ async def install_mcp(
             binary_flags = ["--only-binary=:all:"] if wheels_only else []
             for pkg in no_binary:
                 binary_flags.extend(["--no-binary", pkg])
-            if uv_bin and os.path.isfile(uv_bin):
+            if uv_bin and os.path.isfile(uv_bin):  # noqa: ASYNC240  # one stat of the uv binary before a minutes-long install
                 cmd = [uv_bin, "pip", "install",
                        "--python", str(venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"),
                        *binary_flags, *upgrade_flag, pip_pkg]
@@ -1212,7 +1214,7 @@ async def install_mcp(
             # any supported satellite, but defensive). The install env carries
             # UV_LINK_MODE=copy so the python.exe link step also works
             # without Windows Developer Mode / admin.
-            uv_here = bool(uv_bin and os.path.isfile(uv_bin))
+            uv_here = bool(uv_bin and os.path.isfile(uv_bin))  # noqa: ASYNC240  # one stat of the uv binary before a minutes-long install
             msg = ((f"uv venv --python {python_spec}" if python_spec else "uv venv")
                    if uv_here else "python -m venv")
             await _emit(progress_cb, {"mcp": name, "phase": "deps", "pct": 10,
@@ -1230,7 +1232,7 @@ async def install_mcp(
                 return InstallResult(ok=False, log=log)
         async def _req_install() -> tuple[bool, str]:
             # Prefer uv when available (much faster).
-            if uv_bin and os.path.isfile(uv_bin):
+            if uv_bin and os.path.isfile(uv_bin):  # noqa: ASYNC240  # one stat of the uv binary before a minutes-long install
                 cmd = [uv_bin, "pip", "install",
                        "--python", str(venv_dir / _VENV_BIN_DIR / f"python{_EXE_SUFFIX}"),
                        "-r", str(req_file)]
@@ -1250,7 +1252,7 @@ async def install_mcp(
         # music-gen-mcp needs >=3.11, satellite venv is 3.10 — uv can fetch a
         # matching standalone CPython, it just was never asked). Recreate the
         # venv with the reported constraint and retry once.
-        if not ok and uv_bin and os.path.isfile(uv_bin):
+        if not ok and uv_bin and os.path.isfile(uv_bin):  # noqa: ASYNC240  # one stat of the uv binary before a minutes-long install
             m = _PY_FLOOR_RE.search(log)
             if m:
                 floor = m.group(1).replace(" ", "")

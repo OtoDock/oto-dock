@@ -20,12 +20,11 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends
 
-from auth.providers import UserContext, get_current_user, require_auth
-from storage.agents import agent_store
-from storage import database as task_store
-from ws import chat_phase
-
 from api.agents._router import router
+from auth.providers import UserContext, get_current_user, require_auth
+from storage import database as task_store
+from storage.agents import agent_store
+from ws import chat_phase
 
 _WINDOW_DAYS = 7
 

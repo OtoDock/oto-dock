@@ -8,8 +8,11 @@ admin supplies the base URL.
 """
 
 import logging
+
 from core.layers.providers.openai_adapter import (
-    OpenAIAdapter, _effort_to_openai, _thinking_enabled,
+    OpenAIAdapter,
+    _effort_to_openai,
+    _thinking_enabled,
 )
 
 logger = logging.getLogger("direct-runner")
@@ -94,10 +97,13 @@ class OllamaAdapter(OpenAIAdapter):
         """Fetch models from Ollama's native /api/tags endpoint."""
         import httpx
 
-        url = f"{self.native_api_base(endpoint_url)}/api/tags"
+        from services.infra import pinned_http
 
+        url = f"{self.native_api_base(endpoint_url)}/api/tags"
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            # An admin's own endpoint, here or on the LAN: checked at the dial.
+            async with pinned_http.checked_client(
+                    url, pinned_http.model_server, timeout=10) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
                 data = resp.json()
@@ -110,8 +116,8 @@ class OllamaAdapter(OpenAIAdapter):
                             "display_name": name,
                         })
                 return sorted(models, key=lambda x: x["model_id"])
-        except Exception as e:
-            logger.warning(f"Ollama model list failed: {e}")
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, AttributeError, TypeError) as e:
+            logger.warning("Ollama model list failed: %s", e)
             return []
 
 

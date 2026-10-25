@@ -99,7 +99,7 @@ class TestParseSource:
         "pypi:name[a;b]",           # a separator pip would read
         "pypi:name[a]@-x",          # a flag-like version
         "pypi:name[" + "a" * 200 + "]",   # an over-long extra
-        "pypi:name[" + ",".join("e%d" % i for i in range(17)) + "]",  # too many
+        "pypi:name[" + ",".join(f"e{i}" for i in range(17)) + "]",  # too many
         "pypi:name]a[",
         "pypi:-name[a]",
     ])

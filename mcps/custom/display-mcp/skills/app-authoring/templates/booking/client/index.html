@@ -1,11 +1,11 @@
 <script src="/ui-kit/tailwind.js"></script>
 <div class="px-1 py-2 min-w-0">
   <div class="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
-    <h2 id="service" class="text-base font-semibold break-words">Booking</h2>
+    <h2 id="service" class="text-xl font-semibold break-words">Booking</h2>
     <span id="price" class="text-sm text-[var(--p-text-secondary)]"></span>
     <span id="status" class="ml-auto text-xs text-[var(--p-text-light)]">Connecting…</span>
   </div>
-  <div id="notice" class="card mb-3 p-3 text-sm" hidden></div>
+  <div id="notice" class="mb-3 rounded-[var(--p-radius)] border p-3 text-sm" role="status" hidden></div>
 
   <!-- Accounts: shown on a link only. The dashboard has an identity already
        (otodock.session is unavailable there), so members see the slots and
@@ -13,18 +13,18 @@
        frame is sandboxed without allow-forms; buttons and Enter do the work. -->
   <div id="auth" class="card mb-3 p-3" hidden>
     <div id="auth-out">
-      <div class="mb-2 flex gap-3 text-sm">
-        <button type="button" id="tab-login" class="font-semibold underline">Log in</button>
-        <button type="button" id="tab-register" class="text-[var(--p-text-secondary)]">Register</button>
+      <div class="mb-2 inline-flex gap-1 rounded-[var(--p-radius)] bg-[var(--p-bg)] p-1 text-sm" role="tablist">
+        <button type="button" role="tab" id="tab-login" class="rounded-[var(--p-radius-sm)] px-3 py-1.5 font-medium">Sign in</button>
+        <button type="button" role="tab" id="tab-register" class="rounded-[var(--p-radius-sm)] px-3 py-1.5 font-medium">Register</button>
       </div>
       <div class="grid gap-2 sm:grid-cols-3">
-        <input id="name" class="w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-3 py-1.5 text-sm text-[var(--p-text)]" placeholder="Your name" maxlength="80" hidden>
-        <input id="email" type="email" class="w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-3 py-1.5 text-sm text-[var(--p-text)]" placeholder="Email" maxlength="200" autocomplete="username">
-        <input id="password" type="password" class="w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-3 py-1.5 text-sm text-[var(--p-text)]" placeholder="Password (8 or more characters)" maxlength="200" autocomplete="current-password">
+        <input id="name" class="w-full" placeholder="Your name" aria-label="Your name" maxlength="80" hidden>
+        <input id="email" type="email" class="w-full" placeholder="Email" aria-label="Email" maxlength="200" autocomplete="username">
+        <input id="password" type="password" class="w-full" placeholder="Password, 8 characters or more" aria-label="Password" maxlength="200" autocomplete="current-password">
       </div>
       <div class="mt-2 flex flex-wrap items-center gap-2">
-        <button class="btn primary" type="button" id="auth-btn">Log in</button>
-        <span id="auth-err" class="text-xs text-red-500"></span>
+        <button class="btn primary" type="button" id="auth-btn">Sign in</button>
+        <span id="auth-err" role="alert" class="text-xs text-[var(--p-status-danger-fg)]"></span>
       </div>
     </div>
     <div id="auth-in" class="flex flex-wrap items-center gap-2 text-sm" hidden>
@@ -32,7 +32,7 @@
       <button class="btn" type="button" id="logout-btn">Sign out</button>
     </div>
   </div>
-  <p id="dash-note" class="mb-3 text-xs text-[var(--p-text-secondary)]" hidden>Customers register and book through the public link (the app's menu → Share).</p>
+  <p id="dash-note" class="mb-3 text-xs text-[var(--p-text-secondary)]" hidden>Customers sign up and book through the public link. Make one with Share in the app's menu.</p>
 
   <section id="mine" class="card mb-3 p-3" hidden>
     <h3 class="mb-2 text-sm font-semibold">Your bookings</h3>
@@ -50,16 +50,16 @@
     <h3 class="text-sm font-semibold">Owner</h3>
     <div class="card p-3">
       <div class="grid gap-2 sm:grid-cols-2 text-sm" id="settings-form">
-        <label class="block min-w-0">Service<input data-key="service_name" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
-        <label class="block min-w-0">Price in minor units (1250 = 12.50; 0 = free)<input data-key="price_cents" inputmode="numeric" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
-        <label class="block min-w-0">Currency<input data-key="currency" maxlength="3" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
-        <label class="block min-w-0">Slot length (minutes)<input data-key="slot_minutes" inputmode="numeric" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
-        <label class="block min-w-0">Open from (HH:MM)<input data-key="open_from" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
-        <label class="block min-w-0">Open to (HH:MM)<input data-key="open_to" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
-        <label class="block min-w-0">Weekdays (1 Monday … 7 Sunday)<input data-key="weekdays" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
-        <label class="block min-w-0">Days ahead<input data-key="days_ahead" inputmode="numeric" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
-        <label class="block min-w-0">Hold an unpaid booking (minutes)<input data-key="hold_minutes" inputmode="numeric" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
-        <label class="block min-w-0">Time zone<input data-key="timezone" class="mt-1 w-full rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-2 py-1"></label>
+        <label class="label min-w-0">Service<input data-key="service_name" class="mt-1 w-full"></label>
+        <label class="label min-w-0">Price in cents<input data-key="price_cents" inputmode="numeric" placeholder="1250 for 12.50, 0 for free" class="mt-1 w-full"></label>
+        <label class="label min-w-0">Currency<input data-key="currency" maxlength="3" placeholder="EUR" class="mt-1 w-full"></label>
+        <label class="label min-w-0">Minutes per booking<input data-key="slot_minutes" inputmode="numeric" class="mt-1 w-full"></label>
+        <label class="label min-w-0">Opens at<input data-key="open_from" placeholder="09:00" class="mt-1 w-full"></label>
+        <label class="label min-w-0">Closes at<input data-key="open_to" placeholder="17:00" class="mt-1 w-full"></label>
+        <label class="label min-w-0">Open days, 1 for Monday to 7 for Sunday<input data-key="weekdays" placeholder="1,2,3,4,5" class="mt-1 w-full"></label>
+        <label class="label min-w-0">Days ahead<input data-key="days_ahead" inputmode="numeric" class="mt-1 w-full"></label>
+        <label class="label min-w-0">Minutes to hold an unpaid booking<input data-key="hold_minutes" inputmode="numeric" class="mt-1 w-full"></label>
+        <label class="label min-w-0">Time zone<input data-key="timezone" placeholder="Europe/Athens" class="mt-1 w-full"></label>
       </div>
       <div class="mt-2 flex flex-wrap items-center gap-2">
         <button class="btn primary" type="button" id="save-btn">Save</button>
@@ -69,8 +69,8 @@
     <div class="card p-3">
       <h4 class="mb-2 text-sm font-semibold">Bookings <span id="customers" class="font-normal text-[var(--p-text-secondary)]"></span></h4>
       <div class="overflow-x-auto">
-        <table class="w-full text-sm">
-          <thead><tr class="text-left text-xs text-[var(--p-text-secondary)]"><th class="pr-3">When</th><th class="pr-3">Who</th><th class="pr-3">Status</th><th></th></tr></thead>
+        <table class="folding">
+          <thead><tr><th>When</th><th>Who</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead>
           <tbody id="owner-list"></tbody>
         </table>
       </div>
@@ -78,11 +78,27 @@
     </div>
   </section>
 </div>
+<style>
+/* The owner's bookings: a table from 768 px, a small card per booking on a phone. */
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.folding .actions { text-align: right; white-space: nowrap; }
+@media (max-width: 767px) {
+  .folding thead { display: none; }
+  .folding, .folding tbody, .folding tr, .folding td { display: block; }
+  .folding tr { padding: 12px 0; border-bottom: 1px solid var(--p-border-light); }
+  .folding tr:last-child { border-bottom: 0; }
+  .folding td { padding: 2px 0; border: 0; }
+  .folding td[data-label]::before { content: attr(data-label); display: inline-block; min-width: 5em; margin-right: 8px; font-size: var(--p-font-size-xs); color: var(--p-text-light); }
+  .folding td.actions { padding-top: 8px; text-align: left; }
+  .folding tbody tr:hover { background: transparent; }
+}
+</style>
 <script>
 (function () {
   var $ = function (id) { return document.getElementById(id); };
   var me = null, owner = false, onLink = false, service = null, mode = "login";
   var slots = [], mine = [];
+  var STATUS_WORDS = { confirmed: "Confirmed", held: "Waiting for payment", cancelled: "Cancelled" };
 
   function money(cents, cur) {
     if (!cents) return "Free";
@@ -94,13 +110,13 @@
     init.headers = Object.assign({ "content-type": "application/json" }, init.headers || {});
     return otodock.fetch(path, init).then(function (r) {
       return r.json().catch(function () { return {}; }).then(function (d) { d._status = r.status; d._ok = r.ok; return d; });
-    }).catch(function () { $("status").textContent = "Could not reach the app's server"; return { _ok: false, error: "no answer" }; });
+    }).catch(function () { $("status").textContent = "No connection right now. Try again."; return { _ok: false, error: "No connection right now. Try again." }; });
   }
   function notice(text, tone) {
     var n = $("notice");
     n.hidden = !text;
     n.textContent = text || "";
-    n.className = "card mb-3 p-3 text-sm " + (tone === "ok" ? "text-green-600" : tone === "warn" ? "text-amber-600" : "");
+    n.className = "mb-3 rounded-[var(--p-radius)] border p-3 text-sm " + (tone === "ok" ? "border-[var(--p-status-success-border)] bg-[var(--p-status-success-bg)] text-[var(--p-status-success-fg)]" : tone === "warn" ? "border-[var(--p-status-warning-border)] bg-[var(--p-status-warning-bg)] text-[var(--p-status-warning-fg)]" : "border-[var(--p-border-light)] bg-[var(--p-surface)] text-[var(--p-text-secondary)]");
   }
 
   // ── rendering ───────────────────────────────────────────────────────────
@@ -116,9 +132,13 @@
     $("auth-in").hidden = !me;
     if (me) $("me-name").textContent = me.name;
     $("name").hidden = mode !== "register";
-    $("auth-btn").textContent = mode === "register" ? "Create account" : "Log in";
-    $("tab-login").className = mode === "login" ? "font-semibold underline" : "text-[var(--p-text-secondary)]";
-    $("tab-register").className = mode === "register" ? "font-semibold underline" : "text-[var(--p-text-secondary)]";
+    $("auth-btn").textContent = mode === "register" ? "Create account" : "Sign in";
+    var ON = "rounded-[var(--p-radius-sm)] px-3 py-1.5 font-medium bg-[var(--p-card)] text-[var(--p-text)] shadow-[var(--p-elevation-1)]";
+    var OFF = "rounded-[var(--p-radius-sm)] px-3 py-1.5 font-medium text-[var(--p-text-secondary)] hover:text-[var(--p-text)]";
+    $("tab-login").className = mode === "login" ? ON : OFF;
+    $("tab-login").setAttribute("aria-selected", String(mode === "login"));
+    $("tab-register").className = mode === "register" ? ON : OFF;
+    $("tab-register").setAttribute("aria-selected", String(mode === "register"));
   }
   function renderMine() {
     $("mine").hidden = !me || !mine.length;
@@ -131,8 +151,8 @@
       t.textContent = b.label;
       li.appendChild(t);
       var st = document.createElement("span");
-      st.className = "text-xs " + (b.status === "confirmed" ? "text-green-600" : b.status === "held" ? "text-amber-600" : "text-[var(--p-text-light)]");
-      st.textContent = b.status === "confirmed" ? "confirmed" : b.status === "held" ? "awaiting payment" : "cancelled";
+      st.className = b.status === "confirmed" ? "badge success" : b.status === "held" ? "badge warn" : "text-xs text-[var(--p-text-light)]";
+      st.textContent = STATUS_WORDS[b.status] || "Cancelled";
       li.appendChild(st);
       if (b.status === "held") {
         var pay = document.createElement("button");
@@ -181,22 +201,21 @@
     $("customers").textContent = "· " + data.customers + " customer" + (data.customers === 1 ? "" : "s");
     data.bookings.forEach(function (b) {
       var tr = document.createElement("tr");
-      tr.className = "border-t border-[var(--p-border-light)]";
-      [b.label, b.name + " <" + b.email + ">", b.status === "held" ? "awaiting payment" : b.status].forEach(function (txt) {
+      [["When", b.label], ["Who", b.name + ", " + b.email], ["Status", STATUS_WORDS[b.status] || b.status]].forEach(function (cell) {
         var td = document.createElement("td");
-        td.className = "py-1 pr-3 whitespace-nowrap";
-        td.textContent = txt;
+        td.dataset.label = cell[0];
+        td.textContent = cell[1];
         tr.appendChild(td);
       });
       var td = document.createElement("td");
-      td.className = "py-1";
+      td.className = "actions";
       if (b.status !== "cancelled") {
         var c = document.createElement("button");
-        c.type = "button"; c.className = "text-xs text-[var(--p-text-light)] hover:text-red-500"; c.textContent = "cancel";
+        c.type = "button"; c.className = "btn quiet-danger"; c.textContent = "Cancel booking";
         // Two clicks instead of a confirm() dialog, which the sandbox refuses.
         c.onclick = function () {
           if (c.dataset.sure) { api("/owner/bookings/" + b.id + "/cancel", { method: "POST" }).then(load); }
-          else { c.dataset.sure = "1"; c.textContent = "sure?"; setTimeout(function () { delete c.dataset.sure; c.textContent = "cancel"; }, 4000); }
+          else { c.dataset.sure = "1"; c.textContent = "Press again to cancel"; setTimeout(function () { delete c.dataset.sure; c.textContent = "Cancel booking"; }, 4000); }
         };
         td.appendChild(c);
       }
@@ -218,25 +237,25 @@
   }
   function checkout(bookingId) {
     return api("/checkout", { method: "POST", body: JSON.stringify({ booking_id: bookingId, return_path: linkPath() }) }).then(function (d) {
-      if (!d._ok) { notice(d.error || "The payment page could not be created", "warn"); return; }
+      if (!d._ok) { notice(d.error || "Could not open the payment page. Try again in a moment.", "warn"); return; }
       // The host opens the declared host in a new tab; the visitor comes
-      // back to this link with ?paid=<id>. Called from the click itself —
+      // back to this link with ?paid=<id>. Called from the click itself:
       // a user gesture is required.
       return otodock.openExternal(d.url).then(function (r) {
         if (r.status === "opened") notice("The payment page opened in a new tab. Your booking is held until you pay.", "ok");
-        else notice("The payment page did not open (" + (r.reason || r.status) + "). Press Pay next to your booking to try again.", "warn");
+        else notice("The payment page did not open. Press Pay next to your booking to try again.", "warn");
       });
     });
   }
   function book(slot, btn) {
     if (!me) {
-      if (onLink) { notice("Log in or register to book " + slot.time + ".", "warn"); $("email").focus(); }
+      if (onLink) { notice("Sign in or register to book " + slot.time + ".", "warn"); $("email").focus(); }
       else notice("Customers book through the public link.", "warn");
       return;
     }
     btn.disabled = true;
     api("/bookings", { method: "POST", body: JSON.stringify({ starts_at: slot.starts_at }) }).then(function (d) {
-      if (!d._ok) { notice(d.error || "Could not book", "warn"); btn.disabled = false; return load(); }
+      if (!d._ok) { notice(d.error || "That booking did not go through. Try again.", "warn"); btn.disabled = false; return load(); }
       if (d.booking.status === "confirmed") { notice("Booked: " + d.booking.label, "ok"); return load(); }
       return load().then(function () { return checkout(d.booking.id); });
     });
@@ -249,8 +268,8 @@
     if (mode === "register") {
       body.name = $("name").value.trim();
       // The bot check: the host shows it and resolves with a token, or null
-      // where there is none (the dashboard, an install without Turnstile) —
-      // call anyway; the platform verifies the token on /register.
+      // where there is none (the dashboard, an install without Turnstile):
+      // call anyway, the platform verifies the token on /register.
       go = otodock.challenge().then(function (t) {
         return api("/register", { method: "POST", headers: { "X-OtoDock-Challenge": t || "" }, body: JSON.stringify(body) });
       });
@@ -264,7 +283,7 @@
       // Hand the session to the host: it keeps it in a cookie of the link's
       // and puts it inside every claim from now on.
       return otodock.session.set(d.token).then(function (r) {
-        if (r.status !== "ok") $("auth-err").textContent = "The login could not be kept (" + r.status + ")";
+        if (r.status !== "ok") $("auth-err").textContent = "You are signed in until you close this page.";
         return load();
       });
     });
@@ -312,8 +331,8 @@
     var sl = otodock.sharedLink;
     var q = sl && sl.query ? new URLSearchParams(sl.query) : null;
     if (!q) return;
-    if (q.get("paid")) notice("Thank you — your payment is being confirmed. The booking shows as confirmed as soon as Stripe tells us.", "ok");
-    else if (q.get("cancelled")) notice("The payment was cancelled. Your booking is held for a while — press Pay to try again.", "warn");
+    if (q.get("paid")) notice("Thank you. We are confirming your payment. Your booking shows as confirmed once Stripe tells us.", "ok");
+    else if (q.get("cancelled")) notice("The payment was cancelled. We hold your booking for a short while. Press Pay to try again.", "warn");
   }
   addEventListener("otodock:shared-link", function () { readQuery(); load(); });
   addEventListener("otodock:session", function () { load(); });

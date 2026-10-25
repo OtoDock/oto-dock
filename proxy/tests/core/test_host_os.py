@@ -20,8 +20,7 @@ _MIRROR = REPO_ROOT / "dashboard" / "src" / "lib" / "hostOs" / "os.ts"
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-from satellite import config as sat_config  # noqa: E402
-
+from satellite import config as sat_config
 
 # ---------------------------------------------------------------------------
 # the rows

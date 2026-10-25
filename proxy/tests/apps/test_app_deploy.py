@@ -152,7 +152,7 @@ def _served(app_id: str, **params) -> str:
 
 
 def test_app_json_is_validated_as_a_whole(agent_tree):
-    v = lambda doc, shared=False: app_deploy.validate_app_json(doc, AGENT, shared)  # noqa: E731
+    v = lambda doc, shared=False: app_deploy.validate_app_json(doc, AGENT, shared)
     m = v({"title": "Board", "actions": [], "files": {"read": ["workspace/notes"]},
            "egress": ["api.example.com", "93.184.216.34"]})
     assert m.title == "Board" and m.actions_json == "[]"
@@ -201,7 +201,7 @@ BLOCKS = {
 
 
 def test_the_manifest_blocks_are_validated_signed_and_carried(agent_tree):
-    v = lambda doc, shared=True: app_deploy.validate_app_json(doc, AGENT, shared)  # noqa: E731
+    v = lambda doc, shared=True: app_deploy.validate_app_json(doc, AGENT, shared)
     m = v({"title": "Flow", **BLOCKS})
     for name in BLOCKS:
         assert json.loads(getattr(m, f"{name}_json")) == BLOCKS[name], name
@@ -222,7 +222,8 @@ def test_the_manifest_blocks_are_validated_signed_and_carried(agent_tree):
         {"handlers": {"on_event": {"r": ["notification_created"]}}},  # shared: never an inbox
         {"exports": {"x": {}}},
         {"exports": {"methods": {"m": {}}}},
-        {"exports": {"methods": {"m": {"description": "x", "min_role": "viewer"}}}},
+        {"exports": {"methods": {"m": {"description": "x", "min_role": "admin"}}}},
+        {"exports": {"methods": {"m": {"description": "x", "min_role": "none"}}}},
         {"exports": {"events": {"e": {"description": "x", "min_role": "editor"}}}},
         {"exports": {"methods": {"M": {"description": "x"}}}},
         {"bindings": [{"name": "x"}]},
@@ -269,6 +270,16 @@ def test_the_manifest_blocks_are_validated_signed_and_carried(agent_tree):
     assert row["actions_approved_sig"] == "" and not task_store.app_actions_approved(row)
 
 
+def test_an_export_floors_at_contributor_and_the_default_floor_is_never_stored(agent_tree):
+    v = lambda exports: json.loads(app_deploy.validate_app_json(
+        {"title": "T", "exports": exports}, AGENT, True).exports_json)
+    assert v({"methods": {"m": {"description": "x", "min_role": "contributor"}}}) == {
+        "methods": {"m": {"description": "x", "min_role": "contributor"}}}
+    assert v({"methods": {"m": {"description": "x", "min_role": "viewer"}},
+              "snapshots": {"s": {"description": "y", "min_role": "manager"}}}) == {
+        "methods": {"m": {"description": "x"}}, "snapshots": {"s": {"description": "y", "min_role": "manager"}}}
+
+
 def test_the_shipped_templates_pass_the_validator_and_serve_what_they_declare():
     """The app-authoring templates are copied verbatim by authors and by
     community agents, so a block that no longer validates would ship as a
@@ -290,6 +301,14 @@ def test_the_shipped_templates_pass_the_validator_and_serve_what_they_declare():
             assert "/_handler/" in server, tpl
             for name in names:
                 assert f'"{name}"' in server, (tpl, name)
+    # The kanban template is the worked example of an app built to be
+    # shared: an exported read with no floor, a write at editor, both served.
+    kanban = json.loads((root / "kanban" / "app.json").read_text())
+    methods = kanban["exports"]["methods"]
+    assert set(methods) == {"summary", "move"}
+    assert "min_role" not in methods["summary"] and methods["move"]["min_role"] == "editor"
+    server = (root / "kanban" / "server" / "index.ts").read_text()
+    assert '"/api/summary"' in server and '"/api/move"' in server
     # The booking template is the worked example of APPS.md "Secrets",
     # "Inbound hooks" and "External links": every block of the lane, a key
     # that never enters the sandbox, and every release a person's click.
@@ -969,6 +988,14 @@ def test_a_single_file_pin_gets_the_client_rules(agent_tree):
     assert task_store.get_app_by_slug(AGENT, "alice", "single-lint") is None
     body = _hook("pin", {"slug": "single-lint", "html": "<p>fine</p>", "actions": []}).json()
     assert body.get("status") != "refused" and task_store.get_app_by_slug(AGENT, "alice", "single-lint")
+    assert "findings" not in body
+    # A warning rides a pin that goes through, for the agent to fix.
+    body = _hook("pin", {"slug": "single-lint", "html": "<p>fine</p><script>alert(1);</script>",
+                         "actions": []}).json()
+    assert body["status"] == "ok" and body["problems"] == 0 and body["warnings"] == 1
+    assert [f["rule"] for f in body["findings"]] == ["client.modal"]
+    # The pin's own answer keys stay beside the warnings.
+    assert body["approval"] == "none" and body["release"] >= 1 and body["path"] == "/users/alice/workspace/apps/single-lint.html"
 
 
 @pytest.mark.parametrize("op", ["deploy", "check", "preview", "export"])
@@ -1297,3 +1324,163 @@ def test_the_database_snapshot_and_restore_never_follow_a_planted_link(tmp_path,
     assert victim.read_bytes() == b"keep"
     assert not (data / "app.db").is_symlink()
     assert (data / "app.db").read_bytes()[:15] == b"SQLite format 3"
+
+
+# ── the folders an app needs made (files.create) ────────────────────────────
+
+FOLDER_APP = {"title": "Timeline", "files": {"read": ["workspace/videos/"],
+                                             "create": ["workspace/videos/projects/"]}}
+
+
+def test_files_create_is_validated_and_an_old_manifest_signs_as_before(agent_tree, monkeypatch):
+    v = app_deploy.validate_app_json
+    # Without create, the stored text of every shape is what it always was.
+    assert v({"title": "T", "files": {"read": ["workspace/x/"]}}, AGENT, True).files_json \
+        == '{"read":["workspace/x"],"write":[]}'
+    assert v({"title": "T", "files": {"read": ["workspace/x"], "write": ["workspace/y"]}}, AGENT,
+             True).files_json == '{"read":["workspace/x"],"write":["workspace/y"]}'
+    assert v({"title": "T", "files": {"read": ["workspace/x"]}}, AGENT, False).files_json \
+        == '{"read":["users/{owner}/workspace/x"],"write":[]}'
+    assert v({"title": "T", "files": {"read": ["workspace/x"], "create": []}}, AGENT, True).files_json \
+        == '{"read":["workspace/x"],"write":[]}'
+    # Accepted: equal to or under a read or write prefix, stored like them.
+    m = v({"title": "T", "files": {"read": ["workspace/videos"], "create": ["/workspace/videos/projects/"]}},
+          AGENT, True)
+    assert m.files_json == '{"create":["workspace/videos/projects"],"read":["workspace/videos"],"write":[]}'
+    m = v({"title": "T", "files": {"write": ["workspace/out"], "create": ["workspace/out"]}}, AGENT, False)
+    assert json.loads(m.files_json)["create"] == ["users/{owner}/workspace/out"]
+    from services import path_roles
+    monkeypatch.setattr(path_roles, "is_protected_credentials_path", lambda p: "vault" in str(p))
+    for files, words in [
+        ({"read": ["workspace/a"], "create": ["workspace/a/../b"]}, "no empty part"),
+        ({"read": ["knowledge/a"], "create": ["knowledge/a/b"]}, "inside workspace/"),
+        ({"read": ["workspace"], "create": ["workspace"]}, "inside workspace/"),
+        ({"read": ["workspace/a"], "create": ["workspace/b"]}, "reads no folder there"),
+        ({"read": ["workspace"], "create": ["workspace/x/data/y"]}, "never creates"),
+        ({"read": ["workspace"], "create": ["workspace/Apps/x"]}, "never creates"),
+        ({"read": ["workspace"], "create": ["workspace/.cache"]}, "starts with a dot"),
+        ({"read": ["workspace"], "create": ["workspace/a//b"]}, "no empty part"),
+        ({"read": ["workspace"], "create": ["workspace/a\\b"]}, "forward slashes"),
+        ({"read": ["workspace"], "create": [f"workspace/{n}" for n in range(5)]}, "at most 4"),
+        ({"read": ["workspace"], "create": [7]}, "as text"),
+        ({"read": ["workspace"], "create": "workspace/a"}, "must be a list"),
+        ({"read": ["workspace"], "create": ["workspace/vault"]}, "holds credentials"),
+        ({"read": ["workspace"], "make": ["workspace/a"]}, "read, write and create"),
+    ]:
+        with pytest.raises(app_deploy.DeployError, match=words):
+            v({"title": "T", "files": files}, AGENT, True)
+
+
+def _status(app_id: str) -> dict:
+    return client.get(f"/v1/apps/{app_id}/deploy/status").json()
+
+
+def test_an_approved_release_makes_its_folders_and_a_waiting_one_does_not(agent_tree, tmp_path):
+    _folder(agent_tree, manifest=FOLDER_APP)
+    body = _hook("deploy", {"slug": "board"}).json()
+    assert body["status"] == "pending approval" and "folders" not in body
+    row = task_store.get_app(body["app_id"])
+    path = "users/alice/workspace/videos/projects"
+    target = agent_tree / path
+    assert not target.exists()
+    assert _status(row["id"])["folders"] == [{"path": path, "state": "missing"}]
+    # Nothing a person has not approved makes a folder: a check, a preview.
+    assert _hook("check", {"slug": "board"}).json()["status"] == "ok"
+    assert _hook("preview", {"slug": "board"}).json()["status"] == "ok"
+    assert not target.exists()
+    r = client.post(f"/v1/apps/{row['id']}/deploy/approve")
+    assert r.status_code == 200 and r.json()["folders"] == {"created": [path], "kept": [], "skipped": []}
+    assert target.is_dir() and _status(row["id"])["folders"] == [{"path": path, "state": "present"}]
+    # A file a person keeps there survives the next release.
+    (target / "launch.vproj.json").write_text("{}")
+    body = _hook("deploy", {"slug": "board"}).json()
+    assert body["status"] == "ok" and body["folders"] == {"created": [], "kept": [path], "skipped": []}
+    assert (target / "launch.vproj.json").read_text() == "{}"
+    # A folder someone removed comes back at the next approved release.
+    shutil.rmtree(target)
+    assert _hook("deploy", {"slug": "board"}).json()["folders"]["created"] == [path]
+    # A file in the way is reported and the release still goes live.
+    shutil.rmtree(target)
+    target.write_text("not a folder")
+    body = _hook("deploy", {"slug": "board"}).json()
+    assert body["status"] == "ok" and body["folders"]["skipped"] == [
+        {"path": path, "reason": "a file is in the way"}]
+    assert _status(row["id"])["folders"] == [{"path": path, "state": "blocked"}]
+    # A link on the way is never followed.
+    target.unlink()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    shutil.rmtree(agent_tree / "users/alice/workspace/videos")
+    (agent_tree / "users/alice/workspace/videos").symlink_to(elsewhere)
+    body = _hook("deploy", {"slug": "board"}).json()
+    assert body["status"] == "ok" and body["folders"]["skipped"][0]["reason"].startswith("a link")
+    assert list(elsewhere.iterdir()) == []
+    assert _status(row["id"])["folders"] == [{"path": path, "state": "blocked"}]
+    # A link at the folder's own name is blocked too, never followed.
+    (agent_tree / "users/alice/workspace/videos").unlink()
+    (agent_tree / "users/alice/workspace/videos").mkdir()
+    target.symlink_to(elsewhere)
+    assert _status(row["id"])["folders"] == [{"path": path, "state": "blocked"}]
+    body = _hook("deploy", {"slug": "board"}).json()
+    assert body["folders"]["skipped"] == [{"path": path, "reason": "a link is in the way, and a link is never followed"}]
+
+
+def test_a_rollback_makes_the_folders_once_their_manifest_is_approved(agent_tree):
+    _folder(agent_tree, manifest=FOLDER_APP)
+    row = task_store.get_app(_hook("deploy", {"slug": "board"}).json()["app_id"])
+    assert client.post(f"/v1/apps/{row['id']}/deploy/approve").status_code == 200
+    path = "users/alice/workspace/videos/projects"
+    target = agent_tree / path
+    # Release 2 keeps the manifest: a rollback to release 1 is approved as it
+    # stands and makes the folder again.
+    (agent_tree / row["rel_path"] / "client" / "index.html").write_text("<p>v2</p>")
+    assert _hook("deploy", {"slug": "board"}).json()["release"] == 2
+    shutil.rmtree(target)
+    r = client.post(f"/v1/apps/{row['id']}/rollback")
+    assert r.status_code == 200 and r.json()["release"] == 1 and r.json()["folders"]["created"] == [path]
+    # Release 3 drops the folder (a new manifest, approved); a rollback to the
+    # manifest that declares it waits for the plain card, which makes it.
+    (agent_tree / row["rel_path"] / "app.json").write_text(json.dumps(
+        {"title": "Timeline", "files": {"read": ["workspace/videos/"]}}))
+    body = _hook("deploy", {"slug": "board"}).json()
+    assert body["status"] == "pending approval"
+    assert client.post(f"/v1/apps/{row['id']}/deploy/approve").status_code == 200
+    shutil.rmtree(target)
+    r = client.post(f"/v1/apps/{row['id']}/rollback")
+    assert r.status_code == 200 and r.json()["folders"] == {"created": [], "kept": [], "skipped": []}
+    assert not target.exists()
+    row = task_store.get_app(row["id"])
+    assert not task_store.app_actions_approved(row)
+    r = client.post(f"/v1/apps/{row['id']}/approve", json={"sig": task_store.manifest_sig(row)})
+    assert r.status_code == 200 and r.json()["folders"]["created"] == [path]
+    assert target.is_dir()
+
+
+
+def test_a_long_description_never_voids_a_release(agent_tree):
+    # Releases cut before the description had its warning carry long ones; a
+    # rollback, a reject and a member's seed validate them again.
+    long = {"title": "Board", "description": "word " * 50, "actions": [
+        {"id": "me", "label": "Who am I", "type": "platform", "method": "viewer.me"}]}
+    _folder(agent_tree, manifest=long)
+    row = task_store.get_app(_hook("deploy", {"slug": "board"}).json()["app_id"])
+    assert client.post(f"/v1/apps/{row['id']}/deploy/approve").status_code == 200
+    app_json = agent_tree / row["rel_path"] / "app.json"
+    # A reject over the live release keeps its approval.
+    app_json.write_text(json.dumps({**long, "actions": long["actions"] + [
+        {"id": "you", "label": "Who else", "type": "platform", "method": "viewer.me"}]}))
+    assert _hook("deploy", {"slug": "board"}).json()["status"] == "pending approval"
+    assert client.post(f"/v1/apps/{row['id']}/deploy/reject").status_code == 200
+    row = task_store.get_app(row["id"])
+    assert task_store.app_actions_approved(row) and [a["id"] for a in json.loads(row["actions"])] == ["me"]
+    # A release with another manifest, approved; the rollback puts the first
+    # release's own manifest back on the row (a refused description would
+    # leave the newer one there while the older code serves).
+    app_json.write_text(json.dumps({**long, "actions": [
+        {"id": "two", "label": "Who is it", "type": "platform", "method": "viewer.me"}]}))
+    assert _hook("deploy", {"slug": "board"}).json()["status"] == "pending approval"
+    assert client.post(f"/v1/apps/{row['id']}/deploy/approve").status_code == 200
+    assert [a["id"] for a in json.loads(task_store.get_app(row["id"])["actions"])] == ["two"]
+    r = client.post(f"/v1/apps/{row['id']}/rollback")
+    assert r.status_code == 200 and r.json()["release"] == 1
+    assert [a["id"] for a in json.loads(task_store.get_app(row["id"])["actions"])] == ["me"]

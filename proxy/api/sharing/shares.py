@@ -21,12 +21,12 @@ import hashlib
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 import config
-from api.apps import manifest as _mf
 from api.apps.apps import _can_manage, _visible_row
 from api.media.ui import request_origin
 from auth import confirm, rate_limiter, roles
@@ -39,20 +39,20 @@ from auth.providers import (
     require_human,
     require_user,
 )
-from services.apps import audience
+from core.session import session_kind
+from core.session.visibility import is_task_chat_owner
+from services.apps import audience, manifest as _mf
 from services.sharing import share_inbox
 from storage import database as task_store
 from storage.agents import agent_store, db_departments
 from storage.sharing import share_store
-from core.session import session_kind
-from core.session.visibility import is_task_chat_owner
 
 logger = logging.getLogger("otodock.shares")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
 
 MAX_EXPIRY_DAYS_HARD = 3650
-SETTING_DIRECTORY = "user_directory_visible_to_members"
+SETTING_DIRECTORY = share_store.SETTING_DIRECTORY
 SETTING_MAX_EXPIRY = "sharing_max_expiry_days"
 SETTING_EXTERNAL = "sharing_external_enabled"
 SETTING_PUBLIC = "sharing_public_links_enabled"
@@ -158,9 +158,9 @@ def _parse_expiry(spec: str, cap_days: int | None) -> str | None:
         return (now + timedelta(days=days)).isoformat()
     try:
         when = datetime.fromisoformat(spec.replace("Z", "+00:00"))
-    except ValueError:
+    except ValueError as exc:
         raise HTTPException(status_code=400,
-                            detail="expiry must be an ISO instant, '<n>d' or 'never'")
+                            detail="expiry must be an ISO instant, '<n>d' or 'never'") from exc
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
     if when <= now:
@@ -190,7 +190,8 @@ def _chat_share_target(u: UserContext, chat_id: str) -> dict:
     """The chat the caller may share as a snapshot: one they may open, that
     is not a task run, owned by them or (a shared-only agent's chat) with
     editor rights; the same 404 as a missing chat otherwise."""
-    from api.agents.chats import can_access_chat, can_share_chat
+    from api.agents.chats import can_share_chat
+    from core.session.visibility import can_access_chat
     chat = task_store.get_chat(chat_id)
     if not chat or not can_access_chat(u, chat):
         raise HTTPException(status_code=404, detail="Chat not found")
@@ -231,10 +232,10 @@ def _snapshot_for(u: UserContext, share: dict, chat: dict, include_tools: bool) 
     username = task_store.get_username_by_sub(u.sub) or u.sub
     try:
         ref = chat_snapshot.build(chat, share["id"], username, include_tools=include_tools)
-    except chat_snapshot.SnapshotTooLarge:
+    except chat_snapshot.SnapshotTooLarge as exc:
         _ss.revoke_share(share["id"])
         raise HTTPException(status_code=400,
-                            detail="This chat's files exceed what one share may hold (50 MB)")
+                            detail="This chat's files exceed what one share may hold (50 MB)") from exc
     _ss.set_snapshot_ref(share["id"], ref)
     share["snapshot_ref"] = ref
 
@@ -384,8 +385,8 @@ async def _link_password_hash(plain: str) -> str:
     _check_link_password(plain)
     try:
         return await hash_password_async(plain)
-    except HashBusy:
-        raise confirm.hash_busy()
+    except HashBusy as exc:
+        raise confirm.hash_busy() from exc
 
 
 async def _create_external(req: ShareCreateRequest, u: UserContext, request: Request) -> dict:
@@ -442,9 +443,11 @@ async def _create_external(req: ShareCreateRequest, u: UserContext, request: Req
     out = {"status": "ok", "share": _shape(share), "link": f"{base}/s/{token}"}
     if plain:
         out["password"] = plain
-    logger.info(f"External link created: share={share['id']}, kind={req.target_kind}, "
-                f"target={req.target_id}, public={bool(req.public)}, "
-                f"actions={bool(req.allow_actions)}, by={u.sub[:16]}")
+    logger.info("External link created: share=%s, kind=%s, "
+                "target=%s, public=%s, "
+                "actions=%s, by=%s",
+                share['id'], req.target_kind, req.target_id, bool(req.public),
+                bool(req.allow_actions), u.sub[:16])
     return out
 
 
@@ -559,10 +562,10 @@ async def create_share(
                 target_kind=req.target_kind, target_id=req.target_id, created_by=u.sub,
                 expires_at=expires_at, **fields,
             )
-        except share_store.ShareExists:
+        except share_store.ShareExists as exc:
             if directory:
                 raise HTTPException(status_code=409, detail="Already shared with that "
-                                    + ("user" if kind == share_store.PERSON else kind))
+                                    + ("user" if kind == share_store.PERSON else kind)) from exc
             return {"status": "ok"}
         if not is_app:
             _snapshot_for(u, share, row, bool(req.include_tools))
@@ -571,16 +574,17 @@ async def create_share(
         # The INSERT answers the bare row: the names the dialog shows at
         # once come from what the route already resolved.
         if kind == share_store.PERSON:
-            share.update(grantee_display_name=grantee.get("display_name") or "",
-                         grantee_name=grantee.get("name") or "",
-                         grantee_username=grantee.get("username") or "")
+            person = cast("dict", grantee)  # resolved by the same kind's branch above
+            share.update(grantee_display_name=person.get("display_name") or "",
+                         grantee_name=person.get("name") or "",
+                         grantee_username=person.get("username") or "")
         elif kind == share_store.AGENT:
-            share["to_agent_name"] = target.get("display_name") or slug
+            share["to_agent_name"] = cast("dict", target).get("display_name") or slug
         else:
-            share["to_department_name"] = dept.get("name") or ""
+            share["to_department_name"] = cast("dict", dept).get("name") or ""
         shaped = _shape(share, u.sub)
         shaped["landed"] = share["decision"] == share_store.ACCEPTED
-        out = {"status": "ok"} if not directory else {"status": "ok", "share": shaped}
+        out: dict[str, Any] = {"status": "ok"} if not directory else {"status": "ok", "share": shaped}
         if notify is not None:
             notify.update(title=title, agent=agent, sharer=u.display_name or u.name or u.email,
                           href=(f"/apps/{row['id']}" if is_app else f"/shared/{share['id']}"))
@@ -608,8 +612,9 @@ async def create_share(
             except Exception:
                 logger.exception("share notification failed")
     if out.get("share") or notify or targets:
-        logger.info(f"Share created: kind={req.target_kind}, to={kind}, "
-                    f"target={req.target_id}, by={u.sub[:16]}")
+        logger.info("Share created: kind=%s, to=%s, "
+                    "target=%s, by=%s",
+                    req.target_kind, kind, req.target_id, u.sub[:16])
     return out
 
 
@@ -990,7 +995,7 @@ async def unhide_share(
 def _snapshot_viewer(u: UserContext, share: dict) -> bool:
     """May this user read a chat share's snapshot: its grantee while the
     share is live, its creator, whoever may still open the chat, an admin."""
-    from api.agents.chats import can_access_chat
+    from core.session.visibility import can_access_chat
     if share.get("target_kind") != "chat":
         return False
     if u.is_admin or share.get("created_by") == u.sub:
@@ -999,7 +1004,7 @@ def _snapshot_viewer(u: UserContext, share: dict) -> bool:
             and share_store.is_live(share):
         return True
     chat = task_store.get_chat(share.get("chat_id") or "")
-    return bool(chat) and can_access_chat(u, chat)
+    return bool(chat) and can_access_chat(u, cast("dict", chat))
 
 
 def _load_snapshot_share(u: UserContext, share_id: str) -> dict:
@@ -1040,7 +1045,9 @@ async def read_snapshot_media(share_id: str, token: str,
     """A snapshot's image, clip or file; inert types inline, the rest as a
     download (the ``/v1/media`` rule)."""
     import mimetypes
+
     from fastapi.responses import FileResponse
+
     from services.sharing import chat_snapshot
     u = require_auth(user)
 

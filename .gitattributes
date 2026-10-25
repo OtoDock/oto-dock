@@ -2,3 +2,7 @@
 # codex_base_instructions.md is a verbatim copy of Codex's prompt.md whose
 # length and hash are pinned by tests (a CRLF checkout would change both).
 proxy/core/layers/codex/codex_base_instructions.md -text
+
+# The vendored ONNX models: binary (an INT8 graph has no NUL in its first
+# bytes, so the text heuristic would diff and merge it line by line).
+*.onnx binary

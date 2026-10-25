@@ -87,7 +87,7 @@ export function SoundIcon({ text }: { text: string }) {
     <button
       onClick={onClick}
       title={playing ? 'Stop' : 'Play aloud'}
-      className="p-1 rounded-sm text-p-text-light hover:text-brand transition-colors"
+      className="p-1 rounded-sm text-tertiary hover:text-secondary transition-colors"
     >
       {playing ? (
         <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">

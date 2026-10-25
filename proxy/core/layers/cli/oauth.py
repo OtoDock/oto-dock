@@ -168,14 +168,14 @@ def exchange_code(code: str, code_verifier: str, state: str = "") -> dict:
 
     if resp.status_code != 200:
         resp_body = resp.text[:500]
-        logger.error(f"Claude OAuth token exchange failed: {resp.status_code} {resp_body}")
+        logger.error("Claude OAuth token exchange failed: %s %s", resp.status_code, resp_body)
         try:
             err = resp.json()
             if isinstance(err.get("error"), dict):
                 detail = err["error"].get("message", resp_body)
             else:
                 detail = err.get("message") or err.get("error_description") or err.get("error") or resp_body
-        except Exception:
+        except (ValueError, AttributeError):
             detail = resp_body
         raise ValueError(detail)
 
@@ -224,7 +224,7 @@ def fetch_profile(access_token: str) -> dict | None:
             return None
         body = resp.json()
         return body if isinstance(body, dict) else None
-    except Exception as e:
+    except (httpx.HTTPError, ValueError) as e:
         logger.info("Anthropic profile endpoint unreachable: %s", e)
         return None
 
@@ -248,7 +248,7 @@ def fetch_subscription_fields(access_token: str) -> tuple[str, str]:
 def _json_or_none(resp) -> dict | None:
     try:
         body = resp.json()
-    except Exception:
+    except ValueError:
         return None
     return body if isinstance(body, dict) else None
 
@@ -278,7 +278,7 @@ def refresh(refresh_token: str, stored: dict) -> OAuthRefresh:
             headers={"Content-Type": "application/json"},
             timeout=15,
         )
-    except Exception as e:
+    except httpx.HTTPError as e:
         return OAuthRefresh(error=str(e))
     if resp.status_code != 200:
         return OAuthRefresh(status=resp.status_code, body=_json_or_none(resp))
@@ -286,7 +286,8 @@ def refresh(refresh_token: str, stored: dict) -> OAuthRefresh:
     new_access = data.get("access_token")
     if not new_access:
         return OAuthRefresh(status=200, body=data, error="no access_token in the response")
-    old = stored.get("oauth_token") if isinstance(stored.get("oauth_token"), dict) else {}
+    stored_oauth = stored.get("oauth_token")
+    old = stored_oauth if isinstance(stored_oauth, dict) else {}
     sub_type = data.get("subscriptionType") or old.get("subscriptionType") or ""
     rate_tier = data.get("rateLimitTier") or old.get("rateLimitTier") or ""
     if not sub_type:
@@ -319,7 +320,8 @@ def credentials_file(access_token: str, expires_at_ms: int, stored: dict) -> dic
     it from disk, which fails SAFE (an auth error repaired by the next
     fan-out) instead of cascading revocations. The Claude Code TUI gates
     plan-included models on ``subscriptionType``, so it rides along."""
-    oauth = stored.get("oauth_token") if isinstance(stored.get("oauth_token"), dict) else {}
+    stored_oauth = stored.get("oauth_token")
+    oauth = stored_oauth if isinstance(stored_oauth, dict) else {}
     blob = {
         "accessToken": access_token,
         "refreshToken": "",

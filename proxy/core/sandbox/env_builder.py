@@ -108,7 +108,7 @@ def build_session_env(
     # surfaces them under --forward-subagent-text, which we don't pass) — so
     # they'd burn tokens with no badge/widget/task accounting. Freeze at depth
     # 1 (the pre-2.1.219 behavior) until nested visibility lands (ROADMAP:
-    # "Engines / CLI upgrades — follow-ups").
+    # "Proxy core: sessions, engines and admission").
     env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = "1"
 
     # Claude Code 2.1.233 removed the Todo/Task tools (TodoWrite,

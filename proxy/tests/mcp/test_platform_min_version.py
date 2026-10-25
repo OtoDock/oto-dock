@@ -18,6 +18,7 @@ import pytest
 from fastapi import HTTPException
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)

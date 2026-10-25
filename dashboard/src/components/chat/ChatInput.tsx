@@ -1,4 +1,4 @@
-import { useRef, useCallback, useEffect, useState } from 'react'
+import { useRef, useCallback, useEffect, useState, useLayoutEffect } from 'react'
 import { Capacitor } from '@capacitor/core'
 
 export type { PendingImage, PendingFile } from '../../store/types'
@@ -8,6 +8,7 @@ import { MicIcon } from './MicIcon'
 import { VoiceControl } from './VoiceControl'
 import { PresenceHalo } from './PresenceHalo'
 import type { DuplexPhase } from '../../hooks/useDuplexVoice'
+import { useDictationDraft } from '../../hooks/useDictationDraft'
 
 // ?presenceDebug=<phase> — the halo styling/geometry harness (see render).
 const _DEBUG_PHASES: ReadonlySet<string> =
@@ -39,9 +40,12 @@ import { enterAction, insertNewline, isComposingKey, pasteAttachesFiles } from '
 import { useFlag } from '../../hooks/useFlag'
 import { useTransferStore } from '../../store/transferStore'
 import { saveDocumentPane, useDocumentPushStore } from '../../store/documentPaneStore'
-import { Bar, fmtSize, pct } from '../common/TransferBar'
+import { Bar } from '../common/TransferBar'
+import { POPOVER } from '../ui/classes'
+import { GLASS } from '../ui/glass'
 import { SEND_SAVE_TIMEOUT_MS } from './media/DocumentFrame'
 import ImageLightbox from './media/ImageLightbox'
+import { fmtSize, pct } from '../common/transferFormat'
 
 // Any file type is accepted (no extension allowlist — see lib/fileTypes);
 // the universal cap mirrors proxy config OTODOCK_MAX_FILE_MB (default 1GB) —
@@ -276,14 +280,17 @@ export default function ChatInput({
   // created once (when the mic starts) and would otherwise capture a stale
   // value, making each dictated phrase REPLACE the input instead of append.
   const valueRef = useRef(value)
-  valueRef.current = value
-  // Same live mirror for the draft key, plus the key the mic started under:
-  // they disagree from the render that switched chats until the discard
-  // below lands, and a phrase arriving in that window belongs to the old
-  // chat, never the new one — the check is synchronous on purpose.
+  useLayoutEffect(() => { valueRef.current = value })
+  // The dictation draft hook is built further down (it needs the height
+  // controls); the send and input handlers above it reach it through a ref.
+  const dictRef = useRef<ReturnType<typeof useDictationDraft> | null>(null)
+  // Same live mirror for the draft key; the hook keeps the key the mic
+  // started under and compares the two: they disagree from the commit that
+  // switched chats until the discard below lands, and a phrase arriving in
+  // that window belongs to the old chat, never the new one — the check is
+  // a plain read on purpose.
   const draftKeyRef = useRef(draftKey)
-  draftKeyRef.current = draftKey
-  const dictKeyRef = useRef(draftKey)
+  useLayoutEffect(() => { draftKeyRef.current = draftKey })
   const [menuOpen, setMenuOpen] = useState(false)
   const [hasCamera, setHasCamera] = useState(false)
   // External-file drag over the composer (counter: child enter/leave pairs
@@ -303,6 +310,7 @@ export default function ChatInput({
   // transfer_* WS events (same store the workspace popup reads).
   const transfersById = useTransferStore(s => s.byId)
   const [micStopSignal, setMicStopSignal] = useState(0)      // bump → close the mic, keep the tail (input focus)
+  const [dictationSlot, setDictationSlot] = useState<HTMLDivElement | null>(null)  // the mic's sentence row
   const [micDiscardSignal, setMicDiscardSignal] = useState(0)  // bump → close the mic, drop the tail (send)
   const internalRef = useRef<HTMLTextAreaElement>(null)
   const textareaRef = (externalTextareaRef ?? internalRef) as React.RefObject<HTMLTextAreaElement>
@@ -342,7 +350,7 @@ export default function ChatInput({
         textareaRef.current.setSelectionRange(len, len)
       }
     }
-  }, [editText, onClearEditText])
+  }, [editText, onClearEditText, setText, textareaRef])
 
   const anyFileUploading = pendingFiles.some(f => f.uploading)
   const anyFileErrored = pendingFiles.some(f => f.error)
@@ -370,26 +378,30 @@ export default function ChatInput({
     return () => clearTimeout(t)
   }, [docNotice])
   const attachmentsRef = useRef(0)
-  attachmentsRef.current = pendingImages.length + pendingFiles.length
   // The composer's own guards as they are when the save answers.
   const blockedRef = useRef(false)
-  blockedRef.current = anyFileUploading || anyFileErrored || !!sendDisabled
   // The page's send as it is at the moment it runs: a send that waited for
   // the save goes out with the page's state then (a turn may have started
   // or ended, attachments changed), never the state of the tap.
   const onSendRef = useRef(onSend)
-  onSendRef.current = onSend
-  // The save a send waits for: a chat switch lets it go (its send is then
-  // dropped), so the next chat's composer is never held by it.
-  const savingRef = useRef<object | null>(null)
-  useEffect(() => {
-    savingRef.current = null
+  useLayoutEffect(() => {
+    attachmentsRef.current = pendingImages.length + pendingFiles.length
+    blockedRef.current = anyFileUploading || anyFileErrored || !!sendDisabled
+    onSendRef.current = onSend
+  })
+  // The save a send waits for, with the chat it was started in: a chat
+  // switch lets it go (its send is then dropped), so the next chat's
+  // composer is never held by it.
+  const savingRef = useRef<{ key: string; token: object } | null>(null)
+  const [docKey, setDocKey] = useState(draftKey)
+  if (docKey !== draftKey) {
+    setDocKey(draftKey)
     setDocSaving(false)
     setDocNotice('')
-  }, [draftKey])
+  }
 
   const handleSend = useCallback(async () => {
-    if (anyFileUploading || sendDisabled || savingRef.current) return
+    if (anyFileUploading || sendDisabled || savingRef.current?.key === draftKey) return
     let trimmed = text.trim()
     if (!trimmed && pendingImages.length === 0 && pendingFiles.length === 0) return
     if (docDirty && draftKey) {
@@ -397,13 +409,13 @@ export default function ChatInput({
       // goes out is the composer as it is then, in the chat it was sent in.
       const key = draftKey
       const mine = {}
-      savingRef.current = mine
+      savingRef.current = { key, token: mine }
       setDocSaving(true)
       let saved: boolean
       try {
         saved = await saveDocumentPane(key, SEND_SAVE_TIMEOUT_MS)
       } finally {
-        if (savingRef.current === mine) {
+        if (savingRef.current?.token === mine) {
           savingRef.current = null
           setDocSaving(false)
         }
@@ -418,9 +430,9 @@ export default function ChatInput({
     // Close an open dictation mic AND drop its tail: the text was just sent,
     // so a late stop-flush final must not re-fill the cleared input. Reset
     // the dictation accumulator for the same reason.
-    dictBaseRef.current = ''
+    dictRef.current?.reset()
     setMicDiscardSignal(n => n + 1)
-  }, [text, pendingImages, pendingFiles, anyFileUploading, sendDisabled, docDirty, draftKey])
+  }, [text, pendingImages, pendingFiles, anyFileUploading, sendDisabled, docDirty, draftKey, setText])
 
   // First genuine interaction with the composer → fire onEngage once. Guarded
   // by a ref so it never re-fires; bound to keydown/pointerdown (NOT focus or
@@ -449,21 +461,11 @@ export default function ChatInput({
 
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setText(e.target.value)
-    // Manual edit mid-dictation → re-baseline so the next partial/final builds on
-    // the edited text (otherwise a deleted phrase reappears on the next utterance).
-    if (dictatingRef.current) dictBaseRef.current = e.target.value
+    dictRef.current?.rebaseline(e.target.value)
     height.settle()
     height.fit()
   }
 
-  // Mic dictation shows live interim text as you speak and commits each final at
-  // a pause (the native-dictation feel). `dictBaseRef` is the committed text the
-  // live interim is appended onto: interims REPLACE (preview), finals ACCUMULATE.
-  // Bypasses handleInput, so nudge the textarea auto-resize manually.
-  const dictBaseRef = useRef('')
-  const dictatingRef = useRef(false)   // mic actively dictating → manual edits re-baseline
-  const joinText = (a: string, b: string) =>
-    a ? `${a}${a.endsWith(' ') || a.endsWith('\n') ? '' : ' '}${b}` : b
   const nudgeResize = () => height.fit()
   // Autosize on EVERY value change: programmatic sets bypass handleInput —
   // a draft restored from localStorage on mount, edit/template insertion,
@@ -473,36 +475,18 @@ export default function ChatInput({
     nudgeResize()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value])
-  // Dictation started → snapshot whatever's already in the input as the base
-  // (live partials append onto it). Live-mode barge-in is handled in VoiceControl.
-  const onMicActive = (active: boolean) => {
-    dictatingRef.current = active
+  // Mic dictation: interims REPLACE (a preview), finals ACCUMULATE, a language
+  // switch REWRITES the words the session placed (hooks/useDictationDraft.ts).
+  // Bypasses handleInput, so the hook nudges the textarea auto-resize.
+  const dict = useDictationDraft({
+    valueRef, draftKeyRef, setText,
     // Dictated text must land in view; phone mode's caption bridge calls this
     // on every utterance and leaves the height alone.
-    if (active && !voice?.duplex?.active) height.grow()
-    if (active) {
-      dictKeyRef.current = draftKeyRef.current
-      dictBaseRef.current = valueRef.current
-    }
-  }
-  // Dictation is bound to the chat it started in: after a switch the old
-  // attempt's interims and finals are dropped. This also keeps the duplex
-  // caption bridge's deactivation (an empty interim, fired once its session
-  // ends on the switch) from wiping the new chat's restored draft.
-  const dictatingHere = () => dictKeyRef.current === draftKeyRef.current
-  // Live partial → show base+interim without committing (the next partial/final replaces it).
-  const showInterim = (t: string) => {
-    if (!dictatingHere()) return
-    setText(joinText(dictBaseRef.current, t))
-    nudgeResize()
-  }
-  // Finalized phrase → commit it onto the base so the next utterance builds after it.
-  const appendTranscript = (t: string) => {
-    if (!dictatingHere()) return
-    dictBaseRef.current = joinText(dictBaseRef.current, t)
-    setText(dictBaseRef.current)
-    nudgeResize()
-  }
+    onStart: () => { if (!voice?.duplex?.active) height.grow() },
+    afterChange: nudgeResize,
+  })
+  useEffect(() => { dictRef.current = dict })
+  const { onMicActive, showInterim, appendTranscript, replaceTranscript } = dict
   // A chat switch ends dictation: close the mic and drop its tail. Bumped
   // even when the mic is already off — a stopped attempt keeps delivering
   // its tail on purpose (the mic-button stop wants the last phrase), and
@@ -514,8 +498,7 @@ export default function ChatInput({
   useEffect(() => {
     if (prevDraftKeyRef.current === draftKey) return
     prevDraftKeyRef.current = draftKey
-    dictBaseRef.current = ''
-    dictatingRef.current = false
+    dictRef.current?.reset(true)
     setMicDiscardSignal(n => n + 1)
   }, [draftKey])
 
@@ -550,7 +533,7 @@ export default function ChatInput({
           // uploads it as a file the agent can still open).
           onAddFiles([{
             id: generateId(), name: file.name, size: file.size, file,
-            error: 'Inline photo limit for one message reached — remove some photos or send it as a file',
+            error: 'Too many photos for one message. Remove some, or send this one as a file.',
           }])
           continue
         }
@@ -635,10 +618,10 @@ export default function ChatInput({
       onClick={() => void handleSend()}
       disabled={!canSend}
       aria-label="Send"
-      title={touchPrimary ? undefined : 'Send (Shift+Enter)'}
+      title={touchPrimary ? undefined : 'Send: Shift+Enter'}
       aria-keyshortcuts={touchPrimary ? undefined : 'Shift+Enter Control+Enter Meta+Enter'}
-      className="w-9 h-9 rounded-lg text-sm font-medium text-white flex items-center justify-center
-                 bg-brand hover:bg-brand-hover disabled:bg-p-surface disabled:text-p-text-light disabled:cursor-not-allowed
+      className="w-9 h-9 rounded-control text-sm font-medium text-action-fg flex items-center justify-center
+                 bg-action hover:bg-action-hover disabled:bg-surface-muted disabled:text-tertiary disabled:cursor-not-allowed
                  transition-colors shrink-0"
     >
       <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -651,12 +634,15 @@ export default function ChatInput({
     <div ref={rootRef} className="px-3 pb-composer-safe">
       <div className="max-w-4xl mx-auto">
         {(docNotice || docDirty) && (
-          <p role="status" className="mb-1 truncate px-1 text-xs text-amber-700 dark:text-amber-400">
+          <p role="status" className="mb-1 truncate px-1 text-xs text-status-warning-fg">
             {docNotice || (docSaving
               ? `Saving ${docDirtyName || 'the document'} before sending.`
               : `Unsaved edits in ${docDirtyName || 'the document'}.`)}
           </p>
         )}
+        {/* The dictation's sentence (a slow link, a stop, the time limit):
+            the mic renders it here, above the pill, never over its text. */}
+        <div ref={setDictationSlot} />
         {/* relative wrapper: the PresenceHalo canvas positions against the
             pill; the pill's explicit z-index keeps content above the glow
             (before, that layering only held by accident of backdrop-blur's
@@ -678,7 +664,7 @@ export default function ChatInput({
           <PresenceHalo phase={voice.duplex.phase} getLevels={voice.duplex.getLevels} />
         )}
         <div
-          className="relative z-40 bg-white/90 dark:bg-gray-900/90 backdrop-blur-xs rounded-xl border border-p-border-light dark:border-gray-700 shadow-xs p-2"
+          className={`relative z-40 ${GLASS} rounded-composer p-2`}
           // Drop zone for EXTERNAL files only (dataTransfer carries 'Files').
           // Internal agent-path drags never do, so their native text insert
           // into the textarea keeps working untouched. preventDefault on the
@@ -720,14 +706,14 @@ export default function ChatInput({
           }}
         >
           {dragDepth > 0 && (
-            <div className="absolute inset-0 z-20 rounded-xl border-2 border-dashed border-brand bg-brand/10
+            <div className="absolute inset-0 z-20 rounded-composer border-2 border-dashed border-action bg-action-subtle
                             flex items-center justify-center pointer-events-none">
-              <span className="text-sm font-medium text-brand">Drop to attach</span>
+              <span className="text-sm font-medium text-link">Drop to attach</span>
             </div>
           )}
           {/* Attachment preview row (images + files) */}
           {(pendingImages.length > 0 || pendingFiles.length > 0) && (
-            <div className="flex gap-2 overflow-x-auto pt-2 pb-2 mb-2 border-b border-p-border-light/50 px-1.5 items-center">
+            <div className="flex gap-2 overflow-x-auto pt-2 pb-2 mb-2 border-b border-subtle px-1.5 items-center">
               {pendingImages.map((img, i) => (
                 <div key={img.id} className="relative shrink-0 group">
                   {/* Tile opens the standard lightbox (zoom/swipe) so the
@@ -737,20 +723,20 @@ export default function ChatInput({
                     onClick={() => setLightbox({ images: [...pendingImages], idx: i })}
                     aria-label={`Preview ${img.name}`}
                     title="Click to preview"
-                    className="block rounded-lg focus:outline-hidden focus-visible:ring-2 focus-visible:ring-brand"
+                    className="block rounded-control focus:outline-hidden focus-visible:ring-2 focus-visible:ring-focus-ring"
                   >
                     <img
                       src={pendingImageSrc(img, agentName)}
                       alt={img.name}
-                      className="w-14 h-14 rounded-lg object-cover border border-p-border-light cursor-pointer"
+                      className="w-14 h-14 rounded-card object-cover border border-subtle cursor-pointer"
                     />
                   </button>
                   <button
                     onClick={() => onRemoveImage(img.id)}
                     aria-label="Remove image"
-                    className={`absolute -top-1.5 -right-1.5 z-10 w-5 h-5 rounded-full bg-p-accent-red text-white
-                               flex items-center justify-center text-xs ring-2 ring-white dark:ring-gray-900
-                               shadow-sm transition-opacity ${removeBtnVisibility}`}
+                    className={`absolute -top-1.5 -right-1.5 z-10 w-5 h-5 rounded-full bg-status-danger-fill text-on-solid
+                               flex items-center justify-center text-xs ring-2 ring-surface-card
+                               shadow-elevation-1 transition-opacity ${removeBtnVisibility}`}
                     style={{ fontSize: '10px', lineHeight: 1 }}
                   >
                     ✕
@@ -787,30 +773,30 @@ export default function ChatInput({
                     key={f.id}
                     title={f.error || undefined}
                     className={`relative shrink-0 group flex flex-col gap-1
-                                bg-p-surface rounded-lg px-2.5 py-1.5 border
+                                bg-surface-muted rounded-card px-2.5 py-1.5 border
                                 ${(uploadingNow || syncing) ? 'min-w-[160px]' : ''}
                                 max-w-[220px]
-                                ${f.error ? 'border-p-accent-red' : 'border-p-border-light'}`}
+                                ${f.error ? 'border-status-danger-solid' : 'border-subtle'}`}
                   >
                     <div className="flex items-center gap-1.5">
                       {f.uploading ? (
                         <span
-                          className="w-4 h-4 border-2 border-brand border-t-transparent rounded-full animate-spin shrink-0"
+                          className="w-4 h-4 border-2 border-action border-t-transparent rounded-full animate-spin shrink-0"
                           aria-label={f.queued ? 'Queued' : 'Uploading'}
                         />
                       ) : f.error ? (
-                        <svg className="w-4 h-4 text-p-accent-red shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <svg className="w-4 h-4 text-status-danger-fg shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                                 d="M12 9v2m0 4h.01M12 5l7 12H5l7-12z" />
                         </svg>
                       ) : (
-                        <svg className="w-4 h-4 text-p-text-secondary shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <svg className="w-4 h-4 text-secondary shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                                 d={f.folder ? FOLDER_ICON_PATH : FILE_ICON_PATH} />
                         </svg>
                       )}
-                      <span className="text-xs text-p-text truncate max-w-[100px]">{f.name}</span>
-                      <span className="text-xs text-p-text-light shrink-0">
+                      <span className="text-xs text-primary truncate max-w-[100px]">{f.name}</span>
+                      <span className="text-xs text-tertiary shrink-0">
                         {f.folder
                           ? f.fileCount == null ? 'Folder' : `${f.fileCount} file${f.fileCount === 1 ? '' : 's'}`
                           : formatFileSize(f.size)}
@@ -820,7 +806,7 @@ export default function ChatInput({
                           onClick={() => onRetryFile(f.id)}
                           aria-label="Retry upload"
                           title="Retry upload"
-                          className="w-4 h-4 rounded-full text-p-text-secondary hover:text-brand
+                          className="w-4 h-4 rounded-full text-secondary hover:text-link
                                      flex items-center justify-center shrink-0"
                         >
                           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
@@ -832,7 +818,7 @@ export default function ChatInput({
                       <button
                         onClick={() => onRemoveFile(f.id)}
                         aria-label="Remove file"
-                        className={`w-4 h-4 rounded-full bg-p-accent-red text-white flex items-center justify-center
+                        className={`w-4 h-4 rounded-full bg-status-danger-fill text-on-solid flex items-center justify-center
                                    text-xs shrink-0 transition-opacity ${removeBtnVisibility}`}
                         style={{ fontSize: '9px', lineHeight: 1 }}
                       >
@@ -844,8 +830,8 @@ export default function ChatInput({
                     )}
                     {subText && (
                       <span
-                        className={`text-[10px] leading-tight truncate
-                                    ${f.error ? 'text-p-accent-red' : 'text-p-text-light'}`}
+                        className={`text-3xs leading-tight truncate
+                                    ${f.error ? 'text-status-danger-fg' : 'text-tertiary'}`}
                         title={subText}
                       >
                         {subText}
@@ -866,18 +852,18 @@ export default function ChatInput({
             {onToggleWorkspace && (
               <button
                 onClick={onToggleWorkspace}
-                title={workspaceOpen ? 'Close workspace (Esc)' : 'Open workspace (Ctrl+E)'}
-                className={`relative w-9 h-9 -mr-0.5 rounded-lg flex items-center justify-center transition-colors shrink-0
+                title={workspaceOpen ? 'Close workspace: Esc' : 'Open workspace: Ctrl+E'}
+                className={`relative w-9 h-9 -mr-0.5 rounded-control flex items-center justify-center transition-colors shrink-0
                   ${workspaceOpen
-                    ? 'bg-brand text-white hover:bg-brand-hover'
-                    : 'text-p-text-secondary hover:text-brand hover:bg-brand/5'}
+                    ? 'bg-action text-action-fg hover:bg-action-hover'
+                    : 'text-secondary hover:text-primary hover:bg-surface-hover'}
                 `}
               >
                 <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
                   <path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" />
                 </svg>
                 {workspaceOpen && workspaceHasNewMessage && (
-                  <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-white ring-2 ring-brand" />
+                  <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-action-fg ring-2 ring-action" />
                 )}
               </button>
             )}
@@ -886,10 +872,10 @@ export default function ChatInput({
               <button
                 onClick={onToggleApps}
                 title={appsOpen ? 'Close apps' : 'Open apps'}
-                className={`w-9 h-9 -mr-0.5 rounded-lg flex items-center justify-center transition-colors shrink-0
+                className={`w-9 h-9 -mr-0.5 rounded-control flex items-center justify-center transition-colors shrink-0
                   ${appsOpen
-                    ? 'bg-emerald-600 text-white hover:bg-emerald-700'
-                    : 'text-p-text-secondary hover:text-emerald-600 hover:bg-emerald-500/5'}
+                    ? 'bg-action text-action-fg hover:bg-action-hover'
+                    : 'text-secondary hover:text-primary hover:bg-surface-hover'}
                 `}
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
@@ -908,10 +894,10 @@ export default function ChatInput({
               <button
                 onClick={onToggleProjects}
                 title={`${projectsOpen ? 'Close' : 'Open'} ${dockKind === 'chat' ? 'chat dock' : 'project dock'}`}
-                className={`w-9 h-9 -mr-0.5 rounded-lg flex items-center justify-center transition-colors shrink-0
+                className={`w-9 h-9 -mr-0.5 rounded-control flex items-center justify-center transition-colors shrink-0
                   ${projectsOpen
-                    ? 'bg-violet-600 text-white hover:bg-violet-700'
-                    : 'text-p-text-secondary hover:text-violet-600 hover:bg-violet-500/5'}
+                    ? 'bg-action text-action-fg hover:bg-action-hover'
+                    : 'text-secondary hover:text-primary hover:bg-surface-hover'}
                 `}
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
@@ -927,8 +913,8 @@ export default function ChatInput({
                 ref={plusBtnRef}
                 onClick={() => setMenuOpen(!menuOpen)}
                 disabled={disabled}
-                className="w-9 h-9 rounded-lg flex items-center justify-center
-                           text-p-text-secondary hover:text-brand hover:bg-brand/5
+                className="w-9 h-9 rounded-control flex items-center justify-center
+                           text-secondary hover:text-primary hover:bg-surface-hover
                            disabled:opacity-40 disabled:cursor-not-allowed
                            transition-colors shrink-0"
               >
@@ -941,16 +927,15 @@ export default function ChatInput({
               {menuOpen && (
                 <div
                   ref={menuRef}
-                  className="absolute bottom-full left-0 mb-2 bg-white dark:bg-p-surface rounded-lg border border-p-border-light
-                             shadow-lg py-1 min-w-[160px] z-50"
+                  className={`absolute bottom-full left-0 mb-2 ${POPOVER} py-1 min-w-[160px] z-50`}
                 >
                   {hasCamera && (
                     <button
                       onClick={handleCamera}
-                      className="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-p-text
-                                 hover:bg-p-surface-hover transition-colors"
+                      className="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-primary
+                                 hover:bg-surface-hover transition-colors"
                     >
-                      <svg className="w-4 h-4 text-p-text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <svg className="w-4 h-4 text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                               d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
@@ -961,10 +946,10 @@ export default function ChatInput({
                   )}
                   <button
                     onClick={handleUploadPhoto}
-                    className="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-p-text
-                               hover:bg-p-surface-hover transition-colors"
+                    className="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-primary
+                               hover:bg-surface-hover transition-colors"
                   >
-                    <svg className="w-4 h-4 text-p-text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg className="w-4 h-4 text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                             d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                     </svg>
@@ -972,10 +957,10 @@ export default function ChatInput({
                   </button>
                   <button
                     onClick={handleUploadFile}
-                    className="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-p-text
-                               hover:bg-p-surface-hover transition-colors"
+                    className="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-primary
+                               hover:bg-surface-hover transition-colors"
                   >
-                    <svg className="w-4 h-4 text-p-text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg className="w-4 h-4 text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                             d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                     </svg>
@@ -984,10 +969,10 @@ export default function ChatInput({
                   {onAddFolder && canPickFolder() && (
                     <button
                       onClick={handleUploadFolder}
-                      className="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-p-text
-                                 hover:bg-p-surface-hover transition-colors"
+                      className="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-primary
+                                 hover:bg-surface-hover transition-colors"
                     >
-                      <svg className="w-4 h-4 text-p-text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <svg className="w-4 h-4 text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={FOLDER_ICON_PATH} />
                       </svg>
                       Upload Folder
@@ -1050,9 +1035,9 @@ export default function ChatInput({
               placeholder={placeholder || 'Type a message...'}
               disabled={disabled}
               rows={1}
-              className="flex-1 resize-none rounded-lg px-3 py-2 text-sm bg-transparent
+              className="flex-1 resize-none rounded-control px-3 py-2 text-sm bg-transparent
                          focus:outline-hidden order-first basis-full
-                         disabled:text-p-text-light placeholder:text-p-text-light"
+                         disabled:text-tertiary placeholder:text-tertiary"
             />
 
             {/* Right controls (mic/live + send) — pushed to the right end of
@@ -1072,18 +1057,22 @@ export default function ChatInput({
                 } : undefined}
                 onDictateInterim={showInterim}
                 onDictateFinal={appendTranscript}
+                onDictateReplace={replaceTranscript}
                 onDictateActive={onMicActive}
                 interruptSignal={micStopSignal}
                 discardSignal={micDiscardSignal}
                 disabled={disabled}
+                sentenceSlot={dictationSlot}
               />
             ) : (
               <MicIcon
                 onTranscript={appendTranscript}
                 onInterim={showInterim}
+                onReplace={replaceTranscript}
                 onActive={onMicActive}
                 discardSignal={micDiscardSignal}
                 disabled={disabled}
+                sentenceSlot={dictationSlot}
               />
             )}
             {streaming && onAbort ? (
@@ -1093,8 +1082,8 @@ export default function ChatInput({
                     onClick={onAbort}
                     aria-label="Stop"
                     title="Stop"
-                    className="w-9 h-9 rounded-lg flex items-center justify-center text-white shrink-0
-                               bg-p-accent-red hover:bg-red-700 transition-colors"
+                    className="w-9 h-9 rounded-control flex items-center justify-center text-on-solid shrink-0
+                               bg-status-danger-fill hover:bg-status-danger-fill-hover transition-colors"
                   >
                     <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
                       <rect x="5" y="5" width="14" height="14" rx="2" />
@@ -1104,10 +1093,10 @@ export default function ChatInput({
                   <button
                     onClick={onAbort}
                     disabled={aborting}
-                    className={`px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors shrink-0 ${
+                    className={`px-4 py-2 rounded-control text-sm font-medium transition-colors shrink-0 ${
                       aborting
-                        ? 'bg-p-text-light cursor-not-allowed'
-                        : 'bg-p-accent-red hover:bg-red-700'
+                        ? 'bg-surface-muted text-tertiary cursor-not-allowed'
+                        : 'bg-status-danger-fill text-on-solid hover:bg-status-danger-fill-hover'
                     }`}
                   >
                     {aborting ? 'Stopping...' : 'Stop'}

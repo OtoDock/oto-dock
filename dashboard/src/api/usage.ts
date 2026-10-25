@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './auth'
+import { apiOk, withMessage, apiJson } from '../lib/http/apiJson'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -181,9 +181,7 @@ export function useMyUsage(days = 30) {
   return useQuery({
     queryKey: ['my-usage', days],
     queryFn: async (): Promise<UserUsageSummary> => {
-      const res = await apiFetch(`/v1/usage/me?days=${days}`)
-      if (!res.ok) throw new Error('Failed to fetch usage')
-      return res.json()
+      return apiJson<UserUsageSummary>(`/v1/usage/me?days=${days}`).catch(withMessage('Failed to fetch usage'))
     },
     staleTime: 30_000,
   })
@@ -193,9 +191,7 @@ export function useMyLimits() {
   return useQuery({
     queryKey: ['my-usage-limits'],
     queryFn: async (): Promise<{ limits: UsageLimit[] }> => {
-      const res = await apiFetch('/v1/usage/me/limits')
-      if (!res.ok) throw new Error('Failed to fetch limits')
-      return res.json()
+      return apiJson<{ limits: UsageLimit[] }>('/v1/usage/me/limits').catch(withMessage('Failed to fetch limits'))
     },
   })
 }
@@ -205,15 +201,11 @@ export function useSetMyLimit() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (data: { period: string; cost_limit_usd: number | null }) => {
-      const res = await apiFetch('/v1/usage/me/limits', {
+      await apiOk('/v1/usage/me/limits', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to set limit')
-      }
+      }, 'Failed to set limit')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['my-usage-limits'] })
@@ -223,22 +215,15 @@ export function useSetMyLimit() {
 }
 
 async function fetchPoolCap(path: string): Promise<PoolCapResponse> {
-  const res = await apiFetch(path)
-  if (!res.ok) throw new Error('Failed to fetch the pool cap')
-  return res.json()
+  return apiJson<PoolCapResponse>(path).catch(withMessage('Could not load the subscription limits'))
 }
 
 async function putPoolCap(path: string, data: PoolCapUpdate): Promise<PoolCapResponse> {
-  const res = await apiFetch(path, {
+  return apiJson<PoolCapResponse>(path, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error(err.detail || 'Failed to save the cap')
-  }
-  return res.json()
+  }, 'Failed to save the cap')
 }
 
 export function useMyPoolCap() {
@@ -287,9 +272,8 @@ export function useAdminUsageOverview(days = 30) {
   return useQuery({
     queryKey: ['admin-usage-overview', days],
     queryFn: async (): Promise<AdminUsageOverview> => {
-      const res = await apiFetch(`/v1/admin/usage/overview?days=${days}`)
-      if (!res.ok) throw new Error('Failed to fetch admin usage')
-      return res.json()
+      return apiJson<AdminUsageOverview>(`/v1/admin/usage/overview?days=${days}`)
+        .catch(withMessage('Failed to fetch admin usage'))
     },
     staleTime: 30_000,
   })
@@ -299,9 +283,7 @@ export function useAdminUsageLimits() {
   return useQuery({
     queryKey: ['admin-usage-limits'],
     queryFn: async (): Promise<{ limits: UsageLimit[] }> => {
-      const res = await apiFetch('/v1/admin/usage/limits')
-      if (!res.ok) throw new Error('Failed to fetch limits')
-      return res.json()
+      return apiJson<{ limits: UsageLimit[] }>('/v1/admin/usage/limits').catch(withMessage('Failed to fetch limits'))
     },
   })
 }
@@ -310,15 +292,11 @@ export function useSetUsageLimit() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (data: { limit_type: string; target: string; period: string; cost_limit_usd: number | null }) => {
-      const res = await apiFetch('/v1/admin/usage/limits', {
+      await apiOk('/v1/admin/usage/limits', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to set limit')
-      }
+      }, 'Failed to set limit')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['admin-usage-limits'] })
@@ -331,15 +309,11 @@ export function useDeleteUsageLimit() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (data: { limit_type: string; target: string; period: string }) => {
-      const res = await apiFetch('/v1/admin/usage/limits/delete', {
+      await apiOk('/v1/admin/usage/limits/delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to delete limit')
-      }
+      }, 'Failed to delete limit')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['admin-usage-limits'] })

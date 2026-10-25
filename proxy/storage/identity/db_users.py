@@ -6,12 +6,13 @@ synchronous (called via ``asyncio.to_thread`` from async code).
 """
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import NamedTuple
 
-from storage.pg import get_conn
 from auth import roles
 from core import layout
+from storage.pg import get_conn
 
 logger = logging.getLogger("otodock.db-users")
 
@@ -53,6 +54,7 @@ def usernames_on_disk() -> frozenset[str]:
     directory (dot entries of ``AGENTS_DIR`` skipped: the offboarding
     archive lives in one). A scan that fails is logged and reads as none."""
     import os
+
     import config as _cfg
     names: set[str] = set()
     try:
@@ -354,67 +356,36 @@ def _cascade_remove_user_scope_items(conn, sub: str, agent: str | None) -> None:
         share_store.reap_person_placements(conn, sub, agent)
 
 
+# The steps above storage a membership change takes after its commit (a
+# person's memory scope removed on an agent they lost; their folders made on
+# the agents they hold): ``services/agents/agent_provisioning.py`` installs
+# them at startup, and these two run them where they always ran, bare (what
+# a step lets through propagates).
+_scope_memory_hooks: list[Callable[[str, str | None, str], None]] = []
+_agent_folder_hooks: list[Callable[[str, list[str]], None]] = []
+
+
+def on_membership_change(remove_scope_memory: Callable[[str, str | None, str], None],
+                         ensure_agent_folders: Callable[[str, list[str]], None]) -> None:
+    """Install the two post-commit steps; idempotent."""
+    if remove_scope_memory not in _scope_memory_hooks:
+        _scope_memory_hooks.append(remove_scope_memory)
+    if ensure_agent_folders not in _agent_folder_hooks:
+        _agent_folder_hooks.append(ensure_agent_folders)
+
+
 def _remove_user_scope_memory(sub: str, username: str | None, agent: str) -> None:
-    """Delete ``agents/{agent}/users/{username}/context/memory/`` after the
-    removal commits, so a later reassignment doesn't resurrect ghost
-    memories (git history in the per-user context repo still allows
-    recovery). Beneath the agent root with no symlink followed: the person's
-    own sessions write under ``users/{username}``. Best-effort: a missing
-    dir or username is silently ignored."""
-    if not username:
-        return
-    try:
-        import config as _cfg
-        from services.infra import safe_fs
-        # From AGENTS_DIR with the agent as the first component: the agent's
-        # own folder is not a root (a sidecar can swap it for a link).
-        rel = f"{agent}/{layout.USERS}/{username}/{layout.CONTEXT}/memory"
-        safe_fs.rmtree_beneath(_cfg.AGENTS_DIR, rel)
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        logger.warning(f"User-scope memory cleanup of {sub} on agent {agent} failed: {exc}")
+    if not _scope_memory_hooks:
+        logger.error("No provisioning hook installed: %s keeps their memory on %s", sub, agent)
+    for hook in _scope_memory_hooks:
+        hook(sub, username, agent)
 
 
 def _ensure_user_agent_dirs(sub: str, agents: list[str]) -> None:
-    """Create users/{username}/workspace and users/{username}/context dirs
-    for each agent the user is assigned to. Safe to call repeatedly.
-    Skips Shared-only agents — they have no per-user directories.
-    Also initializes a git repo in users/{username}/context/ so
-    per-user docs + memory/ are audit-tracked from day one.
-    """
-    try:
-        username = get_username_by_sub(sub)
-        if not username:
-            return
-        import config as _cfg
-        from core.session.visibility import is_shared_only
-        for agent_name in agents:
-            if is_shared_only(agent_name):
-                continue  # Shared-only agents are agent-scope; no per-user dirs
-            agent_dir = _cfg.get_agent_dir(agent_name)
-            if not agent_dir.exists():
-                continue
-            user_dir = layout.user_dir(agent_dir, username)
-            (user_dir / layout.WORKSPACE).mkdir(parents=True, exist_ok=True)
-            (user_dir / "context").mkdir(parents=True, exist_ok=True)
-            try:
-                from services.infra import git_writer
-                git_writer.init_if_missing(user_dir / "context")
-            except Exception as exc:
-                # Non-critical
-                logger.debug(f"Git init of user context dir for {agent_name} failed: {exc}")
-            # Bind this user's folder to its XFS project ID + limit before any
-            # write (no-op unless the kernel quota tier is enabled).
-            try:
-                from services.infra import storage_quota
-                storage_quota.ensure_scope(agent_name, "user", username)
-            except Exception as exc:
-                # Non-critical — the quota sweep re-asserts assignment
-                logger.debug(f"Quota scope binding for {agent_name} failed: {exc}")
-    except Exception as exc:
-        # Non-critical — dirs will be created on first access anyway
-        logger.debug(f"Ensuring user-agent dirs failed: {exc}")
+    if not _agent_folder_hooks:
+        logger.error("No provisioning hook installed: no folders for %s on %s", sub, agents)
+    for hook in _agent_folder_hooks:
+        hook(sub, agents)
 
 
 def set_user_agent_role(sub: str, agent: str, role: str) -> None:

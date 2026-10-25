@@ -311,7 +311,9 @@ def save_push_subscription(
     platform: str,
     subscription_data: str,
 ) -> dict:
-    """Save or update a push subscription. Returns the row."""
+    """Save or update a push subscription. Returns the row. A token
+    registered again takes the platform it now names (a token stored under
+    the wrong app platform reached no phone)."""
     now = _now()
     with get_conn() as conn:
         # Check for existing
@@ -322,8 +324,8 @@ def save_push_subscription(
         ).fetchone()
         if existing:
             conn.execute(
-                "UPDATE push_subscriptions SET updated_at=%s WHERE id=%s",
-                (now, existing["id"]),
+                "UPDATE push_subscriptions SET platform=%s, updated_at=%s WHERE id=%s",
+                (platform, now, existing["id"]),
             )
             row = conn.execute(
                 "SELECT * FROM push_subscriptions WHERE id=%s",

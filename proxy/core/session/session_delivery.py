@@ -45,8 +45,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+
+import psycopg
 
 logger = logging.getLogger("otodock.session-delivery")
 
@@ -55,7 +57,7 @@ logger = logging.getLogger("otodock.session-delivery")
 # With a chat_id the rung runs the echo turn through a headless pump and
 # returns "" (the pump persisted it); chat-less calls return the collected
 # response text for the pending-result flow. None = rung could not deliver.
-DeliverFn = Callable[..., "Awaitable[Optional[str]]"]
+DeliverFn = Callable[..., "Awaitable[str | None]"]
 
 # In-flight one-shot echo turns, keyed by chat id. An interactive re-warm that
 # starts while a one-shot ``--resume`` is still writing the same JSONL renders
@@ -79,9 +81,9 @@ async def chat_layer(chat: dict):
     acting role) off the loop, since the resolver reads the remote store.
     None when the row cannot be resolved (a target machine that is gone), so
     the caller takes its fallback instead of failing the delivery."""
-    from storage.pg import run_db
     from auth.providers import acting_role_of
     from core.session.session_manager import get_execution_layer
+    from storage.pg import run_db
 
     agent = chat.get("agent", "") or ""
     owner = chat.get("user_sub", "") or ""
@@ -94,15 +96,16 @@ async def chat_layer(chat: dict):
                 execution_target=chat.get("execution_target") or "",
             )
         return await run_db(_resolve)
-    except Exception:
+    except (RuntimeError, ValueError, psycopg.Error):
         logger.warning(
-            f"chat_layer: layer resolution failed for chat={str(chat.get('id', ''))[:8]}",
+            "chat_layer: layer resolution failed for chat=%s",
+            str(chat.get('id', ''))[:8],
             exc_info=True,
         )
         return None
 
 
-def oneshot_inflight(chat_id: str) -> "asyncio.Event | None":
+def oneshot_inflight(chat_id: str) -> asyncio.Event | None:
     """The in-flight one-shot delivery on ``chat_id``, or None. Warmups await
     the returned event (set on completion) before resuming the session."""
     return _oneshot_inflight.get(chat_id) if chat_id else None
@@ -143,7 +146,7 @@ async def deliver_prompt(
     persist_event: Callable[[str], None] | None = None,
     persistent_fn: DeliverFn | None = None,
     oneshot_fn: DeliverFn | None = None,
-    on_outcome: Callable[[DeliveryOutcome], "Optional[Awaitable[None]]"] | None = None,
+    on_outcome: Callable[[DeliveryOutcome], Awaitable[None] | None] | None = None,
     allow_pty: bool = True,
     allow_ws: bool = True,
     hops: int = 0,
@@ -230,8 +233,8 @@ async def deliver_prompt(
                 # can't double-persist.
                 _persist_once(target_chat_id or "")
                 logger.info(
-                    f"deliver_prompt[{source}]: queued on interactive PTY, "
-                    f"session={isess.session_id[:8]}"
+                    "deliver_prompt[%s]: queued on interactive PTY, "
+                    "session=%s", source, isess.session_id[:8]
                 )
                 outcome = DeliveryOutcome(
                     "pty", chat_id=target_chat_id or "",
@@ -257,9 +260,11 @@ async def deliver_prompt(
         notify_queue = _dashboard_notify_queues.get(session_id)
 
     logger.info(
-        f"deliver_prompt[{source}]: session={session_id[:8] if session_id else '-'}, "
-        f"chat={target_chat_id[:8] if target_chat_id else '-'}, "
-        f"notify_queue={'found' if notify_queue else 'not found'}"
+        "deliver_prompt[%s]: session=%s, "
+        "chat=%s, "
+        "notify_queue=%s",
+        source, session_id[:8] if session_id else '-',
+        target_chat_id[:8] if target_chat_id else '-', 'found' if notify_queue else 'not found'
     )
 
     # Liveness gate: the WS handler can only run the turn on a session that is
@@ -270,7 +275,8 @@ async def deliver_prompt(
     if notify_queue and session_id:
         try:
             from core.session.session_manager import (
-                get_layer_by_path, resolve_execution_path,
+                get_layer_by_path,
+                resolve_execution_path,
             )
             _ws_layer = get_layer_by_path(resolve_execution_path(
                 (chat or {}).get("agent", ""),
@@ -278,14 +284,15 @@ async def deliver_prompt(
             ))
             if not await _ws_layer.is_session_alive(session_id):
                 logger.info(
-                    f"deliver_prompt[{source}]: session {session_id[:8]} not "
-                    f"alive — skipping WS route, using the ladder"
+                    "deliver_prompt[%s]: session %s not "
+                    "alive — skipping WS route, using the ladder", source, session_id[:8]
                 )
                 notify_queue = None
-        except Exception:
+        except (ImportError, ValueError, psycopg.Error):
             logger.warning(
-                f"deliver_prompt[{source}]: liveness resolution failed for "
-                f"session {session_id[:8]} — keeping the WS route", exc_info=True,
+                "deliver_prompt[%s]: liveness resolution failed for "
+                "session %s — keeping the WS route",
+                source, session_id[:8], exc_info=True,
             )
 
     if allow_ws and notify_queue and notify_payload is not None:
@@ -295,7 +302,8 @@ async def deliver_prompt(
         notify_payload["chat_id"] = chat_id or None
         await notify_queue.put(notify_payload)
         logger.info(
-            f"deliver_prompt[{source}]: routed via dashboard WS, session={session_id[:8]}"
+            "deliver_prompt[%s]: routed via dashboard WS, session=%s",
+            source, session_id[:8]
         )
         return await _finish(
             DeliveryOutcome("ws", chat_id=target_chat_id or "", session_id=session_id),
@@ -328,8 +336,8 @@ async def deliver_prompt(
                 if pump_event:
                     push_pump_event(target_chat_id, pump_event)
                 logger.info(
-                    f"deliver_prompt[{source}]: steered into live turn, "
-                    f"chat={target_chat_id[:8]}"
+                    "deliver_prompt[%s]: steered into live turn, "
+                    "chat=%s", source, target_chat_id[:8]
                 )
                 return await _finish(
                     DeliveryOutcome(
@@ -347,7 +355,8 @@ async def deliver_prompt(
         if pump_event:
             push_pump_event(target_chat_id, pump_event)
         logger.info(
-            f"deliver_prompt[{source}]: queued on pump, chat={target_chat_id[:8]}"
+            "deliver_prompt[%s]: queued on pump, chat=%s",
+            source, target_chat_id[:8]
         )
         return await _finish(
             DeliveryOutcome("pump", chat_id=target_chat_id, session_id=session_id),
@@ -365,8 +374,9 @@ async def deliver_prompt(
         _live_pump = _pumps_now.get(target_chat_id)
         if _live_pump is not None and not _live_pump.is_done:
             logger.info(
-                f"deliver_prompt[{source}]: live non-consumer pump on "
-                f"chat={target_chat_id[:8]} — deferring to durable wake"
+                "deliver_prompt[%s]: live non-consumer pump on "
+                "chat=%s — deferring to durable wake",
+                source, target_chat_id[:8]
             )
             return await _finish(
                 DeliveryOutcome("none", chat_id=target_chat_id, session_id=session_id),
@@ -415,8 +425,9 @@ async def deliver_prompt(
             if _oneshot_blocked(session_id, target_chat_id):
                 _release_inflight()  # refusing — never wait while holding a claim
                 logger.info(
-                    f"deliver_prompt[{source}]: one-shot refused — live interactive "
-                    f"session/warmup holds chat={target_chat_id[:8] if target_chat_id else '-'}"
+                    "deliver_prompt[%s]: one-shot refused — live interactive "
+                    "session/warmup holds chat=%s",
+                    source, target_chat_id[:8] if target_chat_id else '-'
                 )
                 if allow_pty and target_chat_id:
                     retry = await _queue_on_pty_after_warmup(
@@ -451,7 +462,7 @@ async def _queue_on_pty_after_warmup(
     text: str,
     source: str,
     **context,
-) -> "DeliveryOutcome | None":
+) -> DeliveryOutcome | None:
     """A refused one-shot's recovery: wait (bounded) for the blocking warmup
     to settle, then queue the prompt on the chat's live PTY for quiescence
     injection. Returns the ``pty`` outcome, or None when no live session
@@ -460,16 +471,25 @@ async def _queue_on_pty_after_warmup(
     from core.session import interactive_session, warmup_registry
 
     deadline = time.monotonic() + _ONESHOT_WARMUP_WAIT_S
-    while warmup_registry.get(chat_id) is not None and time.monotonic() < deadline:
-        await asyncio.sleep(0.5)
+    # A newer warmup of the chat may follow the one waited for: the entry is
+    # read again after each wake.
+    while (inflight := warmup_registry.get(chat_id)) is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait_for(inflight.completed.wait(), remaining)
+        except TimeoutError:
+            break
     isess = interactive_session.find_live_for_chat(chat_id)
     if isess is None or not isess.alive:
         return None
     if not isess.queue_prompt(text, source, chat_id=chat_id, **context):
         return None
     logger.info(
-        f"deliver_prompt[{source}]: one-shot refusal recovered — queued on the "
-        f"warmed PTY, session={isess.session_id[:8]}, chat={chat_id[:8]}"
+        "deliver_prompt[%s]: one-shot refusal recovered — queued on the "
+        "warmed PTY, session=%s, chat=%s",
+        source, isess.session_id[:8], chat_id[:8]
     )
     return DeliveryOutcome("pty", chat_id=chat_id, session_id=isess.session_id)
 
@@ -494,7 +514,7 @@ def _oneshot_blocked(session_id: str, chat_id: str) -> bool:
 
 async def _finish(
     outcome: DeliveryOutcome,
-    on_outcome: Callable[[DeliveryOutcome], "Optional[Awaitable[None]]"] | None,
+    on_outcome: Callable[[DeliveryOutcome], Awaitable[None] | None] | None,
 ) -> DeliveryOutcome:
     """Run the caller's post-delivery hook (echo persistence etc.) and return
     the outcome. The hook also rides PTY-queued items so a close-time handback

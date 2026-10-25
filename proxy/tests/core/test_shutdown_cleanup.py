@@ -186,6 +186,7 @@ class TestFailsafe:
 class TestStopMcpThread:
     def test_skips_close_when_thread_wont_stop(self):
         from unittest.mock import MagicMock
+
         from core.layers.direct import mcp as direct_mcp
 
         loop = MagicMock()
@@ -201,6 +202,7 @@ class TestStopMcpThread:
 
     def test_closes_stopped_loop_and_is_idempotent(self):
         from unittest.mock import MagicMock
+
         from core.layers.direct import mcp as direct_mcp
 
         loop = MagicMock()

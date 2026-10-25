@@ -26,15 +26,22 @@ Codex (thread-id resume already covers next-turn continuity) and direct-LLM
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 from datetime import datetime, timezone
+from typing import cast
 
+import psycopg
+
+from core import placement
+from core.background import spawn
+from core.permission_modes import ASK_MODE, current_mode
+from core.session import session_kind
+from services.scheduler import cut_turns
 from storage import database as task_store
 from storage.automation import run_status
-from core import placement
-from core.session import session_kind
-from core.background import spawn
+from storage.chat import open_turns
 
 logger = logging.getLogger("otodock.recovery")
 
@@ -59,7 +66,8 @@ def _is_remote_cli_chat(chat: dict) -> bool:
     resolve it the way the spawn path does before comparing; the literal
     comparison silently excluded every delegate lane from Mode C."""
     from core.session.session_manager import (
-        get_layer_capabilities, resolve_execution_path,
+        get_layer_capabilities,
+        resolve_execution_path,
     )
     path = resolve_execution_path(
         chat.get("agent") or "", chat.get("execution_path") or "",
@@ -83,7 +91,7 @@ def defer_orphaned_runs() -> tuple[int, int]:
         eligible = (
             bool(session_id) and bool(chat)
             and bool(placement.machine_of(target))
-            and _is_remote_cli_chat(chat)
+            and _is_remote_cli_chat(cast("dict", chat))
         )
         if eligible:
             _parked[session_id] = {
@@ -141,6 +149,7 @@ async def sweep_expired() -> None:
             "Recovery: parked session %s deadline lapsed — failed run %s",
             (rec.get("chat_id") or "")[:16], rid or "(none)",
         )
+    await cut_turns.sweep_expired()
 
 
 def _fail_run(run_id: str, reason: str) -> None:
@@ -177,8 +186,11 @@ def _readopt_state(machine_id: str, session_id: str, chat: dict | None) -> tuple
     process holds for it."""
     from core.session import session_kind
     from core.session.session_state import (
-        get_session_client_type, get_session_security, live_state,
-        reloaded_state, security_context_expired,
+        get_session_client_type,
+        get_session_security,
+        live_state,
+        reloaded_state,
+        security_context_expired,
     )
     ctx = get_session_security(session_id)
     if ctx is None or not _placed_here(ctx, machine_id):
@@ -192,7 +204,7 @@ def _readopt_state(machine_id: str, session_id: str, chat: dict | None) -> tuple
         if not session_kind.attended(get_session_client_type(session_id)):
             mode = "auto"
         else:
-            mode = (chat or {}).get("permission_mode") or "default"
+            mode = current_mode((chat or {}).get("permission_mode") or ASK_MODE)
     return mode, floor
 
 
@@ -200,7 +212,9 @@ def _mark_reported_starting(reported: dict[str, dict], machine_id: str,
                             others: dict[str, dict] | None = None) -> None:
     from core.session.session_manager import capabilities_for_path
     from core.session.session_state import (
-        READOPT_MARK_TTL_S, get_session_security, mark_starting,
+        READOPT_MARK_TTL_S,
+        get_session_security,
+        mark_starting,
     )
     for sid, info in [*reported.items(), *(others or {}).items()]:
         ctx = get_session_security(sid) if sid else None
@@ -275,6 +289,9 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict],
     # Every reported session's replay mark is read now, a parked one's too,
     # so none outlives this report.
     marked = {sid for sid in reported if take_recover_pending(sid)}
+    # A turn the restart cut that its machine still holds is replayed even
+    # when it finished while the platform was down: the satellite kept it.
+    marked |= {sid for sid in reported if cut_turns.waiting(sid)}
 
     from core.session.session_manager import _get_remote_layer
     remote = _get_remote_layer()
@@ -302,7 +319,7 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict],
         for sid, _rec in to_fail:
             _parked.pop(sid, None)
 
-    for sid, rec in to_fail:
+    for _sid, rec in to_fail:
         rid = rec.get("run_id")
         if rid:
             await asyncio.to_thread(
@@ -341,7 +358,7 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict],
         spawn(_recover_session(
             machine_id, sid, info,
             run_id=rec.get("run_id"), chat_id=rec["chat_id"],
-            agent=rec["agent"], state=state,
+            agent=rec["agent"], state=state, cut=cut_turns.claim(sid),
         ), name="recover_session", owner="run_recovery")
 
     # Adopt plain chats whose turn was live at the shutdown (no parked run)
@@ -385,7 +402,7 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict],
         spawn(_recover_session(
             machine_id, sid, info,
             run_id=None, chat_id=chat["id"], agent=chat.get("agent") or "",
-            state=state,
+            state=state, cut=cut_turns.claim(sid),
         ), name="recover_session", owner="run_recovery")
 
     # Idle sessions the satellite kept alive across the restart get
@@ -450,6 +467,10 @@ async def on_sessions_alive(machine_id: str, sessions: list[dict],
                 logger.exception("Recovery: the held session %s on %s failed",
                                  sid[:8], machine_id[:8])
 
+    # The turns the restart cut on this machine that nothing above adopted
+    # get their closing row now.
+    await cut_turns.settle_machine(machine_id)
+
     # This machine is back: redeliver any delegate wakes parked on ITS chats —
     # including idle ones the adopt loops above never touch (a wake stored
     # while the machine was away can only deliver now).
@@ -476,12 +497,13 @@ def _drop_local_state(session_id: str) -> None:
     """A declined session's context and the platform-side caches kept for it
     (the caches are named by its context, so they go first)."""
     from core.session.session_state import (
-        cleanup_session_permission_state, get_session_security,
+        cleanup_session_permission_state,
+        get_session_security,
     )
     try:
         from core.remote import remote_file_flow
         remote_file_flow.cleanup_session(session_id)
-    except Exception:
+    except Exception:  # noqa: BLE001  # purging a recovered session's leftovers, the recovery goes on
         logger.warning("Recovery: remote file cache of %s not purged", session_id[:8],
                        exc_info=True)
     ctx = get_session_security(session_id)
@@ -489,7 +511,7 @@ def _drop_local_state(session_id: str) -> None:
         try:
             from services.mcp import mcp_output_relocation
             mcp_output_relocation.cleanup_session(session_id, ctx.agent, ctx.username)
-        except Exception:
+        except Exception:  # noqa: BLE001  # purging a recovered session's leftovers, the recovery goes on
             logger.warning("Recovery: MCP outputs of %s not purged", session_id[:8],
                            exc_info=True)
     cleanup_session_permission_state(session_id)
@@ -536,7 +558,7 @@ def _adopted_model(chat: dict, execution_path: str, reported: str) -> str:
             if any((m.get("model_id") or "") == model
                    for m in subscription_store.list_models(execution_path)):
                 return model
-        except Exception:
+        except psycopg.Error:
             logger.debug("model check failed for %s", execution_path, exc_info=True)
     return reported or model
 
@@ -547,7 +569,10 @@ async def _other_session(remote, machine_id: str, sid: str, entry: dict,
     one back, with a thread to resume, its chat on this engine and machine,
     its person's standing and its context, is taken back; anything else is
     closed on the satellite by the incarnation the report named."""
-    from core.session.session_manager import capabilities_for_path, resolve_execution_path
+    from core.session.session_manager import (
+        capabilities_for_path,
+        resolve_execution_path,
+    )
     if _held_or_spawning(remote, sid):
         return
     path = entry.get("execution_path") or ""
@@ -584,6 +609,7 @@ async def _other_session(remote, machine_id: str, sid: str, entry: dict,
         if not _held_or_spawning(remote, sid):
             await decline(sid, why, drop_state=drop, incarnation=entry.get("incarnation") or "")
         return
+    chat, state = cast("dict", chat), cast("tuple[str, int]", state)  # no why: the last branch set both
     from storage import remote_store
     machine = await asyncio.to_thread(remote_store.get_remote_machine, machine_id)
     model = await asyncio.to_thread(_adopted_model, chat, path, entry.get("model") or "")
@@ -628,13 +654,16 @@ async def _machine_resume_pass(machine_id: str, reported: set[str]) -> None:
                 continue
             chat = await asyncio.to_thread(task_store.get_chat_by_session, sid)
             if lanes.takes_chat_contract(chat, sid):
-                arm_bg_monitors(remote, sid, chat["id"])
+                arm_bg_monitors(remote, sid, cast("dict", chat)["id"])  # the contract needs a chat row
     except Exception:
         logger.exception("Resume pass: monitors failed for machine %s", machine_id[:8])
     try:
         for chat_id in await asyncio.to_thread(
                 task_store.list_chats_with_waiting_input, machine_id, on_machine):
             input_queue.clear_waiting(chat_id)
+            # A message that waited on this machine's unanswered probe before
+            # it dropped waits for nothing now either.
+            input_queue.clear_waiting(chat_id, input_queue.WAITING_MACHINE)
             input_queue.arm(chat_id)
     except Exception:
         logger.exception("Resume pass: queued messages failed for machine %s",
@@ -644,9 +673,12 @@ async def _machine_resume_pass(machine_id: str, reported: set[str]) -> None:
 async def _recover_session(
     machine_id: str, session_id: str, info: dict,
     *, run_id: str | None, chat_id: str, agent: str,
-    state: tuple[str, int] = ("", 0),
+    state: tuple[str, int] = ("", 0), cut: dict | None = None,
 ) -> None:
-    """Drive the adopted turn through a recovery pump, then finalize the run."""
+    """Drive the adopted turn through a recovery pump, then finalize the run.
+    ``cut``: the turn's waiting closing-row entry (``cut_turns.claim``). Its
+    open-turn record is taken before the replay pump writes its own, and the
+    replay's first event decides (``_settle_cut``)."""
     from core.events.stream_pump import ChatStreamPump, _active_pumps
     from core.session.session_manager import _get_remote_layer
 
@@ -658,19 +690,26 @@ async def _recover_session(
             "Recovery: chat %s already has a live pump — skipping adopt",
             chat_id[:16],
         )
+        await cut_turns.close_claimed(cut)
         return
 
     layer = _get_remote_layer()
     if layer is None:
         _clear_readopt_mark(session_id, machine_id)
+        await cut_turns.close_claimed(cut)
         return
+    taken = await _take_cut(chat_id, cut)
+    closed = False      # the replay never began: the cut turn got its closing row
 
     command_id = info.get("command_id", "")
     use_native = bool(info.get("use_native_permissions"))
     event_queue: asyncio.Queue = asyncio.Queue()
 
     async def _produce():
-        from core.events.common_events import CommonEvent, ERROR, PRODUCER_DONE
+        from core.events.common_events import DONE, ERROR, PRODUCER_DONE, CommonEvent
+        from core.remote.remote_resume import REPLAY_BEGIN
+        nonlocal closed
+        settled = False
         try:
             async for event in layer.adopt_session(
                 machine_id=machine_id, session_id=session_id,
@@ -679,12 +718,23 @@ async def _recover_session(
                 use_native_permissions=use_native,
                 mode=state[0], token_floor=state[1],
             ):
-                await event_queue.put(event)
-        except Exception as e:  # noqa: BLE001
+                if not settled:
+                    settled = True
+                    closed = await _settle_cut(chat_id, taken, began=event.type not in (DONE, ERROR),
+                                      truncated=bool(event.data.get("truncated"))
+                                      if event.type == REPLAY_BEGIN else False,
+                                      errored=event.type == ERROR)
+                if event.type != REPLAY_BEGIN:
+                    await event_queue.put(event)
+        except Exception as e:  # the producer turns any failure into an error event for the pump
             logger.exception("Recovery producer failed for %s", session_id[:8])
+            settled = True
             await event_queue.put(CommonEvent(type=ERROR,
                                               data={"message": str(e)}))
         finally:
+            if not settled:
+                closed = await _settle_cut(chat_id, taken, began=False, truncated=False,
+                                           errored=False)
             await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))
 
     producer = asyncio.create_task(_produce())
@@ -705,19 +755,65 @@ async def _recover_session(
     )
     # asyncio.wait, not the task: cancelling this coroutine at shutdown must
     # never cancel the adopted pump (its chat stays recoverable).
-    await asyncio.wait({pump._task})
-    if not pump._task.cancelled() and pump._task.exception() is not None:
+    await asyncio.wait({cast("asyncio.Task", pump._task)})  # start() set it
+    if not cast("asyncio.Task", pump._task).cancelled() and cast("asyncio.Task", pump._task).exception() is not None:
         logger.error("Recovery pump error for chat %s", chat_id[:16],
-                     exc_info=pump._task.exception())
+                     exc_info=cast("asyncio.Task", pump._task).exception())
 
     if run_id:
-        await _finalize_run(run_id, chat_id)
+        await _finalize_run(run_id, chat_id, cut_short=closed)
 
 
-async def _finalize_run(run_id: str, chat_id: str) -> None:
+async def _take_cut(chat_id: str, cut: dict | None) -> open_turns.Taken | None:
+    """The claimed cut turn's record, taken on the chat's lane before the
+    replay pump writes its own: its early ranges and its start, None when
+    there is none."""
+    if cut is None:
+        return None
+    from core.events import chat_writer
+    try:
+        return await chat_writer.submit(chat_id, functools.partial(
+            open_turns.take_record, chat_id, cut["token"]), label="turn_replay_take")
+    except Exception:  # the replay goes on: at worst it repeats rows a checkpoint saved
+        logger.exception("Recovery: chat %s: the cut turn's record was not taken", chat_id[:16])
+        return None
+
+
+async def _settle_cut(chat_id: str, taken: open_turns.Taken | None, *,
+                      began: bool, truncated: bool, errored: bool) -> bool:
+    """The replay's first event decides the cut turn's early rows, before the
+    replay writes anything: an untruncated replay writes the whole turn, so
+    they go; a truncated one lost the turn's start, so they stay (an overlap
+    repeated beats a start lost); no replay at all keeps them and writes the
+    closing row (an error's own card ends the turn instead). True when it
+    wrote the closing row."""
+    if taken is None:
+        return False
+    from core.events import chat_writer
+    try:
+        if began and not truncated and taken.early:
+            dropped = await chat_writer.submit(chat_id, functools.partial(
+                task_store.delete_chat_message_ranges, chat_id, taken.early),
+                label="turn_replay_drop")
+            logger.info("Recovery: chat %s: %s row(s) saved early left to the replay",
+                        chat_id[:16], dropped)
+        elif not began and not errored:
+            await cut_turns.close_taken(chat_id, taken.started_at)
+            return True
+    except Exception:  # the replay goes on
+        logger.exception("Recovery: chat %s: the cut turn's early rows were not settled", chat_id[:16])
+    return False
+
+
+async def _finalize_run(run_id: str, chat_id: str, *, cut_short: bool = False) -> None:
     """Complete a recovered run: persist the collected output + cost, then
-    fire the delegate callback if any. Called after the recovery pump ends."""
+    fire the delegate callback if any. Called after the recovery pump ends.
+    ``cut_short``: the replay never began and the chat got the restart's
+    closing row: the run fails with the same ending, its callback says so."""
+    from core.events import turn_ending
     from services.scheduler import scheduler
+    ending = turn_ending.TurnEnding(reason=turn_ending.RESTARTED) if cut_short else None
+    final = run_status.FAILED if ending else run_status.COMPLETED
     run = await asyncio.to_thread(task_store.get_run, run_id)
     if not run or not run_status.is_live(run.get("status")):
         return  # already terminal (a concurrent path finished it)
@@ -725,13 +821,14 @@ async def _finalize_run(run_id: str, chat_id: str) -> None:
     chat_row = await asyncio.to_thread(task_store.get_chat, chat_id) or {}
     cost = chat_row.get("total_cost") or 0
     await asyncio.to_thread(
-        task_store.update_run, run_id, status=run_status.COMPLETED,
+        task_store.update_run, run_id, status=final,
         output_text=output[:10000] if output else "",
         completed_at=_now(),
         cost_usd=cost if cost > 0 else None,
         chat_id=chat_id,
+        error_message=ending.summary() if ending else None,
     )
-    logger.info("Recovery: run %s completed after re-adopt", run_id)
+    logger.info("Recovery: run %s %s after re-adopt", run_id, final)
     # Delegate hand-off (best-effort; self-gates on on_complete_agent).
     dyn = await asyncio.to_thread(
         task_store.get_dynamic_task, run.get("task_id") or "",
@@ -739,6 +836,7 @@ async def _finalize_run(run_id: str, chat_id: str) -> None:
     if dyn:
         task = scheduler._row_to_task(dyn)
         try:
-            await scheduler._deliver_task_result(task, "completed", output or "", run_id=run_id)
+            await scheduler._deliver_task_result(task, final, output or "", run_id=run_id,
+                                                 ending=ending)
         except Exception:
             logger.exception("Recovery delegate delivery failed for %s", run_id)

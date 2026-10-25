@@ -3,6 +3,8 @@ import type { FileNode } from '../../api/agents'
 import { dropRoots, type DropRoot } from '../../lib/droppedItems'
 import FileTile from './FileTile'
 
+const DBLCLICK_MS = 400
+
 interface Props {
   agent: string
   nodes: FileNode[]
@@ -104,10 +106,9 @@ export default function FileGrid({
   // tiles fast — sometimes opening the second file even though the
   // clicks landed on different elements. Tracking the path + timestamp
   // ourselves guarantees we only open when both clicks hit the same tile.
-  const DBLCLICK_MS = 400
   const lastClickRef = useRef<{ path: string; time: number } | null>(null)
 
-  const dispatchClick = (node: FileNode, e: React.MouseEvent) => {
+  const dispatchClick = useCallback((node: FileNode, e: React.MouseEvent) => {
     e.stopPropagation()
     // Mobile: tap = open in normal mode, tap = toggle in selection mode.
     if (!isDesktop) {
@@ -136,7 +137,7 @@ export default function FileGrid({
     }
     lastClickRef.current = { path: node.path, time: now }
     onSelectReplace(node.path)
-  }
+  }, [isDesktop, selectionMode, onSelectToggle, onOpen, onSelectRange, visibleOrder, onSelectReplace])
 
   return (
     <div
@@ -156,11 +157,11 @@ export default function FileGrid({
       onDragOver={onDragOver}
       onDrop={onDrop}
       className={`relative h-full overflow-auto p-2 pb-24 transition-colors ${
-        dragDepth > 0 ? 'ring-2 ring-brand ring-inset bg-brand/5' : ''
+        dragDepth > 0 ? 'ring-2 ring-action ring-inset bg-action-subtle' : ''
       }`}
     >
       {nodes.length === 0 ? (
-        <div className="flex items-center justify-center h-full text-xs text-p-text-light">
+        <div className="flex items-center justify-center h-full text-xs text-tertiary">
           Empty folder.
         </div>
       ) : (

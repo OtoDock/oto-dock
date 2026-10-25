@@ -39,10 +39,14 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
+
+import psycopg
+
 from auth import roles
-from core.placement import LOCAL_PLACEMENT, PlacementCapabilities
 from core import host_os
+from core.placement import LOCAL_PLACEMENT, PlacementCapabilities
 from services.infra import external_data
 
 logger = logging.getLogger("otodock")
@@ -95,6 +99,9 @@ async def get_dynamic_contexts(
     if "department" not in kwargs and any(
             _providers.get(n) is _delegation_mcp_context for n in assigned_mcp_names):
         kwargs["department"] = await asyncio.to_thread(_department_data, agent_name)
+    # A session is told once where its GitHub reach stops (the gateway and
+    # the credential helper refuse past it), by the scope it resolves in.
+    reach_lines = await asyncio.to_thread(_reach_lines, agent_name, assigned_mcp_names, user_sub)
 
     for mcp_name in assigned_mcp_names:
         # 1. Python provider (iterative / computed context)
@@ -112,7 +119,7 @@ async def get_dynamic_contexts(
                 )
                 if text:
                     results.append((mcp_name, text))
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # a registered context provider failing must not drop the others
                 logger.warning(
                     "Dynamic context provider '%s' failed: %s", mcp_name, e
                 )
@@ -125,12 +132,45 @@ async def get_dynamic_contexts(
             )
             for text in blocks:
                 results.append((mcp_name, text))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # agent_context blocks span the db and builder tools, the prompt goes on
             logger.warning(
                 "agent_context resolution failed for '%s': %s", mcp_name, e
             )
+        if mcp_name in reach_lines:
+            results.append((mcp_name, reach_lines[mcp_name]))
 
     return results
+
+
+def _reach_lines(agent_name: str, mcp_names: list[str], user_sub: str = "") -> dict[str, str]:
+    """The line a session reads for each MCP whose GitHub reach narrows the
+    agent (``auth/github_reach``), in the scope its credentials resolve in:
+    a session with a user resolves as that person (their own choice of
+    account for the agent), except on a Shared-only agent, whose chats
+    mount the agent scope and resolve through its service binding as a
+    session with no user does. ``user_sub`` is the credential user (none
+    for an agent-scope task)."""
+    from auth import github_reach
+    from auth.oauth_providers import github_app
+    from core.session.visibility import SCOPE_AGENT, SCOPE_USER, is_shared_only
+    from services.mcp import mcp_registry
+    from services.oauth.credential_resolver import binding_reach
+    github: list[str] = []
+    for name in mcp_names:
+        manifest = mcp_registry.get_manifest(name)
+        oauth = (manifest.credentials.oauth or {}) if manifest and manifest.credentials else {}
+        if str(oauth.get("provider_id") or "") == github_app.PROVIDER_ID:
+            github.append(name)
+    if not github:
+        return {}
+    own = bool(user_sub) and not is_shared_only(agent_name)
+    out: dict[str, str] = {}
+    for name in github:
+        reach = binding_reach(name, agent_name, user_sub=user_sub if own else None,
+                              task_scope=SCOPE_USER if own else SCOPE_AGENT)
+        if reach is not None:
+            out[name] = github_reach.instructions_line(reach)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -258,10 +298,10 @@ def _build_token_map(
     Tokens that cannot be resolved are simply absent from the map. The
     substitution loop renders absent tokens as the empty string.
     """
+    from services.oauth import credential_resolver
+    from storage import database as task_store
     from storage.agents import agent_store
     from storage.identity import credential_store
-    from storage import database as task_store
-    from services.oauth import credential_resolver
 
     tokens: dict[str, str] = {}
 
@@ -340,7 +380,7 @@ def _build_token_map(
                 svc = credential_store.get_user_credentials(
                     ref.owner_sub, mcp_name, account_label,
                 )
-            except Exception as e:
+            except psycopg.Error as e:
                 logger.warning(
                     "Failed to load bound user credentials for token map "
                     "(mcp=%s account=%s user=%s): %s",
@@ -406,7 +446,7 @@ def _populate_account_extras(
             return
         for ek, ev in extra.items():
             tokens[f"account.extra.{ek}"] = str(ev or "")
-    except Exception as e:
+    except (psycopg.Error, OSError, ValueError) as e:
         logger.debug(
             "account.extra.* population skipped (mcp=%s account=%s): %s",
             mcp_name, account_label, e,
@@ -532,8 +572,7 @@ async def _resolve_manifest_blocks(
     for parallel evaluation via ``asyncio.gather`` so total latency is
     ``max(per-block timeouts)`` rather than the sum.
     """
-    from services.mcp import mcp_registry
-    from services.mcp import builder_executor
+    from services.mcp import builder_executor, mcp_registry
 
     manifest = mcp_registry.get_manifest(mcp_name)
     if not manifest or not manifest.agent_context:
@@ -594,8 +633,8 @@ async def _resolve_manifest_blocks(
         idxs = [j[0] for j in builder_jobs]
         coros = [j[1] for j in builder_jobs]
         builder_results = await asyncio.gather(*coros, return_exceptions=True)
-        for idx, result in zip(idxs, builder_results):
-            if isinstance(result, Exception):
+        for idx, result in zip(idxs, builder_results, strict=False):
+            if isinstance(result, BaseException):
                 logger.warning(
                     "builder block %d on '%s' raised %s: %s",
                     idx, mcp_name, type(result).__name__, result,
@@ -636,8 +675,8 @@ def build_delegation_roster(
     from a context provider (providers are no-I/O by contract).
     """
     import config as app_config
-    from api.agents._common import _get_execution_paths
     from storage.agents import agent_store
+    from storage.agents.agent_store import _get_execution_paths
     from storage.billing import subscription_store
 
     models_by_layer: dict[str, list[dict]] = {}
@@ -658,7 +697,7 @@ def build_delegation_roster(
                     "tier_label": app_config.MODEL_TIER_LABELS.get(m.get("tier") or 0, ""),
                     "good_at": m.get("good_at") or "",
                 } for m in rows]
-            except Exception:
+            except psycopg.Error:
                 models_by_layer[path] = []
         return models_by_layer[path]
 
@@ -675,7 +714,7 @@ def build_delegation_roster(
             # shows no default at all.
             try:
                 default_model = app_config.resolve_agent_model(slug, layer=path)
-            except Exception:
+            except (RuntimeError, psycopg.Error):
                 default_model = ""
             catalog = _layer_models(path)
             models = [m["model_id"] for m in catalog]
@@ -756,8 +795,8 @@ def build_meetings_access(user_sub: str, user_role: str) -> list[dict]:
     and pass the result through the ``meetings_access`` kwarg; NEVER call
     from a context provider (providers are no-I/O by contract).
     """
-    from storage.agents import agent_store
     from storage import database as task_store
+    from storage.agents import agent_store
 
     if not user_sub:
         return []
@@ -850,8 +889,7 @@ def _department_line(
     if not dept_id or not level_id:
         return ""
     try:
-        from storage.agents import agent_store
-        from storage.agents import db_departments
+        from storage.agents import agent_store, db_departments
         # ``department`` is the row ``get_dynamic_contexts`` pre-resolved
         # off the loop; a direct caller without it reads here.
         dept = (db_departments.get_department(dept_id)
@@ -1301,6 +1339,7 @@ def format_ssh_host_command(field_values: dict, *, mux: bool) -> str | None:
     )
 
 # memory-mcp has no dynamic_context provider — memory reaches the prompt
-# via the dedicated # Memory sections (``config._render_memory_sections``:
+# via the dedicated # Memory sections
+# (``configuration.prompts._render_memory_sections``:
 # topic files inline under the budget, generated index past it), so a
 # session restart picks up new entries via the normal prompt build.

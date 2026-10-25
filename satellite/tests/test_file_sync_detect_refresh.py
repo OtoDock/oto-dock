@@ -523,8 +523,9 @@ def test_cli_runtime_cruft_excluded(tmp_path):
         assert "users/alice/.claude/.credentials.json" not in paths
         assert "users/alice/.claude/.settings.json.oto-tmp-0a1b" not in paths
         assert "users/alice/.claude/bin/.gh.oto-tmp-0a1b" not in paths
-        # .codex/models_cache.json is real config and DOES sync.
-        assert "users/alice/.codex/models_cache.json" in paths
+        # .codex/models_cache.json is Codex's own catalog cache: a direct
+        # file under the engine home, never synced (only skills/ is).
+        assert "users/alice/.codex/models_cache.json" not in paths
         for leaked in ("users/alice/.claude/projects/f", "users/alice/.claude/tasks/f",
                        "users/alice/.claude/backups/f",
                        "users/alice/.claude/shell-snapshots/f", "users/alice/.codex/sessions/f",
@@ -534,13 +535,51 @@ def test_cli_runtime_cruft_excluded(tmp_path):
             assert leaked not in paths, f"leaked: {leaked}"
 
 
+def test_only_the_persons_folders_sync_under_an_engine_home(tmp_path):
+    """Under ``workspace/.claude`` and ``users/<u>/.codex`` the CLIs keep
+    their own files (``history.jsonl``, ``state/``, the ``bin`` wrappers, the
+    model catalog cache): never listed by any surface, so the platform never
+    scrubs them. What a person authors syncs (Claude's skills, commands,
+    agents and output styles; Codex's prompts and skills); a ``.claude``
+    nested deeper (a repository's project config) keeps the general rules."""
+    for rel in ("users/alice/.claude/history.jsonl", "users/alice/.claude/bin/gh",
+                "users/alice/.claude/skills/x/SKILL.md", "users/alice/.claude/commands/d.md",
+                "users/alice/.claude/agents/r.md", "users/alice/.claude/output-styles/t.md",
+                "users/alice/.claude/prompts/p.md", "workspace/.codex/installation_id",
+                "workspace/.codex/state/s.json", "workspace/.codex/thread-writer-locks/t.lock",
+                "workspace/.codex/models_cache.json", "workspace/.codex/skills/y/SKILL.md",
+                "workspace/.codex/prompts/q.md", "workspace/.codex/commands/c.md",
+                "workspace/repo/.claude/commands/deploy.md", "users/alice/notes.md"):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+    expected = {"users/alice/.claude/skills/x/SKILL.md", "users/alice/.claude/commands/d.md",
+                "users/alice/.claude/agents/r.md", "users/alice/.claude/output-styles/t.md",
+                "workspace/.codex/skills/y/SKILL.md", "workspace/.codex/prompts/q.md",
+                "workspace/repo/.claude/commands/deploy.md", "users/alice/notes.md"}
+    assert set(snapshot_agent_dir(tmp_path)) == expected
+    assert {e["path"] for e in compute_manifest(tmp_path)} == expected
+    for rel in ("users/alice/.claude/history.jsonl", "users/alice/.claude/bin/gh",
+                "users/alice/.claude/bin", "users/alice/.claude/prompts/p.md",
+                "workspace/.codex/state/s.json", "workspace/.codex/commands/c.md",
+                "workspace/.codex/models_cache.json"):
+        assert _file_sync.is_unsynced_engine_home_path(rel), rel
+    for rel in ("users/alice/.claude/skills", "users/alice/.claude/skills/x/SKILL.md",
+                "users/alice/.claude/commands/d.md", "workspace/.codex/prompts/q.md",
+                "workspace/repo/.claude/commands/deploy.md", "users/alice/notes.md",
+                "workspace/.claude", "users/alice/.codex"):
+        assert not _file_sync.is_unsynced_engine_home_path(rel), rel
+
+
 def test_the_per_session_mcp_config_copies_never_sync(tmp_path):
     """The session MCP config copies carry that session's own tokens and are
     rewritten at every start: this satellite's ``mcp-config-<sid12>.json``,
     the proxy's ``<agent>-<sha256(sub)[:12]>-<sid12>.json`` and the shared
     names earlier releases wrote are host-local, so the manifest never lists
-    them (the proxy would push its copies here and scrub ours)."""
-    cl = tmp_path / "users" / "alice" / ".claude"
+    them (the proxy would push its copies here and scrub ours). Under an
+    engine home no direct file syncs at all, so the rule is pinned on a
+    nested project config, where the general rules apply."""
+    cl = tmp_path / "workspace" / "repo" / ".claude"
     cl.mkdir(parents=True)
     copies = ("mcp-config.json", "mcp-config-1a2b3c4d-5e6.json",
               "personal-assistant-0123456789ab-1a2b3c4d-5e6.json",
@@ -551,8 +590,8 @@ def test_the_per_session_mcp_config_copies_never_sync(tmp_path):
     for paths in (set(snapshot_agent_dir(tmp_path)),
                   {e["path"] for e in compute_manifest(tmp_path)}):
         for name in copies:
-            assert f"users/alice/.claude/{name}" not in paths, name
-        assert "users/alice/.claude/notes.json" in paths
+            assert f"workspace/repo/.claude/{name}" not in paths, name
+        assert "workspace/repo/.claude/notes.json" in paths
 
 
 def test_large_changed_file_reports_hash_size_without_reading(tmp_path, monkeypatch):

@@ -8,14 +8,14 @@ without an XDG user-dirs file), macOS, Windows (mocked via
 
 import sys
 
-
 # Add repo root to path so we can import satellite/* directly.
 from tests._paths import REPO_ROOT as _REPO_ROOT
+
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from satellite import config as sat_config  # noqa: E402
-from satellite.sessions.session_manager import (  # noqa: E402
+from satellite import config as sat_config
+from satellite.sessions.session_manager import (
     _detect_os_user_and_home,
     _detect_user_dirs,
 )

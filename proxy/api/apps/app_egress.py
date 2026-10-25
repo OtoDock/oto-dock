@@ -23,9 +23,8 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
 from api.apps import app_proxy
-from api.apps import manifest as _mf
 from auth.request_path import has_traversal
-from services.apps import app_secrets, app_supervisor
+from services.apps import app_secrets, app_supervisor, manifest as _mf
 from services.infra import pinned_http
 from services.infra.outbound_url import validate_outbound_url
 from storage import database as task_store
@@ -49,13 +48,13 @@ def _http(url: str = "") -> httpx.AsyncClient:
     if url and pinned_http.proxied(url):
         if _proxied_client is None or _proxied_client.is_closed:
             _proxied_client = httpx.AsyncClient(timeout=EGRESS_TIMEOUT_S, follow_redirects=False)
-            _proxied_client.cookies.jar = app_proxy._NoCookieJar()
+            _proxied_client.cookies.jar = app_supervisor._NoCookieJar()
         return _proxied_client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
             timeout=EGRESS_TIMEOUT_S, follow_redirects=False,
             transport=pinned_http.CheckedTransport(pinned_http.public_only))
-        _client.cookies.jar = app_proxy._NoCookieJar()
+        _client.cookies.jar = app_supervisor._NoCookieJar()
     return _client
 
 
@@ -135,7 +134,7 @@ async def app_egress(app_id: str, host: str, path: str, request: Request):
     except (httpx.HTTPError, httpx.InvalidURL) as e:
         logger.warning("App %s: egress to %s failed: %s", row.get("slug"), host,
                        type(e).__name__)
-        raise app_proxy._refuse(502, "the host did not answer")
+        raise app_proxy._refuse(502, "the host did not answer") from e
     if 300 <= upstream.status_code < 400 and upstream.status_code != 304:
         await upstream.aclose()
         raise app_proxy._refuse(502, "the host answered with a redirect")

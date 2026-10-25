@@ -6,15 +6,19 @@ workspace, and pushes an inline audio player to the dashboard. BYO key only:
 ``ELEVENLABS_API_KEY`` comes from the MCP instance config (admin page).
 """
 
+import asyncio
 import json
 import logging
 import os
 import uuid
+from pathlib import Path
 
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+
+from _tool_args import ToolArgs
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -60,11 +64,12 @@ def _missing_key_msg() -> str:
 # ---------------------------------------------------------------------------
 
 server = Server("music-gen")
+TOOL_ARGS = ToolArgs()
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="compose_music",
             description=(
@@ -119,6 +124,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["prompt"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
         ),
         Tool(
             name="sound_effect",
@@ -164,12 +170,16 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["prompt"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
         ),
-    ]
+    ])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     if name == "compose_music":
         return await _handle_compose(arguments)
     elif name == "sound_effect":
@@ -197,7 +207,7 @@ async def _hook_post(endpoint: str, payload: dict, *, read_timeout: float = 120.
             )
             resp.raise_for_status()
             return True
-    except Exception as e:
+    except httpx.HTTPError as e:
         logger.warning("Hook %s failed: %s", endpoint, e)
         return False
 
@@ -291,7 +301,7 @@ def _api_error_message(e: httpx.HTTPStatusError) -> str:
     detail = ""
     try:
         detail = json.dumps(e.response.json().get("detail", ""))[:300]
-    except Exception:
+    except (ValueError, AttributeError):
         detail = e.response.text[:300]
     return f"ElevenLabs API error {status}: {detail}"
 
@@ -314,8 +324,8 @@ async def _eleven_post(path: str, body: dict) -> bytes:
 def _coerce_number(value, name: str) -> float:
     try:
         return float(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be a number, got: {value!r}")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number, got: {value!r}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -361,8 +371,7 @@ async def _handle_compose(args: dict) -> list[TextContent]:
         return [TextContent(type="text", text=f"Error composing music: {e}")]
 
     path = _get_save_path(args.get("save_path"), "music")
-    with open(path, "wb") as f:
-        f.write(audio)
+    await asyncio.to_thread(Path(path).write_bytes, audio)
 
     played = await _push_audio_player(path, f"Music: {prompt[:80]}")
     suffix = " Audio player displayed to user." if played else ""
@@ -413,8 +422,7 @@ async def _handle_sfx(args: dict) -> list[TextContent]:
         return [TextContent(type="text", text=f"Error generating sound effect: {e}")]
 
     path = _get_save_path(args.get("save_path"), "sfx")
-    with open(path, "wb") as f:
-        f.write(audio)
+    await asyncio.to_thread(Path(path).write_bytes, audio)
 
     played = await _push_audio_player(path, f"SFX: {prompt[:80]}")
     suffix = " Audio player displayed to user." if played else ""

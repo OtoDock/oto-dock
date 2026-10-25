@@ -255,11 +255,11 @@ def record_batch_usage(session_id: str, chat_id: str, usage_by_model: dict,
                 "interactive %s: usage batch dropped — no chat row for %s",
                 session_id[:8], chat_id)
             return 0
+        from config import get_model_provider, price_usage
         from core.session import visibility as _vis
         from core.session.session_state import get_session_client_type
         from services.billing import usage_service
         from services.engines import subscription_pool
-        from config import get_model_provider, price_usage
 
         agent = rec.get("agent", "")
         scope = "agent" if _vis.is_shared_only(agent) else "user"
@@ -327,6 +327,10 @@ class ToolEventBuffer:
     def __init__(self) -> None:
         self.pending: dict[str, dict] = {}
         self._seen: dict[str, object] = {}
+        # The dialog calls (a question, a plan approval) seen and not yet
+        # answered, across batches: their answer is the one result that
+        # reopens a turn the dialog parked.
+        self.dialogs: set[str] = set()
 
     def claim(self, key: str) -> bool:
         """Claim a tool id for processing; False if already claimed. A unique

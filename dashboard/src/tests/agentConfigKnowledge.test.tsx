@@ -71,12 +71,15 @@ const mkAtt = (over: Partial<KAtt> = {}): KAtt => ({
   has_bulletin: false, ...over,
 })
 
+const updateAgent = vi.hoisted(() => ({ mutate: vi.fn(), mutateAsync: () => Promise.resolve({}) }))
 vi.mock('@/api/agents', () => ({
   useAgentInfo: () => ({ data: h.agentInfo, isLoading: false }),
-  useUpdateAgent: () => ({ mutate: vi.fn(), isPending: false }),
-  useDeleteAgent: () => ({ mutate: vi.fn(), isPending: false }),
+  // One function for every render, as TanStack's own: the page's save
+  // effects list it.
+  useUpdateAgent: () => ({ mutate: updateAgent.mutate, mutateAsync: updateAgent.mutateAsync, isPending: false }),
+  useDeleteAgent: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false }),
   useDelegationTargets: () => ({ data: undefined }),
-  useSetDelegationTargets: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetDelegationTargets: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
   useExecutionLayers: () => ({ data: undefined }),
   useSetDefaultForNewUsers: () => ({ mutate: vi.fn() }),
   useAgentUsers: () => ({ data: [] }),
@@ -86,13 +89,15 @@ vi.mock('@/api/agents', () => ({
     h.librariesEnabledArg = enabled
     return { data: enabled ? h.libraries : undefined }
   },
-  useSetKnowledgeLibrary: () => ({ mutate: h.setLibraryMock, isPending: false }),
-  useAttachKnowledgeLibrary: () => ({ mutate: h.attachMock, isPending: false }),
-  useDetachKnowledgeLibrary: () => ({ mutate: h.detachMock, isPending: false }),
+  useSetKnowledgeLibrary: () => ({ mutate: h.setLibraryMock, mutateAsync: (v: unknown) => { h.setLibraryMock(v); return Promise.resolve({}) }, isPending: false }),
+  useAttachKnowledgeLibrary: () => ({ mutate: h.attachMock, mutateAsync: (v: unknown) => { h.attachMock(v); return Promise.resolve({}) }, isPending: false }),
+  useDetachKnowledgeLibrary: () => ({ mutate: h.detachMock, mutateAsync: (v: unknown) => { h.detachMock(v); return Promise.resolve({}) }, isPending: false }),
   // Picker feed — only queried while the share form is open (name '' = off).
   useAgentFiles: (name: string) => ({ data: name ? h.fileTree : undefined }),
 }))
-vi.mock('@/api/remoteMachines', () => ({ useRemoteMachines: () => ({ data: [] }) }))
+vi.mock('@/api/remoteMachines', async (orig) => ({
+  ...(await orig<typeof import('@/api/remoteMachines')>()), useRemoteMachines: () => ({ data: [] }),
+}))
 vi.mock('@/api/departments', () => ({ useDepartments: () => ({ data: [] }) }))
 vi.mock('@/api/memory', () => ({
   useAgentMemorySettings: () => ({
@@ -102,8 +107,8 @@ vi.mock('@/api/memory', () => ({
       master: { user_memory_enabled: true, agent_memory_enabled: true },
     },
   }),
-  useSetAgentMemoryToggle: () => ({ mutate: vi.fn() }),
-  useClearAgentMemory: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetAgentMemoryToggle: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})) }),
+  useClearAgentMemory: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
 }))
 vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: h.user }),
@@ -136,7 +141,7 @@ describe('AgentConfig — execution target row on phones', () => {
     h.knowledgeData = { is_library: false, libraries: [], attachments: [] }
     h.libraries = []
     renderConfig()
-    const local = screen.getByRole('option', { name: 'Local (this server)' })
+    const local = screen.getByRole('option', { name: 'OtoDock platform' })
     const select = local.closest('select') as HTMLSelectElement
     const classes = select.className.split(/\s+/)
     for (const cls of ['w-full', 'min-w-0', 'sm:w-auto']) expect(classes).toContain(cls)
@@ -243,6 +248,26 @@ describe('AgentConfig — shared knowledge card', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(h.setLibraryMock).not.toHaveBeenCalled()
     expect(screen.queryByLabelText('Library name')).toBeNull()
+  })
+
+  // Forms open where they are invoked: a new share above the libraries, a
+  // rename under the library it renames; Escape closes either.
+  it('a new share opens above the libraries, a rename under its row', () => {
+    h.knowledgeData = {
+      is_library: true,
+      libraries: [mkLib({ subdir: 'marketing', name: 'Old Name' }), mkLib({ subdir: 'legal', name: 'Contracts' })],
+      attachments: [],
+    }
+    renderConfig()
+    const follows = (a: Node, b: Node) => !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)
+    fireEvent.click(shareFolderBtn())
+    expect(follows(screen.getByLabelText('Library name'), screen.getByText('Old Name'))).toBe(true)
+    fireEvent.keyDown(screen.getByLabelText('Library name'), { key: 'Escape' })
+    expect(screen.queryByLabelText('Library name')).toBeNull()
+    fireEvent.click(screen.getByLabelText('Rename library legal'))
+    const field = screen.getByLabelText('Library name')
+    expect(follows(screen.getByText('Contracts'), field)).toBe(true)
+    expect(follows(screen.getByText('Old Name'), field)).toBe(true)
   })
 
   it('creator managing the agent: same powers as admin', () => {

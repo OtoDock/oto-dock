@@ -26,7 +26,11 @@ export default function AppToastHost() {
       scope: 'user', source: 'local', delivered_at: new Date().toISOString(),
       read: 1, dismissed: 0, read_at: null, dismissed_at: null, agent_slug: null, chat_id: null,
     }
-    setToasts((prev) => [{ id, delivery, createdAt: Date.now() }, ...prev].slice(0, MAX_TOASTS))
+    // A toast equal to one still shown (a save on every keystroke refused
+    // each time, two calls refused alike) is that toast again: no copy stacks.
+    setToasts((prev) => prev.some((x) => x.delivery.title === t.title && x.delivery.body === t.body)
+      ? prev
+      : [{ id, delivery, createdAt: Date.now() }, ...prev].slice(0, MAX_TOASTS))
     const ms = AUTO_DISMISS_MS[t.severity] ?? 5000
     if (ms > 0) setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), ms)
   }), [])

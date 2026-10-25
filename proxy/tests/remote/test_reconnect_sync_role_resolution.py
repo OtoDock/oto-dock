@@ -17,17 +17,19 @@ machines.
 
 import asyncio
 import sys
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
-from core.remote import remote_workspace_sync as rws  # noqa: E402
-from core.remote.remote_execution import RemoteExecutionLayer  # noqa: E402
+from core.remote import remote_workspace_sync as rws
+from core.remote.remote_execution import RemoteExecutionLayer
 
 
 @pytest.fixture(autouse=True)
@@ -36,9 +38,11 @@ def _no_jitter_and_a_clean_walk_map(monkeypatch):
     tests below pin the sleep to zero and start from an empty map."""
     monkeypatch.setattr(rws, "_reconnect_jitter_s", lambda: 0.0)
     rws._reconnect_walks.clear()
+    rws._reconnect_completed_at.clear()
     rws._idle_sync_inflight.clear()
     yield
     rws._reconnect_walks.clear()
+    rws._reconnect_completed_at.clear()
     rws._idle_sync_inflight.clear()
 
 
@@ -233,6 +237,8 @@ async def test_a_walk_whose_machine_left_does_no_manifest_work():
 
 @pytest.mark.asyncio
 async def test_kicks_within_the_jitter_coalesce_into_one_walk(monkeypatch):
+    # The coalescing alone: the debounce window has its own tests below.
+    monkeypatch.setattr(rws, "_RECONNECT_DEBOUNCE_S", 0.0)
     layer, calls = _layer_with_capture()
     _identity(layer)
     monkeypatch.setattr(rws, "_reconnect_jitter_s", lambda: 0.05)
@@ -328,3 +334,76 @@ async def test_the_idle_sweep_spawns_one_task_per_pending_pair(monkeypatch):
     await layer.run_idle_fingerprint_sweep()
     await asyncio.sleep(0)
     assert started == ["a1", "a1"]
+
+
+# --- the debounce after a complete walk -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_second_walk_within_the_window_waits_for_its_end(monkeypatch):
+    """A flapping machine walks again only when the debounce window after
+    its completed walk ends; the kicks meanwhile coalesce into that one."""
+    layer, calls = _layer_with_capture()
+    _identity(layer)
+    monkeypatch.setattr(rws, "_RECONNECT_DEBOUNCE_S", 0.3)
+    with _agents({"a1"}):
+        await layer.sync_all_agents_on_reconnect("m1")
+        assert len(calls) == 1
+        second = asyncio.create_task(layer.sync_all_agents_on_reconnect("m1"))
+        await asyncio.sleep(0.1)
+        assert len(calls) == 1 and rws._reconnect_walks["m1"].sleeping
+        await layer.sync_all_agents_on_reconnect("m1")   # coalesces into the sleeping walk
+        await second
+    assert len(calls) == 2
+    assert "m1" not in rws._reconnect_walks
+
+
+@pytest.mark.asyncio
+async def test_a_walk_after_the_window_and_one_after_a_cut_pass_run_at_once(monkeypatch):
+    layer, calls = _layer_with_capture()
+    _identity(layer)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(rws, "_monotonic", lambda: clock["now"])
+    with _agents({"a1"}):
+        await layer.sync_all_agents_on_reconnect("m1")
+        assert rws._reconnect_hold_s("m1") == rws._RECONNECT_DEBOUNCE_S
+        clock["now"] += rws._RECONNECT_DEBOUNCE_S + 1.0
+        assert rws._reconnect_hold_s("m1") == 0.0
+        await layer.sync_all_agents_on_reconnect("m1")
+        assert len(calls) == 2
+        # A pass the machine's drop cut short completes no walk: the next
+        # kick runs at once, and the stamps older than a window are gone.
+        layer._cm.is_connected.return_value = False
+        await layer.sync_all_agents_on_reconnect("m2")
+        assert len(calls) == 2 and "m2" not in rws._reconnect_completed_at
+        assert rws._reconnect_hold_s("m2") == 0.0
+        layer._cm.is_connected.return_value = True
+        await layer.sync_all_agents_on_reconnect("m2")
+        assert len(calls) == 3
+    assert set(rws._reconnect_completed_at) == {"m1", "m2"}
+
+
+@pytest.mark.asyncio
+async def test_a_kick_during_a_pass_reruns_after_the_window(monkeypatch):
+    layer = RemoteExecutionLayer(MagicMock())
+    _identity(layer)
+    monkeypatch.setattr(rws, "_RECONNECT_DEBOUNCE_S", 0.3)
+    release = asyncio.Event()
+    passes: list[float] = []
+
+    async def _sync(machine_id, agent_slug, **kw):
+        passes.append(time.monotonic())
+        if len(passes) == 1:
+            await release.wait()
+
+    layer._initial_workspace_sync = _sync
+    with _agents({"a1"}):
+        first = asyncio.create_task(layer.sync_all_agents_on_reconnect("m1"))
+        await asyncio.sleep(0.01)
+        await layer.sync_all_agents_on_reconnect("m1")   # a rerun is owed
+        release.set()
+        await asyncio.sleep(0.05)
+        assert len(passes) == 1 and rws._reconnect_walks["m1"].sleeping
+        await first
+    assert len(passes) == 2
+    assert passes[1] - passes[0] >= 0.25

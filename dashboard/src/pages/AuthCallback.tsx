@@ -5,12 +5,16 @@ import { NATIVE_HANDOFF_STATE, exchangeNativeToken } from '../api/webauthn'
 import { useAuth } from '../contexts/AuthContext'
 import { peekPending, saveConfirm } from '../lib/shareConfirm'
 import { callNative } from '../lib/nativeBridge'
+import { isNativePlatform } from '../audio/types'
 
 export default function AuthCallback() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const { setUser, user, loading } = useAuth()
-  const [error, setError] = useState<string | null>(null)
+  const [failure, setError] = useState<string | null>(null)
+  // The handoff link opened outside the app: the reason, no exchange.
+  const appOnlyLink = searchParams.get('state') === NATIVE_HANDOFF_STATE && !isNativePlatform()
+  const error = failure ?? (appOnlyLink ? 'This sign-in link only works in the OtoDock app.' : null)
   // The code is one-shot: the exchange runs once per (code, state), however
   // often the effect re-runs (the account arriving after a login changes
   // `user`, and a second POST would only get "invalid or expired state").
@@ -38,7 +42,7 @@ export default function AuthCallback() {
       // portal: the home.
       const pending = peekPending(user?.sub || '')
       if (pending) {
-        const reason = 'The identity provider sent you back without an answer. Try again; if it repeats, '
+        const reason = 'The identity provider sent you back without an answer. Try again. If it repeats, '
           + 'its application "Launch URL" should point at this dashboard.'
         const sep = pending.return_to.includes('?') ? '&' : '?'
         navigate(`${pending.return_to}${sep}confirm_error=${encodeURIComponent(reason)}`, { replace: true })
@@ -63,11 +67,7 @@ export default function AuthCallback() {
     // callback: `code` carries the one-time token, `state` the fixed marker.
     // Only the app's webview ever exchanges one (the token is bound to its
     // cookie): a browser that opens such a link gets the reason, not a call.
-    const isNative = !!(window as any).Capacitor?.isNativePlatform?.()
-    if (state === NATIVE_HANDOFF_STATE && !isNative) {
-      setError('This sign-in link only works in the OtoDock app.')
-      return
-    }
+    if (appOnlyLink) return
     const exchange: Promise<CallbackResult> = state === NATIVE_HANDOFF_STATE
       ? exchangeNativeToken(code).then((u) => ({ kind: 'login' as const, user: u }))
       : handleCallback(code, state)
@@ -109,17 +109,17 @@ export default function AuthCallback() {
           setError(e.message || 'Authentication failed')
         }
       })
-  }, [searchParams, navigate, setUser, loading, user?.sub])
+  }, [searchParams, navigate, setUser, loading, user?.sub, appOnlyLink])
 
   if (error) {
     return (
-      <div className="flex items-center justify-center min-h-screen bg-gray-50 dark:bg-gray-900">
-        <div className="bg-white dark:bg-p-surface border border-red-200 dark:border-red-800 rounded-lg p-6 max-w-md">
-          <h2 className="text-lg font-semibold text-red-700 dark:text-red-400 mb-2">Authentication Failed</h2>
-          <p className="text-sm text-gray-700 dark:text-gray-300">{error}</p>
+      <div className="flex items-center justify-center min-h-screen bg-hero-bg">
+        <div className="bg-surface-overlay text-primary rounded-hero shadow-elevation-4 p-6 max-w-md">
+          <h2 className="font-display text-lg font-semibold text-status-danger-fg mb-2">Authentication Failed</h2>
+          <p className="text-sm text-secondary">{error}</p>
           <button
             onClick={() => (window.location.href = '/')}
-            className="mt-4 text-sm text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+            className="mt-4 text-sm text-link hover:text-link-hover"
           >
             Back to home
           </button>
@@ -129,8 +129,8 @@ export default function AuthCallback() {
   }
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-gray-50 dark:bg-gray-900">
-      <p className="text-sm text-gray-500 dark:text-gray-400">Completing login...</p>
+    <div className="flex items-center justify-center min-h-screen bg-hero-bg">
+      <p className="text-sm text-hero-text-muted">Completing login...</p>
     </div>
   )
 }

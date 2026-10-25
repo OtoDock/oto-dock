@@ -107,7 +107,7 @@ def test_codex_translator_text_delta():
     Shapes verified live against codex 0.120.0: userMessage items are suppressed
     (we persist the user turn ourselves), text streams as incremental `delta`s.
     """
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator(model="gpt-5.4")
     out = []
@@ -133,7 +133,7 @@ def test_codex_translator_text_delta():
 
 def test_codex_translator_reasoning_to_thinking():
     """`reasoning` items frame THINKING; `item/reasoning/textDelta` streams it."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     out = []
@@ -149,7 +149,7 @@ def test_codex_translator_reasoning_to_thinking():
 
 def test_codex_translator_command_execution_normalized_to_bash():
     """app-server `commandExecution` items → TOOL_USE name='Bash' (CLI parity)."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     out = t.translate(CodexEvent(type="item/started", data={
@@ -162,7 +162,7 @@ def test_codex_translator_command_execution_normalized_to_bash():
 
 def test_codex_translator_mcp_tool_call_namespaced():
     """`mcpToolCall` items → TOOL_USE mcp__{server}__{tool} (server+tool split)."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     out = t.translate(CodexEvent(type="item/started", data={
@@ -180,7 +180,7 @@ def test_codex_translator_completed_command_carries_output():
     Headless Codex chats previously dropped the body entirely — the dashboard
     pill had no Output section while interactive transcripts (rollout tailer)
     showed it."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     out = t.translate(CodexEvent(type="item/completed", data={
@@ -196,7 +196,7 @@ def test_codex_translator_completed_command_carries_output():
 
 
 def test_codex_translator_failed_command_flags_error():
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     out = t.translate(CodexEvent(type="item/completed", data={
@@ -218,7 +218,7 @@ def test_codex_translator_failed_command_flags_error():
 def test_codex_translator_file_change_output_is_the_patch():
     """`fileChange` completion → TOOL_RESULT body = per-change kind+path+diff
     (probe-verified shape: changes[{path, kind.type, diff}])."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     out = t.translate(CodexEvent(type="item/completed", data={
@@ -236,7 +236,7 @@ def test_codex_translator_mcp_result_and_error_bodies():
     """`mcpToolCall` completion: result.content text blocks join as the body;
     error.message rides as an error body (codex-rs v2 McpToolCallResult:
     content: Vec<content block>, error: {message})."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     out = t.translate(CodexEvent(type="item/completed", data={
@@ -274,7 +274,7 @@ def test_codex_translator_mcp_result_carries_its_pictures_and_blobs():
     """A completed `mcpToolCall`'s image blocks and embedded resources ride
     as `result_blocks` (the pump hands them to the result-files service and
     pops them); a failed call carries none."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     image = {"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}
     blob = {"type": "resource", "resource": {"uri": "gdrive://f.pdf", "mimeType": "application/pdf",
@@ -300,7 +300,7 @@ def test_codex_translator_mcp_result_carries_its_pictures_and_blobs():
 
 def test_codex_translator_plan_updated_to_todo_update():
     """app-server `turn/plan/updated` → TODO_UPDATE (status mapped to platform)."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     out = t.translate(CodexEvent(type="turn/plan/updated", data={
@@ -318,7 +318,7 @@ def test_codex_translator_goal_updated_to_goal_update():
     Wire shape verified LIVE vs 0.142.5 (thread/goal/set RPC probe): params
     {threadId, turnId, goal} with ThreadGoal {threadId, objective, status,
     tokenBudget, tokensUsed, timeUsedSeconds, createdAt, updatedAt}."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     out = t.translate(CodexEvent(type="thread/goal/updated", data={
@@ -356,7 +356,7 @@ def test_codex_translator_goal_updated_to_goal_update():
 
 def test_codex_translator_goal_cleared():
     """`thread/goal/cleared` → GOAL_UPDATE {cleared: True} (no goal fields)."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     out = t.translate(CodexEvent(type="thread/goal/cleared", data={"threadId": "th-1"}))
@@ -366,7 +366,7 @@ def test_codex_translator_goal_cleared():
 
 def test_codex_translator_goal_junk_shapes_ignored():
     """Malformed goal payloads are dropped without breaking the stream."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     for junk in [
@@ -386,7 +386,7 @@ def test_codex_translator_goal_junk_shapes_ignored():
 
 def test_codex_translator_goal_subagent_thread_suppressed():
     """A sub-agent thread's goal notifications never reach the main stream."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     t.translate(CodexEvent(type="turn/started", data={"threadId": "main"}))
@@ -399,13 +399,31 @@ def test_codex_translator_goal_subagent_thread_suppressed():
     assert out[0].data["objective"] == "main goal"
 
 
+def test_codex_translator_read_state_notice_is_quiet(caplog):
+    """Codex 0.163 sends ``thread/readState/changed`` (experimental, every
+    turn, the main thread's id) to a client that declared ``experimentalApi``:
+    a known method with nothing for the chat, not an unhandled one."""
+    import logging
+
+    from core.layers.codex import CodexEvent, CodexEventTranslator
+
+    t = CodexEventTranslator()
+    with caplog.at_level(logging.DEBUG, logger="codex-layer"):
+        out = t.translate(CodexEvent(type="thread/readState/changed", data={
+            "threadId": "main",
+            "readState": {"firstUnread": {"type": "turn", "turnId": "t-1"}, "revision": "r-1"},
+        }))
+    assert out == []
+    assert "unhandled notification" not in caplog.text
+
+
 def test_codex_translator_turn_completed_metadata_and_done():
     """tokenUsage.last drives per-turn cost; turn/completed → METADATA + DONE.
 
     Numbers mirror the live-validated turn: per-turn `last` breakdown, non-cached
     input split for pricing, and the context gauge populated from inputTokens +
     modelContextWindow (a gain over exec mode, which hid it)."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator(model="gpt-5.4")
     t.translate(CodexEvent(type="thread/tokenUsage/updated", data={
@@ -433,7 +451,7 @@ def test_codex_translator_prices_a_prompt_past_272k_at_the_tier():
     """A Codex turn is priced through the registry's long-context tier: OpenAI
     bills the whole request at 2x input / 1.5x output once its input passes
     272K, which a 500K live window reaches with no platform override."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     def cost_of(input_tokens: int, cached: int) -> float:
         t = CodexEventTranslator(model="gpt-6.1-sol")
@@ -459,7 +477,7 @@ def test_codex_translator_prices_a_prompt_past_272k_at_the_tier():
 
 def test_codex_translator_turn_failed_to_error():
     """turn/completed with status=failed → ERROR + DONE (no turn/failed method)."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     out = t.translate(CodexEvent(type="turn/completed", data={
@@ -478,7 +496,7 @@ def test_codex_usage_limit_and_policy_declines_are_typed_endings():
     a cyber or misalignment policy block ends as a decline; any other failure
     stays a plain error."""
     from core.events import turn_ending
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     t = CodexEventTranslator()
     t.translate(CodexEvent(type="account/rateLimits/updated", data={"rateLimits": {
@@ -544,7 +562,7 @@ def test_codex_error_codex_retries_does_not_end_the_turn():
     """``willRetry`` sits at the params' top level (0.156.1); a retried error
     is not the turn's end. An older satellite ends its own turn on it, so the
     remote adapter keeps the ERROR there."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     retried = {"error": {"message": "stream disconnected"}, "threadId": "t", "turnId": "u",
                "willRetry": True}
@@ -569,7 +587,7 @@ def test_codex_translator_subagent_spawn_and_wait():
     (description from the spawn prompt); wait/completed → SUBAGENT_END for the
     agent whose agentsStates went terminal. Diffed from the authoritative
     agentsStates snapshot, so completions are per-agent (not coarse)."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     a1 = "019e8618-a5cb-7c13-bde2-97a5fec4caf8"
     a2 = "019e8618-a6a2-7681-b196-66f384f5a0ac"
@@ -618,7 +636,7 @@ def test_codex_translator_subagent_spawn_and_wait():
 def test_codex_translator_subagent_turn_end_sweep():
     """A sub-agent still active at turn end is swept to SUBAGENT_END (safety net),
     and the per-turn tracker resets so the next turn starts clean."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     a1 = "agent-thread-1"
     t = CodexEventTranslator(model="gpt-5.4")
@@ -640,7 +658,7 @@ def test_codex_translator_subagent_terminal_without_prior_start():
     """Robustness: a first agentsStates sighting that is ALREADY terminal (a
     spawn we never saw active) emits START then END so the widget renders +
     clears rather than being dropped."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     a1 = "agent-thread-9"
     t = CodexEventTranslator()
@@ -660,7 +678,7 @@ def test_codex_translator_suppresses_subagent_thread_notifications():
     leak as the main agent's text or emit a premature DONE/METADATA. The main
     thread id is captured from its first turn/started; everything tagged with a
     different threadId is dropped."""
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     MAIN, SUB = "main-thread", "sub-thread"
     t = CodexEventTranslator(model="gpt-5.4")
@@ -715,7 +733,7 @@ def test_direct_llm_always_returns_local_layer_even_with_remote_target():
     """Direct LLM has no satellite path. SessionManager must return the
     DirectLLMExecutionLayer regardless of execution_target — Direct LLM
     sessions can't be migrated to a satellite."""
-    from core.session.session_manager import get_execution_layer, _direct_layer
+    from core.session.session_manager import _direct_layer, get_execution_layer
 
     with patch("core.session.session_manager.agent_store") as mock_store:
         mock_store.get_agent.return_value = {
@@ -728,7 +746,7 @@ def test_direct_llm_always_returns_local_layer_even_with_remote_target():
 
 def test_direct_llm_local_target_returns_local():
     """The expected local case for Direct LLM also returns the direct layer."""
-    from core.session.session_manager import get_execution_layer, _direct_layer
+    from core.session.session_manager import _direct_layer, get_execution_layer
 
     with patch("core.session.session_manager.agent_store") as mock_store:
         mock_store.get_agent.return_value = {
@@ -744,7 +762,8 @@ def test_codex_translator_rate_limits_recorded_not_emitted():
     channel and never becomes a CommonEvent (a pool account's usage is not
     the chatting user's business)."""
     from unittest.mock import patch
-    from core.layers.codex import CodexEventTranslator, CodexEvent
+
+    from core.layers.codex import CodexEvent, CodexEventTranslator
 
     snapshot = {"limitName": "codex", "planType": "plus",
                 "primary": {"usedPercent": 12, "windowDurationMins": 300, "resetsAt": 1789114918},

@@ -95,3 +95,7 @@ environment (its lockfile plus the test tools from `proxy/requirements-test.txt`
 the way a paired machine and the phone image install them. The private
 workflow runs all four Python suites in one environment instead.
 
+The `android` job builds the web bundle, syncs it into `dashboard/android`
+and runs `./gradlew assembleDebug` and `testDebugUnitTest` (JDK 21), with no
+`google-services.json` and no signing values, as a contributor's clone
+builds it; it is not a required check.

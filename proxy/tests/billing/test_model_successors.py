@@ -33,7 +33,7 @@ def test_successor_model_follows_the_chain_to_its_end():
 
 
 def test_successor_model_is_cycle_safe(monkeypatch):
-    monkeypatch.setattr(app_config, "MODEL_SUCCESSORS", {"a": "b", "b": "a"})
+    monkeypatch.setattr("configuration.models.MODEL_SUCCESSORS", {"a": "b", "b": "a"})
     assert app_config.successor_model("a") in {"a", "b"}
 
 

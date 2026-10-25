@@ -27,18 +27,19 @@ function task(over: Partial<Task> = {}): Task {
 describe('TaskModelChip', () => {
   it('renders the agent default muted, with no engine suffix', () => {
     render(<TaskModelChip task={task()} />)
-    const chip = screen.getByTitle('Agent default: claude-sonnet-5 (untiered)')
+    const chip = screen.getByTitle('Agent default: claude-sonnet-5, untiered')
     expect(chip.textContent).toBe('claude-sonnet-5')
-    expect(chip.className).not.toContain('text-brand')
+    expect(chip.className).toContain('bg-surface-muted')
+    expect(chip.className).not.toContain('text-link')
   })
 
   it('shows the capability tier as the four-dot mark, the word in the tooltip', () => {
     render(<TaskModelChip task={task({
       effective_model_tier: 3, tier_label: 'balanced', effective_model_source: 'agent default',
     })} />)
-    const chip = screen.getByTitle('Agent default: claude-sonnet-5 (tier 3 balanced)')
+    const chip = screen.getByTitle('Agent default: claude-sonnet-5, tier 3 balanced')
     expect(chip.textContent).not.toContain('balanced')
-    const mark = screen.getByRole('img', { name: 'Balanced (tier 3 of 4)' })
+    const mark = screen.getByRole('img', { name: 'Balanced, tier 3 of 4' })
     expect(mark.getAttribute('data-tier')).toBe('3')
     expect(mark.querySelectorAll('span')).toHaveLength(4)
     expect(mark.querySelectorAll('span.opacity-25')).toHaveLength(2)
@@ -55,7 +56,7 @@ describe('TaskModelChip', () => {
       effective_model: 'gpt-6-sol', effective_model_source: 'layer default',
       effective_model_tier: 2, tier_label: 'strong',
     })} />)
-    expect(screen.getByTitle('Engine default: gpt-6-sol (tier 2 strong)').textContent)
+    expect(screen.getByTitle('Engine default: gpt-6-sol, tier 2 strong').textContent)
       .toContain('codex-cli')
   })
 
@@ -65,7 +66,8 @@ describe('TaskModelChip', () => {
     })} />)
     const chip = screen.getByTitle(/^Pinned to claude-opus-5-5/)
     expect(chip.textContent).toContain('claude-opus-5-5')
-    expect(chip.className).toContain('text-brand')
+    expect(chip.className).toContain('bg-action-subtle')
+    expect(chip.className).toContain('text-link')
   })
 
   it('appends the engine only when the task pins the layer too', () => {

@@ -9,7 +9,10 @@ import asyncio
 import pytest
 
 from core.remote import remote_workspace_sync as rws
-from core.remote.satellite_connection import SatelliteConnection, SatelliteConnectionManager
+from core.remote.satellite_connection import (
+    SatelliteConnection,
+    SatelliteConnectionManager,
+)
 
 
 def _cm_with(version: str, mid: str = "m1") -> SatelliteConnectionManager:
@@ -153,6 +156,7 @@ async def test_the_file_listing_asks_a_paging_satellite_for_pages(monkeypatch):
     """The file listing sends the same paged request as the merge, through
     the manager's own command path (the joined pages resolve that wait)."""
     from types import SimpleNamespace
+
     from core.remote import remote_file_flow as rff
 
     cm = _cm_with("0.5.130")
@@ -183,6 +187,7 @@ async def test_the_listing_with_sizes_and_the_private_pull(monkeypatch, tmp_path
     the caller's byte cap, and refuses a session held for another agent or
     a path that is not canonical without asking the machine."""
     from types import SimpleNamespace
+
     from core.remote import remote_file_flow as rff
     from core.remote.satellite_connection import SatelliteConnectionManager as _Mgr
 
@@ -198,7 +203,8 @@ async def test_the_listing_with_sizes_and_the_private_pull(monkeypatch, tmp_path
     pulls: list[tuple] = []
 
     async def pull_file_to_path(machine_id, ref, dest_path, *, agent_slug="",
-                                stall_s=None, max_bytes=None):
+                                stall_s=None, max_bytes=None, request_fields=None,
+                                progress_cb=None):
         pulls.append((machine_id, ref.kind, ref.value, dest_path, agent_slug, max_bytes))
         return True
 
@@ -254,6 +260,7 @@ async def test_the_listing_asks_a_satellite_that_lists_what_it_skipped(monkeypat
     with ``dir``, inside the prefix or covering it, and an older satellite
     is asked for nothing and lists nothing of the kind."""
     from types import SimpleNamespace
+
     from core.remote import remote_file_flow as rff
 
     sent: list[dict] = []
@@ -302,6 +309,7 @@ async def test_the_listing_asks_a_satellite_that_lists_what_it_skipped(monkeypat
 
 def test_absence_is_reliable_follows_the_satellite(monkeypatch):
     from types import SimpleNamespace
+
     from core.remote import remote_file_flow as rff
 
     cm = _cm_with("0.5.145")

@@ -45,6 +45,7 @@ def t1(monkeypatch):
     monkeypatch.setattr(
         cr, "_collect_used_subnets", lambda exclude_network=None: ["172.17.0.0/16"],
     )
+    monkeypatch.setattr(cr, "_picked_subnets", {})
 
 
 # --------------------------------------------------------------------------- #
@@ -109,6 +110,21 @@ def test_override_force_realloc_picks_new_subnet(tmp_path, t1, monkeypatch):
     cr.ensure_t1_override(m, force_realloc=True)
     data = yaml.safe_load((m.mcp_dir / "docker-compose.override.yml").read_text())
     assert data["networks"]["default"]["ipam"]["config"][0]["subnet"] == "10.201.1.0/24"
+
+
+def test_two_projects_picking_before_either_network_exists_never_collide(tmp_path, t1):
+    """The boot starts the projects concurrently: the second pick sees the
+    first one although docker has no network for it yet."""
+    a = _mk_manifest(tmp_path, name="camoufox")
+    b = _mk_manifest(tmp_path, name="video-tools")
+
+    def subnet(m):
+        return yaml.safe_load(cr.ensure_t1_override(m).read_text())["networks"]["default"]["ipam"]["config"][0]["subnet"]
+
+    first, second = subnet(a), subnet(b)
+    assert first != second
+    # A project's own earlier pick is no obstacle to itself.
+    assert subnet(a) == first
 
 
 def test_override_imageless_has_no_image_key(tmp_path, t1):
@@ -205,3 +221,22 @@ def test_override_preserved_across_update(tmp_path):
     assert (target / "manifest.json").read_text() == "new"          # replaced
     assert (target / "docker-compose.override.yml").is_file()       # preserved
     assert "pinned subnet" in (target / "docker-compose.override.yml").read_text()
+
+
+@pytest.mark.parametrize("svc", [
+    {"deploy": ["replicas: 2"]},
+    {"deploy": {"resources": "small"}},
+    {"deploy": {"resources": {"limits": None}}},
+])
+def test_a_deploy_block_of_another_shape_reads_as_no_limit(svc, monkeypatch):
+    """A catalog compose is the author's YAML: a `deploy` that is not a
+    mapping at some level declares no memory limit, never a crash."""
+    monkeypatch.setattr(cr, "_default_mem_limit", lambda: "2g")
+    out = cr._missing_default_bounds(svc)
+    assert out["mem_limit"] == out["memswap_limit"] == "2g"
+
+
+def test_a_deploy_memory_limit_still_wins(monkeypatch):
+    monkeypatch.setattr(cr, "_default_mem_limit", lambda: "2g")
+    out = cr._missing_default_bounds({"deploy": {"resources": {"limits": {"memory": "512m"}}}})
+    assert "mem_limit" not in out

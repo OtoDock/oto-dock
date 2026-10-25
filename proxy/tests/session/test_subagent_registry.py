@@ -10,8 +10,12 @@ from __future__ import annotations
 import asyncio
 
 from core.session.session_state import (
-    SubagentRegistry, _chat_streaming_state, _dashboard_notify_queues,
-    _subagent_registries, clear_session_liveness, get_subagent_registry,
+    SubagentRegistry,
+    _chat_streaming_state,
+    _dashboard_notify_queues,
+    _subagent_registries,
+    clear_session_liveness,
+    get_subagent_registry,
     reset_subagent_registry,
 )
 
@@ -127,10 +131,11 @@ def test_module_accessors_get_and_reset():
 # clear_session_liveness — dead-session badge/registry cleanup
 # ---------------------------------------------------------------------------
 
-from core.session import session_state
 from core.events.bg_command_state import (
-    _bg_command_registries, get_bg_command_registry,
+    _bg_command_registries,
+    get_bg_command_registry,
 )
+from core.session import session_state
 
 
 def test_clear_liveness_pops_matching_chats_and_broadcasts():

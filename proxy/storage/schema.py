@@ -25,7 +25,7 @@ from storage.automation.schema import (
     init_webhooks,
 )
 from storage.billing.schema import init_execution_layers, init_usage
-from storage.chat.schema import init_chats, init_meetings
+from storage.chat.schema import init_chats, init_meetings, init_reply_reports
 from storage.checks.schema import init_checks
 from storage.files.schema import (
     init_file_sync,
@@ -36,9 +36,12 @@ from storage.files.schema import (
 from storage.identity.schema import init_identity
 from storage.knowledge.schema import init_knowledge_libraries
 from storage.mcp.schema import init_community_requests, init_mcp, init_mcp_autoupdate
+from storage.move_schema import init_chat_moves, init_engine_switch_leftovers
 from storage.phone.schema import init_audio_telephony, init_phone_call_log
-from storage.schema_base import _drop_invalid_indexes
-from storage.schema_base import _index_exists  # noqa: F401  (offered to migrations, DATABASE-SCHEMA.md)
+from storage.schema_base import (
+    _drop_invalid_indexes,
+    _index_exists,
+)
 from storage.sharing.schema import (
     DECISION_CHECK,
     GRANTEE_CHECK,
@@ -477,6 +480,8 @@ def init_schema(conn) -> None:
     init_audio_telephony(conn)
     init_phone_call_log(conn)
     init_remote_machines(conn)
+    init_chat_moves(conn)
+    init_engine_switch_leftovers(conn)
     init_meetings(conn)
     init_execution_layers(conn)
     init_notifications(conn)
@@ -497,6 +502,7 @@ def init_schema(conn) -> None:
     init_file_transfers(conn)
     init_knowledge_libraries(conn)
     init_checks(conn)
+    init_reply_reports(conn)
     init_schema_meta(conn)
     logger.info("PostgreSQL schema initialized (all tables created)")
 
@@ -738,6 +744,39 @@ def _hold_windows_hash_deletes(conn) -> None:
         logger.exception("Windows hash hold migration failed — will retry next startup")
 
 
+def apscheduler_dow_to_standard(field: str) -> str:
+    """Rewrite a day-of-week field from APScheduler numbering (0 = Monday)
+    back to standard cron (0 or 7 = Sunday), preserving the fired days.
+
+    The one-shot startup migration uses this on pre-existing rows: their
+    numeric weekdays were INTERPRETED as APScheduler days, so rewriting them
+    one day forward keeps every schedule firing exactly when it always did
+    (the failure mode to avoid is silently shifting fire days). Numbers map
+    0-6 → 1-7 so ranges never wrap; a lone Sunday emits the conventional 0;
+    ``*/k`` becomes ``1-7/k`` (standard anchors steps at Sunday, APScheduler
+    at Monday). Names and unrecognized tokens pass through untouched.
+    """
+    out: list[str] = []
+    for token in field.split(","):
+        token = token.strip()
+        expr, sep, step_s = token.partition("/")
+        suffix = f"{sep}{step_s}" if sep else ""
+        if expr == "*":
+            out.append(f"1-7{suffix}" if step_s.isdigit() and int(step_s) > 1 else token)
+        elif "-" in expr:
+            lo_s, _, hi_s = expr.partition("-")
+            if lo_s.isdigit() and hi_s.isdigit() and 0 <= int(lo_s) <= int(hi_s) <= 6:
+                out.append(f"{int(lo_s) + 1}-{int(hi_s) + 1}{suffix}")
+            else:
+                out.append(token)
+        elif expr.isdigit() and 0 <= int(expr) <= 6:
+            std = int(expr) + 1
+            out.append(f"{0 if std == 7 else std}{suffix}")
+        else:
+            out.append(token)
+    return ",".join(out)
+
+
 def run_migrations(conn) -> None:
     """Post-launch schema migration hook.
 
@@ -853,6 +892,24 @@ def run_migrations(conn) -> None:
         "ALTER TABLE webhook_subscriptions "
         "ADD COLUMN IF NOT EXISTS target_kind TEXT NOT NULL DEFAULT ''"
     )
+    # 2026-10-15: GitHub Apps. An account's vendor meta (the installations a
+    # GitHub-App account can reach) and an agent's installation identity;
+    # '' on every pre-existing row = an OAuth-App or PAT account, the account
+    # itself as the service identity. An agent's GitHub reach, on a service
+    # binding and on a person's own account choice: '[]' and false = every
+    # repository, writes allowed.
+    conn.execute(
+        "ALTER TABLE user_credential_accounts "
+        "ADD COLUMN IF NOT EXISTS meta TEXT NOT NULL DEFAULT ''"
+    )
+    conn.execute(
+        "ALTER TABLE service_agent_bindings "
+        "ADD COLUMN IF NOT EXISTS installation_id TEXT NOT NULL DEFAULT '', "
+        "ADD COLUMN IF NOT EXISTS repositories TEXT NOT NULL DEFAULT '[]', "
+        "ADD COLUMN IF NOT EXISTS read_only BOOLEAN NOT NULL DEFAULT FALSE"
+    )
+    conn.execute("ALTER TABLE agent_account_bindings ADD COLUMN IF NOT EXISTS repositories TEXT NOT NULL "
+                 "DEFAULT '[]', ADD COLUMN IF NOT EXISTS read_only BOOLEAN NOT NULL DEFAULT FALSE")
     # 2026-07-17: skills adoption — approval requests carry which catalog
     # they target ('mcp' | 'skill'); every pre-existing row is an MCP request.
     conn.execute(
@@ -1054,6 +1111,18 @@ def run_migrations(conn) -> None:
         "ALTER TABLE dynamic_tasks "
         "ADD COLUMN IF NOT EXISTS override_execution_path TEXT DEFAULT ''"
     )
+    # 1.9.0: the machine a task's runs go to ('' = the agent's default).
+    conn.execute("ALTER TABLE dynamic_tasks ADD COLUMN IF NOT EXISTS target_machine TEXT DEFAULT ''")
+    # A task's permission mode (1.9): '' = Don't Ask (the unattended word, as
+    # every task ran before the column existed), or Auto (the engine's own
+    # review).
+    conn.execute(
+        "ALTER TABLE dynamic_tasks "
+        "ADD COLUMN IF NOT EXISTS permission_mode TEXT DEFAULT ''"
+    )
+    # Who started a chat's move (1.9.0): the agent's chain of its own moves
+    # is counted by it. A table a pre-release build created lacks it.
+    conn.execute("ALTER TABLE chat_moves ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT ''")
     # Capability tier + "good at" line per model row. NULL tier = untiered
     # (admin-added models until an admin tags them); builtins are stamped
     # from the registry by sync_builtin_models at boot and on the admin
@@ -1135,7 +1204,6 @@ def run_migrations(conn) -> None:
         "SELECT 1 FROM platform_settings WHERE key = %s", (_MIGRATION_FLAG,)
     ).fetchone()
     if not done:
-        from services.scheduler.scheduler_triggers import apscheduler_dow_to_standard
         conn.execute("SAVEPOINT cron_dow_std")
         try:
             for table in ("dynamic_tasks", "notifications"):
@@ -1405,7 +1473,7 @@ def check_schema_drift(conn) -> list[tuple[str, str]]:
             live = _check_constraint_words(conn, table, name, live_schema)
             if expected is not None and live != expected:
                 stale.append((table, f"CHECK {name}"))
-    except Exception as e:  # the guard must never take the boot down with it
+    except Exception as e:  # noqa: BLE001  # the boot's drift probe must never take the boot down with it
         logger.debug("schema drift probe skipped: %s", e)
     finally:
         with contextlib.suppress(Exception):

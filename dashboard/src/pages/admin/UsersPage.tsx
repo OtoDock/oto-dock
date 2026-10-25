@@ -1,10 +1,23 @@
 import { useState, useRef, useEffect, useLayoutEffect } from 'react'
+import { flushSync } from 'react-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch, fetchAuthConfig, signOutEverywhere } from '../../api/auth'
+import { fetchAuthConfig, signOutEverywhere } from '../../api/auth'
 import { useAuth } from '../../contexts/AuthContext'
 import { ROLE, allowedOnSharedOnly, roleBadge, roleLabel } from '../../lib/permissions'
 import { isSharedOnly, modeOfAgent } from '../../lib/visibility'
 import { useSetPlatformAuth } from '../../api/executionLayers'
+import { apiJson, apiOk, withMessage } from '../../lib/http/apiJson'
+import { SaveState } from '../../components/ui/SettingsControls'
+import { useSaveState, type SaveStateApi } from '../../hooks/useSaveState'
+import Switch from '../../components/ui/Switch'
+import { blockedByModal } from '../../lib/ui/modalLayers'
+import { useDialogs } from '../../components/ui/dialogs'
+import { revealOnAttach } from '../../components/common/useInvokedForm'
+import Button from '../../components/ui/Button'
+import { Input, Select } from '../../components/ui/Field'
+import { BADGE_BASE, BADGE_TONE, CARD, POPOVER } from '../../components/ui/classes'
+import { PAGE_TITLE } from '../../components/ui/classes'
+import InfoTip from '../../components/ui/InfoTip'
 
 interface UserRecord {
   sub: string
@@ -27,10 +40,8 @@ function useUsers() {
   return useQuery({
     queryKey: ['admin-users'],
     queryFn: async () => {
-      const res = await apiFetch('/v1/admin/users')
-      if (!res.ok) throw new Error('Failed to fetch users')
-      const data = await res.json()
-      return data.users as UserRecord[]
+      const data = await apiJson<{ users: UserRecord[] }>('/v1/admin/users').catch(withMessage('Failed to fetch users'))
+      return data.users
     },
   })
 }
@@ -39,11 +50,11 @@ function useAgentList() {
   return useQuery({
     queryKey: ['admin-agent-names'],
     queryFn: async () => {
-      const res = await apiFetch('/v1/agents?all=true')
-      if (!res.ok) throw new Error('Failed to fetch agents')
-      const data = await res.json()
+      const data = await apiJson<{ agents: { name: string; collaborative?: boolean; default_scope?: 'user' | 'agent' }[] }>(
+        '/v1/agents?all=true',
+      ).catch(withMessage('Failed to fetch agents'))
       // A Shared-only agent takes editor or manager assignments only.
-      return (data.agents as { name: string; collaborative?: boolean; default_scope?: 'user' | 'agent' }[])
+      return data.agents
         .map((a) => ({ name: a.name, sharedOnly: isSharedOnly(modeOfAgent(a)) }))
     },
   })
@@ -55,8 +66,8 @@ function formatDate(iso: string): string {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
 }
 
-const SELECT_CLS = 'text-sm border border-p-border-light rounded-sm px-2 py-1 bg-white dark:bg-p-surface text-p-text'
-const SELECT_XS_CLS = 'text-[10px] border border-p-border-light rounded-sm px-1 py-0.5 bg-white dark:bg-p-surface text-p-text'
+const SELECT_CLS = 'text-sm border border-strong rounded-control px-2 py-1 bg-surface-card text-primary'
+const SELECT_XS_CLS = 'text-3xs border rounded-control px-1 py-0.5 bg-surface-card text-primary'
 
 /**
  * Agents-and-roles popover, triggered by a compact "N agents" chip next to the
@@ -74,7 +85,7 @@ function AgentsPopover({ user }: { user: UserRecord }) {
     const onDown = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
     }
-    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape' && !blockedByModal(e)) setOpen(false) }
     document.addEventListener('mousedown', onDown)
     document.addEventListener('keydown', onEsc)
     return () => {
@@ -95,7 +106,7 @@ function AgentsPopover({ user }: { user: UserRecord }) {
   }, [open])
 
   if (user.agents.length === 0) {
-    return <span className="text-[10px] text-p-text-light">No agents</span>
+    return <span className="text-3xs text-tertiary">No agents</span>
   }
 
   return (
@@ -103,10 +114,10 @@ function AgentsPopover({ user }: { user: UserRecord }) {
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        title="View agents & roles"
+        title="View agents and roles"
         aria-expanded={open}
-        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-medium border transition-colors ${
-          open ? 'border-brand/40 bg-brand/5 text-brand' : 'border-p-border-light bg-p-surface text-p-text-secondary hover:bg-p-surface-hover'
+        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-control text-3xs font-medium border transition-colors ${
+          open ? 'border-transparent bg-action-subtle text-link' : 'border-transparent bg-surface-muted text-secondary bg-linear-to-b from-transparent to-transparent hover:from-surface-hover hover:to-surface-hover'
         }`}
       >
         <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -117,20 +128,20 @@ function AgentsPopover({ user }: { user: UserRecord }) {
       </button>
       {open && (
         <div ref={popRef} style={{ transform: shiftX ? `translateX(${shiftX}px)` : undefined }}
-          className="absolute z-20 left-0 mt-1 w-60 max-w-[80vw] p-2 rounded-lg border border-p-border-light bg-white dark:bg-p-surface shadow-lg">
-          <p className="text-[10px] uppercase tracking-wide text-p-text-light px-1 pb-1.5">Agents &amp; roles</p>
+          className={`${POPOVER} absolute z-20 left-0 mt-1 w-60 max-w-[80vw] p-2`}>
+          <p className="text-3xs uppercase tracking-wide text-tertiary px-1 pb-1.5">Agents and roles</p>
           <div className="flex flex-wrap gap-1.5">
             {user.agents.map((a) => {
               const tag = { label: roleLabel(user.agent_roles?.[a]), cls: roleBadge(user.agent_roles?.[a]) }
               const isDefault = a === user.default_agent
               return (
                 <span key={a}
-                  className={`inline-flex items-center gap-1 pl-1.5 pr-1 py-0.5 rounded-md border text-xs ${
-                    isDefault ? 'border-brand/40 bg-brand/5' : 'border-p-border-light bg-white dark:bg-p-surface'
+                  className={`inline-flex items-center gap-1 pl-1.5 pr-1 py-0.5 rounded-control border text-xs ${
+                    isDefault ? 'border-transparent bg-action-subtle' : 'border-subtle'
                   }`}>
-                  {isDefault && <span title="Default agent" className="text-amber-500 leading-none">&#9733;</span>}
-                  <span className="text-p-text">{a}</span>
-                  <span className={`px-1 py-px rounded-sm text-[10px] font-medium leading-none ${tag.cls}`}>{tag.label}</span>
+                  {isDefault && <span title="Default agent" className="text-status-warning-fg leading-none">&#9733;</span>}
+                  <span className="text-primary">{a}</span>
+                  <span className={`px-1 py-px rounded-sm text-3xs font-medium leading-none ${tag.cls}`}>{tag.label}</span>
                 </span>
               )
             })}
@@ -141,55 +152,47 @@ function AgentsPopover({ user }: { user: UserRecord }) {
   )
 }
 
-function PlatformAuthToggle({ user }: { user: UserRecord }) {
+// The two switches save on their own; the form shows their save state
+// beside each label.
+function PlatformAuthToggle({ user, run }: { user: UserRecord; run: SaveStateApi['run'] }) {
   const setPlatformAuth = useSetPlatformAuth()
   const checked = !!user.allow_platform_auth
   return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      title={checked ? 'May borrow admin API credentials (not OAuth subscriptions)' : 'Own subscription only'}
-      onClick={() => setPlatformAuth.mutate({ userSub: user.sub, allowed: !checked })}
+    <Switch
+      aria-label="Platform API"
+      checked={checked}
+      title={checked ? 'May borrow admin API credentials, but not OAuth subscriptions' : 'Own subscription only'}
+      onChange={(allowed) => { void run(`${user.sub}:platform_auth`, () => setPlatformAuth.mutateAsync({ userSub: user.sub, allowed }), { failTitle: 'The Platform API access was not changed' }) }}
       disabled={setPlatformAuth.isPending}
-      className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-hidden disabled:opacity-50
-        ${checked ? 'bg-brand' : 'bg-gray-300 dark:bg-gray-600'}`}
-    >
-      <span
-        className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200
-          ${checked ? 'translate-x-4' : 'translate-x-0'}`}
-      />
-    </button>
+    />
   )
 }
 
-function LocalOnlyToggle({ user }: { user: UserRecord }) {
+function LocalOnlyToggle({ user, run }: { user: UserRecord; run: SaveStateApi['run'] }) {
   const queryClient = useQueryClient()
   const toggle = useMutation({
     mutationFn: async ({ sub, localOnly }: { sub: string; localOnly: boolean }) => {
-      const res = await apiFetch(`/v1/admin/users/${sub}/local-only`, {
+      await apiOk(`/v1/admin/users/${sub}/local-only`, {
         method: 'PUT',
         body: JSON.stringify({ local_only: localOnly }),
-      })
-      if (!res.ok) throw new Error('Failed')
+      }).catch(withMessage('The server did not accept the change.'))
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['admin-users'] }),
   })
   const checked = !!user.local_only
   return (
-    <button type="button" role="switch" aria-checked={checked}
-      title={checked ? 'LAN only — login restricted to local network' : 'No network restriction'}
-      onClick={() => toggle.mutate({ sub: user.sub, localOnly: !checked })}
+    <Switch
+      aria-label="LAN only"
+      checked={checked}
+      title={checked ? 'LAN only: sign-in only from the local network' : 'No network restriction'}
+      onChange={(localOnly) => { void run(`${user.sub}:local_only`, () => toggle.mutateAsync({ sub: user.sub, localOnly }), { failTitle: 'The LAN-only setting was not saved' }) }}
       disabled={toggle.isPending}
-      className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-hidden disabled:opacity-50
-        ${checked ? 'bg-brand' : 'bg-gray-300 dark:bg-gray-600'}`}>
-      <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200
-        ${checked ? 'translate-x-4' : 'translate-x-0'}`} />
-    </button>
+    />
   )
 }
 
 export default function UsersPage() {
+  const dialogs = useDialogs()
   const { data: users, isLoading } = useUsers()
   const { data: allAgents } = useAgentList()
   const { user: authUser, refreshUser } = useAuth()
@@ -199,6 +202,7 @@ export default function UsersPage() {
   const [editAgents, setEditAgents] = useState<string[]>([])
   const [editAgentRoles, setEditAgentRoles] = useState<Record<string, string>>({})
   const [error, setError] = useState<string | null>(null)
+  const { stateOf, run } = useSaveState()
   const [search, setSearch] = useState('')
 
   // Add User modal
@@ -219,17 +223,14 @@ export default function UsersPage() {
 
   // Reset password result
   const [resetPasswordResult, setResetPasswordResult] = useState<{ sub: string; password: string } | null>(null)
+  const resetButtonRef = useRef<HTMLButtonElement>(null)
 
   const updateRole = useMutation({
     mutationFn: async ({ sub, role }: { sub: string; role: string }) => {
-      const res = await apiFetch(`/v1/admin/users/${sub}/role`, {
+      await apiOk(`/v1/admin/users/${sub}/role`, {
         method: 'PUT',
         body: JSON.stringify({ role }),
-      })
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({}))
-        throw new Error(d.detail || 'Failed to update role')
-      }
+      }, 'Failed to update role')
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['admin-users'] }),
     onError: (e: Error) => setError(e.message),
@@ -237,14 +238,10 @@ export default function UsersPage() {
 
   const updateAgents = useMutation({
     mutationFn: async ({ sub, agents, agent_roles }: { sub: string; agents: string[]; agent_roles?: Record<string, string> }) => {
-      const res = await apiFetch(`/v1/admin/users/${sub}/agents`, {
+      await apiOk(`/v1/admin/users/${sub}/agents`, {
         method: 'PUT',
         body: JSON.stringify({ agents, agent_roles }),
-      })
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({}))
-        throw new Error(d.detail || 'Failed to update agents')
-      }
+      }, 'Failed to update agents')
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['admin-users'] }),
     onError: (e: Error) => setError(e.message),
@@ -252,11 +249,7 @@ export default function UsersPage() {
 
   const deleteUser = useMutation({
     mutationFn: async (sub: string) => {
-      const res = await apiFetch(`/v1/admin/users/${sub}/delete`, { method: 'POST' })
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({}))
-        throw new Error(d.detail || 'Failed to delete user')
-      }
+      await apiOk(`/v1/admin/users/${sub}/delete`, { method: 'POST' }, 'Failed to delete user')
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['admin-users'] }),
     onError: (e: Error) => setError(e.message),
@@ -264,15 +257,10 @@ export default function UsersPage() {
 
   const createUser = useMutation({
     mutationFn: async (data: { email: string; display_name: string; role: string; password?: string; send_invite?: boolean }) => {
-      const res = await apiFetch('/v1/admin/users', {
+      return apiJson<{ temp_password?: string; invite_url?: string; invite_sent?: boolean }>('/v1/admin/users', {
         method: 'POST',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({}))
-        throw new Error(d.detail || 'Failed to create user')
-      }
-      return res.json()
+      }, 'Failed to create user')
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['admin-users'] })
@@ -299,12 +287,7 @@ export default function UsersPage() {
 
   const resetUserPassword = useMutation({
     mutationFn: async (sub: string) => {
-      const res = await apiFetch(`/v1/admin/users/${sub}/reset-password`, { method: 'POST' })
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({}))
-        throw new Error(d.detail || 'Failed to reset password')
-      }
-      return res.json()
+      return apiJson<{ temp_password: string }>(`/v1/admin/users/${sub}/reset-password`, { method: 'POST' }, 'Failed to reset password')
     },
     onSuccess: (data, sub) => {
       setResetPasswordResult({ sub, password: data.temp_password })
@@ -381,16 +364,16 @@ export default function UsersPage() {
           // older install holds shows, marked, and cannot be picked again.
           const legacy = agentSharedOnly && !allowedOnSharedOnly(role)
           return (
-            <label key={agent} className="flex items-center gap-2 min-w-0 text-xs text-p-text">
+            <label key={agent} className="flex items-center gap-2 min-w-0 text-xs text-primary">
               <input
                 type="checkbox"
                 checked={editAgents.includes(agent)}
                 onChange={() => toggleAgent(agent)}
-                className="rounded-sm border-p-border-light shrink-0"
+                className="accent-action shrink-0"
               />
               <span className="min-w-[120px]">
                 {agent}
-                {agentSharedOnly && <span className="ml-1 text-[10px] text-p-text-light">(Shared only)</span>}
+                {agentSharedOnly && <span className="ml-1 text-3xs text-tertiary">Shared only</span>}
               </span>
               {/* The role select shrinks to what the row has left (its
                   longest option is wider than a phone) and clips its closed
@@ -400,35 +383,54 @@ export default function UsersPage() {
                   value={role}
                   onChange={(e) => setEditAgentRoles((prev) => ({ ...prev, [agent]: e.target.value }))}
                   aria-label={`Role on ${agent}`}
-                  className={`${SELECT_XS_CLS} min-w-0 truncate ${legacy ? 'border-amber-500' : ''}`}
+                  className={`${SELECT_XS_CLS} min-w-0 truncate ${legacy ? 'border-status-warning-solid' : 'border-strong'}`}
                   title={legacy ? 'Shared only takes the editor role or above: this assignment opens no chat. Raise it or untick the agent.' : undefined}
                 >
                   {(!agentSharedOnly || role === ROLE.VIEWER) && (
                     <option value={ROLE.VIEWER} disabled={agentSharedOnly}>
-                      {agentSharedOnly ? 'viewer — needs editor on Shared only' : 'viewer — reads and chats'}
+                      {agentSharedOnly ? 'Viewer: needs editor on Shared only' : 'Viewer: reads and chats'}
                     </option>
                   )}
                   {(!agentSharedOnly || role === ROLE.CONTRIBUTOR) && (
                     <option value={ROLE.CONTRIBUTOR} disabled={agentSharedOnly}>
-                      {agentSharedOnly ? 'contributor — needs editor on Shared only' : 'contributor — also writes the shared workspace'}
+                      {agentSharedOnly ? 'Contributor: needs editor on Shared only' : 'Contributor: also writes the shared workspace'}
                     </option>
                   )}
-                  <option value={ROLE.EDITOR}>editor — also automates as the agent</option>
-                  <option value={ROLE.MANAGER}>manager — configures the agent</option>
+                  <option value={ROLE.EDITOR}>Editor: also automates as the agent</option>
+                  <option value={ROLE.MANAGER}>Manager: configures the agent</option>
                 </select>
               )}
             </label>
           )
         })}
       </div>
-      <p className="text-[11px] text-p-text-secondary">
-        Per-agent roles are independent of the platform role — the platform role only
-        controls platform-level actions (creating agents, admin settings).
-      </p>
     </div>
   )
 
   // --- Shared edit form (desktop + mobile) ---
+  // The one-time password, where the Reset was pressed: in the card of the
+  // user it was reset for, scrolled into view (on a desktop Copy takes the
+  // focus), never at the top of the page above a long list.
+  // Dismiss takes its own button away: the focus goes back to Reset
+  // Password, where the reset was asked for, when the edit form is open.
+  const dismissResetResult = () => {
+    flushSync(() => setResetPasswordResult(null))
+    if (resetButtonRef.current?.isConnected) resetButtonRef.current.focus()
+  }
+  const resetResultPanel = (password: string) => (
+    <div ref={revealOnAttach} data-testid="reset-password-result">
+      <div className="rounded-card border border-status-warning-border bg-status-warning-bg p-4">
+        <p className="text-sm font-medium text-status-warning-fg mb-2">Password Reset</p>
+        <p className="text-xs text-status-warning-fg mb-2">New temporary password. Copy it now. It won't be shown again.</p>
+        <div className="flex gap-2 mb-3">
+          <code className="flex-1 px-3 py-2 text-sm font-mono bg-surface-card border border-subtle rounded-control text-primary select-all">{password}</code>
+          <Button size="sm" onClick={() => navigator.clipboard.writeText(password)}>Copy</Button>
+        </div>
+        <Button variant="primary" size="xs" onClick={dismissResetResult}>Dismiss</Button>
+      </div>
+    </div>
+  )
+
   const renderEditForm = (u: UserRecord) => {
     const isLocal = (u.auth_provider || 'local').startsWith('local')
     return (
@@ -436,7 +438,7 @@ export default function UsersPage() {
         {/* Role + access — two columns on desktop, stacked on mobile */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
-            <label className="text-xs text-p-text-secondary block mb-1">Role</label>
+            <label className="text-xs text-secondary block mb-1">Role</label>
             <select value={editRole} onChange={(e) => setEditRole(e.target.value)} className={`${SELECT_CLS} w-full sm:w-44`}>
               <option value="admin">Admin</option>
               <option value="creator">Creator</option>
@@ -444,63 +446,84 @@ export default function UsersPage() {
             </select>
           </div>
           <div>
-            <label className="text-xs text-p-text-secondary block mb-1">Access</label>
+            <label className="text-xs text-secondary block mb-1">Access</label>
             <div className="space-y-1.5">
               <div className="flex items-center justify-between gap-3 max-w-[15rem]">
-                <span className="text-xs text-p-text-secondary" title="Allow this user to borrow admin API credentials (API keys) when they have no subscription of their own — never admin OAuth subscriptions">Platform Auth</span>
-                <PlatformAuthToggle user={u} />
+                <div className="min-w-0">
+                  <span className="text-xs text-secondary">Platform API</span>
+                  <InfoTip label="Platform API">Lets this user borrow admin API keys. This applies when they have no subscription of their own. Admin OAuth subscriptions are never lent.</InfoTip>
+                  <SaveState state={stateOf(`${u.sub}:platform_auth`)} />
+                </div>
+                <PlatformAuthToggle user={u} run={run} />
               </div>
               {isLocal && (
                 <div className="flex items-center justify-between gap-3 max-w-[15rem]">
-                  <span className="text-xs text-p-text-secondary" title="Restrict this account to local network only">LAN only</span>
-                  <LocalOnlyToggle user={u} />
+                  <div className="min-w-0">
+                    <span className="text-xs text-secondary">LAN only</span>
+                    <InfoTip label="LAN only">Restrict this account to local network only</InfoTip>
+                    <SaveState state={stateOf(`${u.sub}:local_only`)} />
+                  </div>
+                  <LocalOnlyToggle user={u} run={run} />
                 </div>
               )}
             </div>
           </div>
         </div>
         <div>
-          <label className="text-xs text-p-text-secondary block mb-1">Agents</label>
+          <div className="mb-1">
+            <label className="text-xs text-secondary">Agents</label>
+            <InfoTip label="Agents">
+              Roles on each agent are separate from the platform role. The platform role
+              only covers platform actions, like creating agents and admin settings.
+            </InfoTip>
+          </div>
           {renderAgentEditor()}
         </div>
 
         {/* Account actions — kept out of the resting card to declutter it.
-            Proper bordered buttons so the admin sees them clearly. */}
+            Proper buttons so the admin sees them clearly. */}
         {(isLocal || !Number(u.is_owner)) && (
-          <div className="pt-3 border-t border-p-border-light space-y-1.5">
-            <label className="text-xs text-p-text-secondary block">Account actions</label>
+          <div className="pt-3 border-t border-subtle space-y-1.5">
+            <label className="text-xs text-secondary block">Account actions</label>
             <div className="flex flex-wrap gap-2">
               {isLocal && (
-                <button onClick={() => { if (window.confirm(`Reset password for ${u.email}?`)) resetUserPassword.mutate(u.sub) }}
-                  className="text-xs px-3 py-1.5 rounded-sm border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors">
+                <Button variant="secondary" size="xs" ref={resetButtonRef} onClick={async () => {
+                    if (await dialogs.confirm({ title: `Reset the password of ${u.email}?`, confirmLabel: 'Reset password' })) resetUserPassword.mutate(u.sub)
+                  }}>
                   Reset Password
-                </button>
+                </Button>
               )}
               {!Number(u.is_owner) && (
-                <button onClick={() => { if (window.confirm(`Sign ${u.email} out of every device? Their open chats restart at their next message.`)) signOutUserEverywhere.mutate(u.sub) }}
-                  className="text-xs px-3 py-1.5 rounded-sm border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors">
+                <Button variant="secondary" size="xs" onClick={async () => {
+                    if (await dialogs.confirm({
+                      title: `Sign ${u.email} out of every device?`,
+                      body: 'Their open chats restart at their next message.',
+                      confirmLabel: 'Sign out everywhere',
+                      tone: 'danger',
+                    })) signOutUserEverywhere.mutate(u.sub)
+                  }}>
                   Sign Out Everywhere
-                </button>
+                </Button>
               )}
               {!Number(u.is_owner) && (
-                <button onClick={() => { if (window.confirm(`Delete user ${u.email}?`)) deleteUser.mutate(u.sub) }}
-                  className="text-xs px-3 py-1.5 rounded-sm border border-red-300 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors">
+                <Button variant="danger" size="xs" onClick={async () => {
+                    if (await dialogs.confirm({ title: `Delete the user ${u.email}?`, confirmLabel: 'Delete', tone: 'danger' })) deleteUser.mutate(u.sub)
+                  }}>
                   Delete User
-                </button>
+                </Button>
               )}
             </div>
           </div>
         )}
+        {resetPasswordResult?.sub === u.sub && resetResultPanel(resetPasswordResult.password)}
 
         <div className="flex gap-2 pt-1">
-          <button onClick={saveEdit} disabled={isSaving}
-            className="text-xs px-3 py-1.5 bg-brand text-white rounded-sm hover:bg-brand-hover disabled:opacity-50">
+          <Button variant="primary" size="xs" onClick={saveEdit} disabled={isSaving}>
             {isSaving ? 'Saving…' : 'Save'}
-          </button>
-          <button onClick={() => setEditingSub(null)}
-            className="text-xs px-3 py-1.5 border border-p-border-light rounded-sm text-p-text-secondary hover:bg-p-surface-hover">
+          </Button>
+          <Button variant="secondary" size="xs" onClick={() => setEditingSub(null)}>
             Cancel
-          </button>
+          </Button>
         </div>
       </div>
     )
@@ -512,13 +535,13 @@ export default function UsersPage() {
     const name = (u.auth_provider || '').replace('oidc:', '')
     const label = name.toLowerCase() === 'sso' ? 'SSO' : name.charAt(0).toUpperCase() + name.slice(1)
     return (
-      <span className="text-[10px] px-1.5 py-0.5 rounded-sm font-medium bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-400">
+      <span className={`${BADGE_BASE} ${BADGE_TONE.info}`}>
         {label}
       </span>
     )
   }
 
-  if (isLoading) return <p className="text-sm text-p-text-secondary">Loading users...</p>
+  if (isLoading) return <p className="text-sm text-secondary">Loading users...</p>
 
   const q = search.trim().toLowerCase()
   const filteredUsers = (users || []).filter(
@@ -533,96 +556,89 @@ export default function UsersPage() {
 
   return (
     <div className="space-y-4">
-      {/* Header — desktop: title left, [search][Add User] right.
-          Mobile: title + Add User on row 1, search full-width on row 2. */}
-      <div className="flex flex-wrap items-center gap-3">
-        <h2 className="text-lg font-bold text-p-text mr-auto">Users</h2>
+      {/* Desktop: title left, search and Add User right. Phone: Add User on
+          row 1, the search full width on row 2. */}
+      <div className="flex flex-wrap items-center justify-end gap-3">
+        <h2 className={`${PAGE_TITLE} mr-auto`}>Users</h2>
         <div className="relative order-last w-full sm:order-none sm:w-60">
-          <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-p-text-light pointer-events-none"
+          <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-tertiary pointer-events-none"
             fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-4.35-4.35M11 18a7 7 0 100-14 7 7 0 000 14z" />
           </svg>
-          <input
+          <Input
             type="search"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search users…"
-            className="w-full pl-8 pr-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
+            className="pl-8"
           />
         </div>
-        <button onClick={openAddUser}
-          className="shrink-0 px-3 py-1.5 text-sm font-medium text-white bg-brand hover:bg-brand-hover rounded-lg transition-colors">
+        <Button variant="primary" size="sm" onClick={openAddUser}
+          className="shrink-0">
           Add User
-        </button>
+        </Button>
       </div>
 
       {/* Add User Modal */}
       {showAddUser && (
-        <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4 space-y-3">
-          <h3 className="text-sm font-semibold text-p-text">Create New User</h3>
+        <div className={`${CARD} p-4 space-y-3`}>
+          <h3 className="text-sm font-semibold text-primary">Create New User</h3>
           {tempPasswordResult ? (
             <div className="space-y-3">
-              <p className="text-sm text-green-600 dark:text-green-400">User created successfully.</p>
+              <p className="text-sm text-status-success-fg">User created successfully.</p>
               <div>
-                <label className="block text-xs text-p-text-secondary mb-1">Temporary Password (copy now — won't be shown again)</label>
+                <label className="block text-xs text-secondary mb-1">Temporary password. Copy it now. It won't be shown again.</label>
                 <div className="flex gap-2">
-                  <code className="flex-1 px-3 py-2 text-sm font-mono bg-p-bg border border-p-border-light rounded-lg text-p-text select-all">{tempPasswordResult}</code>
-                  <button onClick={() => navigator.clipboard.writeText(tempPasswordResult)}
-                    className="px-3 py-2 text-xs border border-p-border-light rounded-lg text-p-text-secondary hover:bg-p-surface-hover">Copy</button>
+                  <code className="flex-1 px-3 py-2 text-sm font-mono bg-surface-sunken rounded-control text-primary select-all">{tempPasswordResult}</code>
+                  <Button variant="secondary" size="xs" onClick={() => navigator.clipboard.writeText(tempPasswordResult)}>Copy</Button>
                 </div>
               </div>
-              <button onClick={() => { setShowAddUser(false); setTempPasswordResult('') }}
-                className="text-xs px-3 py-1.5 bg-brand text-white rounded-sm hover:bg-brand-hover">Done</button>
+              <Button variant="primary" size="xs" onClick={() => { setShowAddUser(false); setTempPasswordResult('') }}>Done</Button>
             </div>
           ) : inviteResult ? (
             <div className="space-y-3">
-              <p className="text-sm text-green-600 dark:text-green-400">
+              <p className="text-sm text-status-success-fg">
                 User created successfully.{inviteResult.sent && ' Invite email sent.'}
               </p>
               <div>
-                <label className="block text-xs text-p-text-secondary mb-1">Invite link (copy now — won't be shown again; expires in 48 hours)</label>
+                <label className="block text-xs text-secondary mb-1">Invite link. Copy it now: it won't be shown again. It expires in 48 hours.</label>
                 <div className="flex gap-2">
-                  <code className="flex-1 px-3 py-2 text-sm font-mono bg-p-bg border border-p-border-light rounded-lg text-p-text select-all break-all">{inviteResult.url}</code>
-                  <button onClick={() => navigator.clipboard.writeText(inviteResult.url)}
-                    className="px-3 py-2 text-xs border border-p-border-light rounded-lg text-p-text-secondary hover:bg-p-surface-hover">Copy</button>
+                  <code className="flex-1 px-3 py-2 text-sm font-mono bg-surface-sunken rounded-control text-primary select-all break-all">{inviteResult.url}</code>
+                  <Button variant="secondary" size="xs" onClick={() => navigator.clipboard.writeText(inviteResult.url)}>Copy</Button>
                 </div>
               </div>
-              <button onClick={() => { setShowAddUser(false); setInviteResult(null) }}
-                className="text-xs px-3 py-1.5 bg-brand text-white rounded-sm hover:bg-brand-hover">Done</button>
+              <Button variant="primary" size="xs" onClick={() => { setShowAddUser(false); setInviteResult(null) }}>Done</Button>
             </div>
           ) : (
             <>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs text-p-text-secondary mb-1">Display Name</label>
-                  <input type="text" value={newDisplayName} onChange={e => setNewDisplayName(e.target.value)}
-                    placeholder="John Smith"
-                    className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+                  <label className="block text-xs text-secondary mb-1">Display Name</label>
+                  <Input type="text" value={newDisplayName} onChange={e => setNewDisplayName(e.target.value)}
+                    placeholder="John Smith" />
                 </div>
                 <div>
-                  <label className="block text-xs text-p-text-secondary mb-1">Email</label>
-                  <input type="email" value={newEmail} onChange={e => setNewEmail(e.target.value)}
-                    placeholder="user@example.com"
-                    className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+                  <label className="block text-xs text-secondary mb-1">Email</label>
+                  <Input type="email" value={newEmail} onChange={e => setNewEmail(e.target.value)}
+                    placeholder="user@example.com" />
                 </div>
                 <div>
-                  <label className="block text-xs text-p-text-secondary mb-1">Role</label>
-                  <select value={newRole} onChange={e => setNewRole(e.target.value)}
-                    className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text">
+                  <label className="block text-xs text-secondary mb-1">Role</label>
+                  <Select value={newRole} onChange={e => setNewRole(e.target.value)}>
                     <option value="admin">Admin</option>
                     <option value="creator">Creator</option>
                     <option value="member">Member</option>
-                  </select>
+                  </Select>
                 </div>
                 <div>
-                  <label className="block text-xs text-p-text-secondary mb-1">Account Setup</label>
+                  <label className="block text-xs text-secondary mb-1">Account Setup</label>
                   <div className="space-y-1.5 pt-1">
-                    <label className="flex items-center gap-2 text-xs text-p-text">
+                    <label className="flex items-center gap-2 text-xs text-primary">
                       <input type="radio" name="account-setup" checked={newMode === 'invite'}
                         onChange={() => setNewMode('invite')} className="shrink-0" />
-                      Invite link — user sets their own password
+                      Invite link: the user sets their own password
                     </label>
-                    <label className="flex items-center gap-2 text-xs text-p-text">
+                    <label className="flex items-center gap-2 text-xs text-primary">
                       <input type="radio" name="account-setup" checked={newMode === 'password'}
                         onChange={() => setNewMode('password')} className="shrink-0" />
                       Temporary password
@@ -631,58 +647,40 @@ export default function UsersPage() {
                 </div>
                 {newMode === 'password' ? (
                   <div>
-                    <label className="block text-xs text-p-text-secondary mb-1">Temporary Password</label>
-                    <input type="text" value={newPassword} onChange={e => setNewPassword(e.target.value)}
-                      placeholder="Set a temporary password"
-                      className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
-                    <p className="text-[10px] text-p-text-light mt-0.5">User will be required to change it on first login</p>
+                    <label className="block text-xs text-secondary mb-1">Temporary Password</label>
+                    <Input type="text" value={newPassword} onChange={e => setNewPassword(e.target.value)}
+                      placeholder="Set a temporary password" />
+                    <p className="text-3xs text-tertiary mt-0.5">User will be required to change it on first login</p>
                   </div>
                 ) : (
                   <div className="self-end">
-                    <label className={`flex items-center gap-2 text-xs ${canEmailInvites ? 'text-p-text' : 'text-p-text-light'}`}>
+                    <label className={`flex items-center gap-2 text-xs ${canEmailInvites ? 'text-primary' : 'text-tertiary'}`}>
                       <input type="checkbox" checked={sendEmailInvite && canEmailInvites}
                         disabled={!canEmailInvites}
                         onChange={e => setSendEmailInvite(e.target.checked)}
-                        className="rounded-sm border-p-border-light shrink-0" />
+                        className="accent-action shrink-0" />
                       Also email the invite link
                     </label>
                     {!canEmailInvites && (
-                      <p className="text-[10px] text-p-text-light mt-0.5">Needs SMTP (Platform → Security) and a public dashboard URL</p>
+                      <p className="text-3xs text-tertiary mt-0.5">Needs a public dashboard URL and SMTP in Setup, Security</p>
                     )}
                   </div>
                 )}
               </div>
               <div className="flex gap-2 pt-1">
-                <button onClick={handleCreateUser}
-                  disabled={createUser.isPending || !newEmail || !newDisplayName || (newMode === 'password' && !newPassword)}
-                  className="text-xs px-3 py-1.5 bg-brand text-white rounded-sm hover:bg-brand-hover disabled:opacity-50">
+                <Button variant="primary" size="xs" onClick={handleCreateUser}
+                  disabled={createUser.isPending || !newEmail || !newDisplayName || (newMode === 'password' && !newPassword)}>
                   {createUser.isPending ? 'Creating...' : 'Create User'}
-                </button>
-                <button onClick={() => setShowAddUser(false)}
-                  className="text-xs px-3 py-1.5 border border-p-border-light rounded-sm text-p-text-secondary hover:bg-p-surface-hover">Cancel</button>
+                </Button>
+                <Button variant="secondary" size="xs" onClick={() => setShowAddUser(false)}>Cancel</Button>
               </div>
             </>
           )}
         </div>
       )}
 
-      {/* Reset Password Result */}
-      {resetPasswordResult && (
-        <div className="border border-amber-200 dark:border-amber-800 rounded-xl bg-amber-50 dark:bg-amber-900/20 p-4">
-          <p className="text-sm font-medium text-amber-800 dark:text-amber-300 mb-2">Password Reset</p>
-          <p className="text-xs text-amber-700 dark:text-amber-400 mb-2">New temporary password (copy now — won't be shown again):</p>
-          <div className="flex gap-2 mb-3">
-            <code className="flex-1 px-3 py-2 text-sm font-mono bg-white dark:bg-p-surface border border-p-border-light rounded-lg text-p-text select-all">{resetPasswordResult.password}</code>
-            <button onClick={() => navigator.clipboard.writeText(resetPasswordResult.password)}
-              className="px-3 py-2 text-xs border border-p-border-light rounded-lg text-p-text-secondary hover:bg-p-surface-hover">Copy</button>
-          </div>
-          <button onClick={() => setResetPasswordResult(null)}
-            className="text-xs px-3 py-1.5 bg-brand text-white rounded-sm hover:bg-brand-hover">Dismiss</button>
-        </div>
-      )}
-
       {error && (
-        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-3 text-sm text-red-700 dark:text-red-400">
+        <div className="bg-status-danger-bg border border-status-danger-border rounded-card p-3 text-sm text-status-danger-fg">
           {error}
           <button onClick={() => setError(null)} className="ml-2 underline">dismiss</button>
         </div>
@@ -690,11 +688,11 @@ export default function UsersPage() {
 
       {/* User list — unified card layout (desktop + mobile) */}
       {(!users || users.length === 0) ? (
-        <p className="text-sm text-p-text-light py-4 text-center border border-p-border-light rounded-xl bg-white dark:bg-p-surface">
+        <p className={`${CARD} text-sm text-tertiary py-4 text-center`}>
           No users yet. Add a user to get started.
         </p>
       ) : filteredUsers.length === 0 ? (
-        <p className="text-sm text-p-text-light py-4 text-center border border-p-border-light rounded-xl bg-white dark:bg-p-surface">
+        <p className={`${CARD} text-sm text-tertiary py-4 text-center`}>
           No users match “{search.trim()}”.
         </p>
       ) : null}
@@ -703,55 +701,61 @@ export default function UsersPage() {
           const isEditing = editingSub === u.sub
           const isLocal = (u.auth_provider || 'local').startsWith('local')
           return (
-            <div key={u.sub} className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light transition-shadow hover:shadow-xs">
+            <div key={u.sub} className={CARD}>
               {/* Header row */}
               <div className="px-4 py-3 flex items-center justify-between gap-3">
                 <div className="flex items-center gap-3 min-w-0">
                   {/* Avatar circle */}
-                  <div className="w-9 h-9 rounded-full bg-brand/10 flex items-center justify-center shrink-0">
-                    <span className="text-sm font-semibold text-brand">
+                  <div className="w-9 h-9 rounded-full bg-surface-muted flex items-center justify-center shrink-0">
+                    <span className="text-sm font-semibold text-secondary">
                       {(u.name || u.email)[0]?.toUpperCase()}
                     </span>
                   </div>
                   <div className="min-w-0">
                     <div className="flex items-center gap-1.5 flex-wrap">
-                      <p className="font-medium text-sm text-p-text truncate">{u.name}</p>
-                      {!!u.is_owner && <span title="Platform owner" className="text-amber-500 text-sm">&#9733;</span>}
-                      <span className={`px-1.5 py-0.5 rounded-sm text-[10px] font-medium ${roleBadge(u.role)}`}>{u.role}</span>
+                      <p className="font-medium text-sm text-primary truncate">{u.name}</p>
+                      {!!u.is_owner && <span title="Platform owner" className="text-status-warning-fg text-sm">&#9733;</span>}
+                      <span className={`${BADGE_BASE} ${roleBadge(u.role)}`}>{u.role}</span>
                       {/* Only SSO/OIDC users get an auth badge — "no badge = local". */}
                       {!isLocal && <AuthBadge user={u} />}
                       <AgentsPopover user={u} />
                     </div>
-                    <p className="text-xs text-p-text-secondary truncate">{u.email}</p>
+                    <p className="text-xs text-secondary truncate">{u.email}</p>
                   </div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   {!isEditing && (
-                    <button onClick={() => startEdit(u)} className="text-xs text-brand hover:text-brand-hover font-medium">Edit</button>
+                    <button onClick={() => startEdit(u)} className="text-xs text-link hover:text-link-hover font-medium">Edit</button>
                   )}
                 </div>
               </div>
 
+              {/* Resting, the one-time password shows under the card's
+                  header; with the edit form open, under its Account actions. */}
+              {!isEditing && resetPasswordResult?.sub === u.sub && (
+                <div className="px-4 pb-3">{resetResultPanel(resetPasswordResult.password)}</div>
+              )}
+
               {/* Expanded content */}
               {isEditing ? (
-                <div className="px-4 pb-4 border-t border-p-border-light pt-3">
+                <div className="px-4 pb-4 border-t border-subtle pt-3">
                   {renderEditForm(u)}
                 </div>
               ) : (
                 /* Resting body — just status chips + dates. Agents live in the
                    header popover; account actions live in the Edit form. */
-                <div className="px-4 pb-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-p-text-light">
+                <div className="px-4 pb-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-tertiary">
                   {!!u.allow_platform_auth && (
-                    <span className="px-1.5 py-0.5 rounded-sm bg-brand/10 text-brand font-medium"
-                      title="May borrow admin API credentials when they have no subscription of their own">Platform Auth</span>
+                    <span className={`${BADGE_BASE} ${BADGE_TONE.info}`}
+                      title="May borrow admin API credentials when they have no subscription of their own">Platform API</span>
                   )}
                   {isLocal && !!u.local_only && (
-                    <span className="px-1.5 py-0.5 rounded-sm bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 font-medium"
+                    <span className={`${BADGE_BASE} ${BADGE_TONE.warning}`}
                       title="Login restricted to the local network">LAN only</span>
                   )}
                   {!!u.invite_pending && (
-                    <span className="px-1.5 py-0.5 rounded-sm bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 font-medium"
-                      title="No password set yet — waiting on the invite link (reset the password to issue a new way in)">Invite pending</span>
+                    <span className={`${BADGE_BASE} ${BADGE_TONE.info}`}
+                      title="No password set yet. The invite link has not been used yet. Reset the password to give them a new way in.">Invite pending</span>
                   )}
                   <span>Last login {formatDate(u.last_login)}</span>
                   <span>Created {formatDate(u.created_at)}</span>

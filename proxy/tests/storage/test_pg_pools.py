@@ -24,7 +24,6 @@ import pytest
 import config
 from storage import pg
 
-
 # ---------------------------------------------------------------------------
 # A TCP proxy in front of the test database
 # ---------------------------------------------------------------------------

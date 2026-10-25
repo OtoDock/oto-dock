@@ -4,7 +4,7 @@
  * STT/TTS providers + chat audio live in the Audio tab.
  */
 
-import { useState, useCallback } from 'react'
+import { useState, type ReactNode } from 'react'
 import {
   usePhoneRoutes, useCreatePhoneRoute, useUpdatePhoneRoute, useDeletePhoneRoute,
   useDeleteRoutePin,
@@ -14,7 +14,7 @@ import {
   type PhoneRoute, type PhoneRouteCreate, type PhoneServerCreate, type RouteMode,
   PIN_DIGITS, isRoutePin, PHONE_INBOUND, PHONE_OUTBOUND,
 } from '../../api/phone'
-import { formatBytes } from './PlatformPage.shared'
+
 import CallLogModal from '../../components/phone/CallLogModal'
 import {
   useAudioProviders, type AudioProvider,
@@ -22,10 +22,22 @@ import {
 } from '../../api/audio'
 import { useAgents, useAgentUsers } from '../../api/agents'
 import { useTriggers, useCreateTrigger } from '../../api/triggers'
-import { SectionCard, SettingRow, Toggle, Badge, SavedBadge } from '../../components/ui/SettingsControls'
+import { SectionCard, SettingRow, Badge, SaveState } from '../../components/ui/SettingsControls'
+import { useSaveState } from '../../hooks/useSaveState'
+import Switch from '../../components/ui/Switch'
+import InfoTip from '../../components/ui/InfoTip'
 import { PhoneServerPill } from '../../components/phone/PhoneServerPill'
 import { AdvancedTuningCard } from '../../components/audio/AdvancedTuning'
+import { LanguageCandidatesRow } from '../../components/audio/LanguageCandidatesRow'
 import { LANGUAGES, baseLang } from '../../audio/lang'
+import { formatBytes } from './PlatformPage.format'
+import { useDialogs } from '../../components/ui/dialogs'
+import Dialog from '../../components/ui/Dialog'
+import Button from '../../components/ui/Button'
+import { emitAppToast } from '../../lib/appToasts'
+import { errorText, toastError } from '../../lib/http/apiJson'
+import { Input, Select } from '../../components/ui/Field'
+import { BUTTON_BASE, BUTTON_SIZE, CARD_BORDERED, DIALOG_PANEL, FIELD, FIELD_REGULAR, FIELD_BORDER, SEGMENT } from '../../components/ui/classes'
 
 // ---------------------------------------------------------------------------
 // Servers
@@ -39,9 +51,9 @@ type AdapterType = NonNullable<PhoneServerCreate['adapter_type']>
 // infrastructure, FreePBX auto-provisions against an existing box, manual
 // Asterisk is the expert path.
 const ADAPTER_OPTIONS: { value: AdapterType; label: string; hint: string }[] = [
-  { value: 'twilio', label: 'Twilio', hint: 'Buy a number, paste your account SID + auth token, done. Calls enter through your public dashboard URL.' },
-  { value: 'asterisk_freepbx', label: 'FreePBX (automated)', hint: 'FreePBX with GraphQL + AMI — routes auto-provision end to end.' },
-  { value: 'asterisk_manual', label: 'Asterisk (manual)', hint: 'Any Asterisk. You install a one-time dialplan snippet; each route gives you the exact AstDB command. No API automation needed.' },
+  { value: 'twilio', label: 'Twilio', hint: 'Buy a number and paste your account SID and auth token. Calls come in through your public dashboard URL.' },
+  { value: 'asterisk_freepbx', label: 'FreePBX, automated', hint: 'FreePBX with GraphQL and AMI. OtoDock sets up each route for you.' },
+  { value: 'asterisk_manual', label: 'Asterisk, manual', hint: 'Any Asterisk. You install a dialplan snippet once. Each route then shows the exact AstDB command to run. No API access needed.' },
 ]
 
 function AddServerForm() {
@@ -72,46 +84,47 @@ function AddServerForm() {
       : { name: name.trim(), adapter_type: adapter, host: host.trim() }
     create.mutate(payload, {
       onSuccess: reset,
-      onError: (e) => alert((e as Error).message),
+      onError: toastError('The phone server was not added'),
     })
   }
 
-  if (!open) return <button onClick={() => setOpen(true)} className="text-xs text-brand hover:underline">+ Add phone server</button>
+  if (!open) return <button onClick={() => setOpen(true)} className="text-xs text-link hover:underline">+ Add phone server</button>
   const hint = ADAPTER_OPTIONS.find(o => o.value === adapter)?.hint
   return (
-    <div className="p-3 border border-p-border-light rounded-lg bg-gray-50 dark:bg-gray-800/40 space-y-2">
+    <div className="p-3 rounded-card bg-surface-raised shadow-elevation-2 space-y-2">
       <div>
-        <label className="block text-xs font-medium text-p-text mb-1">Adapter</label>
-        <select value={adapter} onChange={e => setAdapter(e.target.value as AdapterType)}
-          className="w-full px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
+        <label className="block text-xs font-medium text-primary mb-1">Server type</label>
+        <Select value={adapter} onChange={e => setAdapter(e.target.value as AdapterType)}>
           {ADAPTER_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-        </select>
-        {hint && <p className="text-xs text-p-text-light mt-1">{hint}</p>}
+        </Select>
+        {hint && <p className="text-xs text-tertiary mt-1">{hint}</p>}
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-        <input value={name} onChange={e => setName(e.target.value)} placeholder={isTwilio ? 'Name (e.g. Twilio)' : 'Name (e.g. Main PBX)'}
-          className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" />
+        <Input value={name} onChange={e => setName(e.target.value)} placeholder={isTwilio ? 'Name, e.g. Twilio' : 'Name, e.g. Main PBX'} />
         {!isTwilio && (
-          <input value={host} onChange={e => setHost(e.target.value)} placeholder="Host (pbx.example.com)"
-            className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" />
+          <Input value={host} onChange={e => setHost(e.target.value)} placeholder="Host, like pbx.example.com" />
         )}
         {isTwilio && (
-          <input value={accountSid} onChange={e => setAccountSid(e.target.value)} placeholder="Account SID (ACxxxxxxxx…)"
-            className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono" />
+          <Input value={accountSid} onChange={e => setAccountSid(e.target.value)} placeholder="Account SID, like ACxxxxxxxx…"
+            className="font-mono" />
         )}
       </div>
       {isTwilio && (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          <input type="password" value={authToken} onChange={e => setAuthToken(e.target.value)} placeholder="Auth token (Twilio console)"
-            className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono" />
+          <Input type="password" value={authToken} onChange={e => setAuthToken(e.target.value)} placeholder="Auth token from the Twilio console"
+            className="font-mono" />
         </div>
       )}
       <div className="flex gap-2 justify-end">
-        <button onClick={reset} className="px-3 py-1 text-xs rounded-lg border border-p-border-light text-p-text-secondary">Cancel</button>
-        <button onClick={submit} disabled={!name.trim() || create.isPending}
-          className="px-3 py-1 text-xs font-medium rounded-lg bg-brand text-white hover:bg-brand-hover disabled:opacity-40">
+        <Button variant="ghost" size="xs" onClick={reset}>Cancel</Button>
+        <Button
+          variant="primary"
+          size="xs"
+          onClick={submit}
+          disabled={!name.trim() || create.isPending}
+        >
           {create.isPending ? 'Adding...' : 'Add'}
-        </button>
+        </Button>
       </div>
     </div>
   )
@@ -119,11 +132,11 @@ function AddServerForm() {
 
 function ServersSection() {
   const { data: servers, isLoading } = usePhoneServers()
-  if (isLoading) return <p className="text-sm text-p-text-secondary">Loading...</p>
+  if (isLoading) return <p className="text-sm text-secondary">Loading...</p>
   return (
     <div className="space-y-3">
       {(servers || []).length === 0
-        ? <p className="text-sm text-p-text-secondary">No phone servers configured.</p>
+        ? <p className="text-sm text-secondary">No phone servers configured.</p>
         : servers!.map(s => <PhoneServerPill key={s.id} server={s} />)}
       <AddServerForm />
     </div>
@@ -148,8 +161,8 @@ const EMPTY_ROUTE: PhoneRouteCreate = {
 
 // Per-route filler toggle: the wire value is 'on'/'off' (RouteMode), the
 // control is a plain switch.
-function ModeToggle({ value, onChange }: { value: RouteMode; onChange: (v: RouteMode) => void }) {
-  return <Toggle checked={value !== 'off'} onChange={v => onChange(v ? 'on' : 'off')} />
+function ModeToggle({ label, value, onChange }: { label: string; value: RouteMode; onChange: (v: RouteMode) => void }) {
+  return <Switch aria-label={label} checked={value !== 'off'} onChange={v => onChange(v ? 'on' : 'off')} />
 }
 
 // The modal's PIN intent: a value being set rides the route save as `pin`
@@ -176,9 +189,9 @@ function pinAllowed(form: { identity_mode: string; direction: string }) {
 // is simply the agent's shared space with no per-caller memory) and always
 // runs as a viewer of the shared space; `user` runs the tied user's own
 // session and is the mode that needs a PIN.
-const IDENTITY_OPTIONS: { value: PhoneRoute['identity_mode']; label: string; hint: string }[] = [
-  { value: 'caller', label: 'Per caller (recommended)', hint: 'Every phone number gets its own private notes and files where the agent has personal spaces; nothing a caller says reaches another caller or the team\'s shared memory. Callers read the agent\'s shared files as viewers and change nothing. On a shared-only agent, callers work in the shared space with no per-caller memory.' },
-  { value: 'user', label: 'A platform user', hint: 'Calls run as that user\'s own session — their memory, schedules, meetings and delegation, capped at manager rights.' },
+const IDENTITY_OPTIONS: { value: PhoneRoute['identity_mode']; label: string; hint?: string; info: string }[] = [
+  { value: 'caller', label: 'Per caller, recommended', info: 'Each phone number gets its own private notes and files. This needs an agent with personal spaces. Nothing a caller says reaches other callers or the team\'s shared memory. Callers read the agent\'s shared files as viewers and change nothing. On a shared-only agent, callers work in the shared space with no per-caller memory.' },
+  { value: 'user', label: 'A platform user', hint: 'A call never gets more than manager rights.', info: 'Calls run as that user\'s own session, with their memory, schedules, meetings and delegation.' },
 ]
 
 const IDENTITY_LABEL: Record<PhoneRoute['identity_mode'], string> = {
@@ -191,16 +204,16 @@ function McpPreview({ agent, identityMode }: { agent: string; identityMode: Phon
   const { data, isLoading, isError } = useRouteMcpPreview(agent, identityMode)
   if (!agent) return null
   if (isError) return null
-  if (isLoading || !data) return <p className="text-xs text-p-text-light">Checking the tools on this line…</p>
+  if (isLoading || !data) return <p className="text-xs text-tertiary">Checking the tools on this line…</p>
   const name = (m: { name: string; label: string }) => m.label || m.name
   return (
     <div className="text-xs space-y-0.5" data-testid="route-mcp-preview">
-      <p className="text-p-text-secondary">
+      <p className="text-secondary">
         <span className="font-medium">Available on this line:</span>{' '}
         {data.attached.length ? data.attached.map(name).join(', ') : 'no MCP tools'}
       </p>
       {data.excluded.length > 0 && (
-        <p className="text-p-text-light">
+        <p className="text-tertiary">
           <span className="font-medium">Not on calls:</span>{' '}
           {data.excluded.map((m, i) => (
             <span key={m.name} title={m.reason}>{i > 0 ? ', ' : ''}{name(m)}</span>
@@ -211,8 +224,16 @@ function McpPreview({ agent, identityMode }: { agent: string; identityMode: Phon
   )
 }
 
+const FieldLabel = ({ label, large, aside, children }: { label: string; large?: boolean; aside?: ReactNode; children: ReactNode }) => (
+  <div className="mb-1">
+    <label className={`${large ? 'text-sm' : 'text-xs'} font-medium text-primary`}>{label}</label>
+    <InfoTip label={label}>{children}</InfoTip>
+    {aside}
+  </div>
+)
+
 function RouteModal({
-  route, agents, languages, servers, providers, onSave, onClose, saving,
+  route, agents, languages, servers, providers, onSave, onClose, saving, error,
 }: {
   route: PhoneRouteCreate & { id?: string; pin_configured?: boolean }
   agents: string[]
@@ -222,7 +243,10 @@ function RouteModal({
   onSave: (data: PhoneRouteCreate & { id?: string }, pin: PinIntent, acknowledged: boolean) => void
   onClose: () => void
   saving: boolean
+  /** Why the last save failed: the editor stays open with it. */
+  error: string
 }) {
+  const dialogs = useDialogs()
   const [form, setForm] = useState(route)
   const selectedServerAdapter = servers.find(sv => sv.id === form.phone_server_id)?.adapter_type
   const set = (field: string, value: unknown) => setForm(prev => ({ ...prev, [field]: value }))
@@ -271,14 +295,14 @@ function RouteModal({
 
   // Backdrop click closes the modal; unsaved edits get a confirm first.
   const dirty = JSON.stringify(form) !== JSON.stringify(route) || pinDirty
-  const requestClose = () => {
-    if (!dirty || window.confirm('Discard unsaved changes?')) onClose()
+  const requestClose = async () => {
+    if (!dirty || await dialogs.confirm({ title: 'Discard the unsaved changes?', confirmLabel: 'Discard', tone: 'danger' })) onClose()
   }
 
   // A user-mode inbound route saved without a PIN is an explicit choice: the
   // admin confirms it in words and the request carries the acknowledgement
   // (the server refuses the save without it).
-  const save = () => {
+  const save = async () => {
     const pin: PinIntent = { dirty: pinDirty, enabled: pinEnabled, value: pinValue }
     const noPin = endsWithoutPin(form, pin, hasPin)
     if (noPin) {
@@ -286,35 +310,37 @@ function RouteModal({
       const who = picked && picked.sub !== picked.name
         ? (picked.name || picked.email || picked.sub)
         : `the tied user (${form.identity_user_sub})`
-      if (!window.confirm(
-        `Anyone who calls this route will act as ${who}, with all their tools and credentials. Save without a PIN?`,
-      )) return
+      if (!(await dialogs.confirm({
+        title: 'Save without a PIN?',
+        body: `Anyone who calls this route will act as ${who}, with all their tools and credentials.`,
+        confirmLabel: 'Save without a PIN',
+        tone: 'danger',
+      }))) return
     }
     onSave(form, pin, noPin)
   }
 
   return (
-    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-      onClick={requestClose}>
-      <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light shadow-xl w-full max-w-lg max-h-[85vh] overflow-y-auto"
-        onClick={e => e.stopPropagation()}>
+    <Dialog
+      onClose={() => { void requestClose() }}
+      busy={saving}
+      aria-labelledby="route-modal-title"
+      panelClassName={`${DIALOG_PANEL} max-w-lg`}
+    >
         <div className="p-5 space-y-4">
-          <h3 className="text-base font-semibold text-p-text">{form.id ? 'Edit Route' : 'New Route'}</h3>
+          <h3 id="route-modal-title" className="text-base font-semibold text-primary">{form.id ? 'Edit Route' : 'New Route'}</h3>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs font-medium text-p-text mb-1">Name</label>
-              <input value={form.name} onChange={e => set('name', e.target.value)}
-                className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="e.g., Main Line" />
+              <label className="block text-xs font-medium text-primary mb-1">Name</label>
+              <Input value={form.name} onChange={e => set('name', e.target.value)} placeholder="e.g., Main Line" />
             </div>
             <div>
-              <label className="block text-xs font-medium text-p-text mb-1">Direction</label>
-              <div className="flex gap-2">
+              <label className="block text-xs font-medium text-primary mb-1">Direction</label>
+              <div role="group" aria-label="Direction" className="flex gap-2">
                 {([PHONE_INBOUND, PHONE_OUTBOUND] as const).map(d => (
-                  <button key={d} onClick={() => set('direction', d)}
-                    className={`flex-1 px-3 py-1.5 text-sm rounded-lg border transition-colors ${
-                      form.direction === d ? 'border-brand bg-brand/10 text-brand font-medium' : 'border-p-border-light text-p-text-secondary hover:border-gray-300'
-                    }`}>{d}</button>
+                  <button key={d} type="button" onClick={() => set('direction', d)} aria-pressed={form.direction === d}
+                    className={`${BUTTON_BASE} ${BUTTON_SIZE.sm} flex-1 ${form.direction === d ? SEGMENT.on : SEGMENT.off}`}>{d}</button>
                 ))}
               </div>
             </div>
@@ -322,73 +348,70 @@ function RouteModal({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs font-medium text-p-text mb-1">Agent</label>
-              <select value={form.agent} onChange={e => set('agent', e.target.value)}
-                className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
-                <option value="">— Select agent —</option>
+              <label className="block text-xs font-medium text-primary mb-1">Agent</label>
+              <Select value={form.agent} onChange={e => set('agent', e.target.value)}>
+                <option value="">Select an agent</option>
                 {agents.map(a => <option key={a} value={a}>{a}</option>)}
-              </select>
+              </Select>
             </div>
             <div>
-              <label className="block text-xs font-medium text-p-text mb-1">Language</label>
-              <select value={form.language} onChange={e => set('language', e.target.value)}
-                className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
+              <label className="block text-xs font-medium text-primary mb-1">Language</label>
+              <Select value={form.language} onChange={e => set('language', e.target.value)}>
                 {languages.map(l => <option key={l} value={l}>{l.toUpperCase()}</option>)}
                 {languages.length === 0 && <option value="en">EN</option>}
-              </select>
+              </Select>
             </div>
           </div>
 
           <SettingRow label="Detect the caller's language"
-            description="The greeting plays in the language above; the caller's first words pick the language of the rest of the call when the line has a voice for it. Off: every call runs in the language above.">
-            <Toggle checked={form.language_detect ?? false} onChange={v => set('language_detect', v)} />
+            info="The greeting plays in the language above. The caller's first words then pick the language for the rest of the call. This needs a voice for that language on the line. Off: every call runs in the language above.">
+            <Switch aria-label="Detect the caller's language" checked={form.language_detect ?? false} onChange={v => set('language_detect', v)} />
           </SettingRow>
 
           <div>
-            <label className="block text-xs font-medium text-p-text mb-1">Phone Server</label>
-            <select value={form.phone_server_id ?? ''} onChange={e => set('phone_server_id', e.target.value ? Number(e.target.value) : null)}
-              className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
-              <option value="">— Select server —</option>
+            <label className="block text-xs font-medium text-primary mb-1">Phone Server</label>
+            <Select value={form.phone_server_id ?? ''} onChange={e => set('phone_server_id', e.target.value ? Number(e.target.value) : null)}>
+              <option value="">Select a server</option>
               {servers.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-            </select>
-            {servers.length === 0 && <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">Add a phone server first (Servers section).</p>}
+            </Select>
+            {servers.length === 0 && <p className="text-xs text-status-warning-fg mt-1">Add a phone server first, under Phone Servers above.</p>}
           </div>
 
-          <div className="border border-p-border-light rounded-lg p-3 space-y-3">
+          <div className="border border-subtle rounded-card p-3 space-y-3">
             <div>
-              <span className="text-sm font-medium text-p-text">Caller identity</span>
-              <p className="text-xs text-p-text-light mt-0.5">Who the agent is talking to on this line, and what the call may touch.</p>
+              <span className="text-sm font-medium text-primary">Caller identity</span>
+              <p className="text-xs text-tertiary mt-0.5">Who the agent is talking to on this line, and what the call may touch.</p>
             </div>
             <div className="space-y-1.5" role="radiogroup" aria-label="Caller identity">
               {IDENTITY_OPTIONS.map(o => (
-                <label key={o.value} className="flex items-start gap-2 text-sm text-p-text cursor-pointer">
-                  <input type="radio" name="identity_mode" value={o.value} checked={form.identity_mode === o.value}
-                    onChange={() => set('identity_mode', o.value)} className="mt-0.5" />
-                  <span>
-                    <span className="font-medium">{o.label}</span>
-                    <span className="block text-xs text-p-text-light">{o.hint}</span>
-                  </span>
-                </label>
+                <div key={o.value} className="relative flex items-start gap-2 text-sm text-primary">
+                  <input type="radio" id={`identity-${o.value}`} name="identity_mode" value={o.value} checked={form.identity_mode === o.value}
+                    aria-describedby={o.hint ? `identity-${o.value}-hint` : undefined} onChange={() => set('identity_mode', o.value)} className="mt-0.5 cursor-pointer" />
+                  <div className="min-w-0">
+                    <label htmlFor={`identity-${o.value}`} className="font-medium cursor-pointer after:absolute after:inset-0">{o.label}</label>
+                    <span className="relative z-10"><InfoTip label={o.label}>{o.info}</InfoTip></span>
+                    {o.hint && <span id={`identity-${o.value}-hint`} className="block text-xs text-tertiary">{o.hint}</span>}
+                  </div>
+                </div>
               ))}
             </div>
             {form.identity_mode === 'user' ? (
               <div>
-                <label className="block text-xs font-medium text-p-text mb-1">Platform user</label>
-                <select value={form.identity_user_sub ?? ''} onChange={e => set('identity_user_sub', e.target.value || null)}
-                  aria-label="Platform user"
-                  className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
-                  <option value="">— Select user —</option>
+                <label className="block text-xs font-medium text-primary mb-1">Platform user</label>
+                <Select value={form.identity_user_sub ?? ''} onChange={e => set('identity_user_sub', e.target.value || null)}
+                  aria-label="Platform user">
+                  <option value="">Select a user</option>
                   {userChoices.map(u => <option key={u.sub} value={u.sub}>{u.name || u.email || u.sub}{u.role ? ` (${u.role})` : ''}</option>)}
-                </select>
-                <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                </Select>
+                <p className="text-xs text-status-warning-fg mt-1">
                   {form.direction === PHONE_INBOUND
-                    ? 'Require a PIN below — without one, anyone who dials this number acts as that user.'
-                    : 'Whoever answers a call on this route acts as that user. Require a PIN below so they enter it first; use the route for calls to your own phone.'}
+                    ? 'Require a PIN below. Without one, anyone who dials this number acts as that user.'
+                    : 'Whoever answers a call on this route acts as that user. Require a PIN below so they enter it first. Use this route for calls to your own phone.'}
                 </p>
               </div>
             ) : (
-              <SettingRow label="Remember callers" description="Keep each caller's notes between calls">
-                <Toggle checked={form.remember_callers} onChange={v => set('remember_callers', v)} />
+              <SettingRow label="Remember callers" info="Keep each caller's notes between calls">
+                <Switch aria-label="Remember callers" checked={form.remember_callers} onChange={v => set('remember_callers', v)} />
               </SettingRow>
             )}
             <McpPreview agent={form.agent} identityMode={form.identity_mode} />
@@ -399,31 +422,29 @@ function RouteModal({
               speaks). A stored PIN on a form that no longer allows one stays
               visible in its removal state, and the save removes it first. */}
           {(pinFits || hasPin) && (
-            <div className="border border-p-border-light rounded-lg p-3 space-y-2">
+            <div className="border border-subtle rounded-card p-3 space-y-2">
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <span className="text-sm font-medium text-p-text">
-                    Require a PIN
-                    {hasPin && <span className="text-xs text-green-600 ml-1.5">(set)</span>}
-                  </span>
-                  <p className="text-xs text-p-text-light mt-0.5">
+                  <span className="text-sm font-medium text-primary">Require a PIN</span>
+                  <InfoTip label="Require a PIN">
                     {form.direction === PHONE_INBOUND
-                      ? 'Anyone who calls this number must enter this code on the keypad before the agent answers — even people you know.'
-                      : 'The person who answers must enter this code on the keypad before the agent speaks. A Twilio line receives every keypress; an Asterisk line needs its AMI event listener connected (else only in-band tones are heard).'}
-                  </p>
+                      ? 'Every caller must enter this code on the keypad before the agent answers. This includes people you know.'
+                      : 'The person who answers must enter this code on the keypad before the agent speaks. A Twilio line hears every keypress. An Asterisk line needs its AMI event listener connected, or it hears only in-band tones.'}
+                  </InfoTip>
+                  {hasPin && <span className="text-xs text-status-success-fg ml-1.5">Set</span>}
                 </div>
-                {pinFits && <Toggle checked={pinEnabled} onChange={setPinEnabled} />}
+                {pinFits && <Switch aria-label="Require a PIN" checked={pinEnabled} onChange={setPinEnabled} />}
               </div>
               {pinFits && pinEnabled && (
                 <div>
-                  <input
+                  <Input
                     type="password" inputMode="numeric" autoComplete="off" maxLength={PIN_DIGITS}
                     value={pinValue}
                     onChange={e => setPinValue(e.target.value.replace(/\D/g, ''))}
-                    className="w-40 px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono tracking-widest"
+                    className="max-w-40 font-mono tracking-widest"
                     placeholder={hasPin ? '••••••' : `${PIN_DIGITS} digits`}
                   />
-                  <p className="text-xs text-p-text-light mt-1">
+                  <p className="text-xs text-tertiary mt-1">
                     {hasPin
                       ? 'Leave empty to keep the current PIN, or type a new one to replace it.'
                       : `Enter ${PIN_DIGITS} digits. The person presses pound (#) after the code.`}
@@ -431,7 +452,7 @@ function RouteModal({
                 </div>
               )}
               {hasPin && (!pinFits || !pinEnabled) && (
-                <p className="text-xs text-amber-600 dark:text-amber-400">The PIN will be removed when you save.</p>
+                <p className="text-xs text-status-warning-fg">The PIN will be removed when you save.</p>
               )}
             </div>
           )}
@@ -439,115 +460,118 @@ function RouteModal({
           {form.direction === PHONE_INBOUND && (
             <>
               <div>
-                <label className="block text-xs font-medium text-p-text mb-1">DID (inbound number)</label>
-                <input value={form.did} onChange={e => set('did', e.target.value)}
-                  className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
+                <FieldLabel label="DID, the inbound number">The number the PBX sends to this route. The phone server links it to the route's AudioSocket UUID.</FieldLabel>
+                <Input value={form.did} onChange={e => set('did', e.target.value)}
+                  className="font-mono"
                   placeholder="+302101234567" />
-                <p className="text-xs text-p-text-light mt-1">The number the PBX maps to this route. Provisioned on the phone server (DID ↔ AudioSocket UUID).</p>
               </div>
               <div>
-                <label className="block text-xs font-medium text-p-text mb-1">Greeting</label>
+                <label className="block text-xs font-medium text-primary mb-1">Greeting</label>
                 <textarea value={form.greeting} onChange={e => set('greeting', e.target.value)} rows={2}
-                  className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text resize-y"
-                  placeholder="TTS greeting text (leave empty for default)" />
+                  className={`${FIELD} ${FIELD_REGULAR} ${FIELD_BORDER} resize-y`}
+                  placeholder="TTS greeting text. Leave empty for the default." />
               </div>
             </>
           )}
 
           {form.direction === PHONE_OUTBOUND && (
             <div>
-              <label className="block text-xs font-medium text-p-text mb-1">Caller ID</label>
-              <input value={form.ami_caller_id} onChange={e => set('ami_caller_id', e.target.value)}
-                className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder='"Company" <+1234567890>' />
+              <label className="block text-xs font-medium text-primary mb-1">Caller ID</label>
+              <Input value={form.ami_caller_id} onChange={e => set('ami_caller_id', e.target.value)} placeholder='"Company" <+1234567890>' />
             </div>
           )}
 
           <div>
-            <label className="block text-xs font-medium text-p-text mb-1">Transfer targets</label>
-            <p className="text-xs text-p-text-light mb-1">
-              The colleagues the agent may hand the caller to with its transfer tool, by name. These are the only numbers it ever dials: a FreePBX extension or a number your outbound routes understand (Asterisk lines transfer inbound calls; Twilio lines both ways).
-            </p>
+            <FieldLabel label="Transfer targets">The colleagues the agent may transfer the caller to, by name. These are the only numbers it ever dials. Asterisk lines transfer inbound calls only. Twilio lines transfer both ways.</FieldLabel>
+            <p className="text-xs text-tertiary mb-1">Use a FreePBX extension or a number your outbound routes understand.</p>
             <div className="space-y-2" data-testid="transfer-targets">
               {/* Wraps on a phone: the number takes its own row below 640 px. */}
               {(form.transfer_targets ?? []).map((t, i) => (
                 <div key={i} className="flex flex-wrap gap-2">
-                  <input value={t.label} aria-label={`Transfer target ${i + 1} name`}
+                  <Input value={t.label} aria-label={`Transfer target ${i + 1} name`}
                     onChange={e => set('transfer_targets', (form.transfer_targets ?? []).map((x, j) => j === i ? { ...x, label: e.target.value } : x))}
-                    className="flex-1 min-w-[10rem] px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="Name, e.g. Reception" />
-                  <input value={t.number} aria-label={`Transfer target ${i + 1} number`}
+                    className="flex-1 min-w-[10rem]" placeholder="Name, e.g. Reception" />
+                  <Input value={t.number} aria-label={`Transfer target ${i + 1} number`}
                     onChange={e => set('transfer_targets', (form.transfer_targets ?? []).map((x, j) => j === i ? { ...x, number: e.target.value } : x))}
-                    className="w-full sm:w-40 px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono" placeholder="200 or +30210…" />
+                    className="sm:w-40 font-mono" placeholder="200 or +30210…" />
                   <button type="button" aria-label={`Remove transfer target ${i + 1}`}
                     onClick={() => set('transfer_targets', (form.transfer_targets ?? []).filter((_, j) => j !== i))}
-                    className="px-2 text-xs text-p-text-secondary hover:text-red-500">Remove</button>
+                    className="px-2 text-xs text-secondary hover:text-status-danger-fg">Remove</button>
                 </div>
               ))}
-              <button type="button" onClick={() => set('transfer_targets', [...(form.transfer_targets ?? []), { label: '', number: '' }])}
+              <Button
+                size="xs"
+                type="button"
+                onClick={() => set('transfer_targets', [...(form.transfer_targets ?? []), { label: '', number: '' }])}
                 disabled={(form.transfer_targets ?? []).length >= 20}
-                className="px-3 py-1.5 text-xs rounded-lg border border-p-border-light text-p-text-secondary hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-40">
+              >
                 + Add target
-              </button>
+              </Button>
             </div>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <SettingRow label="Backchannel" description="Active-listening sounds while the caller talks">
-              <ModeToggle value={form.backchannel_mode} onChange={v => set('backchannel_mode', v)} />
+            <SettingRow label="Backchannel" info="Active-listening sounds while the caller talks">
+              <ModeToggle label="Backchannel" value={form.backchannel_mode} onChange={v => set('backchannel_mode', v)} />
             </SettingRow>
-            <SettingRow label="Thinking filler" description="Plays only when the answer is slow to start">
-              <ModeToggle value={form.thinking_filler_mode} onChange={v => set('thinking_filler_mode', v)} />
+            <SettingRow label="Thinking filler" info="Plays only when the answer is slow to start">
+              <ModeToggle label="Thinking filler" value={form.thinking_filler_mode} onChange={v => set('thinking_filler_mode', v)} />
             </SettingRow>
           </div>
 
           <div>
-            <label className="block text-xs font-medium text-p-text mb-1">Background Ambience</label>
-            <p className="text-xs text-p-text-light mb-1">A soft ambient bed played through the whole call so the line never goes dead-quiet.</p>
-            <select value={form.background_sound || 'off'} onChange={e => set('background_sound', e.target.value as PhoneRouteCreate['background_sound'])}
-              className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
+            <FieldLabel label="Background Ambience">A soft ambient bed played through the whole call so the line never goes dead-quiet.</FieldLabel>
+            <Select value={form.background_sound || 'off'} onChange={e => set('background_sound', e.target.value as PhoneRouteCreate['background_sound'])}>
               <option value="off">Off</option>
               <option value="call_center">Call center</option>
               <option value="office">Office</option>
               <option value="city">City street</option>
-              <option value="nature">Nature / park</option>
-            </select>
+              <option value="nature">Nature in a park</option>
+            </Select>
           </div>
 
           <div>
-            <label className="block text-xs font-medium text-p-text mb-1">Route-Specific Context</label>
-            <p className="text-xs text-p-text-light mb-1">Additional instructions appended to the base call context for this route only.</p>
+            <FieldLabel label="Route-Specific Context">Additional instructions appended to the base call context for this route only.</FieldLabel>
             <textarea value={form.phone_context_override} onChange={e => set('phone_context_override', e.target.value)} rows={2}
-              className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text resize-y"
+              className={`${FIELD} ${FIELD_REGULAR} ${FIELD_BORDER} resize-y`}
               placeholder="e.g., Always speak formally on this line" />
           </div>
 
           <div>
-            <label className="block text-xs font-medium text-p-text mb-1">Bound Trigger</label>
-            <p className="text-xs text-p-text-light mb-1">
-              When set, inbound calls land with a <code>{'${trigger.*}'}</code> payload (caller phone, DID, etc.) that manifest <code>agent_context</code> blocks read. The trigger row acts only as a name — it does NOT fire its task on the call.
-            </p>
+            <FieldLabel label="Bound Trigger">When set, inbound calls bring <code>{'${trigger.*}'}</code> values, such as the caller's phone and the DID. The agent's <code>agent_context</code> blocks read them. The trigger only gives the link a name. It does not run its task on the call.</FieldLabel>
             <div className="flex gap-2">
-              <select value={form.trigger_slug || ''} onChange={e => set('trigger_slug', e.target.value || null)}
-                className="flex-1 px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
-                <option value="">— None —</option>
+              <Select value={form.trigger_slug || ''} onChange={e => set('trigger_slug', e.target.value || null)}
+                className="flex-1">
+                <option value="">None</option>
                 {(agentTriggers || []).map(t => <option key={t.slug} value={t.slug}>{t.name} ({t.slug})</option>)}
-              </select>
-              <button type="button" onClick={() => setShowCreateTrigger(v => !v)} disabled={!form.agent}
-                className="px-3 py-1.5 text-xs rounded-lg border border-p-border-light text-p-text-secondary hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-40 shrink-0"
-                title="Create a new context-profile trigger for this agent">+ New</button>
+              </Select>
+              <Button
+                size="xs"
+                className="shrink-0"
+                type="button"
+                onClick={() => setShowCreateTrigger(v => !v)}
+                disabled={!form.agent}
+                title="Create a new context-profile trigger for this agent"
+              >+ New</Button>
             </div>
             {showCreateTrigger && (
-              <div className="mt-2 p-3 border border-p-border-light rounded-lg bg-gray-50 dark:bg-gray-800/40 space-y-2">
-                <p className="text-xs text-p-text-light">Creates an agent-scope trigger (disabled, no webhook action). Used only as a label that binds this route to the <code>${'${'}trigger.*{'}'}</code> payload.</p>
+              <div className="mt-2 p-3 border border-subtle rounded-card space-y-2">
+                <p className="text-xs text-tertiary">Creates a trigger for this agent, with no webhook action. It only names the link between this route and the <code>{'${trigger.*}'}</code> values.</p>
                 <div className="flex gap-2">
-                  <input autoFocus value={newTriggerName} onChange={e => setNewTriggerName(e.target.value)}
+                  <Input autoFocus value={newTriggerName} onChange={e => setNewTriggerName(e.target.value)}
                     onKeyDown={e => { if (e.key === 'Enter') handleCreateTrigger() }} placeholder="e.g., Support call"
-                    className="flex-1 px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" />
-                  <button type="button" onClick={handleCreateTrigger} disabled={!newTriggerName.trim() || createTrigger.isPending}
-                    className="px-3 py-1.5 text-xs font-medium rounded-lg bg-brand text-white hover:bg-brand-hover disabled:opacity-40">
+                    className="flex-1" />
+                  <Button
+                    variant="primary"
+                    size="xs"
+                    type="button"
+                    onClick={handleCreateTrigger}
+                    disabled={!newTriggerName.trim() || createTrigger.isPending}
+                  >
                     {createTrigger.isPending ? 'Creating...' : 'Create'}
-                  </button>
+                  </Button>
                 </div>
-                {createTrigger.error && <p className="text-xs text-red-500">{(createTrigger.error as Error).message}</p>}
+                {createTrigger.error && <p className="text-xs text-status-danger-fg">{(createTrigger.error as Error).message}</p>}
               </div>
             )}
           </div>
@@ -557,85 +581,79 @@ function RouteModal({
               matches by DID and dials by REST, so its lines never show
               the three Asterisk fields). */}
           <details className="group" data-testid="route-advanced">
-            <summary className="text-xs text-p-text-light cursor-pointer select-none hover:text-p-text">
+            <summary className="text-xs text-tertiary cursor-pointer select-none hover:text-primary">
               Advanced
             </summary>
             <div className="mt-2 space-y-3">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-medium text-p-text mb-1">STT Provider</label>
-                  <select value={form.stt_provider_id ?? ''} onChange={e => set('stt_provider_id', e.target.value ? Number(e.target.value) : null)}
-                    className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
-                    <option value="">(use default)</option>
+                  <label className="block text-xs font-medium text-primary mb-1">STT Provider</label>
+                  <Select value={form.stt_provider_id ?? ''} onChange={e => set('stt_provider_id', e.target.value ? Number(e.target.value) : null)}>
+                    <option value="">Use the default</option>
                     {sttProviders.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
-                  </select>
+                  </Select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-p-text mb-1">TTS Provider</label>
-                  <select value={form.tts_provider_id ?? ''} onChange={e => set('tts_provider_id', e.target.value ? Number(e.target.value) : null)}
-                    className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
-                    <option value="">(use default)</option>
+                  <label className="block text-xs font-medium text-primary mb-1">TTS Provider</label>
+                  <Select value={form.tts_provider_id ?? ''} onChange={e => set('tts_provider_id', e.target.value ? Number(e.target.value) : null)}>
+                    <option value="">Use the default</option>
                     {ttsProviders.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
-                  </select>
+                  </Select>
                 </div>
               </div>
               <div>
-                <label className="block text-xs font-medium text-p-text mb-1">Voice</label>
-                <input value={form.voice_id ?? ''} aria-label="Voice id"
+                <FieldLabel label="Voice">A voice id from the TTS provider's library, for this route only.</FieldLabel>
+                <Input value={form.voice_id ?? ''} aria-label="Voice id"
                   onChange={e => set('voice_id', e.target.value.replace(/\s+/g, ''))}
-                  className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
-                  placeholder="(the provider's voice for the language)" />
-                <p className="mt-1 text-xs text-p-text-light">A voice id from the TTS provider's library, for this route only. Needs the phone server of 1.8.0 or later.</p>
+                  className="font-mono"
+                  placeholder="The provider's voice for the language" />
+                <p className="mt-1 text-xs text-tertiary">Needs the phone server of 1.8.0 or later.</p>
               </div>
               {form.direction === PHONE_OUTBOUND && selectedServerAdapter !== 'twilio' && (
                 <>
                   <div>
-                    <label className="block text-xs font-medium text-p-text mb-1">Outbound Dial Prefix</label>
-                    <input value={form.dial_prefix} onChange={e => set('dial_prefix', e.target.value)}
-                      className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="(e.g. 81)" />
-                    <p className="mt-1 text-xs text-p-text-light">Digits dialled before the number to pick a trunk, with a matching FreePBX outbound route. Blank: your default routing.</p>
+                    <FieldLabel label="Outbound Dial Prefix">Digits dialled before the number to pick a trunk, with a matching FreePBX outbound route.</FieldLabel>
+                    <Input value={form.dial_prefix} onChange={e => set('dial_prefix', e.target.value)} placeholder="(e.g. 81)" />
+                    <p className="mt-1 text-xs text-tertiary">Blank: your default routing.</p>
                   </div>
                   <div>
-                    <label className="block text-xs font-medium text-p-text mb-1">Dialplan Context</label>
-                    <input value={form.ami_outbound_context} onChange={e => set('ami_outbound_context', e.target.value)}
-                      className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="oto-audiosocket-outbound" />
-                    <p className="mt-1 text-xs text-p-text-light">Blank unless you changed the installed dialplan.</p>
+                    <label className="block text-xs font-medium text-primary mb-1">Dialplan Context</label>
+                    <Input value={form.ami_outbound_context} onChange={e => set('ami_outbound_context', e.target.value)} placeholder="oto-audiosocket-outbound" />
+                    <p className="mt-1 text-xs text-tertiary">Blank unless you changed the installed dialplan.</p>
                   </div>
                 </>
               )}
               {form.direction === PHONE_INBOUND && selectedServerAdapter !== 'twilio' && (
                 <div>
-                  <label className="block text-xs font-medium text-p-text mb-1">AudioSocket UUID</label>
-                  <input value={form.audiosocket_uuid || ''} onChange={e => set('audiosocket_uuid', e.target.value || null)}
-                    className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono"
-                    placeholder="(auto-allocated on save)" />
-                  <p className="mt-1 text-xs text-p-text-light">Auto-allocated on save. Set it only to reuse the UUID your dialplan already carries.</p>
+                  <label className="block text-xs font-medium text-primary mb-1">AudioSocket UUID</label>
+                  <Input value={form.audiosocket_uuid || ''} onChange={e => set('audiosocket_uuid', e.target.value || null)}
+                    className="font-mono"
+                    placeholder="Filled in when you save" />
+                  <p className="mt-1 text-xs text-tertiary">Filled in when you save. Set it only to reuse the UUID your dialplan already uses.</p>
                 </div>
               )}
             </div>
           </details>
 
           <div className="flex items-center gap-2">
-            <Toggle checked={form.enabled} onChange={v => set('enabled', v)} />
-            <span className="text-sm text-p-text">Enabled</span>
+            <Switch aria-labelledby="route-enabled-label" checked={form.enabled} onChange={v => set('enabled', v)} />
+            <span id="route-enabled-label" className="text-sm text-primary">Enabled</span>
           </div>
 
-          <div className="flex justify-end gap-2 pt-2 border-t border-p-border-light">
-            <button onClick={onClose} className="px-4 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-gray-50 dark:hover:bg-gray-800">Cancel</button>
-            <button
-              onClick={save}
-              disabled={!canSave}
-              className="px-4 py-1.5 text-sm font-medium rounded-lg bg-brand text-white hover:bg-brand-hover disabled:opacity-40">
+          {error && <p role="alert" className="text-xs text-status-danger-fg">{error}</p>}
+          <div className="flex justify-end gap-2 pt-2 border-t border-subtle">
+            <Button onClick={onClose} disabled={saving} className="px-4">Cancel</Button>
+            <Button variant="primary" onClick={() => { void save() }} disabled={!canSave} className="px-4">
               {saving ? 'Saving...' : 'Save'}
-            </button>
+            </Button>
           </div>
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }
 
 function RoutesSection() {
+  const dialogs = useDialogs()
   const { data: routes, isLoading } = usePhoneRoutes()
   const { data: agents } = useAgents({ all: true })
   const { data: servers } = usePhoneServers()
@@ -646,7 +664,14 @@ function RoutesSection() {
   const deleteMut = useDeletePhoneRoute()
   const toggleMut = useUpdatePhoneRoute()
   const delPinMut = useDeleteRoutePin()
-  const [editRoute, setEditRoute] = useState<(PhoneRouteCreate & { id?: string; pin_configured?: boolean }) | null>(null)
+  const { stateOf, run } = useSaveState()
+  const [editRoute, setEditRouteState] = useState<(PhoneRouteCreate & { id?: string; pin_configured?: boolean }) | null>(null)
+  const [routeError, setRouteError] = useState('')
+  // A route opened (or closed) starts without the last one's refusal.
+  const setEditRoute = (r: (PhoneRouteCreate & { id?: string; pin_configured?: boolean }) | null) => {
+    setRouteError('')
+    setEditRouteState(r)
+  }
   const [logRoute, setLogRoute] = useState<PhoneRoute | null>(null)
 
   const agentSlugs = (agents || []).map(a => a.name)
@@ -667,15 +692,16 @@ function RoutesSection() {
   // exact risk: repeating it teaches people to dismiss alerts.
   const showWarnings = (
     res: { warnings?: string[] } | undefined, prefix: string, acknowledged: boolean,
-  ) => {
+  ): Promise<void> => {
     const w = (res?.warnings ?? []).filter(x => !acknowledged || !x.includes('no PIN'))
-    if (w.length) alert(`${prefix}\n\n${w.map(x => `• ${x}`).join('\n')}`)
+    if (!w.length) return Promise.resolve()
+    return dialogs.alert({ title: prefix, body: w.map(x => `• ${x}`).join('\n') })
   }
 
   const removePin = (routeId: string, acknowledged: boolean) => {
     delPinMut.mutate({ id: routeId, acknowledgeNoPin: acknowledged }, {
-      onSuccess: (res) => showWarnings(res, 'PIN removed. Please note:', acknowledged),
-      onError: (e) => alert(`Route saved, but removing the PIN failed: ${(e as Error).message}`),
+      onSuccess: (res) => { void showWarnings(res, 'PIN removed. Please note:', acknowledged) },
+      onError: toastError('The route was saved, but its PIN was not removed'),
     })
   }
 
@@ -697,14 +723,16 @@ function RoutesSection() {
     // since the server refuses the save while the PIN would be stranded.
     const removingPin = hadPin && pin.dirty && !pin.enabled
     const strandedPin = hadPin && !fits
+    setRouteError('')
+    const refused = (e: unknown) => setRouteError(errorText(e) || 'The route was not saved.')
     if (id) {
       const save = () => updateMut.mutate({ id, data: rest }, {
         onSuccess: (res) => {
           if (removingPin && !strandedPin) removePin(id, acknowledged)
           setEditRoute(null)
-          showWarnings(res, 'Route saved. Please note:', acknowledged)
+          void showWarnings(res, 'Route saved. Please note:', acknowledged)
         },
-        onError: (e) => alert((e as Error).message),
+        onError: refused,
       })
       if (strandedPin) {
         // The card said the PIN goes with this save; the stored row may still
@@ -712,92 +740,102 @@ function RoutesSection() {
         // only acknowledged.
         delPinMut.mutate({ id, acknowledgeNoPin: true }, {
           onSuccess: save,
-          onError: (e) => showWarnings(
-            { warnings: [(e as Error).message] }, 'The PIN could not be removed, so the route was not saved:', true),
+          onError: (e) => { void showWarnings(
+            { warnings: [(e as Error).message] }, 'The PIN could not be removed, so the route was not saved:', true) },
         })
       } else {
         save()
       }
     } else {
       createMut.mutate(rest as PhoneRouteCreate, {
-        onSuccess: (created) => {
+        onSuccess: async (created) => {
           setEditRoute(null)
-          if (created?.provisioning_instructions) alert(created.provisioning_instructions)
-          showWarnings(created, 'Route created. Please note:', acknowledged)
+          // The instructions first, then the notes: each waits for the one before.
+          if (created?.provisioning_instructions) {
+            await dialogs.alert({ title: 'Set up the route on the phone system', body: created.provisioning_instructions })
+          }
+          await showWarnings(created, 'Route created. Please note:', acknowledged)
         },
-        onError: (e) => alert((e as Error).message),
+        onError: refused,
       })
     }
   }
 
-  if (isLoading) return <p className="text-sm text-p-text-secondary">Loading...</p>
+  if (isLoading) return <p className="text-sm text-secondary">Loading...</p>
 
   return (
     <>
       <div className="flex items-center justify-between mb-3">
-        <p className="text-xs text-p-text-light">Set up your inbound and outbound call routes.</p>
-        <button onClick={openNew} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-brand text-white hover:bg-brand-hover">Add Route</button>
+        <p className="text-xs text-tertiary">Set up your inbound and outbound call routes.</p>
+        <Button variant="primary" size="xs" onClick={openNew}>Add Route</Button>
       </div>
 
       {(!routes || routes.length === 0) ? (
-        <p className="text-sm text-p-text-secondary text-center py-6">No routes configured</p>
+        <p className="text-sm text-secondary text-center py-6">No routes configured</p>
       ) : (
         // overflow-x-auto (not hidden): the 8-column table is wider than a
         // phone screen — let the admin scroll to the Actions column
-        <div className="border border-p-border-light rounded-lg overflow-x-auto">
+        <div className={`${CARD_BORDERED} overflow-x-auto`}>
           <table className="w-full min-w-[760px] text-sm">
-            <thead className="bg-gray-50 dark:bg-gray-800/50">
+            <thead className="bg-surface-muted">
               <tr>
-                <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Name</th>
-                <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Direction</th>
-                <th className="text-left px-3 py-2 font-medium text-p-text-secondary">DID</th>
-                <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Agent</th>
-                <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Identity</th>
-                <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Language</th>
-                <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Trigger</th>
-                <th className="text-center px-3 py-2 font-medium text-p-text-secondary">Enabled</th>
-                <th className="text-right px-3 py-2 font-medium text-p-text-secondary">Actions</th>
+                <th className="text-left px-3 py-2 font-medium text-secondary">Name</th>
+                <th className="text-left px-3 py-2 font-medium text-secondary">Direction</th>
+                <th className="text-left px-3 py-2 font-medium text-secondary">DID</th>
+                <th className="text-left px-3 py-2 font-medium text-secondary">Agent</th>
+                <th className="text-left px-3 py-2 font-medium text-secondary">Identity</th>
+                <th className="text-left px-3 py-2 font-medium text-secondary">Language</th>
+                <th className="text-left px-3 py-2 font-medium text-secondary">Trigger</th>
+                <th className="text-center px-3 py-2 font-medium text-secondary">Enabled</th>
+                <th className="text-right px-3 py-2 font-medium text-secondary">Actions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-p-border-light">
+            <tbody className="divide-y divide-subtle">
               {routes.map(r => (
-                <tr key={r.id} className="hover:bg-gray-50/50 dark:hover:bg-gray-800/30">
-                  <td className="px-3 py-2 text-p-text">{r.name || r.id.slice(0, 8)}</td>
+                <tr key={r.id} className="hover:bg-surface-hover">
+                  <td className="px-3 py-2 text-primary">{r.name || r.id.slice(0, 8)}</td>
                   <td className="px-3 py-2">
-                    <Badge variant={r.direction === PHONE_INBOUND ? 'blue' : 'amber'}>{r.direction}</Badge>
+                    <Badge variant={r.direction === PHONE_INBOUND ? 'info' : 'neutral'}>{r.direction}</Badge>
                     {r.pin_configured && (
-                      <svg className="inline-block w-3 h-3 ml-1.5 text-p-text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-label="PIN protected">
+                      <svg className="inline-block w-3 h-3 ml-1.5 text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-label="PIN protected">
                         <title>PIN protected</title>
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
                       </svg>
                     )}
                   </td>
-                  <td className="px-3 py-2 text-p-text font-mono text-xs">{r.did || <span className="text-p-text-light">—</span>}</td>
-                  <td className="px-3 py-2 text-p-text font-mono text-xs">{r.agent}</td>
-                  <td className="px-3 py-2 text-p-text text-xs whitespace-nowrap">
+                  <td className="px-3 py-2 text-primary font-mono text-xs">{r.did || <span className="text-tertiary">—</span>}</td>
+                  <td className="px-3 py-2 text-primary font-mono text-xs">{r.agent}</td>
+                  <td className="px-3 py-2 text-primary text-xs whitespace-nowrap">
                     {IDENTITY_LABEL[r.identity_mode] ?? r.identity_mode}
                     {(r.warnings?.length ?? 0) > 0 && (
-                      <svg className="inline-block w-3.5 h-3.5 ml-1.5 text-amber-500 align-text-bottom" fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                      <svg className="inline-block w-3.5 h-3.5 ml-1.5 text-status-warning-fg align-text-bottom" fill="none" viewBox="0 0 24 24" stroke="currentColor"
                         aria-label="Route warnings" role="img">
                         <title>{r.warnings.join('\n')}</title>
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
                       </svg>
                     )}
                   </td>
-                  <td className="px-3 py-2 text-p-text">{r.language}</td>
-                  <td className="px-3 py-2 text-p-text font-mono text-xs">{r.trigger_slug || <span className="text-p-text-light">—</span>}</td>
+                  <td className="px-3 py-2 text-primary">{r.language}</td>
+                  <td className="px-3 py-2 text-primary font-mono text-xs">{r.trigger_slug || <span className="text-tertiary">—</span>}</td>
                   <td className="px-3 py-2 text-center">
-                    <Toggle checked={r.enabled} onChange={v => toggleMut.mutate({ id: r.id, data: { enabled: v } })} />
+                    <Switch aria-label={`${r.name || r.id.slice(0, 8)} enabled`} checked={r.enabled} onChange={v => { void run(r.id, () => toggleMut.mutateAsync({ id: r.id, data: { enabled: v } }), { failTitle: v ? 'The route was not turned on' : 'The route was not turned off' }) }} />
+                    <SaveState state={stateOf(r.id)} />
                   </td>
                   <td className="px-3 py-2 text-right space-x-2 whitespace-nowrap">
                     <button onClick={() => setLogRoute(r)} title="Call log"
-                      className="text-xs text-p-text-secondary hover:text-brand transition-colors align-middle">
+                      className="text-xs text-secondary hover:text-link transition-colors align-middle">
                       <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                       </svg>
                     </button>
-                    <button onClick={() => setEditRoute({ ...r })} className="text-xs text-brand hover:underline">Edit</button>
-                    <button onClick={() => { if (confirm('Delete this route?')) deleteMut.mutate(r.id, { onSuccess: (res) => { if (res?.warning) alert(res.warning) }, onError: (e) => alert((e as Error).message) }) }} className="text-xs text-red-500 hover:underline">Delete</button>
+                    <button onClick={() => setEditRoute({ ...r })} className="text-xs text-link hover:underline">Edit</button>
+                    <button onClick={async () => {
+                      if (!(await dialogs.confirm({ title: 'Delete this route?', confirmLabel: 'Delete', tone: 'danger' }))) return
+                      deleteMut.mutate(r.id, {
+                        onSuccess: (res) => { if (res?.warning) void dialogs.alert({ title: 'The route is deleted. Please note:', body: res.warning }) },
+                        onError: toastError('The route was not deleted'),
+                      })
+                    }} className="text-xs text-status-danger-fg hover:underline">Delete</button>
                   </td>
                 </tr>
               ))}
@@ -812,6 +850,7 @@ function RoutesSection() {
           servers={serverList} providers={providers || []}
           onSave={handleSave} onClose={() => setEditRoute(null)}
           saving={createMut.isPending || updateMut.isPending}
+          error={routeError}
         />
       )}
       {logRoute && <CallLogModal route={logRoute} onClose={() => setLogRoute(null)} />}
@@ -824,70 +863,77 @@ function RoutesSection() {
 // ---------------------------------------------------------------------------
 
 function CallerDataSection() {
+  const dialogs = useDialogs()
   const { data, isLoading } = useExternalData()
   const save = useSaveExternalData()
   const forget = useForgetExternalData()
+  const { stateOf, run } = useSaveState()
   const [days, setDays] = useState<string | null>(null)
   const shownDays = days ?? (data ? String(data.days) : '')
 
+  // A refused number stays in the field as typed.
   const saveDays = () => {
     const n = Number(shownDays)
     if (!Number.isInteger(n) || n < 1 || n > 3650 || !data || n === data.days) { setDays(null); return }
-    save.mutate({ days: n }, {
-      onSuccess: () => setDays(null),
-      onError: (e) => { alert((e as Error).message); setDays(null) },
-    })
+    void run('days', () => save.mutateAsync({ days: n }).then(() => setDays(null)), { failTitle: 'The retention was not saved' })
   }
 
-  const forgetAll = () => {
-    if (!window.confirm(
-      'Forget ALL caller data now? Every caller\'s private notes and files, every phone conversation and the whole call log are deleted. '
-      + 'Calls in progress are skipped. Nothing goes to the Recover bin — this cannot be undone.')) return
+  const forgetAll = async () => {
+    if (!(await dialogs.confirm({
+      title: 'Forget all caller data now?',
+      body: 'This deletes every caller\'s private notes and files and every phone conversation. It also deletes the whole call log. '
+        + 'Calls in progress are skipped. Nothing goes to the Recover bin: this cannot be undone.',
+      confirmLabel: 'Forget everything',
+      tone: 'danger',
+    }))) return
     forget.mutate(undefined, {
-      onSuccess: (r) => alert(
-        `Caller data forgotten: ${r.callers_forgotten} callers, ${r.phone_chats_deleted} conversations, `
-        + `${r.call_log_rows_deleted} call-log rows (${formatBytes(r.caller_bytes_freed)} freed)`
-        + (r.callers_busy_skipped || r.phone_chats_busy_skipped
-          ? `. Skipped ${r.callers_busy_skipped} callers and ${r.phone_chats_busy_skipped} conversations still on a call — run again later.`
-          : '.'),
-      ),
-      onError: (e) => alert((e as Error).message),
+      onSuccess: (r) => emitAppToast({
+        severity: 'success',
+        title: 'Caller data forgotten',
+        body: `${r.callers_forgotten} callers, ${r.phone_chats_deleted} conversations, `
+          + `${r.call_log_rows_deleted} call-log rows, ${formatBytes(r.caller_bytes_freed)} freed`
+          + (r.callers_busy_skipped || r.phone_chats_busy_skipped
+            ? `. Skipped ${r.callers_busy_skipped} callers and ${r.phone_chats_busy_skipped} conversations still on a call: run again later.`
+            : '.'),
+      }),
+      onError: toastError('The caller data was not forgotten'),
     })
   }
 
-  if (isLoading || !data) return <p className="text-sm text-p-text-secondary">Loading...</p>
+  if (isLoading || !data) return <p className="text-sm text-secondary">Loading...</p>
   return (
     <div className="space-y-4">
-      <p className="text-xs text-p-text-light">
-        Callers who are not platform users leave three things behind: their private notes and files
-        (per-caller routes), the phone conversations, and the call log. They age out together.
+      <p className="text-xs text-tertiary">
+        Callers who are not platform users leave three things behind. These are their notes and files,
+        their phone conversations and the call log. Notes and files exist only on per-caller routes.
+        All three age out together.
       </p>
-      <SettingRow label="Forget callers automatically"
-        description="Callers not heard from within the window below are forgotten on the daily cleanup. Off keeps everything until you forget it by hand.">
-        <Toggle checked={data.enabled} onChange={v => save.mutate({ enabled: v }, { onError: (e) => alert((e as Error).message) })} />
+      <SettingRow label="Forget callers automatically" save={stateOf('enabled')}
+        info="Callers not heard from within the window below are forgotten on the daily cleanup. Off keeps everything until you forget it by hand.">
+        <Switch aria-label="Forget callers automatically" checked={data.enabled} onChange={v => { void run('enabled', () => save.mutateAsync({ enabled: v }), { failTitle: 'The setting was not saved' }) }} />
       </SettingRow>
-      <SettingRow label="Keep caller data for (days)" description="Counted from the caller's last call. Minimum 1.">
-        <input type="number" min={1} max={3650} value={shownDays} disabled={!data.enabled}
-          aria-label="Keep caller data for (days)"
+      <SettingRow label="Days to keep caller data" description="Minimum 1." info="Counted from the caller's last call." save={stateOf('days')}>
+        <Input type="number" min={1} max={3650} value={shownDays} disabled={!data.enabled}
+          aria-label="Days to keep caller data"
           onChange={e => setDays(e.target.value)} onBlur={saveDays}
           onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
-          className="w-20 px-2 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text text-right disabled:opacity-50" />
+          className="max-w-20 text-right" />
       </SettingRow>
       <div>
-        <p className="text-sm font-medium text-p-text mb-1">On this platform now</p>
+        <p className="text-sm font-medium text-primary mb-1">On this platform now</p>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1 text-xs" data-testid="caller-data-usage">
-          <div className="flex justify-between gap-2"><span className="text-p-text-light">Callers remembered</span><span className="text-p-text tabular-nums">{data.callers}</span></div>
-          <div className="flex justify-between gap-2"><span className="text-p-text-light">Caller files</span><span className="text-p-text tabular-nums">{formatBytes(data.bytes)}</span></div>
-          <div className="flex justify-between gap-2"><span className="text-p-text-light">Phone conversations</span><span className="text-p-text tabular-nums">{data.phone_chats}</span></div>
-          <div className="flex justify-between gap-2"><span className="text-p-text-light">Call-log rows</span><span className="text-p-text tabular-nums">{data.call_log_rows}</span></div>
+          <div className="flex justify-between gap-2"><span className="text-tertiary">Callers remembered</span><span className="text-primary tabular-nums">{data.callers}</span></div>
+          <div className="flex justify-between gap-2"><span className="text-tertiary">Caller files</span><span className="text-primary tabular-nums">{formatBytes(data.bytes)}</span></div>
+          <div className="flex justify-between gap-2"><span className="text-tertiary">Phone conversations</span><span className="text-primary tabular-nums">{data.phone_chats}</span></div>
+          <div className="flex justify-between gap-2"><span className="text-tertiary">Call-log rows</span><span className="text-primary tabular-nums">{data.call_log_rows}</span></div>
         </div>
       </div>
       <div className="flex items-center gap-3 flex-wrap">
         <button onClick={forgetAll} disabled={forget.isPending}
-          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-red-300 text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-40">
+          className="px-3 py-1.5 text-xs font-medium rounded-control border border-status-danger-border text-status-danger-fg hover:bg-status-danger-bg disabled:opacity-40">
           {forget.isPending ? 'Forgetting…' : 'Forget all caller data now'}
         </button>
-        <span className="text-xs text-p-text-light">Deletes every caller's files, the phone conversations and the call log. Nothing lands in the Recover bin.</span>
+        <span className="text-xs text-tertiary">Deletes every caller's files, the phone conversations and the call log. Nothing lands in the Recover bin.</span>
       </div>
     </div>
   )
@@ -903,37 +949,37 @@ function CallPromptsSection() {
   // Default writes what a fresh install gets.
   const { data: defaults } = usePhonePromptDefaults()
   const saveMut = useSavePhoneSettings()
-  const [savedField, setSavedField] = useState('')
+  const { stateOf, run } = useSaveState()
 
   const save = (key: string, value: string) => {
-    saveMut.mutate({ [key]: value }, { onSuccess: () => { setSavedField(key); setTimeout(() => setSavedField(''), 2000) } })
+    void run(key, () => saveMut.mutateAsync({ [key]: value }), { failTitle: 'The call prompt was not saved' })
   }
 
   const prompt = (key: 'context_inbound' | 'context_outbound', label: string, rows: number) => (
     <div>
       <div className="flex items-center justify-between mb-1">
         <div className="flex items-center gap-2">
-          <label className="text-sm font-medium text-p-text">{label}</label>
-          <SavedBadge show={savedField === key} />
+          <label className="text-sm font-medium text-primary">{label}</label>
+          <SaveState state={stateOf(key)} />
         </div>
         <button
           onClick={() => { if (defaults) save(key, defaults[key]) }}
           disabled={!defaults}
-          className="text-xs text-p-text-secondary hover:text-p-text disabled:opacity-50"
+          className="text-xs text-secondary hover:text-primary disabled:opacity-50"
         >Restore Default</button>
       </div>
       <textarea
         defaultValue={settings?.[key] || ''}
         onBlur={e => { if (e.target.value !== (settings?.[key] || '')) save(key, e.target.value) }}
         rows={rows} key={`${key}-${settings?.[key] ?? ''}`}
-        className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text font-mono resize-y"
+        className={`${FIELD} ${FIELD_REGULAR} ${FIELD_BORDER} font-mono resize-y`}
       />
     </div>
   )
 
   return (
     <div className="space-y-4">
-      <p className="text-xs text-p-text-light">System prompt instructions injected into all call sessions. Edit to customize, or restore defaults.</p>
+      <p className="text-xs text-tertiary">Instructions added to the agent's prompt on every call. Edit them, or restore the defaults.</p>
       {prompt('context_inbound', 'Inbound Context', 10)}
       {prompt('context_outbound', 'Outbound Context', 10)}
     </div>
@@ -947,24 +993,25 @@ function CallPromptsSection() {
 function TurnClassifierSection() {
   const { data: tc, isLoading } = useTurnClassifier()
 
-  if (isLoading || !tc) return <p className="text-sm text-p-text-secondary">Loading...</p>
+  if (isLoading || !tc) return <p className="text-sm text-secondary">Loading...</p>
 
   return (
     <div className="space-y-3">
-      <p className="text-xs text-p-text-light">
-        Text-based turn-completion classifier used on calls (per-language opt-in via the Languages section). Smart Turn (local prosody) is the audio-based alternative.
+      <p className="text-xs text-tertiary">
+        A text classifier that decides from the words when a caller has finished speaking. Choose it for each language
+        in the Languages section. Smart Turn is the alternative: it runs locally and listens to the tone of the voice.
       </p>
-      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border border-p-border-light rounded-lg px-3 py-2.5">
+      <div className={`${CARD_BORDERED} flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-3 py-2.5`}>
         <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-p-text">Groq</span>
-          <Badge variant={tc.active ? 'green' : 'default'}>{tc.active ? 'Active' : 'Inactive'}</Badge>
+          <span className="text-sm font-medium text-primary">Groq</span>
+          <Badge variant={tc.active ? 'success' : 'neutral'}>{tc.active ? 'Active' : 'Inactive'}</Badge>
         </div>
-        <span className="text-xs text-p-text-light font-mono">openai/gpt-oss-120b</span>
+        <span className="text-xs text-tertiary font-mono">openai/gpt-oss-120b</span>
       </div>
-      <p className="text-xs text-p-text-light">
+      <p className="text-xs text-tertiary">
         {tc.active
-          ? 'Using the Groq API key from the Direct LLM execution layer.'
-          : 'No Groq key in the Direct LLM execution layer — languages set to Groq fall back to Smart Turn. Add a Groq key under Execution Layers → Direct LLM to activate.'}
+          ? 'Using the Groq API key from the Direct LLM AI engine.'
+          : 'No Groq key in the Direct LLM AI engine. Languages set to Groq use Smart Turn instead. Add a Groq key in Setup, AI Engines, Direct LLM to turn it on.'}
       </p>
     </div>
   )
@@ -1011,7 +1058,7 @@ const PHONE_LANGS: { code: string; label: string }[] = (() => {
     const base = baseLang(code)
     if (seen.has(base)) continue
     seen.add(base)
-    out.push({ code: base, label: label.replace(/\s*\(.*\)\s*$/, '') })
+    out.push({ code: base, label: label.replace(/,.*$/, '') })
   }
   return out
 })()
@@ -1019,7 +1066,7 @@ const PHONE_LANGS: { code: string; label: string }[] = (() => {
 function LanguagesSection() {
   const { data: settings } = usePhoneSettings()
   const saveMut = useSavePhoneSettings()
-  const [savedField, setSavedField] = useState('')
+  const { stateOf, run } = useSaveState()
   const [lang, setLang] = useState(PHONE_LANGS[0].code)
   // Bumped on Restore to remount the (uncontrolled) inputs so they reflect the
   // restored defaults; normal edits don't change it (so tabbing between fields
@@ -1036,20 +1083,19 @@ function LanguagesSection() {
     try { return settings?.thinking_phrases ? JSON.parse(settings.thinking_phrases) : {} } catch { return {} }
   })()
 
-  const save = useCallback((key: string, value: string) => {
-    saveMut.mutate({ [key]: value }, {
-      onSuccess: () => { setSavedField(key); setTimeout(() => setSavedField(''), 2000) },
-    })
-  }, [saveMut])
+  // `field` keys the save state: the phrases of one language share a setting.
+  const save = (field: string, key: string, value: string) => {
+    void run(field, () => saveMut.mutateAsync({ [key]: value }), { failTitle: 'The language settings were not saved' })
+  }
 
   const updatePhrase = (key: string, value: string) => {
-    save('phrases', JSON.stringify({ ...phrases, [lang]: { ...(phrases[lang] || {}), [key]: value } }))
+    save(key, 'phrases', JSON.stringify({ ...phrases, [lang]: { ...(phrases[lang] || {}), [key]: value } }))
   }
   const updateBackchannel = (value: string) => {
-    save('backchannel_phrases', JSON.stringify({ ...backchannel, [lang]: value.split(',').map(s => s.trim()).filter(Boolean) }))
+    save('backchannel', 'backchannel_phrases', JSON.stringify({ ...backchannel, [lang]: value.split(',').map(s => s.trim()).filter(Boolean) }))
   }
   const updateThinking = (value: string) => {
-    save('thinking_phrases', JSON.stringify({ ...thinking, [lang]: value.split(',').map(s => s.trim()).filter(Boolean) }))
+    save('thinking', 'thinking_phrases', JSON.stringify({ ...thinking, [lang]: value.split(',').map(s => s.trim()).filter(Boolean) }))
   }
   const restoreLang = () => {
     const dp = DEFAULT_LANGUAGES.phrases[lang]
@@ -1060,72 +1106,64 @@ function LanguagesSection() {
     if (dp) payload.phrases = JSON.stringify({ ...phrases, [lang]: dp })
     if (db) payload.backchannel_phrases = JSON.stringify({ ...backchannel, [lang]: db })
     if (dt) payload.thinking_phrases = JSON.stringify({ ...thinking, [lang]: dt })
-    saveMut.mutate(payload, {
-      onSuccess: () => { setRestoreVersion(v => v + 1); setSavedField('_all'); setTimeout(() => setSavedField(''), 2000) },
-    })
+    void run('_all', () => saveMut.mutateAsync(payload).then(() => setRestoreVersion(v => v + 1)),
+      { failTitle: 'The language defaults were not restored' })
   }
 
   const p: Record<string, string> = phrases[lang] || {}
   return (
     <div className="space-y-3">
-      <p className="text-xs text-p-text-light">
+      <p className="text-xs text-tertiary">
         Per-language phrases and filler sounds for calls. Pick a language to edit its prompts. Voice IDs are configured per provider in the Audio tab's TTS Providers section.
       </p>
-      <SettingRow label="Language" description="Edit the prompts for one language at a time">
-        <select value={lang} onChange={e => setLang(e.target.value)}
-          className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
-          {PHONE_LANGS.map(l => <option key={l.code} value={l.code}>{l.label} — {l.code}</option>)}
-        </select>
-        <SavedBadge show={savedField === '_all'} />
+      <SettingRow label="Language" info="Edit the prompts for one language at a time">
+        <Select value={lang} onChange={e => setLang(e.target.value)}>
+          {PHONE_LANGS.map(l => <option key={l.code} value={l.code}>{l.label} ({l.code})</option>)}
+        </Select>
       </SettingRow>
       {/* Stacked full-width fields: comma-separated phrase lists want width,
           and fixed-width inputs crush the labels on phones. */}
-      <div key={`${lang}:${restoreVersion}`} className="border border-p-border-light rounded-lg p-3 space-y-3">
+      <div key={`${lang}:${restoreVersion}`} className={`${CARD_BORDERED} p-3 space-y-3`}>
         <div>
-          <label className="block text-sm font-medium text-p-text mb-1">Hold Message<SavedBadge show={savedField === 'phrases'} /></label>
-          <input defaultValue={p.hold_message || ''}
-            onBlur={e => { if (e.target.value !== (p.hold_message || '')) updatePhrase('hold_message', e.target.value) }}
-            className="w-full px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="One moment please..." />
+          <p className="text-sm font-medium text-primary mb-1"><label>Hold Message</label><SaveState state={stateOf('hold_message')} /></p>
+          <Input defaultValue={p.hold_message || ''}
+            onBlur={e => { if (e.target.value !== (p.hold_message || '')) updatePhrase('hold_message', e.target.value) }} placeholder="One moment please..." />
         </div>
         <div>
-          <label className="block text-sm font-medium text-p-text mb-1">Greeting Fallback</label>
-          <input defaultValue={p.greeting_fallback || ''}
-            onBlur={e => { if (e.target.value !== (p.greeting_fallback || '')) updatePhrase('greeting_fallback', e.target.value) }}
-            className="w-full px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="Hello, how can I help you?" />
+          <p className="text-sm font-medium text-primary mb-1"><label>Greeting Fallback</label><SaveState state={stateOf('greeting_fallback')} /></p>
+          <Input defaultValue={p.greeting_fallback || ''}
+            onBlur={e => { if (e.target.value !== (p.greeting_fallback || '')) updatePhrase('greeting_fallback', e.target.value) }} placeholder="Hello, how can I help you?" />
         </div>
-        <SettingRow label="Turn Classifier"
-          description="Which backend classifies turn completeness. Platform default: Groq when a Groq key is configured, Smart Turn otherwise.">
+        <SettingRow label="Turn Classifier" save={stateOf('turn_classifier')}
+          info="Which service decides when the caller has finished speaking. Platform default: Groq when a Groq key is set, otherwise Smart Turn.">
           {/* Empty value = no per-language pin → the platform default backend
               decides (the phone daemon ignores a falsy pin). Only an explicit
               choice here overrides it for this language. */}
-          <select value={p.turn_classifier || ''}
-            onChange={e => updatePhrase('turn_classifier', e.target.value)}
-            className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
-            <option value="">Platform default (Groq → Smart Turn)</option>
-            <option value="smart_turn">Smart Turn (audio, local)</option>
-            <option value="groq">Groq (text, cloud)</option>
-          </select>
+          <Select value={p.turn_classifier || ''}
+            onChange={e => updatePhrase('turn_classifier', e.target.value)}>
+            <option value="">Platform default: Groq, else Smart Turn</option>
+            <option value="smart_turn">Smart Turn: audio, local</option>
+            <option value="groq">Groq: text, cloud</option>
+          </Select>
         </SettingRow>
         <div>
-          <label className="block text-sm font-medium text-p-text mb-1">Backchannel Sounds<SavedBadge show={savedField === 'backchannel_phrases'} /></label>
-          <p className="text-xs text-p-text-light mb-1">Active listening sounds (comma-separated)</p>
-          <input defaultValue={(backchannel[lang] || []).join(', ')}
-            onBlur={e => updateBackchannel(e.target.value)}
-            className="w-full px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="mhm, ok, right" />
+          <p className="text-sm font-medium text-primary mb-1"><label>Backchannel Sounds</label><SaveState state={stateOf('backchannel')} /></p>
+          <p className="text-xs text-tertiary mb-1">Active listening sounds, separated by commas</p>
+          <Input defaultValue={(backchannel[lang] || []).join(', ')}
+            onBlur={e => updateBackchannel(e.target.value)} placeholder="Mhm, ok, right" />
         </div>
         <div>
-          <label className="block text-sm font-medium text-p-text mb-1">Thinking Fillers<SavedBadge show={savedField === 'thinking_phrases'} /></label>
-          <p className="text-xs text-p-text-light mb-1">Played only when the answer is slow to start (comma-separated)</p>
-          <input defaultValue={(thinking[lang] || []).join(', ')}
-            onBlur={e => updateThinking(e.target.value)}
-            className="w-full px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" placeholder="hmm, let me see, one moment" />
+          <FieldLabel label="Thinking Fillers" large aside={<SaveState state={stateOf('thinking')} />}>Played only when the answer is slow to start.</FieldLabel>
+          <p className="text-xs text-tertiary mb-1">Separate them with commas.</p>
+          <Input defaultValue={(thinking[lang] || []).join(', ')}
+            onBlur={e => updateThinking(e.target.value)} placeholder="Hmm, let me see, one moment" />
         </div>
       </div>
-      <div className="pt-2 border-t border-p-border-light">
-        <button onClick={restoreLang} disabled={saveMut.isPending}
-          className="px-3 py-1.5 text-xs rounded-lg border border-p-border-light text-p-text-secondary hover:bg-gray-50 dark:hover:bg-gray-800">
+      <div className="pt-2 border-t border-subtle">
+        <Button size="xs" onClick={restoreLang} disabled={saveMut.isPending}>
           Restore {lang.toUpperCase()} to default
-        </button>
+        </Button>
+        <SaveState state={stateOf('_all')} />
       </div>
     </div>
   )
@@ -1138,60 +1176,56 @@ function LanguagesSection() {
 // Split: transport (AudioSocket / HTTP API ports) vs call-lifecycle
 // timeouts. ``audiosocket_host`` stays hidden (auto-derived per deployment).
 const TRANSPORT_FIELDS = [
-  { key: 'audiosocket_port', label: 'AudioSocket Port', desc: 'TCP port for Asterisk connections', def: '9092' },
-  { key: 'http_api_port', label: 'HTTP API Port', desc: 'Port for outbound call management', def: '9093' },
+  { key: 'audiosocket_port', label: 'AudioSocket Port', info: 'TCP port for Asterisk connections', def: '9092' },
+  { key: 'http_api_port', label: 'HTTP API Port', info: 'Port for outbound call management', def: '9093' },
 ]
 const LIFECYCLE_FIELDS = [
-  { key: 'idle_timeout_s', label: 'Idle Timeout (s)', desc: 'Disconnect after silence', def: '30' },
-  { key: 'call_max_duration_s', label: 'Max Call Duration (s)', desc: 'Hard limit per call', def: '600' },
-  { key: 'outbound_call_timeout_s', label: 'Outbound Call Timeout (s)', desc: 'Max wait for call completion', def: '300' },
-  { key: 'question_answer_timeout_s', label: 'Q&A Timeout (s)', desc: 'Max wait for manager answer', def: '40' },
+  { key: 'idle_timeout_s', label: 'Idle Timeout (s)', info: 'Disconnect after silence', def: '30' },
+  { key: 'call_max_duration_s', label: 'Max Call Duration (s)', info: 'Hard limit per call', def: '600' },
+  { key: 'outbound_call_timeout_s', label: 'Outbound Call Timeout (s)', info: 'Max wait for call completion', def: '300' },
+  { key: 'question_answer_timeout_s', label: 'Q&A Timeout (s)', info: 'Max wait for manager answer', def: '40' },
 ]
 
 function InfrastructureSection() {
   const { data: settings } = usePhoneSettings()
   const saveMut = useSavePhoneSettings()
-  const [savedField, setSavedField] = useState('')
+  const { stateOf, run } = useSaveState()
 
   const save = (key: string, value: string) => {
     if (value !== (settings?.[key] ?? '')) {
-      saveMut.mutate({ [key]: value }, { onSuccess: () => { setSavedField(key); setTimeout(() => setSavedField(''), 2000) } })
+      void run(key, () => saveMut.mutateAsync({ [key]: value }), { failTitle: 'The setting was not saved' })
     }
   }
 
-  const numRow = (f: { key: string; label: string; desc: string; def: string }) => (
-    <SettingRow key={f.key} label={f.label} description={f.desc}>
-      <input type="number" defaultValue={settings?.[f.key] ?? f.def} key={`${f.key}-${settings?.[f.key] ?? ''}`}
+  const numRow = (f: { key: string; label: string; info: string; def: string }) => (
+    <SettingRow key={f.key} label={f.label} info={f.info} save={stateOf(f.key)}>
+      <Input type="number" defaultValue={settings?.[f.key] ?? f.def} key={`${f.key}-${settings?.[f.key] ?? ''}`}
         onBlur={e => save(f.key, e.target.value)}
-        className="w-28 px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text text-right" />
-      <SavedBadge show={savedField === f.key} />
+        className="max-w-28 text-right" />
     </SettingRow>
   )
 
   return (
     <div className="space-y-5">
       <div>
-        <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider mb-2">Transport</h4>
+        <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Transport</h4>
         <div className="space-y-2">{TRANSPORT_FIELDS.map(numRow)}</div>
       </div>
       <div>
-        <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider mb-2">Call Lifecycle</h4>
+        <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Call Lifecycle</h4>
         <div className="space-y-2">{LIFECYCLE_FIELDS.map(numRow)}</div>
       </div>
       <div>
-        <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider mb-2">Logging</h4>
-        <SettingRow label="Log Level">
-          <select value={settings?.log_level || 'INFO'} onChange={e => save('log_level', e.target.value)}
-            className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
+        <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider mb-2">Logging</h4>
+        <SettingRow label="Log Level" save={stateOf('log_level')}>
+          <Select value={settings?.log_level || 'INFO'} onChange={e => save('log_level', e.target.value)}>
             {['DEBUG', 'INFO', 'WARNING', 'ERROR'].map(l => <option key={l} value={l}>{l}</option>)}
-          </select>
-          <SavedBadge show={savedField === 'log_level'} />
+          </Select>
         </SettingRow>
-        <SettingRow label="Save outgoing audio"
-          description="Save the agent's outgoing audio of every call as a WAV file next to the phone log until you turn it off. For checking playback artifacts; the caller's audio is never saved. Needs the phone server of 1.8.0 or later.">
-          <Toggle checked={settings?.debug_outgoing_audio === 'on'}
+        <SettingRow label="Save outgoing audio" description="Needs the phone server of 1.8.0 or later." save={stateOf('debug_outgoing_audio')}
+          info="Saves the agent's audio of each call as a WAV file beside the phone log. This runs until you turn it off. It helps you check for playback glitches. The caller's audio is never saved.">
+          <Switch aria-label="Save outgoing audio" checked={settings?.debug_outgoing_audio === 'on'}
             onChange={v => save('debug_outgoing_audio', v ? 'on' : 'off')} />
-          <SavedBadge show={savedField === 'debug_outgoing_audio'} />
         </SettingRow>
       </div>
     </div>
@@ -1209,7 +1243,10 @@ export default function PhoneServersTab() {
       <SectionCard title="Routes"><RoutesSection /></SectionCard>
       <SectionCard title="Caller Data" defaultOpen={false}><CallerDataSection /></SectionCard>
       <SectionCard title="Call Prompts" defaultOpen={false}><CallPromptsSection /></SectionCard>
-      <SectionCard title="Languages" defaultOpen={false}><LanguagesSection /></SectionCard>
+      <SectionCard title="Languages" defaultOpen={false}>
+        <LanguageCandidatesRow />
+        <LanguagesSection />
+      </SectionCard>
       <SectionCard title="Turn Classifier"><TurnClassifierSection /></SectionCard>
       <SectionCard title="Infrastructure" defaultOpen={false}><InfrastructureSection /></SectionCard>
       <AdvancedTuningCard />

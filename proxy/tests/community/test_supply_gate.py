@@ -20,8 +20,7 @@ from fastapi import HTTPException
 import config
 from core.config import deployment
 from services.community import community_installer as ci
-from services.mcp import mcp_manifest_parse as mmp
-from services.mcp import mcp_registry
+from services.mcp import mcp_manifest_parse as mmp, mcp_registry
 
 
 @pytest.fixture

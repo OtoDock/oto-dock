@@ -26,7 +26,7 @@ from tests.fixtures.ws_dashboard_harness import (
 
 class TestMidTurnReattach:
     def test_resume_chat_during_stream_reattaches(self, temp_db, monkeypatch):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
 
         layer = FakeExecutionLayer()
         stub_dashboard_seams(monkeypatch, layer)
@@ -77,7 +77,7 @@ class TestMidTurnReattach:
                     "context_max": 0, "cache_read": 0, "cache_write": 0,
                     "output_tokens": 0,
                     "execution_path": "claude-code-cli",
-                    "execution_mode": "", "model": TEST_MODEL, "mode": "default",
+                    "execution_mode": "", "model": TEST_MODEL, "mode": "autoReview",
                     "process_alive": True,  # active pump mid-turn
                     "live_pending": True,   # its live_state follows: one paint
                 })
@@ -87,7 +87,7 @@ class TestMidTurnReattach:
                 ]
                 await ws.expect({
                     "type": "warmup_ready", "session_id": sid,
-                    "chat_id": chat_id, "mode": "default",
+                    "chat_id": chat_id, "mode": "autoReview",
                     "model": TEST_MODEL,
                     "execution_path": "claude-code-cli",
                 })
@@ -126,7 +126,7 @@ class TestMidTurnReattach:
 class TestBgNudgeServerTurn:
     def test_bg_nudge_runs_review_turn_on_viewed_chat(self, temp_db,
                                                       monkeypatch):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
         from core.session.session_state import _dashboard_notify_queues
 
         layer = FakeExecutionLayer()
@@ -154,7 +154,7 @@ class TestBgNudgeServerTurn:
 
                 await ws.expect({"type": "bg_agents_complete", "count": 2})
                 await ws.expect({"type": "server_turn_start",
-                                 "chat_id": chat_id})
+                                 "chat_id": chat_id, "cause": "bg_review"})
                 await ws.expect({"type": "chat_status", "chat_id": chat_id,
                                  "status": "streaming"})
                 await ws.expect({
@@ -195,7 +195,8 @@ class TestBgNudgeServerTurn:
         agents finished in the composed review prompt and persists the
         labels in the event row."""
         import json as _json
-        from core.events.common_events import CommonEvent, TEXT, DONE
+
+        from core.events.common_events import DONE, TEXT, CommonEvent
         from core.session.session_state import _dashboard_notify_queues
 
         layer = FakeExecutionLayer()
@@ -269,7 +270,7 @@ class TestExistingChatWarmupInline:
                 # inline reuse: warmup_ready BEFORE the dispatch's count frame
                 await ws.expect({
                     "type": "warmup_ready", "session_id": sid,
-                    "chat_id": cid, "mode": "default", "model": TEST_MODEL,
+                    "chat_id": cid, "mode": "ask", "model": TEST_MODEL,
                     "execution_path": "claude-code-cli",
                     "interactive": False,
                 })
@@ -288,7 +289,7 @@ class TestMidTurnReattachKeepsSteeredMessage:
         # it and the pump replay never re-sends user rows — so switching away
         # and back mid-turn made the just-steered message vanish. USER rows are
         # now exempt from the cutoff filter.
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
         from storage import database as task_store
 
         layer = FakeExecutionLayer()
@@ -348,7 +349,7 @@ class TestMidTurnReattachKeepsSteeredMessage:
                     "output_tokens": 0,
                     "execution_path": "claude-code-cli",
                     "execution_mode": "", "model": TEST_MODEL,
-                    "mode": "default",
+                    "mode": "autoReview",
                     "process_alive": True,  # active pump mid-turn
                     "live_pending": True,   # its live_state follows: one paint
                 })
@@ -361,7 +362,7 @@ class TestMidTurnReattachKeepsSteeredMessage:
                 ]
                 await ws.expect({
                     "type": "warmup_ready", "session_id": sid,
-                    "chat_id": chat_id, "mode": "default",
+                    "chat_id": chat_id, "mode": "autoReview",
                     "model": TEST_MODEL,
                     "execution_path": "claude-code-cli",
                 })

@@ -1,6 +1,7 @@
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
-import { CODE_BODY_STYLE } from './CodeBlock'
+import { CODE_BODY_STYLE } from '../../lib/chat/codeStyle'
+
 
 interface Props {
   language: string

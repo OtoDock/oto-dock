@@ -99,3 +99,46 @@ python3 proxy/tests/mcp/test_stream_sidecar.py    # standalone, no pytest / aioh
 
 The aiohttp-backed handlers are verified live (E2E over a real MCP), not in unit
 tests.
+
+## `tool_args.py` — a tool call's arguments, checked with the schema it was listed with
+
+The MCP SDK checks a call's arguments by default and answers the first
+problem without naming the argument; it also refuses a value that misses an
+enum only by its case. A custom MCP registers its handler with
+`@server.call_tool(validate_input=False)` and checks the arguments itself:
+
+```python
+from _tool_args import ToolArgs
+
+TOOL_ARGS = ToolArgs()
+
+@server.list_tools()
+async def list_tools():
+    return TOOL_ARGS.listed([...])          # records each tool's inputSchema
+
+@server.call_tool(validate_input=False)
+async def call_tool(name, arguments):
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal                      # CallToolResult, isError=True
+    ...
+```
+
+`check` takes a string that equals exactly one member of its enum once both
+are folded (case, and `-` or a space read as `_`) as that member, walking
+nested objects and array items; it never guesses between two members and
+never coerces a type. What is still invalid is refused with the SDK's own
+validation steps (the same draft, `check_schema`, no format checker): every
+problem named by its argument (`operations[2].op`, `notify.severity`), an
+enum's allowed values listed, the SDK's own first problem first, five at
+most, and the tool to call again. A tool that was never listed passes
+unchecked, as with the SDK; a schema jsonschema cannot read raises, which the
+SDK answers as an error result.
+
+### How to use it (vendored copy)
+
+Copy this file into the MCP's folder as `_tool_args.py`, byte for byte (an MCP
+imports nothing outside its own folder; a Docker MCP's `COPY *.py` takes it
+along). `proxy/tests/mcp/test_tool_args.py` holds every copy equal to this one
+and calls each server through the SDK with an argument it must refuse. The
+file holds no module-level state: the copies share one module name.

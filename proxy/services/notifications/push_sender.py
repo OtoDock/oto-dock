@@ -6,18 +6,25 @@ Both are optional — if libraries/config are missing, calls are no-ops.
 """
 
 import asyncio
-import time
 import functools
 import json
 import logging
 import ssl
+from typing import cast
 from urllib.parse import urlsplit
+
+import httpx
+import psycopg
 
 import config
 from services.infra.outbound_url import validate_outbound_url
 from storage.automation import notification_store
 
 logger = logging.getLogger("otodock.push")
+
+#: The app platforms a push token is registered for (the FCM leg); a
+#: browser's subscription is ``web``.
+NATIVE_PUSH_PLATFORMS = ("android", "ios")
 
 
 def _endpoint_is_public(endpoint: str) -> bool:
@@ -89,16 +96,16 @@ async def send_web_push(subscription_data: str, payload: dict) -> bool:
                 requests_session=session,
             )
         return True
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # pywebpush raises its own and the requests library's errors
         error_str = str(e)
         # 410 Gone or 404 = subscription expired, clean up
         if "410" in error_str or "404" in error_str:
-            logger.info(f"Push subscription expired, removing: {error_str[:100]}")
+            logger.info("Push subscription expired, removing: %s", error_str[:100])
             await asyncio.to_thread(
                 notification_store.delete_push_subscription_by_data, subscription_data
             )
         else:
-            logger.warning(f"Web Push failed: {error_str[:200]}")
+            logger.warning("Web Push failed: %s", error_str[:200])
         return False
 
 
@@ -122,13 +129,14 @@ try:
             sa_data = json.load(f)
             _fcm_project_id = sa_data.get("project_id", "")
         _fcm_available = True
-        logger.info(f"FCM enabled for project: {_fcm_project_id}")
-except Exception as e:
-    logger.info(f"FCM not configured: {e}")
+        logger.info("FCM enabled for project: %s", _fcm_project_id)
+except Exception as e:  # noqa: BLE001  # google-auth raises anything on a bad service-account file
+    logger.info("FCM not configured: %s", e)
 
 # google-auth's transport waits 120 s per attempt by default; the refresh
 # runs in a worker thread under the lock below, so its wait is bounded.
 _FCM_TOKEN_TIMEOUT_S = 15
+_FCM_ORIGIN = "https://fcm.googleapis.com"
 
 
 class _FcmLoopState:
@@ -162,7 +170,14 @@ def reset_fcm_state() -> None:
 
 
 def _refresh_fcm_token_blocking() -> None:
-    request = functools.partial(GoogleAuthRequest(), timeout=_FCM_TOKEN_TIMEOUT_S)
+    """The service account's token refresh, its https connections going
+    only to public addresses (``pinned_http``)."""
+    import requests
+
+    from services.infra import pinned_http
+    session = requests.Session()
+    session.mount("https://", pinned_http.PublicHTTPSAdapter())
+    request = functools.partial(GoogleAuthRequest(session=session), timeout=_FCM_TOKEN_TIMEOUT_S)
     _fcm_credentials.refresh(request)
 
 
@@ -172,7 +187,7 @@ async def _fcm_access_token() -> str:
     in flight, the other pushes waiting for its result."""
     if _fcm_credentials.valid:
         return _fcm_credentials.token
-    async with _fcm_state.current().token_lock:
+    async with cast("asyncio.Lock", _fcm_state.current().token_lock):  # current() sets it
         if not _fcm_credentials.valid:
             await asyncio.to_thread(_refresh_fcm_token_blocking)
     return _fcm_credentials.token
@@ -187,7 +202,7 @@ async def _fcm_http_client():
     """One ``httpx.AsyncClient`` per loop. The SSL context is what makes a
     client construction cost several milliseconds on the loop: built once,
     in a thread."""
-    import httpx
+    from services.infra import pinned_http
 
     global _ssl_context
     state = _fcm_state.current()
@@ -196,7 +211,9 @@ async def _fcm_http_client():
             if state.client is None:
                 if _ssl_context is None:
                     _ssl_context = await asyncio.to_thread(_build_ssl_context)
-                state.client = httpx.AsyncClient(verify=_ssl_context, timeout=10)
+                # Google's public host: checked at the dial (``pinned_http``).
+                state.client = pinned_http.checked_client(
+                    _FCM_ORIGIN, pinned_http.public_only, verify=_ssl_context, timeout=10)
     return state.client
 
 
@@ -240,7 +257,7 @@ async def _send_fcm_direct(token: str, payload: dict) -> bool:
 
         client = await _fcm_http_client()
         resp = await client.post(
-            f"https://fcm.googleapis.com/v1/projects/{_fcm_project_id}/messages:send",
+            f"{_FCM_ORIGIN}/v1/projects/{_fcm_project_id}/messages:send",
             json=message,
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=10,
@@ -259,10 +276,10 @@ async def _send_fcm_direct(token: str, payload: dict) -> bool:
             _fcm_credentials.token = None
             logger.warning("FCM refused the access token; the next push refreshes it")
         else:
-            logger.warning(f"FCM send failed: {resp.status_code} {resp.text[:200]}")
+            logger.warning("FCM send failed: %s %s", resp.status_code, resp.text[:200])
         return False
-    except Exception as e:
-        logger.warning(f"FCM error: {e}")
+    except Exception as e:  # noqa: BLE001  # google-auth's token refresh raises whatever its transport does
+        logger.warning("FCM error: %s", e)
         return False
 
 
@@ -288,38 +305,30 @@ async def _send_fcm_relay(platform: str, token: str, payload: dict) -> bool:
                 notification_store.delete_push_subscription_by_data, token
             )
         else:
-            logger.warning(f"Relay push rejected: {e.code}")
+            logger.warning("Relay push rejected: %s", e.code)
         return False
     except relay_client.RelayNotConfigured:
         return False
-    except Exception as e:
-        logger.warning(f"Relay push failed: {e}")
+    except (httpx.HTTPError, psycopg.Error, ValueError) as e:
+        logger.warning("Relay push failed: %s", e)
         return False
 
 
-_RELAY_VERDICT_TTL_S = 60.0
-_relay_verdict: tuple[bool, float] | None = None
-
-
 async def _relay_available() -> bool:
-    """``relay_client.is_available()`` (a licence read and check) served
-    from a 60 s cache, refreshed on ``run_db``: a fan-out of N pushes reads
-    it once, not per push."""
-    global _relay_verdict
-    now = time.monotonic()
-    if _relay_verdict is not None and now - _relay_verdict[1] < _RELAY_VERDICT_TTL_S:
-        return _relay_verdict[0]
+    """``relay_client.is_available()`` (a licence read and check) from the
+    relay client's identity cache (60 s, refreshed on ``run_db``): a fan-out
+    of N pushes reads it once, not per push, and ``push_send`` sends the
+    same cached identity."""
     from services.billing import relay_client
-    from storage.pg import run_db
 
-    verdict = bool(await run_db(relay_client.is_available))
-    _relay_verdict = (verdict, now)
-    return verdict
+    available, _ = await relay_client.relay_identity()
+    return available
 
 
 def reset_relay_verdict() -> None:
-    global _relay_verdict
-    _relay_verdict = None
+    from services.billing import relay_client
+
+    relay_client.reset_identity_cache()
 
 
 async def send_fcm(token: str, payload: dict, platform: str = "android") -> bool:
@@ -372,7 +381,7 @@ async def send_to_user(user_sub: str, payload: dict) -> None:
         async with slot:
             if platform == "web":
                 await send_web_push(data, payload)
-            elif platform in ("android", "ios"):
+            elif platform in NATIVE_PUSH_PLATFORMS:
                 await send_fcm(data, payload, platform)
 
     await asyncio.gather(*(_one(s) for s in subscriptions), return_exceptions=True)

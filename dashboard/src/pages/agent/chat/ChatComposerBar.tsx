@@ -2,9 +2,10 @@
  * ChatComposerBar — AgentChat's floating bottom bar: ChatStatusBar, the usage
  * limit banner + warning toast, and ChatInput (its duplex `voice` prop is
  * built by pages/agent/chat/useChatDuplexVoice.ts).
- * Presentational: every value is computed by the page.
+ * Presentational: every value is computed by the page. `ChatBottomPanel`
+ * holds it with the banners above it and draws the fade over the chat.
  */
-import type { Dispatch, SetStateAction } from 'react'
+import type { Dispatch, JSX, ReactNode, SetStateAction } from 'react'
 import type { useChatStream } from '../../../hooks/useChatStream'
 import type { useInteractiveChat } from '../../../hooks/useInteractiveChat'
 import { utf8ToB64 } from '../../../hooks/useInteractiveChat'
@@ -21,6 +22,8 @@ import { describeLimitReached, describeLimitWarning } from '../../../components/
 import { usePrimaryPointerCoarse } from '../../../hooks/usePrimaryPointerCoarse'
 import { withSendHint } from '../../../lib/composerKeys'
 import type { CollectedItems } from '../../../lib/droppedItems'
+import { DONT_ASK_MODE, currentMode, runsWithoutAsking } from '../../../lib/engines/modes'
+import { TOAST } from '../../../components/ui/classes'
 
 type Stream = ReturnType<typeof useChatStream>
 
@@ -36,7 +39,8 @@ interface Props {
   pendingEngineSwitch: { layer: string; model: string } | null
   model: string
   modelCompound: string
-  totalCost: number
+  billedCost: number
+  toolCost: number
   costBilled: Stream['costBilled']
   contextUsed: number
   contextMax: number
@@ -104,28 +108,32 @@ interface Props {
   voice: ChatInputVoice
   /** Animate the composer's shrink and regrow (ChatInput `animateHeight`). */
   composerAnimates: boolean
+  /** The chat's "Runs on" chip, rendered by ChatStatusBar beside the mode
+   *  and model controls. */
+  targetSlot?: JSX.Element
+  /** Non-empty while the chat is read-only for this person: the
+   *  composer is disabled and says why. */
+  composerLockReason?: string
 }
 
 export default function ChatComposerBar({
   viewedStreaming, warming, turnStartTime, thinkingActive, compressingActive, activeAgents,
-  mode, pendingEngineSwitch, model, modelCompound, totalCost, costBilled, contextUsed,
+  mode, pendingEngineSwitch, model, modelCompound, billedCost, toolCost, costBilled, contextUsed,
   contextMax, cacheStats, meetingActive, permissionModes, agentLayerModels, modelGroups,
   interactiveAvailable, interactive, interactiveLocked, pickersLockReason, handleInteractiveToggle,
   handleToggleRichView, isTaskChat, chatId, agentName, ws, handleModeChange, handleModelChange,
-  chatActiveLayer, effectiveLayer, supportsCompact,
+  chatActiveLayer, supportsCompact,
   limitReached, limitReachedInfo, limitWarning, setLimitWarning, engineLabels,
   draftInput, setDraftInput, handleSend, handleAbort, handleEditQueued, handleEngage,
   permissionPending, warmingUp, aborting, queuedMessages, editText, setEditText,
   pendingImages, draftKey, pendingFiles, handleAddFiles, handleAddFolder, handleRemoveFile, handleRetryFile,
   workspace, appsActive, toggleApps, setAppsOpen,
   projectsActive, isProjectChat, dockAvailable, setProjectsOpen,
-  voice, composerAnimates,
+  voice, composerAnimates, targetSlot, composerLockReason = '',
 }: Props) {
   const touchPrimary = usePrimaryPointerCoarse()
   return (
-    <div data-composer-bar className="shrink-0 relative bg-p-bg">
-      {/* Gradient fade overlay — extends above into chat scroll area */}
-      <div className="absolute left-0 right-0 bottom-full h-4 bg-linear-to-t from-p-bg to-transparent pointer-events-none" />
+    <div data-composer-bar className="shrink-0 relative bg-surface-page">
       <div className="max-w-4xl mx-auto">
         <ChatStatusBar
           streaming={viewedStreaming}
@@ -134,7 +142,7 @@ export default function ChatComposerBar({
           thinkingActive={thinkingActive}
           compressingActive={compressingActive}
           activeAgents={activeAgents}
-          mode={mode === 'auto' ? 'dontAsk' : mode}
+          mode={runsWithoutAsking(mode) ? DONT_ASK_MODE : currentMode(mode)}
           // While a cross-engine pick is pending these are DISPLAY-ONLY
           // overrides — the real `model` state stays on the chat's
           // engine (it feeds handleSend/pre-warm; mutating it would warm
@@ -143,7 +151,8 @@ export default function ChatComposerBar({
           modelValue={pendingEngineSwitch
             ? `${pendingEngineSwitch.layer}::${pendingEngineSwitch.model}`
             : modelCompound}
-          costUsd={totalCost}
+          costUsd={billedCost}
+          toolCostUsd={toolCost}
           costBilled={costBilled}
           contextUsed={contextUsed}
           contextMax={contextMax}
@@ -152,7 +161,8 @@ export default function ChatComposerBar({
           permissionModes={permissionModes}
           modelOptions={agentLayerModels}
           modelGroups={modelGroups}
-          interactiveAvailable={interactiveAvailable}
+          // No terminal toggle on a task chat.
+          interactiveAvailable={interactiveAvailable && !isTaskChat}
           interactiveOn={interactive.interactiveMode}
           interactiveDisabled={interactiveLocked || !!pickersLockReason}
           onInteractiveToggle={handleInteractiveToggle}
@@ -176,6 +186,7 @@ export default function ChatComposerBar({
           leftSlot={interactive.sessionInteractive && chatId
             ? <TerminalControlBar className="flex-1 min-w-0" send={(seq) => ws.sendPtyInput(chatId, utf8ToB64(seq))} />
             : undefined}
+          targetSlot={targetSlot}
           onModeChange={handleModeChange}
           onModelChange={handleModelChange}
           // Lazy liveness re-probe on dropdown open (committed chats
@@ -201,21 +212,21 @@ export default function ChatComposerBar({
       {/* Usage limit banner — names the budget that blocked (platform
           budget, own API-key budget, or the subscription pool cap). */}
       {limitReached && (
-        <div data-testid="limit-banner" className="mx-4 mb-2 p-3 rounded-lg bg-p-error/10 border border-p-error/30 text-sm text-p-error">
+        <div data-testid="limit-banner" className="mx-4 mb-2 p-3 rounded-card bg-status-danger-bg border border-status-danger-border text-sm text-status-danger-fg">
           <strong>{describeLimitReached(limitReachedInfo, engineLabels).title}</strong>{' '}
           {describeLimitReached(limitReachedInfo, engineLabels).body}
         </div>
       )}
       {/* Usage limit warning toast */}
       {limitWarning && (
-        <div className="fixed top-4 right-4 z-50 max-w-sm p-4 rounded-xl bg-p-accent-yellow/10 border border-p-accent-yellow/40 text-sm shadow-lg backdrop-blur-xs">
+        <div className={`fixed top-4 right-4 z-50 max-w-sm p-4 ${TOAST} border-l-4 border-l-status-warning-solid text-sm`}>
           <div className="flex items-start gap-2">
-            <span className="text-p-accent-yellow text-lg leading-none">&#9888;</span>
+            <span className="text-status-warning-solid text-lg leading-none">&#9888;</span>
             <div>
-              <p className="font-medium text-p-text">Usage limit warning</p>
-              <p className="text-p-text-secondary mt-0.5">{describeLimitWarning(limitWarning, engineLabels)}</p>
+              <p className="font-medium text-status-warning-fg">Usage limit warning</p>
+              <p className="text-secondary mt-0.5">{describeLimitWarning(limitWarning, engineLabels)}</p>
             </div>
-            <button onClick={() => setLimitWarning(null)} className="text-p-text-light hover:text-p-text ml-auto">&times;</button>
+            <button onClick={() => setLimitWarning(null)} className="text-tertiary hover:text-primary ml-auto">&times;</button>
           </div>
         </div>
       )}
@@ -228,15 +239,15 @@ export default function ChatComposerBar({
         onAbort={handleAbort}
         onEditQueued={handleEditQueued}
         onEngage={handleEngage}
-        disabled={!ws.connected || limitReached}
+        disabled={!ws.connected || limitReached || !!composerLockReason}
         sendDisabled={!!pendingEngineSwitch}
         streaming={(viewedStreaming && !permissionPending) || warmingUp}
         queueable={viewedStreaming && !permissionPending && !warmingUp}
         aborting={aborting}
-        placeholder={pendingEngineSwitch
+        placeholder={composerLockReason || (pendingEngineSwitch
           ? 'Confirm or cancel the engine switch first…'
           : limitReached ? 'Usage limit reached'
-            : withSendHint(viewedStreaming ? 'Type to queue a message' : 'Type a message', touchPrimary)}
+            : withSendHint(viewedStreaming ? 'Type to queue a message' : 'Type a message', touchPrimary))}
         queuedCount={queuedMessages.length}
         editText={editText}
         onClearEditText={() => setEditText(null)}
@@ -265,6 +276,22 @@ export default function ChatComposerBar({
         voice={voice}
         animateHeight={composerAnimates}
       />
+    </div>
+  )
+}
+
+/** The chat page's bottom panel: the banners, the lock line and the
+ *  composer, on the page colour. The fade over the chat's last lines sits
+ *  above the whole panel, so it never covers a banner. */
+export function ChatBottomPanel({ children }: { children: ReactNode }) {
+  return (
+    <div data-chat-bottom className="shrink-0 relative bg-surface-page">
+      <div
+        data-composer-fade
+        aria-hidden="true"
+        className="absolute left-0 right-0 bottom-full h-4 bg-linear-to-t from-surface-page to-transparent pointer-events-none"
+      />
+      {children}
     </div>
   )
 }

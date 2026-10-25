@@ -11,11 +11,13 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
 import psycopg
 
+from core.permission_modes import ASK_MODE, chat_row
 from core.session import session_kind
 from storage.pg import get_conn
 
@@ -185,8 +187,8 @@ def search_chats(user_sub: str, agent: str, query: str, limit: int = 50) -> list
                    LIMIT %s""",
                 (user_sub, agent, _TASK_SOURCE_TYPES, tsquery, limit),
             ).fetchall()
-            return [dict(r) for r in rows]
-        except Exception as e:
+            return [chat_row(r) for r in rows]
+        except psycopg.Error as e:
             return _search_failed("chats", query, e)
 
 
@@ -227,7 +229,7 @@ def rebuild_chat_search(chat_id: str) -> None:
         with get_conn() as conn:
             _rebuild_chat_search_row(conn, chat_id)
             conn.commit()
-    except Exception as e:
+    except psycopg.Error as e:
         _warn_rebuild_failed(chat_id, e)
 
 
@@ -277,7 +279,7 @@ def list_task_chats(agent: str, scope_user_sub: str | None = None,
               ORDER BY c.updated_at DESC LIMIT %s""",
             params,
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [chat_row(r) for r in rows]
 
 
 def search_task_chats(agent: str, query: str, scope_user_sub: str | None = None,
@@ -306,15 +308,15 @@ def search_task_chats(agent: str, query: str, scope_user_sub: str | None = None,
                      LIMIT %s""",
                 params,
             ).fetchall()
-            return [dict(r) for r in rows]
-        except Exception as e:
+            return [chat_row(r) for r in rows]
+        except psycopg.Error as e:
             return _search_failed("tasks", query, e)
 
 
 # --- Chat CRUD ---
 
 
-def create_chat(chat_id: str, user_sub: str, agent: str, permission_mode: str = "default", model: str = "", execution_path: str = "", source_type: str = "chat", execution_mode: str = "", origin: str = "dashboard", work_cwd: str = "", parent_chat_id: str = "", project_id: str = "", delegate_role: str = "", title: str = "", checks: str = "") -> dict:
+def create_chat(chat_id: str, user_sub: str, agent: str, permission_mode: str = ASK_MODE, model: str = "", execution_path: str = "", source_type: str = "chat", execution_mode: str = "", origin: str = "dashboard", work_cwd: str = "", parent_chat_id: str = "", project_id: str = "", delegate_role: str = "", title: str = "", checks: str = "") -> dict:
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         conn.execute(
@@ -324,13 +326,13 @@ def create_chat(chat_id: str, user_sub: str, agent: str, permission_mode: str = 
         )
         conn.commit()
         row = conn.execute("SELECT * FROM chats WHERE id=%s", (chat_id,)).fetchone()
-        return dict(row)
+        return chat_row(row)
 
 
 def get_chat(chat_id: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM chats WHERE id=%s", (chat_id,)).fetchone()
-        return dict(row) if row else None
+        return chat_row(row) if row else None
 
 
 def get_chats_by_ids(chat_ids: list[str]) -> dict[str, dict]:
@@ -345,7 +347,7 @@ def get_chats_by_ids(chat_ids: list[str]) -> dict[str, dict]:
         rows = conn.execute(
             "SELECT * FROM chats WHERE id = ANY(%s)", (ids,),
         ).fetchall()
-        return {r["id"]: dict(r) for r in rows}
+        return {r["id"]: chat_row(r) for r in rows}
 
 
 def list_chats(user_sub: str, agent: str | None = None, limit: int = 50) -> list[dict]:
@@ -374,7 +376,7 @@ def list_chats(user_sub: str, agent: str | None = None, limit: int = 50) -> list
                 {where} ORDER BY c.updated_at DESC LIMIT %s""",
             params,
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [chat_row(r) for r in rows]
 
 
 def list_unread_finished_chats(since: str, limit: int = 30) -> list[dict]:
@@ -401,7 +403,7 @@ def list_unread_finished_chats(since: str, limit: int = 30) -> list[dict]:
              ORDER BY c.last_response_at DESC LIMIT %s""",
             (since, _TASK_SOURCE_TYPES, limit),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [chat_row(r) for r in rows]
 
 
 def mark_chat_read(chat_id: str, owner_identity: str) -> None:
@@ -432,7 +434,7 @@ def list_chats_by_parent(parent_chat_id: str, limit: int = 50) -> list[dict]:
             "ORDER BY updated_at DESC LIMIT %s",
             (parent_chat_id, limit),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [chat_row(r) for r in rows]
 
 
 def list_chats_by_project(project_id: str, limit: int = 100) -> list[dict]:
@@ -446,7 +448,7 @@ def list_chats_by_project(project_id: str, limit: int = 100) -> list[dict]:
             "ORDER BY updated_at DESC LIMIT %s",
             (project_id, limit),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [chat_row(r) for r in rows]
 
 
 def get_agent_conversations(agent: str, *, source_type: str = "", source_types=(), offset: int = 0, limit: int = 50) -> list[dict]:
@@ -469,7 +471,7 @@ def get_agent_conversations(agent: str, *, source_type: str = "", source_types=(
     params.extend([limit, offset])
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
+        return [chat_row(r) for r in rows]
 
 
 def count_agent_conversations(agent: str, *, source_type: str = "", source_types=()) -> int:
@@ -502,7 +504,7 @@ def update_chat(chat_id: str, **fields: Any) -> bool:
             try:
                 _rebuild_chat_search_row(conn, chat_id)
                 conn.commit()
-            except Exception:
+            except psycopg.Error:
                 # A stale FTS row keeps matching the old title until the next
                 # rebuild — recoverable, but worth a trace instead of silence.
                 logger.warning("chat_search rebuild failed for %s", chat_id,
@@ -525,9 +527,9 @@ def rebind_chat_for_engine_switch(
     session_id) pair the handler's gates observed, so a concurrent warmup /
     dead-session adopt that re-bound the row between gate-check and commit
     makes this a clean no-op (rowcount 0 → the op is denied, never half
-    applied). Shape mirrors ``remote_store.rebind_chat_to_current_target``
-    minus the pin clear — an engine switch does NOT move machines — plus the
-    engine/model flip. ``pending_seed`` is ``'engine_switch:<old_path>'`` for
+    applied). Shape mirrors ``remote_store.rebind_chat_to_target`` (the
+    move's reseed rebind) minus the new pin — an engine switch does NOT move
+    machines — plus the engine/model flip. ``pending_seed`` is ``'engine_switch:<old_path>'`` for
     CLI targets and ``''`` for direct-llm (which never consumes seeds and
     rebuilds full DB history every turn)."""
     with get_conn() as conn:
@@ -568,10 +570,22 @@ def claim_pending_history_seed(chat_id: str) -> str:
         return row["pending_history_seed"] if row else ""
 
 
+# A record that waits for the chat's next typed message (a concluded
+# meeting's note): it never runs as a turn of its own, so the redelivery
+# sweeps and a terminal's start leave it stored and only a typed turn takes
+# it. A record without a kind is a wake the sweeps deliver.
+WAKE_NOTE = "note"
+
+
+def _is_note(record: dict) -> bool:
+    return record.get("kind") == WAKE_NOTE
+
+
 def wake_records(raw: str) -> list[dict]:
     """The wake records of a ``pending_delegate_wake`` value, oldest first:
-    ``{"prompt", "person", "role", "by"}`` each. A plain string (the form
-    1.7.0 stored) is a wake with no person; anything else is dropped."""
+    ``{"prompt", "person", "role", "by"}`` each, plus ``"kind"`` on a note
+    (``WAKE_NOTE``). A plain string (the form 1.7.0 stored) is a wake with no
+    person; anything else is dropped."""
     try:
         items = json.loads(raw or "[]")
     except ValueError:
@@ -586,18 +600,23 @@ def wake_records(raw: str) -> list[dict]:
             continue
         prompt = item.get("prompt")
         if isinstance(prompt, str) and prompt:
-            out.append({"prompt": prompt, "person": str(item.get("person") or ""),
-                        "role": str(item.get("role") or ""), "by": str(item.get("by") or "")})
+            record = {"prompt": prompt, "person": str(item.get("person") or ""),
+                      "role": str(item.get("role") or ""), "by": str(item.get("by") or "")}
+            if item.get("kind") == WAKE_NOTE:
+                record["kind"] = WAKE_NOTE
+            out.append(record)
     return out
 
 
 def append_pending_delegate_wake(chat_id: str, wake_prompt: str, *,
-                                 person: str = "", role: str = "", by: str = "") -> bool:
+                                 person: str = "", role: str = "", by: str = "",
+                                 note: bool = False) -> bool:
     """Append an undeliverable wake to the chat's durable replay store
     (``chats.pending_delegate_wake``: a JSON array of ``{"prompt", "person",
     "role", "by"}``: the person and role the delivery ran as, "" for no
     person, and for a wake that runs as nobody at its creator's role, that
-    creator, so a replay reads their role again).
+    creator, so a replay reads their role again). ``note``: the record waits
+    for the next typed message instead (``WAKE_NOTE``).
     Written when every delivery-ladder rung failed; claimed and injected at
     the chat's next warmup/turn, or redelivered by the sweep as its person.
     Row-locked read-modify-write so two concurrent failed deliveries can't
@@ -614,8 +633,10 @@ def append_pending_delegate_wake(chat_id: str, wake_prompt: str, *,
             conn.commit()
             return False
         wakes = wake_records(row["pending_delegate_wake"])
-        wakes.append({"prompt": wake_prompt, "person": person or "", "role": role or "",
-                      "by": by or ""})
+        record = {"prompt": wake_prompt, "person": person or "", "role": role or "", "by": by or ""}
+        if note:
+            record["kind"] = WAKE_NOTE
+        wakes.append(record)
         conn.execute(
             "UPDATE chats SET pending_delegate_wake = %s WHERE id = %s",
             (json.dumps(wakes), chat_id),
@@ -624,29 +645,42 @@ def append_pending_delegate_wake(chat_id: str, wake_prompt: str, *,
         return True
 
 
-def claim_pending_wake_records(chat_id: str) -> list[dict]:
-    """Atomically claim-and-clear the chat's pending wakes, each with the
-    person and role it was stored for (oldest first; ``[]`` when none). Same
-    single-statement claim shape as ``claim_pending_history_seed``: exactly
-    one of two racing claimers gets the wakes.
+def claim_pending_wake_records(chat_id: str, *, notes: bool = False,
+                               wakes: bool = True) -> list[dict]:
+    """Atomically claim-and-clear the chat's pending wakes (``wakes``) and
+    notes (``notes``), each with the person and role it was stored for
+    (oldest first; ``[]`` when none); the records of the kind not asked for
+    stay stored, in order. One locked read-modify-write: exactly one of two
+    racing claimers gets each record.
     """
     with get_conn() as conn:
         row = conn.execute(
-            """UPDATE chats c SET pending_delegate_wake = ''
-               FROM (SELECT id, pending_delegate_wake FROM chats
-                      WHERE id = %s FOR UPDATE) old
-               WHERE c.id = old.id AND old.pending_delegate_wake <> ''
-               RETURNING old.pending_delegate_wake""",
+            "SELECT pending_delegate_wake FROM chats WHERE id = %s FOR UPDATE",
             (chat_id,),
         ).fetchone()
+        if row is None or not row["pending_delegate_wake"]:
+            conn.commit()
+            return []
+        records = wake_records(row["pending_delegate_wake"])
+        taken = [r for r in records if (notes if _is_note(r) else wakes)]
+        kept = [r for r in records if not (notes if _is_note(r) else wakes)]
+        conn.execute("UPDATE chats SET pending_delegate_wake = %s WHERE id = %s",
+                     (json.dumps(kept) if kept else "", chat_id))
         conn.commit()
-    return wake_records(row["pending_delegate_wake"]) if row else []
+    return taken
 
 
-def claim_pending_delegate_wake(chat_id: str) -> list[str]:
+def claim_pending_delegate_wake(chat_id: str, *, notes: bool = False) -> list[str]:
     """The prompts of :func:`claim_pending_wake_records`, for a claimer whose
-    own turn carries them (it runs as its own person)."""
-    return [w["prompt"] for w in claim_pending_wake_records(chat_id)]
+    own turn carries them (it runs as its own person): the wakes, and with
+    ``notes`` (a typed turn, or a drop) the notes too."""
+    return [w["prompt"] for w in claim_pending_wake_records(chat_id, notes=notes)]
+
+
+def claim_pending_notes(chat_id: str) -> list[str]:
+    """The notes waiting for this chat's next typed message, claimed; its
+    wakes stay stored for their own delivery."""
+    return [w["prompt"] for w in claim_pending_wake_records(chat_id, notes=True, wakes=False)]
 
 
 def _wake_of(wake: dict, person: str) -> bool:
@@ -695,7 +729,7 @@ def list_chats_with_pending_wakes(execution_target: str | None = None,
     running one of ``session_ids`` (the sessions the platform holds there; a
     chat with an empty target). None = all — the startup sweep. Claiming
     stays per-chat and atomic, so this list is a candidate set, not a lock."""
-    q = ("SELECT id, agent, user_sub, session_id, execution_target "
+    q = ("SELECT id, agent, user_sub, session_id, execution_target, pending_delegate_wake "
          "FROM chats WHERE pending_delegate_wake <> ''")
     params: tuple = ()
     if execution_target:
@@ -703,7 +737,13 @@ def list_chats_with_pending_wakes(execution_target: str | None = None,
         params = (execution_target, list(session_ids))
     with get_conn() as conn:
         rows = conn.execute(q, params).fetchall()
-        return [dict(r) for r in rows]
+    # A chat holding notes alone has nothing for a sweep to deliver.
+    out: list[dict] = []
+    for r in rows:
+        row = chat_row(r)
+        if any(not _is_note(w) for w in wake_records(row.pop("pending_delegate_wake"))):
+            out.append(row)
+    return out
 
 
 def list_chats_with_waiting_input(execution_target: str,
@@ -770,7 +810,7 @@ def set_chat_title_if_unset(chat_id: str, title: str) -> bool:
             try:
                 _rebuild_chat_search_row(conn, chat_id)
                 conn.commit()
-            except Exception:
+            except psycopg.Error:
                 logger.warning("chat_search rebuild failed for %s", chat_id,
                                exc_info=True)
         return cur.rowcount > 0
@@ -798,7 +838,7 @@ def update_chat_title_cas(chat_id: str, new_title: str,
         try:
             _rebuild_chat_search_row(conn, chat_id)
             conn.commit()
-        except Exception:
+        except psycopg.Error:
             logger.warning("chat_search rebuild failed for %s", chat_id,
                            exc_info=True)
         return True
@@ -826,7 +866,53 @@ def get_retention_candidate_chats(cutoff_iso: str, *,
                   AND updated_at < %s""",
             (list(fileless_paths), cutoff_iso),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [chat_row(r) for r in rows]
+
+
+def get_remote_retention_candidate_chats(cutoff_iso: str, *,
+                                         fileless_paths: list[str]) -> list[dict]:
+    """The remote half of ``get_retention_candidate_chats``: chats pinned to
+    a machine (``execution_target`` neither ``'local'`` nor ``''``) whose
+    session there may be aged out, with the machine they are pinned to.
+    The same engine and age rules."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, user_sub, agent, session_id, codex_thread_id, execution_target
+                 FROM chats
+                WHERE execution_target NOT IN ('local', '')
+                  AND execution_path <> ALL(%s)
+                  AND (session_id IS NOT NULL OR codex_thread_id IS NOT NULL)
+                  AND updated_at < %s""",
+            (list(fileless_paths), cutoff_iso),
+        ).fetchall()
+        return [chat_row(r) for r in rows]
+
+
+def get_session_refs_by_target() -> dict[str, set[str]]:
+    """Every session and thread id a row still points at, keyed by the
+    row's stored ``execution_target`` as it is (the caller asks
+    ``core.placement`` which machine, if any, a value names);
+    ``dynamic_tasks``' refs are under ``""``. The remote retention pass
+    reads it after the flagging, so an aged chat's old ids are in no
+    list."""
+    by_target: dict[str, set[str]] = {"": set()}
+    with get_conn() as conn:
+        for r in conn.execute(
+            "SELECT execution_target, session_id, codex_thread_id FROM chats "
+            "WHERE session_id IS NOT NULL OR codex_thread_id IS NOT NULL"
+        ).fetchall():
+            bucket = by_target.setdefault(r["execution_target"] or "", set())
+            for ref in (r["session_id"], r["codex_thread_id"]):
+                if ref:
+                    bucket.add(ref)
+        for sql in (
+            "SELECT DISTINCT continue_session AS r FROM dynamic_tasks "
+            "WHERE continue_session IS NOT NULL AND continue_session != ''",
+            "SELECT DISTINCT on_complete_session_id AS r FROM dynamic_tasks "
+            "WHERE on_complete_session_id IS NOT NULL AND on_complete_session_id != ''",
+        ):
+            by_target[""].update(r["r"] for r in conn.execute(sql).fetchall())
+    return by_target
 
 
 def get_phone_chats(cutoff_iso: str | None = None) -> list[dict]:
@@ -842,7 +928,7 @@ def get_phone_chats(cutoff_iso: str | None = None) -> list[dict]:
         params.append(cutoff_iso)
     with get_conn() as conn:
         rows = conn.execute(sql + " ORDER BY updated_at", params).fetchall()
-        return [dict(r) for r in rows]
+        return [chat_row(r) for r in rows]
 
 
 def get_protected_session_refs(cutoff_iso: str) -> tuple[set[str], set[str]]:
@@ -932,7 +1018,7 @@ def get_chat_by_session(session_id: str) -> dict | None:
             "SELECT * FROM chats WHERE session_id=%s ORDER BY updated_at DESC LIMIT 1",
             (session_id,),
         ).fetchone()
-        return dict(row) if row else None
+        return chat_row(row) if row else None
 
 
 def delete_chat(chat_id: str) -> bool:
@@ -1007,7 +1093,7 @@ def add_chat_message(chat_id: str, role: str, content: str = "",
             try:
                 _rebuild_chat_search_row(conn, chat_id)
                 conn.commit()
-            except Exception as e:
+            except psycopg.Error as e:
                 conn.rollback()
                 _warn_rebuild_failed(chat_id, e)  # the row itself is committed
         return row_id
@@ -1023,12 +1109,12 @@ def _stamp_task_title(conn, chat_id: str, first_prompt: str) -> None:
                 "SELECT title FROM chats WHERE id=%s", (chat_id,),
             ).fetchone()
             if title_row is not None and not (title_row["title"] or "").strip():
-                from services.title_generator import deterministic_title
+                from storage.chat.chat_titles import deterministic_title
                 conn.execute(
                     "UPDATE chats SET title=%s WHERE id=%s",
                     (deterministic_title(first_prompt), chat_id),
                 )
-    except Exception:
+    except psycopg.Error:
         logger.debug("task title stamp failed for %s", chat_id, exc_info=True)
 
 
@@ -1045,7 +1131,10 @@ def _row_refused(exc: Exception) -> bool:
 
 
 def add_chat_messages_batch(chat_id: str,
-                            rows: list[tuple[str, str, str, str]]) -> int:
+                            rows: list[tuple[str, str, str, str]], *,
+                            ids: list[int] | None = None,
+                            in_txn: Callable[[psycopg.Connection, list[int]], None] | None = None,
+                            search: bool = True) -> int:
     """Persist a turn's rows, ``(role, content, event_type, event_data)``
     each, in order: one transaction for the inserts and ``updated_at``, then
     ONE search-row rebuild for the lot (not one per text row). When the
@@ -1054,7 +1143,13 @@ def add_chat_messages_batch(chat_id: str,
     connection or pool failure before the commit sends the batch once more
     (nothing was committed; a cancel or a server shutdown is the server's
     answer and is not); any other failure is raised, with nothing written
-    again. Returns the last inserted id (0 when nothing landed)."""
+    again. Returns the last inserted id (0 when nothing landed).
+
+    ``ids`` receives each row's id in order (0 for a row refused one by
+    one). ``in_txn(conn, ids)`` runs inside the insert transaction before its
+    commit, so what it writes lands with the rows or not at all; after the
+    rows one by one it runs in a transaction of its own. ``search=False``
+    leaves the search row to a later rebuild (a turn's checkpoint)."""
     if not rows:
         return 0
     now = datetime.now(timezone.utc).isoformat()
@@ -1064,23 +1159,27 @@ def add_chat_messages_batch(chat_id: str,
                          if role == _ROLE_USER and content), "")
     committing = False
 
+    written: list[int] = []
+
     def _write() -> int:
         nonlocal committing
-        last = 0
+        written.clear()
         with get_conn() as conn:
             for role, content, event_type, event_data in rows:
-                last = conn.execute(
+                written.append(conn.execute(
                     """INSERT INTO chat_messages (chat_id, role, content, event_type, event_data, author_sub, created_at)
                        VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                     (chat_id, role, content or "", event_type or "",
                      event_data or "", "", now),
-                ).fetchone()["id"]
+                ).fetchone()["id"])
             conn.execute("UPDATE chats SET updated_at=%s WHERE id=%s", (now, chat_id))
             if first_prompt and session_kind.is_task_chat_id(chat_id):
                 _stamp_task_title(conn, chat_id, first_prompt)
+            if in_txn is not None:
+                in_txn(conn, written)
             committing = True
             conn.commit()
-        return last
+        return written[-1]
 
     last_id = 0
     for attempt in (1, 2):
@@ -1091,7 +1190,12 @@ def add_chat_messages_batch(chat_id: str,
             if _row_refused(e):
                 logger.warning("chat %s: a %d-row batch failed (%s); writing row by row",
                                chat_id, len(rows), e)
-                last_id = _write_rows_one_by_one(chat_id, rows)
+                written[:] = _write_rows_one_by_one(chat_id, rows)
+                last_id = max(written, default=0)
+                if in_txn is not None:
+                    with get_conn() as conn:
+                        in_txn(conn, written)
+                        conn.commit()
                 break
             if (committing or attempt == 2
                     or not isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError))
@@ -1100,23 +1204,36 @@ def add_chat_messages_batch(chat_id: str,
                 raise
             logger.warning("chat %s: a %d-row batch failed before its commit (%s); "
                            "sending it once more", chat_id, len(rows), e)
-    if needs_search:
+    if ids is not None:
+        ids[:] = written
+    if needs_search and search:
         rebuild_chat_search(chat_id)
     return last_id
 
 
-def _write_rows_one_by_one(chat_id: str, rows: list[tuple[str, str, str, str]]) -> int:
-    last_id = 0
+def _write_rows_one_by_one(chat_id: str, rows: list[tuple[str, str, str, str]]) -> list[int]:
+    """Each row in its own transaction; a refused row's id is 0."""
+    written: list[int] = []
     for role, content, event_type, event_data in rows:
         try:
-            last_id = add_chat_message(chat_id, role, content or "",
-                                       event_type=event_type or "",
-                                       event_data=event_data or "",
-                                       sync_search=False)
-        except Exception as row_err:
+            written.append(add_chat_message(chat_id, role, content or "",
+                                            event_type=event_type or "",
+                                            event_data=event_data or "",
+                                            sync_search=False))
+        except (psycopg.Error, ValueError) as row_err:
+            written.append(0)
             logger.warning("chat %s: a %s row was refused: %s",
                            chat_id, role, row_err)
-    return last_id
+    return written
+
+
+def update_chat_message_event_data(chat_id: str, message_id: int, event_data: str) -> None:
+    """Rewrite one event row's payload in place (a block a turn saved early
+    and changed afterwards). Event rows are not in the search row."""
+    with get_conn() as conn:
+        conn.execute("UPDATE chat_messages SET event_data=%s WHERE id=%s AND chat_id=%s",
+                     (event_data, message_id, chat_id))
+        conn.commit()
 
 
 def get_chat_messages(chat_id: str, limit: int = 500, *, before_id: int | None = None) -> list[dict]:
@@ -1282,24 +1399,32 @@ def delete_chat_inputs_where(*, chat_id: str = "", author_sub: str = "",
     return [dict(r) for r in rows]
 
 
+def delete_message_ranges_in(conn: psycopg.Connection, chat_id: str,
+                             ranges: list[tuple[int, int]]) -> int:
+    """Delete, inside the caller's transaction, the assistant and event rows
+    of ``chat_id`` whose id falls in one of ``ranges`` (each ``(after,
+    upto)``: above ``after``, at most ``upto``), user rows kept: the blocks a
+    turn saved early that its replay after a restart writes again. The search
+    row follows when anything went. Returns the rows deleted."""
+    deleted = 0
+    for after, upto in ranges:
+        cur = conn.execute(
+            "DELETE FROM chat_messages WHERE chat_id=%s AND id > %s AND id <= %s "
+            "AND role <> %s",
+            (chat_id, after, upto, _ROLE_USER),
+        )
+        deleted += cur.rowcount or 0
+    if deleted:
+        _rebuild_chat_search_row(conn, chat_id)
+    return deleted
+
+
 def delete_chat_message_ranges(chat_id: str, ranges: list[tuple[int, int]]) -> int:
-    """Delete the assistant and event rows of ``chat_id`` whose id falls in
-    one of ``ranges`` (each ``(after, upto)``: above ``after``, at most
-    ``upto``), user rows kept: the blocks a turn saved early that its replay
-    after a restart writes again. Returns the rows deleted."""
+    """``delete_message_ranges_in`` in a transaction of its own."""
     if not ranges:
         return 0
-    deleted = 0
     with get_conn() as conn:
-        for after, upto in ranges:
-            cur = conn.execute(
-                "DELETE FROM chat_messages WHERE chat_id=%s AND id > %s AND id <= %s "
-                "AND role <> %s",
-                (chat_id, after, upto, _ROLE_USER),
-            )
-            deleted += cur.rowcount or 0
-        if deleted:
-            _rebuild_chat_search_row(conn, chat_id)
+        deleted = delete_message_ranges_in(conn, chat_id, ranges)
         conn.commit()
     return deleted
 
@@ -1341,7 +1466,7 @@ def accept_chat_inputs(chat_id: str, rows: list[dict]) -> list[int]:
             try:
                 _rebuild_chat_search_row(conn, chat_id)
                 conn.commit()
-            except Exception as e:
+            except psycopg.Error as e:
                 conn.rollback()
                 _warn_rebuild_failed(chat_id, e)
     return ids

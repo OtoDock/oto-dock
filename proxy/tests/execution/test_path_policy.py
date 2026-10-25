@@ -7,6 +7,7 @@ Tests the restructured agent folder hierarchy:
     users/{username}/ (workspace/, context/)
 """
 
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import pytest
 
 # Ensure proxy root on path
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
@@ -762,11 +764,13 @@ class TestBashTierForDevTools:
         assert not d.allowed
         assert "platform admin role" in d.reason
 
-    def test_ssh_admin_only(self):
+    def test_ssh_reaches_only_the_attached_hosts_below_admin(self):
         ctx = _ctx("manager", "alice")
         d = self._decision("ssh user@host", ctx)
         assert not d.allowed
-        assert "platform admin role" in d.reason
+        assert "reaches only the SSH hosts an admin attached to the agent" in d.reason
+        assert self._decision("ssh user@host", dataclasses.replace(
+            ctx, ssh_hosts=(("host", "user"),))).allowed
 
     def test_apt_admin_only(self):
         ctx = _ctx("manager", "alice")

@@ -18,12 +18,11 @@ from types import SimpleNamespace
 import pytest
 
 from auth.path_policy import SecurityContext
-from services.checks import changed_set as cs
-from services.checks import documents as d
+from core import placement
+from services.checks import changed_set as cs, documents as d
 from services.checks.kinds import script_kind
 from services.checks.render import Verdict
 from services.scripts import runner
-from core import placement
 
 AGENT = "script-agent"
 
@@ -201,7 +200,10 @@ def test_the_remote_frame_carries_the_new_fields_only_where_the_satellite_has_th
 
 
 def test_the_gate_is_the_version():
-    from core.remote.satellite_connection import SatelliteConnection, SatelliteConnectionManager
+    from core.remote.satellite_connection import (
+        SatelliteConnection,
+        SatelliteConnectionManager,
+    )
     cm = SatelliteConnectionManager()
     for mid, ver in [("new", "0.5.123"), ("old", "0.5.122"), ("future", "0.6.0")]:
         cm._connections[mid] = SatelliteConnection(machine_id=mid, ws=None, satellite_version=ver,
@@ -257,8 +259,7 @@ def test_an_agent_check_names_the_shared_app_before_a_personal_one(monkeypatch):
 
 
 def test_the_handler_kind_wakes_the_app_once_and_reads_the_verdict(monkeypatch):
-    from api.apps import app_proxy
-    from services.apps import app_supervisor, app_tokens
+    from services.apps import app_handlers, app_supervisor, app_tokens
     from services.checks.kinds import handler_kind
     from storage import database as task_store
     row = {"id": "app-1", "slug": "reviewer", "agent": AGENT, "kind": "folder",
@@ -289,9 +290,9 @@ def test_the_handler_kind_wakes_the_app_once_and_reads_the_verdict(monkeypatch):
 
     async def forward(i, method, path, headers, body, timeout):
         calls.append((path, dict(headers), json.loads(body)))
-        assert app_proxy._inflight_checks, "the run is registered while the handler runs"
+        assert app_handlers._inflight_checks, "the run is registered while the handler runs"
         return answers.pop(0)
-    monkeypatch.setattr(app_proxy, "forward", forward)
+    monkeypatch.setattr(app_supervisor, "forward", forward)
     doc = d.validate_check_doc({"name": "coding", "handler": {"app": "reviewer", "handler": "judge"}})
     check = d.CheckDoc(agent=AGENT, owner="", name="coding", doc=doc, folder=Path("/x"), doc_sha256="x")
     v = asyncio.run(handler_kind.run(check, _target(), _changed(), round_no=1))
@@ -300,7 +301,7 @@ def test_the_handler_kind_wakes_the_app_once_and_reads_the_verdict(monkeypatch):
     assert path == "/_handler/judge" and headers["X-OtoDock-Viewer"] == "claim-check"
     assert headers["X-OtoDock-Basis"] == "platform" and body["event"] == "check:coding"
     assert body["payload"]["check"] == "coding" and body["payload"]["paths"]
-    assert app_proxy._inflight_checks == {}
+    assert app_handlers._inflight_checks == {}
     assert asyncio.run(handler_kind.run(check, _target(), _changed(), round_no=1)).status == "error"
     v3 = asyncio.run(handler_kind.run(check, _target(), _changed(), round_no=1))
     assert v3.status == "error" and "500" in v3.reason
@@ -314,16 +315,16 @@ def test_the_handler_kind_wakes_the_app_once_and_reads_the_verdict(monkeypatch):
 
 def test_a_check_claim_is_in_flight_only_while_registered():
     from api.apps import app_proxy
-    from services.apps import app_tokens
+    from services.apps import app_handlers, app_tokens
     row = {"id": "app-x"}
     monkey = app_tokens.verify
     try:
         app_tokens.verify = lambda tok, app_id, purpose: {"principal": "platform", "kind": "check",
                                                           "delivery": "run-1"}
-        app_proxy.register_inflight_check("run-1", "app-x", "judge", "check:coding", ttl_s=60)
+        app_handlers.register_inflight_check("run-1", "app-x", "judge", "check:coding", ttl_s=60)
         reg = asyncio.run(app_proxy.inflight_delivery("t", row))
         assert reg["status"] == "inflight" and reg["handler"] == "judge"
-        app_proxy.unregister_inflight_check("run-1")
+        app_handlers.unregister_inflight_check("run-1")
         with pytest.raises(Exception, match="not in flight"):
             asyncio.run(app_proxy.inflight_delivery("t", row))
     finally:

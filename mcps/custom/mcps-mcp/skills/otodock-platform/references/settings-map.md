@@ -14,16 +14,26 @@ feature is enabled on the install.
   views; **Create Agent** and **Browse Community** *(admin/creator)* — a template's
   card shows the apps and checks it ships and, per installed agent, an **Update** when
   the catalog is newer *(admin, or a creator who manages that agent; also a banner on
-  that agent's Config tab)*; Departments tab *(admin/creator)*. What others shared
+  that agent's Configuration section)*; Departments tab *(admin/creator)*. What others shared
   with you is under **Shared with you** at the top of the notifications panel (the bell on
   the chat page) *(any)*.
-- **Avatar menu** → User Settings *(any)* · Agent Settings *(any with access — tabs
-  vary)* · Admin *(admin)* · Logout.
+- **Avatar menu** → User Settings *(any)* · Agent Settings *(any with access — sections
+  vary)* · App Settings *(the Android app only: its **Installations**, the servers it holds)*
+  · Admin *(admin)* · Logout.
+- **The three settings areas share one shape.** On a desktop a sidebar on the left lists
+  the area's sections. On a phone the area opens as a list of its sections with icons;
+  a section opens as its own page with a back arrow, and the arrow, the browser's back,
+  the Android back gesture and a swipe to the right go back one step (to the list, or to
+  the section the person came from). **Back to Chat** at the top of the sidebar or the
+  list returns to the chat the person came from. A page shows each setting's label. Its
+  longer explanation sits behind the small round **i** beside the label, opened by a
+  hover, a tap or the keyboard.
 
 ## User Settings (avatar menu → User Settings)
 
-Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usage** — all
-*(any)*, own account only.
+Sections (`/user-settings/<section>`): **General · Integrations · Remote Machines · AI
+Engines · Audio · Usage** — all *(any)*, own account only. An older link of the form
+`/user-settings?tab=<section>` still opens the section.
 
 - **General**: Profile (display name, email, role) · Security (change password,
   passkeys, authenticator 2FA — local accounts) · Appearance (theme; **Chat activity**
@@ -31,38 +41,48 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
   ("Agents know which app I am looking at", "Agents may open apps on my screen", both on
   by default) · Memory ("Clear my memory across all agents").
 - **Integrations**: **Connected Accounts** (per-service OAuth sign-in / personal access
-  tokens with optional account labels; per-account Reconnect/Disconnect; an account whose token can no longer be
-  refreshed shows **Reconnect needed** with the reason; **Subscribe to
-  events** for vendors with event APIs, **Subscribe as** yourself or an agent this
-  account serves as service account — managers of that agent only; Personal-only
-  agents are not offered) · **API Keys** (personal webhook-trigger keys,
-  shown once).
+  tokens with optional account labels; per-account Reconnect/Disconnect; an account whose
+  token can no longer be refreshed shows **Reconnect needed** with the reason; a GitHub
+  account connected through a GitHub App lists its **Installations** with **Install on
+  GitHub** (**Change on GitHub** once installed), which picks the repositories on GitHub,
+  and **Refresh**; **Subscribe to events** for vendors with event APIs, **Subscribe as**
+  yourself or an agent this account serves as service account — managers of that agent
+  only; Personal-only agents are not offered) · **API Keys** (personal webhook-trigger
+  keys, shown once). Beneath each agent a GitHub account serves, the card holds the
+  repositories that agent may reach in the person's own chats, and **Read only**.
 - **Remote Machines**: **Pair Machine**; per machine — remove, filesystem access
   (home-only vs full), **Device control** grants (computer / browser / app connectors),
   the browser control's **Browser mode** (Dedicated profile / My own browser + the
   Playwright Extension token), "Run these agents on this machine". Hidden if the build lacks the feature; replaced
   by a notice if an admin disabled user pairing.
 - **AI Engines**: connect Claude / ChatGPT subscriptions; per account — status,
-  **Reconnect**, Remove, **Personal use** toggle; admins also see **Agent pool**. The
+  **Reconnect**, Remove, **Personal use** toggle; admins also see **Shared with agents**. The
   Claude popup signs in with the browser's platform.claude.com session, so to add a
   second Claude account sign out there first or use a private window — a code for an
   account already connected only refreshes it and the form says so; a refused paste
   offers Try again.
-- **Audio**: voice/dictation engine choice (only when the admin policy is *User
-  choice*), dictation language (**Automatic** lets the provider recognise it; also
-  picked by holding the chat's microphone button), device-native voice.
+- **Audio**: voice/dictation engine choice (only when the admin policy is *User choice*),
+  dictation language (**Automatic** starts in the browser's language, or the first listed
+  one, and moves the text to the language spoken within a few seconds, among the languages
+  an admin lists under Setup → Phone → Languages; also picked by holding the chat's
+  microphone button), device-native voice.
 - **Usage**: own platform-API usage vs own-subscription reference, daily chart,
   per-agent breakdown. Read-only.
 
-## Agent Settings (avatar menu → Agent Settings, or /agents/<name>)
+## Agent Settings (avatar menu → Agent Settings, or /agents/<name>; a section at /agents/<name>/<section>)
 
 - **Overview** *(any with access)*: description, tool chips, recent activity; managers
   also see visibility mode + assigned users with roles (on a Shared only agent a viewer or
   contributor kept from an older install is marked "no chat access").
 - **MCPs** *(manager)*: per-tool enable checkboxes; service-account binding per capable
-  tool; beneath a binding, **Subscribe to events for this agent** and the agent's own
-  event subscriptions (what agent-scope triggers and shared apps need); Browse
-  Community drawer.
+  tool (one of the manager's own connected accounts or, for a GitHub account connected
+  through a GitHub App, one of its installations the manager owns, so the agent's git and
+  gh reach only that installation's repositories); beneath a binding, **Subscribe to
+  events for this agent** and the agent's own event subscriptions (what agent-scope
+  triggers and shared apps need); **Browse Community**.
+  Beneath a GitHub binding, **GitHub reach** holds the repositories the agent's own
+  GitHub account reaches, and **Read only**: the agent's own work keeps to it, a person's
+  chats keep to their own.
 - **Skills** *(manager)*: per-skill toggles for installed packages; bundled-with-MCP
   list; Browse community skills.
 - **Configuration** *(manager; some rows gated higher)*: name/description/color · AI
@@ -95,7 +115,7 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
   accounts; admin)*.
 - **An app's menu**: Open full screen *(any who sees it)* · **Share** *(owner; editor+
   for a shared app)* · Roll back · View the working copy · Logs · **Settings** (the
-  app's secrets) · Unpin / Unpin for everyone (Stop app on an app with a server) ·
+  app's **Secrets**, **Triggers** and **Webhooks**) · Unpin / Unpin for everyone (Stop app on an app with a server) ·
   Delete app and its data *(all: owner; editor+ for a shared app)* · Hide for me *(a
   shared app, one shared with you, or one placed here by a share, any)* · Remove for me
   *(in place of Hide for me on an app you accepted into this agent and no agent or
@@ -108,25 +128,28 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
 - **A chat's row in the chat history** → **Share** *(its owner; editor+ on a Shared only
   agent)*.
 
-## Admin area (avatar menu → Admin) — all *(admin)*
+## Admin area (avatar menu → Admin, or /admin; a section at /admin/<section>) — all *(admin)*
 
 - **Overview**: platform-wide runs/schedules overview (the runs table; a run that
   finished with background work still running shows an "N left running" badge).
 - **Users**: add user (invite link / temp password), platform role (Admin / Creator /
   Member; lowering it signs the person out on every device), per-agent role assignments (a Shared only agent offers editor and manager
-  only), **Platform Auth** toggle (borrow platform API credentials), reset password,
+  only), **Platform API** switch (borrow platform API credentials), reset password,
   delete (the person's folders move to an archive, listed under Setup → System Settings).
 - **Usage** ("Usage & Limits"): totals, daily chart, per-provider/model costs,
   per-user usage + limit overrides, agent-scoped usage, **Agent Budgets**, role default
   budgets (weekly/monthly).
 - **MCP Servers**: core/custom/community inventory; enable/config/instances/delete per
   tool; **Check Updates**; **Install** (ZIP); **Browse Community**. **Check Updates**
-  results stay on the page; the weekly run takes a release once it is seven days old
-  and **Update** applies it at once; an MCP whose catalog source changed shows the old
-  and new source, the credential plan and **Switch** *(admin)*; an install ahead of the
-  catalog shows **Revert to catalog**. An MCP whose vendor server signs people in
-  itself shows this install's client registration at the vendor (client id,
-  callback, times) with **Forget**.
+  results stay on the page; the weekly run takes a release once it is seven days old and
+  **Update** applies it at once; an MCP whose catalog source changed shows the old and new
+  source, the credential plan and **Switch** *(admin)*; an install ahead of the catalog
+  shows **Revert to catalog**. An MCP whose vendor server signs people in itself shows
+  this install's client registration at the vendor (client id, callback, times) with
+  **Forget**. The GitHub MCP's app credentials card offers the application kind (an OAuth
+  App or a GitHub App: a GitHub App takes its private key and shows the callback, setup
+  and webhook addresses to paste on GitHub). Meeting Rooms carries **Max parallel meeting
+  participants per user** (four by default, and 0 turns meetings off since 1.9.0).
 - **Skills**: installed skill packages; Check Updates / Update / Delete; **Browse
   Community Skills**; ZIP install (a package ahead of the catalog is left alone and shows
   a revert).
@@ -139,9 +162,14 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
 - **Shares**: every share on the install, to people, agents and departments with its
   standing, and every link (target, creator, password or none, Buttons, opens,
   expiry); kind, agent and standing filters; each revocable, notifying nobody.
+- **Reports**: the agent replies people flagged with **Report this reply**, the flag under
+  each agent reply, newest first: who reported, the agent, the reason, the note, the
+  reply and a link to the chat. **Dismiss** moves one to the **Dismissed** list at the
+  bottom, where **Restore** brings it back. Reports stay on this install and never go to
+  OtoDock.
 - **Monitoring**: Scheduled Tasks · Triggers · Notifications · Task History · Meetings
   — cross-agent, cross-user audit views.
-- **Setup** — tabs in order:
+- **Setup** (second in the list, beside Overview; the one page with tabs) — tabs in order:
   - **General**: company name; platform-wide agent instructions.
   - **AI Engines**: platform subscriptions, API keys, local endpoints, model lists +
     pricing per layer (Claude Code, Codex, Direct LLM) and, per custom/local model,
@@ -150,25 +178,29 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
     billing.
   - **Audio**: chat audio policy; STT/TTS provider cards (keys, per-language voices,
     defaults).
-  - **Phone**: phone servers (Twilio / FreePBX / Asterisk) · routes (agent, language,
-    the caller's language, transfer targets, PIN, call log) · call prompts · languages ·
-    turn classifier · infrastructure · advanced tuning.
+  - **Phone**: phone servers (Twilio / FreePBX / Asterisk) · routes (agent, language, the
+    caller's language, transfer targets, PIN, call log) · caller data · call prompts ·
+    languages (which of the six languages automatic detection may pick on calls, in live
+    voice and in dictation set to Automatic) · turn classifier · infrastructure · advanced
+    tuning.
   - **Security**: require 2FA, passkey mode, password policy, SMTP, Turnstile bot
     protection, OAuth bearer allowlist, **Sharing** (Sharing to agents · Sharing to
     departments · External links · Links without a password · User directory when
     sharing · Longest share expiry).
   - **System Settings**: timezone · session/login timeouts · "Allow users to pair their
-    own remote machines" · offline-fallback toggles · interactive-terminal kill switch
-    · concurrency/idle timeout · memory knobs · storage & retention · **Archive of
-    removed people** (a deleted person's folders: kept 180 days by default, 0 keeps them
-    for ever, its own on/off; the list with each archive's size and date, and **Delete
-    now**) · **Storage Quotas** (per-agent shared + per-user folder caps) · chat title
-    generation (Auto: the first configured Direct LLM provider, Groq, then OpenAI,
-    then Anthropic, whose title model is Haiku 5.5, then a local Ollama model; a
-    pinned model keeps titling while its provider is configured) ·
-    **Automatic MCP Updates** (weekly, includes skill packages; takes a release once it
-    is seven days old; never applies a catalog source change, which waits for an
-    admin's Switch, and never moves an install back).
+    own remote machines" · offline-fallback toggles · interactive-terminal kill switch ·
+    concurrency/idle timeout · memory knobs · storage & retention (old chats' session
+    files age out on this server and, since 1.9.0, on the machines the chats ran on: the
+    disk use counts the machines' files, with **Run cleanup now** and **Dry run**) ·
+    **Archive of removed people** (a deleted person's folders: kept 180 days by default, 0
+    keeps them for ever, its own on/off; the list with each archive's size and date, and
+    **Delete now**) · **Storage Quotas** (per-agent shared + per-user folder caps) · chat
+    title generation (Auto: the first configured Direct LLM provider, Groq, then OpenAI,
+    then Anthropic, whose title model is Haiku 5.5, then a local Ollama model; a pinned
+    model keeps titling while its provider is configured) · **Automatic MCP Updates**
+    (weekly, includes skill packages; takes a release once it is seven days old; never
+    applies a catalog source change, which waits for an admin's Switch, and never moves an
+    install back).
 
 ## Quick answers to frequent "where/who" questions
 
@@ -177,13 +209,15 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
 | Connect my Claude/ChatGPT | User Settings → AI Engines *(any)* |
 | Add an API key / local model for the platform | Setup → AI Engines *(admin)* |
 | Add a user / change a role | Admin → Users *(admin)* |
-| Let a user borrow platform credentials | Admin → Users → Platform Auth *(admin)* |
+| Let a user borrow platform credentials | Admin → Users → Platform API *(admin)* |
 | Give an agent a tool | Agent Settings → MCPs *(manager)*; install first via Admin → MCP Servers *(admin)* |
 | Enable a skill | Agent Settings → Skills *(manager)*; package install *(admin)* |
 | Create a department / move an agent | Agents page → Departments *(admin/creator)*; Agent Settings → Configuration → Department *(admin/creator)* |
 | Share knowledge between agents | Agent Settings → Configuration → Shared Knowledge *(admin/creator)* |
 | Pair my laptop | User Settings → Remote Machines *(any, unless disabled)* |
 | Pair a team server | Admin → Remote Machines *(admin)* |
+| Run a chat on my laptop | the chat's **Runs on** pill *(who can continue the chat)* |
+| A task's machine or mode | Agent Settings → Monitoring → Scheduled Tasks → the row's **Settings** *(who may edit the task)* |
 | Set spending limits | Admin → Usage *(admin)* |
 | Set disk quotas | Setup → System Settings → Storage Quotas *(admin)* |
 | Delete a removed person's archived files, or change how long they are kept | Setup → System Settings → Archive of removed people *(admin)* |
@@ -203,8 +237,8 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
 | Change how a department delegates | Agents page → Departments → the department's mode and reach *(admin, or the creator who made it)* |
 | Remove someone's machine | Admin → Remote Machines *(admin)* |
 | Pick the dictation language | hold the chat's microphone button, or User Settings → Audio *(any)* |
-| Find a message sent while the agent was busy | the faded "queued" bubbles at the end of the conversation *(any; the x takes it back, Edit returns it to the composer)* |
-| Retry a turn that stopped with a card | **Send again** on the card *(the chat's author; once no turn runs)* |
+| Find a message sent while the agent was busy | the "queued" bubbles with a dashed edge at the end of the conversation *(any; the x takes it back, Edit returns it to the composer)* |
+| Retry a turn that stopped with a card | **Resume** on the card when the turn had started, **Send again** when nothing ran *(the chat's author, once no turn runs)* |
 | Sign in to a hosted MCP server that signs people in itself | User Settings → Integrations → Connected Accounts *(any)*; the install's registration at the vendor is under Admin → MCP Servers → Forget *(admin)* |
 | Switch a machine's automatic updates off | Admin → Remote Machines → the machine card *(admin)* |
 | See the running version, or whether a newer release is out | Setup → OtoDock *(admin)* |
@@ -212,3 +246,10 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
 | Let an agent transfer a caller, follow the caller's language, or ask for a PIN | Setup → Phone → the route *(admin)* |
 | Upload a whole folder | drop it on the chat or the workspace *(any)* |
 | "Connect from the address in DASHBOARD_PUBLIC_URL" when connecting an account | open the dashboard at that address *(any)* |
+| Nobody can sign in (a lost admin password, a lost authenticator) | `otodock-admin.sh` for the running release, from the install folder: `user reset-password <email>` or `user disable-2fa <email>` *(whoever runs the server, since 1.9.0)* |
+| Limit or turn off meetings | Admin → MCP Servers → Meeting Rooms → Max parallel meeting participants per user *(admin; 0 turns meetings off)* |
+| Report a reply, or read what people reported | the flag under the reply, **Report this reply** *(any)*, read under Admin → Reports *(admin)* |
+| Narrow which repositories an agent reaches, or make it read only | for the agent's own work, Agent Settings → MCPs → beneath the GitHub service account, **GitHub reach** *(manager)*. For your own chats, User Settings → Integrations → the GitHub account → beneath the agent *(any)* |
+| Let an agent's people use an SSH host | Admin → MCP Servers → **SSH** → an instance per host, given to the agent *(admin)*. Its managers and editors then reach it |
+| Why a setting is there | the small round **i** beside its label *(any)* |
+| Let an agent act on chosen GitHub repositories only | connect GitHub through the GitHub App and **Install on GitHub** under User Settings → Integrations *(any)*, then pick that installation as the agent's identity on Agent Settings → MCPs *(manager)*; an admin registers the GitHub App first under Admin → MCP Servers |

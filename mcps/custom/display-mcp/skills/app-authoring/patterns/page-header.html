@@ -1,0 +1,54 @@
+<p class="muted">The page header. A title in the display face, a status word, the time of the last update and one main action. It stays at the top while a long page scrolls. Use it on every app with live data. A person then knows at a glance whether what they see is current. The status word says Connecting until the live connection opens, Live while it is open and Reconnecting when it dropped. Without a live connection only the update time shows.</p>
+
+<header class="page-header" id="header">
+  <div class="page-header-text">
+    <h1 class="page-header-title">Orders</h1>
+    <span class="badge" id="status-badge">Connecting</span>
+    <span class="muted page-header-updated" id="updated" aria-live="polite"></span>
+  </div>
+  <button type="button" class="btn primary" id="main-action">New order</button>
+</header>
+<div class="card" style="margin-top: 16px; min-height: 120vh"><p>A long page, so the header can show that it stays.</p></div>
+
+<style>
+.page-header { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; background: var(--p-bg); border-bottom: 1px solid var(--p-border-light); }
+.page-header-text { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 12px; min-width: 0; }
+.page-header-title { margin: 0; font-size: var(--p-font-size-xl); line-height: var(--p-line-height-xl); }
+.page-header-updated { font-size: var(--p-font-size-2xs); }
+</style>
+
+<script>
+(function () {
+  var badge = document.getElementById('status-badge')
+  var updated = document.getElementById('updated')
+  var lastAt = Date.now()
+  function words(ms) {
+    var m = Math.round(ms / 60000)
+    if (m < 1) return 'Updated just now'
+    if (m < 60) return 'Updated ' + m + ' min ago'
+    var h = Math.round(m / 60)
+    return 'Updated ' + h + (h === 1 ? ' hour ago' : ' hours ago')
+  }
+  function tick() {
+    updated.textContent = words(Date.now() - lastAt)
+    updated.title = 'Last update at ' + new Date(lastAt).toLocaleTimeString()
+  }
+  function dataArrived() { lastAt = Date.now(); tick() }
+  function live(on) {
+    badge.textContent = on ? 'Live' : 'Reconnecting'
+    badge.className = 'badge ' + (on ? 'success' : 'warning')
+  }
+  tick()
+  setInterval(tick, 30000)
+  // With the app's own live connection every message is fresh data. A
+  // page without one shows the update time alone.
+  if (window.otodock && typeof otodock.ws === 'function') {
+    var ws = otodock.ws('/live')
+    ws.onopen = function () { live(true) }
+    ws.onclose = function () { live(false) }
+    ws.onmessage = function () { dataArrived() }
+  } else {
+    badge.hidden = true
+  }
+})()
+</script>

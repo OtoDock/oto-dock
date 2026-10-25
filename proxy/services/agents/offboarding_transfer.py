@@ -58,6 +58,7 @@ import logging
 import os
 import re
 from collections.abc import Iterable
+from typing import cast
 
 import config
 from auth import roles
@@ -181,13 +182,13 @@ def _counts(result: dict) -> dict[str, int]:
 
 
 def _changed_anything(result: dict | None) -> bool:
-    return bool(result) and any(_counts(result).values())
+    return bool(result) and any(_counts(cast("dict", result)).values())
 
 
 def _moved_anything(result: dict | None) -> bool:
     """Something changed hands (ended continuations alone are not worth a
     notice)."""
-    return bool(result) and any(v for k, v in _counts(result).items() if k != "continuations")
+    return bool(result) and any(v for k, v in _counts(cast("dict", result)).items() if k != "continuations")
 
 
 def _drop_jobs(result: dict) -> None:
@@ -265,6 +266,7 @@ async def _end_meetings(sub: str, people: dict) -> int:
     marked failed with the reason). Returns how many."""
     import contextlib
     import json
+
     from services.meetings import meeting_orchestrator
     ended = 0
     for meeting in await run_db(task_store.list_live_meetings_created_by, sub):
@@ -280,7 +282,7 @@ async def _end_meetings(sub: str, people: dict) -> int:
             else:
                 await meeting_orchestrator.fail_meeting(meeting["id"], MEETING_END_REASON)
             ended += 1
-        except Exception:
+        except Exception:  # noqa: BLE001  # offboarding ends each meeting: one failure must not stop the rest
             logger.warning("offboarding: meeting %s of %s was not ended", meeting["id"], sub,
                            exc_info=True)
     if ended:

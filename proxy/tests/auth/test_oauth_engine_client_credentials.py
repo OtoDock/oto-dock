@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -63,7 +63,7 @@ async def test_client_credentials_extra_params_forwarded():
             return self
         async def __aexit__(self, *_):
             pass
-        async def post(self, url, data=None):
+        async def post(self, url, data=None, headers=None):
             captured["url"] = url
             captured["data"] = dict(data or {})
             resp = MagicMock()

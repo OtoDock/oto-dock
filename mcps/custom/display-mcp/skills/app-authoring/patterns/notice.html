@@ -1,0 +1,30 @@
+<p class="muted">Notices and banners. A notice is one box in a status tint with its edge and its text colour. The body stays at full strength. A banner that asks for something sits on the warning tint, one that only informs on the info tint. A neutral notice is grey. A button inside is an outline in the notice's own colour, never a second tint. Use a notice next to the thing it is about, a banner across the top.</p>
+
+<div class="notice warning" role="status">
+  <p>The payment page is not connected yet. Bookings are held without a payment until it is.</p>
+  <button type="button" class="notice-btn">Connect Stripe</button>
+</div>
+<div class="notice info" role="status">
+  <p>A new version of this app is ready. It arrives the next time the page opens.</p>
+</div>
+<div class="notice success" role="status">
+  <p>Saved. Customers see the new hours from now on.</p>
+</div>
+<div class="notice danger" role="alert">
+  <p>No answer came back. Your change was not saved.</p>
+  <button type="button" class="notice-btn">Try again</button>
+</div>
+<div class="notice" role="status">
+  <p>Nothing changed in the last hour.</p>
+</div>
+
+<style>
+.notice { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; padding: 12px 16px; border: 1px solid var(--p-border-light); border-radius: var(--p-radius); background: var(--p-surface); color: var(--p-text-secondary); font-size: var(--p-font-size-sm); }
+.notice p { margin: 0; flex: 1; min-width: 12em; }
+.notice.info { background: var(--p-status-info-bg); border-color: var(--p-status-info-border); color: var(--p-status-info-fg); }
+.notice.success { background: var(--p-status-success-bg); border-color: var(--p-status-success-border); color: var(--p-status-success-fg); }
+.notice.warning { background: var(--p-status-warning-bg); border-color: var(--p-status-warning-border); color: var(--p-status-warning-fg); }
+.notice.danger { background: var(--p-status-danger-bg); border-color: var(--p-status-danger-border); color: var(--p-status-danger-fg); }
+.notice-btn { min-height: var(--p-control-sm); padding: 4px 12px; border: 1px solid currentColor; border-radius: var(--p-radius-sm); background: transparent; color: inherit; font: 500 var(--p-font-size-sm)/var(--p-line-height-sm) var(--p-font); cursor: pointer; }
+.notice-btn:hover { text-decoration: underline; }
+</style>

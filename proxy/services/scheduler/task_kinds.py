@@ -28,6 +28,7 @@ scheduler imports this package without the platform.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 # ---------------------------------------------------------------------------
 # the definition's kind (dynamic_tasks.task_type)
@@ -164,7 +165,7 @@ def run_kind_of(task) -> str:
     word = getattr(task, "task_type", "") or ""
     if word in _EXPLICIT:
         return KINDS[word].run_kind  # type: ignore[return-value]
-    return KINDS[derive(getattr(task, "schedule", None), getattr(task, "interval_seconds", None))].run_kind
+    return cast("str", KINDS[derive(getattr(task, "schedule", None), getattr(task, "interval_seconds", None))].run_kind)  # both timing kinds mint a run row
 
 
 def self_removes(task) -> bool:

@@ -13,10 +13,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.apps import apps as apps_api
-from api.apps import catalog
-from api.apps import manifest as _mf
 from app import app
 from auth.providers import UserContext, get_current_user
+from services.apps import catalog, manifest as _mf
 from services.notifications import notification_manager as nm
 from storage import database as task_store
 
@@ -282,6 +281,24 @@ def test_the_emit_sites_read_the_audience_cache_and_no_chat_row(monkeypatch):
     assert titled and titled[-1]["delta"] == {"id": chat_id, "title": "Named"}
 
 
+def test_the_title_and_the_stamp_deltas_take_the_row_the_caller_holds(monkeypatch):
+    """A title broadcast passes the row's agent as it is (an empty one
+    included), and the orchestrator stamp takes the chat row: neither
+    reads the chat row on the way to the catalog."""
+    live = _connect(OWNER)
+    chat_id = str(uuid.uuid4())
+    row = task_store.create_chat(chat_id, OWNER, AGENT)
+    monkeypatch.setattr(task_store, "get_chat", lambda cid: (_ for _ in ()).throw(AssertionError("row read")))
+    nm.broadcast_chat_title(OWNER, chat_id, "Named", "")
+    titled = [f for f in _drain(live) if f["type"] == "catalog"]
+    assert titled and titled[-1]["delta"] == {"id": chat_id, "title": "Named"}
+    from api.tasks.delegation import _broadcast_orchestrator_stamp
+    _broadcast_orchestrator_stamp(row, "proj-1")
+    stamped = [f for f in _drain(live) if f["type"] == "catalog"]
+    assert stamped and stamped[-1]["delta"] == {
+        "id": chat_id, "delegate_role": "orchestrator", "project_id": "proj-1"}
+
+
 def test_deltas_reach_only_the_connections_that_asked_for_the_feed():
     """A tab with no app on the feed takes no frame and the sequence does
     not move for it; an agent-less feed matches under any agent; the
@@ -350,10 +367,11 @@ def test_integrations_status_judges_the_identity_the_buttons_run_with(monkeypatc
     method (and the card's `requires_status`) reports THAT account — not
     whether the viewer connected one (the card told the agent's own
     buttons "not connected for you" on the internal install)."""
+    from types import SimpleNamespace as NS
+
+    from services.mcp import mcp_registry
     from services.oauth import credential_resolver
     from storage.identity import credential_store
-    from services.mcp import mcp_registry
-    from types import SimpleNamespace as NS
 
     gh = NS(name="github-mcp", manifest=NS(credentials=NS(oauth={"provider_id": "github"})))
     plain = NS(name="file-tools", manifest=NS(credentials=None))
@@ -427,6 +445,7 @@ def _verdict(status: str, user_sub: str, owner: str = "", name: str = "coding") 
 def test_checks_snapshot_lists_the_checks_with_their_last_verdict_in_the_viewers_slice(tmp_path, monkeypatch):
     import json
     import time
+
     from services.checks import documents
     _checks_world(tmp_path, monkeypatch)
     row = _shared_app([_feed("checks")])

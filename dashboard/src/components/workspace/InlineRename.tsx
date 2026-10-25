@@ -68,12 +68,12 @@ export default function InlineRename({ initial, validate, onCommit, onCancel }: 
           if (e.key === 'Enter') { e.preventDefault(); submit() }
         }}
         onBlur={submit}
-        className={`w-full text-xs px-1.5 py-0.5 rounded-sm border bg-white dark:bg-p-surface text-p-text ${
-          error ? 'border-red-400' : 'border-brand'
+        className={`w-full text-xs px-1.5 py-0.5 rounded-control border bg-surface-card text-primary ${
+          error ? 'border-status-danger-solid' : 'border-action'
         }`}
       />
       {error && (
-        <span className="text-[10px] text-red-500">{error}</span>
+        <span className="text-3xs text-status-danger-fg">{error}</span>
       )}
     </div>
   )

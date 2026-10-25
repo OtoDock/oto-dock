@@ -5,7 +5,7 @@ reconnect, session start) and the cascade that runs on ON→OFF flip
 (close live user-paired satellites + clear their target rows).
 """
 
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -25,9 +25,8 @@ def _make_pair_app(monkeypatch, *, allow_user_paired: bool = True):
     async def _stub_user():
         return user
 
-    from storage import remote_store as _rs
-    from storage import database as _db
     import config as _cfg
+    from storage import database as _db, remote_store as _rs
 
     monkeypatch.setattr(
         _db, "get_platform_setting",
@@ -200,7 +199,7 @@ def test_session_start_refuses_user_paired_when_disabled(monkeypatch):
     }
 
     with patch("core.session.session_manager.agent_store") as mock_store, \
-         patch("storage.remote_store.resolve_execution_target",
+         patch("services.remote.remote_status.resolve_execution_target",
                return_value=("machine-user", None)), \
          patch("storage.remote_store.get_remote_machine",
                return_value=fake_machine), \
@@ -225,7 +224,7 @@ def test_session_start_allows_user_paired_when_enabled(monkeypatch):
     }
 
     with patch("core.session.session_manager.agent_store") as mock_store, \
-         patch("storage.remote_store.resolve_execution_target",
+         patch("services.remote.remote_status.resolve_execution_target",
                return_value=("machine-user", None)), \
          patch("storage.remote_store.get_remote_machine",
                return_value=fake_machine), \

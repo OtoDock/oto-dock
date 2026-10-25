@@ -161,6 +161,7 @@ async def test_a_remote_session_answers_its_plans_from_the_chat_rows(temp_db, mo
     the database in a worker, never asked of the machine and never cached on
     the proxy's disk."""
     from types import SimpleNamespace
+
     import config
     from core.remote import satellite_connection
     from storage import database as task_store
@@ -179,7 +180,7 @@ async def test_a_remote_session_answers_its_plans_from_the_chat_rows(temp_db, mo
         with pytest.raises(HTTPException) as ei:
             await sessions.get_plan_file("other.md", bearer, SID)
     assert [p["filename"] for p in listed] == ["second.md", "first.md"]  # newest first
-    assert listed[0]["size"] == len("# second, édition\n".encode("utf-8"))
+    assert listed[0]["size"] == len("# second, édition\n".encode())
     assert all(isinstance(p["modified"], float) and p["modified"] > 0 for p in listed)
     assert read == {"content": "# second, édition\n", "filename": "second.md"}
     assert ei.value.status_code == 404
@@ -258,6 +259,7 @@ def test_a_hook_route_refuses_a_token_whose_holder_is_gone(temp_db, monkeypatch,
     holder like the session routes: a person who no longer exists is refused
     before the route runs, a living person's token reaches the route."""
     from unittest.mock import AsyncMock
+
     from api.hooks import permission
     monkeypatch.setattr(permission, "decide_tool_permission", AsyncMock(return_value={"decision": "allow"}))
     ghost = live_session_token(SID, "pa", user_sub="user-nobody")

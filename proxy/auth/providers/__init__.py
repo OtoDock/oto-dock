@@ -17,14 +17,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypedDict, cast
 
-import jwt
 from fastapi import Depends, HTTPException, Request
 from starlette.requests import HTTPConnection
 
 import config
+from auth import roles, tokens
 from storage import database as task_store
 from storage.pg import run_db_fast
-from auth import roles
 
 logger = logging.getLogger("otodock.auth")
 
@@ -396,10 +395,9 @@ def create_session_jwt(sub: str, email: str, name: str, role: str,
     hours = expiry_hours if expiry_hours is not None else config.get_jwt_expiry_hours()
     now = int(time.time()) if issued_at is None else int(issued_at)
     payload = {
-        # Discriminator: marks this as a dashboard session cookie. Required by
-        # validate_session_jwt so that OTHER JWTs signed with the same
-        # JWT_SECRET (the 2FA step token, the password-reset token) can never be
-        # replayed as a session cookie. NEVER reuse "session" for another token.
+        # The 1.8 discriminator, kept in the payload: a cookie signed before
+        # 1.9 is told from the 2FA step and the reset token by it
+        # (``auth/tokens.SIGN_IN``'s legacy claim).
         "purpose": "session",
         "sub": sub,
         "email": email,
@@ -410,7 +408,7 @@ def create_session_jwt(sub: str, email: str, name: str, role: str,
         "exp": now + hours * 3600,
         "jti": jti or secrets.token_urlsafe(16),
     }
-    return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
+    return tokens.mint(tokens.SIGN_IN, payload)
 
 
 def apply_session_cookie(response, token: str, *, expiry_hours: int | None = None) -> None:
@@ -638,24 +636,19 @@ def _enforce_auth_gate(request, principal: "UserContext") -> None:
 def validate_session_jwt(token: str) -> dict | None:
     """Decode and validate a dashboard session-cookie JWT. Returns payload or None.
 
-    Enforces ``purpose == "session"``: the 2FA step token (``purpose="2fa"``,
-    handed to the client *before* the second factor) and the password-reset
-    token (``purpose="password_reset"``) are signed with the SAME ``JWT_SECRET``,
-    so without this check either could be presented as the ``session`` cookie for
-    a full authenticated session (2FA / reset bypass). Bearer session tokens are
-    a separate scheme (``type="session"``) validated by
+    A ``SIGN_IN`` token only (``auth/tokens.py``): the 2FA step token, the
+    password-reset token and the agent session bearer are other kinds, under
+    other keys, so none of them is ever taken for a cookie (2FA / reset
+    bypass). Bearer session tokens are validated by
     ``auth.session_token.validate_session_token``.
     """
     try:
-        payload = jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
-    except jwt.ExpiredSignatureError:
+        payload = tokens.decode(token, tokens.SIGN_IN)
+    except tokens.TokenExpired:
         logger.debug("JWT expired")
         return None
-    except jwt.InvalidTokenError as e:
-        logger.debug(f"JWT invalid: {e}")
-        return None
-    if payload.get("purpose") != "session":
-        logger.debug("JWT rejected: not a session cookie (purpose=%r)", payload.get("purpose"))
+    except tokens.TokenInvalid as e:
+        logger.debug("JWT invalid: %s", e)
         return None
     from auth import session_revocation
     if session_revocation.is_revoked(session_revocation.session_cookie_id(payload)):

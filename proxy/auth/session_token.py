@@ -9,8 +9,11 @@ import threading
 import time
 from collections import OrderedDict
 
-import jwt
+from auth import tokens
 
+# The session's command-line token (``attach_cli_token``): the shell's
+# credential for ``POST /v1/hooks/cli-credential``, kept from every MCP child.
+CLI_TOKEN_ENV = "OTO_CLI_TOKEN"
 
 # Sentinel Authorization bearer for Docker MCPs that call back to the proxy
 # (manifest ``server.proxy_callbacks``). The per-session MCP config carries this
@@ -112,7 +115,6 @@ def create_session_token(
             it; "" mints a plain token. Tokens carrying ``ext`` are accepted
             only while the session is live (``middleware.py``).
     """
-    import config
     if external is None:
         external = _live_external_claim(session_id)
     if session_id and user_sub:
@@ -128,16 +130,59 @@ def create_session_token(
     }
     if external:
         payload["ext"] = external
-    return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
+    return tokens.mint(tokens.SESSION, payload)
 
 
-def validate_session_token(token: str) -> dict | None:
-    """Validate a session JWT. Returns the payload dict or None."""
-    import config
-    try:
-        payload = jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
-        if payload.get("type") == "session":
-            return payload
-    except (jwt.InvalidTokenError, jwt.ExpiredSignatureError):
-        pass
-    return None
+def mint_session_env(
+    env: dict[str, str],
+    session_id: str,
+    agent_name: str,
+    person_sub: str,
+    *,
+    external: str | None,
+) -> int:
+    """Write the session's token into ``env`` as ``PROXY_API_KEY``, naming
+    ``person_sub`` ("" for nobody), and return its ``iat``: the session's
+    token floor (``AgentConfig.token_minted_at``).
+
+    The one mint of every session builder (the chat, task, meeting and phone
+    builders, a wake's respawn). ``env`` is the session's credential
+    environment, laid last over the process env and written into a Codex
+    config's stdio MCPs, so an engine's own token, which names nobody, never
+    reaches them. ``external`` is the ``ext`` claim ("" for none, ``None`` to
+    derive it from the live session, as :func:`create_session_token`)."""
+    issued_at = int(time.time())
+    env["PROXY_API_KEY"] = create_session_token(
+        session_id, agent_name, person_sub, external=external, issued_at=issued_at,
+    )
+    return issued_at
+
+
+def validate_session_token(token: str, *, legacy: bool = True) -> dict | None:
+    """The payload of a live session token, or None. ``legacy=False``
+    answers only a token minted by this release (``auth/tokens.py``)."""
+    return tokens.verify(token, tokens.SESSION, legacy=legacy)
+
+
+# The session claims a command-line token mirrors.
+_CLI_CLAIMS = ("sid", "agent", "user_sub", "iat", "exp", "ext")
+
+
+def attach_cli_token(env: dict) -> None:
+    """Set ``OTO_CLI_TOKEN`` in an engine process's ``env`` from its final
+    ``PROXY_API_KEY``: the same session, person, life (``iat``) and expiry,
+    the ``CLI`` kind's key. Called last where an env that hosts a shell is
+    assembled; without a valid session token the key is removed."""
+    claims = validate_session_token(str(env.get("PROXY_API_KEY") or ""))
+    # An external caller's session (``ext`` and no person) has no shell.
+    if not claims or (claims.get("ext") and not claims.get("user_sub")):
+        env.pop(CLI_TOKEN_ENV, None)
+        return
+    env[CLI_TOKEN_ENV] = tokens.mint(
+        tokens.CLI, {k: claims[k] for k in _CLI_CLAIMS if k in claims},
+    )
+
+
+def validate_cli_token(token: str) -> dict | None:
+    """The claims of a live command-line token, or None."""
+    return tokens.verify(token, tokens.CLI)

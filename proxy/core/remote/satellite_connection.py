@@ -12,11 +12,15 @@ import logging
 import time
 import uuid
 from collections import deque
-from core import placement
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
+import psycopg
 from fastapi import WebSocket
+
 from auth import roles
+from core import placement
 from core.background import spawn
 
 logger = logging.getLogger("otodock.satellite")
@@ -63,9 +67,9 @@ class _BulkCredit:
         self.cap = max(1, cap)
         self.inflight = 0
         self.slow = False
-        self._tickets: "deque[tuple[int, asyncio.Future]]" = deque()
+        self._tickets: deque[tuple[int, asyncio.Future]] = deque()
         self._failed: CreditFailed | None = None
-        self._acked: "deque[tuple[float, int]]" = deque()
+        self._acked: deque[tuple[float, int]] = deque()
         self._busy_since: float | None = None
 
     def _fits(self, n: int) -> bool:
@@ -350,6 +354,14 @@ _CODEX_ATTENDED_FLOOR_MIN_VERSION = (0, 5, 143)
 # (``report_skipped``) what it could not read.
 _WINDOWS_BLIND_HASH_VERSIONS = ((0, 5, 130), (0, 5, 144))
 _SKIPPED_MANIFEST_MIN_VERSION = (0, 5, 145)
+# A satellite from this version removes the CLI transcripts the retention
+# sweep names (``session_files_retention``); an older one would drop the frame.
+_SESSION_RETENTION_MIN_VERSION = (0, 5, 150)
+# A chat's engine session files move with it (``session_move``, 0.5.156),
+# from 0.5.157: a 0.5.156 satellite resumed a carried Codex thread in the cwd
+# its rollout recorded, a folder of another place, where every stdio MCP
+# failed, so a move with one continues from a summary instead.
+_SESSION_MOVE_MIN_VERSION = (0, 5, 157)
 
 # Heartbeat persistence cadence. The heartbeat handler refreshes the in-memory
 # ``last_heartbeat`` / ``last_seen_iso`` on EVERY heartbeat (20 s) but hands a
@@ -542,9 +554,8 @@ async def _notify_admins_machine_state_change(
     just-went-offline notice. Skips silently when the machine row is
     missing or its `pairing_scope` is not `'admin'`.
     """
-    from storage import remote_store
     from services.notifications import notification_manager
-
+    from storage import remote_store
     from storage.pg import run_db
 
     machine = await run_db(remote_store.get_remote_machine, machine_id)
@@ -582,11 +593,14 @@ async def _notify_admins_machine_state_change(
             )
 
 
-from core.remote.satellite_grace import SatelliteGraceMixin
 from core.remote.satellite_admin_alerts import SatelliteAdminAlertsMixin
-from core.remote.satellite_file_transfer import (  # noqa: F401
-    SatelliteFileTransferMixin, _FileChangedLane, _PullStream, evict_file_changed_stamps,
+from core.remote.satellite_file_transfer import (
+    SatelliteFileTransferMixin,
+    _FileChangedLane,
+    _PullStream,
+    evict_file_changed_stamps,
 )
+from core.remote.satellite_grace import SatelliteGraceMixin
 
 
 class SatelliteConnectionManager(
@@ -636,13 +650,18 @@ class SatelliteConnectionManager(
         # per-FILE serialization (vs live write-backs) is the separate global path
         # lock in remote_file_flow, taken per file inside the sync.
         self._sync_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # When each machine's connection last went away (monotonic), cleared
+        # at its next register: a resume probe waits for a machine that
+        # dropped within the grace window and refuses at once for one away
+        # longer (``machine_dropped_recently``).
+        self._last_drop_at: dict[str, float] = {}
         # Per-command install progress callbacks. mcp_sync registers one
         # before issuing sync_mcps and removes it after the ack arrives.
-        self._install_progress_cbs: dict[str, object] = {}
+        self._install_progress_cbs: dict[str, Callable[[dict], Any]] = {}
         # Per-command step output callbacks (APPS.md "Steps"): app_steps
         # registers one around its step_run send_command so the script's
         # lines reach the app log as they arrive.
-        self._step_output_cbs: dict[str, object] = {}
+        self._step_output_cbs: dict[str, Callable[[str], Any]] = {}
         # Per-machine reconnect-grace holding area. On a WS
         # drop we move the connection's in-flight session_queues here
         # (machine_id -> {session_id -> (queue, execution_path)}) + start a
@@ -727,7 +746,7 @@ class SatelliteConnectionManager(
                         await run_db(_persist_write, lane, machine_id, value)
                     except asyncio.CancelledError:
                         raise
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001  # the persist flusher's per-lane write: one lane must not drop the rest
                         self._warn_persist_failure(machine_id, lane, e)
                         failed[lane] = value
                 if failed:
@@ -801,7 +820,7 @@ class SatelliteConnectionManager(
             self._persist_status(conn, remote_store.STATUS_ONLINE,
                                  getattr(conn, "last_seen_iso", "") or None)
 
-    async def _refresh_machine_cache(self, machine_id: str, conn) -> None:
+    async def _refresh_machine_cache(self, machine_id: str, conn: SatelliteConnection) -> None:
         """Read the admin ``max_sessions`` override + machine name off-loop
         and cache them on the connection (only while it is still the live
         one). Fail-open on any error: the caches stay None/"" and the
@@ -811,7 +830,7 @@ class SatelliteConnectionManager(
         from storage.pg import run_db
         try:
             m = await run_db(remote_store.get_remote_machine, machine_id)
-        except Exception:
+        except psycopg.Error:
             logger.debug("machine cache refresh failed for %s", machine_id[:8], exc_info=True)
             return
         if not m or self._connections.get(machine_id) is not conn:
@@ -932,7 +951,9 @@ class SatelliteConnectionManager(
 
         On send failure: re-queue the message to its own lane (slight
         reordering accepted over losing it) then trigger deregister so callers
-        wake up immediately instead of waiting for the heartbeat monitor.
+        wake up immediately instead of waiting for the heartbeat monitor. A
+        frame that cannot be encoded is not a send failure: it is dropped and
+        its waiter failed (``_drop_unencodable``), the machine kept.
         """
         try:
             while True:
@@ -961,8 +982,15 @@ class SatelliteConnectionManager(
                 if token is not None and token.cancelled:
                     continue
                 try:
-                    await conn.ws.send_text(json.dumps(msg))
-                except Exception as e:
+                    text = json.dumps(msg)
+                except (TypeError, ValueError) as e:
+                    # A frame that cannot be encoded is this frame's fault,
+                    # never the socket's: drop it, keep the machine.
+                    self._drop_unencodable(conn, msg, e)
+                    continue
+                try:
+                    await conn.ws.send_text(text)
+                except Exception as e:  # noqa: BLE001  # the writer loop's send: a raise would end the writer silently
                     logger.warning(
                         "Satellite %s writer send failed: %s; requeueing %s",
                         conn.machine_id[:8], e,
@@ -985,6 +1013,25 @@ class SatelliteConnectionManager(
                     return
         except asyncio.CancelledError:
             return
+
+    def _drop_unencodable(self, conn: SatelliteConnection, msg: dict, error: Exception) -> None:
+        """Log a frame the writer could not encode and fail its waiter at once
+        (a command's ack by ``command_id``, a file pull by ``request_id``)
+        instead of leaving it to its timeout. A frame with no waiter here (a
+        tunnel frame) is only logged; an online update push's ack (keyed by
+        machine) is left to its timeout, the push being strings only."""
+        kind = msg.get("type") or "frame"
+        logger.error("Satellite %s: dropped a %s frame that could not be encoded: %s",
+                     conn.machine_id[:8], kind, error)
+        why = f"Satellite {conn.machine_id[:8]}: the {kind} request could not be encoded"
+        entry = self._pending_acks.get(str(msg.get("command_id") or ""))
+        if entry is not None and not entry[1].done():
+            entry[1].set_exception(RuntimeError(why))
+        st = self._pending_pulls.pop(str(msg.get("request_id") or ""), None)
+        if st is not None:
+            self._cleanup_pull_stream(st)
+            if not st.future.done():
+                st.future.set_exception(RuntimeError(why))
 
     # --- Connection lifecycle ---
 
@@ -1037,6 +1084,7 @@ class SatelliteConnectionManager(
             # needed). Inside the lock → mutually exclusive with deregister /
             # _expire_grace; whichever pops `_grace_sessions` first wins.
             held = self._grace_sessions.pop(machine_id, None)
+            self._last_drop_at.pop(machine_id, None)
             prior_timer = self._grace_timers.pop(machine_id, None)
             if prior_timer is not None and not prior_timer.done():
                 prior_timer.cancel()
@@ -1109,7 +1157,7 @@ class SatelliteConnectionManager(
                     {"type": "sync_mcps_verify"},
                     timeout=15.0,
                 )
-            except Exception as e:
+            except RuntimeError as e:
                 logger.debug("reconcile verify on reconnect failed: %s", e)
         spawn(_kick_verify(), name="kick_verify", owner="satellite_connection")
 
@@ -1123,7 +1171,7 @@ class SatelliteConnectionManager(
                 layer = _get_remote_layer()
                 if layer is not None:
                     await layer.sync_all_agents_on_reconnect(machine_id)
-            except Exception:
+            except Exception:  # noqa: BLE001  # reconnect catch-up spans db, disk and satellite: a reconnect retries
                 logger.debug(
                     "reconnect workspace sync kick failed for %s", machine_id[:8],
                 )
@@ -1177,6 +1225,8 @@ class SatelliteConnectionManager(
                 )
                 return
             conn = self._connections.pop(machine_id, None)
+            if conn is not None:
+                self._last_drop_at[machine_id] = time.monotonic()
             # Interactive remote PTYs: the satellite keeps the
             # PTY + its child process alive across a WS drop, so do NOT kill them
             # here. Hold them in a reconnect-grace window + a timer; the
@@ -1638,6 +1688,19 @@ class SatelliteConnectionManager(
         (SATELLITE_VERSION 0.5.145)."""
         return self._satellite_at_least(machine_id, _SKIPPED_MANIFEST_MIN_VERSION)
 
+    def satellite_supports_session_retention(self, machine_id: str) -> bool:
+        """True if the connected satellite applies the retention sweep's
+        ``session_files_retention`` frame (SATELLITE_VERSION 0.5.150)."""
+        return self._satellite_at_least(machine_id, _SESSION_RETENTION_MIN_VERSION)
+
+    def satellite_supports_session_move(self, machine_id: str) -> bool:
+        """True if the connected satellite moves a chat's session files
+        (``session_move``): the capability flag AND SATELLITE_VERSION 0.5.157."""
+        conn = self._connections.get(machine_id)
+        if not conn or not (getattr(conn, "capabilities", None) or {}).get("session_move"):
+            return False
+        return self._satellite_at_least(machine_id, _SESSION_MOVE_MIN_VERSION)
+
     def satellite_absence_unreliable(self, machine_id: str) -> bool:
         """True for a Windows satellite whose manifest may leave out files it
         has (``_WINDOWS_BLIND_HASH_VERSIONS``): the merge must not read an
@@ -1748,7 +1811,7 @@ class SatelliteConnectionManager(
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending_acks[command_id] = (machine_id, future, conn)
         # A paged manifest's pages end with the wait, however it ends.
-        future.add_done_callback(lambda _f, _cid=command_id: self._manifest_pages.pop(_cid, None))
+        future.add_done_callback(lambda _f, _cid=command_id: self._manifest_pages.pop(_cid, None))  # type: ignore[misc]  # mypy infers no type for a lambda with a default argument
 
         try:
             # Enqueue rather than ws.send_text(). The writer task does the
@@ -1762,13 +1825,54 @@ class SatelliteConnectionManager(
                     f"Satellite command error: {ack.get('error', 'unknown')}"
                 )
             return ack
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"Satellite {machine_id[:8]} command timeout ({timeout}s)"
-            )
+            ) from exc
         finally:
             self._pending_acks.pop(command_id, None)
             self._manifest_pages.pop(command_id, None)
+
+    async def begin_command(self, machine_id: str, msg: dict) -> tuple[str, asyncio.Future]:
+        """Send a command and hand its ack back as a future the caller waits
+        on at its own pace: a probe that stays outstanding while its caller
+        waits in rounds (the resume probe) is sent once, not once per round.
+        The future resolves with the ack dict (its ``status`` unjudged) and
+        fails with ``RuntimeError`` when the machine drops. The caller ends
+        the wait with ``forget_command`` when it gives up. Raises
+        ``RuntimeError`` when the machine is not connected."""
+        conn = self._connections.get(machine_id)
+        if not conn:
+            raise RuntimeError(f"Satellite {machine_id[:8]} not connected")
+        command_id = str(uuid.uuid4())
+        msg["command_id"] = command_id
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_acks[command_id] = (machine_id, future, conn)
+        future.add_done_callback(lambda _f, _cid=command_id: self._pending_acks.pop(_cid, None))  # type: ignore[misc]  # mypy infers no type for a lambda with a default argument
+        try:
+            await conn.enqueue_send(msg)
+        except BaseException:
+            # A frame that never left waits for no ack.
+            self._pending_acks.pop(command_id, None)
+            if not future.done():
+                future.cancel()
+            raise
+        return command_id, future
+
+    def forget_command(self, command_id: str) -> None:
+        """Stop waiting for a ``begin_command`` ack (a late one is dropped)."""
+        entry = self._pending_acks.pop(command_id, None)
+        if entry is not None and not entry[1].done():
+            entry[1].cancel()
+
+    def machine_dropped_recently(self, machine_id: str) -> bool:
+        """True while a machine that is not connected may still be coming
+        back: it dropped within the reconnect grace, or it holds sessions or
+        terminals in it. False for a machine away longer, or never seen."""
+        if machine_id in self._grace_sessions or machine_id in self._pty_grace_timers:
+            return True
+        dropped = self._last_drop_at.get(machine_id)
+        return dropped is not None and time.monotonic() - dropped < _GRACE_WINDOW_S
 
     async def send_fire_and_forget(self, machine_id: str, msg: dict) -> None:
         """Send a message without waiting for ack.
@@ -1898,415 +2002,459 @@ class SatelliteConnectionManager(
 
     # --- Incoming message handling ---
 
+    # One method per frame type the satellite sends; a type not named here
+    # is ignored.
+    _FRAME_HANDLERS: dict[str, str] = {
+        "ack": "_frame_ack",
+        "update_received": "_frame_update_received",
+        "pause": "_frame_pause",
+        "cli_status": "_frame_cli_status",
+        "heartbeat": "_frame_heartbeat",
+        "session_event": "_frame_session_event",
+        "pty_output": "_frame_pty_output",
+        "pty_exit": "_frame_pty_exit",
+        "pty_alive": "_frame_pty_alive",
+        "sessions_alive": "_frame_sessions_alive",
+        "transcript_lines": "_frame_transcript_lines",
+        "pty_inject_result": "_frame_pty_inject_result",
+        "session_started": "_frame_session_started",
+        "session_ended": "_frame_session_ended",
+        "session_aborted": "_frame_session_aborted",
+        "turn_ended": "_frame_turn_ended",
+        "codex_thread_id": "_frame_codex_thread_id",
+        "file_changed": "_frame_file_changed",
+        "file_manifest": "_frame_file_manifest",
+        "file_content": "_frame_file_content",
+        "mcp_install_progress": "_frame_mcp_install_progress",
+        "step_output": "_frame_step_output",
+        "http_request": "_frame_http_request",
+        "http_request_chunk": "_frame_http_request_chunk",
+        "http_abort": "_frame_http_abort",
+        "local_session_open": "_frame_local_session_open",
+        "local_session_list": "_frame_local_session_list",
+        "local_session_detached": "_frame_local_session_detached",
+    }
+
     async def handle_message(self, machine_id: str, msg: dict) -> None:
         """Route an incoming message from a satellite."""
         msg_type = msg.get("type", "")
+        # A type that is not a string is ignored before the lookup (an
+        # unhashable one would raise there).
+        if not isinstance(msg_type, str):
+            return
+        handler = self._FRAME_HANDLERS.get(msg_type)
+        if handler is not None:
+            await getattr(self, handler)(machine_id, msg)
 
-        if msg_type == "ack":
-            command_id = msg.get("command_id", "")
-            entry = self._pending_acks.get(command_id)
-            if entry:
-                future = entry[1]
-                if not future.done():
-                    future.set_result(msg)
+    async def _frame_ack(self, machine_id: str, msg: dict) -> None:
+        command_id = msg.get("command_id", "")
+        entry = self._pending_acks.get(command_id)
+        # Only the machine a command went to answers it.
+        if entry and entry[0] == machine_id:
+            future = entry[1]
+            if not future.done():
+                future.set_result(msg)
 
-        elif msg_type == "update_received":
-            # A satellite read an online "Update now" push (0.5.140; the
-            # auth-time push reads its acknowledgement on its own socket).
-            fut = self._update_acks.pop(machine_id, None)
-            if fut is not None and not fut.done():
-                fut.set_result(str(msg.get("target_version") or ""))
+    async def _frame_update_received(self, machine_id: str, msg: dict) -> None:
+        # A satellite read an online "Update now" push (0.5.140; the
+        # auth-time push reads its acknowledgement on its own socket).
+        fut = self._update_acks.pop(machine_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(str(msg.get("target_version") or ""))
 
-        elif msg_type == "pause":
-            # Deliberate pause (tray Pause). Persist so the sustained-outage
-            # evaluator skips this machine (no false admin alert). The
-            # satellite closes the WS right after this; the next successful
-            # auth (tray Resume / reboot) clears the flag — through the same
-            # lane, so the two writes keep their order.
-            self._request_persist(machine_id, "paused", True)
+    async def _frame_pause(self, machine_id: str, msg: dict) -> None:
+        # Deliberate pause (tray Pause). Persist so the sustained-outage
+        # evaluator skips this machine (no false admin alert). The
+        # satellite closes the WS right after this; the next successful
+        # auth (tray Resume / reboot) clears the flag — through the same
+        # lane, so the two writes keep their order.
+        self._request_persist(machine_id, "paused", True)
 
-        elif msg_type == "cli_status":
-            # Per-CLI {version, path} from the satellite's pin reconcile
-            # (0.5.107+), sent after every reconcile pass. Data only — pin
-            # mismatch is judged against config.PINNED_* by consumers, never
-            # asserted by the satellite. Merged into capabilities for the
-            # machines API; auth REPLACES capabilities wholesale on reconnect
-            # and the reconcile re-reports seconds later, so this
-            # self-refreshes every connect. Input is whitelisted + bounded:
-            # an authenticated-but-compromised satellite must not park
-            # arbitrary payloads in the capabilities column.
-            conn = self._connections.get(machine_id)
-            if conn:
-                clis_raw = msg.get("clis")
-                clis: dict = {}
-                if isinstance(clis_raw, dict):
-                    # The whitelist is the registered engines' binaries
-                    # (``runtime.binary``) — the keys the satellite's pin
-                    # reconcile reports under.
-                    from core.session.session_manager import get_all_layers
-                    for name in sorted({
-                        lay.capabilities.runtime.binary
-                        for lay in get_all_layers().values()
-                        if lay.capabilities.runtime.binary
-                    }):
-                        entry = clis_raw.get(name)
-                        if not isinstance(entry, dict):
-                            continue
-                        ver = entry.get("version")
-                        path = entry.get("path")
-                        clis[name] = {
-                            "version": ver[:300] if isinstance(ver, str) else None,
-                            "path": path[:300] if isinstance(path, str) else None,
-                        }
-                conn.capabilities["cli_status"] = clis
-                # Persist a SNAPSHOT through the caps lane: json.dumps on
-                # the worker thread must never iterate a dict the event loop
-                # can still mutate, and the lane's newest-wins rule means a
-                # register() snapshot and this re-report can never land out
-                # of order (the old to_thread pair could).
-                self._request_persist(machine_id, "caps", dict(conn.capabilities))
+    async def _frame_cli_status(self, machine_id: str, msg: dict) -> None:
+        # Per-CLI {version, path} from the satellite's pin reconcile
+        # (0.5.107+), sent after every reconcile pass. Data only — pin
+        # mismatch is judged against config.PINNED_* by consumers, never
+        # asserted by the satellite. Merged into capabilities for the
+        # machines API; auth REPLACES capabilities wholesale on reconnect
+        # and the reconcile re-reports seconds later, so this
+        # self-refreshes every connect. Input is whitelisted + bounded:
+        # an authenticated-but-compromised satellite must not park
+        # arbitrary payloads in the capabilities column.
+        conn = self._connections.get(machine_id)
+        if conn:
+            clis_raw = msg.get("clis")
+            clis: dict = {}
+            if isinstance(clis_raw, dict):
+                # The whitelist is the registered engines' binaries
+                # (``runtime.binary``) — the keys the satellite's pin
+                # reconcile reports under.
+                from core.session.session_manager import get_all_layers
+                for name in sorted({
+                    lay.capabilities.runtime.binary
+                    for lay in get_all_layers().values()
+                    if lay.capabilities.runtime.binary
+                }):
+                    entry = clis_raw.get(name)
+                    if not isinstance(entry, dict):
+                        continue
+                    ver = entry.get("version")
+                    path = entry.get("path")
+                    clis[name] = {
+                        "version": ver[:300] if isinstance(ver, str) else None,
+                        "path": path[:300] if isinstance(path, str) else None,
+                    }
+            conn.capabilities["cli_status"] = clis
+            # Persist a SNAPSHOT through the caps lane: json.dumps on
+            # the worker thread must never iterate a dict the event loop
+            # can still mutate, and the lane's newest-wins rule means a
+            # register() snapshot and this re-report can never land out
+            # of order (the old to_thread pair could).
+            self._request_persist(machine_id, "caps", dict(conn.capabilities))
 
-        elif msg_type == "heartbeat":
-            conn = self._connections.get(machine_id)
-            if conn:
-                conn.last_heartbeat = time.monotonic()
-                conn.last_seen_iso = _iso_now()
-                # Measure the signed clock offset (proxy_utc − satellite_utc) so the
-                # file-sync merge can adjust the satellite's epoch mtimes into the
-                # proxy clock before ordering a divergence. Best-effort; epoch mtime
-                # is timezone-immune, so this only corrects genuine wall-clock skew.
-                _ts = msg.get("timestamp")
-                if _ts:
-                    try:
-                        from datetime import datetime, timezone
-                        _sat = datetime.fromisoformat(_ts)
-                        if _sat.tzinfo is None:
-                            _sat = _sat.replace(tzinfo=timezone.utc)
-                        conn.clock_offset = (
-                            datetime.now(timezone.utc) - _sat
-                        ).total_seconds()
-                    except (ValueError, TypeError):
-                        pass
-                # Record the latest per-agent STAT fingerprints. Seed the
-                # synced baseline on FIRST sight (setdefault) WITHOUT a merge —
-                # initial catch-up is reconnect-sync / session-start's job; the
-                # periodic sweep only fires on SUBSEQUENT changes. After a proxy
-                # restart the baseline re-seeds here, so there's no merge burst.
-                _fps = msg.get("agent_fingerprints")
-                if isinstance(_fps, dict):
-                    for _slug, _fp in _fps.items():
-                        if isinstance(_slug, str) and isinstance(_fp, str):
-                            conn.agent_fingerprints[_slug] = _fp
-                            conn.synced_fingerprints.setdefault(_slug, _fp)
-                # Store per-satellite load + live session count (the proxy
-                # otherwise discards these). Authoritative for the admin display +
-                # the soft capacity pre-check in RemoteExecutionLayer.start_session.
-                _load = msg.get("load")
-                if isinstance(_load, dict):
-                    conn.load = _load
-                _active = msg.get("active_sessions")
-                if isinstance(_active, int):
-                    conn.reported_sessions = _active
-                # ``online`` + ``last_seen`` → the persister, coalesced to one
-                # write per machine per HEARTBEAT_PERSIST_INTERVAL_S (or at
-                # once on a transition). NEVER a synchronous commit here: this
-                # branch runs every 20 s per satellite on the event loop.
-                self._maybe_persist_heartbeat(conn)
-            # Respond with pong
-            await self.send_fire_and_forget(machine_id, {"type": "pong"})
+    async def _frame_heartbeat(self, machine_id: str, msg: dict) -> None:
+        conn = self._connections.get(machine_id)
+        if conn:
+            conn.last_heartbeat = time.monotonic()
+            conn.last_seen_iso = _iso_now()
+            # Measure the signed clock offset (proxy_utc − satellite_utc) so the
+            # file-sync merge can adjust the satellite's epoch mtimes into the
+            # proxy clock before ordering a divergence. Best-effort; epoch mtime
+            # is timezone-immune, so this only corrects genuine wall-clock skew.
+            _ts = msg.get("timestamp")
+            if _ts:
+                try:
+                    from datetime import datetime, timezone
+                    _sat = datetime.fromisoformat(_ts)
+                    if _sat.tzinfo is None:
+                        _sat = _sat.replace(tzinfo=timezone.utc)
+                    conn.clock_offset = (
+                        datetime.now(timezone.utc) - _sat
+                    ).total_seconds()
+                except (ValueError, TypeError):
+                    pass
+            # Record the latest per-agent STAT fingerprints. Seed the
+            # synced baseline on FIRST sight (setdefault) WITHOUT a merge —
+            # initial catch-up is reconnect-sync / session-start's job; the
+            # periodic sweep only fires on SUBSEQUENT changes. After a proxy
+            # restart the baseline re-seeds here, so there's no merge burst.
+            _fps = msg.get("agent_fingerprints")
+            if isinstance(_fps, dict):
+                for _slug, _fp in _fps.items():
+                    if isinstance(_slug, str) and isinstance(_fp, str):
+                        conn.agent_fingerprints[_slug] = _fp
+                        conn.synced_fingerprints.setdefault(_slug, _fp)
+            # Store per-satellite load + live session count (the proxy
+            # otherwise discards these). Authoritative for the admin display +
+            # the soft capacity pre-check in RemoteExecutionLayer.start_session.
+            _load = msg.get("load")
+            if isinstance(_load, dict):
+                conn.load = _load
+            _active = msg.get("active_sessions")
+            if isinstance(_active, int):
+                conn.reported_sessions = _active
+            # ``online`` + ``last_seen`` → the persister, coalesced to one
+            # write per machine per HEARTBEAT_PERSIST_INTERVAL_S (or at
+            # once on a transition). NEVER a synchronous commit here: this
+            # branch runs every 20 s per satellite on the event loop.
+            self._maybe_persist_heartbeat(conn)
+        # Respond with pong
+        await self.send_fire_and_forget(machine_id, {"type": "pong"})
 
-        elif msg_type == "session_event":
-            session_id = msg.get("session_id", "")
+    async def _frame_session_event(self, machine_id: str, msg: dict) -> None:
+        session_id = msg.get("session_id", "")
+        conn = self._connections.get(machine_id)
+        if conn:
+            queue = conn.session_queues.get(session_id)
+            if queue:
+                try:
+                    queue.put_nowait(msg.get("event", {}))
+                except asyncio.QueueFull:
+                    logger.warning(
+                        "Satellite %s session %s queue full",
+                        machine_id[:8], session_id[:8],
+                    )
+
+    async def _frame_pty_output(self, machine_id: str, msg: dict) -> None:
+        # Interactive remote PTY: rendered bytes from
+        # the satellite-hosted TUI → the RemotePtyProcess, which fans them out
+        # to the dashboard viewer + scrollback. Routed by (machine_id,
+        # session_id) — NOT the lossy session_event queue (a dropped byte
+        # would corrupt the xterm). base64 keeps raw control bytes intact.
+        import base64 as _b64
+
+        from core.remote import remote_pty
+        try:
+            _data = _b64.b64decode(msg.get("data_b64", "") or "")
+        except (ValueError, TypeError):
+            _data = b""
+        if _data:
+            remote_pty.feed_output(machine_id, msg.get("session_id", ""), _data)
+
+    async def _frame_pty_exit(self, machine_id: str, msg: dict) -> None:
+        # The satellite-hosted interactive PTY process ended → fire the
+        # InteractiveSession's on_exit (dashboard reverts to the rich view +
+        # primes a resume).
+        from core.remote import remote_pty
+        remote_pty.feed_exit(
+            machine_id, msg.get("session_id", ""), msg.get("code"),
+        )
+
+    async def _frame_pty_alive(self, machine_id: str, msg: dict) -> None:
+        # Right after (re)auth the satellite reports the session ids
+        # of its still-live interactive PTYs (empty on a fresh connect).
+        # Reconcile against our grace-held handles — re-adopt the survivors,
+        # exit the ones whose child died, and close the orphans we no longer
+        # want (kills the reverse-orphan, also covers a proxy restart).
+        await self._reconcile_ptys(
+            machine_id, msg.get("session_ids", []) or [],
+        )
+
+    async def _frame_sessions_alive(self, machine_id: str, msg: dict) -> None:
+        # Headless twin of pty_alive: live CLI sessions + in-flight turn
+        # state, and (0.5.138) every other headless session the satellite
+        # holds (``other_sessions``; None when an older satellite sends no
+        # such list). Routed to the run-recovery callback (registered at
+        # startup) so a restarted proxy re-adopts running turns instead
+        # of failing them blind (Mode C). Absent callback → old behavior.
+        cb = self._sessions_alive_callback
+        if cb is not None:
+            others = msg.get("other_sessions")
+            spawn(cb(machine_id, msg.get("sessions") or [],
+                   others if isinstance(others, list) else None),
+                  name="sessions_alive", owner="satellite_connection")
+
+    async def _frame_transcript_lines(self, machine_id: str, msg: dict) -> None:
+        # Interactive remote PTY: the satellite
+        # tailed this session's transcript JSONL and forwarded new lines → the
+        # InteractiveSession persists them to chat_messages via the SAME tailer
+        # parser used for local sessions (no on-disk mirror). Routed by
+        # session_id (the proxy's InteractiveSession id), not the machine.
+        from core.session import interactive_session
+        _isess = interactive_session.get(msg.get("session_id", "") or "")
+        # Only the satellite that actually owns this interactive session may
+        # feed its transcript — otherwise a compromised satellite could
+        # inject forged chat lines into another machine's session by id.
+        if _isess is not None and _isess.target == machine_id:
+            _isess.feed_transcript_lines(msg.get("lines") or [])
+        elif _isess is not None:
+            logger.warning(
+                "Dropping transcript_lines for session %s from machine %s "
+                "(owned by %s)",
+                (msg.get("session_id") or "")[:8], machine_id[:8],
+                (_isess.target or "")[:8],
+            )
+
+    async def _frame_pty_inject_result(self, machine_id: str, msg: dict) -> None:
+        # Server-prompt injection ACK/NACK from the satellite (the
+        # delegation-delivery PTY rung for otodock-attached sessions). Same
+        # owner check as transcript_lines — only the owning satellite may
+        # resolve an in-flight injection.
+        from core.session import interactive_session
+        _isess = interactive_session.get(msg.get("session_id", "") or "")
+        if _isess is not None and _isess.target == machine_id:
+            _isess.handle_inject_result(
+                str(msg.get("inject_id", "")),
+                bool(msg.get("ok")),
+                str(msg.get("reason", "") or ""),
+            )
+        elif _isess is not None:
+            logger.warning(
+                "Dropping pty_inject_result for session %s from machine %s "
+                "(owned by %s)",
+                (msg.get("session_id") or "")[:8], machine_id[:8],
+                (_isess.target or "")[:8],
+            )
+
+    async def _frame_session_started(self, machine_id: str, msg: dict) -> None:
+        session_id = msg.get("session_id", "")
+        logger.info(
+            "Satellite %s: session %s started (pid=%s, path=%s)",
+            machine_id[:8], session_id[:8],
+            msg.get("pid"), msg.get("execution_path"),
+        )
+
+    async def _frame_session_ended(self, machine_id: str, msg: dict) -> None:
+        session_id = msg.get("session_id", "")
+        conn = self._connections.get(machine_id)
+        if conn:
+            queue = conn.session_queues.get(session_id)
+            if queue:
+                queue.put_nowait(None)  # sentinel
+        logger.info(
+            "Satellite %s: session %s ended (exit=%s)",
+            machine_id[:8], session_id[:8], msg.get("exit_code"),
+        )
+
+    async def _frame_session_aborted(self, machine_id: str, msg: dict) -> None:
+        # Satellite confirms the abort is fully complete. Only a HARD
+        # abort (which armed the ack via arm_abort_acked before sending)
+        # drains here: its producer is being cancelled, so events the
+        # dying CLI flushed during the kill window would otherwise leak
+        # into the next (auto-resumed) turn. A GRACEFUL codex abort also
+        # acks (the satellite always acks ``abort``), but its producer is
+        # ALIVE and consuming the closing turn's tail — draining would
+        # steal the terminal turn event and strand it, so skip. (A late
+        # hard-abort ack past wait_abort_acked's timeout also skips; the
+        # next turn's start-of-turn drain in send_message covers it.)
+        session_id = msg.get("session_id", "")
+        armed = (machine_id, session_id) in self._abort_acked_events
+        drained = 0
+        if armed:
             conn = self._connections.get(machine_id)
             if conn:
                 queue = conn.session_queues.get(session_id)
                 if queue:
-                    try:
-                        queue.put_nowait(msg.get("event", {}))
-                    except asyncio.QueueFull:
-                        logger.warning(
-                            "Satellite %s session %s queue full",
-                            machine_id[:8], session_id[:8],
-                        )
+                    while True:
+                        try:
+                            queue.get_nowait()
+                            drained += 1
+                        except asyncio.QueueEmpty:
+                            break
+        self._signal_abort_acked(machine_id, session_id)
+        logger.info(
+            "Satellite %s: session %s abort confirmed (%s)",
+            machine_id[:8], session_id[:8],
+            (f"drained {drained} stale events" if armed
+             else "graceful — queue left to the live producer"),
+        )
 
-        elif msg_type == "pty_output":
-            # Interactive remote PTY: rendered bytes from
-            # the satellite-hosted TUI → the RemotePtyProcess, which fans them out
-            # to the dashboard viewer + scrollback. Routed by (machine_id,
-            # session_id) — NOT the lossy session_event queue (a dropped byte
-            # would corrupt the xterm). base64 keeps raw control bytes intact.
-            import base64 as _b64
-            from core.remote import remote_pty
+    async def _frame_turn_ended(self, machine_id: str, msg: dict) -> None:
+        # Satellite finished the current turn (stdout read loop exited
+        # normally or stop_turn command was processed). Inject a marker
+        # so RemoteExecutionLayer.send_message can yield DONE and return.
+        # ``command_id`` is echoed by the satellite so the layer can
+        # filter out a turn_ended from a previous turn whose late
+        # file-scan delivered after the proxy's drain timeout (otherwise
+        # the stale marker would terminate the next turn prematurely).
+        session_id = msg.get("session_id", "")
+        conn = self._connections.get(machine_id)
+        if conn:
+            queue = conn.session_queues.get(session_id)
+            if queue:
+                try:
+                    queue.put_nowait({
+                        "type": "_turn_ended",
+                        "command_id": msg.get("command_id", ""),
+                    })
+                except asyncio.QueueFull:
+                    # Dropping the marker stalls the turn until the drain
+                    # timeout — leave a trace so it isn't a silent hang.
+                    logger.warning(
+                        "turn_ended marker dropped (queue full) for "
+                        "session=%s machine=%s", session_id, machine_id,
+                    )
+
+    async def _frame_codex_thread_id(self, machine_id: str, msg: dict) -> None:
+        # The satellite reported the engine's RESUME HANDLE for a session
+        # (the frame type is Codex's own wire vocabulary — frozen; the
+        # marker it becomes on the session queue is the generic one every
+        # engine's remote adapter records through
+        # ``remote_turn.record_resume_handle`` and persists on its first
+        # turn).
+        session_id = msg.get("session_id", "")
+        handle = msg.get("thread_id", "")
+        if session_id and handle:
+            conn = self._connections.get(machine_id)
+            if conn:
+                queue = conn.session_queues.get(session_id)
+                if queue:
+                    queue.put_nowait({
+                        "type": "_resume_handle",
+                        "handle": handle,
+                    })
+
+    async def _frame_file_changed(self, machine_id: str, msg: dict) -> None:
+        # Apply the change to the platform's agent_dir so the dashboard
+        # workspace listing reflects what the satellite agent did.
+        # Large files (>1 MB) are sent without `content_b64` — the
+        # satellite already wrote them; we issue a pull to fetch the body.
+        # Admitted, bounded and shed in the mixin; never one task per
+        # frame with nothing above it.
+        self._dispatch_file_changed(machine_id, msg)
+
+    async def _frame_file_manifest(self, machine_id: str, msg: dict) -> None:
+        self._on_manifest_frame(machine_id, msg)
+
+    async def _frame_file_content(self, machine_id: str, msg: dict) -> None:
+        conn = self._connections.get(machine_id)
+        if conn is not None:
+            conn.last_transfer_at = time.monotonic()
+        request_id = msg.get("request_id", "")
+        st = self._pending_pulls.get(request_id)
+        # Only the machine a pull went to answers it.
+        if st is not None and st.machine_id == machine_id:
+            self._on_pull_chunk(st, msg)
+
+    async def _frame_mcp_install_progress(self, machine_id: str, msg: dict) -> None:
+        # Satellite streaming install progress during a sync_mcps batch.
+        # Delivered to any registered per-command callback (mcp_sync
+        # keeps one keyed by command_id); remote_session_start turns them
+        # into the dashboard's install_progress frames.
+        command_id = msg.get("command_id", "")
+        cb = self._install_progress_cbs.get(command_id)
+        logger.info(
+            "satellite mcp_install_progress RECEIVED: cmd=%s mcp=%s phase=%s pct=%s cb_match=%s registered_cmds=%d",
+            command_id[:8], msg.get("mcp", "-"), msg.get("phase", "-"),
+            msg.get("pct", "-"), "YES" if cb is not None else "NO",
+            len(self._install_progress_cbs),
+        )
+        if cb is not None:
             try:
-                _data = _b64.b64decode(msg.get("data_b64", "") or "")
+                r = cb(msg)
+                if asyncio.iscoroutine(r):
+                    await r
             except Exception:
-                _data = b""
-            if _data:
-                remote_pty.feed_output(machine_id, msg.get("session_id", ""), _data)
+                logger.exception("install progress cb raised")
 
-        elif msg_type == "pty_exit":
-            # The satellite-hosted interactive PTY process ended → fire the
-            # InteractiveSession's on_exit (dashboard reverts to the rich view +
-            # primes a resume).
-            from core.remote import remote_pty
-            remote_pty.feed_exit(
-                machine_id, msg.get("session_id", ""), msg.get("code"),
-            )
+    async def _frame_step_output(self, machine_id: str, msg: dict) -> None:
+        # A running app step's output (APPS.md "Steps"): to the callback
+        # app_steps registered for the command; nothing else keeps it.
+        cb = self._step_output_cbs.get(msg.get("command_id", ""))
+        if cb is not None:
+            try:
+                r = cb(str(msg.get("text") or ""))
+                if asyncio.iscoroutine(r):
+                    await r
+            except Exception:
+                logger.exception("step output cb raised")
 
-        elif msg_type == "pty_alive":
-            # Right after (re)auth the satellite reports the session ids
-            # of its still-live interactive PTYs (empty on a fresh connect).
-            # Reconcile against our grace-held handles — re-adopt the survivors,
-            # exit the ones whose child died, and close the orphans we no longer
-            # want (kills the reverse-orphan, also covers a proxy restart).
-            await self._reconcile_ptys(
-                machine_id, msg.get("session_ids", []) or [],
-            )
+    async def _frame_http_request(self, machine_id: str, msg: dict) -> None:
+        # HTTP-over-WS tunnel: subprocess on satellite wants to call a
+        # platform-internal endpoint. Dispatch via httpx loopback.
+        from core.remote.satellite_http_tunnel import get_dispatcher
+        await get_dispatcher().handle_request_frame(self, machine_id, msg)
 
-        elif msg_type == "sessions_alive":
-            # Headless twin of pty_alive: live CLI sessions + in-flight turn
-            # state, and (0.5.138) every other headless session the satellite
-            # holds (``other_sessions``; None when an older satellite sends no
-            # such list). Routed to the run-recovery callback (registered at
-            # startup) so a restarted proxy re-adopts running turns instead
-            # of failing them blind (Mode C). Absent callback → old behavior.
-            cb = self._sessions_alive_callback
-            if cb is not None:
-                others = msg.get("other_sessions")
-                spawn(cb(machine_id, msg.get("sessions") or [],
-                       others if isinstance(others, list) else None),
-                      name="sessions_alive", owner="satellite_connection")
+    async def _frame_http_request_chunk(self, machine_id: str, msg: dict) -> None:
+        # Continuation of a streamed request body for an open tunnel
+        # stream. Synchronous queue put (no upstream call).
+        from core.remote.satellite_http_tunnel import get_dispatcher
+        get_dispatcher().handle_request_chunk(machine_id, msg)
 
-        elif msg_type == "transcript_lines":
-            # Interactive remote PTY: the satellite
-            # tailed this session's transcript JSONL and forwarded new lines → the
-            # InteractiveSession persists them to chat_messages via the SAME tailer
-            # parser used for local sessions (no on-disk mirror). Routed by
-            # session_id (the proxy's InteractiveSession id), not the machine.
-            from core.session import interactive_session
-            _isess = interactive_session.get(msg.get("session_id", "") or "")
-            # Only the satellite that actually owns this interactive session may
-            # feed its transcript — otherwise a compromised satellite could
-            # inject forged chat lines into another machine's session by id.
-            if _isess is not None and _isess.target == machine_id:
-                _isess.feed_transcript_lines(msg.get("lines") or [])
-            elif _isess is not None:
-                logger.warning(
-                    "Dropping transcript_lines for session %s from machine %s "
-                    "(owned by %s)",
-                    (msg.get("session_id") or "")[:8], machine_id[:8],
-                    (_isess.target or "")[:8],
-                )
+    async def _frame_http_abort(self, machine_id: str, msg: dict) -> None:
+        # 0.5.115+: the satellite's local client (hook script / MCP
+        # client) went away mid-stream — close our upstream now instead
+        # of holding it until the idle sweep.
+        from core.remote.satellite_http_tunnel import get_dispatcher
+        get_dispatcher().abort_stream(machine_id, str(msg.get("stream_id", "")))
 
-        elif msg_type == "pty_inject_result":
-            # Server-prompt injection ACK/NACK from the satellite (the
-            # delegation-delivery PTY rung for otodock-attached sessions). Same
-            # owner check as transcript_lines — only the owning satellite may
-            # resolve an in-flight injection.
-            from core.session import interactive_session
-            _isess = interactive_session.get(msg.get("session_id", "") or "")
-            if _isess is not None and _isess.target == machine_id:
-                _isess.handle_inject_result(
-                    str(msg.get("inject_id", "")),
-                    bool(msg.get("ok")),
-                    str(msg.get("reason", "") or ""),
-                )
-            elif _isess is not None:
-                logger.warning(
-                    "Dropping pty_inject_result for session %s from machine %s "
-                    "(owned by %s)",
-                    (msg.get("session_id") or "")[:8], machine_id[:8],
-                    (_isess.target or "")[:8],
-                )
+    async def _frame_local_session_open(self, machine_id: str, msg: dict) -> None:
+        # otodock-CLI: a satellite-initiated request to open an interactive
+        # session (the user ran `otodock` on the machine). Identity is
+        # re-derived from THIS machine's owner binding — never the frame.
+        spawn(self._handle_local_session_open(machine_id, msg),
+              name="handle_local_session_open", owner="satellite_connection")
 
-        elif msg_type == "session_started":
-            session_id = msg.get("session_id", "")
-            logger.info(
-                "Satellite %s: session %s started (pid=%s, path=%s)",
-                machine_id[:8], session_id[:8],
-                msg.get("pid"), msg.get("execution_path"),
-            )
+    async def _frame_local_session_list(self, machine_id: str, msg: dict) -> None:
+        # otodock-CLI --resume: list the owner's resumable chats for an agent.
+        spawn(self._handle_local_session_list(machine_id, msg),
+              name="handle_local_session_list", owner="satellite_connection")
 
-        elif msg_type == "session_ended":
-            session_id = msg.get("session_id", "")
-            conn = self._connections.get(machine_id)
-            if conn:
-                queue = conn.session_queues.get(session_id)
-                if queue:
-                    queue.put_nowait(None)  # sentinel
-            logger.info(
-                "Satellite %s: session %s ended (exit=%s)",
-                machine_id[:8], session_id[:8], msg.get("exit_code"),
-            )
+    async def _frame_local_session_detached(self, machine_id: str, msg: dict) -> None:
+        # The local `otodock` terminal disconnected — drop the idle-reaper
+        # exemption (the PTY stays alive; the chat is dashboard-resumable).
+        from core.session import otodock_session
+        otodock_session.detach_local_session(msg.get("session_id", ""))
 
-        elif msg_type == "session_aborted":
-            # Satellite confirms the abort is fully complete. Only a HARD
-            # abort (which armed the ack via arm_abort_acked before sending)
-            # drains here: its producer is being cancelled, so events the
-            # dying CLI flushed during the kill window would otherwise leak
-            # into the next (auto-resumed) turn. A GRACEFUL codex abort also
-            # acks (the satellite always acks ``abort``), but its producer is
-            # ALIVE and consuming the closing turn's tail — draining would
-            # steal the terminal turn event and strand it, so skip. (A late
-            # hard-abort ack past wait_abort_acked's timeout also skips; the
-            # next turn's start-of-turn drain in send_message covers it.)
-            session_id = msg.get("session_id", "")
-            armed = (machine_id, session_id) in self._abort_acked_events
-            drained = 0
-            if armed:
-                conn = self._connections.get(machine_id)
-                if conn:
-                    queue = conn.session_queues.get(session_id)
-                    if queue:
-                        while True:
-                            try:
-                                queue.get_nowait()
-                                drained += 1
-                            except asyncio.QueueEmpty:
-                                break
-            self._signal_abort_acked(machine_id, session_id)
-            logger.info(
-                "Satellite %s: session %s abort confirmed (%s)",
-                machine_id[:8], session_id[:8],
-                (f"drained {drained} stale events" if armed
-                 else "graceful — queue left to the live producer"),
-            )
-
-        elif msg_type == "turn_ended":
-            # Satellite finished the current turn (stdout read loop exited
-            # normally or stop_turn command was processed). Inject a marker
-            # so RemoteExecutionLayer.send_message can yield DONE and return.
-            # ``command_id`` is echoed by the satellite so the layer can
-            # filter out a turn_ended from a previous turn whose late
-            # file-scan delivered after the proxy's drain timeout (otherwise
-            # the stale marker would terminate the next turn prematurely).
-            session_id = msg.get("session_id", "")
-            conn = self._connections.get(machine_id)
-            if conn:
-                queue = conn.session_queues.get(session_id)
-                if queue:
-                    try:
-                        queue.put_nowait({
-                            "type": "_turn_ended",
-                            "command_id": msg.get("command_id", ""),
-                        })
-                    except asyncio.QueueFull:
-                        # Dropping the marker stalls the turn until the drain
-                        # timeout — leave a trace so it isn't a silent hang.
-                        logger.warning(
-                            "turn_ended marker dropped (queue full) for "
-                            "session=%s machine=%s", session_id, machine_id,
-                        )
-
-        elif msg_type == "codex_thread_id":
-            # The satellite reported the engine's RESUME HANDLE for a session
-            # (the frame type is Codex's own wire vocabulary — frozen; the
-            # marker it becomes on the session queue is the generic one every
-            # engine's remote adapter records through
-            # ``remote_turn.record_resume_handle`` and persists on its first
-            # turn).
-            session_id = msg.get("session_id", "")
-            handle = msg.get("thread_id", "")
-            if session_id and handle:
-                conn = self._connections.get(machine_id)
-                if conn:
-                    queue = conn.session_queues.get(session_id)
-                    if queue:
-                        queue.put_nowait({
-                            "type": "_resume_handle",
-                            "handle": handle,
-                        })
-
-        elif msg_type == "file_changed":
-            # Apply the change to the platform's agent_dir so the dashboard
-            # workspace listing reflects what the satellite agent did.
-            # Large files (>1 MB) are sent without `content_b64` — the
-            # satellite already wrote them; we issue a pull to fetch the body.
-            # Admitted, bounded and shed in the mixin; never one task per
-            # frame with nothing above it.
-            self._dispatch_file_changed(machine_id, msg)
-
-        elif msg_type == "file_manifest":
-            self._on_manifest_frame(machine_id, msg)
-
-        elif msg_type == "file_content":
-            conn = self._connections.get(machine_id)
-            if conn is not None:
-                conn.last_transfer_at = time.monotonic()
-            request_id = msg.get("request_id", "")
-            st = self._pending_pulls.get(request_id)
-            if st is not None:
-                self._on_pull_chunk(st, msg)
-
-        elif msg_type == "mcp_install_progress":
-            # Satellite streaming install progress during a sync_mcps batch.
-            # Delivered to any registered per-command callback (mcp_sync
-            # keeps one keyed by command_id); remote_session_start turns them
-            # into the dashboard's install_progress frames.
-            command_id = msg.get("command_id", "")
-            cb = self._install_progress_cbs.get(command_id)
-            logger.info(
-                "satellite mcp_install_progress RECEIVED: cmd=%s mcp=%s phase=%s pct=%s cb_match=%s registered_cmds=%d",
-                command_id[:8], msg.get("mcp", "-"), msg.get("phase", "-"),
-                msg.get("pct", "-"), "YES" if cb is not None else "NO",
-                len(self._install_progress_cbs),
-            )
-            if cb is not None:
-                try:
-                    r = cb(msg)
-                    if asyncio.iscoroutine(r):
-                        await r
-                except Exception:
-                    logger.exception("install progress cb raised")
-
-        elif msg_type == "step_output":
-            # A running app step's output (APPS.md "Steps"): to the callback
-            # app_steps registered for the command; nothing else keeps it.
-            cb = self._step_output_cbs.get(msg.get("command_id", ""))
-            if cb is not None:
-                try:
-                    r = cb(str(msg.get("text") or ""))
-                    if asyncio.iscoroutine(r):
-                        await r
-                except Exception:
-                    logger.exception("step output cb raised")
-
-        elif msg_type == "http_request":
-            # HTTP-over-WS tunnel: subprocess on satellite wants to call a
-            # platform-internal endpoint. Dispatch via httpx loopback.
-            from core.remote.satellite_http_tunnel import get_dispatcher
-            await get_dispatcher().handle_request_frame(self, machine_id, msg)
-
-        elif msg_type == "http_request_chunk":
-            # Continuation of a streamed request body for an open tunnel
-            # stream. Synchronous queue put (no upstream call).
-            from core.remote.satellite_http_tunnel import get_dispatcher
-            get_dispatcher().handle_request_chunk(machine_id, msg)
-
-        elif msg_type == "http_abort":
-            # 0.5.115+: the satellite's local client (hook script / MCP
-            # client) went away mid-stream — close our upstream now instead
-            # of holding it until the idle sweep.
-            from core.remote.satellite_http_tunnel import get_dispatcher
-            get_dispatcher().abort_stream(machine_id, str(msg.get("stream_id", "")))
-
-        elif msg_type == "local_session_open":
-            # otodock-CLI: a satellite-initiated request to open an interactive
-            # session (the user ran `otodock` on the machine). Identity is
-            # re-derived from THIS machine's owner binding — never the frame.
-            spawn(self._handle_local_session_open(machine_id, msg),
-                  name="handle_local_session_open", owner="satellite_connection")
-
-        elif msg_type == "local_session_list":
-            # otodock-CLI --resume: list the owner's resumable chats for an agent.
-            spawn(self._handle_local_session_list(machine_id, msg),
-                  name="handle_local_session_list", owner="satellite_connection")
-
-        elif msg_type == "local_session_detached":
-            # The local `otodock` terminal disconnected — drop the idle-reaper
-            # exemption (the PTY stays alive; the chat is dashboard-resumable).
-            from core.session import otodock_session
-            otodock_session.detach_local_session(msg.get("session_id", ""))
 
     # --- Heartbeat monitor ---
 
@@ -2345,10 +2493,10 @@ class SatelliteConnectionManager(
                     "Satellite %s: no heartbeat for 5min, disconnecting",
                     machine_id[:8],
                 )
-                conn = self._connections.get(machine_id)
-                if conn:
+                gone = self._connections.get(machine_id)
+                if gone:
                     with contextlib.suppress(Exception):
-                        await conn.ws.close(
+                        await gone.ws.close(
                             code=4003, reason="Heartbeat timeout"
                         )
                 await self.deregister(machine_id)

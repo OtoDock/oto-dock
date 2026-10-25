@@ -1,0 +1,206 @@
+{
+ "offsets": {},
+ "pending": [],
+ "rebuilds": [
+  "chat-char-1"
+ ],
+ "registry": {
+  "completed": [],
+  "has_pending": false,
+  "spawned": []
+ },
+ "results": [
+  {
+   "assistant_chars": 236,
+   "compacted": false,
+   "last_message": "I listed the workspace, wrote one line to `c9p1-note.txt`, and printed it back. I displayed the Example link and marked all three plan items complete.",
+   "last_signal": "end_turn",
+   "last_signal_at": 1792188572.991,
+   "persisted": 4,
+   "question_pending": false,
+   "title_set": true,
+   "tool_rows": 2,
+   "turn_complete": true,
+   "usage_rows": 1
+  }
+ ],
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "I’ll list the workspace, write and read back the note, then display the Example link.\n",
+   "role": "assistant",
+   "sync_search": false
+  },
+  {
+   "event_data": {
+    "active": false,
+    "is_error": false,
+    "name": "exec",
+    "result_summary": "ok",
+    "summary": "text(await tools.update_plan({plan:[{step:\"List the workspace folder.\",status:\"in_progress\"},{step:\"...",
+    "tool_id": "call_c92a140c544a447d8f6de9f812e117a0",
+    "tool_input": {
+     "input": "text(await tools.update_plan({plan:[{step:\"List the workspace folder.\",status:\"in_progress\"},{step:\"Write and print c9p1-note.txt.\",status:\"pending\"},{step:\"Display the Example link.\",status:\"pending\"}]}));\ntext(await tools.exec_command({cmd:\"ls -la /users/dev-admin/workspace/\",\"max_output_tokens\":2000}));\ntext(await tools.update_plan({plan:[{step:\"List the workspace folder.\",status:\"completed\"},{step:\"Write and print c9p1-note.txt.\",status:\"in_progress\"},{step:\"Display the Example link.\",status:\"pending\"}]}));\ntext(ALL_TOOLS.filter(x=>/send_url$/.test(x.name)));\n"
+    },
+    "tool_result": "[{\"type\": \"input_text\", \"text\": \"Script completed\\nWall time 0.7 seconds\\nOutput:\\n\"}, {\"type\": \"input_text\", \"text\": \"{}\"}, {\"type\": \"input_text\", \"text\": \"{\\\"chunk_id\\\":\\\"cd6cf7\\\",\\\"wall_time_seconds\\\":0.00006089,\\\"exit_code\\\":0,\\\"original_token_count\\\":580,\\\"output\\\":\\\"total 5064\\\\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\\\\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\\\\n-rw-r--r-- 1 person person    9042 Oct 10 07:14 sample-sales-workbook-2026-h1.xlsx\\\\ndrwxr-xr-x 2 person person    4096 Sep 28 08:31 apps\\\\n-rw-rw-r-- 1 person person 4509904 [\\u2026]\"}, {\"type\": \"input_text\", \"text\": \"{}\"}, {\"type\": \"input_text\", \"text\": \"[{\\\"name\\\":\\\"mcp__display__send_url\\\",\\\"description\\\":\\\"Send a clickable link to the user's chat. Use this to share URLs that the user should open in their browser (e.g. Nextcloud share links, web pages, dashboards).\\\\n\\\\nexec tool declaration:\\\\n```ts\\\\ndeclare const tools: { mcp__display__send_url(args: {\\\\n  // Optional description shown below the title.\\\\n  description?: string;\\\\n  // Link title displayed  [\\u2026]\"}]",
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "active": false,
+    "is_error": false,
+    "name": "exec",
+    "result_summary": "ok",
+    "summary": "text(await tools.exec_command({cmd:\"printf '%s\\\\n' 'Completed the workspace note.' > /users/dev-admi...",
+    "tool_id": "call_706dee526d2d462097c630322c2b6bfb",
+    "tool_input": {
+     "input": "text(await tools.exec_command({cmd:\"printf '%s\\\\n' 'Completed the workspace note.' > /users/dev-admin/workspace/c9p1-note.txt\"}));\ntext(await tools.exec_command({cmd:\"cat /users/dev-admin/workspace/c9p1-note.txt\"}));\ntext(await tools.update_plan({plan:[{step:\"List the workspace folder.\",status:\"completed\"},{step:\"Write and print c9p1-note.txt.\",status:\"completed\"},{step:\"Display the Example link.\",status:\"in_progress\"}]}));\ntext(await tools.mcp__display__send_url({url:\"https://example.com\",title:\"Example\"}));\ntext(await tools.update_plan({plan:[{step:\"List the workspace folder.\",status:\"completed\"},{step:\"Write and print c9p1-note.txt.\",status:\"completed\"},{step:\"Display the Example link.\",status:\"completed\"}]}));\n"
+    },
+    "tool_result": "[{\"type\": \"input_text\", \"text\": \"Script completed\\nWall time 2.8 seconds\\nOutput:\\n\"}, {\"type\": \"input_text\", \"text\": \"{\\\"chunk_id\\\":\\\"d753f8\\\",\\\"wall_time_seconds\\\":0.000037529,\\\"exit_code\\\":0,\\\"original_token_count\\\":0,\\\"output\\\":\\\"\\\"}\"}, {\"type\": \"input_text\", \"text\": \"{\\\"chunk_id\\\":\\\"95440f\\\",\\\"wall_time_seconds\\\":0.000042858,\\\"exit_code\\\":0,\\\"original_token_count\\\":8,\\\"output\\\":\\\"Completed the workspace note.\\\\n\\\"}\"}, {\"type\": \"input_text\", \"text\": \"{}\"}, {\"type\": \"input_text\", \"text\": \"{\\\"content\\\":[{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"Link sent to user: [Example](https://example.com)\\\"}],\\\"isError\\\":false}\"}, {\"type\": \"input_text\", \"text\": \"{}\"}]",
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "I listed the workspace, wrote one line to `c9p1-note.txt`, and printed it back. I displayed the Example link and marked all three plan items complete.",
+   "role": "assistant",
+   "sync_search": false
+  }
+ ],
+ "snapshots": [
+  [
+   {
+    "credits": {
+     "balance": "0",
+     "has_credits": false,
+     "unlimited": false
+    },
+    "individual_limit": null,
+    "limit_id": "codex",
+    "limit_name": null,
+    "plan_type": "plus",
+    "primary": {
+     "resets_at": 1792206560,
+     "used_percent": 0.0,
+     "window_minutes": 300
+    },
+    "rate_limit_reached_type": null,
+    "secondary": {
+     "resets_at": 1792660027,
+     "used_percent": 2.0,
+     "window_minutes": 10080
+    },
+    "spend_control_reached": null
+   },
+   "2026-10-16T22:09:25.353Z"
+  ],
+  [
+   {
+    "credits": {
+     "balance": "0",
+     "has_credits": false,
+     "unlimited": false
+    },
+    "individual_limit": null,
+    "limit_id": "codex",
+    "limit_name": null,
+    "plan_type": "plus",
+    "primary": {
+     "resets_at": 1792206565,
+     "used_percent": 1.0,
+     "window_minutes": 300
+    },
+    "rate_limit_reached_type": null,
+    "secondary": {
+     "resets_at": 1792660027,
+     "used_percent": 3.0,
+     "window_minutes": 10080
+    },
+    "spend_control_reached": null
+   },
+   "2026-10-16T22:09:31.274Z"
+  ],
+  [
+   {
+    "credits": {
+     "balance": "0",
+     "has_credits": false,
+     "unlimited": false
+    },
+    "individual_limit": null,
+    "limit_id": "codex",
+    "limit_name": null,
+    "plan_type": "plus",
+    "primary": {
+     "resets_at": 1792206565,
+     "used_percent": 1.0,
+     "window_minutes": 300
+    },
+    "rate_limit_reached_type": null,
+    "secondary": {
+     "resets_at": 1792660027,
+     "used_percent": 3.0,
+     "window_minutes": 10080
+    },
+    "spend_control_reached": null
+   },
+   "2026-10-16T22:09:32.900Z"
+  ]
+ ],
+ "throttles": [],
+ "titles": [
+  [
+   "u-person",
+   "chat-char-1",
+   "Do these steps in order, all…",
+   "lite"
+  ]
+ ],
+ "tool_records": [
+  [
+   "exec",
+   "call_c92a140c544a447d8f6de9f812e117a0",
+   false,
+   "tailer",
+   []
+  ],
+  [
+   "exec",
+   "call_706dee526d2d462097c630322c2b6bfb",
+   false,
+   "tailer",
+   []
+  ]
+ ],
+ "updates": [
+  {
+   "codex_thread_id": "01a146c3-2376-7940-8aac-dfb3c9d4e4dd"
+  },
+  {
+   "title": "Do these steps in order, all…"
+  }
+ ],
+ "usage": [
+  {
+   "agent": "lite",
+   "cache_read": 56704,
+   "cache_write": 0,
+   "cost_usd": 0.069308,
+   "input_tokens": 29739,
+   "message_count": 1,
+   "model": "gpt-6.1-sol",
+   "output_tokens": 416,
+   "provider": "openai",
+   "scope": "user",
+   "source_id": "chat-char-1",
+   "source_key": "default",
+   "source_type": "chat",
+   "user_sub": "u-person"
+  }
+ ]
+}

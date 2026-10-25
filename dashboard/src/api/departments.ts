@@ -8,8 +8,7 @@
  * SERVER-side — these hooks never filter, they render what they get.
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './auth'
-import { apiJson } from '../lib/http/apiJson'
+import { apiJson, withMessage } from '../lib/http/apiJson'
 import type { AgentRole } from '../lib/permissions'
 import type { DepartmentMode, DepartmentReach } from '../lib/kinds/department'
 
@@ -66,9 +65,9 @@ export const useDepartments = () =>
   useQuery({
     queryKey: ['departments'],
     queryFn: async (): Promise<Department[]> => {
-      const res = await apiFetch('/v1/departments')
-      if (!res.ok) throw new Error('Failed to fetch departments')
-      return (await res.json()).departments ?? []
+      const data = await apiJson<{ departments?: Department[] }>('/v1/departments')
+        .catch(withMessage('Failed to fetch departments'))
+      return data.departments ?? []
     },
     refetchInterval: 60_000,
   })
@@ -90,19 +89,19 @@ export const useDelegationEdges = (enabled = true) =>
   useQuery({
     queryKey: ['delegation-edges-all'],
     queryFn: async (): Promise<DelegationEdge[]> => {
-      const res = await apiFetch('/v1/agents/delegation-edges')
-      if (!res.ok) throw new Error('Failed to fetch delegation edges')
-      return (await res.json()).edges ?? []
+      const data = await apiJson<{ edges?: DelegationEdge[] }>('/v1/agents/delegation-edges')
+        .catch(withMessage('Failed to fetch delegation edges'))
+      return data.edges ?? []
     },
     refetchInterval: 60_000,
     enabled,
   })
 
-const invalidateMapFeeds = (qc: ReturnType<typeof useQueryClient>) => {
-  qc.invalidateQueries({ queryKey: ['departments'] })
-  qc.invalidateQueries({ queryKey: ['agents'] })
-  qc.invalidateQueries({ queryKey: ['delegation-edges-all'] })
-}
+const invalidateMapFeeds = (qc: ReturnType<typeof useQueryClient>) => Promise.all([
+  qc.invalidateQueries({ queryKey: ['departments'] }),
+  qc.invalidateQueries({ queryKey: ['agents'] }),
+  qc.invalidateQueries({ queryKey: ['delegation-edges-all'] }),
+])
 
 export function useCreateDepartment() {
   const qc = useQueryClient()
@@ -113,15 +112,10 @@ export function useCreateDepartment() {
       reach?: DepartmentReach
       levels?: string[]
     }) => {
-      const res = await apiFetch('/v1/departments', {
+      return apiJson<Department>('/v1/departments', {
         method: 'POST',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) {
-        const e = await res.json().catch(() => ({}))
-        throw new Error(e.detail || 'Failed to create department')
-      }
-      return res.json() as Promise<Department>
+      }, 'Failed to create department')
     },
     onSuccess: () => invalidateMapFeeds(qc),
   })
@@ -137,15 +131,10 @@ export function useUpdateDepartment() {
       reach?: DepartmentReach
       position_hint?: string
     }) => {
-      const res = await apiFetch(`/v1/departments/${id}`, {
+      return apiJson<Department>(`/v1/departments/${id}`, {
         method: 'PATCH',
         body: JSON.stringify(fields),
-      })
-      if (!res.ok) {
-        const e = await res.json().catch(() => ({}))
-        throw new Error(e.detail || 'Failed to update department')
-      }
-      return res.json() as Promise<Department>
+      }, 'Failed to update department')
     },
     onSuccess: () => invalidateMapFeeds(qc),
   })
@@ -155,12 +144,7 @@ export function useDeleteDepartment() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ id }: { id: string }) => {
-      const res = await apiFetch(`/v1/departments/${id}`, { method: 'DELETE' })
-      if (!res.ok) {
-        const e = await res.json().catch(() => ({}))
-        throw new Error(e.detail || 'Failed to delete department')
-      }
-      return res.json() as Promise<{ status: string; unassigned_agents: string[] }>
+      return apiJson<{ status: string; unassigned_agents: string[] }>(`/v1/departments/${id}`, { method: 'DELETE' }, 'Failed to delete department')
     },
     onSuccess: () => invalidateMapFeeds(qc),
   })
@@ -174,18 +158,13 @@ export function useSetDepartmentLevels() {
       /** id: '' for a new level; keeping an id preserves assignments. */
       levels: { id: string; name: string }[]
     }) => {
-      const res = await apiFetch(`/v1/departments/${id}/levels`, {
-        method: 'PUT',
-        body: JSON.stringify({ levels }),
-      })
-      if (!res.ok) {
-        const e = await res.json().catch(() => ({}))
-        throw new Error(e.detail || 'Failed to save levels')
-      }
-      return res.json() as Promise<{
+      return apiJson<{
         levels: DepartmentLevel[]
         unassigned_agents: string[]
-      }>
+      }>(`/v1/departments/${id}/levels`, {
+        method: 'PUT',
+        body: JSON.stringify({ levels }),
+      }, 'Failed to save levels')
     },
     onSuccess: () => invalidateMapFeeds(qc),
   })
@@ -201,15 +180,10 @@ export function useAdminAddUserAgent() {
       agent: string
       role?: AgentRole
     }) => {
-      const res = await apiFetch(`/v1/admin/users/${sub}/agents/${agent}`, {
+      return apiJson<{ status: string; agent: string }>(`/v1/admin/users/${sub}/agents/${agent}`, {
         method: 'POST',
         body: JSON.stringify({ role }),
-      })
-      if (!res.ok) {
-        const e = await res.json().catch(() => ({}))
-        throw new Error(e.detail || 'Failed to add agent')
-      }
-      return res.json() as Promise<{ status: string; agent: string }>
+      }, 'Failed to add agent')
     },
     onSuccess: () => invalidateMapFeeds(qc),
   })

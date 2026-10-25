@@ -25,7 +25,9 @@ import os
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+
+from _tool_args import ToolArgs
 
 AGENT = os.environ.get("SCHEDULES_MCP_AGENT", "system-admin")
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
@@ -76,6 +78,31 @@ _LAYER_ARG_SCHEMA = {
         "'claude-code-cli', 'codex-cli', 'direct-llm') — must be enabled for "
         f"{AGENT}. Omit to inherit the agent's default layer. On `edit_task`, "
         "pass \"\" to clear an existing pin."
+    ),
+}
+
+_PERMISSION_MODE_ARG_SCHEMA = {
+    "type": "string",
+    "enum": ["dontAsk", "autoReview"],
+    "default": "dontAsk",
+    "description": (
+        "How the run treats a tool that needs approval. dontAsk (the default): "
+        "every tool runs. autoReview (Auto): reads, file edits and safe tools run, "
+        "anything else is checked by the engine's own reviewer first and refused "
+        "when it cannot be checked. Auto needs Claude Code or Codex."
+    ),
+}
+
+# The machine THIS task's runs use. Validated server-side for the person the
+# runs belong to; the run itself falls back to the default when it is offline.
+_MACHINE_ARG_SCHEMA = {
+    "type": "string",
+    "description": (
+        "OPTIONAL machine for THIS task's runs: one of your own paired machines "
+        "or, for an admin, an admin machine, by its name or id; 'default' (or "
+        "omit) for the agent's default. On edit_task, 'default' clears it. A "
+        "machine that is offline at run time: the run uses the agent's default "
+        "and its record says so."
     ),
 }
 
@@ -169,6 +196,36 @@ def _lane_line(args: dict, cleared: bool = False) -> str:
     return f"Runs on: {', '.join(bits)}" if bits else ""
 
 
+# The word that names the agent's default machine (the proxy's own).
+MACHINE_DEFAULT = "default"
+
+
+_OMITTED = object()   # an argument the call did not name
+
+
+def _is_default_machine(value) -> bool:
+    return (value or "").strip() in ("", MACHINE_DEFAULT)
+
+
+def _machine_line(args: dict, cleared: bool = False) -> str:
+    """One confirmation line for the task's machine, or ''. ``cleared``
+    (edit path) reports an explicit default as the reset it is."""
+    value = args.get("machine", _OMITTED)
+    if value is _OMITTED:
+        return ""
+    if not _is_default_machine(value):
+        return f"Machine: {value}"
+    return "Machine: agent default (cleared)" if cleared else ""
+
+
+def _machine_label(t: dict) -> str:
+    """A task's own machine as the API names it ('' when it runs on the
+    agent's default)."""
+    if not t.get("target_machine"):
+        return ""
+    return t.get("target_machine_label") or t["target_machine"][:8]
+
+
 def _agent_param(args: dict) -> dict:
     """Resolve the ``agent`` arg into query params: default = own agent,
     'all' = no filter (the proxy then returns every accessible agent)."""
@@ -202,6 +259,7 @@ SCOPE_DEFAULT = DEFAULT_SCOPE if DEFAULT_SCOPE in AVAILABLE_SCOPES else AVAILABL
 
 
 server = Server("schedules-mcp")
+TOOL_ARGS = ToolArgs()
 
 
 def _headers() -> dict:
@@ -235,13 +293,14 @@ async def _delete(path: str, headers: dict | None = None) -> dict:
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="create_scheduled_task",
             description=(
                 "Create a recurring task — fire-and-forget only. Read the skill "
                 "`task-scheduling-guide` (Skill tool) before creating a recurring task: "
-                "notification modes, cron vs interval, model pinning, timezone rules. "
+                "notification modes, cron vs interval, model pinning, choosing a machine, "
+                "timezone rules. "
                 "Returns immediately; the task runs on its own schedule in the background. "
                 "No result is returned to this session — use get_task_history to check past runs. "
                 "Use this only for genuinely recurring automation (daily reports, weekly checks, etc.). "
@@ -338,11 +397,14 @@ async def list_tools() -> list[Tool]:
                     },
                     "model": _MODEL_ARG_SCHEMA,
                     "layer": _LAYER_ARG_SCHEMA,
+                    "permission_mode": _PERMISSION_MODE_ARG_SCHEMA,
+                    "machine": _MACHINE_ARG_SCHEMA,
                     "checks": _CHECKS_ARG_SCHEMA,
                     "timezone": _TIMEZONE_ARG_SCHEMA,
                 },
                 "required": ["name", "prompt", "notification_mode"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
         Tool(
             name="create_one_time_task",
@@ -428,11 +490,14 @@ async def list_tools() -> list[Tool]:
                     },
                     "model": _MODEL_ARG_SCHEMA,
                     "layer": _LAYER_ARG_SCHEMA,
+                    "permission_mode": _PERMISSION_MODE_ARG_SCHEMA,
+                    "machine": _MACHINE_ARG_SCHEMA,
                     "checks": _CHECKS_ARG_SCHEMA,
                     "timezone": _TIMEZONE_ARG_SCHEMA,
                 },
                 "required": ["name", "prompt", "notification_mode"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
         Tool(
             name="schedule_continuation",
@@ -505,6 +570,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["prompt"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
         Tool(
             name="run_task",
@@ -539,6 +605,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["task_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
         ),
         Tool(
             name="get_task_result",
@@ -556,6 +623,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["task_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="list_tasks",
@@ -567,7 +635,9 @@ async def list_tools() -> list[Tool]:
                 "<label>]`, plus `via <layer> [pinned layer]` when the engine is "
                 "pinned (`layer default` = only the engine is pinned and its own "
                 "first choice runs); an `[app]` handler row runs no LLM turn and "
-                "shows no model. This is the authoritative read for "
+                "shows no model; `, machine: <name>` when the task runs on its "
+                "own machine instead of the agent's default. This is the "
+                "authoritative read for "
                 "\"what model does this task run on?\" — never assume the default. "
                 "Use this to find a task before "
                 "calling pause_task, resume_task, run_task, or delete_task. "
@@ -579,6 +649,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {"agent": _AGENT_ARG_SCHEMA},
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="get_task",
@@ -588,7 +659,8 @@ async def list_tools() -> list[Tool]:
                 "or the triggers pointing at a trigger-type task), status and "
                 "next run, timeout, notification mode, what its runs execute "
                 "on (model with its capability tier, pinned or default, and "
-                "the layer when one is pinned), warnings when a pin no longer resolves, "
+                "the layer when one is pinned), the machine it runs on when it has "
+                "its own, warnings when a pin no longer resolves, "
                 "run count and limits. The read for \"what does this task do "
                 "and should it run on another model?\": list_tasks never "
                 "shows the prompt and get_task_history only covers tasks that "
@@ -603,6 +675,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["task_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="delete_task",
@@ -618,6 +691,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["task_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
         ),
         Tool(
             name="pause_task",
@@ -634,6 +708,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["task_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
         ),
         Tool(
             name="resume_task",
@@ -650,15 +725,16 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["task_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
         ),
         Tool(
             name="edit_task",
             description=(
                 "Edit a scheduled or one-time task in place — change its "
                 "schedule, run time, name, prompt, notification settings, or "
-                "the model / execution layer its runs use, without deleting "
-                "and recreating it. Model and layer changes apply from the "
-                "next run; the schedule keeps firing exactly as before. "
+                "the model / execution layer / machine its runs use, without "
+                "deleting and recreating it. Model, layer and machine changes "
+                "apply from the next run; the schedule keeps firing exactly as before. "
                 "At least one editable field besides task_id must be provided. "
                 "schedule, interval_seconds, and run_at are mutually exclusive: "
                 "setting one switches the task's mode and automatically clears "
@@ -730,11 +806,14 @@ async def list_tools() -> list[Tool]:
                     },
                     "model": _MODEL_ARG_SCHEMA,
                     "layer": _LAYER_ARG_SCHEMA,
+                    "permission_mode": _PERMISSION_MODE_ARG_SCHEMA,
+                    "machine": _MACHINE_ARG_SCHEMA,
                     "checks": _CHECKS_ARG_SCHEMA,
                     "timezone": _TIMEZONE_ARG_SCHEMA,
                 },
                 "required": ["task_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
         ),
         Tool(
             name="get_task_history",
@@ -745,7 +824,8 @@ async def list_tools() -> list[Tool]:
                 "(the run waited for them up to the task's timeout, then finished "
                 "without their output; the session was kept for them). No prompt "
                 "or output text: get_task_result shows the latest run's output, "
-                "get_task the prompt. Runs are NOT stamped with the model they "
+                "get_task the prompt. Each run names the place it ran on "
+                "(`ran on:`). Runs are NOT stamped with the model they "
                 "executed on — read it from list_tasks or get_task. With `agent`, "
                 "reads another accessible agent's history instead."
             ),
@@ -764,6 +844,7 @@ async def list_tools() -> list[Tool]:
                     "agent": _AGENT_ARG_SCHEMA,
                 },
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="cancel_task_run",
@@ -778,466 +859,520 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["run_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
         ),
+    ])
+
+
+async def _tool_create_scheduled_task(arguments: dict) -> list[TextContent]:
+    if "notification_mode" not in arguments:
+        return [TextContent(
+            type="text",
+            text=(
+                "Error: notification_mode is required. "
+                "Pick 'auto' (system fires generic 'Task Complete'), "
+                "'manual' (task agent fires its own notification with results), "
+                "or 'none' (fully silent)."
+            ),
+        )]
+    has_schedule = bool(arguments.get("schedule"))
+    has_interval = arguments.get("interval_seconds") is not None
+    if has_schedule and has_interval:
+        return [TextContent(
+            type="text",
+            text="Error: provide either `schedule` (cron) OR `interval_seconds` — not both.",
+        )]
+    if not has_schedule and not has_interval:
+        return [TextContent(
+            type="text",
+            text=(
+                "Error: a recurring task needs `schedule` (cron, e.g. '0 9 * * 1-5') "
+                "or `interval_seconds` (e.g. 61200 for every 17 hours). "
+                "Use `interval_seconds` whenever the cadence doesn't divide 24 evenly."
+            ),
+        )]
+    body = {
+        "name": arguments["name"],
+        "agent": AGENT,
+        "prompt": arguments["prompt"],
+        "llm_mode": arguments.get("llm_mode", "cli"),
+        "timeout_seconds": arguments.get("timeout_seconds", 600),
+        "scope": arguments.get("scope") or SCOPE_DEFAULT,
+        "notification_mode": arguments["notification_mode"],
+        "notify_severity": arguments.get("notify_severity", "info"),
+    }
+    for k in ("model", "layer", "machine"):
+        if arguments.get(k):
+            body[k] = arguments[k]
+    if arguments.get("permission_mode"):
+        body["permission_mode"] = arguments["permission_mode"]
+    if arguments.get("checks"):
+        body["checks"] = list(arguments["checks"])
+    if arguments.get("timezone"):
+        body["user_tz"] = arguments["timezone"]
+    if has_schedule:
+        body["schedule"] = arguments["schedule"]
+        timing_line = f"Schedule: {arguments['schedule']}"
+    else:
+        body["interval_seconds"] = arguments["interval_seconds"]
+        timing_line = f"Interval: every {arguments['interval_seconds']}s"
+    result = await _post("/v1/tasks/scheduled", body)
+    return [TextContent(type="text", text="\n".join(x for x in [
+        f"Created scheduled task: {result['task_id']}",
+        timing_line,
+        f"Timezone: {arguments['timezone']}" if arguments.get("timezone") else "",
+        f"Scope: {arguments.get('scope') or SCOPE_DEFAULT}",
+        f"Notification mode: {arguments['notification_mode']}",
+        _lane_line(arguments),
+        _machine_line(arguments),
+        f"Name: {arguments['name']}",
+    ] if x))]
+
+
+async def _tool_create_one_time_task(arguments: dict) -> list[TextContent]:
+    if "notification_mode" not in arguments:
+        return [TextContent(
+            type="text",
+            text=(
+                "Error: notification_mode is required. "
+                "Pick 'auto' (system fires generic 'Task Complete'), "
+                "'manual' (task agent fires its own notification with results), "
+                "or 'none' (fully silent)."
+            ),
+        )]
+    task_type = arguments.get("task_type", "one_time")
+    if task_type == "one_time":
+        if not arguments.get("run_at") and arguments.get("delay_seconds") is None:
+            return [TextContent(
+                type="text",
+                text="Error: one_time tasks require run_at or delay_seconds.",
+            )]
+    elif task_type == "trigger":
+        if arguments.get("run_at") or arguments.get("delay_seconds") is not None:
+            return [TextContent(
+                type="text",
+                text="Error: task_type='trigger' tasks cannot have run_at or delay_seconds; they fire only via webhook triggers.",
+            )]
+    body = {
+        "name": arguments["name"],
+        "agent": AGENT,
+        "prompt": arguments["prompt"],
+        "run_at": arguments.get("run_at"),
+        "delay_seconds": arguments.get("delay_seconds"),
+        "llm_mode": arguments.get("llm_mode", "cli"),
+        "timeout_seconds": arguments.get("timeout_seconds", 600),
+        "scope": arguments.get("scope") or SCOPE_DEFAULT,
+        "notification_mode": arguments["notification_mode"],
+        "notify_severity": arguments.get("notify_severity", "info"),
+        "task_type": task_type,
+    }
+    for k in ("model", "layer", "machine"):
+        if arguments.get(k):
+            body[k] = arguments[k]
+    if arguments.get("permission_mode"):
+        body["permission_mode"] = arguments["permission_mode"]
+    if arguments.get("checks"):
+        body["checks"] = list(arguments["checks"])
+    if arguments.get("timezone"):
+        body["user_tz"] = arguments["timezone"]
+    result = await _post("/v1/tasks/one-time", body)
+    if task_type == "trigger":
+        timing = "on trigger fire"
+    else:
+        timing = (
+            f"at {arguments['run_at']}" if arguments.get("run_at")
+            else f"in {arguments['delay_seconds']}s"
+        )
+    return [TextContent(type="text", text="\n".join(x for x in [
+        f"Created {task_type} task: {result['task_id']}",
+        f"Runs: {timing}",
+        f"Timezone: {arguments['timezone']}" if arguments.get("timezone") else "",
+        _lane_line(arguments),
+        _machine_line(arguments),
+        f"Name: {arguments['name']}",
+    ] if x))]
+
+
+async def _tool_schedule_continuation(arguments: dict) -> list[TextContent]:
+    prompt = arguments.get("prompt", "")
+    if not prompt:
+        return [TextContent(type="text", text="Error: prompt is required.")]
+    one_shot = [k for k in ("at", "in_seconds") if arguments.get(k) is not None]
+    recurring = [k for k in ("repeat_cron", "repeat_interval_seconds")
+                 if arguments.get(k) is not None]
+    if len(one_shot) + len(recurring) != 1:
+        return [TextContent(
+            type="text",
+            text=(
+                "Error: provide exactly ONE timing field — `at` or `in_seconds` "
+                "for a one-shot continuation, `repeat_cron` or "
+                "`repeat_interval_seconds` for a recurring one."
+            ),
+        )]
+    body = {
+        "prompt": prompt,
+        "name": arguments.get("name") or "",
+        "at": arguments.get("at"),
+        "in_seconds": arguments.get("in_seconds"),
+        "repeat_cron": arguments.get("repeat_cron"),
+        "repeat_interval_seconds": arguments.get("repeat_interval_seconds"),
+        "max_runs": arguments.get("max_runs"),
+        "until": arguments.get("until"),
+    }
+    result = await _post("/v1/continuations", body)
+    lines = [
+        f"Continuation scheduled: {result['task_id']}",
+        f"Fires: {result.get('fires', '—')}",
     ]
+    if result.get("max_runs"):
+        lines.append(f"Bounded: max {result['max_runs']} run(s)"
+                     + (f", until {result['until']}" if result.get("until") else ""))
+    lines.append("Cancel any time with delete_task; it auto-cancels if this chat is deleted.")
+    return [TextContent(type="text", text="\n".join(lines))]
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def _tool_run_task(arguments: dict) -> list[TextContent]:
+    task_id = arguments["task_id"]
+    wait = arguments.get("wait", False)
+    timeout_seconds = arguments.get("timeout_seconds", 600)
+
+    r = await _post(f"/v1/tasks/{task_id}/run", {})
+    run_id = r["run_id"]
+
+    if not wait:
+        return [TextContent(
+            type="text",
+            text=f"Task triggered: {task_id}\nRun ID: {run_id}\nRunning in background.",
+        )]
+
+    # Wait for completion via SSE stream. ``final_status`` is the
+    # run's own word from the ``done`` frame (the proxy's run
+    # vocabulary, read as a string over the API) — or this tool's
+    # own WAIT_TIMED_OUT when the wait gave up listening first.
+    url = f"{PROXY_URL}/v1/tasks/runs/{run_id}/stream"
+    output_parts: list[str] = []
+
+    async def _listen() -> str:
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "GET", url,
+                headers=_headers(),
+                # A default is REQUIRED (httpx >= 0.28 raises ValueError
+                # for partial kwargs without one) — the old
+                # Timeout(connect=..., read=...) form crashed wait mode
+                # before the stream ever opened.
+                timeout=httpx.Timeout(
+                    float(timeout_seconds + 30), connect=5.0,
+                ),
+            ) as resp:
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        ev = json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("type") == "status":
+                        if ev.get("status") == "pending":
+                            output_parts.append(
+                                "[queued — waiting for a free task "
+                                "slot]\n"
+                            )
+                    elif ev.get("type") == "text":
+                        output_parts.append(ev.get("text", ""))
+                    elif ev.get("type") == "done":
+                        return ev.get("status", "completed")
+        return "unknown"
+
     try:
-        if name == "create_scheduled_task":
-            if "notification_mode" not in arguments:
-                return [TextContent(
-                    type="text",
-                    text=(
-                        "Error: notification_mode is required. "
-                        "Pick 'auto' (system fires generic 'Task Complete'), "
-                        "'manual' (task agent fires its own notification with results), "
-                        "or 'none' (fully silent)."
-                    ),
-                )]
-            has_schedule = bool(arguments.get("schedule"))
-            has_interval = arguments.get("interval_seconds") is not None
-            if has_schedule and has_interval:
-                return [TextContent(
-                    type="text",
-                    text="Error: provide either `schedule` (cron) OR `interval_seconds` — not both.",
-                )]
-            if not has_schedule and not has_interval:
-                return [TextContent(
-                    type="text",
-                    text=(
-                        "Error: a recurring task needs `schedule` (cron, e.g. '0 9 * * 1-5') "
-                        "or `interval_seconds` (e.g. 61200 for every 17 hours). "
-                        "Use `interval_seconds` whenever the cadence doesn't divide 24 evenly."
-                    ),
-                )]
-            body = {
-                "name": arguments["name"],
-                "agent": AGENT,
-                "prompt": arguments["prompt"],
-                "llm_mode": arguments.get("llm_mode", "cli"),
-                "timeout_seconds": arguments.get("timeout_seconds", 600),
-                "scope": arguments.get("scope") or SCOPE_DEFAULT,
-                "notification_mode": arguments["notification_mode"],
-                "notify_severity": arguments.get("notify_severity", "info"),
-            }
-            for k in ("model", "layer"):
-                if arguments.get(k):
-                    body[k] = arguments[k]
-            if arguments.get("checks"):
-                body["checks"] = list(arguments["checks"])
-            if arguments.get("timezone"):
-                body["user_tz"] = arguments["timezone"]
-            if has_schedule:
-                body["schedule"] = arguments["schedule"]
-                timing_line = f"Schedule: {arguments['schedule']}"
-            else:
-                body["interval_seconds"] = arguments["interval_seconds"]
-                timing_line = f"Interval: every {arguments['interval_seconds']}s"
-            result = await _post("/v1/tasks/scheduled", body)
-            return [TextContent(type="text", text="\n".join(x for x in [
-                f"Created scheduled task: {result['task_id']}",
-                timing_line,
-                f"Timezone: {arguments['timezone']}" if arguments.get("timezone") else "",
-                f"Scope: {arguments.get('scope') or SCOPE_DEFAULT}",
-                f"Notification mode: {arguments['notification_mode']}",
-                _lane_line(arguments),
-                f"Name: {arguments['name']}",
-            ] if x))]
+        # The wall-clock bound: httpx's read timeout is per read, and
+        # the stream's keep-alive every 30 s resets it for the whole run.
+        final_status = await asyncio.wait_for(_listen(), timeout_seconds)
+    except (asyncio.TimeoutError, httpx.ReadTimeout):
+        final_status = WAIT_TIMED_OUT
+    except httpx.HTTPError as e:
+        return [TextContent(
+            type="text",
+            text=(
+                f"Task triggered (run: {run_id}) but the wait stream "
+                f"failed: {e}. The run continues in the background — "
+                f"check get_task_result('{task_id}') later."
+            ),
+        )]
 
-        elif name == "create_one_time_task":
-            if "notification_mode" not in arguments:
-                return [TextContent(
-                    type="text",
-                    text=(
-                        "Error: notification_mode is required. "
-                        "Pick 'auto' (system fires generic 'Task Complete'), "
-                        "'manual' (task agent fires its own notification with results), "
-                        "or 'none' (fully silent)."
-                    ),
-                )]
-            task_type = arguments.get("task_type", "one_time")
-            if task_type == "one_time":
-                if not arguments.get("run_at") and arguments.get("delay_seconds") is None:
-                    return [TextContent(
-                        type="text",
-                        text="Error: one_time tasks require run_at or delay_seconds.",
-                    )]
-            elif task_type == "trigger":
-                if arguments.get("run_at") or arguments.get("delay_seconds") is not None:
-                    return [TextContent(
-                        type="text",
-                        text="Error: task_type='trigger' tasks cannot have run_at or delay_seconds; they fire only via webhook triggers.",
-                    )]
-            body = {
-                "name": arguments["name"],
-                "agent": AGENT,
-                "prompt": arguments["prompt"],
-                "run_at": arguments.get("run_at"),
-                "delay_seconds": arguments.get("delay_seconds"),
-                "llm_mode": arguments.get("llm_mode", "cli"),
-                "timeout_seconds": arguments.get("timeout_seconds", 600),
-                "scope": arguments.get("scope") or SCOPE_DEFAULT,
-                "notification_mode": arguments["notification_mode"],
-                "notify_severity": arguments.get("notify_severity", "info"),
-                "task_type": task_type,
-            }
-            for k in ("model", "layer"):
-                if arguments.get(k):
-                    body[k] = arguments[k]
-            if arguments.get("checks"):
-                body["checks"] = list(arguments["checks"])
-            if arguments.get("timezone"):
-                body["user_tz"] = arguments["timezone"]
-            result = await _post("/v1/tasks/one-time", body)
-            if task_type == "trigger":
-                timing = "on trigger fire"
-            else:
-                timing = (
-                    f"at {arguments['run_at']}" if arguments.get("run_at")
-                    else f"in {arguments['delay_seconds']}s"
-                )
-            return [TextContent(type="text", text="\n".join(x for x in [
-                f"Created {task_type} task: {result['task_id']}",
-                f"Runs: {timing}",
-                f"Timezone: {arguments['timezone']}" if arguments.get("timezone") else "",
-                _lane_line(arguments),
-                f"Name: {arguments['name']}",
-            ] if x))]
+    if final_status == WAIT_TIMED_OUT:
+        return [TextContent(
+            type="text",
+            text=(
+                f"Task {task_id} (run: {run_id}) is still running after {timeout_seconds}s. "
+                f"It continues in the background. Check get_task_result(task_id) later "
+                f"for the result."
+            ),
+        )]
 
-        elif name == "schedule_continuation":
-            prompt = arguments.get("prompt", "")
-            if not prompt:
-                return [TextContent(type="text", text="Error: prompt is required.")]
-            one_shot = [k for k in ("at", "in_seconds") if arguments.get(k) is not None]
-            recurring = [k for k in ("repeat_cron", "repeat_interval_seconds")
-                         if arguments.get(k) is not None]
-            if len(one_shot) + len(recurring) != 1:
-                return [TextContent(
-                    type="text",
-                    text=(
-                        "Error: provide exactly ONE timing field — `at` or `in_seconds` "
-                        "for a one-shot continuation, `repeat_cron` or "
-                        "`repeat_interval_seconds` for a recurring one."
-                    ),
-                )]
-            body = {
-                "prompt": prompt,
-                "name": arguments.get("name") or "",
-                "at": arguments.get("at"),
-                "in_seconds": arguments.get("in_seconds"),
-                "repeat_cron": arguments.get("repeat_cron"),
-                "repeat_interval_seconds": arguments.get("repeat_interval_seconds"),
-                "max_runs": arguments.get("max_runs"),
-                "until": arguments.get("until"),
-            }
-            result = await _post("/v1/continuations", body)
-            lines = [
-                f"Continuation scheduled: {result['task_id']}",
-                f"Fires: {result.get('fires', '—')}",
-            ]
-            if result.get("max_runs"):
-                lines.append(f"Bounded: max {result['max_runs']} run(s)"
-                             + (f", until {result['until']}" if result.get("until") else ""))
-            lines.append("Cancel any time with delete_task; it auto-cancels if this chat is deleted.")
-            return [TextContent(type="text", text="\n".join(lines))]
+    output = "".join(output_parts) or "(no output)"
+    return [TextContent(
+        type="text",
+        text=(
+            f"Task run ended: {task_id} (run: {run_id})\n"
+            f"Status: {final_status}\n\n"
+            f"Output:\n{output}"
+        ),
+    )]
 
-        elif name == "run_task":
-            task_id = arguments["task_id"]
-            wait = arguments.get("wait", False)
-            timeout_seconds = arguments.get("timeout_seconds", 600)
 
-            r = await _post(f"/v1/tasks/{task_id}/run", {})
-            run_id = r["run_id"]
+async def _tool_get_task_result(arguments: dict) -> list[TextContent]:
+    task_id = arguments["task_id"]
+    params: dict = {"task_id": task_id, "limit": 1, **_agent_param(arguments)}
+    result = await _get("/v1/tasks/runs", params=params)
+    runs = result.get("runs", [])
+    if not runs:
+        return [TextContent(type="text", text=f"No runs found for task {task_id}.")]
+    r = runs[0]
+    duration = f"{r['duration_ms']}ms" if r.get("duration_ms") else "—"
+    lines = [
+        f"Task: {task_id}",
+        f"Run: {r['id']}",
+        f"Status: {r['status']}",
+        f"Started: {r.get('started_at', '—')}",
+        f"Completed: {r.get('completed_at', '—')}",
+        f"Duration: {duration}",
+    ]
+    if r.get("error_message"):
+        lines.append(f"Error: {r['error_message']}")
+    if r.get("output_text"):
+        lines.append(f"\nOutput:\n{r['output_text']}")
+    return [TextContent(type="text", text="\n".join(lines))]
 
-            if not wait:
-                return [TextContent(
-                    type="text",
-                    text=f"Task triggered: {task_id}\nRun ID: {run_id}\nRunning in background.",
-                )]
 
-            # Wait for completion via SSE stream. ``final_status`` is the
-            # run's own word from the ``done`` frame (the proxy's run
-            # vocabulary, read as a string over the API) — or this tool's
-            # own WAIT_TIMED_OUT when the wait gave up listening first.
-            url = f"{PROXY_URL}/v1/tasks/runs/{run_id}/stream"
-            output_parts: list[str] = []
+async def _tool_list_tasks(arguments: dict) -> list[TextContent]:
+    result = await _get("/v1/tasks", params=_agent_param(arguments))
+    tasks = result.get("tasks", [])
+    if not tasks:
+        return [TextContent(type="text", text="No tasks found.")]
+    lines = [f"Tasks ({len(tasks)} total):"]
+    for t in tasks:
+        next_run = t.get("next_run_time") or "—"
+        status = "active" if t.get("enabled") else "paused"
+        task_type = t.get("task_type", "task")
+        machine = _machine_label(t)
+        lines.append(
+            f"  [{task_type}] {t['id']} — {t['name']} "
+            f"({t['agent']}, {_fires_info(t)}, {status}, next: {next_run}"
+            f"{_runs_on(t)}{f', machine: {machine}' if machine else ''})"
+        )
+    return [TextContent(type="text", text="\n".join(lines))]
 
-            async def _listen() -> str:
-                async with httpx.AsyncClient() as client:
-                    async with client.stream(
-                        "GET", url,
-                        headers=_headers(),
-                        # A default is REQUIRED (httpx >= 0.28 raises ValueError
-                        # for partial kwargs without one) — the old
-                        # Timeout(connect=..., read=...) form crashed wait mode
-                        # before the stream ever opened.
-                        timeout=httpx.Timeout(
-                            float(timeout_seconds + 30), connect=5.0,
-                        ),
-                    ) as resp:
-                        async for line in resp.aiter_lines():
-                            if not line.startswith("data:"):
-                                continue
-                            try:
-                                ev = json.loads(line[5:].strip())
-                            except json.JSONDecodeError:
-                                continue
-                            if ev.get("type") == "status":
-                                if ev.get("status") == "pending":
-                                    output_parts.append(
-                                        "[queued — waiting for a free task "
-                                        "slot]\n"
-                                    )
-                            elif ev.get("type") == "text":
-                                output_parts.append(ev.get("text", ""))
-                            elif ev.get("type") == "done":
-                                return ev.get("status", "completed")
-                return "unknown"
 
-            try:
-                # The wall-clock bound: httpx's read timeout is per read, and
-                # the stream's keep-alive every 30 s resets it for the whole run.
-                final_status = await asyncio.wait_for(_listen(), timeout_seconds)
-            except (asyncio.TimeoutError, httpx.ReadTimeout):
-                final_status = WAIT_TIMED_OUT
-            except httpx.HTTPError as e:
-                return [TextContent(
-                    type="text",
-                    text=(
-                        f"Task triggered (run: {run_id}) but the wait stream "
-                        f"failed: {e}. The run continues in the background — "
-                        f"check get_task_result('{task_id}') later."
-                    ),
-                )]
-
-            if final_status == WAIT_TIMED_OUT:
-                return [TextContent(
-                    type="text",
-                    text=(
-                        f"Task {task_id} (run: {run_id}) is still running after {timeout_seconds}s. "
-                        f"It continues in the background. Check get_task_result(task_id) later "
-                        f"for the result."
-                    ),
-                )]
-
-            output = "".join(output_parts) or "(no output)"
-            return [TextContent(
-                type="text",
-                text=(
-                    f"Task run ended: {task_id} (run: {run_id})\n"
-                    f"Status: {final_status}\n\n"
-                    f"Output:\n{output}"
-                ),
-            )]
-
-        elif name == "get_task_result":
-            task_id = arguments["task_id"]
-            params: dict = {"task_id": task_id, "limit": 1, **_agent_param(arguments)}
-            result = await _get("/v1/tasks/runs", params=params)
-            runs = result.get("runs", [])
-            if not runs:
-                return [TextContent(type="text", text=f"No runs found for task {task_id}.")]
-            r = runs[0]
-            duration = f"{r['duration_ms']}ms" if r.get("duration_ms") else "—"
-            lines = [
-                f"Task: {task_id}",
-                f"Run: {r['id']}",
-                f"Status: {r['status']}",
-                f"Started: {r.get('started_at', '—')}",
-                f"Completed: {r.get('completed_at', '—')}",
-                f"Duration: {duration}",
-            ]
-            if r.get("error_message"):
-                lines.append(f"Error: {r['error_message']}")
-            if r.get("output_text"):
-                lines.append(f"\nOutput:\n{r['output_text']}")
-            return [TextContent(type="text", text="\n".join(lines))]
-
-        elif name == "list_tasks":
-            result = await _get("/v1/tasks", params=_agent_param(arguments))
-            tasks = result.get("tasks", [])
-            if not tasks:
-                return [TextContent(type="text", text="No tasks found.")]
-            lines = [f"Tasks ({len(tasks)} total):"]
-            for t in tasks:
-                next_run = t.get("next_run_time") or "—"
-                status = "active" if t.get("enabled") else "paused"
-                task_type = t.get("task_type", "task")
+async def _tool_get_task(arguments: dict) -> list[TextContent]:
+    task_id = arguments["task_id"]
+    t = await _get(f"/v1/tasks/{task_id}")
+    status = "active" if t.get("enabled") else "paused"
+    # The zone a cron, an interval anchor or a naive run_at is read
+    # in: the row's own, else the platform's (which the row keeps
+    # following). Meaningless for a trigger-type task.
+    tz_note = ""
+    if t.get("task_type") != "trigger":
+        if t.get("user_tz"):
+            tz_note = f" (timezone {t['user_tz']})"
+        elif t.get("effective_tz"):
+            tz_note = f" (platform timezone {t['effective_tz']})"
+    mode = "Auto" if t.get("permission_mode") == "autoReview" else "Don't Ask"
+    lines = [
+        f"Task: {t['id']} — {t['name']}",
+        f"Type: {t.get('task_type', 'task')}   Agent: {t.get('agent')}   "
+        f"Scope: {t.get('scope')}   Created by: {t.get('created_by') or '—'} "
+        f"at {t.get('created_at') or '—'}",
+        f"Fires: {_fires_info(t)}{tz_note}",
+        f"Status: {status}   Next run: {t.get('next_run_time') or '—'}   "
+        f"Runs so far: {t.get('run_count', 0)}"
+        + (f" of {t['max_runs']}" if t.get("max_runs") else "")
+        + (f"   Until: {t['until_at']}" if t.get("until_at") else ""),
+        f"Timeout: {t.get('timeout_seconds', '—')}s   "
+        f"Notification: {t.get('notification_mode', '—')}"
+        + (f" ({t['notify_severity']})" if t.get("notify_severity") else "")
+        + (f"   Target chat: {t['target_chat_id']}" if t.get("target_chat_id") else "")
+        + f"   Mode: {mode}",
+    ]
+    runs_on = _runs_on(t)
+    if runs_on:
+        lines.append("Runs on: " + runs_on[len(", runs on: "):]
+                     if runs_on.startswith(", runs on: ") else "Runs" + runs_on[len(", runs"):])
+    elif t.get("task_type") == "app":
+        lines.append("Runs on: no model (an app handler, no LLM turn)")
+    machine = _machine_label(t)
+    if machine:
+        state = t.get("target_machine_state") or ""
+        lines.append(f"Machine: {machine}" + (f" ({state})" if state else ""))
+    for w in t.get("pin_warnings") or []:
+        lines.append(f"Warning: {w}")
+    if t.get("task_type") == "trigger":
+        trig = t.get("triggers") or []
+        if trig:
+            lines.append("Triggers pointing at it:")
+            for r in trig:
                 lines.append(
-                    f"  [{task_type}] {t['id']} — {t['name']} "
-                    f"({t['agent']}, {_fires_info(t)}, {status}, next: {next_run}"
-                    f"{_runs_on(t)})"
+                    f"  • {r.get('name')} [{r.get('scope')}] "
+                    f"[{'active' if r.get('enabled') else 'paused'}] "
+                    f"fires={r.get('fired_count', 0)} last={r.get('last_fired_at') or 'never'} "
+                    f"{'vendor subscription' if r.get('subscription_id') else r.get('webhook_path') or ''} "
+                    f"id={r.get('id')}"
                 )
-            return [TextContent(type="text", text="\n".join(lines))]
-
-        elif name == "get_task":
-            task_id = arguments["task_id"]
-            t = await _get(f"/v1/tasks/{task_id}")
-            status = "active" if t.get("enabled") else "paused"
-            # The zone a cron, an interval anchor or a naive run_at is read
-            # in: the row's own, else the platform's (which the row keeps
-            # following). Meaningless for a trigger-type task.
-            tz_note = ""
-            if t.get("task_type") != "trigger":
-                if t.get("user_tz"):
-                    tz_note = f" (timezone {t['user_tz']})"
-                elif t.get("effective_tz"):
-                    tz_note = f" (platform timezone {t['effective_tz']})"
-            lines = [
-                f"Task: {t['id']} — {t['name']}",
-                f"Type: {t.get('task_type', 'task')}   Agent: {t.get('agent')}   "
-                f"Scope: {t.get('scope')}   Created by: {t.get('created_by') or '—'} "
-                f"at {t.get('created_at') or '—'}",
-                f"Fires: {_fires_info(t)}{tz_note}",
-                f"Status: {status}   Next run: {t.get('next_run_time') or '—'}   "
-                f"Runs so far: {t.get('run_count', 0)}"
-                + (f" of {t['max_runs']}" if t.get("max_runs") else "")
-                + (f"   Until: {t['until_at']}" if t.get("until_at") else ""),
-                f"Timeout: {t.get('timeout_seconds', '—')}s   "
-                f"Notification: {t.get('notification_mode', '—')}"
-                + (f" ({t['notify_severity']})" if t.get("notify_severity") else "")
-                + (f"   Target chat: {t['target_chat_id']}" if t.get("target_chat_id") else ""),
-            ]
-            runs_on = _runs_on(t)
-            if runs_on:
-                lines.append("Runs on: " + runs_on[len(", runs on: "):]
-                             if runs_on.startswith(", runs on: ") else "Runs" + runs_on[len(", runs"):])
-            elif t.get("task_type") == "app":
-                lines.append("Runs on: no model (an app handler, no LLM turn)")
-            for w in t.get("pin_warnings") or []:
-                lines.append(f"Warning: {w}")
-            if t.get("task_type") == "trigger":
-                trig = t.get("triggers") or []
-                if trig:
-                    lines.append("Triggers pointing at it:")
-                    for r in trig:
-                        lines.append(
-                            f"  • {r.get('name')} [{r.get('scope')}] "
-                            f"[{'active' if r.get('enabled') else 'paused'}] "
-                            f"fires={r.get('fired_count', 0)} last={r.get('last_fired_at') or 'never'} "
-                            f"{'vendor subscription' if r.get('subscription_id') else r.get('webhook_path') or ''} "
-                            f"id={r.get('id')}"
-                        )
-                else:
-                    lines.append("Triggers pointing at it: none yet — wire one with "
-                                 f"create_trigger(task_id='{t['id']}')")
-            if t.get("on_complete_agent"):
-                lines.append(f"On complete: {t['on_complete_agent']} ← {t.get('on_complete_prompt') or ''}")
-            lines.append("")
-            lines.append("Prompt:")
-            lines.append("```")
-            lines.append(t.get("prompt") or "(empty)")
-            lines.append("```")
-            return [TextContent(type="text", text="\n".join(lines))]
-
-        elif name == "delete_task":
-            task_id = arguments["task_id"]
-            await _delete(f"/v1/tasks/{task_id}")
-            return [TextContent(type="text", text=f"Deleted task: {task_id}")]
-
-        elif name == "pause_task":
-            task_id = arguments["task_id"]
-            await _post(f"/v1/tasks/{task_id}/pause", {})
-            return [TextContent(
-                type="text",
-                text=f"Paused task: {task_id}. It will not fire until resumed.",
-            )]
-
-        elif name == "resume_task":
-            task_id = arguments["task_id"]
-            await _post(f"/v1/tasks/{task_id}/resume", {})
-            return [TextContent(
-                type="text",
-                text=(
-                    f"Resumed task: {task_id}. "
-                    "If this is a one-time task whose scheduled time has passed, "
-                    "it will not fire automatically — the user can run it manually."
-                ),
-            )]
-
-        elif name == "edit_task":
-            task_id = arguments["task_id"]
-            # Build the edit body from any provided field besides task_id.
-            # ``model``/``layer`` are included even when empty — "" is the
-            # explicit "drop the pin, go back to the agent's default" signal.
-            edit_keys = (
-                "name", "prompt", "schedule", "run_at", "interval_seconds",
-                "timeout_seconds", "notification_mode", "notify_severity",
-                "model", "layer", "checks",
-            )
-            body = {k: arguments[k] for k in edit_keys if k in arguments}
-            # The zone travels as user_tz on the wire; a zone edit alone is
-            # a valid edit (the proxy re-registers on it).
-            if arguments.get("timezone"):
-                body["user_tz"] = arguments["timezone"]
-            if not body:
-                return [TextContent(
-                    type="text",
-                    text="Error: provide at least one field to edit besides task_id.",
-                )]
-            timing_set = [k for k in ("schedule", "run_at", "interval_seconds") if body.get(k)]
-            if len(timing_set) > 1:
-                return [TextContent(
-                    type="text",
-                    text=(
-                        f"Error: schedule, run_at, and interval_seconds are mutually exclusive — "
-                        f"set only one. Got: {', '.join(timing_set)}."
-                    ),
-                )]
-            await _post(f"/v1/tasks/{task_id}/edit", body)
-            changed = ", ".join("timezone" if k == "user_tz" else k for k in body)
-            lane = _lane_line(body, cleared=True)
-            return [TextContent(
-                type="text",
-                text="\n".join(x for x in [
-                    f"Updated task {task_id} ({changed}).",
-                    lane,
-                ] if x),
-            )]
-
-        elif name == "get_task_history":
-            # Delegate runs stay visible here (the dashboard's Tasks page
-            # excludes them — they live in the chat history there).
-            params: dict = {"limit": arguments.get("limit", 10),
-                            "include_delegates": "true",
-                            **_agent_param(arguments)}
-            if arguments.get("task_id"):
-                params["task_id"] = arguments["task_id"]
-            result = await _get("/v1/tasks/runs", params=params)
-            runs = result.get("runs", [])
-            if not runs:
-                return [TextContent(type="text", text="No runs found.")]
-            cross_agent = "agent" in arguments  # label rows on cross-agent reads
-            lines = [f"Recent runs ({len(runs)} of {result.get('total', '?')} total):"]
-            for r in runs:
-                duration = f"{r['duration_ms']}ms" if r.get("duration_ms") else "—"
-                agent_tag = f" ({r.get('agent', '?')})" if cross_agent else ""
-                lines.append(
-                    f"  {r['id']} — {r['task_id']}{agent_tag} [{r['status']}] "
-                    f"started={r.get('started_at', '—')} duration={duration}"
-                )
-                if r.get("error_message"):
-                    lines.append(f"    Error: {r['error_message']}")
-                if r.get("background_pending"):
-                    lines.append(
-                        f"    Left running: {r['background_pending']} background "
-                        f"command(s)/subagent(s) past the task's timeout; the session "
-                        f"was kept for them, their output is not in this run"
-                    )
-            return [TextContent(type="text", text="\n".join(lines))]
-
-        elif name == "cancel_task_run":
-            run_id = arguments["run_id"]
-            result = await _post(f"/v1/tasks/runs/{run_id}/cancel", {})
-            return [TextContent(
-                type="text",
-                text=f"Cancel result for {run_id}: {result.get('status', 'unknown')}",
-            )]
-
         else:
+            lines.append("Triggers pointing at it: none yet — wire one with "
+                         f"create_trigger(task_id='{t['id']}')")
+    if t.get("on_complete_agent"):
+        lines.append(f"On complete: {t['on_complete_agent']} ← {t.get('on_complete_prompt') or ''}")
+    lines.append("")
+    lines.append("Prompt:")
+    lines.append("```")
+    lines.append(t.get("prompt") or "(empty)")
+    lines.append("```")
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
+async def _tool_delete_task(arguments: dict) -> list[TextContent]:
+    task_id = arguments["task_id"]
+    await _delete(f"/v1/tasks/{task_id}")
+    return [TextContent(type="text", text=f"Deleted task: {task_id}")]
+
+
+async def _tool_pause_task(arguments: dict) -> list[TextContent]:
+    task_id = arguments["task_id"]
+    await _post(f"/v1/tasks/{task_id}/pause", {})
+    return [TextContent(
+        type="text",
+        text=f"Paused task: {task_id}. It will not fire until resumed.",
+    )]
+
+
+async def _tool_resume_task(arguments: dict) -> list[TextContent]:
+    task_id = arguments["task_id"]
+    await _post(f"/v1/tasks/{task_id}/resume", {})
+    return [TextContent(
+        type="text",
+        text=(
+            f"Resumed task: {task_id}. "
+            "If this is a one-time task whose scheduled time has passed, "
+            "it will not fire automatically — the user can run it manually."
+        ),
+    )]
+
+
+async def _tool_edit_task(arguments: dict) -> list[TextContent]:
+    task_id = arguments["task_id"]
+    # Build the edit body from any provided field besides task_id.
+    # ``model``/``layer``/``machine`` are included even when empty — "" is
+    # the explicit "drop the pin, go back to the agent's default" signal
+    # (and 'default' for the machine).
+    edit_keys = (
+        "name", "prompt", "schedule", "run_at", "interval_seconds",
+        "timeout_seconds", "notification_mode", "notify_severity",
+        "model", "layer", "machine", "permission_mode", "checks",
+    )
+    body = {k: arguments[k] for k in edit_keys if k in arguments}
+    # The zone travels as user_tz on the wire; a zone edit alone is
+    # a valid edit (the proxy re-registers on it).
+    if arguments.get("timezone"):
+        body["user_tz"] = arguments["timezone"]
+    if not body:
+        return [TextContent(
+            type="text",
+            text="Error: provide at least one field to edit besides task_id.",
+        )]
+    timing_set = [k for k in ("schedule", "run_at", "interval_seconds") if body.get(k)]
+    if len(timing_set) > 1:
+        return [TextContent(
+            type="text",
+            text=(
+                f"Error: schedule, run_at, and interval_seconds are mutually exclusive — "
+                f"set only one. Got: {', '.join(timing_set)}."
+            ),
+        )]
+    await _post(f"/v1/tasks/{task_id}/edit", body)
+    changed = ", ".join("timezone" if k == "user_tz" else k for k in body)
+    lane = _lane_line(body, cleared=True)
+    return [TextContent(
+        type="text",
+        text="\n".join(x for x in [
+            f"Updated task {task_id} ({changed}).",
+            lane,
+            _machine_line(body, cleared=True),
+        ] if x),
+    )]
+
+
+async def _tool_get_task_history(arguments: dict) -> list[TextContent]:
+    # Delegate runs stay visible here (the dashboard's Tasks page
+    # excludes them — they live in the chat history there).
+    params: dict = {"limit": arguments.get("limit", 10),
+                    "include_delegates": "true",
+                    **_agent_param(arguments)}
+    if arguments.get("task_id"):
+        params["task_id"] = arguments["task_id"]
+    result = await _get("/v1/tasks/runs", params=params)
+    runs = result.get("runs", [])
+    if not runs:
+        return [TextContent(type="text", text="No runs found.")]
+    cross_agent = "agent" in arguments  # label rows on cross-agent reads
+    lines = [f"Recent runs ({len(runs)} of {result.get('total', '?')} total):"]
+    for r in runs:
+        duration = f"{r['duration_ms']}ms" if r.get("duration_ms") else "—"
+        agent_tag = f" ({r.get('agent', '?')})" if cross_agent else ""
+        where = ""
+        if r.get("execution_target") and r.get("status") != "pending":
+            where = " ran on: " + (r.get("execution_target_label") or r["execution_target"][:8])
+        lines.append(
+            f"  {r['id']} — {r['task_id']}{agent_tag} [{r['status']}] "
+            f"started={r.get('started_at', '—')} duration={duration}{where}"
+        )
+        if r.get("error_message"):
+            lines.append(f"    Error: {r['error_message']}")
+        if r.get("background_pending"):
+            lines.append(
+                f"    Left running: {r['background_pending']} background "
+                f"command(s)/subagent(s) past the task's timeout; the session "
+                f"was kept for them, their output is not in this run"
+            )
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
+async def _tool_cancel_task_run(arguments: dict) -> list[TextContent]:
+    run_id = arguments["run_id"]
+    result = await _post(f"/v1/tasks/runs/{run_id}/cancel", {})
+    return [TextContent(
+        type="text",
+        text=f"Cancel result for {run_id}: {result.get('status', 'unknown')}",
+    )]
+
+
+_TOOL_HANDLERS = {
+    "create_scheduled_task": _tool_create_scheduled_task,
+    "create_one_time_task": _tool_create_one_time_task,
+    "schedule_continuation": _tool_schedule_continuation,
+    "run_task": _tool_run_task,
+    "get_task_result": _tool_get_task_result,
+    "list_tasks": _tool_list_tasks,
+    "get_task": _tool_get_task,
+    "delete_task": _tool_delete_task,
+    "pause_task": _tool_pause_task,
+    "resume_task": _tool_resume_task,
+    "edit_task": _tool_edit_task,
+    "get_task_history": _tool_get_task_history,
+    "cancel_task_run": _tool_cancel_task_run,
+}
+
+
+@server.call_tool(validate_input=False)
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
+    try:
+        handler = _TOOL_HANDLERS.get(name)
+        if handler is None:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
+        return await handler(arguments)
 
     except httpx.HTTPStatusError as e:
         # The proxy's refusals carry their sentence under "detail": show the
@@ -1251,7 +1386,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             type="text",
             text=f"API error {e.response.status_code}: {detail if isinstance(detail, str) else error_body}",
         )]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
 

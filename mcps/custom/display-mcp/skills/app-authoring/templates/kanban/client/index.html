@@ -3,13 +3,15 @@
   <div class="mb-3 flex flex-wrap items-center gap-2">
     <!-- No <form>: the frame is sandboxed without allow-forms, so a form
          submit is blocked before any script runs. Enter and the button are
-         handled in script instead. -->
-    <div id="add" class="flex flex-1 gap-2">
-      <input id="title" class="flex-1 rounded-lg border border-[var(--p-border-light)] bg-[var(--p-surface)] px-3 py-1.5 text-sm text-[var(--p-text)]" placeholder="New card…" maxlength="200">
+         handled in script instead. Hidden until the server says this
+         viewer may change the board. -->
+    <div id="add" class="flex flex-1 gap-2" hidden>
+      <input id="title" class="flex-1" placeholder="New card" aria-label="New card title" maxlength="200">
       <button class="btn primary" type="button" id="add-btn">Add</button>
     </div>
-    <span id="status" class="text-xs text-[var(--p-text-secondary)]">Connecting…</span>
+    <span id="status" class="text-xs text-[var(--p-text-secondary)]" role="status">Connecting…</span>
   </div>
+  <p id="read-only" class="mb-3 text-sm text-[var(--p-text-secondary)]" hidden>You can look at this board. Members who can edit it move the cards.</p>
   <div id="board" class="grid grid-cols-1 gap-3 md:grid-cols-3"></div>
 </div>
 <script>
@@ -18,8 +20,15 @@
   var board = document.getElementById("board");
   var status = document.getElementById("status");
   var cards = [];
+  var canWrite = false;
+
+  function inColumn(col) { return cards.filter(function (k) { return k.col === col; }); }
 
   function render() {
+    // A redraw replaces every element: the card whose picker had the focus
+    // gets it back, so a keyboard move keeps the person's place.
+    var active = document.activeElement;
+    var focused = active && active.dataset ? active.dataset.card || "" : "";
     board.replaceChildren();
     COLUMNS.forEach(function (c) {
       var col = document.createElement("section");
@@ -27,43 +36,70 @@
       col.dataset.col = c[0];
       var h = document.createElement("h3");
       h.className = "mb-2 text-sm font-semibold";
-      h.textContent = c[1] + " (" + cards.filter(function (k) { return k.col === c[0]; }).length + ")";
+      h.textContent = c[1] + " · " + inColumn(c[0]).length;
       col.appendChild(h);
-      cards.filter(function (k) { return k.col === c[0]; }).forEach(function (k) {
+      inColumn(c[0]).forEach(function (k) {
         var el = document.createElement("div");
-        el.className = "mb-2 cursor-grab rounded-lg border border-[var(--p-border-light)] bg-[var(--p-bg)] p-2 text-sm";
-        el.draggable = true;
+        el.className = "mb-2 rounded-[var(--p-radius-sm)] border border-[var(--p-border-light)] bg-[var(--p-surface-raised)] p-2 text-sm" + (canWrite ? " cursor-grab" : "");
+        el.draggable = canWrite;
         el.dataset.id = k.id;
-        el.innerHTML = '<div class="font-medium"></div><div class="mt-1 text-[11px] text-[var(--p-text-secondary)]"></div>';
+        el.innerHTML = '<div class="font-medium break-words"></div><div class="mt-1 text-xs text-[var(--p-text-light)]"></div>';
         el.firstChild.textContent = k.title;
-        el.lastChild.textContent = "moved by " + (k.moved_by || "—");
-        el.addEventListener("dragstart", function (e) { e.dataTransfer.setData("text/plain", String(k.id)); });
-        var del = document.createElement("button");
-        del.className = "mt-1 text-[11px] text-[var(--p-text-light)] hover:text-red-500";
-        del.textContent = "remove";
-        del.onclick = function () { api("/cards/" + k.id, { method: "DELETE" }); };
-        el.appendChild(del);
+        el.lastChild.textContent = k.moved_by ? "Moved by " + k.moved_by : "Not moved yet";
+        if (canWrite) {
+          el.addEventListener("dragstart", function (e) { e.dataTransfer.setData("text/plain", String(k.id)); });
+          var row = document.createElement("div");
+          row.className = "mt-2 flex flex-wrap items-center gap-2";
+          // The column picker moves a card by keyboard and on a phone,
+          // where dragging does not work.
+          var pick = document.createElement("select");
+          pick.setAttribute("aria-label", "Column for " + k.title);
+          pick.dataset.card = String(k.id);
+          pick.className = "text-xs";
+          COLUMNS.forEach(function (c2) {
+            var o = document.createElement("option");
+            o.value = c2[0]; o.textContent = c2[1]; o.selected = c2[0] === k.col;
+            pick.appendChild(o);
+          });
+          pick.addEventListener("change", function () { move(k.id, pick.value); });
+          var del = document.createElement("button");
+          del.type = "button";
+          del.className = "btn quiet-danger";
+          del.textContent = "Remove";
+          del.onclick = function () { api("/cards/" + k.id, { method: "DELETE" }); };
+          row.append(pick, del);
+          el.appendChild(row);
+        }
         col.appendChild(el);
       });
-      col.addEventListener("dragover", function (e) { e.preventDefault(); });
-      col.addEventListener("drop", function (e) {
-        e.preventDefault();
-        var id = e.dataTransfer.getData("text/plain");
-        if (!id) return;
-        var pos = cards.filter(function (k) { return k.col === c[0]; }).length + 1;
-        api("/cards/" + id + "/move", { method: "POST", body: JSON.stringify({ col: c[0], position: pos }) });
-      });
+      if (canWrite) {
+        col.addEventListener("dragover", function (e) { e.preventDefault(); });
+        col.addEventListener("drop", function (e) {
+          e.preventDefault();
+          var id = e.dataTransfer.getData("text/plain");
+          if (id) move(id, c[0]);
+        });
+      }
       board.appendChild(col);
     });
+    if (focused) {
+      var again = board.querySelector('select[data-card="' + focused + '"]');
+      if (again) again.focus();
+    }
+  }
+
+  function move(id, col) {
+    api("/cards/" + id + "/move", { method: "POST", body: JSON.stringify({ col: col, position: inColumn(col).length + 1 }) });
   }
 
   function api(path, init) {
     init = init || {};
     init.headers = Object.assign({ "content-type": "application/json" }, init.headers || {});
     return otodock.fetch(path, init).then(function (r) {
-      if (!r.ok) status.textContent = "The server answered " + r.status;
+      if (r.status === 403) status.textContent = "You can look at this board but not change it.";
+      else if (!r.ok) status.textContent = "That did not save. Try again.";
       return r;
-    }).catch(function () { status.textContent = "Could not reach the app's server"; });
+    }).catch(function () { status.textContent = "No connection right now. Your change was not saved."; });
   }
 
   function addCard() {
@@ -88,8 +124,15 @@
       if (msg.type === "cards") { cards = msg.cards || []; render(); }
     } catch (err) {}
   };
+  // The server says who may change the board: the page hides the rest, and
+  // the server refuses it again whatever the page shows.
   api("/cards").then(function (r) { return r && r.ok ? r.json() : null; }).then(function (d) {
-    if (d) { cards = d.cards || []; render(); }
+    if (!d) return;
+    canWrite = !!d.can_write;
+    document.getElementById("add").hidden = !canWrite;
+    document.getElementById("read-only").hidden = canWrite;
+    cards = d.cards || [];
+    render();
   });
   render();
 })();

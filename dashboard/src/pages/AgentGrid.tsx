@@ -2,11 +2,15 @@ import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { isCreatorOrAbove } from '../lib/permissions'
+import { toastError } from '../lib/http/apiJson'
 import { useAgents, useSetDefaultAgent, type AgentSummary } from '../api/agents'
 import { useDepartments, type Department } from '../api/departments'
 import AgentCard from '../components/AgentCard'
 import AgentInstallModal from '../components/AgentInstallModal'
 import CommunityAgentsBrowser from '../components/CommunityAgentsBrowser'
+import AlertDialog from '../components/ui/AlertDialog'
+import Button from '../components/ui/Button'
+import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT, CARD } from '../components/ui/classes'
 
 const CARD_GRID = 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6'
 
@@ -23,37 +27,34 @@ function DepartmentGroup({ dept, members, defaultAgent, onSetDefault }: {
 }) {
   const [expanded, setExpanded] = useState(true)
   return (
-    // Fill lives on the HEADER only — the body stays transparent so the
-    // page background shows between the member cards' borders and the
-    // group border (the cards' own fill matches the old group fill, which
-    // read as one flat slab). overflow-hidden clips the header fill to the
-    // section's radius (ExecutionLayersTab idiom).
-    <section className="rounded-xl border border-p-border-light overflow-hidden">
+    // The group is the card; its member cards sit inside it on the page's
+    // own colour. overflow-hidden clips the header's hover to the radius.
+    <section className={`${CARD} overflow-hidden`}>
       <button
         type="button"
         aria-expanded={expanded}
         onClick={() => setExpanded(v => !v)}
-        className="w-full flex items-center justify-between gap-3 p-4 text-left bg-white dark:bg-p-surface"
+        className="w-full flex items-center justify-between gap-3 p-4 text-left hover:bg-surface-hover transition-colors"
       >
         <div className="min-w-0">
-          <div className="font-medium text-p-text truncate">{dept.name}</div>
-          <div className="text-sm text-p-text-secondary">
+          <div className="font-display text-lg font-semibold text-primary truncate">{dept.name}</div>
+          <div className="text-sm text-secondary">
             {members.length} {members.length === 1 ? 'agent' : 'agents'}
           </div>
         </div>
         <svg
-          className={`w-4 h-4 shrink-0 text-p-text-light transition-transform ${expanded ? 'rotate-180' : ''}`}
+          className={`w-4 h-4 shrink-0 text-tertiary transition-transform ${expanded ? 'rotate-180' : ''}`}
           fill="none" stroke="currentColor" viewBox="0 0 24 24"
         >
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
         </svg>
       </button>
       {expanded && (
-        <div className="px-4 pb-4 border-t border-p-border-light pt-4">
+        <div className="px-4 pb-4 border-t border-subtle pt-4">
           {members.length === 0 ? (
-            <p className="text-sm text-p-text-light">
-              No agents yet — move one here from the company map or the
-              agent's Configuration tab.
+            <p className="text-sm text-tertiary">
+              No agents yet. Move one here from the company map or the
+              agent's Configuration section.
             </p>
           ) : (
             <div className={CARD_GRID}>
@@ -64,6 +65,7 @@ function DepartmentGroup({ dept, members, defaultAgent, onSetDefault }: {
                   isDefault={defaultAgent === agent.name}
                   onSetDefault={onSetDefault}
                   roleLabel={roleLabel}
+                  surface="item"
                 />
               ))}
             </div>
@@ -93,12 +95,12 @@ export default function AgentGrid({ embedded = false }: { embedded?: boolean }) 
     if (!confirmAgent) return
     const agent = confirmAgent
     setConfirmAgent(null)
-    setDefaultAgent.mutate(agent, {
-      onSuccess: () => {
+    setDefaultAgent.mutateAsync(agent)
+      .then(() => {
         // Update user in auth context so the UI reflects immediately
         if (user) setUser({ ...user, default_agent: agent })
-      },
-    })
+      })
+      .catch(toastError('The default agent was not set'))
   }
 
   const displayName = (name: string) =>
@@ -165,14 +167,14 @@ export default function AgentGrid({ embedded = false }: { embedded?: boolean }) 
   }, [agents, groups, user?.default_agent])
 
   return (
-    <div className={embedded ? '' : 'min-h-screen bg-p-bg'}>
+    <div className={embedded ? '' : 'min-h-screen bg-surface-page'}>
       {/* Top bar — standard "Back to Chat" button (matches agent settings /
           admin). Hidden when embedded in AgentsPage, which brings its own. */}
       {!embedded && (
-        <div className="flex items-center h-12 px-4 bg-white/80 dark:bg-gray-900/80 backdrop-blur-sm border-b border-p-border-light">
+        <div className="flex items-center h-12 px-4 bg-surface-page border-b border-subtle">
           <Link
             to="/"
-            className="flex items-center justify-center gap-1.5 w-full sm:w-auto px-3 sm:px-8 py-1.5 rounded-lg text-sm font-medium text-white bg-brand hover:bg-brand-hover transition-colors"
+            className={`${BUTTON_BASE} ${BUTTON_VARIANT.primary} ${BUTTON_SIZE.sm} w-full sm:w-auto sm:px-8`}
           >
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
@@ -187,40 +189,38 @@ export default function AgentGrid({ embedded = false }: { embedded?: boolean }) 
         {/* Title + actions. On mobile the buttons drop to their own line below. */}
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-6">
           <div>
-            <h1 className="text-lg font-bold text-p-text">OtoDock</h1>
-            <p className="text-sm text-p-text-secondary">Select an agent</p>
+            <h1 className="font-display text-lg font-bold text-primary">OtoDock</h1>
+            <p className="text-sm text-secondary">Select an agent</p>
           </div>
           {canManage && (
             <div className="flex items-center gap-2">
               {/* Browse Community is the primary action — most users install a
                   pre-built agent far more often than they build one from scratch. */}
-              <button
+              <Button
+                variant="primary"
+                size="md"
                 onClick={() => setShowBrowse(true)}
-                className="px-4 py-2 rounded-lg text-sm font-medium text-white bg-brand hover:bg-brand-hover transition-colors flex items-center gap-1.5"
-                title="Install a pre-built agent from the community catalog"
+                title="Install a pre-built agent from the community list"
               >
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-4.35-4.35m1.85-5.65a7.5 7.5 0 11-15 0 7.5 7.5 0 0115 0z" />
                 </svg>
                 Browse Community
-              </button>
-              <button
-                onClick={() => setShowCreateModal(true)}
-                className="px-4 py-2 rounded-lg text-sm font-medium text-p-text-secondary bg-p-surface hover:bg-p-surface-hover transition-colors flex items-center gap-1.5"
-              >
+              </Button>
+              <Button size="md" onClick={() => setShowCreateModal(true)}>
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
                 </svg>
                 Create Agent
-              </button>
+              </Button>
             </div>
           )}
         </div>
 
         {isLoading ? (
-          <p className="text-sm text-p-text-secondary">Loading agents...</p>
+          <p className="text-sm text-secondary">Loading agents...</p>
         ) : groups.length === 0 && (!sortedAgents || sortedAgents.length === 0) ? (
-          <p className="text-sm text-p-text-secondary">No agents found.</p>
+          <p className="text-sm text-secondary">No agents found.</p>
         ) : (
           <div className="space-y-6">
             {groups.map(({ dept, members }) => (
@@ -248,40 +248,17 @@ export default function AgentGrid({ embedded = false }: { embedded?: boolean }) 
         )}
       </main>
 
-      {/* Confirmation popup */}
       {confirmAgent && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs"
-          onClick={() => setConfirmAgent(null)}
+        <AlertDialog
+          title="Set Default Agent"
+          confirmLabel="Confirm"
+          onConfirm={handleConfirm}
+          onCancel={() => setConfirmAgent(null)}
         >
-          <div
-            className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light shadow-xl p-6 max-w-sm mx-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 className="text-sm font-semibold text-p-text mb-2">Set Default Agent</h3>
-            <p className="text-sm text-p-text-secondary mb-5">
-              Set <span className="font-medium text-p-text">
-                {agents?.find(a => a.name === confirmAgent)?.display_name || displayName(confirmAgent)}
-              </span> as your default agent? This will be the agent loaded when you open the dashboard.
-            </p>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setConfirmAgent(null)}
-                className="px-4 py-2 rounded-lg text-sm font-medium text-p-text-secondary
-                           bg-p-surface hover:bg-p-surface-hover transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleConfirm}
-                className="px-4 py-2 rounded-lg text-sm font-medium text-white
-                           bg-brand hover:bg-brand-hover transition-colors"
-              >
-                Confirm
-              </button>
-            </div>
-          </div>
-        </div>
+          Set <span className="font-medium text-primary">
+            {agents?.find(a => a.name === confirmAgent)?.display_name || displayName(confirmAgent)}
+          </span> as your default agent? This will be the agent loaded when you open the dashboard.
+        </AlertDialog>
       )}
 
       {/* Create Agent modal (unified create + install) */}

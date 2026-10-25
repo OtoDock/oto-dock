@@ -10,9 +10,11 @@ import { render, screen, within } from '@testing-library/react'
 
 import NotificationPanel from '@/components/chat/notifications/NotificationPanel'
 import NotificationToast from '@/components/chat/notifications/NotificationToast'
-import NotificationAgentHeader, { titleCaseSlug } from '@/components/chat/notifications/NotificationAgentHeader'
+import ToastViewport from '@/components/ui/Toast'
+import NotificationAgentHeader from '@/components/chat/notifications/NotificationAgentHeader'
 import type { NotificationDelivery } from '@/api/notifications'
 import type { AgentSummary } from '@/api/agents'
+import { titleCaseSlug } from '@/components/chat/notifications/NotificationAgentHeader.helpers'
 
 const agents = [
   { name: 'alpha', display_name: 'Alpha Prime', color: '#336699' },
@@ -51,13 +53,13 @@ describe('NotificationAgentHeader', () => {
     expect(within(header).getByText('Alpha Prime')).toBeTruthy()
     const avatar = within(header).getByText('A')
     expect(avatar.style.backgroundColor).toBe('rgb(51, 102, 153)')
-    expect(avatar.className).not.toContain('bg-brand')
+    expect(avatar.className).not.toContain('bg-accent-agent-fill')
   })
 
-  it('falls back to the brand color when the agent has no color', () => {
+  it('falls back to the agent fill when the agent has no color', () => {
     render(<NotificationAgentHeader agentSlug="no-color" agents={agents} />)
     const avatar = within(screen.getByTestId('notification-agent-header')).getByText('N')
-    expect(avatar.className).toContain('bg-brand')
+    expect(avatar.className).toContain('bg-accent-agent-fill')
     expect(screen.getByText('Colorless')).toBeTruthy()
   })
 
@@ -124,8 +126,10 @@ describe('NotificationPanel — sender header per row', () => {
 })
 
 describe('NotificationToast — sender header per card', () => {
-  it('renders the header above the title', () => {
+  it('renders the header above the title, in the toast region', () => {
     render(
+      <>
+      <ToastViewport />
       <NotificationToast
         toasts={[
           { id: 't1', delivery: mkDelivery({ id: 't1', agent_slug: 'alpha' }), createdAt: Date.now() },
@@ -133,9 +137,11 @@ describe('NotificationToast — sender header per card', () => {
         ]}
         agents={agents}
         onDismiss={vi.fn()}
-      />,
+      />
+      </>,
     )
-    const headers = screen.getAllByTestId('notification-agent-header')
+    const region = screen.getByRole('region', { name: 'Notifications' })
+    const headers = within(region).getAllByTestId('notification-agent-header')
     expect(headers.map((h) => h.getAttribute('data-agent'))).toEqual(['alpha', ''])
     expect(screen.getByText('Alpha Prime')).toBeTruthy()
     expect(screen.getByText('Disk almost full')).toBeTruthy()

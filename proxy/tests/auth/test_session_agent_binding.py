@@ -20,9 +20,9 @@ from fastapi.testclient import TestClient
 
 from app import app
 from auth.providers import create_session_jwt
-from tests.conftest import live_session_token
 from storage import database as task_store
 from storage.agents import agent_store
+from tests.conftest import live_session_token
 
 client = TestClient(app)
 
@@ -124,11 +124,12 @@ def test_a_creators_session_cannot_create_an_agent(sub):
     assert not agent_store.agent_exists("from-a-prompt")
 
 
-def test_a_persons_session_token_acts_at_their_role_on_the_files_routes():
+def test_a_persons_session_token_acts_at_their_role_on_the_files_routes(monkeypatch):
     """A session token that names a person moves, copies, zips and lists at
     that person's tier, never the admin tier: a contributor's session cannot
     zip the config folder or move the persona out of it. The agent's own
-    session keeps the admin tier."""
+    session (no person) is judged by its grant: the config folder only where
+    its context shows it."""
     import config
     contrib = "user-contrib"
     task_store.upsert_user(contrib, "contrib@t.com", "Contrib", "member")
@@ -141,4 +142,14 @@ def test_a_persons_session_token_acts_at_their_role_on_the_files_routes():
     assert r.status_code == 403, r.text
     assert client.post(f"/v1/agents/{A}/zip", json={"paths": ["config"]}, headers=h).status_code == 403
     assert (config.AGENTS_DIR / A / "config" / "agent.md").read_text() == "persona"
-    assert client.post(f"/v1/agents/{A}/zip", json={"paths": ["config"]}, headers=_token(A, "")).status_code == 200
+    from auth.path_policy import SecurityContext
+    from core.session import session_state
+    sid = str(uuid.uuid4())
+    own = {"Authorization": f"Bearer {live_session_token(sid, A, '')}"}
+    assert client.post(f"/v1/agents/{A}/zip", json={"paths": ["config"]}, headers=own).status_code == 403
+    for visible, status in ((False, 403), (True, 200)):
+        monkeypatch.setitem(session_state._session_security, sid, SecurityContext(
+            role="manager", username="", agent=A, is_admin_agent=False,
+            session_scope="agent", config_visible=visible))
+        r = client.post(f"/v1/agents/{A}/zip", json={"paths": ["config"]}, headers=own)
+        assert r.status_code == status, (visible, r.text)

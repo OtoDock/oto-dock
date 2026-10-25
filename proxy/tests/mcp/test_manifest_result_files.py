@@ -58,7 +58,7 @@ def test_a_subdir_that_is_not_one_plain_folder_is_refused(tmp_path, subdir):
 
 @pytest.mark.parametrize("tools", [
     [], "maps_static_map", ["*"], ["maps_*"], ["a b"], [""], [3], ["a", "a"],
-    ["t%d" % i for i in range(65)], None,
+    [f"t{i}" for i in range(65)], None,
 ])
 def test_tools_must_be_exact_names(tmp_path, tools):
     with pytest.raises(ValueError, match="result_files"):

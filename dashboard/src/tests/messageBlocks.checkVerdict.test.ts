@@ -6,6 +6,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import { dbMessagesToDisplay, eventToBlock } from '@/lib/messageBlocks'
+import { type CheckVerdictFrame } from '@/api/wireEvents'
 
 const AGENTS = [{ name: 'alpha', display_name: 'Alpha', color: '#2a6df4' }]
 
@@ -18,7 +19,7 @@ function row(role: string, content: string, eventType = '', eventData: object | 
 }
 
 // The persisted row is the event itself, `type` included.
-const VERDICT = {
+const VERDICT: CheckVerdictFrame = {
   type: 'check_verdict', check: 'coding', ref: 'agent:coding', section: 'judge', status: 'fail', pass: false, score: 0.4,
   summary: 'The commit message names no file.',
   findings: [{ location: 'src/a.py:12', severity: 'error', text: 'unused import' }],

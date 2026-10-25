@@ -33,11 +33,11 @@ import logging
 import threading
 from typing import Any
 
+import psycopg
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-from services.mcp import dynamic_context
-from services.mcp import mcp_registry
+from services.mcp import dynamic_context, mcp_registry
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ async def execute_builder(
         entry = mcp_registry.resolve_server_config(
             tool_mcp, agent_name, mcp_config_format="toml",
         )
-    except Exception as e:
+    except psycopg.Error as e:
         logger.warning(
             "builder on '%s' resolve_server_config failed for %s: %s",
             mcp_name, tool_mcp.name, e,
@@ -153,7 +153,9 @@ async def execute_builder(
         bundle_env.update(await asyncio.to_thread(
             mcp_registry.env_instance_values, tool_mcp, agent_name,
         ))
-    cred, reason = mcp_registry.gateway_entry(
+    # The source may mint an installation token (a thread's work).
+    cred, reason = await asyncio.to_thread(
+        mcp_registry.gateway_entry,
         dict(entry), tool_mcp, srv_key=tool_mcp.server_name or tool_mcp.name,
         user_sub=user_sub or None, agent_name=agent_name, task_scope=task_scope,
         bundle_env=bundle_env,
@@ -177,7 +179,7 @@ async def execute_builder(
         resolved_args = dynamic_context.substitute_in_json(
             builder.args, tokens, trigger_payload,
         )
-    except Exception as e:
+    except (TypeError, ValueError) as e:
         logger.warning(
             "builder on '%s' arg substitution failed: %s", mcp_name, e,
         )
@@ -203,7 +205,7 @@ async def execute_builder(
             mcp_name, builder.tool, builder.timeout_seconds,
         )
         return None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the mcp client raises exception groups and its transport's errors
         logger.warning(
             "builder on '%s' tool=%s failed: %s: %s",
             mcp_name, builder.tool, type(e).__name__, e,
@@ -286,7 +288,7 @@ async def _invoke_quarantined(
                     _invoke(url, headers, tool_short, args), timeout,
                 )
             )
-        except BaseException as e:
+        except BaseException as e:  # noqa: BLE001  # a thread target: its exception is handed to the waiting future
             _post(outcome.set_exception, e)
         else:
             _post(outcome.set_result, result)

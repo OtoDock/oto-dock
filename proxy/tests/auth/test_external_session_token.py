@@ -13,16 +13,15 @@ from __future__ import annotations
 
 import uuid
 
-import jwt
 import pytest
 from starlette.requests import Request
 
-import config
+from auth import tokens
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
 from auth.session_token import create_session_token, validate_session_token
-from tests.conftest import live_session_token
 from core.session import session_state
+from tests.conftest import live_session_token
 
 
 def _ctx(**kw) -> SecurityContext:
@@ -32,7 +31,7 @@ def _ctx(**kw) -> SecurityContext:
 
 
 def _decode(token: str) -> dict:
-    return jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
+    return tokens.decode(token, tokens.SESSION)
 
 
 @pytest.fixture

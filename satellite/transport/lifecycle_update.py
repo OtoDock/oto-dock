@@ -17,9 +17,9 @@ import logging
 import os
 import time
 
+from .. import config
 from ..config import otodock_dir, relaunch_self, venv_exe
 from ..host import auth_paths
-from .. import config
 
 logger = logging.getLogger("satellite")
 
@@ -129,7 +129,7 @@ async def _self_uninstall_and_exit() -> None:
                 spawned = False
                 if config.HOST.service_manager == config.SERVICE_SYSTEMD and shutil.which("systemd-run"):
                     try:
-                        subprocess.Popen(
+                        subprocess.Popen(  # noqa: ASYNC220  # the update blocks the loop by design, the proxy closes the link after the push
                             ["systemd-run", "--user", "--collect",
                              "bash", str(uninstall_script), "--yes"],
                             cwd="/tmp", env=env,
@@ -138,7 +138,7 @@ async def _self_uninstall_and_exit() -> None:
                             start_new_session=True,
                         )
                         spawned = True
-                    except Exception:
+                    except (OSError, subprocess.SubprocessError):
                         logger.warning(
                             "systemd-run spawn failed; falling back to bash",
                             exc_info=True,
@@ -146,7 +146,7 @@ async def _self_uninstall_and_exit() -> None:
                 if not spawned:
                     # start_new_session detaches from our cwd so the script can
                     # remove the OtoDock dir without rmdir failing.
-                    subprocess.Popen(
+                    subprocess.Popen(  # noqa: ASYNC220  # the update blocks the loop by design, the proxy closes the link after the push
                         ["bash", str(uninstall_script), "--yes"],
                         cwd="/tmp",
                         stdout=subprocess.DEVNULL,
@@ -162,7 +162,7 @@ async def _self_uninstall_and_exit() -> None:
                 # the rare missing-script case accepts that.
                 logger.info("uninstall.ps1 missing, doing inline cleanup")
                 with contextlib.suppress(Exception):
-                    subprocess.run(
+                    subprocess.run(  # noqa: ASYNC221  # the update blocks the loop by design, the proxy closes the link after the push
                         ["schtasks", "/Delete", "/TN", "OtoDockSatellite", "/F"],
                         timeout=15, stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL, check=False,
@@ -185,7 +185,7 @@ async def _self_uninstall_and_exit() -> None:
                         ["systemctl", "--user", "disable", service_unit.UNIT_NAME],
                     ):
                         with contextlib.suppress(Exception):
-                            subprocess.run(
+                            subprocess.run(  # noqa: ASYNC221  # the update blocks the loop by design, the proxy closes the link after the push
                                 cmd, env=env, timeout=15,
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, check=False,
@@ -275,7 +275,7 @@ def _reap_own_children_before_restart() -> None:
                 "Reaping %d child process(es) before update-restart", len(procs),
             )
             reap_descendants(procs, timeout=5.0)
-    except Exception:
+    except Exception:  # noqa: BLE001  # reaping children on the exit path must not stop the restart
         logger.warning(
             "pre-restart child reap failed (continuing to exit)", exc_info=True,
         )
@@ -451,13 +451,13 @@ async def _self_update_and_restart(payload: dict) -> None:
                         # partial copy before retrying.
                         if new_venv_target.exists():
                             shutil.rmtree(new_venv_target, ignore_errors=True)
-                        time.sleep(0.5)
+                        time.sleep(0.5)  # noqa: ASYNC251  # the update blocks the loop by design, the proxy closes the link after the push
             else:
                 # Fresh venv in sat_new/. Creating + installing in a side
                 # dir never touches the running interpreter's files.
                 new_py = str(venv_exe(new_venv_target, "python"))
                 try:
-                    subprocess.run(
+                    subprocess.run(  # noqa: ASYNC221  # the update blocks the loop by design, the proxy closes the link after the push
                         [sys.executable, "-m", "venv", str(new_venv_target)],
                         check=True,
                     )
@@ -467,7 +467,7 @@ async def _self_update_and_restart(payload: dict) -> None:
                     # to ABORT the whole update. Best-effort — the venv's bundled
                     # ensurepip pip already installs requirements fine, so a
                     # failed self-upgrade must NOT fail the update.
-                    _r = subprocess.run(
+                    _r = subprocess.run(  # noqa: ASYNC221  # the update blocks the loop by design, the proxy closes the link after the push
                         [new_py, "-m", "pip", "install", "-q", "--upgrade", "pip"],
                     )
                     if _r.returncode != 0:
@@ -475,7 +475,7 @@ async def _self_update_and_restart(payload: dict) -> None:
                             "Update: pip self-upgrade failed (rc=%s) — "
                             "continuing with the bundled pip", _r.returncode,
                         )
-                    subprocess.run(
+                    subprocess.run(  # noqa: ASYNC221  # the update blocks the loop by design, the proxy closes the link after the push
                         [new_py, "-m", "pip", "install",
                          "-q", "-r", str(new_req_path)],
                         check=True,
@@ -536,14 +536,14 @@ async def _self_update_and_restart(payload: dict) -> None:
             base_python = _resolve_base_python()
             new_py = str(venv_exe(sat_root / "venv", "python"))
             try:
-                subprocess.run(
+                subprocess.run(  # noqa: ASYNC221  # the update blocks the loop by design, the proxy closes the link after the push
                     [base_python, "-m", "venv", str(sat_root / "venv")],
                     check=True,
                 )
                 # Best-effort pip self-upgrade via `python -m pip` (see the
                 # Windows path) — a failure here must not abort the update; the
                 # venv's bundled pip installs requirements fine.
-                _r = subprocess.run(
+                _r = subprocess.run(  # noqa: ASYNC221  # the update blocks the loop by design, the proxy closes the link after the push
                     [new_py, "-m", "pip", "install", "-q", "--upgrade", "pip"],
                 )
                 if _r.returncode != 0:
@@ -551,7 +551,7 @@ async def _self_update_and_restart(payload: dict) -> None:
                         "Update: pip self-upgrade failed (rc=%s) — "
                         "continuing with the bundled pip", _r.returncode,
                     )
-                subprocess.run(
+                subprocess.run(  # noqa: ASYNC221  # the update blocks the loop by design, the proxy closes the link after the push
                     [new_py, "-m", "pip", "install",
                      "-q", "-r", str(sat_root / "requirements.txt")],
                     check=True,
@@ -593,7 +593,7 @@ async def _self_update_and_restart(payload: dict) -> None:
         try:
             if sat_new.exists():
                 shutil.rmtree(sat_new, ignore_errors=True)
-        except Exception:
+        except Exception:  # noqa: BLE001  # removing a half-extracted update after the update failed
             pass
         with contextlib.suppress(OSError):
             marker.unlink()

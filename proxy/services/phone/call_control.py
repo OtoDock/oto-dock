@@ -19,8 +19,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
 
 logger = logging.getLogger("otodock")
 
@@ -127,7 +127,7 @@ async def request(session_id: str, action: str, args: dict, *,
     except asyncio.TimeoutError:
         logger.warning("call control: %s on session %s got no answer", action, session_id[:8])
         return {"ok": False, "message": NO_ANSWER_MESSAGE}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool is told the call did not answer whatever the send raised
         logger.warning("call control: %s on session %s failed: %s", action, session_id[:8], e)
         return {"ok": False, "message": NO_ANSWER_MESSAGE}
     finally:

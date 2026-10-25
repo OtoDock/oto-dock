@@ -1,16 +1,18 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { Fragment, useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { useAgentInfo, useUpdateAgent, useDeleteAgent, useDelegationTargets, useSetDelegationTargets, useExecutionLayers, useSetDefaultForNewUsers, useKnowledgeAttachments, useKnowledgeLibraries, useSetKnowledgeLibrary, useAttachKnowledgeLibrary, useDetachKnowledgeLibrary, useAgentFiles, useAgentUsers, AgentUpdateError, type AgentUser, type SharedOnlySwitchResult, type KnowledgeLibrary, type FileNode } from '../../api/agents'
-import { useRemoteMachines } from '../../api/remoteMachines'
+import { useAgentInfo, useUpdateAgent, useDeleteAgent, useDelegationTargets, useSetDelegationTargets, useExecutionLayers, useSetDefaultForNewUsers, useKnowledgeAttachments, useKnowledgeLibraries, useSetKnowledgeLibrary, useAttachKnowledgeLibrary, useDetachKnowledgeLibrary, useAgentFiles, useAgentUsers, AgentUpdateError, type AgentInfo, type AgentUser, type SharedOnlySwitchResult, type KnowledgeLibrary, type FileNode } from '../../api/agents'
+import { LOCAL_LABEL, placePhrase, useRemoteMachines } from '../../api/remoteMachines'
 import { PAIRING_SCOPE, TARGET_LOCAL, isLocalTarget } from '../../lib/placement'
-import { MACHINE_STATE } from '../../lib/status/machine'
+import { MACHINE_STATE, machineStateWord } from '../../lib/status/machine'
 import { useDepartments } from '../../api/departments'
 import { wiringSentence } from '../../lib/kinds/department'
 import { useAuth } from '../../contexts/AuthContext'
 import { useFlag } from '../../hooks/useFlag'
 import { ROLE, allowedOnSharedOnly, canManageAgent, isAdmin as isPlatformAdmin, isCreatorOrAbove, roleLabel, type AgentRole } from '../../lib/permissions'
+import InvokedForm from '../../components/common/InvokedForm'
 import { tierMarkText, tierTitle } from '../../lib/tiers'
+import { toastError } from '../../lib/http/apiJson'
 import {
   type VisibilityMode,
   columnsOf,
@@ -26,9 +28,16 @@ import StrongConfirmModal from '../../components/StrongConfirmModal'
 import AgentUpdateModal from '../../components/AgentUpdateModal'
 import { engineLabel, isCoding, orderedEngines, runsInteractive, runsRemote, vendorBadge } from '../../lib/engines'
 import { coerceEffort, effortLabel, effortLadder, offeredEffortLevels, type EffortListing } from '../../lib/engines/effort'
-import { Toggle, SavedIndicator, DeleteModal, COLOR_PRESETS } from './AgentConfig.parts'
+import Switch from '../../components/ui/Switch'
+import Button from '../../components/ui/Button'
+import { Input, Select } from '../../components/ui/Field'
+import InfoTip from '../../components/ui/InfoTip'
+import { SaveState, SettingRow } from '../../components/ui/SettingsControls'
+import { useSaveState } from '../../hooks/useSaveState'
+import { BADGE_BASE, BADGE_TONE, CARD, CARD_BORDERED, FIELD, FIELD_BORDER, FIELD_REGULAR } from '../../components/ui/classes'
 import { MemorySection } from './AgentConfig.memory'
 import { HEAD } from '../../lib/layout/tree'
+import { COLOR_PRESETS } from './AgentConfig.presets'
 
 // ---------------------------------------------------------------------------
 // Main component
@@ -108,15 +117,15 @@ export default function AgentConfig() {
   const [switchPeople, setSwitchPeople] = useState<AgentUser[] | null>(null)
   const [switchError, setSwitchError] = useState<string | null>(null)
   const [switchNotice, setSwitchNotice] = useState<string | null>(null)
-  const [dfnuError, setDfnuError] = useState<string | null>(null)
   const [adminOnly, setAdminOnly] = useState(false)
   const [showTemplateUpdate, setShowTemplateUpdate] = useState(false)
   const [agentColor, setAgentColor] = useState('')
   const [displayName, setDisplayName] = useState('')
   const [description, setDescription] = useState('')
-  const [savedField, setSavedField] = useState<string | null>(null)
+  const { stateOf, run, markSaved } = useSaveState()
   const [deleteModalOpen, setDeleteModalOpen] = useState(false)
   const [executionTarget, setExecutionTarget] = useState<string>(TARGET_LOCAL)
+  const targetMachine = (machines ?? []).find(m => m.id === executionTarget)
   // Department assignment ('' = unassigned). The two ids always travel
   // together — see saveDepartment.
   const [departmentId, setDepartmentId] = useState('')
@@ -128,6 +137,7 @@ export default function AgentConfig() {
   // Shared knowledge — per-library state. Attachment identity is the
   // (source, subdir) pair, so optimistic-writable keys join both.
   const [shareFormOpen, setShareFormOpen] = useState(false)
+  const shareButtonRef = useRef<HTMLButtonElement>(null)
   const [libraryNameDraft, setLibraryNameDraft] = useState('')
   const [librarySubdirDraft, setLibrarySubdirDraft] = useState('')
   // Set while renaming an existing library — locks the subfolder field so
@@ -141,8 +151,10 @@ export default function AgentConfig() {
   const [attachWritable, setAttachWritable] = useState(false)
   const [unshareTarget, setUnshareTarget] = useState<KnowledgeLibrary | null>(null)
 
-  useEffect(() => {
-    if (!info) return
+  // The agent's row fills the form when it arrives or changes (in render).
+  const [infoShown, setInfoShown] = useState<typeof info>(undefined)
+  if (info && infoShown !== info) {
+    setInfoShown(info)
     setExecutionPath(info.execution_path || '')
     setExecutionPaths(info.execution_paths || (info.execution_path ? [info.execution_path] : []))
     setDefaultModel(info.default_model || '')
@@ -162,41 +174,54 @@ export default function AgentConfig() {
     // Off: the role the toggle would turn on with (editor on a Shared-only
     // agent, whose rows take editor or above).
     setDfnuRole(dfnuRoleRaw || (isSharedOnly(modeOfAgent(info)) ? ROLE.EDITOR : ROLE.VIEWER))
-  }, [info])
+  }
 
-  useEffect(() => {
-    if (knowledgeData) {
-      setAttachmentWritable(Object.fromEntries(
-        knowledgeData.attachments.map(
-          (a) => [libKey(a.source_agent, a.subdir), a.writable]),
-      ))
-    }
-  }, [knowledgeData])
+  const [knowledgeShown, setKnowledgeShown] = useState<typeof knowledgeData>(undefined)
+  if (knowledgeData && knowledgeShown !== knowledgeData) {
+    setKnowledgeShown(knowledgeData)
+    setAttachmentWritable(Object.fromEntries(
+      knowledgeData.attachments.map(
+        (a) => [libKey(a.source_agent, a.subdir), a.writable]),
+    ))
+  }
 
-  useEffect(() => {
-    if (delegationData) {
-      // selectedTargets holds MANUAL targets only — it's the PUT payload.
-      // Department-compiled targets are locked rows the compiler owns; if an
-      // agent somehow appears in both lists (defensive), compiled wins so a
-      // toggle round-trip can never re-submit it as manual.
-      const locked = new Set((delegationData.compiled ?? []).map((e) => e.target))
-      setSelectedTargets(new Set(delegationData.targets.filter((t) => !locked.has(t))))
-    }
-  }, [delegationData])
+  const [delegationShown, setDelegationShown] = useState<typeof delegationData>(undefined)
+  if (delegationData && delegationShown !== delegationData) {
+    setDelegationShown(delegationData)
+    // selectedTargets holds MANUAL targets only — it's the PUT payload.
+    // Department-compiled targets are locked rows the compiler owns; if an
+    // agent somehow appears in both lists (defensive), compiled wins so a
+    // toggle round-trip can never re-submit it as manual.
+    const locked = new Set((delegationData.compiled ?? []).map((e) => e.target))
+    setSelectedTargets(new Set(delegationData.targets.filter((t) => !locked.has(t))))
+  }
 
+  // A revert puts back the agent's row as the server has it when the refusal
+  // lands, never the value from before the click: two quick changes may both
+  // be refused.
+  const stored = useRef(info)
+  useLayoutEffect(() => { stored.current = info })
+  const back = useCallback((apply: (i: AgentInfo) => void) => () => {
+    if (stored.current) apply(stored.current)
+  }, [])
+  const revertDfnu = back((i) => {
+    const role = i.default_for_new_users_role
+    setDfnuEnabled(!!role)
+    setDfnuRole(role || (isSharedOnly(modeOfAgent(i)) ? ROLE.EDITOR : ROLE.VIEWER))
+  })
+
+  // `mutateAsync` and `run` keep their identity across renders, so `save`
+  // does too and the effects that list it never fire twice. `revert` puts
+  // the person's own change back; a correction the page makes by itself
+  // passes none (a revert would bring the stale value back and the check
+  // would fire again).
+  const { mutateAsync: mutateAgentAsync } = updateAgent
   const save = useCallback(
-    (field: string, value: any) => {
-      updateAgent.mutate(
-        { name: name!, [field]: value },
-        {
-          onSuccess: () => {
-            setSavedField(field)
-            setTimeout(() => setSavedField(null), 1500)
-          },
-        },
-      )
+    (field: string, value: unknown, revert?: () => void) => {
+      void run(field, () => mutateAgentAsync({ name: name!, [field]: value }),
+        { failTitle: 'The setting was not saved', revert })
     },
-    [name, updateAgent],
+    [name, mutateAgentAsync, run],
   )
 
   // Current visibility mode + a one-PATCH writer that persists both columns
@@ -207,17 +232,14 @@ export default function AgentConfig() {
       const cols = columnsOf(next)
       setCollaborative(cols.collaborative)
       setDefaultScope(cols.default_scope)
-      updateAgent.mutate(
+      void run('visibility_mode', () => updateAgent.mutateAsync(
         { name: name!, collaborative: cols.collaborative, default_scope: cols.default_scope },
-        {
-          onSuccess: () => {
-            setSavedField('visibility_mode')
-            setTimeout(() => setSavedField(null), 1500)
-          },
-        },
-      )
+      ), {
+        failTitle: 'The visibility mode was not saved',
+        revert: back((i) => { setCollaborative(i.collaborative ?? true); setDefaultScope(i.default_scope || 'user') }),
+      })
     },
-    [name, updateAgent],
+    [name, updateAgent, run, back],
   )
 
   // Department assignment — a one-PATCH writer like saveMode: the backend
@@ -229,19 +251,17 @@ export default function AgentConfig() {
     (deptId: string, levelId: string) => {
       setDepartmentId(deptId)
       setDepartmentLevelId(levelId)
-      updateAgent.mutate(
+      void run('department', () => updateAgent.mutateAsync(
         { name: name!, department_id: deptId, department_level_id: levelId },
-        {
-          onSuccess: () => {
-            setSavedField('department')
-            setTimeout(() => setSavedField(null), 1500)
-            queryClient.invalidateQueries({ queryKey: ['departments'] })
-            queryClient.invalidateQueries({ queryKey: ['delegation-targets', name] })
-          },
-        },
-      )
+      ).then(() => Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['departments'] }),
+        queryClient.invalidateQueries({ queryKey: ['delegation-targets', name] }),
+      ])), {
+        failTitle: 'The department was not saved',
+        revert: back((i) => { setDepartmentId(i.department_id || ''); setDepartmentLevelId(i.department_level_id || '') }),
+      })
     },
-    [name, updateAgent, queryClient],
+    [name, updateAgent, queryClient, run, back],
   )
 
   // Folder picker feed for the share form: the agent's knowledge/ subtree,
@@ -285,38 +305,34 @@ export default function AgentConfig() {
   )
   // Opening the form preselects the whole folder; when a library already
   // covers the current pick, fall to the first free folder once the tree
-  // loads (same-value sets bail out, so this can't loop).
-  useEffect(() => {
-    if (!shareFormOpen || renamingSubdir !== null) return
-    if (!shareOverlap(librarySubdirDraft)) return
+  // loads (in render; a pick that is free stays, so this converges).
+  if (shareFormOpen && renamingSubdir === null && shareOverlap(librarySubdirDraft)) {
     const free = ['', ...knowledgeFolders.map((f) => f.path)]
-      .find((p) => !shareOverlap(p))
-    setLibrarySubdirDraft(free ?? '')
-  }, [shareFormOpen, renamingSubdir, knowledgeFolders, shareOverlap, librarySubdirDraft])
+      .find((p) => !shareOverlap(p)) ?? ''
+    if (free !== librarySubdirDraft) setLibrarySubdirDraft(free)
+  }
 
   // Share (or rename — same PUT) one library: a subtree of this agent's
   // knowledge folder ('' = the whole folder). Server-side validation
   // (subdir shape, overlap, bulletin rename conflicts) lands in shareError.
+  // `close` is the open form's own close, which gives the focus back.
   const shareLibrary = useCallback(
-    (subdir: string, libraryName: string) => {
+    (subdir: string, libraryName: string, close: (setClosed: () => void) => void) => {
       setShareError('')
-      setKnowledgeLibrary.mutate(
+      void run(`knowledge:own:${subdir}`, () => setKnowledgeLibrary.mutateAsync(
         { agent: name!, enabled: true, name: libraryName, subdir },
-        {
-          onSuccess: () => {
-            setShareFormOpen(false)
-            setRenamingSubdir(null)
-            setLibraryNameDraft('')
-            setLibrarySubdirDraft('')
-            setSavedField('shared_knowledge')
-            setTimeout(() => setSavedField(null), 1500)
-          },
-          onError: (e) => setShareError(
-            e instanceof Error ? e.message : 'Failed to share library'),
-        },
-      )
+      ).then(() => {
+        close(() => {
+          setShareFormOpen(false)
+          setRenamingSubdir(null)
+        })
+        setLibraryNameDraft('')
+        setLibrarySubdirDraft('')
+      }), {
+        onFail: (e) => setShareError(e instanceof Error ? e.message : 'Failed to share library'),
+      })
     },
-    [name, setKnowledgeLibrary],
+    [name, setKnowledgeLibrary, run],
   )
 
   // Un-share ONE library. With consumers attached the caller routes through
@@ -324,17 +340,11 @@ export default function AgentConfig() {
   // and tears their mirror subtrees down (v1 warns, never blocks).
   const unshareLibrary = useCallback(
     (subdir: string) => {
-      setKnowledgeLibrary.mutate(
+      void run(`knowledge:own:${subdir}`, () => setKnowledgeLibrary.mutateAsync(
         { agent: name!, enabled: false, subdir },
-        {
-          onSuccess: () => {
-            setSavedField('shared_knowledge')
-            setTimeout(() => setSavedField(null), 1500)
-          },
-        },
-      )
+      ), { failTitle: 'The library was not unshared' })
     },
-    [name, setKnowledgeLibrary],
+    [name, setKnowledgeLibrary, run],
   )
 
   // Flipping into OR out of Shared only changes chat-history grouping (one
@@ -381,16 +391,15 @@ export default function AgentConfig() {
           const r = row?.shared_only_switch
           const notes: string[] = []
           if (r?.not_removed?.length) {
-            notes.push(`${r.not_removed.length} viewer or contributor assignment(s) were kept `
-              + '(added during the switch, or not removed): an admin changes them in Admin → Users.')
+            notes.push(`${r.not_removed.length} viewer or contributor assignment(s) were kept. `
+              + 'They were added during the switch, or their removal failed. An admin can change them in Admin, Users.')
           }
           if (r?.default_cleared) notes.push('The role new users are attached with was cleared.')
           setSwitchNotice(notes.length ? notes.join(' ') : null)
           queryClient.invalidateQueries({ queryKey: ['agent-users', name] })
           queryClient.invalidateQueries({ queryKey: ['admin-users'] })
           if (user?.sub && r?.removed?.includes(user.sub)) void refreshUser()
-          setSavedField('visibility_mode')
-          setTimeout(() => setSavedField(null), 1500)
+          markSaved('visibility_mode')
         },
         onError: (e) => {
           const fresh = e instanceof AgentUpdateError ? e.sharedOnlyPeople : null
@@ -458,12 +467,17 @@ export default function AgentConfig() {
   // A stored interactive default that the control no longer offers (the
   // agent moved to Direct LLM, or the model changed) is reset — the resolver
   // would run -p anyway, but the row must not keep claiming otherwise.
+  // The row is corrected in render; each correction is saved once, for the
+  // agent it was read from: the page stays mounted across a route from one
+  // agent's config to another's, and a correction never lands on the next.
+  const [execModeResets, setExecModeResets] = useState({ agent: name, n: 0 })
+  if (catalogLoaded && canManage && defaultExecutionMode && defaultModel && !defaultModelIsCliLayer) {
+    setDefaultExecutionMode('')
+    setExecModeResets((w) => ({ agent: name, n: w.n + 1 }))
+  }
   useEffect(() => {
-    if (catalogLoaded && canManage && defaultExecutionMode && defaultModel && !defaultModelIsCliLayer) {
-      setDefaultExecutionMode('')
-      save('default_execution_mode', '')
-    }
-  }, [catalogLoaded, canManage, defaultExecutionMode, defaultModel, defaultModelIsCliLayer, save])
+    if (execModeResets.n > 0 && execModeResets.agent === name) save('default_execution_mode', '')
+  }, [execModeResets, save, name])
 
   // The Default Effort ladder is the union of the enabled engines' declared
   // levels, trimmed to what the chosen model's provider takes and gated per
@@ -489,20 +503,22 @@ export default function AgentConfig() {
   // A stored effort the control no longer offers is written back as what it
   // shows, so the dropdown and the DB never disagree — only once the catalog
   // has answered (an empty list before it loads is not "not offered").
-  useEffect(() => {
-    if (!catalogLoaded || !canManage || !defaultEffort || shownEffort === defaultEffort) return
+  const [effortWrites, setEffortWrites] = useState({ agent: name, n: 0, value: '' })
+  if (catalogLoaded && canManage && defaultEffort && shownEffort !== defaultEffort) {
     setDefaultEffort(shownEffort)
-    save('default_effort', shownEffort)
-  }, [catalogLoaded, canManage, defaultEffort, shownEffort, save])
+    setEffortWrites((w) => ({ agent: name, n: w.n + 1, value: shownEffort }))
+  }
+  useEffect(() => {
+    if (effortWrites.n > 0 && effortWrites.agent === name) save('default_effort', effortWrites.value)
+  }, [effortWrites, save, name])
 
   const handleDelete = () => {
-    deleteAgent.mutate(
-      { name: name!, confirm_slug: name! },
-      { onSuccess: () => navigate('/agents') },
-    )
+    deleteAgent.mutateAsync({ name: name!, confirm_slug: name! })
+      .then(() => navigate('/agents'))
+      .catch(toastError('The agent was not deleted'))
   }
 
-  if (isLoading) return <p className="text-sm text-p-text-secondary">Loading...</p>
+  if (isLoading) return <p className="text-sm text-secondary">Loading...</p>
 
   const agentRole = name ? user?.agent_roles?.[name] : undefined
   const isReadOnly = !canManage  // editor + viewer: read-only
@@ -513,6 +529,9 @@ export default function AgentConfig() {
   const compiledByTarget = new Map(
     (delegationData?.compiled ?? []).map((e) => [e.target, e] as const),
   )
+  // The selected department's own wiring, so the row says what the locked
+  // "via" rows below will contain.
+  const assignedDept = (departments ?? []).find((d) => d.id === departmentId)
 
   // Shared-knowledge mutation gate: platform admin/creator AND page-editable
   // (a creator who doesn't manage this agent is read-only here, matching the
@@ -527,56 +546,155 @@ export default function AgentConfig() {
     (l) => l.source_agent !== name && !attachedPairs.has(libKey(l.source_agent, l.subdir)),
   )
 
+  // The share form opens where it was invoked: under the header for a new
+  // share, under the library's row for a rename.
+  const closeShareForm = () => {
+    setShareFormOpen(false)
+    setRenamingSubdir(null)
+    setShareError('')
+  }
+  const shareForm = shareFormOpen && (
+    <InvokedForm onCancel={closeShareForm} fallback={shareButtonRef} className="flex flex-col gap-2">
+      {(close) => (
+        <>
+          {renamingSubdir !== null ? (
+            // Rename keeps the (source, subdir) identity — show the
+            // locked folder instead of the picker.
+            <div className="px-3 py-1.5 text-sm font-mono rounded-control bg-surface-muted text-secondary">
+              {renamingSubdir ? `knowledge/${renamingSubdir}/` : 'The whole knowledge/ folder'}
+            </div>
+          ) : (
+            // Folder picker: the agent's knowledge tree, browsed and picked
+            // like the workspace list.
+            <div
+              role="listbox"
+              aria-label="Library subfolder"
+              className="max-h-44 overflow-y-auto rounded-card border border-subtle divide-y divide-subtle"
+            >
+              {[{ path: '', depth: 0 }, ...knowledgeFolders].map(({ path, depth }) => {
+                const overlap = shareOverlap(path)
+                const selected = librarySubdirDraft === path
+                return (
+                  <button
+                    key={path || '(root)'}
+                    type="button"
+                    role="option"
+                    aria-selected={selected}
+                    disabled={!!overlap}
+                    onClick={() => setLibrarySubdirDraft(path)}
+                    title={overlap ? `Overlaps the shared library “${overlap}”` : undefined}
+                    style={{ paddingLeft: `${0.75 + depth * 1.1}rem` }}
+                    className={`w-full flex items-center gap-2 py-1.5 pr-3 text-sm text-left transition-colors ${
+                      selected ? 'bg-action-subtle text-link' : 'text-primary hover:bg-surface-hover'
+                    } disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer`}
+                  >
+                    <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                            d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                    </svg>
+                    <span className={path ? 'font-mono' : ''}>
+                      {path || 'Whole knowledge folder'}
+                    </span>
+                    {overlap && (
+                      // aria-hidden: the option's accessible name
+                      // stays the bare path (the title carries why).
+                      <span aria-hidden="true" className="ml-auto text-3xs text-tertiary shrink-0">shared</span>
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <Input
+              value={libraryNameDraft}
+              maxLength={64}
+              onChange={(e) => setLibraryNameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && libraryNameDraft.trim()
+                    && (renamingSubdir !== null || !shareOverlap(librarySubdirDraft))) {
+                  shareLibrary(librarySubdirDraft.trim().replace(/^\/+|\/+$/g, ''), libraryNameDraft.trim(), close)
+                }
+              }}
+              placeholder="Name this library, e.g. Brand Guidelines"
+              aria-label="Library name"
+              className="flex-1"
+            />
+            <div className="flex gap-2">
+              <Button
+                variant="primary" size="xs"
+                onClick={() => shareLibrary(librarySubdirDraft.trim().replace(/^\/+|\/+$/g, ''), libraryNameDraft.trim(), close)}
+                disabled={!libraryNameDraft.trim()
+                  || (renamingSubdir === null && shareOverlap(librarySubdirDraft) !== null)}
+              >
+                {renamingSubdir !== null ? 'Rename' : 'Share'}
+              </Button>
+              <Button size="xs" onClick={() => close(closeShareForm)}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+          {shareError && (
+            <p className="text-xs text-status-danger-fg">{shareError}</p>
+          )}
+        </>
+      )}
+    </InvokedForm>
+  )
+
   return (
     <div className="space-y-6">
       {isReadOnly && (
-        <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-xl px-4 py-3 text-xs text-amber-800 dark:text-amber-200">
+        <div className="bg-status-warning-bg border border-status-warning-border rounded-card px-4 py-3 text-xs text-status-warning-fg">
           <strong>Read-only.</strong> Agent settings are owner-only.{' '}
           {agentRole === ROLE.EDITOR
-            ? 'As an editor you can collaborate on the agent\'s shared workspace and files; agent behavior (prompt, MCPs, knowledge, default scope) is curated by an owner.'
+            ? 'As an editor you can work on the agent\'s shared workspace and files. An owner sets how the agent behaves: its prompt, MCPs, knowledge and default scope.'
             : agentRole === ROLE.CONTRIBUTOR
-              ? 'As a contributor you can add and edit files in the agent\'s shared workspace; agent behavior (prompt, MCPs, knowledge, default scope) is curated by an owner.'
+              ? 'As a contributor you can add and edit files in the agent\'s shared workspace. An owner sets how the agent behaves: its prompt, MCPs, knowledge and default scope.'
             : agentRole === ROLE.VIEWER
-              ? 'As a viewer you can read the agent\'s workspace, knowledge, and config; only owners can change them.'
+              ? 'As a viewer you can read the agent\'s workspace, knowledge and settings. Only owners can change them.'
               : 'You do not have manager access to this agent.'}
         </div>
       )}
       {canManage && info?.template_update?.update_available && (
         <div
-          className="bg-brand/5 border border-brand/30 rounded-xl px-4 py-3 text-xs text-p-text flex flex-wrap items-center justify-between gap-2"
+          className="bg-status-info-bg border border-status-info-border rounded-card px-4 py-3 text-xs text-status-info-fg flex flex-wrap items-center justify-between gap-2"
           data-testid="template-update-banner"
         >
           <span>
             <strong>Version {info.template_update.catalog_version}</strong> of this agent's template is available
-            {info.template_update.installed_version ? ` (installed: ${info.template_update.installed_version})` : ''}.
-            {!info.template_update.compat_ok ? ' It needs a newer OtoDock.' : ' What you changed stays; the update shows what it replaces before it runs.'}
+            {info.template_update.installed_version ? `, and you have ${info.template_update.installed_version}` : ''}.
+            {!info.template_update.compat_ok ? ' It needs a newer OtoDock.' : ' What you changed stays. The update shows what it replaces before it runs.'}
           </span>
-          <button
+          <Button
+            variant="primary" size="xs"
             onClick={() => setShowTemplateUpdate(true)}
             disabled={!info.template_update.compat_ok}
-            className="px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-brand hover:bg-brand-hover transition-colors disabled:opacity-50"
           >
             Update
-          </button>
+          </Button>
         </div>
       )}
       {showTemplateUpdate && name && (
         <AgentUpdateModal open agentSlug={name} onClose={() => setShowTemplateUpdate(false)} />
       )}
       {/* Settings */}
-      <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4">
-        <p className="text-xs font-semibold text-p-text-secondary uppercase mb-4">Agent Configuration</p>
+      <div className={`${CARD} p-4`}>
+        <p className="text-xs font-semibold text-secondary uppercase mb-4">Agent Configuration</p>
         {/* divide-y draws a subtle separator between every setting; the child
             padding utilities give each row consistent breathing room. */}
-        <div className="divide-y divide-p-border-light [&>*]:py-4 [&>*:first-child]:pt-0 [&>*:last-child]:pb-0">
+        <div className="divide-y divide-subtle [&>*]:py-4 [&>*:first-child]:pt-0 [&>*:last-child]:pb-0">
           {/* Display Name */}
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
             <div>
-              <p className="text-sm font-medium text-p-text">Display Name</p>
-              <p className="text-xs text-p-text-light">Human-readable agent name</p>
+              <p className="text-sm font-medium text-primary">
+                Display Name
+                <InfoTip label="Display Name">Human-readable agent name</InfoTip>
+                <SaveState state={stateOf('display_name')} />
+              </p>
             </div>
             <div className="flex items-center gap-2">
-              <input
+              <Input
                 type="text"
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
@@ -590,19 +708,20 @@ export default function AgentConfig() {
                     (e.target as HTMLInputElement).blur()
                   }
                 }}
-                className="px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 w-48"
+                className="max-w-48 sm:w-48"
               />
-              <SavedIndicator show={savedField === 'display_name'} />
             </div>
           </div>
 
           {/* Slug (read-only) */}
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
             <div>
-              <p className="text-sm font-medium text-p-text">Slug</p>
-              <p className="text-xs text-p-text-light">Unique identifier (read-only)</p>
+              <p className="text-sm font-medium text-primary">
+                Slug
+                <InfoTip label="Slug">Unique identifier, read-only</InfoTip>
+              </p>
             </div>
-            <span className="px-2.5 py-1.5 text-sm text-p-text-secondary font-mono bg-p-surface rounded-lg border border-p-border-light">
+            <span className="px-2.5 py-1.5 text-sm text-secondary font-mono bg-surface-muted rounded-control">
               {name}
             </span>
           </div>
@@ -616,12 +735,14 @@ export default function AgentConfig() {
               data-testid="template-row"
             >
               <div>
-                <p className="text-sm font-medium text-p-text">Template</p>
-                <p className="text-xs text-p-text-light">
-                  The community template this agent came from. A newer version shows above when the catalog has one.
+                <p className="text-sm font-medium text-primary">
+                  Template
+                  <InfoTip label="Template">
+                    The community template this agent came from. A newer version shows above when the community list has one.
+                  </InfoTip>
                 </p>
               </div>
-              <span className="px-2.5 py-1.5 text-sm text-p-text-secondary font-mono bg-p-surface rounded-lg border border-p-border-light">
+              <span className="px-2.5 py-1.5 text-sm text-secondary font-mono bg-surface-muted rounded-control">
                 {info.community_template.startsWith('local:') ? 'local template' : info.community_template}
                 {' · '}
                 {info.community_template_version ? `version ${info.community_template_version}` : 'version unknown'}
@@ -633,10 +754,12 @@ export default function AgentConfig() {
           <div className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm font-medium text-p-text">Description</p>
-                <p className="text-xs text-p-text-light">What this agent does — shown on cards and to other agents</p>
+                <p className="text-sm font-medium text-primary">
+                  Description
+                  <InfoTip label="Description">What this agent does, shown on cards and to other agents</InfoTip>
+                  <SaveState state={stateOf('description')} />
+                </p>
               </div>
-              <SavedIndicator show={savedField === 'description'} />
             </div>
             <textarea
               value={description}
@@ -648,15 +771,18 @@ export default function AgentConfig() {
               }}
               rows={2}
               placeholder="e.g., Manages smart home devices, cameras, and automations"
-              className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 resize-none"
+              className={`${FIELD} ${FIELD_BORDER} ${FIELD_REGULAR} resize-none`}
             />
           </div>
 
           {/* Agent Color */}
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
             <div>
-              <p className="text-sm font-medium text-p-text">Agent Color</p>
-              <p className="text-xs text-p-text-light">Color for cards and chat avatar</p>
+              <p className="text-sm font-medium text-primary">
+                Agent Color
+                <InfoTip label="Agent Color">Color for cards and chat avatar</InfoTip>
+                <SaveState state={stateOf('color')} />
+              </p>
             </div>
             <div className="flex items-center gap-2">
               <div className="flex gap-1.5 flex-wrap justify-end">
@@ -666,18 +792,17 @@ export default function AgentConfig() {
                     title={name}
                     onClick={() => {
                       setAgentColor(hex)
-                      save('color', hex)
+                      save('color', hex, back((i) => setAgentColor(i.color || '')))
                     }}
                     className={`w-6 h-6 rounded-full border-2 transition-all ${
                       agentColor === hex
-                        ? 'border-p-text scale-110'
+                        ? 'border-action scale-110'
                         : 'border-transparent hover:scale-105'
                     }`}
                     style={{ backgroundColor: hex }}
                   />
                 ))}
               </div>
-              <SavedIndicator show={savedField === 'color'} />
             </div>
           </div>
 
@@ -685,10 +810,12 @@ export default function AgentConfig() {
           <div className="flex flex-col gap-3">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <p className="text-sm font-medium text-p-text">AI Engines</p>
-                <p className="text-xs text-p-text-light">Which AI engines this agent can use</p>
+                <p className="text-sm font-medium text-primary">
+                  AI Engines
+                  <InfoTip label="AI Engines">Which AI engines this agent can use</InfoTip>
+                  <SaveState state={stateOf('execution_paths')} />
+                </p>
               </div>
-              <SavedIndicator show={savedField === 'execution_paths' || savedField === 'execution_path'} />
             </div>
             {/* Click-to-toggle cards (like the visibility options) — full-width,
                 mobile-friendly, with a provider badge per engine. */}
@@ -727,14 +854,17 @@ export default function AgentConfig() {
                         setDefaultModel('')
                         save('default_model', '')
                       }
-                      save('execution_paths', next)
+                      save('execution_paths', next, back((i) => {
+                        setExecutionPaths(i.execution_paths || (i.execution_path ? [i.execution_path] : []))
+                        setExecutionPath(i.execution_path || '')
+                      }))
                     }}
-                    className={`w-full flex items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors ${
-                      checked ? 'border-brand bg-brand-surface' : 'border-p-border-light hover:bg-p-surface-hover'
+                    className={`w-full flex items-start gap-2.5 rounded-control border px-3 py-2 text-left transition-colors ${
+                      checked ? 'border-subtle bg-action-subtle' : 'border-subtle hover:bg-surface-hover'
                     } ${isReadOnly || lockedOff ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
                   >
                     <span className={`mt-0.5 w-4 h-4 shrink-0 rounded-sm border flex items-center justify-center ${
-                      checked ? 'bg-brand border-brand text-white' : 'border-p-border-light'
+                      checked ? 'bg-action border-action text-action-fg' : 'border-strong'
                     }`}>
                       {checked && (
                         <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -745,21 +875,21 @@ export default function AgentConfig() {
                     <span className="min-w-0">
                       <span className="flex items-center gap-1.5 flex-wrap">
                         {badge && (
-                          <span className="text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-p-bg text-p-text-secondary border border-p-border-light">
+                          <span className="text-3xs font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-surface-muted text-secondary">
                             {badge}
                           </span>
                         )}
-                        <span className="text-sm font-medium text-p-text">{label}</span>
+                        <span className="text-sm font-medium text-primary">{label}</span>
                       </span>
                       {!isCoding(engine) && (
-                        <span className="block text-xs text-p-text-light mt-0.5">
-                          Supporting engine — fewer tools, lower latency.
+                        <span className="block text-xs text-tertiary mt-0.5">
+                          Supporting engine: fewer tools, faster replies.
                         </span>
                       )}
                       {!configured && !checked && (
-                        <span className="block text-xs text-amber-600 dark:text-amber-500 mt-0.5">
+                        <span className="block text-xs text-status-warning-fg mt-0.5">
                           No {label} subscription is connected on this platform
-                          {isAdmin ? ' — connect one in Platform → AI Engines' : ''}
+                          {isAdmin ? '. Connect one in Setup, AI Engines.' : '.'}
                         </span>
                       )}
                     </span>
@@ -776,46 +906,53 @@ export default function AgentConfig() {
           {isAdmin && remoteMachinesAvailable && (
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
             <div>
-              <p className="text-sm font-medium text-p-text">Execution Target</p>
-              <p className="text-xs text-p-text-light">
-                {!runsRemote(primaryEngine)
-                  ? 'This engine always runs on the platform host'
-                  : 'Where this agent runs — local or on a remote machine via satellite'}
+              <p className="text-sm font-medium text-primary">
+                Execution Target
+                {runsRemote(primaryEngine) && (
+                  <InfoTip label="Execution Target">
+                    {`Where this agent runs: ${placePhrase(TARGET_LOCAL, '')} or a remote machine`}
+                  </InfoTip>
+                )}
+                <SaveState state={stateOf('execution_target')} />
               </p>
+              {!runsRemote(primaryEngine) && (
+                <p className="text-xs text-tertiary">
+                  {`This engine always runs on ${placePhrase(TARGET_LOCAL, '')}`}
+                </p>
+              )}
             </div>
             {/* Mobile: the select takes the full row (min-w-0 lets it shrink
                 below its widest option) and the status badge wraps BELOW it;
                 from sm: up the badge sits beside an auto-width select. */}
             <div className="flex flex-wrap items-center gap-2 min-w-0">
               {!runsRemote(primaryEngine) ? (
-                <span className="text-sm text-p-text-light">Local only</span>
+                <span className="text-sm text-tertiary">{LOCAL_LABEL}</span>
               ) : (
-                <select
+                <Select
                   value={executionTarget}
                   onChange={e => {
                     setExecutionTarget(e.target.value)
-                    save('execution_target', e.target.value)
+                    save('execution_target', e.target.value, back((i) => setExecutionTarget(i.execution_target || TARGET_LOCAL)))
                   }}
-                  className="w-full min-w-0 sm:w-auto sm:max-w-xs px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
+                  className="sm:w-auto sm:max-w-xs"
                 >
-                  <option value={TARGET_LOCAL}>Local (this server)</option>
+                  <option value={TARGET_LOCAL}>{LOCAL_LABEL}</option>
                   {(machines ?? []).filter(m => m.pairing_scope === PAIRING_SCOPE.ADMIN).map(m => (
                     <option key={m.id} value={m.id}>
-                      {m.name} {m.status === MACHINE_STATE.ONLINE ? '' : `[${m.status}]`}
+                      {m.status === MACHINE_STATE.ONLINE ? m.name : `${m.name}, ${machineStateWord(m.status)}`}
                     </option>
                   ))}
-                </select>
+                </Select>
               )}
               {!isLocalTarget(executionTarget) && (
-                <span className={`inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium ${
-                  (machines ?? []).find(m => m.id === executionTarget)?.status === MACHINE_STATE.ONLINE
-                    ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
-                    : 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
+                <span className={`${BADGE_BASE} ${
+                  targetMachine?.status === MACHINE_STATE.ONLINE
+                    ? BADGE_TONE.success
+                    : BADGE_TONE.warning
                 }`}>
-                  {(machines ?? []).find(m => m.id === executionTarget)?.status ?? 'unknown'}
+                  {targetMachine ? machineStateWord(targetMachine.status) : 'unknown'}
                 </span>
               )}
-              <SavedIndicator show={savedField === 'execution_target'} />
             </div>
           </div>
           )}
@@ -827,19 +964,21 @@ export default function AgentConfig() {
           {canAssignDepartment && (
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
             <div>
-              <p className="text-sm font-medium text-p-text">Department</p>
-              <p className="text-xs text-p-text-light">
-                {(() => {
-                  // The selected department's own wiring, so the row says
-                  // what the locked "via" rows below will contain.
-                  const dept = (departments ?? []).find((d) => d.id === departmentId)
-                  if (!dept) return 'Auto-wires delegation within the department, following its delegation mode and reach.'
-                  return wiringSentence(dept.mode, dept.reach)
-                })()}
+              <p className="text-sm font-medium text-primary">
+                Department
+                {!assignedDept && (
+                  <InfoTip label="Department">
+                    Auto-wires delegation within the department, following its delegation mode and reach.
+                  </InfoTip>
+                )}
+                <SaveState state={stateOf('department')} />
               </p>
+              {assignedDept && (
+                <p className="text-xs text-tertiary">{wiringSentence(assignedDept.mode, assignedDept.reach)}</p>
+              )}
             </div>
             <div className="flex items-center gap-2">
-              <select
+              <Select
                 aria-label="Department"
                 value={departmentId}
                 disabled={isReadOnly}
@@ -856,29 +995,28 @@ export default function AgentConfig() {
                   const firstLevel = [...(dept?.levels ?? [])].sort((a, b) => a.rank - b.rank)[0]
                   saveDepartment(deptId, firstLevel?.id || '')
                 }}
-                className="px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 disabled:cursor-not-allowed"
+                className="max-w-max sm:w-auto"
               >
                 <option value="">None</option>
                 {(departments ?? []).map((d) => (
                   <option key={d.id} value={d.id}>{d.name}</option>
                 ))}
-              </select>
+              </Select>
               {departmentId && (
-                <select
+                <Select
                   aria-label="Level"
                   value={departmentLevelId}
                   disabled={isReadOnly}
                   onChange={(e) => saveDepartment(departmentId, e.target.value)}
-                  className="px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 disabled:cursor-not-allowed"
+                  className="max-w-max sm:w-auto"
                 >
                   {[...((departments ?? []).find((d) => d.id === departmentId)?.levels ?? [])]
                     .sort((a, b) => a.rank - b.rank)
                     .map((l) => (
                       <option key={l.id} value={l.id}>{l.name}</option>
                     ))}
-                </select>
+                </Select>
               )}
-              <SavedIndicator show={savedField === 'department'} />
             </div>
           </div>
           )}
@@ -886,19 +1024,22 @@ export default function AgentConfig() {
           {/* Default Model */}
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
             <div>
-              <p className="text-sm font-medium text-p-text">Default Model</p>
-              <p className="text-xs text-p-text-light">Model used when no override is set</p>
+              <p className="text-sm font-medium text-primary">
+                Default Model
+                <InfoTip label="Default Model">Model used when no override is set</InfoTip>
+                <SaveState state={stateOf('default_model')} />
+              </p>
             </div>
             <div className="flex items-center gap-2">
-              <select
+              <Select
                 value={defaultModel}
                 onChange={(e) => {
                   setDefaultModel(e.target.value)
-                  save('default_model', e.target.value)
+                  save('default_model', e.target.value, back((i) => setDefaultModel(i.default_model || '')))
                 }}
-                className="w-full sm:w-auto sm:max-w-xs px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
+                className="sm:w-auto sm:max-w-xs"
               >
-                <option value="">{autoModel ? `Auto — ${autoModel.label}` : 'Auto'}</option>
+                <option value="">{autoModel ? `Auto: ${autoModel.label}` : 'Auto'}</option>
                 {modelGroups.map(g => (
                   <optgroup key={g.path} label={g.label}>
                     {g.models.map(m => (
@@ -908,8 +1049,7 @@ export default function AgentConfig() {
                     ))}
                   </optgroup>
                 ))}
-              </select>
-              <SavedIndicator show={savedField === 'default_model'} />
+              </Select>
             </div>
           </div>
 
@@ -921,26 +1061,28 @@ export default function AgentConfig() {
           {defaultModelIsCliLayer && interactiveTerminalEnabled && (
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
               <div>
-                <p className="text-sm font-medium text-p-text">Default Session Mode</p>
-                <p className="text-xs text-p-text-light">
-                  How new chats &amp; tasks start — the normal headless stream, or the
-                  interactive terminal (the native CLI running as a live TUI)
+                <p className="text-sm font-medium text-primary">
+                  Default Session Mode
+                  <InfoTip label="Default Session Mode">
+                    How new chats and tasks start: the normal way, or in the
+                    Interactive terminal
+                  </InfoTip>
+                  <SaveState state={stateOf('default_execution_mode')} />
                 </p>
               </div>
               <div className="flex items-center gap-2">
-                <select
+                <Select
                   value={defaultExecutionMode || '-p'}
                   onChange={(e) => {
                     const v = e.target.value as 'interactive' | '-p'
                     setDefaultExecutionMode(v)
-                    save('default_execution_mode', v)
+                    save('default_execution_mode', v, back((i) => setDefaultExecutionMode(i.default_execution_mode || '')))
                   }}
-                  className="px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
+                  className="max-w-max sm:w-auto"
                 >
-                  <option value="-p">Normal (headless)</option>
+                  <option value="-p">Normal, without a terminal</option>
                   <option value="interactive">Interactive terminal</option>
-                </select>
-                <SavedIndicator show={savedField === 'default_execution_mode'} />
+                </Select>
               </div>
             </div>
           )}
@@ -953,23 +1095,25 @@ export default function AgentConfig() {
           {offeredEfforts.length > 0 && (
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
               <div>
-                <p className="text-sm font-medium text-p-text">Default Effort</p>
-                <p className="text-xs text-p-text-light">Thinking effort level</p>
+                <p className="text-sm font-medium text-primary">
+                  Default Effort
+                  <InfoTip label="Default Effort">Thinking effort level</InfoTip>
+                  <SaveState state={stateOf('default_effort')} />
+                </p>
               </div>
               <div className="flex items-center gap-2">
-                <select
+                <Select
                   value={shownEffort || 'high'}
                   onChange={(e) => {
                     setDefaultEffort(e.target.value)
-                    save('default_effort', e.target.value)
+                    save('default_effort', e.target.value, back((i) => setDefaultEffort(i.default_effort || '')))
                   }}
-                  className="px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
+                  className="max-w-max sm:w-auto"
                 >
                   {offeredEfforts.map(level => (
                     <option key={level} value={level}>{effortLabel(level)}</option>
                   ))}
-                </select>
-                <SavedIndicator show={savedField === 'default_effort'} />
+                </Select>
               </div>
             </div>
           )}
@@ -981,26 +1125,28 @@ export default function AgentConfig() {
           <div className="flex flex-col gap-3">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <p className="text-sm font-medium text-p-text">Visibility &amp; workspace</p>
-                <p className="text-xs text-p-text-light">
-                  Who shares this agent's files, chats, and memory — and the
-                  default scope for its tasks, notifications, triggers, and meetings.
+                <p className="text-sm font-medium text-primary">
+                  Visibility and workspace
+                  <InfoTip label="Visibility and workspace">
+                    Who shares this agent's files, chats and memory. It also sets the
+                    default scope for its tasks, notifications, triggers and meetings.
+                  </InfoTip>
+                  <SaveState state={stateOf('visibility_mode')} />
                 </p>
               </div>
-              <SavedIndicator show={savedField === 'visibility_mode'} />
             </div>
 
             {isReadOnly ? (
-              <div className="rounded-lg border border-p-border-light bg-p-bg px-3 py-2">
-                <p className="text-sm font-medium text-p-text">{MODE_LABEL[mode]}</p>
-                <p className="text-xs text-p-text-light mt-0.5">{MODE_SUMMARY[mode]}</p>
+              <div className={`${CARD_BORDERED} px-3 py-2`}>
+                <p className="text-sm font-medium text-primary">{MODE_LABEL[mode]}</p>
+                <p className="text-xs text-tertiary mt-0.5">{MODE_SUMMARY[mode]}</p>
               </div>
             ) : (
               <>
                 <div className="space-y-3">
                   {MODE_GROUPS.map((group) => (
                     <fieldset key={group.label} className="space-y-1.5">
-                      <legend className="text-xs font-semibold text-p-text-secondary mb-1">
+                      <legend className="text-xs font-semibold text-secondary mb-1">
                         {group.label}
                       </legend>
                       {group.modes.map((m) => {
@@ -1008,10 +1154,10 @@ export default function AgentConfig() {
                         return (
                           <label
                             key={m}
-                            className={`flex items-start gap-2.5 rounded-lg border px-3 py-2 cursor-pointer transition-colors ${
+                            className={`flex items-start gap-2.5 rounded-control border px-3 py-2 cursor-pointer transition-colors ${
                               selected
-                                ? 'border-brand bg-brand-surface'
-                                : 'border-p-border-light hover:bg-p-surface-hover'
+                                ? 'border-subtle bg-action-subtle'
+                                : 'border-subtle hover:bg-surface-hover'
                             }`}
                           >
                             <input
@@ -1019,11 +1165,11 @@ export default function AgentConfig() {
                               name="visibility-mode"
                               checked={selected}
                               onChange={() => onSelectMode(m)}
-                              className="mt-0.5 accent-brand"
+                              className="mt-0.5 accent-action"
                             />
                             <span className="min-w-0">
-                              <span className="block text-sm font-medium text-p-text">{MODE_LABEL[m]}</span>
-                              <span className="block text-xs text-p-text-light">{MODE_OPTION_HINT[m]}</span>
+                              <span className="block text-sm font-medium text-primary">{MODE_LABEL[m]}</span>
+                              <span className="block text-xs text-tertiary">{MODE_OPTION_HINT[m]}</span>
                             </span>
                           </label>
                         )
@@ -1031,30 +1177,28 @@ export default function AgentConfig() {
                     </fieldset>
                   ))}
                 </div>
-                <p className="text-xs text-p-text-secondary">{MODE_SUMMARY[mode]}</p>
-                {switchNotice && <p className="text-xs text-amber-600">{switchNotice}</p>}
+                <p className="text-xs text-secondary">{MODE_SUMMARY[mode]}</p>
+                {switchNotice && <p className="text-xs text-status-warning-fg">{switchNotice}</p>}
               </>
             )}
           </div>
 
           {/* Admin Only — admin users only */}
           {isAdmin && (
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-              <div>
-                <p className="text-sm font-medium text-p-text">Admin Only</p>
-                <p className="text-xs text-p-text-light">Restrict access to admin users</p>
-              </div>
-              <div className="flex items-center gap-2">
-                <Toggle
-                  checked={adminOnly}
-                  onChange={(v) => {
-                    setAdminOnly(v)
-                    save('admin_only', v)
-                  }}
-                />
-                <SavedIndicator show={savedField === 'admin_only'} />
-              </div>
-            </div>
+            <SettingRow
+              label="Admin Only"
+              info="Restrict access to admin users"
+              save={stateOf('admin_only')}
+            >
+              <Switch
+                aria-label="Admin only"
+                checked={adminOnly}
+                onChange={(v) => {
+                  setAdminOnly(v)
+                  save('admin_only', v, back((i) => setAdminOnly(i.admin_only ?? false)))
+                }}
+              />
+            </SettingRow>
           )}
 
           {/* Default for new users — admin only.
@@ -1063,93 +1207,70 @@ export default function AgentConfig() {
               policy decision, not a per-agent-manager one. */}
           {isAdmin && (
             <div className="flex flex-col gap-2">
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-                <div>
-                  <p className="text-sm font-medium text-p-text">Default for new users</p>
-                  <p className="text-xs text-p-text-light">
-                    Every newly-created user is auto-attached to this agent with the chosen role.
-                    Existing users are unaffected. Admin-only.
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Toggle
-                    checked={dfnuEnabled}
-                    onChange={(v) => {
-                      // A Shared-only agent takes editor or above: turning the
-                      // default on there starts from editor, never a lower role.
-                      const role = v && mode === 'shared_only' && !allowedOnSharedOnly(dfnuRole)
-                        ? ROLE.EDITOR : dfnuRole
-                      setDfnuEnabled(v)
-                      setDfnuRole(role)
-                      setDfnuError(null)
-                      setDefaultForNewUsers.mutate(
-                        { agent: name!, enabled: v, role: v ? role : null },
-                        {
-                          onSuccess: () => {
-                            setSavedField('default_for_new_users_role')
-                            setTimeout(() => setSavedField(null), 1500)
-                          },
-                          onError: (e) => {
-                            setDfnuEnabled(!v)
-                            setDfnuRole(dfnuRole)
-                            setDfnuError(e.message)
-                          },
-                        },
-                      )
-                    }}
-                  />
-                  <SavedIndicator show={savedField === 'default_for_new_users_role'} />
-                </div>
-              </div>
+              <SettingRow
+                label="Default for new users"
+                description="Every newly-created user is auto-attached to this agent with the chosen role."
+                info="Existing users are unaffected. Admin-only."
+                save={stateOf('default_for_new_users_role')}
+              >
+                <Switch
+                  aria-label="Default for new users"
+                  checked={dfnuEnabled}
+                  onChange={(v) => {
+                    // A Shared-only agent takes editor or above: turning the
+                    // default on there starts from editor, never a lower role.
+                    const role = v && mode === 'shared_only' && !allowedOnSharedOnly(dfnuRole)
+                      ? ROLE.EDITOR : dfnuRole
+                    setDfnuEnabled(v)
+                    setDfnuRole(role)
+                    void run('default_for_new_users_role', () => setDefaultForNewUsers.mutateAsync(
+                      { agent: name!, enabled: v, role: v ? role : null },
+                    ), {
+                      failTitle: 'The default for new users was not saved',
+                      revert: revertDfnu,
+                    })
+                  }}
+                />
+              </SettingRow>
               <div className={`flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4 ${dfnuEnabled ? '' : 'opacity-40'}`}>
-                <p className="text-xs text-p-text-secondary">Role assigned at auto-attach</p>
-                <select
+                <p className="text-xs text-secondary">Role assigned at auto-attach</p>
+                <Select
                   value={dfnuRole}
                   disabled={!dfnuEnabled}
                   onChange={(e) => {
                     const v = e.target.value as AgentRole
-                    const previous = dfnuRole
                     setDfnuRole(v)
-                    setDfnuError(null)
                     if (dfnuEnabled) {
-                      setDefaultForNewUsers.mutate(
+                      void run('default_for_new_users_role', () => setDefaultForNewUsers.mutateAsync(
                         { agent: name!, enabled: true, role: v },
-                        {
-                          onSuccess: () => {
-                            setSavedField('default_for_new_users_role')
-                            setTimeout(() => setSavedField(null), 1500)
-                          },
-                          onError: (err) => {
-                            setDfnuRole(previous)
-                            setDfnuError(err.message)
-                          },
-                        },
-                      )
+                      ), {
+                        failTitle: 'The default for new users was not saved',
+                        revert: revertDfnu,
+                      })
                     }
                   }}
-                  className="w-full sm:w-auto px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 disabled:cursor-not-allowed"
+                  className="sm:w-auto"
                 >
                   {/* A Shared-only agent takes editor or above; a lower default
                       stored before the switch shows, marked, and cannot be picked. */}
                   {(mode !== 'shared_only' || dfnuRole === ROLE.VIEWER) && (
                     <option value={ROLE.VIEWER} disabled={mode === 'shared_only'}>
                       {mode === 'shared_only'
-                        ? 'Viewer (not for a Shared-only agent)'
-                        : 'Viewer (read-only, recommended for personal assistants)'}
+                        ? 'Viewer: not for a Shared-only agent'
+                        : 'Viewer: read-only, recommended for personal assistants'}
                     </option>
                   )}
                   {(mode !== 'shared_only' || dfnuRole === ROLE.CONTRIBUTOR) && (
                     <option value={ROLE.CONTRIBUTOR} disabled={mode === 'shared_only'}>
                       {mode === 'shared_only'
-                        ? 'Contributor (not for a Shared-only agent)'
-                        : 'Contributor (writes the shared workspace, nothing as the agent)'}
+                        ? 'Contributor: not for a Shared-only agent'
+                        : 'Contributor: writes the shared workspace, nothing as the agent'}
                     </option>
                   )}
-                  <option value={ROLE.EDITOR}>Editor (shared workspace edits and agent-scope automations)</option>
-                  <option value={ROLE.MANAGER}>Manager (full configuration access)</option>
-                </select>
+                  <option value={ROLE.EDITOR}>Editor: shared workspace edits and agent-scope automations</option>
+                  <option value={ROLE.MANAGER}>Manager: full configuration access</option>
+                </Select>
               </div>
-              {dfnuError && <p className="text-xs text-red-600">{dfnuError}</p>}
             </div>
           )}
         </div>
@@ -1161,13 +1282,17 @@ export default function AgentConfig() {
 
       {/* Delegation Targets */}
       {delegationData && delegationData.available.length > 0 && (
-        <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4">
+        <div className={`${CARD} p-4`}>
           <div className="flex items-center justify-between mb-4">
             <div>
-              <p className="text-xs font-semibold text-p-text-secondary uppercase">Delegation Targets</p>
-              <p className="text-xs text-p-text-light mt-0.5">Agents this agent can delegate tasks and send files to; a wired target's activity is also readable by this agent's autonomous runs (meetings follow each user's access instead)</p>
+              <p className="text-xs font-semibold text-secondary uppercase">
+                Delegation Targets
+                <InfoTip label="Delegation Targets">
+                  Agents this agent can delegate tasks and send files to. This agent's autonomous runs can also read a target's activity. Meetings follow each user's access instead.
+                </InfoTip>
+                <span className="normal-case tracking-normal"><SaveState state={stateOf('delegation_targets')} /></span>
+              </p>
             </div>
-            <SavedIndicator show={savedField === 'delegation_targets'} />
           </div>
           {/* Checkbox-style cards — same pattern as the AI Engines selection. */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -1182,22 +1307,22 @@ export default function AgentConfig() {
                     key={agent.name}
                     type="button"
                     disabled
-                    title="Wired by department — managed automatically"
-                    className="min-w-0 flex items-center gap-2.5 rounded-lg border px-3 py-2 text-left border-brand bg-brand-surface cursor-not-allowed opacity-60"
+                    title="Wired by the department, managed automatically"
+                    className="min-w-0 flex items-center gap-2.5 rounded-control border px-3 py-2 text-left border-subtle bg-action-subtle cursor-not-allowed opacity-60"
                   >
-                    <span className="w-4 h-4 shrink-0 rounded-sm border flex items-center justify-center bg-brand border-brand text-white">
+                    <span className="w-4 h-4 shrink-0 rounded-sm border flex items-center justify-center bg-action border-action text-action-fg">
                       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
                       </svg>
                     </span>
                     <span
-                      className="w-5 h-5 rounded-full shrink-0 flex items-center justify-center text-white text-[9px] font-bold"
-                      style={{ backgroundColor: agent.color || '#6B7280' }}
+                      className="w-5 h-5 rounded-full shrink-0 flex items-center justify-center text-on-solid text-3xs font-bold"
+                      style={{ backgroundColor: agent.color || 'var(--color-accent-agent-fill)' }}
                     >
                       {agent.name.charAt(0).toUpperCase()}
                     </span>
-                    <span className="text-sm text-p-text truncate">{agent.display_name}</span>
-                    <span className="text-xs text-p-text-light italic">via {compiled.department_name}</span>
+                    <span className="text-sm text-primary truncate">{agent.display_name}</span>
+                    <span className="text-xs text-tertiary italic">via {compiled.department_name}</span>
                   </button>
                 )
               }
@@ -1214,29 +1339,25 @@ export default function AgentConfig() {
                     if (next.has(agent.name)) next.delete(agent.name)
                     else next.add(agent.name)
                     setSelectedTargets(next)
-                    setDelegationTargets.mutate(
+                    void run('delegation_targets', () => setDelegationTargets.mutateAsync(
                       // Manual set only — compiled targets are filtered even
                       // if one ever leaks into selectedTargets (defensive;
                       // the sync effect above already strips them).
                       { agent: name!, targets: Array.from(next).filter((t) => !compiledByTarget.has(t)) },
-                      {
-                        onSuccess: () => {
-                          setSavedField('delegation_targets')
-                          setTimeout(() => setSavedField(null), 1500)
-                        },
-                        // On failure resync to the server's truth (manual only).
-                        onError: () => setSelectedTargets(new Set(
-                          delegationData.targets.filter((t) => !compiledByTarget.has(t)),
-                        )),
-                      },
-                    )
+                    ), {
+                      failTitle: 'The delegation targets were not saved',
+                      // Back to the server's truth (manual only).
+                      revert: () => setSelectedTargets(new Set(
+                        delegationData.targets.filter((t) => !compiledByTarget.has(t)),
+                      )),
+                    })
                   }}
-                  className={`min-w-0 flex items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition-colors ${
-                    selected ? 'border-brand bg-brand-surface' : 'border-p-border-light hover:bg-p-surface-hover'
+                  className={`min-w-0 flex items-center gap-2.5 rounded-control border px-3 py-2 text-left transition-colors ${
+                    selected ? 'border-subtle bg-action-subtle' : 'border-subtle hover:bg-surface-hover'
                   } ${isReadOnly ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
                 >
                   <span className={`w-4 h-4 shrink-0 rounded-sm border flex items-center justify-center ${
-                    selected ? 'bg-brand border-brand text-white' : 'border-p-border-light'
+                    selected ? 'bg-action border-action text-action-fg' : 'border-strong'
                   }`}>
                     {selected && (
                       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1245,12 +1366,12 @@ export default function AgentConfig() {
                     )}
                   </span>
                   <span
-                    className="w-5 h-5 rounded-full shrink-0 flex items-center justify-center text-white text-[9px] font-bold"
-                    style={{ backgroundColor: agent.color || '#6B7280' }}
+                    className="w-5 h-5 rounded-full shrink-0 flex items-center justify-center text-on-solid text-3xs font-bold"
+                    style={{ backgroundColor: agent.color || 'var(--color-accent-agent-fill)' }}
                   >
                     {agent.name.charAt(0).toUpperCase()}
                   </span>
-                  <span className="text-sm text-p-text truncate">{agent.display_name}</span>
+                  <span className="text-sm text-primary truncate">{agent.display_name}</span>
                 </button>
               )
             })}
@@ -1264,30 +1385,36 @@ export default function AgentConfig() {
           everyone else); per-agent managers see the state read-only. The GET
           is manager-tier, so the card is hidden-not-rejected below manager. */}
       {knowledgeData && (
-        <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4">
+        <div className={`${CARD} p-4`}>
           <div className="flex items-center justify-between mb-4">
             <div>
-              <p className="text-xs font-semibold text-p-text-secondary uppercase">Shared Knowledge</p>
-              <p className="text-xs text-p-text-light mt-0.5">
+              <p className="text-xs font-semibold text-secondary uppercase">
+                Shared Knowledge
+                <span className="normal-case tracking-normal"><SaveState state={stateOf('knowledge')} /></span>
+              </p>
+              <p className="text-xs text-tertiary mt-0.5">
                 Libraries mirror into <span className="font-mono">knowledge/shared/&lt;source&gt;/&lt;folder&gt;/</span> on
                 attached agents. Read-only mirrors are edited on the source agent. A library's{' '}
                 <span className="font-mono">bulletin/&lt;name&gt;.md</span> is injected into every attached agent's context.
               </p>
             </div>
-            <SavedIndicator show={savedField === 'shared_knowledge'} />
           </div>
-          <div className="divide-y divide-p-border-light [&>*]:py-4 [&>*:first-child]:pt-0 [&>*:last-child]:pb-0">
+          <div className="divide-y divide-subtle [&>*]:py-4 [&>*:first-child]:pt-0 [&>*:last-child]:pb-0">
             {/* Source half — libraries this agent shares (whole folder or
                 disjoint knowledge subfolders, each independent). */}
             <div className="flex flex-col gap-2">
               <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
                 <div>
-                  <p className="text-sm font-medium text-p-text">Shared libraries</p>
-                  <p className="text-xs text-p-text-light">Share this agent's knowledge folder — or subfolders — for other agents to attach</p>
+                  <p className="text-sm font-medium text-primary">
+                    Shared libraries
+                    <InfoTip label="Shared libraries">
+                      Share this agent's knowledge folder, or some of its subfolders, for other agents to attach
+                    </InfoTip>
+                  </p>
                 </div>
                 {canMutateKnowledge && !shareFormOpen && (
-                  <button
-                    type="button"
+                  <Button
+                    ref={shareButtonRef} size="xs" className="self-start sm:self-auto"
                     onClick={() => {
                       setLibraryNameDraft('')
                       setLibrarySubdirDraft('')
@@ -1295,201 +1422,109 @@ export default function AgentConfig() {
                       setShareError('')
                       setShareFormOpen(true)
                     }}
-                    className="px-3 py-1.5 text-xs rounded-lg border border-p-border-light text-p-text hover:bg-p-surface-hover transition-colors self-start sm:self-auto"
                   >
                     Share a folder…
-                  </button>
+                  </Button>
                 )}
               </div>
               {knowledgeData.libraries.length === 0 && !shareFormOpen && (
-                <p className="text-xs text-p-text-light">Nothing shared yet.</p>
+                <p className="text-xs text-tertiary">Nothing shared yet.</p>
               )}
+              {renamingSubdir === null && shareForm}
               {knowledgeData.libraries.map((lib) => (
-                <div key={lib.subdir} className="flex items-center gap-2 rounded-lg border border-p-border-light px-3 py-2">
-                  <span className="flex-1 min-w-0 truncate">
-                    <span className="text-sm text-p-text">{lib.name || name}</span>
-                    <span className="text-xs font-mono text-p-text-light"> · {lib.subdir ? `${lib.subdir}/` : 'whole folder'}</span>
-                    {lib.has_bulletin && (
-                      <span
-                        className="ml-1.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-sm bg-brand/10 text-brand border border-brand/30"
-                        title={`bulletin/${lib.name}.md is injected into every attached agent's context`}
-                      >
-                        bulletin
-                      </span>
-                    )}
-                  </span>
-                  {lib.consumers.length > 0 ? (
-                    <span className="hidden sm:flex flex-wrap gap-1.5">
-                      {lib.consumers.map((c) => (
+                <Fragment key={lib.subdir}>
+                  <div className="flex items-center gap-2 rounded-card border border-subtle px-3 py-2">
+                    <span className="flex-1 min-w-0 truncate">
+                      <span className="text-sm text-primary">{lib.name || name}</span>
+                      <span className="text-xs font-mono text-tertiary"> · {lib.subdir ? `${lib.subdir}/` : 'whole folder'}</span>
+                      {lib.has_bulletin && (
                         <span
-                          key={c.consumer_agent}
-                          className="text-[10px] font-semibold px-1.5 py-0.5 rounded-sm bg-p-bg text-p-text-secondary border border-p-border-light"
+                          className={`ml-1.5 text-3xs font-semibold px-1.5 py-0.5 rounded-sm ${BADGE_TONE.info}`}
+                          title={`bulletin/${lib.name}.md is injected into every attached agent's context`}
                         >
-                          {c.consumer_agent} ({c.writable ? 'RW' : 'RO'})
+                          bulletin
                         </span>
-                      ))}
+                      )}
                     </span>
-                  ) : (
-                    <span className="hidden sm:inline text-xs text-p-text-light">no consumers</span>
-                  )}
-                  {canMutateKnowledge && (
-                    <>
-                      <button
-                        type="button"
-                        aria-label={`Rename library ${lib.subdir || 'root'}`}
-                        title="Rename this library (its bulletin file follows the name)"
-                        onClick={() => {
-                          setLibraryNameDraft(lib.name)
-                          setLibrarySubdirDraft(lib.subdir)
-                          setRenamingSubdir(lib.subdir)
-                          setShareError('')
-                          setShareFormOpen(true)
-                        }}
-                        className="shrink-0 p-1 rounded-sm text-p-text-light hover:text-p-text hover:bg-p-surface-hover transition-colors cursor-pointer"
-                      >
-                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                        </svg>
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Unshare library ${lib.subdir || 'root'}`}
-                        title="Stop sharing this library"
-                        onClick={() => {
-                          if (lib.consumers.length > 0) setUnshareTarget(lib)
-                          else unshareLibrary(lib.subdir)
-                        }}
-                        className="shrink-0 p-1 rounded-sm text-p-text-light hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors cursor-pointer"
-                      >
-                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                      </button>
-                    </>
-                  )}
-                </div>
-              ))}
-              {shareFormOpen && (
-                <div className="flex flex-col gap-2">
-                  {renamingSubdir !== null ? (
-                    // Rename keeps the (source, subdir) identity — show the
-                    // locked folder instead of the picker.
-                    <div className="px-3 py-1.5 text-sm font-mono rounded-lg border border-p-border-light bg-p-surface text-p-text-secondary">
-                      {renamingSubdir ? `knowledge/${renamingSubdir}/` : 'knowledge/ (whole folder)'}
-                    </div>
-                  ) : (
-                    // Folder picker — the agent's knowledge tree, replacing
-                    // the old free-text subfolder field (operator ask
-                    // 2026-08-24: browse and pick, like the workspace list).
-                    <div
-                      role="listbox"
-                      aria-label="Library subfolder"
-                      className="max-h-44 overflow-y-auto rounded-lg border border-p-border-light divide-y divide-p-border-light/60"
-                    >
-                      {[{ path: '', depth: 0 }, ...knowledgeFolders].map(({ path, depth }) => {
-                        const overlap = shareOverlap(path)
-                        const selected = librarySubdirDraft === path
-                        return (
-                          <button
-                            key={path || '(root)'}
-                            type="button"
-                            role="option"
-                            aria-selected={selected}
-                            disabled={!!overlap}
-                            onClick={() => setLibrarySubdirDraft(path)}
-                            title={overlap ? `Overlaps the shared library “${overlap}”` : undefined}
-                            style={{ paddingLeft: `${0.75 + depth * 1.1}rem` }}
-                            className={`w-full flex items-center gap-2 py-1.5 pr-3 text-sm text-left transition-colors ${
-                              selected ? 'bg-brand/10 text-brand' : 'text-p-text hover:bg-p-surface-hover'
-                            } disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer`}
+                    {lib.consumers.length > 0 ? (
+                      <span className="hidden sm:flex flex-wrap gap-1.5">
+                        {lib.consumers.map((c) => (
+                          <span
+                            key={c.consumer_agent}
+                            className="text-3xs font-semibold px-1.5 py-0.5 rounded-sm bg-surface-muted text-secondary"
                           >
-                            <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                                    d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-                            </svg>
-                            <span className={path ? 'font-mono' : ''}>
-                              {path || 'Whole knowledge folder'}
-                            </span>
-                            {overlap && (
-                              // aria-hidden: the option's accessible name
-                              // stays the bare path (the title carries why).
-                              <span aria-hidden="true" className="ml-auto text-[10px] text-p-text-light shrink-0">shared</span>
-                            )}
-                          </button>
-                        )
-                      })}
-                    </div>
-                  )}
-                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                    <input
-                      autoFocus
-                      value={libraryNameDraft}
-                      maxLength={64}
-                      onChange={(e) => setLibraryNameDraft(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' && libraryNameDraft.trim()
-                            && (renamingSubdir !== null || !shareOverlap(librarySubdirDraft))) {
-                          shareLibrary(librarySubdirDraft.trim().replace(/^\/+|\/+$/g, ''), libraryNameDraft.trim())
-                        } else if (e.key === 'Escape') {
-                          setShareFormOpen(false)
-                          setRenamingSubdir(null)
-                          setShareError('')
-                        }
-                      }}
-                      placeholder="Name this library, e.g. Brand Guidelines"
-                      aria-label="Library name"
-                      className="flex-1 px-3 py-1.5 text-sm rounded-lg border border-p-border-light bg-p-bg text-p-text placeholder:text-p-text-light focus:outline-none focus:ring-2 focus:ring-brand/40"
-                    />
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => shareLibrary(librarySubdirDraft.trim().replace(/^\/+|\/+$/g, ''), libraryNameDraft.trim())}
-                        disabled={!libraryNameDraft.trim()
-                          || (renamingSubdir === null && shareOverlap(librarySubdirDraft) !== null)}
-                        className="px-3 py-1.5 text-xs rounded-lg bg-brand text-white hover:bg-brand/90 transition-colors disabled:opacity-50"
-                      >
-                        {renamingSubdir !== null ? 'Rename' : 'Share'}
-                      </button>
-                      <button
-                        onClick={() => {
-                          setShareFormOpen(false)
-                          setRenamingSubdir(null)
-                          setShareError('')
-                        }}
-                        className="px-3 py-1.5 text-xs rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors"
-                      >
-                        Cancel
-                      </button>
-                    </div>
+                            {c.consumer_agent} ({c.writable ? 'RW' : 'RO'})
+                          </span>
+                        ))}
+                      </span>
+                    ) : (
+                      <span className="hidden sm:inline text-xs text-tertiary">No consumers</span>
+                    )}
+                    {canMutateKnowledge && (
+                      <>
+                        <button
+                          type="button"
+                          aria-label={`Rename library ${lib.subdir || 'root'}`}
+                          title="Rename this library. Its bulletin file follows the name."
+                          onClick={() => {
+                            setLibraryNameDraft(lib.name)
+                            setLibrarySubdirDraft(lib.subdir)
+                            setRenamingSubdir(lib.subdir)
+                            setShareError('')
+                            setShareFormOpen(true)
+                          }}
+                          className="shrink-0 p-1 rounded-sm text-tertiary hover:text-primary hover:bg-surface-hover transition-colors cursor-pointer"
+                        >
+                          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                          </svg>
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Unshare library ${lib.subdir || 'root'}`}
+                          title="Stop sharing this library"
+                          onClick={() => {
+                            if (lib.consumers.length > 0) setUnshareTarget(lib)
+                            else unshareLibrary(lib.subdir)
+                          }}
+                          className="shrink-0 p-1 rounded-sm text-tertiary hover:text-status-danger-fg hover:bg-status-danger-bg transition-colors cursor-pointer"
+                        >
+                          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                          </svg>
+                        </button>
+                      </>
+                    )}
                   </div>
-                  {shareError && (
-                    <p className="text-xs text-red-600 dark:text-red-400">{shareError}</p>
-                  )}
-                </div>
-              )}
+                  {renamingSubdir === lib.subdir && shareForm}
+                </Fragment>
+              ))}
             </div>
 
             {/* Consumer half — libraries attached to this agent */}
             <div className="flex flex-col gap-2">
               <div>
-                <p className="text-sm font-medium text-p-text">Attached libraries</p>
-                <p className="text-xs text-p-text-light">Shared knowledge this agent can read/write</p>
+                <p className="text-sm font-medium text-primary">
+                  Attached libraries
+                  <InfoTip label="Attached libraries">Shared knowledge this agent can read or write</InfoTip>
+                </p>
               </div>
               {knowledgeData.attachments.length === 0 && (
-                <p className="text-xs text-p-text-light">No libraries attached.</p>
+                <p className="text-xs text-tertiary">No libraries attached.</p>
               )}
               {knowledgeData.attachments.map((a) => {
                 const key = libKey(a.source_agent, a.subdir)
                 const writable = attachmentWritable[key] ?? a.writable
                 return (
-                  <div key={key} className="flex items-center gap-2 rounded-lg border border-p-border-light px-3 py-2">
+                  <div key={key} className="flex items-center gap-2 rounded-card border border-subtle px-3 py-2">
                     {/* Label first, mount path second — libraries shared
                         before names existed fall back to the agent slug. */}
                     <span className="flex-1 min-w-0 truncate">
-                      <span className="text-sm text-p-text">{a.name || a.source_agent}</span>
-                      <span className="text-xs font-mono text-p-text-light"> · {libMountPath(a.source_agent, a.subdir)}</span>
+                      <span className="text-sm text-primary">{a.name || a.source_agent}</span>
+                      <span className="text-xs font-mono text-tertiary"> · {libMountPath(a.source_agent, a.subdir)}</span>
                       {a.has_bulletin && (
                         <span
-                          className="ml-1.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-sm bg-brand/10 text-brand border border-brand/30"
+                          className={`ml-1.5 text-3xs font-semibold px-1.5 py-0.5 rounded-sm ${BADGE_TONE.info}`}
                           title="This library publishes a bulletin into this agent's context"
                         >
                           bulletin
@@ -1502,29 +1537,25 @@ export default function AgentConfig() {
                           type="button"
                           aria-label={`Writable ${a.source_agent}${a.subdir ? ` ${a.subdir}` : ''}`}
                           title={writable
-                            ? 'Writable — this agent edits the shared library directly. Click for read-only.'
-                            : 'Read-only — the library is edited on its source agent. Click to make writable.'}
+                            ? 'Writable. This agent edits the shared library directly. Click for read-only.'
+                            : 'Read-only. The library is edited on its source agent. Click to make writable.'}
                           onClick={() => {
                             const next = !writable
                             setAttachmentWritable({ ...attachmentWritable, [key]: next })
-                            attachKnowledgeLibrary.mutate(
+                            void run(`knowledge:${key}`, () => attachKnowledgeLibrary.mutateAsync(
                               { agent: name!, source_agent: a.source_agent, subdir: a.subdir, writable: next },
-                              {
-                                onSuccess: () => {
-                                  setSavedField('shared_knowledge')
-                                  setTimeout(() => setSavedField(null), 1500)
-                                },
-                                // On failure resync to the server's truth.
-                                onError: () => setAttachmentWritable(Object.fromEntries(
-                                  knowledgeData.attachments.map((x) => [libKey(x.source_agent, x.subdir), x.writable]),
-                                )),
-                              },
-                            )
+                            ), {
+                              failTitle: 'The library access was not changed',
+                              // Back to the server's truth.
+                              revert: () => setAttachmentWritable(Object.fromEntries(
+                                knowledgeData.attachments.map((x) => [libKey(x.source_agent, x.subdir), x.writable]),
+                              )),
+                            })
                           }}
-                          className={`shrink-0 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold border transition-colors cursor-pointer ${
+                          className={`shrink-0 px-1.5 py-0.5 rounded-sm text-3xs font-semibold border transition-colors cursor-pointer ${
                             writable
-                              ? 'border-brand bg-brand text-white'
-                              : 'border-p-border-light text-p-text-secondary hover:bg-p-surface-hover'
+                              ? 'border-action bg-action text-action-fg'
+                              : 'border-default text-secondary hover:bg-surface-hover'
                           }`}
                         >
                           {writable ? 'RW' : 'RO'}
@@ -1533,16 +1564,12 @@ export default function AgentConfig() {
                           type="button"
                           aria-label={`Detach ${a.source_agent}${a.subdir ? ` ${a.subdir}` : ''}`}
                           title="Detach this library and remove its mirror"
-                          onClick={() => detachKnowledgeLibrary.mutate(
-                            { agent: name!, source: a.source_agent, subdir: a.subdir },
-                            {
-                              onSuccess: () => {
-                                setSavedField('shared_knowledge')
-                                setTimeout(() => setSavedField(null), 1500)
-                              },
-                            },
-                          )}
-                          className="shrink-0 p-1 rounded-sm text-p-text-light hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors cursor-pointer"
+                          onClick={() => {
+                            void run(`knowledge:${key}`, () => detachKnowledgeLibrary.mutateAsync(
+                              { agent: name!, source: a.source_agent, subdir: a.subdir },
+                            ), { failTitle: 'The library was not detached' })
+                          }}
+                          className="shrink-0 p-1 rounded-sm text-tertiary hover:text-status-danger-fg hover:bg-status-danger-bg transition-colors cursor-pointer"
                         >
                           <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -1550,7 +1577,7 @@ export default function AgentConfig() {
                         </button>
                       </>
                     ) : (
-                      <span className="shrink-0 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold bg-p-bg text-p-text-secondary border border-p-border-light">
+                      <span className="shrink-0 px-1.5 py-0.5 rounded-sm text-3xs font-semibold bg-surface-muted text-secondary">
                         {writable ? 'RW' : 'RO'}
                       </span>
                     )}
@@ -1561,11 +1588,11 @@ export default function AgentConfig() {
                 <div className="flex flex-wrap items-center gap-2">
                   {/* Mobile: full-width + min-w-0 so long library labels
                       ellipsize inside the card instead of widening it. */}
-                  <select
+                  <Select
                     aria-label="Attach library"
                     value={attachPick}
                     onChange={(e) => setAttachPick(e.target.value)}
-                    className="w-full min-w-0 sm:w-auto sm:max-w-xs px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
+                    className="sm:w-auto sm:max-w-xs"
                   >
                     <option value="">Attach library…</option>
                     {attachableLibraries.map((l) => (
@@ -1573,37 +1600,30 @@ export default function AgentConfig() {
                         {(l.name ? `${l.name} · ` : '') + l.source_agent + (l.subdir ? `/${l.subdir}` : '')}
                       </option>
                     ))}
-                  </select>
-                  <label className="flex items-center gap-1.5 text-xs text-p-text-secondary cursor-pointer">
+                  </Select>
+                  <label className="flex items-center gap-1.5 text-xs text-secondary cursor-pointer">
                     <input
                       type="checkbox"
                       checked={attachWritable}
                       onChange={(e) => setAttachWritable(e.target.checked)}
-                      className="accent-brand"
+                      className="accent-action"
                     />
                     Writable
                   </label>
-                  <button
-                    type="button"
+                  <Button
                     disabled={!attachPick}
                     onClick={() => {
                       const [pickSource, pickSubdir] = JSON.parse(attachPick) as [string, string]
-                      attachKnowledgeLibrary.mutate(
+                      void run(`knowledge:${libKey(pickSource, pickSubdir)}`, () => attachKnowledgeLibrary.mutateAsync(
                         { agent: name!, source_agent: pickSource, subdir: pickSubdir, writable: attachWritable },
-                        {
-                          onSuccess: () => {
-                            setAttachPick('')
-                            setAttachWritable(false)
-                            setSavedField('shared_knowledge')
-                            setTimeout(() => setSavedField(null), 1500)
-                          },
-                        },
-                      )
+                      ).then(() => {
+                        setAttachPick('')
+                        setAttachWritable(false)
+                      }), { failTitle: 'The library was not attached' })
                     }}
-                    className="px-3 py-1.5 text-sm font-medium rounded-lg border border-p-border-light text-p-text hover:bg-p-surface-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     Attach
-                  </button>
+                  </Button>
                 </div>
               )}
             </div>
@@ -1613,26 +1633,27 @@ export default function AgentConfig() {
 
       {/* Danger Zone — admin only */}
       {isAdmin && (
-        <div className="rounded-xl border-2 border-red-300 dark:border-red-800 p-4">
-          <p className="text-xs font-semibold text-red-600 uppercase mb-2">Danger Zone</p>
+        <div className={`${CARD} border-2 border-status-danger-border p-4`}>
+          <p className="text-xs font-semibold text-status-danger-fg uppercase mb-2">Danger Zone</p>
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-sm font-medium text-p-text">Delete this agent</p>
-              <p className="text-xs text-p-text-light">Once deleted, this cannot be undone.</p>
+              <p className="text-sm font-medium text-primary">Delete this agent</p>
+              <p className="text-xs text-tertiary">Once deleted, this cannot be undone.</p>
             </div>
-            <button
-              onClick={() => setDeleteModalOpen(true)}
-              className="px-3 py-1.5 text-sm font-medium rounded-lg border border-red-300 dark:border-red-700 text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
-            >
+            <Button variant="danger" onClick={() => setDeleteModalOpen(true)}>
               Delete Agent
-            </button>
+            </Button>
           </div>
         </div>
       )}
 
       {deleteModalOpen && (
-        <DeleteModal
-          slug={name!}
+        <StrongConfirmModal
+          title="Delete Agent"
+          description="This will permanently delete the agent and all its data."
+          confirmWord={name!}
+          confirmLabel="Delete Agent"
+          busyLabel="Deleting..."
           onConfirm={handleDelete}
           onCancel={() => setDeleteModalOpen(false)}
           isPending={deleteAgent.isPending}
@@ -1675,23 +1696,23 @@ export default function AgentConfig() {
             pendingMode === 'shared_only' ? (
               <>
                 In <strong>Shared only</strong>, everyone assigned to this agent shares
-                one workspace and <strong>one chat history</strong> — each person will
+                one workspace and <strong>one chat history</strong>. Each person will
                 see everybody's conversations. Existing per-user chats are kept but stop
-                appearing in the chat list; new chats are shared.
+                appearing in the chat list. New chats are shared.
               </>
             ) : (
               <>
                 Leaving <strong>Shared only</strong> gives each person their own chats
                 again. The existing shared conversations are kept but stop appearing in
-                the chat list; new chats are per-user.
+                the chat list. New chats are per-user.
               </>
             )
           }
           extra={pendingMode === 'shared_only' && (losing.length > 0 || switchError || listPending || usersFailed) ? (
-            <div className="text-sm text-p-text">
-              {listPending && <p className="text-xs text-p-text-light">Loading who loses access…</p>}
+            <div className="text-sm text-primary">
+              {listPending && <p className="text-xs text-tertiary">Loading who loses access…</p>}
               {usersFailed && !switchPeople && (
-                <p className="text-xs text-p-text-light">
+                <p className="text-xs text-tertiary">
                   The list of assignments could not be read: confirming asks the server for it.
                 </p>
               )}
@@ -1702,17 +1723,17 @@ export default function AgentConfig() {
                     {' '}{losing.length === 1 ? 'this person loses' : `these ${losing.length} people lose`}
                     {' '}their assignment to this agent:
                   </p>
-                  <ul className="max-h-40 overflow-y-auto rounded-lg border border-p-border-light px-3 py-1.5 text-xs">
+                  <ul className="max-h-40 overflow-y-auto rounded-card border border-subtle px-3 py-1.5 text-xs">
                     {losing.map((p) => (
                       <li key={p.sub} className="flex justify-between gap-2 py-0.5">
                         <span className="truncate">{p.name}</span>
-                        <span className="shrink-0 text-p-text-light">{roleLabel(p.role)}</span>
+                        <span className="shrink-0 text-tertiary">{roleLabel(p.role)}</span>
                       </li>
                     ))}
                   </ul>
                 </>
               )}
-              {switchError && <p className="mt-2 text-xs text-red-600">{switchError}</p>}
+              {switchError && <p className="mt-2 text-xs text-status-danger-fg">{switchError}</p>}
             </div>
           ) : undefined}
           confirmWord="CONFIRM"

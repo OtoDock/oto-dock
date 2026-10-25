@@ -54,7 +54,7 @@ OVERFLOW_TOLERANCE_PX = 8   # a scrollbar's width, never a layout
 CHECKS_DIRNAME = "checks"
 STALE_CHECK_S = 3600
 
-_probe: dict[str, object] = {"at": 0.0, "ok": False, "reason": "", "base": ""}
+_probe: dict[str, float | bool | str] = {"at": 0.0, "ok": False, "reason": "", "base": ""}
 _ROUTE_RE = re.compile(r"/v1/apps/[^/?#]+/(api|client)/([^?#]*)")
 # file-tools renders one page at a time and answers any other with a 503,
 # which would read as "no renderer" and let a deploy skip its check: the
@@ -228,7 +228,7 @@ def _seed(row: dict, scratch: Path) -> bool:
         if not live.is_file() or live.stat().st_size > DB_SEED_MAX_BYTES:
             return False
         return snapshot_db(live, scratch / "app.db")
-    except Exception:  # noqa: BLE001 — a seed is a nicety
+    except Exception:  # noqa: BLE001  # a seed is a nicety
         return False
 
 
@@ -385,7 +385,8 @@ async def render_working_tree(row: dict, source_dir: Path, *, approved: bool) ->
     of the working tree, rendered and removed, on live data only by
     ``seeds_live_data`` on the copy's own manifest (the code that runs, so
     an edit after the copy buys nothing). Takes the deploy lock."""
-    from services.apps.app_deploy import _deploy_lock, working_manifest
+    from services.apps.app_deploy import working_manifest
+    from services.apps.releases import _deploy_lock
     async with _deploy_lock(row["id"]):
         tree = await asyncio.to_thread(copy_working_tree, row, source_dir)
         try:
@@ -399,7 +400,7 @@ async def render_working_tree(row: dict, source_dir: Path, *, approved: bool) ->
 async def render_live(row: dict, *, approved: bool) -> RenderReport:
     """``screenshot_app(source="live")``: the live release, as a check
     instance on a copy of the live database. Takes the deploy lock."""
-    from services.apps.app_deploy import _deploy_lock
+    from services.apps.releases import _deploy_lock
     async with _deploy_lock(row["id"]):
         try:
             live = await asyncio.to_thread(releases.live_release_dir, row)

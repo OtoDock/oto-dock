@@ -29,9 +29,11 @@ from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
 from core.session import session_state
 from services.apps import app_blueprints, app_deploy, app_handlers, app_supervisor
-from services.community import template_app_seeder as seeder
+from services.community import (
+    community_agent_template_store as tpl,
+    template_app_seeder as seeder,
+)
 from storage import database as task_store
-from storage.agents import community_agent_template_store as tpl
 from storage.pg import get_conn
 
 client = TestClient(app)
@@ -103,6 +105,17 @@ def _folder(root: Path, manifest: dict) -> Path:
     (root / "data").mkdir(exist_ok=True)
     (root / "data" / "app.db").write_bytes(b"never travels")
     return root
+
+
+def _template_apps(tdir: Path) -> list:
+    """A template folder's apps as the loader reads them: from the template
+    schema's document of the folder."""
+    from services.community import template_sig
+    from storage import catalog_schema
+    schema = catalog_schema.load_schema(catalog_schema.TEMPLATE_SCHEMA)
+    document, problems = catalog_schema.template_document(tdir, schema, template_sig.read_file)
+    assert not problems, problems
+    return tpl._discover_apps(tdir, document)
 
 
 def _bundle(files: dict[str, bytes], blueprint: dict | None, *, link: str | None = None) -> bytes:
@@ -194,8 +207,7 @@ def test_an_import_never_pulls_a_bundle_the_session_may_not_write_back(agent_tre
     """A viewer reads the shared workspace but may not write it back: the
     bundle on its machine is never pulled into the platform tree, and with
     no platform copy the import says why."""
-    from core.remote import remote_file_flow as rff
-    from core.remote import satellite_connection
+    from core.remote import remote_file_flow as rff, satellite_connection
     sid = "sess-bp-viewer"
     session_state.set_session_security(sid, SecurityContext(
         role="viewer", username="alice", agent=AGENT, is_admin_agent=False))
@@ -325,12 +337,12 @@ def test_a_template_ships_apps_that_land_pending_with_their_needs(agent_tree, tm
     (tdir / "apps" / "board" / "blueprint.json").write_text(json.dumps(
         {"format": 1, "slug": "board", "tasks": [{"slug": "report", "description": "R", "prompt": "do it"}]}))
     (tdir / "apps" / "notes").mkdir(parents=True)          # no app.json: not an app
-    items = tpl._discover_apps(tdir)
+    items = _template_apps(tdir)
     assert [i.slug for i in items] == ["board"] and items[0].requires_mcps == ["github-mcp"]
     with pytest.raises(tpl.TemplateValidationError):
         (tdir / "apps" / "Bad Name").mkdir()
         (tdir / "apps" / "Bad Name" / "app.json").write_text("{}")
-        tpl._discover_apps(tdir)
+        _template_apps(tdir)
     template = SimpleNamespace(slug="ops-team", apps=items)
     # Without the installer's consent the shared app lands pending, cold.
     seeded = asyncio.run(seeder.seed_shared(AGENT, template, {}))
@@ -368,7 +380,7 @@ def test_a_template_copy_opts_out_on_hard_unpin_and_pin_app_restores_it(agent_tr
     tdir = tmp_path / "template"
     _folder(tdir / "user-apps" / "home", {"title": "Home", "actions": [
         {"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}]})
-    items = tpl._discover_apps(tdir)
+    items = _template_apps(tdir)
     seeder.write_seed_source(AGENT, items[0])
     agent_store.set_community_template_data(AGENT, {
         "slug": "ops-team", "version": "1.0.0", "tasks": [], "triggers": [], "notifications": [],
@@ -405,7 +417,7 @@ def test_a_consented_shared_template_app_goes_live_without_a_server_start(agent_
     tdir = tmp_path / "template"
     _folder(tdir / "apps" / "board", {"title": "Board", "actions": [
         {"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}]})
-    items = tpl._discover_apps(tdir)
+    items = _template_apps(tdir)
     template = SimpleNamespace(slug="ops-team", apps=items)
     task_store.upsert_user("alice-sub", "alice-sub@test.com", "Alice", "admin")
     data = {"consent": {"apps": {"board": {"sig": items[0].sig, "by": "alice-sub", "at": "now"}}}}
@@ -419,7 +431,7 @@ def test_a_consented_shared_template_app_goes_live_without_a_server_start(agent_
     # the old consent parks, and says the app changed since the consent.
     _folder(tdir / "apps" / "board", {"title": "Board", "egress": ["x.example"], "actions": [
         {"id": "me", "label": "Me", "type": "platform", "method": "viewer.me"}]})
-    changed = SimpleNamespace(slug="ops-team", apps=tpl._discover_apps(tdir))
+    changed = SimpleNamespace(slug="ops-team", apps=_template_apps(tdir))
     stale = {"consent": {"apps": {"board": {"sig": items[0].sig, "by": "alice-sub", "at": "now"}}}}
     seeded = asyncio.run(seeder.seed_shared(AGENT, changed, stale))
     assert [p["slug"] for p in seeded["pending"]] == ["board"], seeded
@@ -445,3 +457,47 @@ def test_an_import_into_a_linked_folder_seeds_no_task(agent_tree, tmp_path):
             tasks=[{"slug": "t", "title": "T", "prompt": "p"}]))
     assert seeded == []
     assert list(other.iterdir()) == []
+
+
+def test_a_template_copy_makes_each_members_folder_and_an_export_carries_the_key(agent_tree, tmp_path):
+    from services.community import template_sig
+    from storage.agents import agent_store
+    agent_store.create_agent(AGENT, "Blueprint", collaborative=True)
+    task_store.upsert_user("alice-sub", "alice-sub@test.com", "Alice", "admin")
+    task_store.upsert_user("bob-sub", "bob-sub@test.com", "Bob", "member")
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET username=%s WHERE sub=%s", ("bob", "bob-sub"))
+        conn.commit()
+    task_store.add_user_agent("bob-sub", AGENT, "viewer", "test")
+    (agent_tree / "users" / "bob" / "workspace").mkdir(parents=True, exist_ok=True)
+    manifest = {"title": "Timeline", "files": {"read": ["workspace/videos/projects/"],
+                                               "create": ["workspace/videos/projects/"]},
+                "actions": [{"id": "list", "label": "List", "type": "platform", "method": "files.list"}]}
+    # Making an empty folder in a member's own workspace does not act as the
+    # member: an admin's consent covers every member's copy.
+    assert template_sig.needs_owner(manifest) is False
+    tdir = tmp_path / "template"
+    _folder(tdir / "user-apps" / "timeline", manifest)
+    items = _template_apps(tdir)
+    assert items[0].owner_approval is False
+    seeder.write_seed_source(AGENT, items[0])
+    agent_store.set_community_template_data(AGENT, {
+        "slug": "video-team", "version": "1.0.0", "tasks": [], "triggers": [], "notifications": [],
+        "dashboards": [], "user_apps": [{"slug": "timeline", "sig": items[0].sig, "tree_sha": items[0].tree_sha}],
+        "consent": {"apps": {"timeline": {"sig": items[0].sig, "by": "alice-sub", "at": "now"}}}})
+    for sub, name in (("alice-sub", "alice"), ("bob-sub", "bob")):
+        assert asyncio.run(seeder.seed_user_copy(AGENT, sub, "timeline")) == ("seeded", "release 1")
+        assert (agent_tree / "users" / name / "workspace/videos/projects").is_dir(), name
+    # The export carries the key and never the folder's files.
+    (agent_tree / "users/alice/workspace/videos/projects/cut.vproj.json").write_text("{}")
+    r = _hook("export", {"slug": "timeline", "visibility": "user"}, sid=SID)
+    assert r.status_code == 200, r.text
+    bundle = next((agent_tree / "users/alice/workspace/apps").glob("timeline.otoapp"))
+    folder, _bp = app_blueprints.read_bundle(bundle.read_bytes())
+    try:
+        doc = json.loads((folder / "app.json").read_text())
+        assert doc["files"]["create"] == ["workspace/videos/projects/"]
+        assert not [p for p in folder.rglob("*") if p.name == "cut.vproj.json"]
+    finally:
+        import shutil
+        shutil.rmtree(folder, ignore_errors=True)

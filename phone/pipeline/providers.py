@@ -11,12 +11,14 @@ import asyncio
 import contextlib
 import logging
 
-import config
+from audio.providers.lid.ecapa import prewarm_language_identifier
 from audio.providers.registry import get_provider_class
 from audio.providers.tts.base import TTSProvider
 from audio.providers.turn.dispatcher import build_dispatcher
 from audio.providers.turn.smart_turn import prewarm_smart_turn
 from audio.streaming.lang import base_lang
+
+import config
 from config_manager import ConfigManager
 from fillers import filler_cache
 
@@ -32,8 +34,27 @@ def prewarm_turn_classifier(cfg: ConfigManager) -> None:
         return
     try:
         prewarm_smart_turn(None, cfg.smart_turn_onnx_threads)
-    except Exception as e:
-        logger.warning(f"Smart Turn pre-warm failed: {e}")
+    except Exception as e:  # noqa: BLE001  # onnxruntime loading or running a model raises anything
+        logger.warning("Smart Turn pre-warm failed: %s", e)
+
+
+def language_identifier_wanted(cfg: ConfigManager, *, live_voice: bool = False) -> bool:
+    """Detection is on and something here can use the identifier: a route
+    that detects, or the live voice sessions this daemon can host
+    (``duplex_supported()``: a person on the Automatic pick detects with no
+    route at all)."""
+    if not cfg.language_identify_enabled:
+        return False
+    return live_voice or any(route.language_detect for route in cfg.enabled_routes())
+
+
+def prewarm_language_identifier_for(cfg: ConfigManager, *, live_voice: bool = False) -> None:
+    """Load the language identifier ahead of any call (synchronous, off the
+    loop; a no-op once loaded) when ``language_identifier_wanted``: a daemon
+    that nothing here would use it on never pays its memory. A failure is
+    logged once by the loader and calls run without detection."""
+    if language_identifier_wanted(cfg, live_voice=live_voice):
+        prewarm_language_identifier(None, cfg.language_identify_threads)
 
 
 async def build_turn_classifier(cfg: ConfigManager):
@@ -74,11 +95,18 @@ def build_stt(cfg: ConfigManager, provider: dict | None):
         model = cls.live_model_id(advanced.get("model_id"))
         if model:
             kwargs["model"] = model
-        return cls(**kwargs)
-    return cls.from_row(
-        {"credential_key": "_", "advanced": advanced, "voices": p.get("voices") or {}},
-        lambda _k: api_key,
-    )
+        stt = cls(**kwargs)
+    else:
+        stt = cls.from_row(
+            {"credential_key": "_", "advanced": advanced, "voices": p.get("voices") or {}},
+            lambda _k: api_key,
+        )
+    # A live final answered with no word over speech is listened to again
+    # (Deepgram's empty Greek windows); the turn's take completes the text.
+    enable = getattr(stt, "enable_turn_relisten", None)
+    if enable is not None:
+        enable()
+    return stt
 
 
 def build_tts(provider: dict | None) -> TTSProvider:
@@ -153,9 +181,9 @@ async def prewarm_fillers(cfg: ConfigManager) -> None:
                     key, tts,
                     backchannel_phrases=backchannel, thinking_phrases=thinking,
                 )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # one route's filler pre-warm must not stop the others
             had_error = True
-            logger.warning(f"Filler pre-warm failed for route {route.id} ({locked}): {e}")
+            logger.warning("Filler pre-warm failed for route %s (%s): %s", route.id, locked, e)
         finally:
             if tts is not None:
                 with contextlib.suppress(Exception):
@@ -167,4 +195,4 @@ async def prewarm_fillers(cfg: ConfigManager) -> None:
     # degrades gracefully (no filler for the rest of that rare race).
     if not had_error:
         filler_cache.prune(active_keys)
-    logger.info(f"Filler pre-warm complete ({len(active_keys)} combo(s))")
+    logger.info("Filler pre-warm complete (%s combo(s))", len(active_keys))

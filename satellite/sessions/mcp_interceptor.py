@@ -13,9 +13,8 @@ import re
 import sys
 from pathlib import Path
 
-
 _INTERCEPTOR_SCRIPT = str(
-    (Path(__file__).resolve().parent.parent / "_vendored" / "stdio_path_interceptor.py")
+    Path(__file__).resolve().parent.parent / "_vendored" / "stdio_path_interceptor.py"
 ).replace("\\", "/")
 
 
@@ -50,7 +49,7 @@ def wrap_interceptor_in_mcp_config(mcp_config: dict) -> None:
     # `\\` and Claude CLI's MCP config parser rejects the file (see the
     # comment at cli_session.py around the mcp-config.json write).
     interpreter = (sys.executable or "python3").replace("\\", "/")
-    for name, server in servers.items():
+    for _name, server in servers.items():
         if not isinstance(server, dict):
             continue
         env = server.get("env") or {}

@@ -66,16 +66,22 @@ interface Props {
 
 type Status = 'loading' | 'ready' | 'failed' | 'gone'
 
-/** The `permissions` claim of a WOPI token (a JWT), for the words only:
- * the WOPI host enforces it. */
-export const tokenPermissions = (token: string | null | undefined): 'edit' | 'view' | null => {
+/** The claims of a WOPI token (a JWT), read for the pane's own choices:
+ * the WOPI host and the editor relay enforce them. */
+const tokenClaims = (token: string | null | undefined): { permissions?: unknown; user_sub?: unknown } | null => {
   try {
     const part = (token ?? '').split('.')[1] ?? ''
-    const claims = JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')))
-    return claims?.permissions === 'edit' || claims?.permissions === 'view' ? claims.permissions : null
+    const claims: unknown = JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')))
+    return claims && typeof claims === 'object' ? claims : null
   } catch {
     return null
   }
+}
+
+/** The `permissions` claim of a WOPI token, for the words only. */
+const tokenPermissions = (token: string | null | undefined): 'edit' | 'view' | null => {
+  const permissions = tokenClaims(token)?.permissions
+  return permissions === 'edit' || permissions === 'view' ? permissions : null
 }
 
 const permissionsOf = (j: { permissions?: unknown } | null): 'edit' | 'view' | null =>
@@ -95,10 +101,10 @@ const originOf = (url: string | null | undefined): string => {
   try { return new URL(url, window.location.href).origin } catch { return '' }
 }
 
-const parseMessage = (data: unknown): { MessageId?: string; Values?: any } | null => {
+const parseMessage = (data: unknown): { MessageId?: string; Values?: Record<string, unknown> } | null => {
   try {
     const d = typeof data === 'string' ? JSON.parse(data) : data
-    return d && typeof d === 'object' ? d as { MessageId?: string; Values?: any } : null
+    return d && typeof d === 'object' ? d as { MessageId?: string; Values?: Record<string, unknown> } : null
   } catch {
     return null
   }
@@ -115,7 +121,8 @@ const DocumentFrame = forwardRef<DocumentFrameHandle, Props>(function DocumentFr
   chatId, fileId, filename, snapshotId, shown, pushed, onDirtyChange, onLiveGone, onVersionGone,
   onPermissions, className,
 }, ref) {
-  const { authConfig } = useAuth()
+  const { authConfig, user } = useAuth()
+  const viewer = user?.sub ?? ''
   const live = !snapshotId
   const [loadKey, setLoadKey] = useState(0)
   const [frame, setFrame] = useState<CollaboraFrameData | null>(null)
@@ -143,10 +150,11 @@ const DocumentFrame = forwardRef<DocumentFrameHandle, Props>(function DocumentFr
   }, [])
 
   // What the next load opens. The first load and a push's reload take the
-  // pushed frame while it is fresh (its token, its push's document). A
-  // reload for any other change mints: the file's newest document, which
-  // in a headless turn is a push whose frame arrives only at the turn's
-  // flush. The person's Refresh and Reload always load.
+  // pushed frame while it is fresh (its token, its push's document) when
+  // its token names the signed-in person. A reload for any other change
+  // mints: the file's newest document, which in a headless turn is a push
+  // whose frame arrives only at the turn's flush. The person's Refresh and
+  // Reload always load.
   const lastGeneration = useRef(pushed?.generation ?? 0)
   const nextFromPush = useRef(true)
   const pushNews = useRef(false)
@@ -200,8 +208,10 @@ const DocumentFrame = forwardRef<DocumentFrameHandle, Props>(function DocumentFr
   }, [pushed?.generation, pushed?.wopiUrl, live, fileId])
 
   // Each load decides its own source: a pushed token while its push is
-  // under 15 minutes old and the load is the push's, else a fresh mint.
-  // Never persisted.
+  // under 15 minutes old, the load is the push's and the token names the
+  // signed-in person (the editor relay admits only a token minted for its
+  // own person: a push that reached this pane with another's, or with
+  // none, mints), else a fresh mint. Never persisted.
   useEffect(() => {
     let alive = true
     const fromPush = nextFromPush.current
@@ -213,6 +223,7 @@ const DocumentFrame = forwardRef<DocumentFrameHandle, Props>(function DocumentFr
     setFrame(null)
     const p = pushedRef.current
     const pushedFrame: CollaboraFrameData | null = live && p?.accessToken && p.wopiUrl
+      && !!viewer && tokenClaims(p.accessToken)?.user_sub === viewer
       ? { url: p.wopiUrl, token: p.accessToken, ttl: p.accessTokenTtl } : null
     const allows = (perm: 'edit' | 'view' | null) => { if (live) onPermissionsRef.current?.(perm) }
     const takePushed = () => {
@@ -352,7 +363,7 @@ const DocumentFrame = forwardRef<DocumentFrameHandle, Props>(function DocumentFr
     // flag, tells: only the person can resolve it, in the editor (discard or
     // overwrite) and then with Reload.
     if (changedUnderEditsRef.current) {
-      setNote('This file changed while you edited it. Choose in the editor (discard or overwrite), then Reload.')
+      setNote('This file changed while you edited it. In the editor, choose discard or overwrite, then Reload.')
       return false
     }
     const ok = await requestSave()
@@ -401,17 +412,17 @@ const DocumentFrame = forwardRef<DocumentFrameHandle, Props>(function DocumentFr
       {((reloadAvailable && live) || note) && (
         <div className="absolute top-0 inset-x-0 z-20 flex flex-col">
           {(reloadAvailable && live) && (
-            <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-amber-500/95 text-white text-xs">
-              <span>This document changed. Reload to see the latest — your unsaved edits will be discarded.</span>
-              <button onClick={() => { setNote(''); reloadNow() }} className="shrink-0 px-2 py-0.5 rounded-sm bg-white/20 hover:bg-white/30 font-medium">
+            <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-status-warning-solid/95 text-on-solid text-xs">
+              <span>This document changed. Reload to see the latest. Your unsaved edits will be lost.</span>
+              <button onClick={() => { setNote(''); reloadNow() }} className="shrink-0 px-2 py-0.5 rounded-sm bg-surface-card/20 hover:bg-surface-card/30 font-medium">
                 Reload
               </button>
             </div>
           )}
           {note && (
-            <div role="status" className="flex items-center justify-between gap-2 border-t border-white/30 px-3 py-1.5 bg-amber-600/95 text-white text-xs">
+            <div role="status" className="flex items-center justify-between gap-2 border-t border-status-warning-border px-3 py-1.5 bg-status-warning-bg text-status-warning-fg text-xs">
               <span>{note}</span>
-              <button onClick={() => setNote('')} className="shrink-0 px-2 py-0.5 rounded-sm bg-white/20 hover:bg-white/30 font-medium">
+              <button onClick={() => setNote('')} className="shrink-0 px-2 py-0.5 rounded-control border border-current hover:underline font-medium">
                 OK
               </button>
             </div>
@@ -420,8 +431,8 @@ const DocumentFrame = forwardRef<DocumentFrameHandle, Props>(function DocumentFr
       )}
       {originMismatch ? (
         <div className="h-full flex items-center justify-center p-6">
-          <div className="max-w-md text-sm text-p-text-secondary space-y-2">
-            <p className="font-medium text-p-text">Document preview can't load from this address.</p>
+          <div className="max-w-md text-sm text-secondary space-y-2">
+            <p className="font-medium text-primary">Document preview can't load from this address.</p>
             {editorOwnOrigin ? (
               <>
                 <p>
@@ -438,7 +449,7 @@ const DocumentFrame = forwardRef<DocumentFrameHandle, Props>(function DocumentFr
                 </p>
                 <p>
                   An administrator should set <code className="text-xs">DASHBOARD_PUBLIC_URL={window.location.origin}</code> in
-                  the install's <code className="text-xs">.env</code> (or <code className="text-xs">config.env</code>) and
+                  the install's <code className="text-xs">.env</code> or in <code className="text-xs">config.env</code>, and
                   run <code className="text-xs">docker compose up -d</code> to apply it.
                 </p>
               </>
@@ -448,23 +459,23 @@ const DocumentFrame = forwardRef<DocumentFrameHandle, Props>(function DocumentFr
       ) : (
         <>
           {(status === 'failed' || status === 'gone') && (
-            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-p-surface/80 text-sm text-p-text-secondary">
+            <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-surface-muted/80 text-sm text-secondary">
               <span>
                 {status === 'gone'
                   ? (live ? 'This file is no longer there.' : 'This version is no longer available.')
                   : 'The document could not be opened.'}
               </span>
               {status === 'failed' && (
-                <button onClick={refresh} className="px-2 py-1 rounded-md border border-p-border-light hover:bg-p-surface-hover text-xs">
+                <button onClick={refresh} className="px-2 py-1 rounded-control border border-subtle hover:bg-surface-hover text-xs">
                   Retry
                 </button>
               )}
             </div>
           )}
           {status !== 'failed' && status !== 'gone' && !loaded && (
-            <div className="absolute inset-0 z-10 flex items-center justify-center bg-p-surface/80">
-              <div className="flex items-center gap-2 text-sm text-p-text-secondary">
-                <div className="w-4 h-4 border-2 border-brand/30 border-t-brand rounded-full animate-spin" />
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-surface-muted/80">
+              <div className="flex items-center gap-2 text-sm text-secondary">
+                <div className="w-4 h-4 border-2 border-action/30 border-t-action rounded-full animate-spin" />
                 Loading {filename || 'document'}…
               </div>
             </div>

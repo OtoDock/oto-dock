@@ -18,17 +18,19 @@ import logging
 import uuid
 
 import config
-from core import placement
-from storage.pg import run_db
-from core.session.session_state import get_user_tz, set_session_user_tz
-from core.session.session_manager import get_execution_layer, resolve_execution_path
-from core.config.config_builder import build_agent_config, release_config_seat
-from services.engines import subscription_pool
-# Imported by ws/dashboard.py AFTER its helpers are defined (through the
-# warmup mixin) — safe intra-unit circularity (see the class assembly there).
-from ws.dashboard import _resolve_session_interactive
-from core.session import session_kind
 from auth.providers import acting_role_of
+from core import placement
+from core.config.config_builder import build_agent_config, release_config_seat
+from core.permission_modes import ASK_MODE
+from core.session import session_kind
+from core.session.session_manager import get_execution_layer, resolve_execution_path
+from core.session.session_state import get_user_tz, set_session_user_tz
+from services.engines import subscription_pool
+from storage.pg import run_db
+
+# ws/dashboard.py assembles the connection from the mixins at its end, so
+# its helpers are imported inside the functions that call them: this
+# module imports first too (tests/core/test_import_layers.py).
 
 logger = logging.getLogger("otodock")
 
@@ -64,7 +66,7 @@ def _schedule_pre_warmup_rollback(sid: str, build, agent_cfg, started: bool, lay
 
 async def spawn_detached_prewarm(
     *, agent: str, user: dict, user_sub: str,
-    requested_model: str = "", permission_mode: str = "default",
+    requested_model: str = "", permission_mode: str = ASK_MODE,
 ) -> str | None:
     """Pre-warm a session OUTSIDE any WS connection (wake-word detection fires
     this over HTTP before the dashboard navigates to the chat).
@@ -76,23 +78,28 @@ async def spawn_detached_prewarm(
     ``_spawn_tail``; unclaimed → the TTL reaper frees it. Returns the
     session_id, or None when skipped (remote/interactive) or not spawnable.
     """
+    from ws.dashboard import _resolve_session_interactive
     role = await run_db(acting_role_of, user_sub, agent, fallback_user=user)
     new_sid = str(uuid.uuid4())
     agent_cfg = None
     layer = None
     try:
-        exec_path = resolve_execution_path(agent, "")
-        if _model_foreign_to_engine(requested_model, exec_path):
+        def _path_and_check() -> tuple[str, bool]:
+            path = resolve_execution_path(agent, "")
+            return path, _model_foreign_to_engine(requested_model, path)
+
+        exec_path, foreign_model = await run_db(_path_and_check)
+        if foreign_model:
             logger.info(
-                f"detached pre-warm: skipped (model {requested_model} is not a "
-                f"{exec_path} model) agent={agent}"
+                "detached pre-warm: skipped (model %s is not a "
+                "%s model) agent=%s", requested_model, exec_path, agent
             )
             return None
         # Room for this session and one more, nobody waiting, the person
         # below their cap; otherwise skipped without a word.
         from core import concurrency
         if not concurrency.prewarm_allowed(exec_path, user_sub=user_sub):
-            logger.info(f"detached pre-warm: skipped (no room for two) agent={agent}")
+            logger.info("detached pre-warm: skipped (no room for two) agent=%s", agent)
             return None
         agent_cfg = await build_agent_config(
             agent_name=agent, user=user, user_sub=user_sub,
@@ -107,18 +114,18 @@ async def spawn_detached_prewarm(
         # cold-start never reuses a -p pre-warm. Each skip returns the seat
         # the build acquired.
         if not placement.is_local(agent_cfg.execution_target):
-            logger.info(f"detached pre-warm: skipped (remote target) agent={agent}")
+            logger.info("detached pre-warm: skipped (remote target) agent=%s", agent)
             release_config_seat(new_sid, agent_cfg)
             return None
-        if _resolve_session_interactive(agent_cfg):
-            logger.info(f"detached pre-warm: skipped (interactive) agent={agent}")
+        if await run_db(_resolve_session_interactive, agent_cfg):
+            logger.info("detached pre-warm: skipped (interactive) agent=%s", agent)
             release_config_seat(new_sid, agent_cfg)
             return None
         from core.concurrency import acquire_chat_slot
         adm = await acquire_chat_slot(new_sid, execution_path=agent_cfg.execution_path,
                                       user_sub=user_sub, speculative=True)
         if not adm:
-            logger.info(f"detached pre-warm: no slot ({adm.reason})")
+            logger.info("detached pre-warm: no slot (%s)", adm.reason)
             release_config_seat(new_sid, agent_cfg)
             return None
         # The layer must match the target the build resolved (local here):
@@ -135,19 +142,19 @@ async def spawn_detached_prewarm(
         from core.session import prewarm_session_registry as _prewarm
         await _prewarm.register(new_sid, agent=agent, user_sub=user_sub,
                                 role=role,
-                                exec_path=resolve_execution_path(agent, ""),
+                                exec_path=exec_path,
                                 model=agent_cfg.model)
         logger.info(
-            f"detached pre-warm: created session={new_sid[:8]}, agent={agent}, "
-            f"model={agent_cfg.model}, role={role}"
+            "detached pre-warm: created session=%s, agent=%s, "
+            "model=%s, role=%s", new_sid[:8], agent, agent_cfg.model, role
         )
         return new_sid
     except Exception as e:
         from core.sandbox.session_config_dir import AgentStateRefused
         if isinstance(e, AgentStateRefused):
-            logger.info(f"detached pre-warm skipped (below the editor tier) agent={agent}")
+            logger.info("detached pre-warm skipped (below the editor tier) agent=%s", agent)
         else:
-            logger.error(f"detached pre-warm failed: {e}", exc_info=True)
+            logger.exception("detached pre-warm failed: %s", e)
         from core.concurrency import release_chat_slot
         release_chat_slot(new_sid)
         if layer is not None and await layer.is_session_alive(new_sid):
@@ -168,8 +175,5 @@ def _model_foreign_to_engine(model: str, execution_path: str) -> bool:
     unknown model (custom row, local endpoint) is trusted."""
     if not model or not execution_path:
         return False
-    try:
-        layers = config.get_model_layers(model)
-    except Exception:
-        return False
+    layers = config.get_model_layers(model)
     return bool(layers) and execution_path not in layers

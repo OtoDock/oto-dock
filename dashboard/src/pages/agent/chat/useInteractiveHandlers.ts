@@ -5,13 +5,14 @@
  * message / pull them all back into the composer). Called where the page
  * declared handleInteractiveToggle, so the React hook order is unchanged.
  */
-import { useCallback } from 'react'
+import { useCallback, useLayoutEffect, useRef } from 'react'
 import type { useChatStream } from '../../../hooks/useChatStream'
 import type { useInteractiveChat } from '../../../hooks/useInteractiveChat'
 import { fetchChatPage } from '../../../api/chats'
 import { useChatStore } from '../../../store/chatStore'
 import type { QueuedMessage } from '../../../store/types'
 import { useAgentPrefsStore } from '../../../store/agentPrefsStore'
+import { useDialogs } from '../../../components/ui/dialogs'
 
 type Stream = ReturnType<typeof useChatStream>
 
@@ -29,11 +30,18 @@ export function useInteractiveHandlers({
   queuedMessages: QueuedMessage[]
   setEditText: Stream['setEditText']
 }) {
+  // The members the handlers call (the bundle is rebuilt every render).
+  const { toggle, performSwitch, setSessionInteractive, showRichView, setShowRichView } = interactive
+  const dialogs = useDialogs()
+  // What the switch reads after its confirm: the turn may have ended, or the
+  // page moved to another chat, while the dialog was open.
+  const liveRef = useRef({ streaming: ws.streaming, chatId, sessionId })
+  useLayoutEffect(() => { liveRef.current = { streaming: ws.streaming, chatId, sessionId } })
   // Interactive CLI toggle. No live session:
   // set the per-chat intent + persist it (the next send spawns the chosen mode).
   // Live session: kill+rewarm in the target mode (deferred to turn-end if a -p
   // turn streams); a turn in flight confirms first — the switch kills it.
-  const handleInteractiveToggle = useCallback((next: boolean) => {
+  const handleInteractiveToggle = useCallback(async (next: boolean) => {
     // Sticky for the same agent's next new chat (the interactive twin of the
     // model/mode stickiness). Persist the EXPLICIT choice both ways so
     // turning OFF overrides an interactive agent default on the next new chat.
@@ -41,7 +49,7 @@ export function useInteractiveHandlers({
       useAgentPrefsStore.getState().setLastInteractive(agentName, next ? 'interactive' : '-p')
     }
     if (!sessionId || !chatId) {
-      interactive.toggle(next, chatId)
+      toggle(next, chatId)
       return
     }
     // A live/streaming turn dies with the switch (switch_execution_mode kills
@@ -49,12 +57,24 @@ export function useInteractiveHandlers({
     // Gate on the VIEWED chat's per-chat slice OR the connection-global flag
     // so a turn started in another tab still warns. An IDLE live session
     // switches without a prompt: the restart is lossless (the conversation is
-    // kept and reloaded). window.confirm is this page's existing confirm idiom.
+    // kept and reloaded).
     if (viewedStreaming || ws.streaming) {
-      if (!window.confirm('Switching mode stops the current response. Switch anyway?')) return
+      if (!(await dialogs.confirm({
+        title: 'Switch anyway?',
+        body: 'Switching the mode stops the current response.',
+        confirmLabel: 'Switch',
+        tone: 'danger',
+      }))) return
+      const live = liveRef.current
+      // The page moved to another chat: the answer was for this one.
+      if (live.chatId !== chatId) return
+      // The session ended while the dialog was open: the no-session path.
+      if (!live.sessionId) toggle(next, chatId)
+      else performSwitch(next, chatId, live.streaming)
+      return
     }
-    interactive.performSwitch(next, chatId, ws.streaming)
-  }, [interactive.toggle, interactive.performSwitch, sessionId, chatId, ws.streaming, viewedStreaming, agentName])
+    performSwitch(next, chatId, ws.streaming)
+  }, [toggle, performSwitch, sessionId, chatId, ws.streaming, viewedStreaming, agentName, dialogs])
 
   // Interactive PTY died (the user quit the TUI with Ctrl+C/Ctrl+D, or it was
   // reaped). Leave the dead terminal for the DB rich view — reload chat_history
@@ -63,9 +83,9 @@ export function useInteractiveHandlers({
   // (routeSend cold-start).
   const handleTerminalExit = useCallback(() => {
     if (!chatId) return
-    interactive.setSessionInteractive(false)
+    setSessionInteractive(false)
     ws.resumeChat(chatId)
-  }, [chatId, interactive.setSessionInteractive, ws])
+  }, [chatId, setSessionInteractive, ws])
 
   // View toggle: flip the live terminal ⇄ the DB rich
   // conversation history WITHOUT touching the session. Turning ON fetches a
@@ -76,24 +96,27 @@ export function useInteractiveHandlers({
   // is the live surface), so overwriting them is safe.
   const handleToggleRichView = useCallback(async () => {
     if (!chatId) return
-    if (interactive.showRichView) {
-      interactive.setShowRichView(false)
+    if (showRichView) {
+      setShowRichView(false)
       return
     }
     try {
       const { messages: rows, has_more } = await fetchChatPage(chatId, 50)
       seedDbHistory(rows, has_more)  // newest page + lazy scroll-back, same as resume
-      interactive.setShowRichView(true)
+      setShowRichView(true)
     } catch { /* network error — stay on the terminal */ }
-  }, [chatId, interactive.showRichView, interactive.setShowRichView, seedDbHistory])
+  }, [chatId, showRichView, setShowRichView, seedDbHistory])
 
   // A chip leaves on the proxy's queue_removed, not before (a teammate's
   // chip the proxy refuses stays). A chip a 1.7.0 proxy minted has no id:
   // it is removed here and cancelled by its index, as that proxy expects.
+  // A chip of a task chat viewed through a sibling run names the queue's
+  // own chat (`queueChatId`), so the proxy finds the message in the right
+  // queue between turns.
   const handleCancelQueued = useCallback(
     (i: number) => {
       const item = queuedMessages[i]
-      ws.cancelQueued({ queueId: item?.queueId, index: i }, chatId ?? undefined)
+      ws.cancelQueued({ queueId: item?.queueId, index: i }, item?.queueChatId ?? chatId ?? undefined)
       if (!item?.queueId && draftKey) {
         useChatStore.getState().removeQueuedMessage(draftKey, { index: i })
       }
@@ -109,7 +132,9 @@ export function useInteractiveHandlers({
     () => {
       if (queuedMessages.length === 0) return
       if (queuedMessages.some(q => q.queueId)) {
-        ws.cancelAllQueued(chatId ?? undefined)
+        const queueChats = new Set(queuedMessages.map(q => q.queueChatId).filter(Boolean))
+        const [only] = queueChats
+        ws.cancelAllQueued((queueChats.size === 1 ? only : undefined) ?? chatId ?? undefined)
         return
       }
       const combined = queuedMessages.map(q => q.text).join('\n\n')
@@ -131,7 +156,7 @@ export function useInteractiveHandlers({
       }
       setEditText(combined)
     },
-    [queuedMessages, ws, draftKey],
+    [queuedMessages, ws, draftKey, chatId, setEditText],
   )
 
   return { handleInteractiveToggle, handleTerminalExit, handleToggleRichView, handleCancelQueued, handleEditQueued }

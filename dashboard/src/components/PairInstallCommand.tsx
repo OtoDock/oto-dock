@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { BUTTON_BASE, BUTTON_SIZE, SEGMENT } from './ui/classes'
 import { type PairResult } from '../api/remoteMachines'
 import { BOOTSTRAP_OS, detectBootstrapOs, type BootstrapOs } from '../lib/hostOs/os'
 
@@ -11,7 +12,7 @@ const OS_LABEL: Record<BootstrapOs, string> = {
 const OS_HELPER: Record<BootstrapOs, string> = {
   linux: 'Run in a terminal on the remote machine.',
   macos: 'Run in Terminal.app on the remote machine.',
-  windows: 'Run in a normal PowerShell on the remote machine — no administrator rights needed (Windows may prompt once to install missing tools).',
+  windows: 'Run in a normal PowerShell on the remote machine. No administrator rights are needed. Windows may ask once to install missing tools.',
 }
 
 interface Props {
@@ -32,29 +33,25 @@ export default function PairInstallCommand({ pairResult, introText }: Props) {
   return (
     <div className="space-y-3">
       {introText && (
-        <p className="text-sm text-p-text-light">{introText}</p>
+        <p className="text-sm text-tertiary">{introText}</p>
       )}
-      <div className="inline-flex rounded-lg border border-p-border-light p-0.5 bg-p-surface">
+      <div role="group" aria-label="Operating system" className="flex gap-1">
         {BOOTSTRAP_OS.map(o => (
           <button
             key={o}
             type="button"
             onClick={() => setOs(o)}
-            className={
-              'px-3 py-1 text-xs font-medium rounded-md transition-colors ' +
-              (o === os
-                ? 'bg-brand text-white'
-                : 'text-p-text hover:bg-p-surface-hover')
-            }
+            aria-pressed={o === os}
+            className={`${BUTTON_BASE} ${BUTTON_SIZE.xs} ${o === os ? SEGMENT.on : SEGMENT.off}`}
           >
             {OS_LABEL[o]}
           </button>
         ))}
       </div>
-      <div className="bg-gray-900 text-green-400 p-3 rounded-lg text-xs font-mono break-all select-all">
+      <div className="bg-code-bg text-code-fg p-3 rounded-card text-xs font-mono break-all select-all">
         {cmd}
       </div>
-      <p className="text-xs text-p-text-light">{OS_HELPER[os]}</p>
+      <p className="text-xs text-tertiary">{OS_HELPER[os]}</p>
     </div>
   )
 }

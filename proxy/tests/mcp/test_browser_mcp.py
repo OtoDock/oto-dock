@@ -9,10 +9,10 @@ what we assert here.
 
 import pytest
 
-from services.mcp import mcp_registry as reg
-
-from tests._paths import REPO_ROOT as _ROOT
 from core import placement
+from services.mcp import mcp_registry as reg
+from tests._paths import REPO_ROOT as _ROOT
+
 _MANIFEST = _ROOT / "mcps" / "custom" / "browser-mcp" / "manifest.json"
 
 
@@ -207,6 +207,7 @@ def test_apply_browser_mode_extends_an_existing_bundle():
 
 def test_build_session_config_threads_target_browser(monkeypatch, tmp_path):
     import json
+
     from tests.mcp.test_mcp_broker_activation import _FakeManifest, _stub_assembly
     _stub_assembly(
         monkeypatch, [_FakeManifest("browser-control", server_name="local")],
@@ -225,6 +226,8 @@ def test_build_session_config_threads_target_browser(monkeypatch, tmp_path):
     assert local["env"] == {
         "PLAYWRIGHT_MCP_BLOCKED_ORIGINS": "http://localhost:*",
         "OTO_BROWSER_MODE": "own", "OTO_BROWSER_TOKEN_EXPECTED": "1",
+        # The shell's command-line token: stripped by the wrap, blank anyway.
+        "OTO_STRIP_KEYS": "OTO_CLI_TOKEN", "OTO_CLI_TOKEN": "",
     }
     assert bundles["local"].env == {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "V" * 43}
     # No target_browser (local builders never pass one): the entry keeps only
@@ -233,7 +236,8 @@ def test_build_session_config_threads_target_browser(monkeypatch, tmp_path):
         "agent", None, placement=placement.PlacementCapabilities(kind=placement.KIND_USER_REMOTE, machine_id="m"),
     )
     local = json.loads(path.read_text())["mcpServers"]["local"]
-    assert local["env"] == {"PLAYWRIGHT_MCP_BLOCKED_ORIGINS": "http://localhost:*"}
+    assert local["env"] == {"PLAYWRIGHT_MCP_BLOCKED_ORIGINS": "http://localhost:*",
+                            "OTO_CLI_TOKEN": ""}
     assert "local" not in bundles
 
 

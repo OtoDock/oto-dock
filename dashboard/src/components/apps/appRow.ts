@@ -4,13 +4,13 @@ import { GRANTEE_KIND } from '../../api/shares'
 
 /**
  * What a row of the Apps strip looks like (APPS.md; SHARING.md "A placed
- * app in the Apps panel"). The fill follows ownership: brand-blue for the
- * viewer's own (a personal row, and a person's own share, placed here or
- * granted on a colleague's personal app), accent-purple for the team's (a
+ * app in the Apps panel"). The fill follows ownership: the action blue for
+ * the viewer's own (a personal row, and a person's own share, placed here or
+ * granted on a colleague's personal app), the agent accent for the team's (a
  * shared row, an agent or department placement). A row a share brought
- * here also wears a teal border and the share mark; on the active chip the
- * border is backed by a ring against the page, since teal barely shows on
- * the solid fill.
+ * here also wears the information border and the share mark; on the active
+ * chip the border is backed by a ring against the page, since the border
+ * barely shows on the solid fill.
  */
 
 type ChipRow = Pick<PinnedApp, 'scope' | 'granted' | 'placement'>
@@ -30,21 +30,21 @@ export function appChipClass(app: ChipRow, active: boolean): string {
   if (cameByShare(app)) {
     if (team) {
       return active
-        ? 'bg-p-accent-purple text-white border-p-accent-teal ring-2 ring-p-accent-teal ring-offset-1 ring-offset-p-bg'
-        : 'bg-p-accent-purple/10 text-p-accent-purple border-p-accent-teal hover:bg-p-accent-purple/20'
+        ? 'bg-accent-agent-fill text-on-solid border-status-info-solid ring-2 ring-status-info-solid ring-offset-1 ring-offset-surface-page'
+        : 'bg-accent-agent-bg text-accent-agent-fg border-status-info-solid hover:text-primary'
     }
     return active
-      ? 'bg-brand text-white border-p-accent-teal ring-2 ring-p-accent-teal ring-offset-1 ring-offset-p-bg'
-      : 'bg-brand/10 text-brand border-p-accent-teal hover:bg-brand/20'
+      ? 'bg-action text-action-fg border-status-info-solid ring-2 ring-status-info-solid ring-offset-1 ring-offset-surface-page'
+      : 'bg-action-subtle text-link border-status-info-solid hover:bg-action-subtle-hover hover:text-primary'
   }
   if (team) {
     return active
-      ? 'bg-p-accent-purple text-white border-p-accent-purple'
-      : 'bg-p-accent-purple/10 text-p-accent-purple border-p-accent-purple/30 hover:bg-p-accent-purple/20'
+      ? 'bg-accent-agent-fill text-on-solid border-accent-agent-fill'
+      : 'bg-accent-agent-bg text-accent-agent-fg border-accent-agent-border hover:text-primary'
   }
   return active
-    ? 'bg-brand text-white border-brand'
-    : 'bg-brand/10 text-brand border-brand/30 hover:bg-brand/20'
+    ? 'bg-action text-action-fg border-action'
+    : 'bg-action-subtle text-link border-transparent hover:bg-action-subtle-hover hover:text-primary'
 }
 
 type UnpinRow = Pick<PinnedApp, 'scope' | 'kind' | 'has_server' | 'title' | 'slug'>
@@ -73,6 +73,6 @@ export function unpinWords(app: UnpinRow): { action: string; question: string; d
   return {
     action: everyone ? 'Unpin for everyone' : 'Unpin',
     question: everyone ? `Unpin “${title}” for everyone?` : `Unpin “${title}”?`,
-    detail: 'The workspace file and the approved actions are kept — ask the agent to pin it back anytime.',
+    detail: 'The workspace file and the approved actions are kept. Ask the agent to pin it back anytime.',
   }
 }

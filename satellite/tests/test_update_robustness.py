@@ -17,7 +17,6 @@ import pytest
 from satellite import __main__ as sat_main
 from satellite.transport import lifecycle_update
 
-
 # --- child reap (the actual swap-unlock fix) -------------------------------
 
 def test_reap_never_raises_on_error(monkeypatch):

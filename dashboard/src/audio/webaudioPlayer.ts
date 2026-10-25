@@ -1,3 +1,4 @@
+import { debugLog } from '../lib/debug/log'
 // Gapless PCM playback over the Web Audio API — schedule raw 16-bit signed LE
 // mono chunks back-to-back as they arrive, for low time-to-first-audio. Shared
 // by the one-shot platform-TTS replay (SoundIcon) and the streaming voice-mode
@@ -79,7 +80,7 @@ export function createPcmPlayer(
   let lead = leadS
   // R3.1 instrumentation: count real underruns and their sizes so a live
   // test says where remaining micro-interruptions come from. Read the
-  // summary line (console.info on stop) next to the daemon's TTS logs.
+  // summary line (a debug breadcrumb on stop) next to the daemon's TTS logs.
   let underruns = 0
   let underrunS = 0
   let chunks = 0
@@ -114,7 +115,7 @@ export function createPcmPlayer(
           underruns++
           underrunS += gap
           lead = Math.min(lead + LEAD_STEP_S, LEAD_MAX_S)
-          console.info(
+          debugLog(
             `[pcm] underrun #${underruns}: ${(gap * 1000).toFixed(0)}ms gap `
             + `after ${audioS.toFixed(1)}s of audio (lead → ${lead.toFixed(2)}s)`)
           try { onUnderrun?.(gap * 1000, audioS) } catch { /* never break playback */ }
@@ -143,7 +144,7 @@ export function createPcmPlayer(
     stop() {
       stopped = true
       if (chunks > 0 && underruns > 0) {
-        console.info(
+        debugLog(
           `[pcm] playback summary: ${chunks} chunks, ${audioS.toFixed(1)}s `
           + `audio, ${underruns} underruns (${(underrunS * 1000).toFixed(0)}ms `
           + `total gap)`)

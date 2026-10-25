@@ -14,6 +14,7 @@ point `_parse_manifest` and the tests call); the ``_WEBHOOK_*`` enums and
 import re
 from typing import Any
 
+from services.mcp.mcp_manifest_types import _ENV_VAR_NAME_RE
 
 # ---------------------------------------------------------------------------
 # Webhook receiver validation
@@ -90,6 +91,11 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
         # Skip deeper validation when feature-flagged off.
         return
 
+    for rule in _WEBHOOK_RULES:
+        rule(raw, mcp_name)
+
+
+def _check_webhook_provider_id(raw: dict, mcp_name: str) -> None:
     provider_id = raw.get("provider_id", "")
     if not isinstance(provider_id, str) or not provider_id.strip():
         raise ValueError(
@@ -100,7 +106,9 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
     # at /v1/webhooks/{scope}/{owner}/{slug} where scope ∈ {agent, user};
     # relay-forwarded events land at /v1/webhooks/relay/{provider_id}.
     # Reserving these as provider_ids prevents a future MCP from accidentally
-    # shadowing either URL family.
+    # shadowing either URL family. (A GitHub App's deliveries land at
+    # /v1/webhooks/{provider_id}/app, under the provider: no provider id can
+    # shadow that, and a subscription id is never that word.)
     if provider_id in ("agent", "user", "relay"):
         raise ValueError(
             f"credentials.webhooks.provider_id={provider_id!r} is reserved "
@@ -108,6 +116,8 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
             f"relay /v1/webhooks/relay/... URL families)"
         )
 
+
+def _check_webhook_signature(raw: dict, mcp_name: str) -> None:
     # --- signature sub-block (required when available=true) ---
     sig = raw.get("signature")
     if not isinstance(sig, dict):
@@ -165,6 +175,8 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
             "credential to read for HMAC verification)"
         )
 
+
+def _check_webhook_url_verification(raw: dict, mcp_name: str) -> None:
     # --- url_verification sub-block (required when available=true) ---
     uv = raw.get("url_verification")
     if not isinstance(uv, dict):
@@ -207,6 +219,8 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
                 "is stored per subscription row)"
             )
 
+
+def _check_webhook_registration(raw: dict, mcp_name: str) -> None:
     # --- registration sub-block (required when available=true) ---
     reg = raw.get("registration")
     if not isinstance(reg, dict):
@@ -252,6 +266,8 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
                 "integer when declared (vendor subscription TTL in seconds)"
             )
 
+
+def _check_webhook_event_catalog(raw: dict, mcp_name: str) -> None:
     # --- event_catalog sub-block ---
     catalog = raw.get("event_catalog")
     if not isinstance(catalog, list) or not catalog:
@@ -260,147 +276,162 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
         )
     seen_event_keys: set[str] = set()
     for idx, entry in enumerate(catalog):
-        if not isinstance(entry, dict):
+        _check_catalog_entry(idx, entry, seen_event_keys)
+
+
+def _check_catalog_entry(idx: int, entry: Any, seen_event_keys: set[str]) -> None:
+    """One ``event_catalog`` entry; ``seen_event_keys`` collects the keys."""
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"credentials.webhooks.event_catalog[{idx}] must be an object"
+        )
+    key = entry.get("key", "")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError(
+            f"credentials.webhooks.event_catalog[{idx}].key must be a non-empty string"
+        )
+    if key in seen_event_keys:
+        raise ValueError(
+            f"credentials.webhooks.event_catalog[{idx}] duplicates key={key!r}"
+        )
+    seen_event_keys.add(key)
+    label = entry.get("label", "")
+    if not isinstance(label, str) or not label.strip():
+        raise ValueError(
+            f"credentials.webhooks.event_catalog[{idx}].label must be a non-empty string"
+        )
+    for opt_str in ("description",):
+        v = entry.get(opt_str, "")
+        if not isinstance(v, str):
             raise ValueError(
-                f"credentials.webhooks.event_catalog[{idx}] must be an object"
+                f"credentials.webhooks.event_catalog[{idx}].{opt_str} must be a string"
             )
-        key = entry.get("key", "")
-        if not isinstance(key, str) or not key.strip():
+    scopes = entry.get("required_scopes", [])
+    if not isinstance(scopes, list):
+        raise ValueError(
+            f"credentials.webhooks.event_catalog[{idx}].required_scopes must be a list"
+        )
+    for sidx, s in enumerate(scopes):
+        if not isinstance(s, str) or not s.strip():
             raise ValueError(
-                f"credentials.webhooks.event_catalog[{idx}].key must be a non-empty string"
+                f"credentials.webhooks.event_catalog[{idx}].required_scopes[{sidx}] "
+                f"must be a non-empty string"
             )
-        if key in seen_event_keys:
+    subevents = entry.get("subevents")
+    if subevents is not None:
+        if not isinstance(subevents, list):
             raise ValueError(
-                f"credentials.webhooks.event_catalog[{idx}] duplicates key={key!r}"
+                f"credentials.webhooks.event_catalog[{idx}].subevents must be a list"
             )
-        seen_event_keys.add(key)
-        label = entry.get("label", "")
-        if not isinstance(label, str) or not label.strip():
-            raise ValueError(
-                f"credentials.webhooks.event_catalog[{idx}].label must be a non-empty string"
-            )
-        for opt_str in ("description",):
-            v = entry.get(opt_str, "")
-            if not isinstance(v, str):
+        for sidx, se in enumerate(subevents):
+            if not isinstance(se, str) or not se.strip():
                 raise ValueError(
-                    f"credentials.webhooks.event_catalog[{idx}].{opt_str} must be a string"
-                )
-        scopes = entry.get("required_scopes", [])
-        if not isinstance(scopes, list):
-            raise ValueError(
-                f"credentials.webhooks.event_catalog[{idx}].required_scopes must be a list"
-            )
-        for sidx, s in enumerate(scopes):
-            if not isinstance(s, str) or not s.strip():
-                raise ValueError(
-                    f"credentials.webhooks.event_catalog[{idx}].required_scopes[{sidx}] "
+                    f"credentials.webhooks.event_catalog[{idx}].subevents[{sidx}] "
                     f"must be a non-empty string"
                 )
-        subevents = entry.get("subevents")
-        if subevents is not None:
-            if not isinstance(subevents, list):
-                raise ValueError(
-                    f"credentials.webhooks.event_catalog[{idx}].subevents must be a list"
-                )
-            for sidx, se in enumerate(subevents):
-                if not isinstance(se, str) or not se.strip():
-                    raise ValueError(
-                        f"credentials.webhooks.event_catalog[{idx}].subevents[{sidx}] "
-                        f"must be a non-empty string"
-                    )
-        if "default_selected" in entry and not isinstance(entry["default_selected"], bool):
+    if "default_selected" in entry and not isinstance(entry["default_selected"], bool):
+        raise ValueError(
+            f"credentials.webhooks.event_catalog[{idx}].default_selected must be a boolean"
+        )
+    delivery = entry.get("delivery", "user")
+    if delivery not in ("user", "bot"):
+        raise ValueError(
+            f"credentials.webhooks.event_catalog[{idx}].delivery={delivery!r} "
+            f"must be 'user' or 'bot'"
+        )
+    if "admin_only" in entry and not isinstance(entry["admin_only"], bool):
+        raise ValueError(
+            f"credentials.webhooks.event_catalog[{idx}].admin_only must be a boolean"
+        )
+    _check_catalog_match(idx, entry)
+    # Optional `resource_contains` (batched-vendor canonicalization):
+    # MS-Graph-style vendors deliver value[] items whose `resource`
+    # string names the subscribed resource ("Users/{id}/Events/{id}").
+    # The request-level `match` mechanism can't see per-item context in
+    # a batched body, so providers that canonicalize per item
+    # (microsoft) map an item to this catalog key when the lowercased
+    # substring appears in the item's resource.
+    rc = entry.get("resource_contains")
+    if rc is not None and (not isinstance(rc, str) or not rc.strip()):
+        raise ValueError(
+            f"credentials.webhooks.event_catalog[{idx}].resource_contains "
+            f"must be a non-empty string when declared"
+        )
+    _check_catalog_vendor_fields(idx, entry)
+
+
+def _check_catalog_match(idx: int, entry: dict) -> None:
+    # Optional `match` block: maps a raw vendor payload to this catalog
+    # key (catalog keys are SUBSCRIPTION names — slack's message.channels —
+    # while payloads carry raw types like event.type="message"). Entries
+    # without `match` match when the raw event type equals `key`.
+    match = entry.get("match")
+    if match is not None:
+        if not isinstance(match, dict):
             raise ValueError(
-                f"credentials.webhooks.event_catalog[{idx}].default_selected must be a boolean"
+                f"credentials.webhooks.event_catalog[{idx}].match must be an object"
             )
-        delivery = entry.get("delivery", "user")
-        if delivery not in ("user", "bot"):
+        met = match.get("event_type", "")
+        if not isinstance(met, str) or not met.strip():
             raise ValueError(
-                f"credentials.webhooks.event_catalog[{idx}].delivery={delivery!r} "
-                f"must be 'user' or 'bot'"
+                f"credentials.webhooks.event_catalog[{idx}].match.event_type "
+                f"must be a non-empty string"
             )
-        if "admin_only" in entry and not isinstance(entry["admin_only"], bool):
-            raise ValueError(
-                f"credentials.webhooks.event_catalog[{idx}].admin_only must be a boolean"
-            )
-        # Optional `match` block: maps a raw vendor payload to this catalog
-        # key (catalog keys are SUBSCRIPTION names — slack's message.channels —
-        # while payloads carry raw types like event.type="message"). Entries
-        # without `match` match when the raw event type equals `key`.
-        match = entry.get("match")
-        if match is not None:
-            if not isinstance(match, dict):
+        conditions = match.get("conditions")
+        if conditions is not None:
+            if not isinstance(conditions, dict):
                 raise ValueError(
-                    f"credentials.webhooks.event_catalog[{idx}].match must be an object"
+                    f"credentials.webhooks.event_catalog[{idx}].match.conditions "
+                    f"must be an object"
                 )
-            met = match.get("event_type", "")
-            if not isinstance(met, str) or not met.strip():
-                raise ValueError(
-                    f"credentials.webhooks.event_catalog[{idx}].match.event_type "
-                    f"must be a non-empty string"
-                )
-            conditions = match.get("conditions")
-            if conditions is not None:
-                if not isinstance(conditions, dict):
+            for cpath, expected in conditions.items():
+                if not (
+                    isinstance(cpath, str)
+                    and (cpath.startswith("body.") or cpath.startswith("headers."))
+                ):
                     raise ValueError(
                         f"credentials.webhooks.event_catalog[{idx}].match.conditions "
-                        f"must be an object"
+                        f"key {cpath!r} must start with 'body.' or 'headers.'"
                     )
-                for cpath, expected in conditions.items():
-                    if not (
-                        isinstance(cpath, str)
-                        and (cpath.startswith("body.") or cpath.startswith("headers."))
-                    ):
-                        raise ValueError(
-                            f"credentials.webhooks.event_catalog[{idx}].match.conditions "
-                            f"key {cpath!r} must start with 'body.' or 'headers.'"
-                        )
-                    if isinstance(expected, str):
-                        continue
-                    if isinstance(expected, list) and expected and all(
-                        isinstance(e, str) for e in expected
-                    ):
-                        continue
-                    raise ValueError(
-                        f"credentials.webhooks.event_catalog[{idx}].match.conditions"
-                        f"[{cpath!r}] must be a string or a non-empty list of strings"
-                    )
-        # Optional `resource_contains` (batched-vendor canonicalization):
-        # MS-Graph-style vendors deliver value[] items whose `resource`
-        # string names the subscribed resource ("Users/{id}/Events/{id}").
-        # The request-level `match` mechanism can't see per-item context in
-        # a batched body, so providers that canonicalize per item
-        # (microsoft) map an item to this catalog key when the lowercased
-        # substring appears in the item's resource.
-        rc = entry.get("resource_contains")
-        if rc is not None and (not isinstance(rc, str) or not rc.strip()):
+                if isinstance(expected, str):
+                    continue
+                if isinstance(expected, list) and expected and all(
+                    isinstance(e, str) for e in expected
+                ):
+                    continue
+                raise ValueError(
+                    f"credentials.webhooks.event_catalog[{idx}].match.conditions"
+                    f"[{cpath!r}] must be a string or a non-empty list of strings"
+                )
+
+
+def _check_catalog_vendor_fields(idx: int, entry: dict) -> None:
+    # Optional `vendor_create_fields`: top-level body fields merged over
+    # the substituted registration.create body when THIS event is among
+    # the subscription's selected events (MS Graph driveItem accepts
+    # only changeType="updated" while the shared template sends
+    # "created,updated").
+    vcf = entry.get("vendor_create_fields")
+    if vcf is not None:
+        if not isinstance(vcf, dict) or not vcf:
             raise ValueError(
-                f"credentials.webhooks.event_catalog[{idx}].resource_contains "
-                f"must be a non-empty string when declared"
+                f"credentials.webhooks.event_catalog[{idx}].vendor_create_fields "
+                f"must be a non-empty object when declared"
             )
-        # Optional `vendor_create_fields`: top-level body fields merged over
-        # the substituted registration.create body when THIS event is among
-        # the subscription's selected events (MS Graph driveItem accepts
-        # only changeType="updated" while the shared template sends
-        # "created,updated").
-        vcf = entry.get("vendor_create_fields")
-        if vcf is not None:
-            if not isinstance(vcf, dict) or not vcf:
+        for fk, fv in vcf.items():
+            if not isinstance(fk, str) or not fk.strip():
                 raise ValueError(
                     f"credentials.webhooks.event_catalog[{idx}].vendor_create_fields "
-                    f"must be a non-empty object when declared"
+                    f"keys must be non-empty strings"
                 )
-            for fk, fv in vcf.items():
-                if not isinstance(fk, str) or not fk.strip():
-                    raise ValueError(
-                        f"credentials.webhooks.event_catalog[{idx}].vendor_create_fields "
-                        f"keys must be non-empty strings"
-                    )
-                if not isinstance(fv, str):
-                    raise ValueError(
-                        f"credentials.webhooks.event_catalog[{idx}].vendor_create_fields"
-                        f"[{fk!r}] must be a string"
-                    )
+            if not isinstance(fv, str):
+                raise ValueError(
+                    f"credentials.webhooks.event_catalog[{idx}].vendor_create_fields"
+                    f"[{fk!r}] must be a string"
+                )
 
+
+def _check_webhook_payload_normalization(raw: dict, mcp_name: str) -> None:
     # --- payload_normalization sub-block ---
     norm = raw.get("payload_normalization")
     if not isinstance(norm, dict):
@@ -414,43 +445,50 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
             "non-empty string (path into the inbound payload to read the event type)"
         )
     for ns in ("actor", "subject", "target"):
-        block = norm.get(ns)
-        if block is None:
-            continue
-        if not isinstance(block, dict):
-            raise ValueError(
-                f"credentials.webhooks.payload_normalization.{ns} must be an object when declared"
-            )
-        # Allow `type` as a literal (target.type='repository') or `type_path` as a path.
-        # `*_path` may be a single string OR a list of fallback paths (first
-        # non-empty wins) so one manifest can cover multiple vendor event
-        # shapes (e.g. GitHub PRs vs issues vs releases use different keys).
-        for k, v in block.items():
-            if k == "type":
-                if not isinstance(v, str):
-                    raise ValueError(
-                        f"credentials.webhooks.payload_normalization.{ns}.type must be a string"
-                    )
-            elif k.endswith("_path"):
-                if isinstance(v, str):
-                    continue
-                if isinstance(v, list):
-                    if not v:
-                        raise ValueError(
-                            f"credentials.webhooks.payload_normalization.{ns}.{k} must "
-                            f"be a non-empty list when declared as a fallback array"
-                        )
-                    for idx, path in enumerate(v):
-                        if not isinstance(path, str):
-                            raise ValueError(
-                                f"credentials.webhooks.payload_normalization.{ns}.{k}[{idx}] "
-                                f"must be a string"
-                            )
-                    continue
+        _check_normalized_namespace(ns, norm)
+
+
+def _check_normalized_namespace(ns: str, norm: dict) -> None:
+    block = norm.get(ns)
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ValueError(
+            f"credentials.webhooks.payload_normalization.{ns} must be an object when declared"
+        )
+    # Allow `type` as a literal (target.type='repository') or `type_path` as a path.
+    # `*_path` may be a single string OR a list of fallback paths (first
+    # non-empty wins) so one manifest can cover multiple vendor event
+    # shapes (e.g. GitHub PRs vs issues vs releases use different keys).
+    for k, v in block.items():
+        if k == "type":
+            if not isinstance(v, str):
                 raise ValueError(
-                    f"credentials.webhooks.payload_normalization.{ns}.{k} must be a "
-                    f"string or list of strings (fallback paths)"
+                    f"credentials.webhooks.payload_normalization.{ns}.type must be a string"
                 )
+        elif k.endswith("_path"):
+            if isinstance(v, str):
+                continue
+            if isinstance(v, list):
+                if not v:
+                    raise ValueError(
+                        f"credentials.webhooks.payload_normalization.{ns}.{k} must "
+                        f"be a non-empty list when declared as a fallback array"
+                    )
+                for idx, path in enumerate(v):
+                    if not isinstance(path, str):
+                        raise ValueError(
+                            f"credentials.webhooks.payload_normalization.{ns}.{k}[{idx}] "
+                            f"must be a string"
+                        )
+                continue
+            raise ValueError(
+                f"credentials.webhooks.payload_normalization.{ns}.{k} must be a "
+                f"string or list of strings (fallback paths)"
+            )
+
+
+def _check_webhook_vendor_target_spec(raw: dict, mcp_name: str) -> None:
             # Unknown keys silently allowed — manifest authors may add custom fields.
 
     # --- vendor_target_spec sub-block ---
@@ -515,7 +553,10 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
                         f"credentials.webhooks.vendor_target_spec.static_options[{oidx}]"
                         f".{fname} must be a non-empty string"
                     )
+    _check_target_kinds(vts, raw, mcp_name)
 
+
+def _check_target_kinds(vts: dict, raw: dict, mcp_name: str) -> None:
     # --- target_kinds (optional): the choices a subscriber picks between ---
     # Each kind carries its own field hints and scope, and may restate any
     # registration call (a shallow override of the top-level block: GitHub's
@@ -530,54 +571,61 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
             )
         seen_keys: set[str] = set()
         for kidx, kind in enumerate(kinds):
-            where = f"credentials.webhooks.vendor_target_spec.target_kinds[{kidx}]"
-            if not isinstance(kind, dict):
-                raise ValueError(f"{where} must be an object")
-            for fname in ("key", "label"):
-                v = kind.get(fname, "")
-                if not isinstance(v, str) or not v.strip():
-                    raise ValueError(f"{where}.{fname} must be a non-empty string")
-            if kind["key"] in seen_keys:
-                raise ValueError(f"{where}.key={kind['key']!r} repeats an earlier kind")
-            seen_keys.add(kind["key"])
-            for fname in ("placeholder", "validation_regex", "help_text"):
-                v = kind.get(fname)
-                if v is not None and not isinstance(v, str):
-                    raise ValueError(f"{where}.{fname} must be a string when declared")
-            if kind.get("validation_regex"):
-                try:
-                    re.compile(kind["validation_regex"])
-                except re.error as e:
-                    raise ValueError(f"{where}.validation_regex does not compile: {e}") from e
-            rs = kind.get("required_scopes")
-            if rs is not None and (
-                not isinstance(rs, list) or not all(isinstance(x, str) and x for x in rs)
-            ):
-                raise ValueError(f"{where}.required_scopes must be a list of non-empty strings")
-            kreg = kind.get("registration")
-            if kreg is not None:
-                if not isinstance(kreg, dict) or not kreg:
-                    raise ValueError(f"{where}.registration must be a non-empty object")
-                unknown = set(kreg) - {"create", "delete", "renew"}
-                if unknown:
-                    raise ValueError(
-                        f"{where}.registration may only restate create/delete/renew, "
-                        f"not {sorted(unknown)}"
-                    )
-                for call, override in kreg.items():
-                    if not isinstance(override, dict) or not override:
-                        raise ValueError(f"{where}.registration.{call} must be a non-empty object")
-                    base = (raw.get("registration") or {}).get(call)
-                    if not isinstance(base, dict):
-                        raise ValueError(
-                            f"{where}.registration.{call} restates a call the top-level "
-                            f"registration block does not declare"
-                        )
-                    _validate_webhook_registration_call(
-                        {**base, **override}, mcp_name,
-                        f"{call} (target kind {kind['key']!r})", required=True,
-                    )
+            _check_target_kind(kidx, kind, seen_keys, raw, mcp_name)
 
+
+def _check_target_kind(kidx: int, kind: Any, seen_keys: set[str], raw: dict,
+                       mcp_name: str) -> None:
+    where = f"credentials.webhooks.vendor_target_spec.target_kinds[{kidx}]"
+    if not isinstance(kind, dict):
+        raise ValueError(f"{where} must be an object")
+    for fname in ("key", "label"):
+        v = kind.get(fname, "")
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(f"{where}.{fname} must be a non-empty string")
+    if kind["key"] in seen_keys:
+        raise ValueError(f"{where}.key={kind['key']!r} repeats an earlier kind")
+    seen_keys.add(kind["key"])
+    for fname in ("placeholder", "validation_regex", "help_text"):
+        v = kind.get(fname)
+        if v is not None and not isinstance(v, str):
+            raise ValueError(f"{where}.{fname} must be a string when declared")
+    if kind.get("validation_regex"):
+        try:
+            re.compile(kind["validation_regex"])
+        except re.error as e:
+            raise ValueError(f"{where}.validation_regex does not compile: {e}") from e
+    rs = kind.get("required_scopes")
+    if rs is not None and (
+        not isinstance(rs, list) or not all(isinstance(x, str) and x for x in rs)
+    ):
+        raise ValueError(f"{where}.required_scopes must be a list of non-empty strings")
+    kreg = kind.get("registration")
+    if kreg is not None:
+        if not isinstance(kreg, dict) or not kreg:
+            raise ValueError(f"{where}.registration must be a non-empty object")
+        unknown = set(kreg) - {"create", "delete", "renew"}
+        if unknown:
+            raise ValueError(
+                f"{where}.registration may only restate create/delete/renew, "
+                f"not {sorted(unknown)}"
+            )
+        for call, override in kreg.items():
+            if not isinstance(override, dict) or not override:
+                raise ValueError(f"{where}.registration.{call} must be a non-empty object")
+            base = (raw.get("registration") or {}).get(call)
+            if not isinstance(base, dict):
+                raise ValueError(
+                    f"{where}.registration.{call} restates a call the top-level "
+                    f"registration block does not declare"
+                )
+            _validate_webhook_registration_call(
+                {**base, **override}, mcp_name,
+                f"{call} (target kind {kind['key']!r})", required=True,
+            )
+
+
+def _check_webhook_event_id_field(raw: dict, mcp_name: str) -> None:
     # --- event_id_field (optional but recommended for dedup) ---
     eid = raw.get("event_id_field", "")
     if eid and not isinstance(eid, str):
@@ -586,6 +634,8 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
             "(dot-path into the payload for event-id dedup)"
         )
 
+
+def _check_webhook_workspace_id_path(raw: dict, mcp_name: str) -> None:
     # --- workspace_id_path (optional; required for relay-mode delivery) ---
     # Extracts the tenant/workspace id from a raw payload (slack:
     # body.team_id). The relay-forwarded ingest fans in on subscriptions whose
@@ -600,6 +650,37 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
                 "with 'body.' or 'headers.' when declared"
             )
 
+
+def _check_webhook_app_webhook(raw: dict, mcp_name: str) -> None:
+    # --- app_webhook (optional): the GitHub-App kind's one webhook ---
+    # The app-level secret's bundle key and the payload path of the
+    # installation an event belongs to (services/webhooks/webhook_dispatcher
+    # .dispatch_app_webhook routes on it; never a top-level workspace_id_path,
+    # which would switch every hosted account's repository subscription to
+    # relay delivery).
+    app_hook = raw.get("app_webhook")
+    if app_hook is not None:
+        if not isinstance(app_hook, dict):
+            raise ValueError("credentials.webhooks.app_webhook must be an object when declared")
+        key = app_hook.get("secret_credential_key")
+        if not isinstance(key, str) or not _ENV_VAR_NAME_RE.match(key):
+            raise ValueError(
+                "credentials.webhooks.app_webhook.secret_credential_key must be a POSIX env-var name"
+            )
+        path = app_hook.get("installation_id_path")
+        if not isinstance(path, str) or not path.startswith("body."):
+            raise ValueError(
+                "credentials.webhooks.app_webhook.installation_id_path must be a string "
+                "starting with 'body.'"
+            )
+        if raw.get("workspace_id_path"):
+            raise ValueError(
+                "credentials.webhooks.app_webhook excludes workspace_id_path: the app "
+                "webhook routes on its own installation path"
+            )
+
+
+def _check_webhook_enrichment(raw: dict, mcp_name: str) -> None:
     # --- enrichment sub-block (optional) ---
     # Manifest-driven ID→name lookups run fail-open just before a matched
     # trigger fires (vendor API call with the subscription's bound token).
@@ -615,53 +696,74 @@ def _validate_webhooks_block(raw: Any, mcp_name: str) -> None:
                 "credentials.webhooks.enrichment.lookups must be a non-empty list"
             )
         for lidx, lk in enumerate(lookups):
-            if not isinstance(lk, dict):
-                raise ValueError(
-                    f"credentials.webhooks.enrichment.lookups[{lidx}] must be an object"
-                )
-            sf = lk.get("source_field", "")
-            if not isinstance(sf, str) or not sf.startswith(
-                ("actor.", "subject.", "target.")
-            ):
-                raise ValueError(
-                    f"credentials.webhooks.enrichment.lookups[{lidx}].source_field "
-                    f"must start with 'actor.', 'subject.' or 'target.'"
-                )
-            _validate_webhook_registration_call(
-                lk.get("request"), mcp_name, f"enrichment.lookups[{lidx}].request",
-                required=True, allow_no_body=True,
+            _check_enrichment_lookup(lidx, lk, mcp_name)
+
+
+def _check_enrichment_lookup(lidx: int, lk: Any, mcp_name: str) -> None:
+    if not isinstance(lk, dict):
+        raise ValueError(
+            f"credentials.webhooks.enrichment.lookups[{lidx}] must be an object"
+        )
+    sf = lk.get("source_field", "")
+    if not isinstance(sf, str) or not sf.startswith(
+        ("actor.", "subject.", "target.")
+    ):
+        raise ValueError(
+            f"credentials.webhooks.enrichment.lookups[{lidx}].source_field "
+            f"must start with 'actor.', 'subject.' or 'target.'"
+        )
+    _validate_webhook_registration_call(
+        lk.get("request"), mcp_name, f"enrichment.lookups[{lidx}].request",
+        required=True, allow_no_body=True,
+    )
+    outputs = lk.get("outputs")
+    if not isinstance(outputs, dict) or not outputs:
+        raise ValueError(
+            f"credentials.webhooks.enrichment.lookups[{lidx}].outputs must "
+            f"be a non-empty object"
+        )
+    for okey, opath in outputs.items():
+        if not (
+            isinstance(okey, str)
+            and okey.startswith(("actor.", "subject.", "target."))
+        ):
+            raise ValueError(
+                f"credentials.webhooks.enrichment.lookups[{lidx}].outputs "
+                f"key {okey!r} must start with 'actor.', 'subject.' or 'target.'"
             )
-            outputs = lk.get("outputs")
-            if not isinstance(outputs, dict) or not outputs:
-                raise ValueError(
-                    f"credentials.webhooks.enrichment.lookups[{lidx}].outputs must "
-                    f"be a non-empty object"
-                )
-            for okey, opath in outputs.items():
-                if not (
-                    isinstance(okey, str)
-                    and okey.startswith(("actor.", "subject.", "target."))
-                ):
-                    raise ValueError(
-                        f"credentials.webhooks.enrichment.lookups[{lidx}].outputs "
-                        f"key {okey!r} must start with 'actor.', 'subject.' or 'target.'"
-                    )
-                if isinstance(opath, str):
-                    continue
-                if isinstance(opath, list) and opath and all(
-                    isinstance(p, str) for p in opath
-                ):
-                    continue
-                raise ValueError(
-                    f"credentials.webhooks.enrichment.lookups[{lidx}].outputs"
-                    f"[{okey!r}] must be a string or a non-empty list of strings"
-                )
-            ttl = lk.get("ttl_seconds")
-            if ttl is not None and (not isinstance(ttl, int) or ttl <= 0):
-                raise ValueError(
-                    f"credentials.webhooks.enrichment.lookups[{lidx}].ttl_seconds "
-                    f"must be a positive integer when declared"
-                )
+        if isinstance(opath, str):
+            continue
+        if isinstance(opath, list) and opath and all(
+            isinstance(p, str) for p in opath
+        ):
+            continue
+        raise ValueError(
+            f"credentials.webhooks.enrichment.lookups[{lidx}].outputs"
+            f"[{okey!r}] must be a string or a non-empty list of strings"
+        )
+    ttl = lk.get("ttl_seconds")
+    if ttl is not None and (not isinstance(ttl, int) or ttl <= 0):
+        raise ValueError(
+            f"credentials.webhooks.enrichment.lookups[{lidx}].ttl_seconds "
+            f"must be a positive integer when declared"
+        )
+
+
+# The block's rules in the order they run: each raises on its first defect,
+# so the first rule that fails ends the validation.
+_WEBHOOK_RULES = (
+    _check_webhook_provider_id,
+    _check_webhook_signature,
+    _check_webhook_url_verification,
+    _check_webhook_registration,
+    _check_webhook_event_catalog,
+    _check_webhook_payload_normalization,
+    _check_webhook_vendor_target_spec,
+    _check_webhook_event_id_field,
+    _check_webhook_workspace_id_path,
+    _check_webhook_app_webhook,
+    _check_webhook_enrichment,
+)
 
 
 def _validate_webhook_registration_call(

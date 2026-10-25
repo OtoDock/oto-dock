@@ -10,9 +10,7 @@ import json
 import pytest
 
 import config as app_config
-from core.layers.direct import builtins as B
-from core.layers.direct import session as session_mod
-from core.layers.direct import tool_catalog as tc
+from core.layers.direct import builtins as B, session as session_mod, tool_catalog as tc
 from core.layers.direct.tool_catalog import ToolCatalog
 from core.sandbox.sandbox import SandboxConfig
 

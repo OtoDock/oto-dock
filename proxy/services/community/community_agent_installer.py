@@ -3,7 +3,7 @@
 End-to-end flow for installing a community-agents template (or a bundled
 template like PA-lite):
 
-1. Parse + validate template via :mod:`storage.agents.community_agent_template_store`.
+1. Parse + validate template via :mod:`services.community.community_agent_template_store`.
 2. Pre-flight: every required MCP must exist either in the platform's local
    MCP registry OR in the community MCPs catalog. Hard-error otherwise.
 3. Resolve slug collision (return 409 with ``suggested_slug`` for caller).
@@ -36,25 +36,28 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import shutil
 import uuid
 from pathlib import Path
 
-import config
+import httpx
 from fastapi import HTTPException
 
-from services.scheduler import task_kinds
-from storage.agents.community_agent_template_store import (
+import config
+from auth import roles
+from core import layout
+from services.community.community_agent_template_store import (
     CommunityAgentTemplate,
+    TaskItem,
     TemplateValidationError,
     load_template_from_dict,
     load_template_from_dir,
     substitute_template_vars,
     template_to_persistable_dict,
 )
-from auth import roles
-from core import layout
+from services.scheduler import task_kinds
 
 logger = logging.getLogger("otodock.community-agent-installer")
 
@@ -106,7 +109,7 @@ async def install_from_catalog(
              if e.get("slug") == template_slug),
             None,
         )
-    except Exception:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError):
         entry = None
     if entry is not None:
         community_catalog.require_platform_compat(
@@ -119,7 +122,9 @@ async def install_from_catalog(
     try:
         template = await asyncio.to_thread(load_template_from_dir, extracted)
     except TemplateValidationError as exc:
-        raise HTTPException(400, f"Invalid catalog template: {exc}")
+        raise HTTPException(400, detail={
+            "error": "invalid_template", "message": f"Invalid catalog template: {exc}",
+            "problems": exc.problems}) from exc
     if consent_all and installer_user_sub:
         app_consent = {a.slug: a.sig for a in template.apps}
         check_consent = {c.name: c.sig for c in template.checks}
@@ -189,6 +194,7 @@ async def install_from_extracted_template(
           "created_requests": [{...}, ...],
           "ready_mcps": ["schedules-mcp", "notifications-mcp", ...],
           "seeded_tasks": 3,
+          "task_pins_dropped": ["The task 'digest' runs on the agent's usual model and engine. …"],
           "seeded_triggers": 0,
           "seeded_notifications": 1,
           "seeded_apps": {"seeded": [...], "user": [...], "pending": [...], "failed": [...]},
@@ -217,14 +223,17 @@ async def install_from_extracted_template(
     target_slug = agent_store.sanitize_slug(target_slug)
     if not target_slug:
         raise HTTPException(400, "Invalid agent slug")
-    if await asyncio.to_thread(agent_store.agent_exists, target_slug):
+    # A reserved slug reads as taken, with agent creation's sentence: the
+    # install dialog offers the suggestion on this 409 as for a taken one.
+    refusal = agent_store.reserved_slug_refusal(target_slug)
+    if refusal is not None or await asyncio.to_thread(agent_store.agent_exists, target_slug):
         suggested = await asyncio.to_thread(_propose_free_slug, target_slug)
         raise HTTPException(
             409,
             detail={
                 "error": "slug_taken",
                 "suggested_slug": suggested,
-                "message": f"Agent '{target_slug}' already exists",
+                "message": refusal or f"Agent '{target_slug}' already exists",
             },
         )
     agent_dir = config.AGENTS_DIR / target_slug
@@ -242,9 +251,12 @@ async def install_from_extracted_template(
     try:
         await asyncio.to_thread(_create_agent_folder, agent_dir, template)
     except Exception as exc:
+        logger.exception("Creating the folder of agent %s failed", target_slug)
         if agent_dir.exists():
             shutil.rmtree(agent_dir, ignore_errors=True)
-        raise HTTPException(500, f"Failed to create agent directory: {exc}")
+        raise HTTPException(
+            500, "Could not create the agent's files. The server log has the details.",
+        ) from exc
 
     # 2. Create DB row.
     #
@@ -275,8 +287,15 @@ async def install_from_extracted_template(
             collaborative=template.collaborative,
         )
     except Exception as exc:
+        logger.exception("Saving the record of agent %s failed", target_slug)
         shutil.rmtree(agent_dir, ignore_errors=True)
-        raise HTTPException(500, f"Failed to create agent record: {exc}")
+        raise HTTPException(
+            500, "Could not save the new agent. The server log has the details.",
+        ) from exc
+
+    # A task's own model and engine are judged against the agent just made,
+    # once: the record keeps the answer, so every member's copy gets it.
+    template, task_pins_dropped = await asyncio.to_thread(resolve_task_pins, target_slug, template)
 
     # Persist the parsed template so on_user_added_to_agent can re-seed
     # per-user items for users attached after the installer, with the
@@ -319,6 +338,7 @@ async def install_from_extracted_template(
                              installer_user_sub, target_slug)
 
     # 4. Cascade MCPs.
+    batch_id: str | None
     batch_id = str(uuid.uuid4())
     cascade = await _cascade_required_mcps(
         template=template,
@@ -422,6 +442,7 @@ async def install_from_extracted_template(
         "created_requests": cascade["created_requests"],
         "ready_mcps": cascade["ready_mcps"],
         "seeded_tasks": seeded_tasks,
+        "task_pins_dropped": task_pins_dropped,
         "seeded_triggers": seeded_triggers,
         "seeded_notifications": seeded_notifs,
         "seeded_dashboards": seeded_dashboards,
@@ -461,7 +482,7 @@ async def _preflight_check_mcps(required: list) -> None:
         for entry in (registry or {}).get("mcps", []):
             if entry.get("name"):
                 catalog_names.add(entry["name"])
-    except Exception:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError):
         logger.warning("preflight: community catalog fetch failed — relying on local-installed MCPs only")
 
     missing = [
@@ -509,7 +530,7 @@ async def _preflight_check_skill_packages(
         for entry in (registry or {}).get("skills", []):
             if entry.get("name"):
                 catalog_names.add(entry["name"])
-    except Exception:
+    except (AttributeError, TypeError):
         logger.warning(
             "preflight: skills catalog fetch failed — relying on "
             "local-installed packages only"
@@ -535,7 +556,7 @@ async def _preflight_check_skill_packages(
 
 async def _cascade_skill_packages(
     template, target_slug: str, *,
-    installer_user_sub: str = "",
+    installer_user_sub: str | None = "",
     installer_role: str = "admin",
     batch_id: str | None = None,
 ) -> dict:
@@ -605,7 +626,8 @@ async def _cascade_skill_packages(
 # ---------------------------------------------------------------------------
 
 def _propose_free_slug(base: str) -> str:
-    """Return the first ``base-N`` slug that doesn't collide."""
+    """Return the first ``base-N`` slug that doesn't collide (a reserved
+    slug never: ``base-N`` always carries a dash)."""
     from storage.agents import agent_store
     n = 2
     while True:
@@ -840,8 +862,7 @@ async def _cascade_required_mcps(
     Returns ``{"created_requests": [...], "ready_mcps": [...]}``.
     """
     from services.mcp import mcp_registry
-    from storage.mcp import mcp_store
-    from storage.mcp import mcp_request_store
+    from storage.mcp import mcp_request_store, mcp_store
 
     created_requests: list[dict] = []
     ready_mcps: list[str] = []
@@ -1000,6 +1021,80 @@ async def _seed_skills_for_mcp(agent_slug: str, mcp_name: str, skills: list[str]
 # Template-item seeding
 # ---------------------------------------------------------------------------
 
+def _engine_name(path: str) -> str:
+    """An engine as a person reads it (its layer's display name), or ''
+    when this platform has no such engine."""
+    from core.session.session_manager import get_layer_capabilities
+    caps = get_layer_capabilities(path) if path else None
+    return caps.display_name if caps else ""
+
+
+def task_pin_problem(agent_slug: str, model: str | None, layer: str | None) -> str | None:
+    """Why a template task's ``override_model`` / ``layer`` is outside what
+    ``agent_slug`` has enabled (``spawn_authz.validate_spawn_overrides``,
+    the rule the schedules API holds a pinned task to), as a sentence for
+    the person installing it, or None. A retired model is judged as its
+    successor, the model the run would use."""
+    model = config.live_model_id(model or "") or None
+    if not (model or layer):
+        return None
+    from services.delegation.spawn_authz import validate_spawn_overrides
+    try:
+        validate_spawn_overrides(agent_slug, layer or None, None)
+    except HTTPException:
+        named = _engine_name(layer or "")
+        return (f"{named} is not turned on for this agent." if named
+                else "The engine it asks for is not turned on for this agent.")
+    try:
+        validate_spawn_overrides(agent_slug, layer or None, model)
+    except HTTPException:
+        from storage.agents import agent_store
+        engine = _engine_name(layer or (agent_store.get_agent(agent_slug) or {}).get("execution_path", ""))
+        return (f"The model {model} is not turned on for {engine}." if engine
+                else f"The model {model} is not turned on for this agent.")
+    return None
+
+
+def resolve_task_pins(
+    agent_slug: str, template: CommunityAgentTemplate,
+) -> tuple[CommunityAgentTemplate, list[str]]:
+    """``template`` with each task's pins as ``agent_slug`` can run them: a
+    retired model as its successor; a pair the agent cannot run dropped
+    together (the task runs on the agent's default), named in the notes.
+    The installer and the updater call it before the record is written,
+    so the record holds the answer and every seed of the item agrees."""
+    notes: list[str] = []
+    tasks: list[TaskItem] = []
+    for item in template.tasks:
+        if not (item.override_model or item.layer):
+            tasks.append(item)
+            continue
+        problem = task_pin_problem(agent_slug, item.override_model, item.layer)
+        if problem:
+            notes.append(f"The task '{item.slug}' runs on the agent's usual model and engine. {problem}")
+            tasks.append(dataclasses.replace(item, override_model=None, layer=None))
+        else:
+            tasks.append(dataclasses.replace(
+                item, override_model=config.live_model_id(item.override_model or "") or None))
+    if not notes and tasks == template.tasks:
+        return template, notes
+    return dataclasses.replace(template, tasks=tasks), notes
+
+
+def _seed_pins(item: TaskItem, agent_slug: str) -> tuple[str, str]:
+    """The row's ``override_model`` and ``override_execution_path``: the
+    item's (resolved at install) while the agent still runs them; a pin the
+    agent lost since is left out for this row, never one added."""
+    if not (item.override_model or item.layer):
+        return "", ""
+    problem = task_pin_problem(agent_slug, item.override_model, item.layer)
+    if problem:
+        logger.info("template task %s on %s seeded on the agent's default: %s",
+                    item.slug, agent_slug, problem)
+        return "", ""
+    return config.live_model_id(item.override_model or ""), item.layer or ""
+
+
 def _seed_tasks(
     agent_slug: str, template: CommunityAgentTemplate, installer_user_sub: str | None,
 ) -> int:
@@ -1057,9 +1152,10 @@ def _create_task_idempotent(
 ) -> bool:
     """Returns True if a new row was created, False if it already existed
     (idempotent guard catches the unique-index violation)."""
-    from storage import database as db
     import psycopg
+
     from core.session.session_state import get_user_tz
+    from storage import database as db
 
     task_id = f"task-{template_slug}-{item.slug}-{agent_slug}-{created_by or 'agent'}"[:120]
     enabled = item.default_state == "active"
@@ -1078,6 +1174,7 @@ def _create_task_idempotent(
         "scheduled" if item.schedule_kind in ("cron", "interval") else "one_time"
     )
     try:
+        override_model, override_layer = _seed_pins(item, agent_slug)
         db.create_dynamic_task(
             task_id=task_id, agent=agent_slug, name=item.description or item.slug,
             prompt=item.prompt, llm_mode="cli", task_type=task_type,
@@ -1087,10 +1184,11 @@ def _create_task_idempotent(
             on_complete_agent=None, on_complete_prompt=None,
             on_complete_session_id=None, on_complete_chat_id=None,
             continue_session=None, use_persistent=False,
-            notification_mode="manual", notify_severity="info",
+            notification_mode=item.notification_mode, notify_severity="info",
             user_tz=user_tz,
             community_template=template_slug,
             community_template_item_slug=item.slug,
+            override_model=override_model, override_execution_path=override_layer,
         )
         # Set enabled flag if needed (default in CREATE TABLE is TRUE; pause
         # via an UPDATE when default_state='paused').
@@ -1209,10 +1307,11 @@ def _seed_trigger_with_paired_task(
     ``community_template`` + ``community_template_item_slug`` so the
     template's cleanup hook can wipe them together.
     """
+    import psycopg
+
+    from core.session.session_state import get_user_tz
     from storage import database as db
     from storage.automation import trigger_store
-    import psycopg
-    from core.session.session_state import get_user_tz
 
     # Stable IDs derived from template + agent (+ user for user-scope) so
     # re-installs are idempotent.
@@ -1276,8 +1375,9 @@ def _seed_notifications(
     Later joiners pick up their user-scope notifications via
     :func:`on_user_added_to_agent`.
     """
-    from storage.automation import notification_store
     import psycopg
+
+    from storage.automation import notification_store
 
     count = 0
     for item in template.notifications:

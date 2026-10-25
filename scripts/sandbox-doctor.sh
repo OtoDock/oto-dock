@@ -8,7 +8,10 @@
 # sandbox stack depends on:
 #
 #   P1  unshare -Urn                      (the proxy boot preflight's gate)
+#   P1b /dev/net/tun, a character device  (the boot checks it before P2b)
 #   P2  one-level bwrap, our exact flags  (what every agent session runs in)
+#   P2b the network launcher wrapping P2  (the boot's last check: the shape
+#                                          every local session starts with)
 #   P3  bwrap nested inside bwrap         (what the Codex engine's
 #                                          "fs sandbox helper" needs)
 #   P4  Codex's npm-vendored bwrap, one level and nested (when found) —
@@ -19,7 +22,7 @@
 # Where to run it:
 #   bare-metal (T1) install : scripts/sandbox-doctor.sh      (as the proxy user)
 #   containerised (T2/T3)   : docker exec -it otodock-proxy \
-#                                 /app/scripts/sandbox-doctor.sh
+#                                 /opt/otodock/scripts/sandbox-doctor.sh
 #     (older images without the script: `docker cp` this file in first)
 #
 # Read-only: writes nothing, needs no root. When reporting a sandbox issue,
@@ -44,6 +47,7 @@ probe() {  # probe <label> <cmd...>
   local label="$1"; shift
   local err rc
   err=$("$@" 2>&1 >/dev/null); rc=$?
+  PROBE_ERR="$err"
   if [ "$rc" -eq 0 ]; then
     say "  [PASS] $label"
     PASS_N=$((PASS_N + 1))
@@ -82,6 +86,16 @@ fact "distro bwrap/unshare profiles" \
 fact "bwrap" "$(command -v bwrap >/dev/null && bwrap --version 2>/dev/null || echo '<missing>')"
 fact "pasta" "$(command -v pasta >/dev/null && pasta --version 2>/dev/null | head -1 || echo '<missing>')"
 fact "unshare" "$(command -v unshare >/dev/null && unshare --version 2>/dev/null || echo '<missing>')"
+if [ -c /dev/net/tun ]; then TUN="present, a character device"
+elif [ -e /dev/net/tun ]; then TUN="present, NOT a character device"
+else TUN="<missing>"; fi
+fact "/dev/net/tun" "$TUN"
+
+# The network launcher the proxy puts in front of every session's bwrap
+# (pasta outside, bwrap inside): proxy/scripts/ beside this script's scripts/,
+# in a checkout and in the image alike.
+LAUNCHER="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/proxy/scripts/oto-sandbox-net"
+fact "network launcher" "$([ -x "$LAUNCHER" ] && echo "$LAUNCHER" || echo "<not found at $LAUNCHER>")"
 
 # Codex's vendored bubblewrap: shipped inside the npm package, next to the
 # native binary (…/@openai/codex-linux-*/vendor/*/codex-resources/bwrap).
@@ -106,18 +120,30 @@ if [ "$(id -u)" != "0" ]; then
   UIDFLAGS="--unshare-user --uid $(id -u) --gid $(id -g)"
 fi
 
-P1=1; P2=1; P3=1; P4A=1; P4B=1
+P1=1; P1B=1; P2=1; P2B=0; P2B_ERR=""; P3=1; P4A=1; P4B=1
 if command -v unshare >/dev/null; then
   probe "P1 unshare -Urn (user+net namespace)" unshare -Urn true; P1=$?
 else
   skip "P1 unshare missing (util-linux not installed)"
 fi
+tun_device() { [ -c /dev/net/tun ] || { echo "/dev/net/tun: $TUN" >&2; return 1; }; }
+probe "P1b /dev/net/tun is a character device (the launcher's tap)" tun_device; P1B=$?
 
 if command -v bwrap >/dev/null; then
   # shellcheck disable=SC2086  # UIDFLAGS is a deliberate word-split flag list
   probe "P2 one-level bwrap (session sandbox flags)" \
     bwrap --unshare-pid --die-with-parent $UIDFLAGS \
           --ro-bind / / --dev /dev --proc /proc -- /bin/true; P2=$?
+  if [ -x "$LAUNCHER" ]; then
+    # shellcheck disable=SC2086
+    probe "P2b network launcher wrapping bwrap (the boot's shape check)" \
+      timeout 20 "$LAUNCHER" --block-private -- \
+          bwrap --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --share-net $UIDFLAGS \
+                --ro-bind / / --dev /dev --proc /proc -- true; P2B=$?
+    P2B_ERR="$PROBE_ERR"
+  else
+    skip "P2b network launcher not found"
+  fi
   # shellcheck disable=SC2086
   probe "P3 nested bwrap (system bwrap inside system bwrap)" \
     bwrap --unshare-pid --die-with-parent $UIDFLAGS \
@@ -146,10 +172,30 @@ if [ "$P1" -ne 0 ]; then
   say "  boot preflight fails on this host before any sandbox is tried"
   say "  (Ubuntu 23.10+: apparmor_restrict_unprivileged_userns=$APPARMOR_ON,"
   say "  see scripts/setup-apparmor-userns.sh; containers must allow user namespaces)."
+elif [ "$P1B" -ne 0 ] \
+     || { [ "$P2B" -ne 0 ] && [ "$P2B" -ne 124 ] \
+          && printf '%s' "$P2B_ERR" | grep -qiwE 'tun|tap'; }; then
+  # The boot checks the device before it runs the launcher, so a missing
+  # device is the refusal even when P2b was skipped.
+  say "  The network launcher cannot open its tap device (/dev/net/tun: $TUN)."
+  say "  OtoDock refuses to start until it can. Docker: keep the proxy's"
+  say "  devices line (/dev/net/tun) from docker-compose.yml. Native install:"
+  say "  run sudo modprobe tun. In an LXC or OpenVZ container, the host must"
+  say "  pass the device through."
 elif [ "$P2" -ne 0 ]; then
   say "  The SESSION sandbox itself cannot start here — the proxy boot"
   say "  preflight should already be failing loudly. Fix that first"
   say "  (see the preflight error; Ubuntu 24.04+: setup-apparmor-userns.sh)."
+elif [ "$P2B" -eq 124 ]; then
+  say "  The network launcher did not answer within 20 seconds, the wait the"
+  say "  start allows. OtoDock starts and logs an error, but sessions may fail"
+  say "  to start. Run the doctor again when the host is quiet. Send this"
+  say "  report to the OtoDock maintainers if it repeats."
+elif [ "$P2B" -ne 0 ]; then
+  say "  bwrap starts, but not inside the network launcher (see P2b's error)."
+  say "  OtoDock refuses to start on this host for the same reason. Check that"
+  say "  pasta runs here (the pasta line above). Send this report to the"
+  say "  OtoDock maintainers if it does."
 elif [ "$P3" -ne 0 ] || { [ -n "$VENDORED" ] && [ "$P4B" -ne 0 ]; }; then
   say "  Sessions run, but a bwrap NESTED inside the sandbox fails — exactly"
   say "  what the Codex engine's inner sandbox ('fs sandbox helper') needs."

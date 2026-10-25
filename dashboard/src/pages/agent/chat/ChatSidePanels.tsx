@@ -7,7 +7,7 @@
 import type { useChatStream } from '../../../hooks/useChatStream'
 import type { useWorkspaceState } from '../../../hooks/useWorkspaceState'
 import type { useArtifactWindows } from '../../../hooks/useArtifactWindows'
-import type { useDocumentChips } from './ChatDocumentPane'
+
 import type { useRunByChat } from '../../../api/runs'
 import TaskMetadata from '../../../components/chat/TaskMetadata'
 import PlanPanel from '../../../components/chat/plan/PlanPanel'
@@ -16,6 +16,7 @@ import GoalPanel from '../../../components/chat/plan/GoalPanel'
 import WorkflowPanel from '../../../components/chat/plan/WorkflowPanel'
 import MeetingIndicator from '../../../components/chat/MeetingIndicator'
 import ArtifactDock from '../../../components/chat/artifacts/ArtifactDock'
+import { type useDocumentChips } from './useDocumentChips'
 
 type Stream = ReturnType<typeof useChatStream>
 

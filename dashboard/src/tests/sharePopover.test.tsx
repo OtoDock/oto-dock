@@ -78,14 +78,15 @@ describe('SharePopover', () => {
   it('tells a link maker that an app with steps treats a visitor’s input as data', () => {
     // APPS.md "Steps": the warning reaches a link made after the approval.
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    render(
+    const first = render(
       <QueryClientProvider client={qc}>
         <SharePopover app={{ ...app, steps: { sync: { run: 'scripts/sync.sh' } } }} onClose={vi.fn()} />
       </QueryClientProvider>,
     )
     openLinkTab()
     expect(screen.getByTestId('share-steps-note').textContent).toContain('never instructions')
-    document.body.innerHTML = ''
+    // The dialog lives in the body, outside the render's container.
+    first.unmount()
     renderPopover()
     openLinkTab()
     expect(screen.queryByTestId('share-steps-note')).toBeNull()
@@ -148,7 +149,9 @@ describe('SharePopover', () => {
     const capped = renderPopover()
     expect(values()).toEqual(['7d', '30d', '45d'])
     expect(expiry().value).toBe('45d')
-    expect(Array.from(expiry().options).map((o) => o.textContent)).toContain('Expires in 45 days')
+    expect(Array.from(expiry().options).map((o) => o.textContent)).toEqual([
+      'Expires in 7 days', 'Expires in 30 days', 'Expires in 45 days, the longest allowed',
+    ])
     fireEvent.change(screen.getByLabelText('Who to share with'), { target: { value: 'Ana Ruiz' } })
     fireEvent.click(screen.getByRole('button', { name: 'Share' }))
     expect(state.create).toHaveBeenLastCalledWith(expect.objectContaining({ expires_in: '45d' }), expect.anything())
@@ -264,7 +267,10 @@ describe('SharePopover', () => {
     renderPopover(onClose)
     fireEvent.click(screen.getByLabelText('Close'))
     expect(onClose).toHaveBeenCalledTimes(1)
-    fireEvent.click(screen.getByRole('presentation'))
+    // The backdrop is the <dialog> element around the panel.
+    const dialog = screen.getByRole('dialog', { name: /^Share / })
+    fireEvent.pointerDown(dialog)
+    fireEvent.click(dialog, { detail: 1 })
     expect(onClose).toHaveBeenCalledTimes(2)
   })
 })
@@ -360,6 +366,9 @@ describe('SharePopover — links', () => {
     openLinkTab()
     const values = () => Array.from((screen.getByLabelText('Link expiry') as HTMLSelectElement).options).map((o) => o.value)
     expect(values()).toEqual(['7d', '30d'])
+    // Under a 30-day cap the longest choice says it is the cap.
+    expect(Array.from((screen.getByLabelText('Link expiry') as HTMLSelectElement).options).map((o) => o.textContent))
+      .toEqual(['Expires in 7 days', 'Expires in 30 days, the longest allowed'])
     unmount()
     // A cap below the default: the link's default becomes the cap.
     state.settings = { max_expiry_days: 3 }
@@ -460,10 +469,30 @@ describe('SharePopover — links', () => {
     renderPopover()
     openLinkTab()
     expect(screen.getByText(/password · opened 3×/)).toBeTruthy()
-    fireEvent.click(screen.getByLabelText('Buttons on link l1'))
+    const box = screen.getByLabelText('Buttons on link l1')
+    const status = () => box.closest('li')!.querySelector('[role=status]')!
+    expect(status().textContent).toBe('')
+    fireEvent.click(box)
     await flush()
     expect(state.patchAsync).toHaveBeenCalledWith({ id: 'l1', allow_actions: true })
+    // Saved beside the box once the write lands, outside its label.
+    expect(status()).toHaveTextContent('Saved')
+    expect(box.closest('label')!.contains(status())).toBe(false)
     fireEvent.click(screen.getByLabelText('Revoke link l1'))
     expect(state.patch).toHaveBeenCalledWith({ id: 'l1', revoke: true }, expect.anything())
+  })
+
+  it('a refused Buttons change says why in the popover and never Saved', async () => {
+    state.shares = [
+      { id: 'l1', scope: 'external', state: 'active', grantee: null, public: false, allow_actions: false, access_count: 0, expires_at: null },
+    ]
+    state.patchAsync.mockRejectedValue(new Error('Links cannot carry buttons here.'))
+    renderPopover()
+    openLinkTab()
+    const box = screen.getByLabelText('Buttons on link l1')
+    fireEvent.click(box)
+    await flush()
+    expect(screen.getByText('Links cannot carry buttons here.')).toBeTruthy()
+    expect(box.closest('li')!.querySelector('[role=status]')!.textContent).toBe('')
   })
 })

@@ -150,14 +150,16 @@ export function meetsFloor(action: { min_role?: string | null }, role: string | 
   return wanted in ROLE_RANK && rank(role) >= ROLE_RANK[wanted]
 }
 
+// Each role's chip in the semantic tokens (src/tokens.css): one class per
+// slot, the same in both themes.
 const BADGE: Record<string, string> = {
-  admin: 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400',
-  creator: 'bg-brand-100 text-brand',
-  member: 'bg-p-surface text-p-text-secondary',
-  manager: 'bg-brand-100 text-brand',
-  editor: 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300',
-  contributor: 'bg-teal-100 dark:bg-teal-900/30 text-teal-700 dark:text-teal-300',
-  viewer: 'bg-gray-100 dark:bg-gray-800 text-p-text-secondary',
+  admin: 'bg-status-danger-bg text-status-danger-fg',
+  creator: 'bg-action-subtle text-link',
+  member: 'bg-surface-muted text-secondary',
+  manager: 'bg-action-subtle text-link',
+  editor: 'bg-status-warning-bg text-status-warning-fg',
+  contributor: 'bg-accent-media-bg text-accent-media-fg',
+  viewer: 'bg-surface-muted text-tertiary',
 }
 
 const LABEL: Record<string, string> = {

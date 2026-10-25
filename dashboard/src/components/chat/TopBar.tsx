@@ -1,10 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { User } from '../../api/auth'
-import RemoteBadge, { FELLBACK_LOCAL, type BadgeState } from '../RemoteBadge'
+import RemoteBadge from '../RemoteBadge'
+import { FELLBACK_LOCAL, type BadgeState } from '../remoteBadgeDot'
 import { isAdmin } from '../../lib/permissions'
 import { isLocalTarget, type PairingScope } from '../../lib/placement'
 import { MACHINE_STATE, type MachineState } from '../../lib/status/machine'
+import { IconDeviceMobile, IconGear, IconLogout, IconShieldCheck, IconUser } from '../icons/nav'
+import { POPOVER } from '../ui/classes'
+import { GLASS, GLASS_HOVER, GLASS_PRESSED } from '../ui/glass'
 
 interface Props {
   agentName: string
@@ -32,6 +36,10 @@ interface Props {
   machineScope?: PairingScope
   machineLastSeenIso?: string | null
 }
+
+// Every control of the bar on one height and one glass recipe.
+const ICON_BUTTON = 'flex size-control-md shrink-0 items-center justify-center rounded-xl text-secondary transition-colors duration-fast hover:text-primary'
+const AT_REST = `${GLASS} ${GLASS_HOVER}`
 
 function getInitials(name: string): string {
   const parts = name.trim().split(/\s+/)
@@ -80,12 +88,12 @@ export default function TopBar({
   }, [menuOpen])
 
   return (
-    <div className="absolute top-0 left-0 right-0 z-20 flex items-center h-12 px-3">
+    <div className="absolute top-0 left-0 right-0 z-20 flex items-center gap-2 h-12 px-3">
       {/* Leading button: back-arrow (task run) or hamburger (chat history). */}
       {onBack ? (
         <button
           onClick={onBack}
-          className="w-9 h-9 rounded-xl bg-white/70 dark:bg-gray-900/70 backdrop-blur-xs border border-p-border-light/50 dark:border-gray-600 hover:bg-white/90 dark:hover:bg-gray-800/90 flex items-center justify-center text-p-text-secondary hover:text-p-text transition-colors shadow-xs"
+          className={`${ICON_BUTTON} ${AT_REST}`}
           title="Back"
         >
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -95,7 +103,7 @@ export default function TopBar({
       ) : (
         <button
           onClick={onToggleHistory}
-          className="w-9 h-9 rounded-xl bg-white/70 dark:bg-gray-900/70 backdrop-blur-xs border border-p-border-light/50 dark:border-gray-600 hover:bg-white/90 dark:hover:bg-gray-800/90 flex items-center justify-center text-p-text-secondary hover:text-p-text transition-colors shadow-xs"
+          className={`${ICON_BUTTON} ${AT_REST}`}
           title="Toggle chat history"
         >
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -104,26 +112,34 @@ export default function TopBar({
         </button>
       )}
 
-      {/* Agent pill */}
-      <Link
-        to="/agents"
-        className="ml-2 px-3 py-1.5 rounded-xl bg-white/70 dark:bg-gray-900/70 backdrop-blur-xs border border-p-border-light/50 dark:border-gray-600 hover:bg-white/90 dark:hover:bg-gray-800/90
-                   text-sm font-medium text-p-text transition-colors flex items-center gap-1.5 shadow-xs min-w-0 max-w-[45vw] sm:max-w-none"
+      {/* The agent pill: the name links to the agents page across the whole
+          pill (the link's overlay), the status dot sits above the overlay
+          so its own tap shows its detail. The glass is painted on a span
+          behind the content, never on the pill: a blur makes an element
+          the frame of its fixed children, and the dot's tooltip is fixed
+          to the viewport. */}
+      <div
+        className="group relative isolate flex h-control-md min-w-0 max-w-[45vw] items-center gap-1.5 rounded-xl px-3
+                   has-[a:focus-visible]:ring-2 has-[a:focus-visible]:ring-focus-ring sm:max-w-none"
+        data-testid="agent-pill"
       >
-        <span className="truncate">{displayName || agentName}</span>
-        <svg className="w-3 h-3 text-p-text-light shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-        </svg>
-      </Link>
-
-      {/* Remote execution target indicator. Reflects the caller's
-          effective target — their own paired machine ('user' scope, amber
-          when offline) or the agent's admin default ('admin' scope, red
-          when offline). Hover (desktop) or tap (touch) the dot for detail;
-          the tooltip is its own affordance and won't trigger the adjacent
-          agent-name pill. */}
-      {badgeState && (
-        <span className="ml-2">
+        <span
+          aria-hidden="true"
+          className={`pointer-events-none absolute inset-0 -z-10 rounded-[inherit] ${GLASS} transition-colors duration-fast group-has-[a:hover]:bg-glass-hover`}
+        />
+        <Link
+          to="/agents"
+          title={displayName || agentName}
+          className="min-w-0 truncate text-sm font-medium text-primary focus-visible:outline-none
+                     after:absolute after:inset-0 after:content-['']"
+        >
+          {displayName || agentName}
+        </Link>
+        {/* Remote execution target indicator. Reflects the caller's
+            effective target — their own paired machine ('user' scope, amber
+            when offline) or the agent's admin default ('admin' scope, red
+            when offline). Hover (desktop) or tap (touch) the dot for detail. */}
+        {badgeState && (
           <RemoteBadge
             state={badgeState}
             scope={machineScope}
@@ -131,9 +147,13 @@ export default function TopBar({
             heartbeatAgeS={machineLastHeartbeatAgeS ?? null}
             lastSeenIso={machineLastSeenIso ?? null}
             fallbackReason={fallbackReason ?? null}
+            className="z-[1] shrink-0"
           />
-        </span>
-      )}
+        )}
+        <svg className="w-3 h-3 text-tertiary shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+        </svg>
+      </div>
 
       <div className="flex-1" />
 
@@ -145,52 +165,46 @@ export default function TopBar({
         <div className="relative" ref={menuRef}>
           <button
             onClick={() => setMenuOpen(!menuOpen)}
-            className="w-9 h-9 rounded-xl bg-white/70 dark:bg-gray-900/70 backdrop-blur-xs border border-p-border-light/50 dark:border-gray-600 hover:bg-white/90 dark:hover:bg-gray-800/90
-                       flex items-center justify-center text-xs font-bold text-p-text-secondary transition-colors shadow-xs"
+            aria-expanded={menuOpen}
+            aria-haspopup="menu"
+            className={`${ICON_BUTTON} ${menuOpen ? GLASS_PRESSED : AT_REST} text-xs font-bold`}
             title={user.display_name || user.name}
           >
             {getInitials(user.display_name || user.name)}
           </button>
 
           {menuOpen && (
-            <div className="absolute right-0 top-11 w-52 bg-white dark:bg-p-surface rounded-xl shadow-lg border border-p-border-light py-1 z-50">
-              <div className="px-3 py-2.5 border-b border-p-border-light">
+            <div className={`absolute right-0 top-11 z-50 w-52 py-1 ${POPOVER}`}>
+              <div className="px-3 py-2.5 border-b border-subtle">
                 {user.display_name && (
-                  <p className="text-sm font-medium text-p-text truncate">{user.display_name}</p>
+                  <p className="text-sm font-medium text-primary truncate">{user.display_name}</p>
                 )}
-                <p className={`text-xs truncate ${user.display_name ? 'text-p-text-light' : 'text-sm font-medium text-p-text'}`}>{user.name}</p>
-                <p className="text-xs text-p-text-light truncate">{user.email}</p>
+                <p className={`text-xs truncate ${user.display_name ? 'text-tertiary' : 'text-sm font-medium text-primary'}`}>{user.name}</p>
+                <p className="text-xs text-tertiary truncate">{user.email}</p>
               </div>
 
               <button
                 onClick={() => { setMenuOpen(false); navigate('/user-settings') }}
-                className="w-full text-left px-3 py-2 text-sm text-p-text-secondary hover:bg-p-surface-hover flex items-center gap-2 transition-colors"
+                className="w-full text-left px-3 py-2 text-sm text-secondary hover:bg-surface-hover flex items-center gap-2 transition-colors"
               >
-                <svg className="w-4 h-4 text-p-text-light" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5.121 17.804A13.937 13.937 0 0112 16c2.5 0 4.847.655 6.879 1.804M15 10a3 3 0 11-6 0 3 3 0 016 0zm6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
+                <IconUser className="w-4 h-4 text-tertiary" />
                 User Settings
               </button>
 
               <button
                 onClick={() => { setMenuOpen(false); navigate(`/agents/${agentName}`) }}
-                className="w-full text-left px-3 py-2 text-sm text-p-text-secondary hover:bg-p-surface-hover flex items-center gap-2 transition-colors"
+                className="w-full text-left px-3 py-2 text-sm text-secondary hover:bg-surface-hover flex items-center gap-2 transition-colors"
               >
-                <svg className="w-4 h-4 text-p-text-light" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                </svg>
+                <IconGear className="w-4 h-4 text-tertiary" />
                 Agent Settings
               </button>
 
               {onAppSettings && (
                 <button
                   onClick={() => { setMenuOpen(false); onAppSettings() }}
-                  className="w-full text-left px-3 py-2 text-sm text-p-text-secondary hover:bg-p-surface-hover flex items-center gap-2 transition-colors"
+                  className="w-full text-left px-3 py-2 text-sm text-secondary hover:bg-surface-hover flex items-center gap-2 transition-colors"
                 >
-                  <svg className="w-4 h-4 text-p-text-light" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" />
-                  </svg>
+                  <IconDeviceMobile className="w-4 h-4 text-tertiary" />
                   App Settings
                 </button>
               )}
@@ -198,24 +212,20 @@ export default function TopBar({
               {isAdmin(user) && (
                 <button
                   onClick={() => { setMenuOpen(false); navigate('/admin') }}
-                  className="w-full text-left px-3 py-2 text-sm text-p-text-secondary hover:bg-p-surface-hover flex items-center gap-2 transition-colors"
+                  className="w-full text-left px-3 py-2 text-sm text-secondary hover:bg-surface-hover flex items-center gap-2 transition-colors"
                 >
-                  <svg className="w-4 h-4 text-p-text-light" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-                  </svg>
+                  <IconShieldCheck className="w-4 h-4 text-tertiary" />
                   Admin
                 </button>
               )}
 
-              <div className="border-t border-p-border-light my-1" />
+              <div className="border-t border-subtle my-1" />
 
               <button
                 onClick={() => { setMenuOpen(false); onLogout() }}
-                className="w-full text-left px-3 py-2 text-sm text-p-text-secondary hover:bg-p-surface-hover flex items-center gap-2 transition-colors"
+                className="w-full text-left px-3 py-2 text-sm text-secondary hover:bg-surface-hover flex items-center gap-2 transition-colors"
               >
-                <svg className="w-4 h-4 text-p-text-light" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-                </svg>
+                <IconLogout className="w-4 h-4 text-tertiary" />
                 Logout
               </button>
             </div>

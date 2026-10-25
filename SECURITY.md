@@ -17,8 +17,8 @@ upgrade.
 <!-- supported-versions:begin -->
 | Version | Supported |
 | ------- | --------- |
-| 1.8.x (the latest release line) | ✅ |
-| 1.7.x and earlier | ❌ |
+| 1.9.x (the latest release line) | ✅ |
+| 1.8.x and earlier | ❌ |
 <!-- supported-versions:end -->
 
 The table is rewritten by the release tooling at every release.

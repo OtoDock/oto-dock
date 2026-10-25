@@ -23,6 +23,8 @@ from types import SimpleNamespace
 
 from fastapi import WebSocketDisconnect
 
+from core.execution_layer import MachineReach, ResumeVerdict
+
 # Every stub resolves models to this so frames are deterministic.
 TEST_MODEL = "test-model"
 
@@ -159,6 +161,13 @@ class FakeExecutionLayer:
         self.alive: set[str] = set()
         self.dead_processes: set[str] = set()
         self.resumable: set[str] = set()
+        # Sessions whose resume probe answers UNKNOWN (a machine away or
+        # silent): the warmup waits its budget, then refuses the turn. The
+        # probe a deferred turn's watcher waits on, per session (created on
+        # demand; a test resolves it to stand for the machine's late answer).
+        self.undecided: set[str] = set()
+        self.probe_futures: dict[str, asyncio.Future] = {}
+        self.forgotten_probes: list[str] = []
         self.started: list[tuple[str, object]] = []
         self.messages: list[tuple[str, str, dict]] = []
         self.mode_changes: list[tuple[str, str]] = []
@@ -201,7 +210,8 @@ class FakeExecutionLayer:
         # Contract mirrored from CLIExecutionLayer.start_session: the layer
         # stamps the session's mode (+ security context) from the built config.
         from core.session.session_state import (
-            set_session_mode, set_session_security,
+            set_session_mode,
+            set_session_security,
         )
         set_session_mode(sid, agent_cfg.permission_mode)
         if getattr(agent_cfg, "security_context", None) is not None:
@@ -276,8 +286,26 @@ class FakeExecutionLayer:
         return sid in self.dead_processes
 
     async def can_resume_session(self, sid: str, *, agent_name: str = "",
-                                 username: str = "") -> bool:
-        return sid in self.resumable
+                                 username: str = "", external_home: str = "") -> ResumeVerdict:
+        if sid in self.undecided:
+            return ResumeVerdict.UNKNOWN
+        return ResumeVerdict.RESUMABLE if sid in self.resumable else ResumeVerdict.FRESH
+
+    def resume_machine_reach(self, sid: str, *, agent_name: str = "",
+                             username: str = "") -> MachineReach:
+        # An undecided session's machine is connected but silent: the probe
+        # helper waits its budget on it instead of retrying as a local disk.
+        return MachineReach.CONNECTED if sid in self.undecided else MachineReach.LOCAL
+
+    def resume_probe_future(self, sid: str, *, agent_name: str = "",
+                            username: str = "") -> asyncio.Future | None:
+        if sid not in self.undecided and sid not in self.probe_futures:
+            return None
+        return self.probe_futures.setdefault(sid, asyncio.get_running_loop().create_future())
+
+    def forget_resume_probe(self, sid: str, *, agent_name: str = "", username: str = "") -> None:
+        self.forgotten_probes.append(sid)
+        self.probe_futures.pop(sid, None)
 
     async def close_session(self, sid: str) -> None:
         self.closed_sessions.append(sid)
@@ -374,6 +402,8 @@ class FakeInteractiveSession:
         self.alive = True
         self._turn_open = False  # read by streaming_chat_ids (connect snapshot)
         self.target = "local"
+        # read by the viewer's reset replays (ws/dashboard_pty._mirror_replay)
+        self.is_remote = False
         # read by find_live_for_chat's newest-alive sort (chat_process_alive)
         self.created_at = time.time()
         self.tui_theme = tui_theme
@@ -449,8 +479,9 @@ def stub_dashboard_seams(monkeypatch, fake_layer: FakeExecutionLayer):
     monkeypatch.setattr(sm, "_cli_layer", fake_layer)
     monkeypatch.setitem(sm._LAYERS, "claude-code-cli", fake_layer)
 
+    from services.remote import remote_status
     from storage import remote_store
-    monkeypatch.setattr(remote_store, "resolve_execution_target",
+    monkeypatch.setattr(remote_status, "resolve_execution_target",
                         lambda *a, **k: ("local", None))
     from core import placement as _placement
     monkeypatch.setattr(remote_store, "placement_of",
@@ -487,7 +518,7 @@ def stub_dashboard_seams(monkeypatch, fake_layer: FakeExecutionLayer):
     # switch_engine gate additionally requires `enabled` (admin disables).
     from storage.billing import subscription_store
     monkeypatch.setattr(subscription_store, "list_models",
-                        lambda path: [{"model_id": TEST_MODEL, "enabled": True}])
+                        lambda layer=None: [{"model_id": TEST_MODEL, "enabled": True}])
 
     # Turn-start token guard: no subscription bound to fake sessions.
     from services.engines import subscription_pool as sub_pool
@@ -557,13 +588,13 @@ async def dashboard_connection(cookie: str | None):
             ws.client_disconnect()
         try:
             await asyncio.wait_for(task, 5.0)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
             raise AssertionError(
                 "ws_dashboard_handler did not exit after disconnect"
-            )
+            ) from exc
 
 
 async def drain_startup(ws: FakeDashboardWebSocket) -> None:
@@ -607,7 +638,7 @@ async def warm_new_chat(ws: FakeDashboardWebSocket, layer: FakeExecutionLayer,
         layer.start_gate.set()
     ready = await ws.expect({
         "type": "warmup_ready", "session_id": ANY,
-        "chat_id": started["chat_id"], "mode": "default",
+        "chat_id": started["chat_id"], "mode": "autoReview",
         "model": TEST_MODEL, "execution_path": "claude-code-cli",
         "execution_target": "local", "fallback_reason": None,
         "offline_machine_name": "", "interactive": False,

@@ -11,21 +11,7 @@ import { useBuildWatch } from '@/hooks/useBuildWatch'
 
 vi.mock('@/lib/buildId', () => ({ noteServerBuild: vi.fn() }))
 import { noteServerBuild } from '@/lib/buildId'
-
-class FakeWebSocket {
-  static OPEN = 1
-  static CONNECTING = 0
-  static instances: FakeWebSocket[] = []
-  readyState = FakeWebSocket.OPEN
-  sent: string[] = []
-  onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
-  onmessage: ((e: { data: string }) => void) | null = null
-  constructor(public url: string) { FakeWebSocket.instances.push(this) }
-  send(data: string) { this.sent.push(data) }
-  close() { /* keeps reconnect logic out of the test */ }
-}
+import { FakeWebSocket } from './fakeWebSocket'
 
 describe('build id over the dashboard socket', () => {
   beforeEach(() => {

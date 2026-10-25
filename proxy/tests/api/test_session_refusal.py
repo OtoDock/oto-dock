@@ -137,6 +137,7 @@ class TestEverySite:
     @pytest.mark.asyncio
     async def test_the_app_proxy_refuses_before_any_read(self, monkeypatch):
         from fastapi import HTTPException
+
         from api.apps import app_proxy
 
         async def _no_read(*a, **k):
@@ -156,6 +157,7 @@ class TestEverySite:
     @pytest.mark.asyncio
     async def test_the_phone_relay_refuses_before_any_read(self, monkeypatch):
         from fastapi import HTTPException
+
         from api.phone import phone_relay
 
         async def _no_read(*a, **k):
@@ -174,6 +176,7 @@ class TestEverySite:
     @pytest.mark.asyncio
     async def test_the_principal_on_a_websocket_scope_names_nobody(self):
         from starlette.requests import HTTPConnection
+
         from auth.providers import _resolve_principal
         tokens, done = self._dead_and_stale()
         try:

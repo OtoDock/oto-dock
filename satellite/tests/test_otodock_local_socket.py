@@ -24,11 +24,21 @@ _TMP = tempfile.mkdtemp(prefix="otodock-test-")
 os.environ["HOME"] = _TMP
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from satellite.terminal.otodock_proto import (  # noqa: E402
-    read_frame, encode, encode_json,
-    T_OPEN, T_INPUT, T_RESIZE, T_LIST, T_OPENED, T_ERROR, T_OUTPUT, T_EXIT, T_LISTED,
+from satellite.terminal import local_socket
+from satellite.terminal.otodock_proto import (
+    T_ERROR,
+    T_EXIT,
+    T_INPUT,
+    T_LIST,
+    T_LISTED,
+    T_OPEN,
+    T_OPENED,
+    T_OUTPUT,
+    T_RESIZE,
+    encode,
+    encode_json,
+    read_frame,
 )
-from satellite.terminal import local_socket  # noqa: E402
 
 pytestmark = pytest.mark.asyncio
 
@@ -51,6 +61,9 @@ class FakeSession:
 
     def write(self, data: bytes):
         self.written += data
+
+    def note_local_input(self, data: bytes):
+        pass
 
     def resize(self, rows, cols):
         self.resized = (rows, cols)

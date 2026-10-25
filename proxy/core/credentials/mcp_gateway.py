@@ -15,8 +15,8 @@ A secret-free descriptor of every provisioned session is written under
 re-provisioned with exactly the set it had; the descriptor never carries a
 value, only where it comes from.
 
-``resolve`` blocks (a stat, a file read, two store reads behind memos): the
-callers run it in a thread.
+``resolve`` blocks (a stat, a file read, two store reads and the egress
+guard's name lookup, behind memos): the callers run it in a thread.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import config
@@ -61,8 +62,22 @@ _EGRESS_MEMO_S = 30.0
 # rows name ``localhost`` for the github and m365 containers, and in a
 # containerised deployment the sidecar is dialled by its service name.
 _SIDECAR_ALLOWLIST_HOST = "localhost"
+# The name RFC 6761 reserves for this machine, with every name under it.
+_LOOPBACK_NAME = "localhost"
 
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,160}")
+
+# Added on every forward of a read-only GitHub reach: GitHub's hosted MCP
+# server then offers read tools alone; its path suffix says the same.
+READ_ONLY_HEADER = "X-MCP-Readonly"
+READ_ONLY_PATH_SUFFIX = "readonly"
+# The headers GitHub's server reads to widen or narrow what it offers: a
+# narrowed credential forwards none the session sent.
+_SERVER_OPTION_HEADER_PREFIX = "x-mcp-"
+_IDENTITY_ENCODING = "identity"
+_POST = "POST"
+# Without a body: GET opens the server's stream, DELETE ends the session.
+_BODILESS_METHODS = frozenset({"GET", "DELETE"})
 
 _REFUSAL_NO_CREDENTIAL = "No credential is provisioned for this session and MCP."
 _REFUSAL_NO_VALUE = (
@@ -99,6 +114,16 @@ class GatewayCredential:
     # ``value_from``), so a re-adoption can resolve it again; "" for a
     # token-file credential.
     value_from: str = ""
+    # A narrowed GitHub reach of the agent's service binding
+    # (``auth/github_reach.Reach.to_dict``): every request is judged by it.
+    reach: dict | None = None
+
+    @property
+    def forwarded_here(self) -> bool:
+        """The proxy forwards this credential's traffic itself, for a
+        machine session too: a sidecar, or a credential a reach narrows
+        (judged here, its token never pushed to a machine)."""
+        return self.proxy_local or bool(self.reach)
 
     @property
     def host(self) -> str:
@@ -113,7 +138,7 @@ class GatewayCredential:
         return d
 
     @classmethod
-    def from_descriptor(cls, d: dict) -> "GatewayCredential":
+    def from_descriptor(cls, d: dict) -> GatewayCredential:
         ref = d.get("token_ref")
         return cls(
             upstream=str(d.get("upstream") or ""),
@@ -126,6 +151,7 @@ class GatewayCredential:
             proxy_local=bool(d.get("proxy_local")),
             manifest=str(d.get("manifest") or ""),
             value_from=str(d.get("value_from") or ""),
+            reach=d.get("reach") if isinstance(d.get("reach"), dict) else None,
         )
 
 
@@ -143,6 +169,9 @@ class CliCredential:
     username: str = "x-access-token"
     env_names: tuple[str, ...] = ()
     manifest: str = ""
+    # A narrowed GitHub reach (``auth/github_reach``): each command's request
+    # names its repository and is judged by it.
+    reach: dict | None = None
 
     def descriptor(self) -> dict:
         d = asdict(self)
@@ -150,7 +179,7 @@ class CliCredential:
         return d
 
     @classmethod
-    def from_descriptor(cls, d: dict) -> "CliCredential | None":
+    def from_descriptor(cls, d: dict) -> CliCredential | None:
         ref = d.get("token_ref")
         if not isinstance(ref, dict) or not d.get("host"):
             return None
@@ -160,6 +189,7 @@ class CliCredential:
             username=str(d.get("username") or "x-access-token"),
             env_names=tuple(str(n) for n in (d.get("env_names") or [])),
             manifest=str(d.get("manifest") or ""),
+            reach=d.get("reach") if isinstance(d.get("reach"), dict) else None,
         )
 
 
@@ -272,6 +302,8 @@ _lock = threading.Lock()
 _allowlist_memo: dict[tuple[str, str], tuple[bool, float, int]] = {}
 # upstream -> (refusal or None, deadline)
 _egress_memo: dict[str, tuple[str | None, float]] = {}
+# upstream -> whether the environment proxies it (static while the proxy runs)
+_proxied_memo: dict[str, bool] = {}
 # (token dir, label) -> (mtime_ns, size, parsed file)
 _token_memo: dict[tuple[str, str], tuple[int, int, dict | None]] = {}
 
@@ -290,6 +322,13 @@ def _host_allowed(key: str, host: str) -> bool:
     return allowed
 
 
+def _names_this_machine(host: str) -> bool:
+    """``localhost`` and every ``*.localhost`` name (RFC 6761: they resolve
+    to loopback, whatever a resolver answers)."""
+    name = host.lower().rstrip(".")
+    return name == _LOOPBACK_NAME or name.endswith("." + _LOOPBACK_NAME)
+
+
 def _egress_refusal(upstream: str) -> str | None:
     """The self-SSRF guard on a vendor origin: the admin's allowlist is the
     authority on WHICH host the gateway may reach (an approved LAN or
@@ -298,12 +337,15 @@ def _egress_refusal(upstream: str) -> str | None:
     control plane — loopback, the link-local/metadata range — so an
     allowlisted name that resolves back onto the proxy (a rebind, a
     misconfigured row) cannot turn the gateway on the platform itself.
-    The forward resolves the name again when it connects, so a record that
-    answers differently between the two lookups is not caught here (the
-    stated limit of every such guard)."""
+    The rule is ``pinned_http.control_plane``, the same one the vendor
+    pool applies when it connects (``client``), so a record that answers
+    differently between this lookup and the dial is refused there; this
+    pre-check keeps the message the MCP client reads."""
     import ipaddress
     import socket
     from urllib.parse import urlsplit
+
+    from services.infra import pinned_http
     now = time.monotonic()
     with _lock:
         hit = _egress_memo.get(upstream)
@@ -313,23 +355,32 @@ def _egress_refusal(upstream: str) -> str | None:
     host = parts.hostname or ""
     port = parts.port or (443 if parts.scheme == "https" else 80)
     verdict: str | None = None
+    # Behind the environment's egress proxy the proxy resolves the name, and
+    # this machine's resolver may know nothing of it: the local lookup is
+    # best effort there (no answer passes), while an answer in the
+    # platform's own space, and a name that only ever means this machine,
+    # are still refused (a proxy on this machine would dial its loopback).
+    proxied = _proxied(upstream)
+    if proxied and _names_this_machine(host):
+        verdict = f"the MCP server host {host} names this machine"
+        with _lock:
+            _egress_memo[upstream] = (verdict, now + _EGRESS_MEMO_S)
+        return verdict
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except OSError:
-        verdict = f"the MCP server host {host} does not resolve"
-    else:
+        infos = []
+        if not proxied:
+            verdict = f"the MCP server host {host} does not resolve"
+    if infos:
         for info in infos:
-            ip = info[4][0]
+            ip = cast("str", info[4][0])  # an IP family's sockaddr starts with the address
             try:
-                addr = ipaddress.ip_address(ip)
+                ipaddress.ip_address(ip)
             except ValueError:
                 verdict = f"the MCP server host {host} resolves to an unreadable address"
                 break
-            mapped = getattr(addr, "ipv4_mapped", None)
-            if mapped is not None:
-                addr = mapped
-            if (addr.is_loopback or addr.is_link_local or addr.is_unspecified
-                    or addr.is_multicast or addr.is_reserved):
+            if pinned_http.control_plane(ip):
                 verdict = (f"the MCP server host {host} resolves to the platform's own "
                            f"address space ({ip})")
                 break
@@ -454,6 +505,7 @@ def forget_memos() -> None:
     with _lock:
         _allowlist_memo.clear()
         _egress_memo.clear()
+        _proxied_memo.clear()
         _token_memo.clear()
 
 
@@ -641,14 +693,20 @@ def refusal_shape(method: str, body: bytes, message: str, *, code: int = -32001)
         return 405, {"Allow": "POST, DELETE"}, b""
     if method == "DELETE":
         return 200, {}, b""
-    rid = None
+    doc = None
     if body and len(body) <= _REFUSAL_PARSE_CAP:
         try:
             doc = json.loads(body)
         except ValueError:
             doc = None
-        if isinstance(doc, dict) and doc.get("id") is not None:
-            rid = doc["id"]
+    if isinstance(doc, list):
+        # A batch: one error per message that awaits an answer.
+        errors = [{"jsonrpc": "2.0", "id": m["id"], "error": {"code": code, "message": message}}
+                  for m in doc if isinstance(m, dict) and m.get("id") is not None]
+        if not errors:
+            return 202, {}, b""
+        return 200, {"Content-Type": "application/json"}, json.dumps(errors).encode()
+    rid = doc.get("id") if isinstance(doc, dict) else None
     if rid is None:
         return 202, {}, b""
     payload = {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
@@ -661,29 +719,123 @@ class Prepared:
     headers: dict[str, str]
     proxy_local: bool
     client: object
+    # The body to send when a reach rewrote it (a search given the reach's
+    # ``repo:`` qualifiers); ``None`` = the request's own.
+    content: bytes | None = None
 
 
-_clients: dict[tuple[int, bool], object] = {}
+def _writes(mcp: str, manifest: str):
+    """Whether a tool writes, by the annotations its server last sent
+    (``None`` while unknown)."""
+    from services.mcp import mcp_permissions
+
+    def writes(tool: str) -> bool | None:
+        hints = mcp_permissions.tool_hints(mcp, tool) or (
+            mcp_permissions.tool_hints(manifest, tool) if manifest else None)
+        if not hints:
+            return None
+        return hints.get("readOnlyHint") is not True
+    return writes
 
 
-def client(proxy_local: bool):
+def judge_reach(
+    cred: GatewayCredential, mcp: str, method: str, body: bytes, inbound_headers=(),
+) -> tuple[str, bytes | None]:
+    """A narrowed credential's request judged by its reach
+    (``auth/github_reach.judge_mcp``): the refusal sentence, else the body
+    to forward (``None`` = as it came: a request with no body). A body
+    must be plain JSON the judge reads as the server will. Blocking (the
+    JSON of a body): the callers run it in a thread."""
+    from auth import github_reach
+    reach = github_reach.Reach.from_dict(cred.reach)
+    if reach is None or not reach.narrows:
+        return "", None
+    encodings = [v.strip().lower() for k, v in inbound_headers if k.lower() == "content-encoding"]
+    if any(e and e != _IDENTITY_ENCODING for e in encodings):
+        return github_reach.UNREADABLE, None
+    if len(body) > MAX_BODY_BYTES:
+        return github_reach.UNREADABLE, None
+    # The method as the upstream client will send it (httpx uppercases a
+    # tunnel frame's): only a POST carries a call to judge.
+    verb = (method or "").upper()
+    if verb in _BODILESS_METHODS and not body:
+        return "", None
+    if verb != _POST:
+        return github_reach.METHOD_REFUSED, None
+    verdict = github_reach.judge_mcp(reach, body, writes=_writes(mcp, cred.manifest))
+    return verdict.refusal, verdict.body
+
+
+def _reach_headers(cred: GatewayCredential, headers: dict[str, str]) -> None:
+    """A narrowed credential forwards none of the server's option headers
+    the session sent (two copies of one name read as the first); under a
+    read-only reach, GitHub's own read-only mode."""
+    if not cred.reach:
+        return
+    for k in [k for k in headers if k.lower().startswith(_SERVER_OPTION_HEADER_PREFIX)]:
+        del headers[k]
+    if cred.reach.get("read_only"):
+        headers[READ_ONLY_HEADER] = "true"
+
+
+def _reach_path(cred: GatewayCredential, path: str) -> str:
+    """Under a read-only reach the forward goes to the declared path's
+    read-only twin (GitHub's server: ``/mcp/readonly``)."""
+    if cred.reach and cred.reach.get("read_only"):
+        return path.rstrip("/") + "/" + READ_ONLY_PATH_SUFFIX
+    return path
+
+
+# (loop id, pool kind) -> client; the kinds are "sidecar", "vendor", "proxied"
+_clients: dict[tuple[int, str], object] = {}
+
+
+def _proxied(upstream: str) -> bool:
+    """Whether the environment's proxy carries ``upstream`` (memoised: the
+    forward runs per MCP request, and the environment does not change while
+    the proxy runs)."""
+    if not upstream:
+        return False
+    with _lock:
+        hit = _proxied_memo.get(upstream)
+    if hit is None:
+        from services.infra import pinned_http
+        hit = pinned_http.proxied(upstream)
+        with _lock:
+            _proxied_memo[upstream] = hit
+    return hit
+
+
+def client(proxy_local: bool, upstream: str = ""):
     """The gateway's own HTTP client for the running loop: one pool for
-    vendors, one for sidecars (the tunnel's two-class rule, so a vendor's
-    held streams never starve a sidecar), no redirects, no read timeout
-    (a standing stream), a 10 s connect."""
+    sidecars, one for vendors (the tunnel's two-class rule, so a vendor's
+    held streams never starve a sidecar) and one plain pool for a vendor
+    the environment's proxy carries; no redirects, no read timeout (a
+    standing stream), a 10 s connect. The vendor pool connects only to
+    addresses that pass ``_egress_refusal``'s rule, resolved at the dial
+    (``pinned_http.control_plane``); the pool limits sit on its transport,
+    the only place a custom transport reads them."""
     import asyncio
+
     import httpx
+
+    from services.infra import pinned_http
     loop = asyncio.get_running_loop()
-    key = (id(loop), proxy_local)
+    kind = "sidecar" if proxy_local else ("proxied" if _proxied(upstream) else "vendor")
+    key = (id(loop), kind)
     c = _clients.get(key)
     if c is None:
         for stale in [k for k in _clients if k[0] != id(loop)]:
             _clients.pop(stale, None)
-        c = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0),
-            limits=httpx.Limits(max_connections=_POOL_MAX, max_keepalive_connections=_POOL_MAX),
-            follow_redirects=False,
-        )
+        limits = httpx.Limits(max_connections=_POOL_MAX, max_keepalive_connections=_POOL_MAX)
+        timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+        if kind == "vendor":
+            c = httpx.AsyncClient(
+                transport=pinned_http.CheckedTransport(pinned_http.control_plane, limits=limits),
+                timeout=timeout, follow_redirects=False,
+            )
+        else:
+            c = httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False)
         _clients[key] = c
     return c
 
@@ -692,8 +844,9 @@ def upstream_url(res: Resolved, query: bytes, session_id: str):
     """The target, built from parts: the credential's origin and declared
     path, never a byte of the request. A sidecar keeps the client's query
     with ``session_id`` overwritten by the token's; a vendor gets none."""
-    import httpx
     from urllib.parse import parse_qsl, urlencode
+
+    import httpx
     parts = urlsplit(res.upstream)
     q = b""
     if res.proxy_local:
@@ -701,33 +854,43 @@ def upstream_url(res: Resolved, query: bytes, session_id: str):
                   if k != "session_id"]
         params.append(("session_id", session_id))
         q = urlencode(params).encode()
-    kwargs = {"query": q} if q else {}
+    kwargs: dict[str, Any] = {"query": q} if q else {}
     return httpx.URL(scheme=parts.scheme, host=parts.hostname or "", port=parts.port,
                      path=res.path, **kwargs)
 
 
 async def prepare_forward(
     session_id: str, mcp: str, method: str, rest: str, query: bytes, inbound_headers,
+    body: bytes = b"",
 ) -> Prepared | Refusal:
     """Everything a front door needs to forward one request of ``session_id``
     for ``mcp``: the credential resolved in a thread, the path confined to
-    the declared endpoint, the headers filtered and the credential header
-    added, the client picked. A refusal carries the sentence the client
-    reads."""
+    the declared endpoint, a narrowed reach's judgment of ``body``, the
+    headers filtered and the credential header added, the client picked. A
+    refusal carries the sentence the client reads."""
     import asyncio
     cred = credential(session_id, mcp)
     if cred is None:
         return Refusal("no_credential", _REFUSAL_NO_CREDENTIAL)
     if not path_matches(cred.path, rest):
         return Refusal("path_refused", _REFUSAL_PATH)
+    content: bytes | None = None
+    inbound = list(inbound_headers)
+    if cred.reach:
+        refusal, content = await asyncio.to_thread(judge_reach, cred, mcp, method, body, inbound)
+        if refusal:
+            return Refusal("reach_refused", refusal)
     res = await asyncio.to_thread(resolve_credential, cred)
     if isinstance(res, Refusal):
         return res
-    headers = forward_request_headers(inbound_headers)
+    res.path = _reach_path(cred, res.path)
+    headers = forward_request_headers(inbound)
+    _reach_headers(cred, headers)
     headers[res.header] = res.value
     return Prepared(
         url=upstream_url(res, query, session_id), headers=headers,
-        proxy_local=res.proxy_local, client=client(res.proxy_local),
+        proxy_local=res.proxy_local, client=client(res.proxy_local, res.upstream),
+        content=content,
     )
 
 

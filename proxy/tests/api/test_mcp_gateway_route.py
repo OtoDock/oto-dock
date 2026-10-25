@@ -8,6 +8,7 @@ redirects kept out.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 
@@ -63,7 +64,7 @@ class _Body(httpx.AsyncByteStream):
 
 def _wire(monkeypatch, upstream: _Upstream):
     c = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
-    monkeypatch.setattr(mcp_gateway, "client", lambda proxy_local: c)
+    monkeypatch.setattr(mcp_gateway, "client", lambda *a, **k: c)
 
 
 def _provision(sid: str, key: str = "vendor", **cred) -> str:
@@ -93,6 +94,99 @@ def test_no_bearer_a_cookie_the_master_key_and_a_dead_session_are_refused():
     dead = create_session_token(str(uuid.uuid4()), "agent", "user-1")
     r = client.post("/v1/mcp-gateway/vendor/mcp", json=_RPC, headers={"Authorization": f"Bearer {dead}"})
     assert r.status_code == 401
+
+
+_REACH = {"repositories": ["octo/hello"], "read_only": False}
+
+
+def _tool(name: str, rid: int = 7, **arguments) -> dict:
+    return {"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+
+
+def test_a_narrowed_credential_judges_each_call_through_the_route(monkeypatch):
+    sid = str(uuid.uuid4())
+    up = _Upstream()
+    _wire(monkeypatch, up)
+    _provision(sid, reach=_REACH)
+    try:
+        ok = _tool("get_file_contents", owner="octo", repo="hello", path="README.md")
+        r = client.post("/v1/mcp-gateway/vendor/mcp", json=ok, headers=_token(sid))
+        assert r.status_code == 200 and len(up.requests) == 1
+        assert json.loads(up.requests[0].content) == ok
+        r = client.post("/v1/mcp-gateway/vendor/mcp", json=_tool("issue_write", owner="octo", repo="secret"),
+                        headers=_token(sid))
+        assert r.status_code == 200 and len(up.requests) == 1
+        assert r.json()["id"] == 7 and "octo/secret is not one of them" in r.json()["error"]["message"]
+        r = client.post("/v1/mcp-gateway/vendor/mcp", json=_tool("search_code", query="foo"), headers=_token(sid))
+        assert json.loads(up.requests[-1].content)["params"]["arguments"]["query"] == "foo repo:octo/hello"
+        batch = [_tool("get_me", rid=1), _tool("list_issues", rid=2, owner="x", repo="y"),
+                 {"jsonrpc": "2.0", "method": "notifications/progress"}]
+        r = client.post("/v1/mcp-gateway/vendor/mcp", json=batch, headers=_token(sid))
+        assert [e["id"] for e in r.json()] == [1, 2] and len(up.requests) == 2
+        r = client.post("/v1/mcp-gateway/vendor/mcp", content=json.dumps(ok),
+                        headers={**_token(sid), "Content-Type": "application/json", "Content-Encoding": "gzip"})
+        assert "could not be read" in r.json()["error"]["message"] and len(up.requests) == 2
+    finally:
+        mcp_broker.purge_session(sid)
+
+
+def test_a_read_only_reach_turns_on_githubs_read_only_mode(monkeypatch):
+    sid = str(uuid.uuid4())
+    up = _Upstream()
+    _wire(monkeypatch, up)
+    _provision(sid, reach={"repositories": [], "read_only": True})
+    try:
+        r = client.post("/v1/mcp-gateway/vendor/mcp", json=_RPC, headers={
+            **_token(sid), "x-mcp-readonly": "false", "X-MCP-Toolsets": "all", "X-Mcp-Tools": "x"})
+        assert r.status_code == 200
+        sent = up.requests[0]
+        assert sent.headers.get_list("x-mcp-readonly") == ["true"]
+        assert "x-mcp-toolsets" not in sent.headers and "x-mcp-tools" not in sent.headers
+        assert sent.url.path == "/mcp/readonly"
+    finally:
+        mcp_broker.purge_session(sid)
+
+
+def test_an_unnarrowed_credential_forwards_as_it_always_did(monkeypatch):
+    sid = str(uuid.uuid4())
+    up = _Upstream()
+    _wire(monkeypatch, up)
+    _provision(sid)
+    raw = b'{"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}, "params": 1}'
+    try:
+        client.post("/v1/mcp-gateway/vendor/mcp", content=raw,
+                    headers={**_token(sid), "Content-Type": "application/json", "X-MCP-Toolsets": "all"})
+        sent = up.requests[0]
+        assert sent.content == raw and sent.url.path == "/mcp"
+        assert sent.headers["x-mcp-toolsets"] == "all"
+    finally:
+        mcp_broker.purge_session(sid)
+
+
+def test_the_reach_judges_the_method_the_upstream_client_will_send():
+    """A tunnel frame's method reaches httpx as given and is uppercased
+    there: a lower-case POST is judged, GET and DELETE pass without a body,
+    anything else is refused."""
+    from auth import github_reach
+    cred = GatewayCredential(upstream="https://mcp.example.com", path="/mcp", allowlist_key="k",
+                             reach=_REACH)
+    outside = json.dumps(_tool("list_issues", owner="octo", repo="secret")).encode()
+    assert "octo/secret is not one of them" in mcp_gateway.judge_reach(cred, "vendor", "post", outside)[0]
+    assert mcp_gateway.judge_reach(cred, "vendor", "get", b"") == ("", None)
+    assert mcp_gateway.judge_reach(cred, "vendor", "DELETE", b"") == ("", None)
+    for method, body in (("GET", outside), ("PATCH", outside), ("PUT", b""), ("", outside)):
+        assert mcp_gateway.judge_reach(cred, "vendor", method, body)[0] == github_reach.METHOD_REFUSED, method
+
+
+def test_the_reach_survives_the_descriptor_and_keeps_the_token_on_the_platform():
+    cred = GatewayCredential(upstream="https://api.githubcopilot.com", path="/mcp/", allowlist_key="github",
+                             value="", reach={"repositories": ["octo/hello"], "read_only": True})
+    back = GatewayCredential.from_descriptor(cred.descriptor())
+    assert back.reach == cred.reach and back.forwarded_here
+    assert not GatewayCredential(upstream="https://x.example", path="/", allowlist_key="k").forwarded_here
+    cli = mcp_gateway.CliCredential(host="github.com", token_ref=mcp_gateway.TokenRef("/t", "a"),
+                                    reach={"repositories": [], "read_only": True})
+    assert mcp_gateway.CliCredential.from_descriptor(cli.descriptor()).reach == cli.reach
 
 
 def test_two_authorization_headers_are_refused():
@@ -257,3 +351,60 @@ def test_the_direct_layer_dials_the_internal_listener(monkeypatch):
     assert mcp_gateway.internal_entry_url("http://localhost:8932/mcp/") == "http://localhost:8932/mcp/"
     monkeypatch.setattr(config, "INTERNAL_LISTENER_PORT", 0)
     assert mcp_gateway.internal_entry_url(url) == url
+
+
+_PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+               "NO_PROXY", "no_proxy")
+
+
+def test_the_vendor_pool_is_checked_the_sidecar_and_a_proxied_upstream_plain(monkeypatch):
+    """Three pools per loop: vendors dial only addresses outside the
+    platform's own address space, sidecars keep the plain client, and a
+    vendor the environment's proxy carries keeps a plain client too (the
+    proxy resolves the name)."""
+    from services.infra import pinned_http
+    for var in _PROXY_VARS:
+        monkeypatch.delenv(var, raising=False)
+    mcp_gateway._clients.clear()
+    mcp_gateway.forget_memos()
+
+    async def pools():
+        vendor = mcp_gateway.client(False, "https://mcp.example.com")
+        again = mcp_gateway.client(False, "https://other.example.com")
+        sidecar = mcp_gateway.client(True, "http://127.0.0.1:8932")
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:3128")
+        proxied = mcp_gateway.client(False, "https://proxied.example.com")
+        return vendor, again, sidecar, proxied
+    vendor, again, sidecar, proxied = asyncio.run(pools())
+    assert isinstance(vendor._transport, pinned_http.CheckedTransport)
+    assert vendor._transport.policy is pinned_http.control_plane
+    assert again is vendor
+    assert sidecar is not vendor and not isinstance(sidecar._transport, pinned_http.CheckedTransport)
+    assert proxied is not sidecar and not isinstance(proxied._transport, pinned_http.CheckedTransport)
+    assert sorted(k[1] for k in mcp_gateway._clients) == ["proxied", "sidecar", "vendor"]
+    mcp_gateway._clients.clear()
+    mcp_gateway.forget_memos()
+
+
+def test_a_vendor_that_rebinds_to_loopback_between_the_check_and_the_dial_is_refused(monkeypatch):
+    """The pre-check passed (patched, as in every test here); the dial
+    resolves the name again, gets loopback and refuses before a byte goes
+    out: the route answers its generic JSON-RPC error, the listener sees no
+    connection."""
+    from services.infra import pinned_http
+    from tests.core.test_pinned_http import Listener
+    for var in _PROXY_VARS:
+        monkeypatch.delenv(var, raising=False)
+    target = Listener()
+    monkeypatch.setattr(pinned_http, "_getaddrinfo",
+                        lambda host, port: [(2, 1, 6, "", ("127.0.0.1", port))])
+    mcp_gateway._clients.clear()
+    sid = str(uuid.uuid4())
+    _provision(sid, upstream=f"https://mcp.example.com:{target.port}")
+    r = client.post("/v1/mcp-gateway/vendor/mcp", json=_RPC, headers=_token(sid))
+    assert r.status_code == 200
+    assert "did not answer" in r.json()["error"]["message"]
+    assert target.connections == 0
+    target.close()
+    mcp_broker.purge_session(sid)
+    mcp_gateway._clients.clear()

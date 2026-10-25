@@ -3,35 +3,66 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<meta name="color-scheme" content="light dark">
 <title>Connect to Server</title>
 <style>
   /* The page loads nothing from another host: the fonts are the build's own
      copies (dist/setup-fonts, vite.config.ts), which cap sync puts beside this
-     page in the app's assets. */
+     page in the app's assets. The colours are the design tokens' values in
+     both themes (a test holds them to design/tokens.json); the page follows
+     the phone's theme, since it has no stored one of its own. */
   @font-face {
-    font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 400;
-    src: url(setup-fonts/comfortaa-latin-400-normal.woff2) format('woff2');
+    font-family: 'Manrope'; font-style: normal; font-display: swap; font-weight: 400;
+    src: url(setup-fonts/manrope-latin-400-normal.woff2) format('woff2');
     unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
   }
   @font-face {
-    font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 400;
-    src: url(setup-fonts/comfortaa-greek-400-normal.woff2) format('woff2');
+    font-family: 'Manrope'; font-style: normal; font-display: swap; font-weight: 400;
+    src: url(setup-fonts/manrope-greek-400-normal.woff2) format('woff2');
     unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
   }
   @font-face {
-    font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 600;
-    src: url(setup-fonts/comfortaa-latin-600-normal.woff2) format('woff2');
+    font-family: 'Manrope'; font-style: normal; font-display: swap; font-weight: 600;
+    src: url(setup-fonts/manrope-latin-600-normal.woff2) format('woff2');
     unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
   }
   @font-face {
-    font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 600;
-    src: url(setup-fonts/comfortaa-greek-600-normal.woff2) format('woff2');
+    font-family: 'Manrope'; font-style: normal; font-display: swap; font-weight: 600;
+    src: url(setup-fonts/manrope-greek-600-normal.woff2) format('woff2');
     unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
+  }
+  @font-face {
+    font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 700;
+    src: url(setup-fonts/comfortaa-latin-700-normal.woff2) format('woff2');
+    unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+  }
+  @font-face {
+    font-family: 'Comfortaa'; font-style: normal; font-display: swap; font-weight: 700;
+    src: url(setup-fonts/comfortaa-greek-700-normal.woff2) format('woff2');
+    unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
+  }
+  :root {
+    color-scheme: light;
+    --page: #faf9f9; --card: #ffffff; --text: #1b2430; --text-2: #4a5563; --text-3: #626b77;
+    --border: #d6d2ce; --border-strong: #8c8782; --action: #146bb5; --action-hover: #0f5a9a;
+    --action-fg: #ffffff; --focus: #1e7dd1; --mark: #1d4f80;
+    --danger-bg: #fdf0f0; --danger-fg: #c53030; --danger-border: #f2b8b8;
+    --success-fg: #147538; --star: #d97706;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page: #0d1117; --card: #141b24; --text: #e6edf5; --text-2: #a3b1c2; --text-3: #8b98a9;
+      --border: rgb(255 255 255 / 0.1); --border-strong: rgb(255 255 255 / 0.36);
+      --focus: #5a9fe0; --mark: #ffffff;
+      --danger-bg: #332128; --danger-fg: #f87171; --danger-border: #6c2b31;
+      --success-fg: #4ade80; --star: #f4b206;
+    }
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
-    font-family: 'Comfortaa', system-ui, sans-serif;
-    background: #FAF9F9;
+    font-family: 'Manrope', system-ui, sans-serif;
+    background: var(--page);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -41,39 +72,42 @@
              calc(env(safe-area-inset-right, 0px) + 1.5rem)
              calc(env(safe-area-inset-bottom, 0px) + 1.5rem)
              calc(env(safe-area-inset-left, 0px) + 1.5rem);
-    color: #333;
+    color: var(--text);
   }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
   .card {
     width: 100%;
     max-width: 380px;
     text-align: center;
   }
   .logo {
+    display: block;
     width: 72px;
     height: 72px;
     margin: 0 auto 1.5rem;
-    border-radius: 16px;
+    color: var(--mark);
   }
   h1 {
+    font-family: 'Comfortaa', 'Manrope', system-ui, sans-serif;
     font-size: 1.25rem;
-    font-weight: 600;
+    font-weight: 700;
     margin-bottom: 0.5rem;
   }
   .subtitle {
     font-size: 0.85rem;
-    color: #666;
+    color: var(--text-2);
     margin-bottom: 1.5rem;
     line-height: 1.4;
   }
   .error-banner {
     display: none;
-    background: #fef2f2;
-    border: 1px solid #fecaca;
-    border-radius: 12px;
+    background: var(--danger-bg);
+    border: 1px solid var(--danger-border);
+    border-radius: 8px;
     padding: 0.75rem 1rem;
     margin-bottom: 1rem;
     font-size: 0.8rem;
-    color: #da3536;
+    color: var(--danger-fg);
   }
   .error-banner.visible { display: block; }
   .input-group {
@@ -82,116 +116,118 @@
   input[type="url"], input[type="text"] {
     width: 100%;
     padding: 0.75rem 1rem;
-    font-family: 'Comfortaa', system-ui, sans-serif;
+    font-family: 'Manrope', system-ui, sans-serif;
     font-size: 0.9rem;
-    border: 1px solid #e5e7eb;
-    border-radius: 12px;
-    background: white;
-    color: #333;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--card);
+    color: var(--text);
     outline: none;
     transition: border-color 0.15s;
   }
   input:focus {
-    border-color: #146bb5;
-    box-shadow: 0 0 0 3px rgba(20, 107, 181, 0.12);
+    border-color: var(--focus);
+    box-shadow: 0 0 0 2px var(--focus);
   }
-  input::placeholder { color: #999; }
+  input::placeholder { color: var(--text-3); }
   .msg {
     font-size: 0.78rem;
     margin-top: 0.5rem;
     min-height: 1.2em;
     transition: color 0.15s;
   }
-  .msg.error { color: #da3536; }
-  .msg.info { color: #666; }
-  .msg.success { color: #4CAF50; }
+  .msg.error { color: var(--danger-fg); }
+  .msg.info { color: var(--text-2); }
+  .msg.success { color: var(--success-fg); }
   .btn {
     width: 100%;
     padding: 0.75rem;
     margin-top: 1rem;
-    font-family: 'Comfortaa', system-ui, sans-serif;
+    font-family: 'Manrope', system-ui, sans-serif;
     font-size: 0.9rem;
     font-weight: 600;
-    color: white;
-    background: #146bb5;
+    color: var(--action-fg);
+    background: var(--action);
     border: none;
-    border-radius: 12px;
+    border-radius: 6px;
     cursor: pointer;
     transition: background 0.15s, opacity 0.15s;
   }
-  .btn:hover { background: #0f5a9a; }
+  .btn:hover { background: var(--action-hover); }
   .btn:disabled { opacity: 0.45; cursor: not-allowed; }
   .spinner {
     display: inline-block;
     width: 16px;
     height: 16px;
-    border: 2px solid rgba(255,255,255,0.3);
-    border-top-color: white;
+    border: 2px solid rgb(255 255 255 / 0.3);
+    border-top-color: var(--action-fg);
     border-radius: 50%;
     animation: spin 0.6s linear infinite;
     vertical-align: middle;
     margin-right: 6px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 1.5s; } }
   .btn-link {
     width: 100%;
     margin-top: 10px;
     background: transparent;
-    color: rgba(255,255,255,0.75);
+    color: var(--text-2);
     border: none;
     padding: 10px;
-    font-size: 15px;
+    font-family: 'Manrope', system-ui, sans-serif;
+    font-size: 0.9rem;
     cursor: pointer;
   }
-  .btn-link:hover { color: #fff; }
+  .btn-link:hover { color: var(--text); }
   .privacy-link {
     display: none;
     margin: 1.5rem auto 0;
     background: transparent;
     border: none;
-    font-family: 'Comfortaa', system-ui, sans-serif;
+    font-family: 'Manrope', system-ui, sans-serif;
     font-size: 0.75rem;
-    color: #888;
+    color: var(--text-3);
     text-decoration: underline;
     cursor: pointer;
   }
-  /* "Server unreachable" → switch to another installation */
+  /* "Server unreachable": switch to another installation */
   .installs-picker { display: none; margin-bottom: 1rem; text-align: left; }
   .installs-picker.visible { display: block; }
   .picker-label {
-    font-size: 0.8rem; color: #666; margin-bottom: 0.5rem; text-align: center;
+    font-size: 0.8rem; color: var(--text-2); margin-bottom: 0.5rem; text-align: center;
   }
-  .picker-or { font-size: 0.72rem; color: #999; text-align: center; margin-top: 0.75rem; }
+  .picker-or { font-size: 0.72rem; color: var(--text-3); text-align: center; margin-top: 0.75rem; }
   .inst-row {
     display: flex; align-items: center; gap: 0.6rem;
-    background: white; border: 1px solid #e5e7eb; border-radius: 12px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
     padding: 0.6rem 0.75rem; margin-bottom: 0.5rem;
   }
   .inst-star {
     background: transparent; border: none; font-size: 1.15rem; line-height: 1;
-    color: #c4c4c4; cursor: pointer; padding: 0 2px;
+    color: var(--text-3); cursor: pointer; padding: 0 2px;
   }
-  .inst-star.on { color: #e6b800; }
+  .inst-star.on { color: var(--star); }
   .inst-meta { flex: 1; min-width: 0; cursor: pointer; }
   .inst-name {
-    font-size: 0.85rem; font-weight: 600; color: #333;
+    font-size: 0.85rem; font-weight: 600; color: var(--text);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .inst-host {
-    font-size: 0.72rem; color: #888;
+    font-size: 0.72rem; color: var(--text-3);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .inst-go {
-    background: #146bb5; color: white; border: none; border-radius: 8px;
-    font-family: 'Comfortaa', system-ui, sans-serif;
+    background: var(--action); color: var(--action-fg); border: none; border-radius: 6px;
+    font-family: 'Manrope', system-ui, sans-serif;
     font-size: 0.78rem; font-weight: 600; padding: 0.45rem 0.8rem; cursor: pointer;
   }
-  .inst-go:hover { background: #0f5a9a; }
+  .inst-go:hover { background: var(--action-hover); }
 </style>
 </head>
 <body>
   <div class="card">
-    <img src="logo.png" alt="Logo" class="logo" onerror="this.style.display='none'">
+    <svg class="logo" viewBox="0 0 96 96" role="img" aria-label="OtoDock"><path fill="currentColor" fill-rule="evenodd" d="M 46.5 12.77 A 5 5 0 1 1 49.5 12.77 L 49.5 20.031 A 36 36 0 0 1 81.941 44 L 88 44 A 4 4 0 0 1 92 48 L 92 60 A 4 4 0 0 1 88 64 L 83.1 64 A 36 36 0 0 1 12.9 64 L 8 64 A 4 4 0 0 1 4 60 L 4 48 A 4 4 0 0 1 8 44 L 14.059 44 A 36 36 0 0 1 46.5 20.031 Z M 28 38 L 68 38 A 10 10 0 0 1 78 48 L 78 54 A 10 10 0 0 1 68 64 L 54 64 A 2 2 0 0 0 52 66 A 2 2 0 0 1 50 68 L 28 68 A 10 10 0 0 1 18 58 L 18 48 A 10 10 0 0 1 28 38 Z M 32.4 44.98 L 32.6 42 L 35.4 42 L 35.6 44.98 A 7.2 7.2 0 0 1 37.832 45.905 L 40.081 43.939 L 42.061 45.919 L 40.095 48.168 A 7.2 7.2 0 0 1 41.02 50.4 L 44 50.6 L 44 53.4 L 41.02 53.6 A 7.2 7.2 0 0 1 40.095 55.832 L 42.061 58.081 L 40.081 60.061 L 37.832 58.095 A 7.2 7.2 0 0 1 35.6 59.02 L 35.4 62 L 32.6 62 L 32.4 59.02 A 7.2 7.2 0 0 1 30.168 58.095 L 27.919 60.061 L 25.939 58.081 L 27.905 55.832 A 7.2 7.2 0 0 1 26.98 53.6 L 24 53.4 L 24 50.6 L 26.98 50.4 A 7.2 7.2 0 0 1 27.905 48.168 L 25.939 45.919 L 27.919 43.939 L 30.168 45.905 A 7.2 7.2 0 0 1 32.4 44.98 Z M 30.4 52 A 3.6 3.6 0 1 0 37.6 52 A 3.6 3.6 0 1 0 30.4 52 Z M 57 52 A 5 5 0 1 1 67 52 A 5 5 0 1 1 57 52 Z"/></svg>
     <h1>Connect to Server</h1>
     <p class="subtitle">Enter the URL of your OtoDock server to get started.</p>
 
@@ -202,7 +238,7 @@
     <div id="installs-picker" class="installs-picker">
       <div class="picker-label">Switch to another installation</div>
       <div id="installs-list"></div>
-      <div class="picker-or">or enter a server URL</div>
+      <div class="picker-or">Or enter a server URL</div>
     </div>
 
     <div class="input-group">
@@ -364,7 +400,7 @@
     if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'https://' + url;
 
     // Show loading state
-    showMsg('Validating server...', 'info');
+    showMsg('Checking the server…', 'info');
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>Connecting...';
 
@@ -372,7 +408,7 @@
     try {
       Android.addInstallation(url);
     } catch (e) {
-      showMsg('Native interface unavailable. Are you running in the app?', 'error');
+      showMsg('This page works only inside the OtoDock app.', 'error');
       resetBtn();
     }
   }

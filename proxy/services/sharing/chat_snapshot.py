@@ -24,13 +24,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import config
+from core import layout
 from core.events import artifact_events
 from services.infra import safe_fs
-from services.infra.path_confinement import PathOutsideRoot, join_under
 from services.infra.agent_dirs import agent_dirs
+from services.infra.path_confinement import PathOutsideRoot, join_under
 from storage import database as task_store
 from ws import wire_events as wire
-from core import layout
 
 logger = logging.getLogger("otodock.shares")
 
@@ -118,7 +118,7 @@ class _Copier:
         info = task_store.get_media_token(token)
         if not info:
             return False
-        from api.media.media import MediaUnserveable, locate_media_row
+        from services.media.media_pipeline import MediaUnserveable, locate_media_row
         try:
             root, src_rel = locate_media_row(info)
         except MediaUnserveable:
@@ -132,8 +132,8 @@ class _Copier:
                 root, src_rel, config.AGENTS_DIR, f"{self.root_rel}/{rel}",
                 max_size=MAX_SNAPSHOT_BYTES - self.total, mkdirs=True,
             )
-        except safe_fs.FileTooLarge:
-            raise SnapshotTooLarge()
+        except safe_fs.FileTooLarge as err:
+            raise SnapshotTooLarge() from err
         except OSError as exc:
             logger.warning("share snapshot skipped media token %s: %s",
                            token[:8], type(exc).__name__)

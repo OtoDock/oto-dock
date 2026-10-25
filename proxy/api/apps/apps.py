@@ -9,7 +9,7 @@ serve only their owner, shared rows anyone assigned to the agent; denied
 is the SAME 404 as missing (no oracle).
 
 Actions: buttons in app JS call ``otodock.action(id, args)`` — declared ids
-only, validated against the user-approved manifest (api/apps/manifest.py).
+only, validated against the user-approved manifest (services/apps/manifest.py).
 fire_task and mcp_tool execute HERE; send_prompt rides the chat WS
 (ws/dashboard_chat.py) with the backchannel authority downgrades. Page args
 NEVER reach a prompt or a tool un-gated: fire_task substitutes them only
@@ -23,15 +23,13 @@ import asyncio
 import html as html_escape
 import logging
 import time
-from typing import Any
+from typing import Any, cast
 
+import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from core import placement
-from api.apps import manifest as _mf
-from auth import roles
 from api.media.ui import (
     _placeholder,
     _ui_response,
@@ -40,6 +38,7 @@ from api.media.ui import (
     request_origin,
     wrap_fragment,
 )
+from auth import roles
 from auth.providers import (
     UserContext,
     get_current_user,
@@ -47,9 +46,13 @@ from auth.providers import (
     require_auth,
     require_human,
 )
-from storage import database as task_store
-from storage import db_apps
-from ws import wire_events as wire
+from core import placement
+from core.session.visibility import VisibilityUnavailable
+from services.apps import manifest as _mf
+from services.apps.audience import announce_deploy, app_access
+from services.apps.manifest import _manifest_target_error
+from services.apps.releases import _deploy_lock
+from storage import database as task_store, db_apps
 
 logger = logging.getLogger("otodock.apps")
 router = APIRouter()
@@ -410,72 +413,6 @@ def _check_fire_rate(app_id: str, action_id: str, sub: str,
             _fire_rate.pop(k, None)
 
 
-def _manifest_target_error(row: dict, u: UserContext) -> str:
-    """Why ``u`` may not approve the row's manifest as it stands: an MCP
-    the agent lacks, a task target that is gone or one they may not run.
-    Empty when every target holds. Sync — call off the loop."""
-    available_mcps: dict[str, str] | None = None
-    for a in _mf.parse_actions(row):
-        if a.get("type") == "mcp_tool":
-            if available_mcps is None:
-                available_mcps = _mf.assigned_mcp_keys(row["agent"])
-            if available_mcps.get(a.get("mcp") or "") != a.get("mcp"):
-                return f"action {a.get('id')!r}: its MCP is not available on this agent"
-            continue
-        if a.get("type") != "fire_task":
-            continue
-        err = _mf.check_task_target(
-            a.get("task_id") or "", row["agent"], shared=not row.get("username"),
-        )
-        if err:
-            return err
-        dyn = task_store.get_dynamic_task(a.get("task_id") or "")
-        if not _mf.user_can_run_task(u, dyn or {}):
-            return f"action {a.get('id')!r}: you lack run authority for its task"
-    return ""
-
-
-def app_access(row: dict, user: UserContext) -> bool:
-    """May ``user`` see/serve this app? Personal rows → owner only; shared
-    rows → anyone assigned to the agent; a live internal share grants
-    either (SHARING.md); admin always. A chat- or project-scoped pin is
-    additionally reachable only from its scope (``_scope_access``), grant or
-    not. Reads the DB for scoped rows and for non-member callers — call it
-    off the loop (``_visible_row``)."""
-    # A session acts on the agent it was minted for and never across one,
-    # whoever drives it (the app API's agent basis keeps the same rule): its
-    # bearer resolves to its user, who may belong to other agents too.
-    if user.is_session and (row.get("agent") or "") != (user.agent or ""):
-        return False
-    if user.is_admin:
-        return True
-    # A personal app whose owner lost the agent is dormant (APPS.md
-    # "Lifecycle"): to the owner, a grantee and the render alike it is gone.
-    if db_apps.personal_row_dormant(row):
-        return False
-    # The platform's own headless render sees the one app it was minted for
-    # (auth/render_principal.py), whatever the row's scope.
-    if user.render_app and user.render_app == row.get("id"):
-        return True
-    if row.get("username"):
-        direct = (row.get("owner_sub") or "") == user.sub
-    else:
-        direct = user.can_access_agent(row.get("agent") or "")
-    if not direct and not _granted(row, user):
-        return False
-    return _scope_access(row, user)
-
-
-def _granted(row: dict, user: UserContext) -> bool:
-    """A live share admits the viewer: their own person share, or an agent
-    or department placement on an agent they hold (SHARING.md)."""
-    from storage.sharing import share_store
-    app_id = row.get("id") or ""
-    if share_store.internal_grant("app", app_id, user.sub) is not None:
-        return True
-    return bool(share_store.placements_for_user(app_id, user.sub, list(user.agents)))
-
-
 def _viewer_share(row: dict, user: UserContext) -> tuple[dict | None, dict | None]:
     """How a share reaches this viewer, for the page's words: their person
     share (``granted``), and the placement with the agent it sits in for
@@ -502,33 +439,16 @@ def _viewer_share(row: dict, user: UserContext) -> tuple[dict | None, dict | Non
                   key=lambda p: p["kind"] != share_store.AGENT) if own else []
     placement = None
     if own and not team:
-        placement = {"kind": grant["grantee_kind"], "share_id": grant["id"],
+        granted = cast("dict", grant)  # own is set only from a grant
+        placement = {"kind": granted["grantee_kind"], "share_id": granted["id"],
                      "agent": own, "from_agent": row.get("agent") or "",
-                     "role_cap": grant["role_cap"], "shared_by": grant.get("created_by") or ""}
+                     "role_cap": granted["role_cap"], "shared_by": granted.get("created_by") or ""}
     elif team or placed:
         p = team[0] if team else placed[0]
         placement = {"kind": p["kind"], "share_id": p["share_id"],
                      "agent": p["agent"], "from_agent": row.get("agent") or "",
                      "role_cap": p["role_cap"], "shared_by": p.get("shared_by") or ""}
     return grant, placement
-
-
-def _scope_access(row: dict, user: UserContext) -> bool:
-    """A Dock pin follows its chat's access rule: the chat itself, or for a
-    project pin any lane of the project the viewer may open. Without this a
-    dashboard pinned in a private chat would serve to any member holding
-    its id (the Dock route checked the anchor chat; the app routes did
-    not)."""
-    chat_id = row.get("scope_chat_id") or ""
-    project_id = row.get("scope_project_id") or ""
-    if not chat_id and not project_id:
-        return True
-    from api.agents.chats import can_access_chat
-    if chat_id:
-        chat = task_store.get_chat(chat_id)
-        return bool(chat) and can_access_chat(user, chat)
-    return any(can_access_chat(user, c)
-               for c in task_store.list_chats_by_project(project_id))
 
 
 def _visible_row(app_id: str, user: UserContext) -> dict | None:
@@ -565,7 +485,7 @@ def _can_manage(row: dict, user: UserContext) -> bool:
     return _can_approve_surface(row, user)
 
 
-def _app_document(row: dict, user: UserContext, preview: bool) -> tuple[str, str]:
+def _app_document(row: dict, user: UserContext | None, preview: bool) -> tuple[str, str]:
     """``(kind, content)`` for the serve route: the release copy (verified
     against its hash) unless the row has none, or the owner or an editor
     asked for a preview of the working file; ``missing`` when the working
@@ -575,7 +495,7 @@ def _app_document(row: dict, user: UserContext, preview: bool) -> tuple[str, str
     matches. Sync."""
     from services.apps import releases
     from services.infra import safe_fs
-    if row.get("release_path") and not (preview and _can_approve_surface(row, user)):
+    if row.get("release_path") and not (preview and _can_approve_surface(row, cast("UserContext", user))):
         try:
             data = releases.read_release(row)
         except releases.ReleaseDamaged:
@@ -655,15 +575,6 @@ async def serve_app(
 
 
 # ── Releases (APPS.md "Releases and rollback") ────────────────────────
-# One lock per row: a deploy is a copy plus one UPDATE of the pointer; two
-# pins of the same app a moment apart must not interleave them.
-_deploy_locks: dict[str, asyncio.Lock] = {}
-
-
-def _deploy_lock(app_id: str) -> asyncio.Lock:
-    return _deploy_locks.setdefault(app_id, asyncio.Lock())
-
-
 async def cut_and_point(row: dict, source) -> dict:
     """Copy the working file into the next release and point the row at it;
     returns the fresh row."""
@@ -672,26 +583,9 @@ async def cut_and_point(row: dict, source) -> dict:
         try:
             rel, sha = await asyncio.to_thread(releases.cut_release, row, source)
         except releases.ReleaseInvalid as e:
-            raise HTTPException(status_code=400, detail=f"{e.reason}: pin it again with html")
+            raise HTTPException(status_code=400, detail=f"{e.reason}: pin it again with html") from e
         fresh = await asyncio.to_thread(task_store.set_app_release, row["id"], rel, sha)
     return fresh or row
-
-
-async def announce_deploy(row: dict, release: int, *, file_updated: bool = True) -> int:
-    """Tell every screen that may see the row that a new release serves:
-    ``app_deployed`` on the live queue (the frame reloads once its row
-    carries this manifest signature) and, for dashboards built before the
-    frame existed, the working file's ``file_updated``."""
-    from services.apps.audience import app_audience
-    from services.notifications import notification_manager
-    if file_updated:
-        await notification_manager.broadcast_file_updated(
-            row["agent"], row["rel_path"], source="disk",
-        )
-    frame = {"type": wire.APP_DEPLOYED, "app_id": row["id"], "release": release,
-             "actions_sig": task_store.manifest_sig(row)}
-    subs = await asyncio.to_thread(app_audience, row)
-    return sum(notification_manager.push_live(sub, frame) for sub in subs)
 
 
 async def rollback_app_row(row: dict) -> dict:
@@ -705,7 +599,7 @@ async def rollback_app_row(row: dict) -> dict:
             try:
                 return await app_deploy.rollback_folder(row)
             except app_deploy.DeployError as e:
-                raise HTTPException(status_code=409, detail=str(e))
+                raise HTTPException(status_code=409, detail=str(e)) from e
     async with _deploy_lock(row["id"]):
         prev = await asyncio.to_thread(releases.previous_number, row)
         if prev is None:
@@ -713,7 +607,7 @@ async def rollback_app_row(row: dict) -> dict:
         rel, sha = await asyncio.to_thread(releases.point_to, row, prev)
         fresh = await asyncio.to_thread(task_store.set_app_release, row["id"], rel, sha) or row
     screens = await announce_deploy(fresh, prev)
-    logger.info(f"App rolled back: app={row.get('slug')}, release={prev}, screens={screens}")
+    logger.info("App rolled back: app=%s, release=%s, screens=%s", row.get('slug'), prev, screens)
     return {"release": prev, "screens": screens}
 
 
@@ -788,7 +682,7 @@ async def approve_deploy(
             row, u.sub, expect_sig=req.sig if req else None,
             expect_release=req.release if req else None)}
     except app_deploy.DeployError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
 
 @router.post("/v1/apps/{app_id}/deploy/reject")
@@ -806,7 +700,7 @@ async def reject_deploy(
     try:
         return await app_deploy.reject_pending(row)
     except app_deploy.DeployError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
 
 def shape_app_rows(rows: list[dict], u: UserContext) -> list[dict]:
@@ -1000,8 +894,8 @@ def _step_fields(row: dict) -> dict:
     out: dict = {}
     try:
         from services.apps import app_steps
+        from services.remote.remote_status import resolve_execution_target
         from storage import remote_store
-        from storage.remote_store import resolve_execution_target
         identity, _vis = app_steps.identity_for(row)
         target, _reason = resolve_execution_target(
             row.get("agent") or "", identity.creds_user_sub or None, identity.role)
@@ -1012,14 +906,14 @@ def _step_fields(row: dict) -> dict:
             machine = remote_store.get_remote_machine(machine_id) or {}
             out["step_target"] = {"kind": "machine",
                                   "name": machine.get("name") or target[:8]}
-    except Exception:
+    except (ImportError, psycopg.Error, VisibilityUnavailable):
         logger.debug("app %s: step placement lookup failed", row.get("slug"), exc_info=True)
     try:
         from storage.sharing import share_store
         out["has_live_link"] = any(
             s.get("scope") == "external" and share_store.is_live(s)
             for s in share_store.list_target_shares("app", row["id"]))
-    except Exception:
+    except (ImportError, psycopg.Error):
         logger.debug("app %s: share lookup failed", row.get("slug"), exc_info=True)
     return out
 
@@ -1042,7 +936,7 @@ def _requires_status(agent: str, requires: dict, u: UserContext,
     status: dict = {"mcps": [{"name": m, "assigned": bool(keys.get(m))} for m in mcps],
                     "providers": []}
     if providers:
-        from api.apps import catalog
+        from services.apps import catalog
         known = {p["provider"]: p for p in catalog.provider_status(agent, row, u)}
         for p in providers:
             hit = known.get(p) or {}
@@ -1236,7 +1130,7 @@ async def unhide_app_for_me(
 # ── The platform catalog (APPS.md "Platform catalog") ─────────────────
 
 
-def _catalog_entry(row: dict, u: UserContext, *, feed: str = "", method: str = "",
+def _catalog_entry(row: dict, u: UserContext | None, *, feed: str = "", method: str = "",
                    unattended: bool = False, role: str | None = None) -> dict:
     """The declared, approved entry the viewer clears the floor of; raises
     the refusal otherwise. ``unattended`` is the platform basis (a handler
@@ -1249,7 +1143,7 @@ def _catalog_entry(row: dict, u: UserContext, *, feed: str = "", method: str = "
         if method and a.get("type") == "platform" and a.get("method") == method:
             break
     else:
-        raise HTTPException(status_code=404, detail="not declared in this app's manifest")
+        raise HTTPException(status_code=404, detail="not declared by this app")
     if not task_store.app_actions_approved(row):
         raise HTTPException(status_code=409, detail="actions not approved")
     if not unattended and not _mf.meets_floor(a, role or _mf.caller_role(row, u)):
@@ -1265,7 +1159,7 @@ async def read_catalog_feed(
 ):
     """A feed's snapshot for this viewer, with the sequence deltas continue
     from. The two host-answered feeds are not served here."""
-    from api.apps import catalog
+    from services.apps import catalog
     u = require_auth(user)
     if feed not in catalog.FEEDS or feed in catalog.CLIENT_FEEDS:
         raise HTTPException(status_code=404, detail="unknown feed")
@@ -1299,7 +1193,7 @@ async def call_catalog_method(
 ):
     """One platform method as the viewer: ``{ok, result}`` or ``{ok: false,
     reason}``; four calls per second per (app, viewer)."""
-    from api.apps import catalog
+    from services.apps import catalog
     u = require_auth(user)
     if method not in catalog.METHODS:
         raise HTTPException(status_code=404, detail="unknown platform method")
@@ -1317,9 +1211,11 @@ async def call_catalog_method(
     _check_fire_rate(app_id, f"\x00platform:{method}", u.sub, interval=0.25)
 
     def _run() -> dict:
+        from api.agents import files as files_api
         try:
             return {"ok": True, "result": catalog.run_method(method, row.get("agent") or "", row, u, args,
-                                                              role=role)}
+                                                              role=role,
+                                                              path_gate=files_api.safe_agent_path)}
         except ValueError as e:
             return {"ok": False, "reason": str(e)}
         except PermissionError as e:
@@ -1344,6 +1240,7 @@ async def finish_platform_result(out: dict, user_sub: str) -> None:
     if written:
         agent, rel, host_path = written
         from pathlib import Path as _Path
+
         from api.media.uploads import _push_upload_to_active_remote_sessions
         from services.notifications import notification_manager
         await notification_manager.broadcast_file_updated(agent, rel, source="disk")
@@ -1403,7 +1300,7 @@ async def warm_app(
         try:
             await headless_exec.warm(row)
         except Exception:
-            logger.exception(f"app warm failed: app={row.get('slug')}")
+            logger.exception("app warm failed: app=%s", row.get('slug'))
 
     task = asyncio.get_running_loop().create_task(_build())
     _warm_tasks.add(task)
@@ -1500,6 +1397,6 @@ async def purge_app(
     if not _can_manage(row, u):
         raise HTTPException(status_code=403, detail="Not authorized to delete this app")
     if (req.confirm or "").strip().lower() != row["slug"]:
-        raise HTTPException(status_code=400, detail="Type the app's slug to confirm")
+        raise HTTPException(status_code=400, detail="Type the app's ID to confirm.")
     from services.apps import app_lifecycle
     return await app_lifecycle.purge(row)

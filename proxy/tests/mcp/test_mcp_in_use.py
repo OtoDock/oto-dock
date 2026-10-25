@@ -12,9 +12,9 @@ class _Manifest:
 
 
 def _patch_layers(monkeypatch, *, direct, cli_agents, codex_agents, agent_mcps):
-    import core.layers.direct.mcp as dm
     import core.layers.cli.session as cli_s
     import core.layers.codex.session as codex_s
+    import core.layers.direct.mcp as dm
 
     async def _direct():
         return set(direct)

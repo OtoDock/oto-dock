@@ -3,6 +3,8 @@ import type { FileNode } from '../api/agents'
 import { formatFileSize } from '../lib/fileTypes'
 import { encodePathSegments, toSandboxVirtualPath } from '../lib/paths'
 import FileIcon, { FolderIcon } from './workspace/FileIcon'
+import { useLongPress } from '../hooks/useLongPress'
+import { POPOVER } from './ui/classes'
 
 const INTERNAL_PATHS_MIME = 'application/x-otodock-paths'
 const INTERNAL_PATH_MIME = 'application/x-otodock-path'
@@ -67,15 +69,13 @@ function flattenVisible(nodes: FileNode[], expanded: Set<string>): string[] {
 function ChevronIcon({ open }: { open: boolean }) {
   return (
     <svg
-      className={`w-3.5 h-3.5 text-p-text-light transition-transform duration-150 ${open ? 'rotate-90' : ''}`}
+      className={`w-3.5 h-3.5 text-tertiary transition-transform duration-150 ${open ? 'rotate-90' : ''}`}
       fill="none" stroke="currentColor" viewBox="0 0 24 24"
     >
       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
     </svg>
   )
 }
-
-const LONG_PRESS_MS = 500
 
 // ---------------------------------------------------------------------------
 // Tree node
@@ -124,8 +124,9 @@ function TreeNode(props: TreeNodeProps) {
   // child elements bubble dragenter/dragleave to this handler.
   const [dragDepth, setDragDepth] = useState(0)
   const isDragHover = dragDepth > 0
-  const longPressTimer = useRef<number | null>(null)
-  const touchStart = useRef<{ x: number; y: number } | null>(null)
+  // Where the touch went down: a long press with no host handler opens the
+  // menu there.
+  const touchAt = useRef<{ x: number; y: number } | null>(null)
 
   const isDir = node.type === 'dir'
   const isExpanded = expanded.has(node.path)
@@ -144,42 +145,31 @@ function TreeNode(props: TreeNodeProps) {
     else setLegacyMenuOpen(true)
   }
 
+  // The platform's long press (hooks/useLongPress), which also swallows the
+  // click after the held touch and Android's contextmenu during the hold.
+  // Host-provided long-press wins (workspace overlay routes it to
+  // enter-selection-mode). Without it, fall back to opening the unified
+  // context menu at the touch coords.
+  const longPress = useLongPress(() => {
+    if (onLongPress) onLongPress(node)
+    else if (touchAt.current) openMenuAt({ clientX: touchAt.current.x, clientY: touchAt.current.y })
+  })
   const handleRowContextMenu = (e: React.MouseEvent) => {
     // Stop propagation so the FileTree wrapper's empty-space onContextMenu
     // never fires on a row click. The wrapper intentionally lacks a strict
     // target check so right-clicks in the empty area below the tree still
     // trigger the empty menu; that only works if row clicks don't bubble.
-    e.preventDefault()
     e.stopPropagation()
+    longPress.onContextMenu(e)
+    // A long press in progress or just done took it.
+    if (e.defaultPrevented) return
+    e.preventDefault()
     openMenuAt({ clientX: e.clientX, clientY: e.clientY })
-  }
-  const cancelLongPress = () => {
-    if (longPressTimer.current !== null) {
-      window.clearTimeout(longPressTimer.current)
-      longPressTimer.current = null
-    }
-    touchStart.current = null
   }
   const handleTouchStart = (e: React.TouchEvent) => {
     const t = e.touches[0]
-    if (!t) return
-    touchStart.current = { x: t.clientX, y: t.clientY }
-    longPressTimer.current = window.setTimeout(() => {
-      // Host-provided long-press wins (workspace overlay routes it to
-      // enter-selection-mode). Without it, fall back to opening the
-      // unified context menu at the touch coords.
-      if (onLongPress) onLongPress(node)
-      else openMenuAt({ clientX: t.clientX, clientY: t.clientY })
-      longPressTimer.current = null
-    }, LONG_PRESS_MS)
-  }
-  const handleTouchMove = (e: React.TouchEvent) => {
-    if (!touchStart.current) return
-    const t = e.touches[0]
-    if (!t) return
-    const dx = Math.abs(t.clientX - touchStart.current.x)
-    const dy = Math.abs(t.clientY - touchStart.current.y)
-    if (dx > 8 || dy > 8) cancelLongPress()
+    if (t) touchAt.current = { x: t.clientX, y: t.clientY }
+    longPress.onTouchStart(e)
   }
 
   // ---- Drag source ----
@@ -273,24 +263,26 @@ function TreeNode(props: TreeNodeProps) {
         onDrop={handleDrop}
         onContextMenu={handleRowContextMenu}
         onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={cancelLongPress}
-        onTouchCancel={cancelLongPress}
+        onTouchMove={longPress.onTouchMove}
+        onTouchEnd={longPress.onTouchEnd}
+        onTouchCancel={longPress.onTouchCancel}
+        onPointerDown={longPress.onPointerDown}
+        onClickCapture={longPress.onClickCapture}
         className={`group relative flex items-center h-[26px] cursor-pointer transition-colors duration-75
           ${isSelected
-            ? 'bg-brand/10 dark:bg-brand/20 text-brand'
+            ? 'bg-action-subtle text-link'
             : isDragHover
-              ? 'bg-brand/15 ring-1 ring-brand ring-inset'
+              ? 'bg-action-subtle ring-1 ring-focus-ring ring-inset'
               : isDirActive
-                ? 'bg-amber-50 dark:bg-amber-900/15 text-amber-700 dark:text-amber-400'
-                : 'text-p-text hover:bg-p-surface-hover dark:hover:bg-gray-800/60'
+                ? 'bg-action-subtle text-primary'
+                : 'text-primary hover:bg-surface-hover'
           } ${isCut ? 'opacity-50' : ''}`}
       >
         {/* Indent guides */}
         {Array.from({ length: depth }, (_, i) => (
           <span
             key={i}
-            className="absolute top-0 bottom-0 w-px bg-p-border-light/50 dark:bg-gray-700/50"
+            className="absolute top-0 bottom-0 w-px bg-border/50"
             style={{ left: `${i * 16 + 12}px` }}
           />
         ))}
@@ -325,18 +317,18 @@ function TreeNode(props: TreeNodeProps) {
           {isDir ? <FolderIcon open={isExpanded} /> : <FileIcon name={node.name} />}
 
           {/* Name */}
-          <span className={`text-[13px] truncate ${isDir ? 'font-medium' : ''}`}>
+          <span className={`text-sm truncate ${isDir ? 'font-medium' : ''}`}>
             {node.name}
           </span>
 
           {/* Auto-context indicator — every file under config/context/ */}
           {isAutoContext && (
-            <span className="w-1.5 h-1.5 rounded-full bg-brand shrink-0" title="Auto-loaded as context (config/context/)" />
+            <span className="w-1.5 h-1.5 rounded-full bg-action shrink-0" title="The agent reads this file in every chat, because it is in config/context/." />
           )}
 
           {/* File size (files only, on hover) */}
           {!isDir && node.size > 0 && (
-            <span className="hidden group-hover:inline ml-auto mr-1 text-[10px] text-p-text-light/60 shrink-0">
+            <span className="hidden group-hover:inline ml-auto mr-1 text-3xs text-tertiary shrink-0">
               {formatFileSize(node.size)}
             </span>
           )}
@@ -349,7 +341,7 @@ function TreeNode(props: TreeNodeProps) {
             const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
             openMenuAt({ clientX: rect.right, clientY: rect.bottom })
           }}
-          className="shrink-0 flex md:hidden md:group-hover:flex items-center px-1 h-full text-p-text-light hover:text-p-text-secondary"
+          className="shrink-0 flex md:hidden md:group-hover:flex items-center px-1 h-full text-tertiary hover:text-secondary"
           aria-label="More actions"
         >
           <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 16 16">
@@ -360,13 +352,13 @@ function TreeNode(props: TreeNodeProps) {
         {showLegacyMenu && legacyMenuOpen && (
           <>
             <div className="fixed inset-0 z-40" onClick={() => setLegacyMenuOpen(false)} />
-            <div className="absolute right-0 top-6 z-50 w-48 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-p-border-light py-1">
+            <div className={`${POPOVER} absolute right-0 top-6 z-50 w-48 py-1`}>
               {!isDir && agentName && (
                 <a
                   href={`/v1/agents/${encodeURIComponent(agentName)}/files/${encodePathSegments(node.path)}?download=true&fn=${encodeURIComponent(node.name)}`}
                   download={node.name}
                   onClick={() => setLegacyMenuOpen(false)}
-                  className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-p-text-secondary hover:bg-p-surface-hover"
+                  className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-secondary hover:bg-surface-hover"
                 >
                   <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
@@ -381,7 +373,7 @@ function TreeNode(props: TreeNodeProps) {
                     setLegacyMenuOpen(false)
                     onDelete!(node.path, node.type as 'file' | 'dir')
                   }}
-                  className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20"
+                  className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-status-danger-fg hover:bg-status-danger-bg"
                 >
                   <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 16 16">
                     <path fillRule="evenodd" d="M5 3.25V4H2.75a.75.75 0 000 1.5h.3l.815 8.15A1.5 1.5 0 005.357 15h5.285a1.5 1.5 0 001.493-1.35l.815-8.15h.3a.75.75 0 000-1.5H11v-.75A2.25 2.25 0 008.75 1h-1.5A2.25 2.25 0 005 3.25zm2.25-.75a.75.75 0 00-.75.75V4h3v-.75a.75.75 0 00-.75-.75h-1.5z" clipRule="evenodd" />
@@ -475,7 +467,7 @@ export default function FileTree({
 
   if (nodes.length === 0) {
     return (
-      <div className="text-xs text-p-text-light px-3 py-2">Empty folder.</div>
+      <div className="text-xs text-tertiary px-3 py-2">Empty folder.</div>
     )
   }
 

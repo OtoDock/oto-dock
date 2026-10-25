@@ -26,8 +26,8 @@ export const MODE_LABEL: Record<DepartmentMode, string> = {
 export const MODE_HINT: Record<DepartmentMode, string> = {
   off: 'No automatic delegation.',
   down: 'Each level delegates to the level below it. Nothing goes up or across.',
-  down_across: 'Each level delegates to the level below it, and agents on the same level delegate to each other.',
-  both: 'Each level delegates up and down, and agents on the same level delegate to each other.',
+  down_across: 'Each level delegates to the level below it. Agents on the same level also delegate to each other.',
+  both: 'Each level delegates up and down. Agents on the same level also delegate to each other.',
 }
 
 /** The lower-case words for summary lines. */

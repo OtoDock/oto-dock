@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 
 
 @dataclass(frozen=True)
@@ -50,7 +50,7 @@ class Engine:
         return _resolve(self.pty)
 
 
-@lru_cache(maxsize=None)
+@cache
 def _module(dotted: str):
     return importlib.import_module(dotted, package=__package__)
 

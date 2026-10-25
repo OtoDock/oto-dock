@@ -210,6 +210,11 @@ def init_identity(conn) -> None:
             display_email TEXT NOT NULL DEFAULT '',
             is_default BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TEXT NOT NULL,
+            -- What the vendor knows about the account beyond its identity
+            -- (JSON; '' = nothing): a GitHub-App account keeps the person's
+            -- GitHub id and the installations they can reach
+            -- (storage/identity/oauth_app_kinds.py).
+            meta TEXT NOT NULL DEFAULT '',
             UNIQUE(user_sub, mcp_name, account_label),
             FOREIGN KEY (user_sub) REFERENCES users(sub) ON DELETE CASCADE
         )
@@ -232,6 +237,11 @@ def init_identity(conn) -> None:
             agent_name TEXT NOT NULL,
             account_label TEXT NOT NULL,
             set_at TEXT NOT NULL,
+            -- The person's own GitHub reach for this agent, the service
+            -- binding's shape: a JSON list of owner/name ('[]' = every
+            -- repository the account reaches) and whether it may only read.
+            repositories TEXT NOT NULL DEFAULT '[]',
+            read_only BOOLEAN NOT NULL DEFAULT FALSE,
             UNIQUE(user_sub, mcp_name, agent_name),
             FOREIGN KEY (user_sub) REFERENCES users(sub) ON DELETE CASCADE
         )
@@ -287,6 +297,15 @@ def init_identity(conn) -> None:
             account_owner_sub TEXT NOT NULL DEFAULT '',
             set_by TEXT NOT NULL DEFAULT '',
             set_at TEXT NOT NULL,
+            -- A GitHub App installation of the bound account as the agent's
+            -- identity ('' = the account itself): the agent then gets the
+            -- installation's own token, which reaches its repositories only.
+            installation_id TEXT NOT NULL DEFAULT '',
+            -- The agent's GitHub reach: the repositories it may reach (a JSON
+            -- list of owner/name, '[]' = every one the identity reaches) and
+            -- whether it may only read.
+            repositories TEXT NOT NULL DEFAULT '[]',
+            read_only BOOLEAN NOT NULL DEFAULT FALSE,
             UNIQUE(mcp_name, agent_name)
         )
     """)

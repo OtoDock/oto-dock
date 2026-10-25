@@ -31,8 +31,9 @@ from typing import Any, Literal
 
 import httpx
 from mcp.server import Server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
 
+from _tool_args import ToolArgs
 
 # ---------------------------------------------------------------------------
 # Env + permission matrix
@@ -110,7 +111,7 @@ async def _request(
                 try:
                     js = resp.json()
                     detail = js.get("detail") or js
-                except Exception:
+                except (ValueError, AttributeError):
                     pass
                 raise _ApiError(
                     f"{method} {path} → {resp.status_code}: {detail}", status=resp.status_code,
@@ -195,10 +196,71 @@ async def _tool_list_building_blocks() -> str:
                 f"| `{ex.get('name', '')}` | {', '.join(ex.get('sections') or [])} | {desc} |",
             )
 
+    lines.extend(await _engine_lines())
+
     taken = data.get("agent_slugs", [])
     if taken:
         lines.append(f"\n# Slugs already taken\n{', '.join(f'`{s}`' for s in taken)}")
     return "\n".join(lines)
+
+
+# The engine descriptor's role an install may make an agent's engine; a
+# supporting engine is only ever enabled by hand.
+_CODING_ROLE = "coding"
+
+
+async def _engine_lines() -> list[str]:
+    """The engines and models a template task's pin may name, as THIS
+    install has them (``GET /v1/execution-layers``: the shared pool's
+    models, never one person's own accounts)."""
+    lines = ["\n# Engines a task pin may name"]
+    try:
+        layers = await _request("GET", "/v1/execution-layers")
+    except _ApiError as exc:
+        lines.append(f"_The engines could not be read ({exc}); write the tasks without a pin._")
+        return lines
+    engines = {k: v for k, v in layers.items() if isinstance(v, dict)} if isinstance(layers, dict) else {}
+    if not engines:
+        lines.append("_No engine on this install._")
+        return lines
+
+    def _identity(layer: dict) -> dict:
+        identity = layer.get("identity")
+        return identity if isinstance(identity, dict) else {}
+
+    def _order(item: tuple[str, dict]) -> tuple[bool, int, str]:
+        identity = _identity(item[1])
+        order = identity.get("sort_order")
+        return identity.get("role") != _CODING_ROLE, order if isinstance(order, int) else 0, item[0]
+
+    lines.append(
+        "These are this install's engines and models; another install has its own. "
+        "A task in `tasks.json` may pin `layer` (an engine id) and `override_model` "
+        "(a model id). An install enables ONE engine on the new agent: the first "
+        "engine below that can be the agent's engine and that both the platform and "
+        "the installing person have connected, else the platform's default engine. "
+        "A pin holds only when `layer`, if set, names that engine and "
+        "`override_model`, if set, is one of its models; any other pin is dropped at install "
+        "and on every update, and the task runs on the agent's default. Leave a "
+        "task unpinned unless it truly needs another model.\n"
+    )
+    lines.append("| engine | can be the agent's engine | connected here | models |")
+    lines.append("|---|---|---|---|")
+    for path, layer in sorted(engines.items(), key=_order):
+        identity = _identity(layer)
+        pickable = "yes" if identity.get("role") == _CODING_ROLE else "no — enabled by hand only"
+        models = []
+        for m in layer.get("models") or []:
+            model_id = m.get("value") if isinstance(m, dict) else ""
+            if not model_id:
+                continue  # the "System Default" entry: no id to pin
+            tier = m.get("tier_label") or ""
+            models.append(f"`{model_id}`" + (f" ({tier})" if tier else ""))
+        lines.append(
+            f"| `{path}` | {pickable} | {'yes' if layer.get('configured') else 'no'} | "
+            f"{', '.join(models) or '—'} |",
+        )
+    return lines
 
 
 def _format_plan(result: dict) -> list[str]:
@@ -346,6 +408,12 @@ async def _tool_create_agent(path: str, target_slug: str) -> str:
         f"{result.get('seeded_dashboards', 0)} dashboard(s)",
     ]
     lines.append(f"\n**Seeded**: {', '.join(seeded)}")
+    dropped = result.get("task_pins_dropped") or []
+    if dropped:
+        lines.append(
+            "\n⚠️ **Task pins the new agent cannot run** (those tasks run on its "
+            "default model and engine): " + "; ".join(str(d) for d in dropped),
+        )
     if result.get("seeded_dashboards"):
         lines.append(
             "Seeded dashboards are pinned already (display-only — no "
@@ -400,12 +468,14 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "list_building_blocks": {
         "description": (
             "List the MCPs and skill packages a new agent can be given, the "
-            "check examples a template's checks/ folder can start from, plus "
-            "the agent slugs already taken. Call this BEFORE writing "
-            "`mcps.json` — MCP names are canonical platform names and are not "
-            "always guessable."
+            "check examples a template's checks/ folder can start from, the "
+            "engines and models a scheduled task's pin may name, plus the "
+            "agent slugs already taken. Every list is this install's. Call "
+            "this BEFORE writing `mcps.json` — MCP names are canonical "
+            "platform names and are not always guessable."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     "validate_agent_template": {
         "description": (
@@ -430,6 +500,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["path"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     "create_agent": {
         "description": (
@@ -459,6 +530,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["path"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
     },
 }
 
@@ -479,19 +551,24 @@ _TOOL_HANDLERS = {
 # ---------------------------------------------------------------------------
 
 server = Server("agent-creator-mcp")
+TOOL_ARGS = ToolArgs()
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
-        Tool(name=name, description=schema["description"], inputSchema=schema["inputSchema"])
+    return TOOL_ARGS.listed([
+        Tool(name=name, description=schema["description"], inputSchema=schema["inputSchema"],
+             annotations=ToolAnnotations(**schema["annotations"]))
         for name, schema in _TOOL_SCHEMAS.items()
         if name in ENABLED_TOOLS
-    ]
+    ])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     if name not in ENABLED_TOOLS:
         return [TextContent(type="text", text=f"❌ Error: tool '{name}' not available in this session")]
     handler = _TOOL_HANDLERS.get(name)
@@ -501,7 +578,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         result = await handler(arguments or {})
     except _ApiError as exc:
         return [TextContent(type="text", text=f"❌ Error: {exc}")]
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"❌ Error: {type(exc).__name__}: {exc}")]
     return [TextContent(type="text", text=str(result))]
 

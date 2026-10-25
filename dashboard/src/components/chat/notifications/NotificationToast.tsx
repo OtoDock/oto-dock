@@ -3,6 +3,8 @@ import type { ToastItem } from '../../../hooks/useNotifications'
 import type { AgentSummary } from '../../../api/agents'
 import NotificationBody from './NotificationBody'
 import NotificationAgentHeader from './NotificationAgentHeader'
+import { ToastPortal } from '../../ui/Toast'
+import { TOAST } from '../../ui/classes'
 
 interface Props {
   toasts: ToastItem[]
@@ -13,18 +15,28 @@ interface Props {
   onNavigate?: (agentSlug: string, chatId: string, href?: string) => void
 }
 
+// A toast is an overlay card; its severity is the edge (the solid) and the
+// title (the foreground), never a tinted fill.
 const SEVERITY_STYLES: Record<string, string> = {
-  info: 'border-l-brand bg-brand-surface/80',
-  success: 'border-l-p-accent-teal bg-p-accent-teal/5',
-  warning: 'border-l-p-accent-yellow bg-p-accent-yellow/5',
-  danger: 'border-l-p-accent-red bg-p-accent-red/5',
+  info: 'border-l-status-info-solid',
+  success: 'border-l-status-success-solid',
+  warning: 'border-l-status-warning-solid',
+  danger: 'border-l-status-danger-solid',
+}
+
+// What a screen reader does with a card: a warning or a danger interrupts.
+const SEVERITY_ROLE: Record<string, 'status' | 'alert'> = {
+  info: 'status',
+  success: 'status',
+  warning: 'alert',
+  danger: 'alert',
 }
 
 const SEVERITY_TITLE_COLOR: Record<string, string> = {
-  info: 'text-brand',
-  success: 'text-p-accent-teal',
-  warning: 'text-[#b8860b]',
-  danger: 'text-p-accent-red',
+  info: 'text-status-info-fg',
+  success: 'text-status-success-fg',
+  warning: 'text-status-warning-fg',
+  danger: 'text-status-danger-fg',
 }
 
 function ToastCard({ toast, agents, onDismiss, onStopAlarm, onNavigate }: { toast: ToastItem; agents?: AgentSummary[]; onDismiss: (id: string) => void; onStopAlarm?: () => void; onNavigate?: (agentSlug: string, chatId: string, href?: string) => void }) {
@@ -52,8 +64,9 @@ function ToastCard({ toast, agents, onDismiss, onStopAlarm, onNavigate }: { toas
 
   return (
     <div
-      className={`w-full rounded-lg shadow-lg border border-p-border-light/50 border-l-[4px] backdrop-blur-xs
-                  transition-all duration-200 ease-out
+      role={SEVERITY_ROLE[delivery.severity] ?? 'status'}
+      className={`w-full ${TOAST} border-l-4
+                  transition-all duration-base ease-enter
                   ${SEVERITY_STYLES[delivery.severity] || SEVERITY_STYLES.info}
                   ${visible ? 'translate-x-0 opacity-100' : 'translate-x-full opacity-0'}
                   ${delivery.severity === 'danger' ? 'animate-pulse' : ''}
@@ -65,14 +78,16 @@ function ToastCard({ toast, agents, onDismiss, onStopAlarm, onNavigate }: { toas
           <div className="mb-0.5">
             <NotificationAgentHeader agentSlug={delivery.agent_slug} agents={agents} />
           </div>
-          <p className={`text-sm font-semibold ${SEVERITY_TITLE_COLOR[delivery.severity] || 'text-p-text'}`}>
+          <p className={`text-sm font-semibold ${SEVERITY_TITLE_COLOR[delivery.severity] || 'text-primary'}`}>
             {delivery.title}
           </p>
           <NotificationBody body={delivery.body} clampClass="line-clamp-3" />
         </div>
         <button
+          type="button"
+          aria-label="Dismiss"
           onClick={(e) => { e.stopPropagation(); handleDismiss() }}
-          className="shrink-0 w-5 h-5 flex items-center justify-center text-p-text-light hover:text-p-text transition-colors"
+          className="shrink-0 w-5 h-5 flex items-center justify-center text-tertiary hover:text-primary transition-colors"
         >
           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -83,11 +98,12 @@ function ToastCard({ toast, agents, onDismiss, onStopAlarm, onNavigate }: { toas
   )
 }
 
+/** The cards, rendered into the page's one toast region (`ui/Toast.tsx`). */
 export default function NotificationToast({ toasts, agents, onDismiss, onStopAlarm, onNavigate }: Props) {
   if (toasts.length === 0) return null
 
   return (
-    <div className="fixed top-14 right-3 left-3 sm:left-auto sm:right-4 sm:w-80 z-50 flex flex-col gap-2">
+    <ToastPortal>
       {toasts.map(toast => (
         <ToastCard
           key={toast.id}
@@ -98,6 +114,6 @@ export default function NotificationToast({ toasts, agents, onDismiss, onStopAla
           onNavigate={onNavigate}
         />
       ))}
-    </div>
+    </ToastPortal>
   )
 }

@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { useSpeechSession } from '@/hooks/useSpeechSession'
-import { currentSttLanguage, STT_MENU_OPTIONS } from '@/components/chat/SttLanguageMenu'
+
 import { AUTO_LANGUAGE, isAutoLanguage } from '@/audio/lang'
 import type { STTSession } from '@/audio/types'
+import { currentSttLanguage, STT_MENU_OPTIONS } from '@/lib/chat/sttLanguages'
 
 // ─── The Automatic dictation language ───────────────────────────────────────
 // Stored as "auto": the platform engine gets it and identifies the language;
@@ -21,6 +22,8 @@ vi.mock('@/api/userAudio', () => ({
 }))
 vi.mock('@/audio/backends/platformStt', () => ({
   platformStt: { kind: 'platform', isAvailable: () => false, create: () => { throw new Error('unused') } },
+  STOP_FINAL_WAIT_MS: 10000,
+  STOP_BACKLOG_MAX_MS: 20000,
 }))
 
 function fakeSession(): STTSession {

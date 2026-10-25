@@ -43,7 +43,6 @@ interface Props {
   preWarmedRef: RefObject<string | null>
   preWarmPath: string
   layers: Record<string, LayerCapabilities> | undefined
-  agentLayerModels: LayerCapabilities['models']
   engineSwitchBusy: boolean
   engineSwitchError: string | null
   handleEngineSwitchConfirm: () => void
@@ -54,7 +53,7 @@ export default function ChatBanners({
   sessionExecutionTarget, sessionFallbackReason, offlineMachineName, zeroAccessible,
   chatId, pendingEngineSwitch, targetMismatch, phoneCallActive, viewedStreaming, warming, ws, agentName,
   mode, model, chatActiveLayer, selectedLayer, interactive, preWarmedRef, preWarmPath,
-  layers, agentLayerModels, engineSwitchBusy, engineSwitchError,
+  layers, engineSwitchBusy, engineSwitchError,
   handleEngineSwitchConfirm, handleEngineSwitchCancel,
 }: Props) {
   return (
@@ -72,7 +71,7 @@ export default function ChatBanners({
         <div
           role="status"
           data-testid="phone-call-notice"
-          className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-sm border border-sky-300/40 bg-sky-50/40 text-sky-900 dark:bg-sky-500/10 dark:text-sky-200"
+          className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-card border border-status-info-border bg-status-info-bg text-status-info-fg"
         >
           This chat is on a phone call. It picks up here when the call ends.
         </div>
@@ -82,12 +81,12 @@ export default function ChatBanners({
         <div
           role="status"
           data-testid="no-engine-access-notice"
-          className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-sm border border-amber-300/40 bg-amber-50/40 text-amber-900 dark:bg-amber-500/10 dark:text-amber-200"
+          className="w-full px-3 py-2 mx-auto max-w-4xl text-xs rounded-card border border-status-warning-border bg-status-warning-bg text-status-warning-fg"
         >
-          You can't run any of this agent's AI engines —{' '}
+          You can't run any of this agent's AI engines.{' '}
           <Link to="/user-settings?tab=ai-engines" className="underline hover:no-underline">
-            connect one in your AI-engine settings
-          </Link>{' '}
+            Connect one in User Settings, AI Engines
+          </Link>{', '}
           or ask an admin.
         </div>
       )}
@@ -135,10 +134,7 @@ export default function ChatBanners({
           layer: pendingEngineSwitch.layer,
           model: pendingEngineSwitch.model,
           layerLabel: layers?.[pendingEngineSwitch.layer]?.display_name || pendingEngineSwitch.layer,
-          modelLabel: agentLayerModels.find(m => m.value === pendingEngineSwitch.model)?.label
-            || pendingEngineSwitch.model,
         } : null}
-        fromLabel={(chatActiveLayer && layers?.[chatActiveLayer]?.display_name) || chatActiveLayer || ''}
         busy={engineSwitchBusy}
         error={engineSwitchError}
         onConfirm={handleEngineSwitchConfirm}

@@ -28,16 +28,24 @@ import pytest
 from fastapi.testclient import TestClient
 
 import config
-from api.apps import app_proxy
-from api.apps import apps as apps_api
-from api.apps import manifest as _mf
+from api.apps import app_proxy, apps as apps_api
 from app import app
 from auth import rate_limiter
 from auth.providers import UserContext, get_current_user
-from services.apps import app_deploy, app_handlers, app_inbound, app_lint, app_supervisor, app_tokens
-from storage import database as task_store
-from storage import db_app_deliveries as deliveries
-from storage import db_app_secrets
+from services.apps import (
+    app_deploy,
+    app_handlers,
+    app_inbound,
+    app_lint,
+    app_supervisor,
+    app_tokens,
+    manifest as _mf,
+)
+from storage import (
+    database as task_store,
+    db_app_deliveries as deliveries,
+    db_app_secrets,
+)
 
 client = TestClient(app)
 
@@ -145,7 +153,7 @@ def _post(row: dict, name: str, body: bytes, headers: dict[str, str]):
 
 def test_the_inbound_block_is_validated_signed_and_carried(agent_tree):
     base = {"title": "Shop", "secrets": SECRETS, "handlers": {"on_trigger": ["gh-trigger"]}}
-    v = lambda doc: app_deploy.validate_app_json({**base, **doc}, AGENT, False)  # noqa: E731
+    v = lambda doc: app_deploy.validate_app_json({**base, **doc}, AGENT, False)
     m = v({"inbound": INBOUND})
     got = json.loads(m.inbound_json)
     assert got["stripe"] == {"verify": "stripe", "secret": "STRIPE_WEBHOOK_SECRET", "handler": "payment"}
@@ -296,6 +304,7 @@ def test_garbage_ids_never_arm_the_per_address_bucket(agent_tree, monkeypatch):
     (no TRUSTED_PROXY behind an edge) never arms the per-address bucket, so a
     burst of garbage never refuses a vendor's signed event."""
     from fastapi.testclient import TestClient as _TC
+
     from auth import lan_check
     row = _row(inbound=INBOUND, secrets=SECRETS)
     body = json.dumps({"id": "evt_after_burst", "type": "checkout.session.completed"}).encode()
@@ -331,6 +340,7 @@ def test_an_untrusted_forwarder_is_one_client_for_the_per_address_bucket(agent_t
     """f8: a private peer that is not a trusted proxy counts under its own
     address whatever forwarding header it sends."""
     from fastapi.testclient import TestClient as _TC
+
     from auth import lan_check
     row = _row(inbound=INBOUND, secrets=SECRETS)
     monkeypatch.setitem(config.RATE_LIMIT_RULES, "app_inbound_ip",
@@ -355,6 +365,7 @@ def test_wrong_signatures_meet_the_hooks_failure_bucket(agent_tree, monkeypatch)
     refusal that tested no secret, another hook, another app and another
     client's own key never count."""
     from fastapi.testclient import TestClient as _TC
+
     from auth import lan_check
     row = _row(inbound=INBOUND, secrets=SECRETS)
     other = _row("other", inbound=INBOUND, secrets=SECRETS)
@@ -478,7 +489,7 @@ def test_an_inbound_wake_is_server_only_and_the_app_tells_its_people_itself(agen
     async def fake_ensure_up(r, name="live"):
         return inst
 
-    with patch("api.apps.app_proxy.forward", fake_forward), \
+    with patch("services.apps.app_supervisor.forward", fake_forward), \
             patch.object(app_supervisor, "ensure_up", fake_ensure_up):
         asyncio.run(app_handlers._fire(d))
     assert seen["path"] == "/_handler/payment" and seen["headers"]["X-OtoDock-Basis"] == "inbound"

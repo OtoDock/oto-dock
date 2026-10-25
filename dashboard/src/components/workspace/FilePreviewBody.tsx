@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FileNode } from '../../api/agents'
 import { apiFetch } from '../../api/auth'
+import { apiJson } from '../../lib/http/apiJson'
 import { getFileKind } from '../../lib/fileTypes'
 import { encodePathSegments } from '../../lib/paths'
 import { useCollaboraLiveReload } from '../../hooks/useCollaboraLiveReload'
@@ -9,7 +10,9 @@ import FileEditor from '../FileEditor'
 import FilePreviewPortal from './FilePreviewPortal'
 import VideoPlayer from '../chat/media/VideoPlayer'
 import AudioPlayer from '../chat/media/AudioPlayer'
+import { STAGE_FRAME, STAGE_TEXT, STAGE_TEXT_MUTED } from '../chat/media/stage'
 import CollaboraFrame, { type CollaboraFrameData } from '../chat/media/CollaboraFrame'
+import Button from '../ui/Button'
 
 interface Props {
   agent: string
@@ -42,7 +45,7 @@ export default function FilePreviewBody({ agent, node, canWrite, onClose }: Prop
         filename={node.name}
         onClose={onClose}
         downloadUrl={downloadUrl}
-        bodyBg="bg-white dark:bg-gray-900"
+        bodyBg="bg-surface-card"
       >
         <FileEditor agent={agent} path={node.path} readOnly={!canWrite} compact />
       </FilePreviewPortal>
@@ -68,7 +71,7 @@ export default function FilePreviewBody({ agent, node, canWrite, onClose }: Prop
   // Archive / unknown — just offer the download.
   return (
     <FilePreviewPortal filename={node.name} onClose={onClose} downloadUrl={downloadUrl}>
-      <div className="h-full flex items-center justify-center text-white/80 text-sm">
+      <div className="h-full flex items-center justify-center text-secondary text-sm">
         Preview unavailable for this file type. Use the download button above.
       </div>
     </FilePreviewPortal>
@@ -98,7 +101,7 @@ function ImagePreview({
     let cancelled = false
     apiFetch(`/v1/agents/${encodeURIComponent(agent)}/files/${encodePathSegments(node.path)}`)
       .then(async (res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        if (!res.ok) throw new Error('Could not load the image.')
         const blob = await res.blob()
         blobUrl = URL.createObjectURL(blob)
         // If we unmounted before the fetch resolved, the cleanup already ran
@@ -118,17 +121,17 @@ function ImagePreview({
   }, [agent, node.path])
 
   return (
-    <FilePreviewPortal filename={node.name} onClose={onClose} downloadUrl={downloadUrl}>
+    <FilePreviewPortal filename={node.name} onClose={onClose} downloadUrl={downloadUrl} bodyBg={STAGE_FRAME}>
       <div className="h-full w-full flex items-center justify-center p-4 overflow-hidden">
-        {error && <span className="text-red-300 text-sm">{error}</span>}
+        {error && <span className={`${STAGE_TEXT} text-sm`}>{error}</span>}
         {!error && !src && (
-          <span className="text-white/70 text-sm">Loading…</span>
+          <span className={`${STAGE_TEXT_MUTED} text-sm`}>Loading…</span>
         )}
         {src && (
           <img
             src={src}
             alt={node.name}
-            className="max-w-full max-h-full object-contain rounded-lg shadow-2xl"
+            className="max-w-full max-h-full object-contain rounded-card shadow-elevation-2"
           />
         )}
       </div>
@@ -160,24 +163,23 @@ function MediaPreview({
 
   useEffect(() => {
     let cancelled = false
-    apiFetch('/v1/media/token', {
+    apiJson<{ url: string }>('/v1/media/token', {
       method: 'POST',
-      body: JSON.stringify({ agent, path: node.path }),
-    })
-      .then(async (res) => {
-        if (!res.ok) throw new Error(await res.text())
-        return res.json()
-      })
+      json: { agent, path: node.path },
+    }, 'Could not open the preview')
       .then((data) => !cancelled && setSrc(data.url))
       .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)))
     return () => { cancelled = true }
   }, [agent, node.path])
 
   return (
-    <FilePreviewPortal filename={node.name} onClose={onClose} downloadUrl={downloadUrl}>
+    // A video keeps the media stage, as in the chat; audio is a player, not a
+    // picture, and sits on the sunken step.
+    <FilePreviewPortal filename={node.name} onClose={onClose} downloadUrl={downloadUrl}
+      bodyBg={kind === 'video' ? STAGE_FRAME : 'bg-surface-sunken'}>
       <div className="h-full w-full flex items-center justify-center p-4 overflow-hidden">
-        {error && <span className="text-red-300 text-sm">{error}</span>}
-        {!error && !src && <span className="text-white/70 text-sm">Preparing…</span>}
+        {error && <span className={`${kind === 'video' ? STAGE_TEXT : 'text-status-danger-fg'} text-sm`}>{error}</span>}
+        {!error && !src && <span className={`${kind === 'video' ? STAGE_TEXT_MUTED : 'text-tertiary'} text-sm`}>Preparing…</span>}
         {src && (
           <div className="w-full max-w-3xl">
             {kind === 'video'
@@ -212,8 +214,11 @@ function DocumentPreview({
   // key alone would post the previous load's token into a new iframe.
   const [frame, setFrame] = useState<CollaboraFrameData | null>(null)
   const [frameKey, setFrameKey] = useState(0)
-  const [error, setError] = useState<string | null>(null)
   const [loadKey, setLoadKey] = useState(0)
+  // A failure belongs to the load that met it: the next load starts clean.
+  const loadId = `${agent}|${node.path}|${canWrite}|${loadKey}`
+  const [failed, setFailed] = useState<{ load: string; message: string } | null>(null)
+  const error = failed?.load === loadId ? failed.message : null
   const reload = useCallback(() => setLoadKey((k) => k + 1), [])
   const hostRef = useRef<HTMLDivElement | null>(null)
 
@@ -227,15 +232,10 @@ function DocumentPreview({
 
   useEffect(() => {
     let cancelled = false
-    setError(null)
-    apiFetch('/v1/documents/wopi-url', {
+    apiJson<{ wopi_url: string; access_token: string; access_token_ttl: number }>('/v1/documents/wopi-url', {
       method: 'POST',
-      body: JSON.stringify({ file_path: node.path, agent, edit: canWrite }),
-    })
-      .then(async (res) => {
-        if (!res.ok) throw new Error(await res.text())
-        return res.json()
-      })
+      json: { file_path: node.path, agent, edit: canWrite },
+    }, 'Could not open the document')
       .then((data) => {
         if (cancelled) return
         setFrame({ url: data.wopi_url, token: data.access_token, ttl: data.access_token_ttl })
@@ -245,12 +245,12 @@ function DocumentPreview({
         if (cancelled) return
         // A token from an earlier mint may be past its end: no frame then.
         setFrame(null)
-        setError(e instanceof Error ? e.message : String(e))
+        setFailed({ load: loadId, message: e instanceof Error ? e.message : String(e) })
       })
     return () => {
       cancelled = true
     }
-  }, [agent, node.path, canWrite, loadKey])
+  }, [agent, node.path, canWrite, loadKey, loadId])
 
   // Collabora's idle end: a resume in place when it can, else a fresh mint.
   // Not while the Reload banner is up (the person decides); unsaved edits
@@ -272,31 +272,25 @@ function DocumentPreview({
       downloadUrl={downloadUrl}
       onReload={reload}
     >
-      <div ref={hostRef} className="relative h-full w-full bg-black">
+      <div ref={hostRef} className="relative h-full w-full bg-surface-sunken">
         {reloadAvailable && (
-          <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between gap-2 px-3 py-1.5 bg-amber-500/95 text-white text-xs">
-            <span>This document changed. Reload to see the latest — your unsaved edits will be discarded.</span>
-            <button
-              onClick={doReload}
-              className="shrink-0 px-2 py-0.5 rounded-sm bg-white/20 hover:bg-white/30 font-medium"
-            >
+          <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between gap-2 px-3 py-1.5 bg-status-warning-bg text-status-warning-fg border-b border-status-warning-border text-xs">
+            <span>This document changed. Reload to see the latest. Your unsaved edits will be lost.</span>
+            <Button size="xs" className="shrink-0" onClick={doReload}>
               Reload
-            </button>
+            </Button>
           </div>
         )}
         {error && (
-          <div className="h-full flex flex-col items-center justify-center gap-2 text-red-300 text-sm px-4 text-center">
+          <div className="h-full flex flex-col items-center justify-center gap-2 text-status-danger-fg text-sm px-4 text-center">
             <span>{error}</span>
-            <button
-              onClick={reload}
-              className="px-2 py-1 rounded-md border border-white/30 hover:bg-white/10 text-xs text-white/80"
-            >
+            <Button size="xs" onClick={reload}>
               Retry
-            </button>
+            </Button>
           </div>
         )}
         {!error && !frame && (
-          <div className="h-full flex items-center justify-center text-white/70 text-sm">
+          <div className="h-full flex items-center justify-center text-tertiary text-sm">
             Loading preview…
           </div>
         )}

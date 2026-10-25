@@ -333,5 +333,5 @@ def foreground_window_elevated() -> bool | None:
                 kernel32.CloseHandle(token)
         finally:
             kernel32.CloseHandle(h)
-    except Exception:
+    except Exception:  # noqa: BLE001  # ctypes calls into win32 raise whatever the bridge does
         return None

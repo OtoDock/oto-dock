@@ -4,6 +4,8 @@ import { lazy, Suspense, useEffect } from 'react'
 // app recreated while the person consented would otherwise have none.
 import './lib/oauth'
 import AppToastHost from './components/AppToastHost'
+import DialogsHost from './components/ui/DialogsHost'
+import ToastViewport from './components/ui/Toast'
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import Layout from './components/Layout'
 import AgentLayout from './components/AgentLayout'
@@ -15,7 +17,11 @@ import AgentGuard from './components/AgentGuard'
 import DefaultAgentRedirect from './components/DefaultAgentRedirect'
 import AuthCallback from './pages/AuthCallback'
 import RunRedirect from './pages/RunRedirect'
-import UserSettings from './pages/UserSettings'
+import UserSettings, {
+  GeneralSection, IntegrationsSection, RemoteMachinesSection, AiEnginesSection, AudioSection,
+  UsageRoute, UnknownSection,
+} from './pages/UserSettings'
+import HistoryTrail from './components/settings/HistoryTrail'
 import AppPage from './pages/apps/AppPage'
 import AgentOverview from './pages/agent/AgentOverview'
 import AgentChat from './pages/agent/AgentChat'
@@ -59,6 +65,7 @@ const NotificationsPage = lazy(() => import('./pages/admin/NotificationsPage'))
 const MeetingsPage = lazy(() => import('./pages/admin/MeetingsPage'))
 const RemoteMachinesPage = lazy(() => import('./pages/admin/RemoteMachinesPage'))
 const SharesPage = lazy(() => import('./pages/admin/SharesPage'))
+const ReportsPage = lazy(() => import('./pages/admin/ReportsPage'))
 const SharedChatPage = lazy(() => import('./pages/SharedChatPage'))
 
 /**
@@ -108,7 +115,12 @@ export default function App() {
   return (
     <BrowserRouter>
       <NavigationGuard />
+      {/* Records the tab's history for the settings areas' back and Back to
+          Chat; after the guard, so a cold load records the guard's entry. */}
+      <HistoryTrail />
+      <ToastViewport />
       <AppToastHost />
+      <DialogsHost />
       <Routes>
         {/* Public routes — no auth required */}
         <Route path="/auth/callback" element={<AuthCallback />} />
@@ -134,8 +146,18 @@ export default function App() {
             <Route path=":chatId" element={<AgentChat />} />
           </Route>
 
-          {/* User settings */}
-          <Route path="user-settings" element={<UserSettings />} />
+          {/* User settings: one route per section; the index shows General on
+              a desktop and the section list on a phone. */}
+          <Route path="user-settings" element={<UserSettings />}>
+            <Route index element={<GeneralSection />} />
+            <Route path="general" element={<GeneralSection />} />
+            <Route path="integrations" element={<IntegrationsSection />} />
+            <Route path="remote-machines" element={<RemoteMachinesSection />} />
+            <Route path="ai-engines" element={<AiEnginesSection />} />
+            <Route path="audio" element={<AudioSection />} />
+            <Route path="usage" element={<UsageRoute />} />
+            <Route path="*" element={<UnknownSection />} />
+          </Route>
 
           {/* One app, full screen: the menu's "Open full screen", app
               navigation, notification taps */}
@@ -157,6 +179,7 @@ export default function App() {
           <Route path="agents/:name" element={<AgentGuard />}>
             <Route element={<AgentLayout />}>
               <Route index element={<AgentOverview />} />
+              <Route path="overview" element={<AgentOverview />} />
               <Route path="scheduled-tasks" element={<AgentSchedules />} />
               <Route path="config" element={<AgentConfig />} />
               <Route path="checks" element={<AgentChecks />} />
@@ -173,6 +196,7 @@ export default function App() {
           <Route path="admin" element={<RequireRole minRole="admin" />}>
             <Route element={<Layout />}>
               <Route index element={<Overview />} />
+              <Route path="overview" element={<Overview />} />
               <Route path="scheduled-tasks" element={<Schedules />} />
               <Route path="triggers" element={<Triggers />} />
               <Route path="notifications" element={<NotificationsPage />} />
@@ -185,6 +209,7 @@ export default function App() {
               <Route path="mcp-requests" element={<McpRequestsPage />} />
               <Route path="remote-machines" element={<RemoteMachinesPage />} />
               <Route path="shares" element={<SharesPage />} />
+              <Route path="reports" element={<ReportsPage />} />
               <Route path="platform" element={<PlatformPage />} />
             </Route>
           </Route>

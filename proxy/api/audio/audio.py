@@ -19,35 +19,53 @@ import logging
 import wave
 from dataclasses import asdict
 
+import psycopg
+from audio.providers import registry
+from audio.providers.tts.base import UnsupportedProviderOperation
+from audio.streaming import lang, tts_stream
+from audio.streaming.text_chunks import split_sentences
 from fastapi import (
-    APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile,
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
 )
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
-from audio.providers import registry
-from audio.providers.tts.base import UnsupportedProviderOperation
-from audio.streaming.text_chunks import split_sentences
-from audio.streaming import tts_stream
-from audio.streaming import lang
-from auth.providers import UserContext, get_current_user, mask_email, require_admin, require_user
-from services.media import audio_service
-from services.media import wake_keywords
-from services.media import ws_audio_token
-from storage.prefs import audio_provider_store
-from storage.identity import credential_store
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    mask_email,
+    require_admin,
+    require_user,
+)
+from services.media import audio_service, wake_keywords, ws_audio_token
+from services.phone.phone_config import (
+    groq_classifier_configured,
+    notify_phone_config_changed,
+)
 from storage import database as task_store
-from storage.prefs import user_audio_prefs_store
-from storage.prefs import user_ui_prefs_store
+from storage.identity import credential_store
+from storage.prefs import (
+    audio_provider_store,
+    user_audio_prefs_store,
+    user_ui_prefs_store,
+)
 from storage.prefs.audio_provider_store import (
     CREDENTIAL_INNER_KEY as AUDIO_CREDENTIAL_KEY,
     ProviderDefaultDisabledError,
 )
-from services.phone.phone_config import notify_phone_config_changed, groq_classifier_configured
 
 logger = logging.getLogger("otodock")
 # No route here takes an anonymous caller (auth.providers.require_user).
 router = APIRouter(dependencies=[Depends(require_user)])
+
+_VOICE_UNREACHABLE = "Could not reach the voice service. Try again in a minute."
 
 
 def _int_setting(key: str, default: int) -> int:
@@ -59,6 +77,10 @@ def _int_setting(key: str, default: int) -> int:
 # Audio-domain platform settings exposed via /v1/admin/audio/settings (the
 # ``audio_`` prefix is stripped on the wire). Shared by chat audio + telephony.
 _AUDIO_SETTING_PREFIX = "audio_"
+# The identifier's thread setting is capped at a fixed value, not this host's
+# CPU count: the daemon runs the identifier on its own machine and clamps the
+# value again to its own CPUs on read.
+_IDENTIFY_THREADS_MAX = 8
 
 # Chat-audio policy keys (dedicated /policy endpoint; chat-only, no phone push).
 _POLICY_KEYS = {
@@ -188,14 +210,19 @@ async def create_provider(
     # Seed the engine's advanced defaults so a freshly added provider never runs
     # on hidden built-in fallbacks (e.g. Deepgram chat endpointing). An explicit
     # `advanced` from the client wins; unknown engines stay {}.
+    cls = _provider_class(req.provider_type, req.provider_name)
     if not data.get("advanced"):
-        cls = _provider_class(req.provider_type, req.provider_name)
         data["advanced"] = cls.default_advanced_settings() if cls else {}
+    else:
+        _check_advanced(cls, data["advanced"])
     try:
         provider = await asyncio.to_thread(audio_provider_store.create_provider, data)
     except Exception as e:  # unique (provider_type, provider_name) collision, etc.
-        raise HTTPException(status_code=400, detail=f"Could not create provider: {e}")
-    logger.info(f"Admin {mask_email(u.email)} created audio provider: {provider['provider_name']} ({provider['provider_type']})")
+        logger.warning("POST /v1/admin/audio/providers: %s", e)
+        detail = ("This provider is already added." if isinstance(e, psycopg.errors.UniqueViolation)
+                  else "Could not add the provider. The server log has the details.")
+        raise HTTPException(status_code=400, detail=detail) from e
+    logger.info("Admin %s created audio provider: %s (%s)", mask_email(u.email), provider['provider_name'], provider['provider_type'])
     await notify_phone_config_changed()
     return _decorate(provider)
 
@@ -206,14 +233,32 @@ async def update_provider(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_admin(user)
+    changes = req.model_dump(exclude_unset=True)
+    if changes.get("advanced"):
+        current = await asyncio.to_thread(audio_provider_store.get_provider, provider_id)
+        if not current:
+            raise HTTPException(status_code=404, detail="Provider not found")
+        _check_advanced(
+            _provider_class(current["provider_type"], current["provider_name"]),
+            changes["advanced"])
     provider = await asyncio.to_thread(
-        audio_provider_store.update_provider, provider_id, req.model_dump(exclude_unset=True),
+        audio_provider_store.update_provider, provider_id, changes,
     )
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
-    logger.info(f"Admin {mask_email(u.email)} updated audio provider: {provider_id}")
+    logger.info("Admin %s updated audio provider: %s", mask_email(u.email), provider_id)
     await notify_phone_config_changed()
     return _decorate(provider)
+
+
+def _check_advanced(cls, advanced: dict) -> None:
+    """The engine's own rules for its ``advanced`` block (``validate_advanced``):
+    a bad field answers 400 naming the field, before anything is written."""
+    errors = cls.validate_advanced(advanced) if cls else {}
+    if errors:
+        raise HTTPException(
+            status_code=400,
+            detail="advanced: " + "; ".join(f"{k} {v}" for k, v in errors.items()))
 
 
 @router.delete("/v1/admin/audio/providers/{provider_id}")
@@ -231,7 +276,7 @@ async def delete_provider(
     deleted = await asyncio.to_thread(audio_provider_store.delete_provider, provider_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Provider not found")
-    logger.info(f"Admin {mask_email(u.email)} deleted audio provider: {provider_id}")
+    logger.info("Admin %s deleted audio provider: %s", mask_email(u.email), provider_id)
     await notify_phone_config_changed()
     return {"status": "deleted"}
 
@@ -246,10 +291,10 @@ async def set_provider_default(
     try:
         provider = await asyncio.to_thread(audio_provider_store.set_default, provider_id, context)
     except ProviderDefaultDisabledError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    logger.info(f"Admin {mask_email(u.email)} set audio provider {provider_id} default for {context}")
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    logger.info("Admin %s set audio provider %s default for %s", mask_email(u.email), provider_id, context)
     await notify_phone_config_changed()
     return _decorate(provider)
 
@@ -273,7 +318,7 @@ async def set_provider_credential(
     await asyncio.to_thread(
         credential_store.set_infra_credentials, cred_key, {AUDIO_CREDENTIAL_KEY: req.value},
     )
-    logger.info(f"Admin {mask_email(u.email)} set credential for audio provider {provider_id}")
+    logger.info("Admin %s set credential for audio provider %s", mask_email(u.email), provider_id)
     await notify_phone_config_changed()
     return {"status": "saved"}
 
@@ -289,7 +334,7 @@ async def delete_provider_credential(
     cred_key = provider.get("credential_key")
     if cred_key:
         await asyncio.to_thread(credential_store.delete_infra_credentials, cred_key)
-    logger.info(f"Admin {mask_email(u.email)} deleted credential for audio provider {provider_id}")
+    logger.info("Admin %s deleted credential for audio provider %s", mask_email(u.email), provider_id)
     await notify_phone_config_changed()
     return {"status": "deleted"}
 
@@ -347,7 +392,7 @@ async def update_audio_policy(
             task_store.set_platform_setting,
             _POLICY_KEYS["show_experimental"], "true" if req.show_experimental else "false",
         )
-    logger.info(f"Admin {mask_email(u.email)} updated audio policy")
+    logger.info("Admin %s updated audio policy", mask_email(u.email))
     return {"status": "updated"}
 
 
@@ -371,14 +416,40 @@ async def get_audio_settings(user: UserContext | None = Depends(get_current_user
 async def update_audio_settings(
     req: dict, user: UserContext | None = Depends(get_current_user),
 ):
-    """Partial update of audio_* settings. Keys arrive prefix-stripped."""
+    """Partial update of audio_* settings. Keys arrive prefix-stripped. Every
+    value is checked before the first write, so a bad key leaves the others
+    unwritten."""
     u = require_admin(user)
+    writes: list[tuple[str, str]] = []
     for key, value in req.items():
-        if value is not None:
-            await asyncio.to_thread(
-                task_store.set_platform_setting, f"{_AUDIO_SETTING_PREFIX}{key}", str(value),
-            )
-    logger.info(f"Admin {mask_email(u.email)} updated audio settings: {list(req.keys())}")
+        if value is None:
+            continue
+        if isinstance(value, (list, dict)):
+            raise HTTPException(status_code=400, detail=f"{key} must be a single value")
+        if key == "language_candidates":
+            # A subset of the supported languages, in the admin's order;
+            # an empty or foreign list means every supported language.
+            value = ",".join(lang.language_candidates(str(value)))
+        elif key == "language_identify_threads":
+            # 1 to _IDENTIFY_THREADS_MAX; the proxy and the daemon clamp it
+            # again on read, each to its own CPU count.
+            try:
+                threads = int(str(value).strip())
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="language_identify_threads must be a whole number") from exc
+            value = max(1, min(threads, _IDENTIFY_THREADS_MAX))
+        elif key == "language_identify_enabled":
+            word = str(value).strip().lower()
+            if word in ("true", "1", "yes"):
+                value = "true"
+            elif word in ("false", "0", "no"):
+                value = "false"
+            else:
+                raise HTTPException(status_code=400, detail="language_identify_enabled must be true or false")
+        writes.append((f"{_AUDIO_SETTING_PREFIX}{key}", str(value)))
+    for key, value in writes:
+        await asyncio.to_thread(task_store.set_platform_setting, key, value)
+    logger.info("Admin %s updated audio settings: %s", mask_email(u.email), list(req.keys()))
     await notify_phone_config_changed()
     return {"status": "updated"}
 
@@ -405,7 +476,7 @@ async def update_my_audio_prefs(
             user_audio_prefs_store.upsert_prefs, user.sub, req.model_dump(exclude_unset=True),
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return prefs
 
 
@@ -452,7 +523,7 @@ async def update_my_ui_prefs(
             user_ui_prefs_store.upsert_prefs, user.sub, req,
         )
     except ValueError as e:  # merged-bag ceiling (see user_ui_prefs_store)
-        raise HTTPException(status_code=413, detail=str(e))
+        raise HTTPException(status_code=413, detail=str(e)) from e
     from services.apps import focus_context
     focus_context.invalidate_prefs(user.sub)
     return out
@@ -529,7 +600,7 @@ async def tts_synthesize(
             audio_service.build_chat_provider, "tts", provider_id=req.provider_id,
         )
     except audio_service.AudioUnavailableError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
     tts_lang = lang.base_lang(req.language) if req.language else lang.detect_tts_language(text)
     if req.voice_id:
@@ -540,7 +611,8 @@ async def tts_synthesize(
     try:
         await provider.connect()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TTS connect failed: {e}")
+        logger.warning("Voice service connect failed: %s", e)
+        raise HTTPException(status_code=502, detail=_VOICE_UNREACHABLE) from e
 
     chunks = split_sentences(text)
 
@@ -592,7 +664,7 @@ async def mint_stt_session(
             raise HTTPException(status_code=503, detail="No chat STT provider configured")
         provider_id = default["id"]
 
-    max_seconds = _int_setting("audio_chat_stt_max_seconds", 180)
+    max_seconds = _int_setting("audio_chat_stt_max_seconds", 300)
     return ws_audio_token.create_ws_audio_token(user.sub, max_seconds=max_seconds, provider_id=provider_id)
 
 
@@ -663,14 +735,16 @@ async def transcribe_audio(
             audio_service.build_chat_provider, "stt", provider_id=provider_id,
         )
     except audio_service.AudioUnavailableError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise HTTPException(status_code=503, detail=str(e)) from e
     if not provider.capabilities.supports_transcribe_file:
         raise HTTPException(status_code=400, detail=f"{row['provider_name']} cannot transcribe files")
 
     try:
         result = await provider.transcribe_file(data, language=language)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Transcription failed: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Transcription failed: {audio_service.provider_error_message(e, row['provider_name'])}") from e
 
     max_dur_s = _int_setting("audio_transcribe_max_duration_min", 60) * 60
     if result.audio_seconds > max_dur_s:
@@ -737,9 +811,10 @@ async def _build_generate_provider_or_503(req_provider_id, advanced_overrides):
             audio_service.build_generate_provider,
             provider_id=req_provider_id, advanced_overrides=advanced_overrides,
         )
+    except audio_service.ProviderNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except audio_service.AudioUnavailableError as e:
-        status = 404 if "with id" in str(e) else 503
-        raise HTTPException(status_code=status, detail=str(e))
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
 
 @router.post("/v1/audio/tts/generate")
@@ -794,7 +869,8 @@ async def tts_generate(
     try:
         await provider.connect()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TTS connect failed: {e}")
+        logger.warning("Voice service connect failed: %s", e)
+        raise HTTPException(status_code=502, detail=_VOICE_UNREACHABLE) from e
 
     pcm_parts: list[bytes] = []
     try:
@@ -804,7 +880,10 @@ async def tts_generate(
         ):
             pcm_parts.append(chunk)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TTS generation failed: {e}")
+        logger.warning("POST /v1/audio/tts/generate: %s", e)
+        raise HTTPException(
+            status_code=502, detail=audio_service.provider_error_message(e, row["provider_name"]),
+        ) from e
     finally:
         with contextlib.suppress(Exception):
             await provider.close()
@@ -848,9 +927,11 @@ async def tts_voices(
     try:
         voices = await provider.list_voices()
     except UnsupportedProviderOperation as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Voice listing failed: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Voice listing failed: {audio_service.provider_error_message(e, row['provider_name'])}") from e
     return {
         "provider_id": row["id"],
         "provider_name": row["provider_name"],
@@ -880,9 +961,12 @@ async def tts_voices_search(
             category=category, page=page, page_size=page_size,
         )
     except UnsupportedProviderOperation as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Voice search failed: {e}")
+        logger.warning("GET /v1/audio/tts/voices/search: %s", e)
+        raise HTTPException(
+            status_code=502, detail=audio_service.provider_error_message(e, row["provider_name"]),
+        ) from e
     return {"provider_name": row["provider_name"], "voices": [asdict(v) for v in voices]}
 
 
@@ -899,7 +983,10 @@ async def tts_voices_add(
             req.public_owner_id, req.voice_id, name=req.name,
         )
     except UnsupportedProviderOperation as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Voice add failed: {e}")
+        logger.warning("POST /v1/audio/tts/voices/add: %s", e)
+        raise HTTPException(
+            status_code=502, detail=audio_service.provider_error_message(e, row["provider_name"]),
+        ) from e
     return {"provider_name": row["provider_name"], "voice_id": voice_id}

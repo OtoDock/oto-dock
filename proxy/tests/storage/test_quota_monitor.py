@@ -1,12 +1,12 @@
 """Tests for services/infra/quota_monitor.py — threshold evaluation, dedup + hysteresis
 re-arm, notification routing, and message formatting."""
 
-import config
 import pytest
-from services.infra import quota_monitor as qm
-from services.infra import storage_quota as sq
-from storage.agents import agent_store
+
+import config
+from services.infra import quota_monitor as qm, storage_quota as sq
 from storage import database
+from storage.agents import agent_store
 
 
 def _scope(scope_key="acme:shared", scope_type="shared", agent="acme",
@@ -189,9 +189,9 @@ async def test_check_quotas_skips_when_nothing_limited(monkeypatch):
 async def test_measure_adds_a_users_staged_uploads(monkeypatch):
     """A chunked upload sits in the staging area until it completes; the
     user's soft-tier usage counts it, the shared scope never does."""
-    from api.media import uploads
+    from services.media import upload_staging
     monkeypatch.setattr(sq, "hard_enabled", lambda: False)
-    monkeypatch.setattr(uploads, "staged_bytes_for", lambda sub: 1234 if sub == "local:u1" else 0)
+    monkeypatch.setattr(upload_staging, "staged_bytes_for", lambda sub: 1234 if sub == "local:u1" else 0)
     user = _scope("acme:user:u1", "user", "acme", "u1", owner_sub="local:u1")
     assert await qm._measure(user) == (1234, 0)
     shared = _scope("acme:shared", "shared", "acme")

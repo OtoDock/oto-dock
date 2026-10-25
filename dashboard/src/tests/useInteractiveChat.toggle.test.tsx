@@ -24,7 +24,7 @@ const CTX = {
   chatId: null,
   sessionId: null,
   warmingUp: false,
-  warmupParams: { agentName: 'dev', chatId: undefined, mode: 'default', model: 'm', layer: undefined as string | undefined },
+  warmupParams: { agentName: 'dev', chatId: undefined, mode: 'ask', model: 'm', layer: undefined as string | undefined },
 }
 
 describe('useInteractiveChat toggle', () => {
@@ -76,5 +76,87 @@ describe('useInteractiveChat cold start', () => {
       expect(prompt).toEqual({ text: 'hello there' })
       expect(execMode).toBe('interactive')
     }
+  })
+})
+
+describe('useInteractiveChat: a live switch the server refuses or fails', () => {
+  it('a refusal before the re-warm started ("Access denied") ends "Switching…" and keeps the mode', () => {
+    const ws = makeWs()
+    const { result } = renderHook(() => useInteractiveChat(ws, ''))
+    act(() => { result.current.restoreFromMeta('interactive') })
+    act(() => { result.current.performSwitch(false, 'c1', false) })
+    expect(result.current.switching).toBe(true)
+    expect(result.current.chatExecMode).toBe('-p')
+    act(() => { result.current.switchErrored('Access denied') })
+    expect(result.current.switching).toBe(false)
+    expect(result.current.chatExecMode).toBe('interactive')
+  })
+
+  it('an error once the switched chat\'s re-warm started keeps the lock; its warmup_failed ends it', () => {
+    const ws = makeWs()
+    const { result } = renderHook(() => useInteractiveChat(ws, ''))
+    act(() => { result.current.performSwitch(true, 'c1', false) })
+    act(() => { result.current.switchStarted('other-chat') })
+    act(() => { result.current.switchStarted('c1') })
+    act(() => { result.current.switchErrored('Access denied') })
+    expect(result.current.switching).toBe(true)
+    act(() => { result.current.switchFailed() })
+    expect(result.current.switching).toBe(false)
+  })
+
+  it('an unrelated error during the switch leaves it running and its mode', () => {
+    const ws = makeWs()
+    const { result } = renderHook(() => useInteractiveChat(ws, ''))
+    act(() => { result.current.restoreFromMeta('interactive') })
+    act(() => { result.current.performSwitch(false, 'c1', false) })
+    act(() => { result.current.switchErrored('A spawned task failed') })
+    expect(result.current.switching).toBe(true)
+    expect(result.current.chatExecMode).toBe('-p')
+  })
+
+  it('a deferred switch flushed at turn end ends the same way', () => {
+    const ws = makeWs()
+    const { result } = renderHook(() => useInteractiveChat(ws, ''))
+    act(() => { result.current.performSwitch(false, 'c2', true) })
+    expect(result.current.switching).toBe(false)
+    act(() => { result.current.flushDeferredSwitch('c2') })
+    expect(result.current.switching).toBe(true)
+    act(() => { result.current.switchErrored('Access denied') })
+    expect(result.current.switching).toBe(false)
+  })
+
+  it('no switch in flight: the tails change nothing', () => {
+    const ws = makeWs()
+    const { result } = renderHook(() => useInteractiveChat(ws, ''))
+    act(() => { result.current.switchErrored('Access denied'); result.current.switchFailed() })
+    expect(result.current.switching).toBe(false)
+  })
+})
+
+describe('useInteractiveChat on a task chat (no terminal toggle there)', () => {
+  it('a stored interactive mode never cold-starts a terminal: the warmup asks for headless', () => {
+    const ws = makeWs()
+    const { result } = renderHook(() => useInteractiveChat(ws, 'interactive', { taskChat: true }))
+    act(() => { result.current.restoreFromMeta('interactive') })
+    expect(result.current.interactiveMode).toBe(false)
+    expect(result.current.chatExecMode).toBe('-p')
+    let routed: unknown = 'unset'
+    act(() => {
+      routed = result.current.routeSend('follow up', { ...CTX, chatId: 'task-run-1', onColdStart: vi.fn() })
+    })
+    expect(routed).toBeNull()
+    expect(ws.warmup).not.toHaveBeenCalled()
+  })
+
+  it('the run\'s own live terminal stays interactive and takes the sends', () => {
+    const ws = makeWs()
+    const { result } = renderHook(() => useInteractiveChat(ws, '', { taskChat: true }))
+    act(() => { result.current.onWarmupReady({ interactive: true, chat_id: 'task-run-1' }, { onDecline: vi.fn() }) })
+    expect(result.current.interactiveMode).toBe(true)
+    expect(result.current.chatExecMode).toBe('interactive')
+    act(() => {
+      result.current.routeSend('steer', { ...CTX, chatId: 'task-run-1', sessionId: 's1', onColdStart: vi.fn() })
+    })
+    expect(ws.sendPtyInput).toHaveBeenCalledTimes(1)
   })
 })

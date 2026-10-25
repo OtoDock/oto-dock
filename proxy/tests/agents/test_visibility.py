@@ -197,7 +197,9 @@ def test_an_unreadable_mode_fails_closed(temp_db, monkeypatch):
 
     from core.session import visibility
     from core.session.visibility import (
-        VisibilityUnavailable, chat_history_owner, is_shared_only,
+        VisibilityUnavailable,
+        chat_history_owner,
+        is_shared_only,
     )
 
     _seed_modes()

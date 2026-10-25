@@ -1,19 +1,33 @@
 import { useState, useRef, useCallback } from 'react'
 import type { MutableRefObject } from 'react'
 import type { DisplayMessage, MessageBlock } from '../components/chat/types'
-import { dbMessagesToDisplay } from '../lib/messageBlocks'
+import { dbMessagesToDisplay, withPlanRows } from '../lib/messageBlocks'
 import { fetchOlderMessages } from '../api/chats'
+import { WIRE, type DbMessageRow, type DbPlanRow } from '../api/wireEvents'
+
+/** How a request for an older page settled: rows `landed`; `nothing` came
+ *  (an empty page, a failure, no history to page); or the request is
+ *  `stale` (the rows were reset, the chat switched or a history waits for
+ *  its live state: the next window of rows pages again). */
+export type OlderPage = 'landed' | 'nothing' | 'stale'
 
 /**
  * Owns the chat message list, the lazy chat-history pagination state, and the
- * message-assembly helpers. Extracted verbatim from useChatStream — every
- * helper keeps its original useCallback deps and byte-identical body.
+ * message-assembly helpers (split from useChatStream).
  *
  * `currentMsgRef` is created HERE and returned so useChatStream shares the same
- * ref object. `meetingSpeakerRef` and `chatIdRef` are created in the main hook
- * (also read by handlers that stay there) and passed in. The pagination
- * internals (rawRowsRef / oldestLoadedIdRef / loadingOlderRef / setHasMoreOlder
- * / setLoadingOlder) are returned because onChatHistory — which stays in the
+ * ref object. It names the streaming bubble by the message as it was MINTED:
+ * every updater below finds that bubble by its id in the list it is given and
+ * never writes the ref, so an updater is pure and gives the same answer each
+ * time React runs it (StrictMode runs each one twice; an updater that moved the
+ * ref while it ran made the second run keep the old list, and the next chunk
+ * was lost). A message's id and identity fields never change after its mint,
+ * so the ref's object is as good as the newest one for them; whoever needs the
+ * bubble's blocks reads the committed list (`messagesRef` in useChatStream).
+ * `meetingSpeakerRef` and `chatIdRef` are created in the main hook (also read
+ * by handlers that stay there) and passed in. The pagination internals
+ * (rawRowsRef / oldestLoadedIdRef / loadingOlderRef / setHasMoreOlder /
+ * setLoadingOlder) are returned because onChatHistory — which stays in the
  * main hook — resets them.
  */
 export function useChatMessages(args: {
@@ -29,81 +43,114 @@ export function useChatMessages(args: {
   // truth) so dbMessagesToDisplay can be re-run over the FULL merged set — it has
   // cross-row state (turn grouping, delegate pairing, dedup) that breaks if pages
   // are converted in isolation and concatenated.
-  const rawRowsRef = useRef<any[]>([])
+  const rawRowsRef = useRef<DbMessageRow[]>([])
+  // The chat's plan rows, which answer the plan reviews the rows saved
+  // unanswered (withPlanRows): every rebuild of the rows reads them.
+  const planRowsRef = useRef<DbPlanRow[]>([])
   const oldestLoadedIdRef = useRef<number | null>(null)
   const loadingOlderRef = useRef(false)
+  // The window the cursor belongs to: the chat whose rows it pages and a
+  // count every reset of the rows bumps (`resetWindow`). A page asked for in
+  // another window (a chat switch, a history frame sent again meanwhile)
+  // would prepend rows before an id of another window.
+  const windowRef = useRef<{ chatId: string | null; epoch: number }>({ chatId: null, epoch: 0 })
   const [hasMoreOlder, setHasMoreOlder] = useState(false)
   const [loadingOlder, setLoadingOlder] = useState(false)
   const currentMsgRef = useRef<DisplayMessage | null>(null)
+  // The nudge of a background review the chat's socket took between turns
+  // (its row is stored, then the frame, then the review turn starts): the
+  // turn's start mints its bubble with the nudge's line, as the stored row
+  // draws it. Dropped at every turn end, result and history frame.
+  const reviewNudgeRef = useRef<{ subtype: string; count?: number } | null>(null)
+  // A history frame's rows held for the live state that follows them
+  // (useChatHistory): their paint would drop a page loaded meanwhile.
+  const historyHeldRef = useRef(false)
+
+  /** A new window of rows (a history frame, a seed): the cursor is this
+   *  chat's from here, and a page still loading for the last one is void. */
+  const resetWindow = useCallback((chatId?: string | null) => {
+    windowRef.current = { chatId: chatId ?? chatIdRef.current, epoch: windowRef.current.epoch + 1 }
+  }, [chatIdRef])
+
+  /** The streaming bubble, when it is the last message of `prev`. */
+  const streamTail = (prev: DisplayMessage[]): DisplayMessage | null => {
+    const last = prev[prev.length - 1]
+    const id = currentMsgRef.current?.id
+    return last && id !== undefined && last.role === 'assistant' && last.id === id ? last : null
+  }
 
   // --- Message assembly helpers ---
 
   const appendBlock = useCallback((block: MessageBlock) => {
     setMessages((prev) => {
-      const last = prev[prev.length - 1]
-      if (last && last.role === 'assistant' && last === currentMsgRef.current) {
-        const updated = { ...last, blocks: [...last.blocks, block] }
-        currentMsgRef.current = updated
-        return [...prev.slice(0, -1), updated]
-      }
-      return prev
+      const last = streamTail(prev)
+      if (!last) return prev
+      return [...prev.slice(0, -1), { ...last, blocks: [...last.blocks, block] }]
     })
   }, [])
 
   // Seed the rendered view + pagination state from a REST snapshot (the rich-view
   // toggle) — the same paged contract as onChatHistory, so scroll-back lazy-loads
   // afterwards and nothing is capped.
-  const seedDbHistory = useCallback((rows: any[], hasMore: boolean) => {
+  const seedDbHistory = useCallback((rows: DbMessageRow[], hasMore: boolean) => {
+    resetWindow()
     rawRowsRef.current = rows
     oldestLoadedIdRef.current = rows.length ? rows[0].id : null
     loadingOlderRef.current = false
     setLoadingOlder(false)
     setHasMoreOlder(hasMore)
-    setMessages(dbMessagesToDisplay(rows, agents))
-  }, [agents])
+    setMessages(withPlanRows(dbMessagesToDisplay(rows, agents), planRowsRef.current))
+  }, [agents, resetWindow])
 
   // Lazy scroll-back: fetch the next older page and re-render the DB portion from
   // the full merged raw rows, preserving the live/optimistic tail (non-`db-` ids).
-  const loadOlder = useCallback(async () => {
+  const loadOlder = useCallback(async (): Promise<OlderPage> => {
     const cid = chatIdRef.current
     const beforeId = oldestLoadedIdRef.current
-    if (!cid || beforeId == null || loadingOlderRef.current) return
+    const asked = windowRef.current
+    if (!cid || beforeId == null) return 'nothing'
+    if (loadingOlderRef.current || asked.chatId !== cid || historyHeldRef.current) return 'stale'
     loadingOlderRef.current = true
     setLoadingOlder(true)
     try {
       const { messages: older, has_more } = await fetchOlderMessages(cid, beforeId)
-      if (chatIdRef.current !== cid) return  // switched chats mid-fetch
+      // Switched chats, or the rows were reset, mid-fetch.
+      if (chatIdRef.current !== cid || windowRef.current !== asked) return 'stale'
       if (older.length) {
         rawRowsRef.current = [...older, ...rawRowsRef.current]
         oldestLoadedIdRef.current = rawRowsRef.current[0]?.id ?? beforeId
         setMessages((prev) => {
           const tail = prev.filter((m) => !m.id.startsWith('db-'))
-          return [...dbMessagesToDisplay(rawRowsRef.current, agents), ...tail]
+          return [...withPlanRows(dbMessagesToDisplay(rawRowsRef.current, agents), planRowsRef.current), ...tail]
         })
       }
       setHasMoreOlder(has_more)
+      return older.length > 0 ? 'landed' : 'nothing'
     } catch {
       // transient — leave hasMoreOlder set so a later scroll retries
+      return 'nothing'
     } finally {
-      loadingOlderRef.current = false
-      setLoadingOlder(false)
+      // A reset meanwhile cleared the flag itself (and a page of its own
+      // may be loading now).
+      if (windowRef.current === asked) {
+        loadingOlderRef.current = false
+        setLoadingOlder(false)
+      }
     }
-  }, [agents])
+  }, [agents, chatIdRef])
 
   // A document push's card: appended to the streaming bubble, or in place
   // of the card of the same file already there (a reconnect's live state
   // may have drawn it before the turn's flush delivered the frame).
   const upsertPreviewBlock = useCallback((block: Extract<MessageBlock, { type: 'document_preview' }>) => {
     setMessages((prev) => {
-      const last = prev[prev.length - 1]
-      if (!last || last.role !== 'assistant' || last !== currentMsgRef.current) return prev
+      const last = streamTail(prev)
+      if (!last) return prev
       const at = last.blocks.findIndex((b) => b.type === 'document_preview' && b.fileId === block.fileId)
       const blocks = at >= 0
         ? last.blocks.map((b, i) => (i === at ? block : b))
         : [...last.blocks, block]
-      const updated = { ...last, blocks }
-      currentMsgRef.current = updated
-      return [...prev.slice(0, -1), updated]
+      return [...prev.slice(0, -1), { ...last, blocks }]
     })
   }, [])
 
@@ -118,28 +165,29 @@ export function useChatMessages(args: {
       if (!last || last.role !== 'assistant') return prev
       const blocks = last.blocks.filter((b) => b.type !== kind)
       if (blocks.length === last.blocks.length) return prev
-      const updated = { ...last, blocks }
-      currentMsgRef.current = updated
-      return [...prev.slice(0, -1), updated]
+      return [...prev.slice(0, -1), { ...last, blocks }]
     })
   }, [])
 
-  const appendToLastTextBlock = useCallback((content: string) => {
+  // A progress note and the answer never share a block: the text joins the
+  // last block only when it is text of the same kind. The note mark (a note
+  // with no content: the text just streamed came right before a tool call)
+  // turns the last block into a note when it is plain text, else nothing.
+  const appendToLastTextBlock = useCallback((content: string, note = false) => {
     setMessages((prev) => {
-      const last = prev[prev.length - 1]
-      if (last && last.role === 'assistant' && last === currentMsgRef.current) {
-        const blocks = [...last.blocks]
-        const lastBlock = blocks[blocks.length - 1]
-        if (lastBlock && lastBlock.type === 'text') {
-          blocks[blocks.length - 1] = { ...lastBlock, content: lastBlock.content + content }
-        } else {
-          blocks.push({ type: 'text', content })
-        }
-        const updated = { ...last, blocks }
-        currentMsgRef.current = updated
-        return [...prev.slice(0, -1), updated]
+      const last = streamTail(prev)
+      if (!last) return prev
+      const blocks = [...last.blocks]
+      const lastBlock = blocks[blocks.length - 1]
+      if (!content && note) {
+        if (lastBlock?.type !== WIRE.TEXT || lastBlock.note) return prev
+        blocks[blocks.length - 1] = { ...lastBlock, note: true }
+      } else if (lastBlock && lastBlock.type === 'text' && !!lastBlock.note === note) {
+        blocks[blocks.length - 1] = { ...lastBlock, content: lastBlock.content + content }
+      } else {
+        blocks.push(note ? { type: 'text', content, note: true } : { type: 'text', content })
       }
-      return prev
+      return [...prev.slice(0, -1), { ...last, blocks }]
     })
   }, [])
 
@@ -156,9 +204,7 @@ export function useChatMessages(args: {
           const blocks = msg.blocks.map((b) =>
             b.type === 'tool' && b.toolId === toolId ? { ...b, ...updates } : b,
           )
-          const updatedMsg = { ...msg, blocks }
-          if (msg === currentMsgRef.current) currentMsgRef.current = updatedMsg
-          return updatedMsg
+          return { ...msg, blocks }
         })
         return found ? updated : prev
       })
@@ -168,7 +214,7 @@ export function useChatMessages(args: {
 
   // Update tool block by name — find most recent running tool with matching name
   const updateToolBlockByName = useCallback(
-    (name: string, updates: Partial<{ summary: string; status: 'running' | 'done'; toolInput: any; toolResult: string; resultSummary: string }>) => {
+    (name: string, updates: Partial<{ summary: string; status: 'running' | 'done'; toolInput: unknown; toolResult: string; resultSummary: string }>) => {
       setMessages((prev) => {
         // Search backwards through all messages for the most recent running tool
         let found = false
@@ -197,9 +243,7 @@ export function useChatMessages(args: {
           const blocks = msg.blocks.map((b, bi) =>
             bi === targetBlockIdx ? { ...b, ...updates } as MessageBlock : b,
           )
-          const updatedMsg = { ...msg, blocks }
-          if (msg === currentMsgRef.current) currentMsgRef.current = updatedMsg
-          return updatedMsg
+          return { ...msg, blocks }
         })
       })
     },
@@ -213,7 +257,7 @@ export function useChatMessages(args: {
           (b) => b.type === 'permission' && b.requestId === requestId,
         )
         if (!hasMatch) return msg // keep same reference
-        const updated = {
+        return {
           ...msg,
           blocks: msg.blocks.map((b) =>
             b.type === 'permission' && b.requestId === requestId
@@ -221,9 +265,6 @@ export function useChatMessages(args: {
               : b,
           ),
         }
-        // Keep currentMsgRef in sync so appendToLastTextBlock works
-        if (msg === currentMsgRef.current) currentMsgRef.current = updated
-        return updated
       }),
     )
   }, [])
@@ -235,18 +276,16 @@ export function useChatMessages(args: {
       const updated = prev.map((msg) => {
         if (found || msg.role !== 'assistant') return msg
         const hasMatch = msg.blocks.some(
-          (b) => b.type === 'subagent' && (b as any)._toolId === toolId,
+          (b) => b.type === 'subagent' && b._toolId === toolId,
         )
         if (!hasMatch) return msg
         found = true
         const blocks = msg.blocks.map((b) =>
-          b.type === 'subagent' && (b as any)._toolId === toolId
+          b.type === 'subagent' && b._toolId === toolId
             ? { ...b, isActive }
             : b,
         )
-        const updatedMsg = { ...msg, blocks }
-        if (msg === currentMsgRef.current) currentMsgRef.current = updatedMsg
-        return updatedMsg
+        return { ...msg, blocks }
       })
       return found ? updated : prev
     })
@@ -260,18 +299,16 @@ export function useChatMessages(args: {
       const updated = prev.map((msg) => {
         if (found || msg.role !== 'assistant') return msg
         const hasMatch = msg.blocks.some(
-          (b) => b.type === 'bgcommand' && (b as any)._toolId === toolId,
+          (b) => b.type === 'bgcommand' && b._toolId === toolId,
         )
         if (!hasMatch) return msg
         found = true
         const blocks = msg.blocks.map((b) =>
-          b.type === 'bgcommand' && (b as any)._toolId === toolId
+          b.type === 'bgcommand' && b._toolId === toolId
             ? { ...b, isActive }
             : b,
         )
-        const updatedMsg = { ...msg, blocks }
-        if (msg === currentMsgRef.current) currentMsgRef.current = updatedMsg
-        return updatedMsg
+        return { ...msg, blocks }
       })
       return found ? updated : prev
     })
@@ -298,8 +335,8 @@ export function useChatMessages(args: {
   }
 
   return {
-    messages, setMessages, currentMsgRef,
-    rawRowsRef, oldestLoadedIdRef, loadingOlderRef,
+    messages, setMessages, currentMsgRef, reviewNudgeRef, historyHeldRef,
+    rawRowsRef, planRowsRef, oldestLoadedIdRef, loadingOlderRef, resetWindow,
     hasMoreOlder, loadingOlder, setHasMoreOlder, setLoadingOlder,
     seedDbHistory, loadOlder,
     appendBlock, removePlaceholders, appendToLastTextBlock,

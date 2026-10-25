@@ -9,14 +9,14 @@ Behavior is pinned by tests/session/test_ws_dashboard_*.
 
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+
 import config
-from storage import database as task_store
-from storage.automation import run_status
 from core.events import input_queue
 from core.session import visibility as _vis
-from ws import chat_phase
-from ws import wire_events as wire
+from storage import database as task_store
+from storage.automation import run_status
+from ws import chat_phase, wire_events as wire
 from ws.dashboard_chat_text import TurnDeferred
 
 if TYPE_CHECKING:
@@ -38,7 +38,8 @@ _DIRECT_COPY_ONLY = frozenset({wire.TITLE_UPDATED, wire.ENGINE_SWITCHED})
 
 # What a delegate result carries beyond its base keys: the worker's typed
 # ending, a failed run's check verdict, the files the worker attached (both
-# lists together, as the ladder writes them, an empty one included). Every
+# lists together, as the ladder writes them, an empty one included), the
+# background work still running and a report-less end's flag. Every
 # rebuild of the event from a notify item copies them through here, so no
 # rung drops a key another keeps.
 _RESULT_ENDING_KEYS = ("reason", "resets_at")
@@ -62,6 +63,10 @@ def result_event_from_notify(notification: dict) -> dict:
     if notification.get("verdict"):
         event["verdict"] = notification["verdict"]
     event.update({k: notification[k] for k in _RESULT_LIST_KEYS if k in notification})
+    if notification.get("background_pending"):
+        event["background_pending"] = notification["background_pending"]
+    if notification.get("report_missing"):
+        event["report_missing"] = True
     return event
 
 
@@ -69,6 +74,12 @@ class ServerNotificationController(_Host):
     """Server-initiated work delivered via the notify queue: notification
     forwards, the server-kicked first turn, and bg-nudge / task-result
     review turns on their originating chats."""
+
+    # The connection state this mixin assigns, declared where it assigns it:
+    # the type checker reads an attribute a mixin assigns from the mixin
+    # first. Annotations only (strings), no class attributes.
+    _warmup_abort_chat: "str | None"
+    _warmup_chat_id: "str | None"
 
     async def _handle_server_notification(self, notification: dict):
         """Process a server-initiated item from the notify queue.
@@ -152,22 +163,29 @@ class ServerNotificationController(_Host):
             kick_files = notification.get("files", [])
             if not kick_text or not kick_cid:
                 return
+            # The kick is taken: this socket's own warmup owes the chat
+            # nothing more (a Stop on it from here is a joined page's).
+            if self._warmup_chat_id == kick_cid:
+                self._warmup_chat_id = None
             # Abort-during-spawn race: the spawn finished and enqueued this kick
             # before the user's abort arrived (so _spawn_tail didn't catch it).
             # Kill the session and skip the turn — the client already got `aborted`.
             if self._warmup_abort_chat == kick_cid:
                 self._warmup_abort_chat = None
-                input_queue.first_turn_started(kick_cid)
+                # No first turn: what a teammate sent while the chat got
+                # ready goes out on its own (the session is aborted below;
+                # the delivery warms another).
+                input_queue.first_turn_not_run(kick_cid)
                 _k_layer = self.layer if kick_cid == self.chat_id else await self._resolve_layer_for_chat_async(kick_cid)
                 if _k_layer and kick_sid:
                     try:
                         await _k_layer.abort(kick_sid)
-                    except Exception:
-                        logger.warning(f"server-kick abort teardown failed for chat={kick_cid}")
+                    except Exception:  # noqa: BLE001  # an abort during teardown: the chat is being released anyway
+                        logger.warning("server-kick abort teardown failed for chat=%s", kick_cid)
                 return
             logger.info(
-                f"WS dashboard: server kick drained for chat={kick_cid[:8]} "
-                f"(viewed={kick_cid == self.chat_id})"
+                "WS dashboard: server kick drained for chat=%s "
+                "(viewed=%s)", kick_cid[:8], kick_cid == self.chat_id
             )
             if kick_cid == self.chat_id:
                 await self._handle_chat({
@@ -217,12 +235,13 @@ class ServerNotificationController(_Host):
             if nudge_chat_id == self.chat_id:
                 await self._send({"type": wire.BG_AGENTS_COMPLETE, "count": count})
             # Drive the review turn on the originating chat (headless if unviewed).
-            nudge_layer = self.layer if nudge_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(nudge_chat_id)
+            nudge_layer = self.layer if nudge_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(cast("str", nudge_chat_id))
             await self._run_server_turn_or_keep(
                 nudge,
                 target_session_id=nudge_sid,
                 target_chat_id=nudge_chat_id,
                 target_layer=nudge_layer,
+                cause=wire.CAUSE_BG_REVIEW,
             )
 
         elif ntype == wire.NOTIFY_BG_COMMAND_NUDGE:
@@ -245,12 +264,13 @@ class ServerNotificationController(_Host):
             # path is the reliable clear, exactly like bg_nudge → bg_agents_complete.
             if nudge_chat_id == self.chat_id:
                 await self._send({"type": wire.BG_COMMANDS_COMPLETE, "count": count})
-            nudge_layer = self.layer if nudge_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(nudge_chat_id)
+            nudge_layer = self.layer if nudge_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(cast("str", nudge_chat_id))
             await self._run_server_turn_or_keep(
                 nudge,
                 target_session_id=nudge_sid,
                 target_chat_id=nudge_chat_id,
                 target_layer=nudge_layer,
+                cause=wire.CAUSE_BG_REVIEW,
             )
 
         elif ntype == wire.NOTIFY_LIVENESS_CLEAR:
@@ -266,8 +286,9 @@ class ServerNotificationController(_Host):
                 await self._send({"type": wire.BG_COMMANDS_COMPLETE, "count": 0})
                 await self._send({"type": wire.FG_AGENTS_COMPLETE})
                 logger.info(
-                    f"WS dashboard: cleared liveness badges for chat={dead_chat[:8]} "
-                    f"(session death: {notification.get('reason') or '-'})"
+                    "WS dashboard: cleared liveness badges for chat=%s "
+                    "(session death: %s)",
+                    dead_chat[:8], notification.get('reason') or '-'
                 )
 
         elif ntype == wire.NOTIFY_CHAT_UI_FRAME:
@@ -301,13 +322,14 @@ class ServerNotificationController(_Host):
             if res_chat_id == self.chat_id:
                 await self._send({"type": wire.DELEGATE_RESULT, **event})
             # Drive the synthesis turn on the delegating chat (headless if unviewed).
-            res_layer = self.layer if res_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(res_chat_id)
+            res_layer = self.layer if res_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(cast("str", res_chat_id))
             try:
                 turn_pump = await self._run_server_turn(
                     result_prompt,
                     target_session_id=res_sid,
-                    target_chat_id=res_chat_id,
+                    target_chat_id=cast("str", res_chat_id),
                     target_layer=res_layer,
+                    cause=wire.CAUSE_DELEGATE_RESULT,
                 )
             except TurnDeferred:
                 turn_pump = None
@@ -323,9 +345,10 @@ class ServerNotificationController(_Host):
                 stored = await run_db(store_chat_wake, res_chat_id, result_prompt,
                                       self.user_sub or "")
                 logger.warning(
-                    f"WS dashboard: delegate-result turn could not start for "
-                    f"chat={res_chat_id[:8]} — wake "
-                    f"{'stored for replay' if stored else 'NOT stored'}"
+                    "WS dashboard: delegate-result turn could not start for "
+                    "chat=%s — wake "
+                    "%s",
+                    res_chat_id[:8], 'stored for replay' if stored else 'NOT stored'
                 )
 
         elif ntype == wire.NOTIFY_CONTINUATION_PROMPT:
@@ -343,21 +366,22 @@ class ServerNotificationController(_Host):
                         "prompt": wake_prompt,
                         "task_id": notification.get("task_id", ""),
                     }))
-            wake_layer = self.layer if wake_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(wake_chat_id)
+            wake_layer = self.layer if wake_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(cast("str", wake_chat_id))
             await self._run_server_turn_or_keep(
                 wake_prompt,
                 target_session_id=wake_sid,
                 target_chat_id=wake_chat_id,
                 target_layer=wake_layer,
+                cause=wire.CAUSE_WAKE,
             )
 
         else:
-            logger.warning(f"WS dashboard: unknown notify item type={ntype!r} dropped")
+            logger.warning("WS dashboard: unknown notify item type=%r dropped", ntype)
 
     async def _run_server_turn(self,
         prompt: str, *, target_session_id: str | None, target_chat_id: str,
-        target_layer: "ExecutionLayer | None", images: list[dict] | None = None,
-        force_headless: bool = False,
+        target_layer: "ExecutionLayer | None", cause: str, images: list[dict] | None = None,
+        force_headless: bool = False, typed: bool = False,
     ) -> object | None:
         """Run a server-initiated turn (bg nudge / delegate result / server-kick)
         on its ORIGINATING chat, regardless of what this socket is viewing.
@@ -374,7 +398,9 @@ class ServerNotificationController(_Host):
         ``images`` (Direct LLM vision blocks) is forwarded for the first
         server-kicked turn that carried chat-attached photos. ``force_headless``
         runs the turn headless even when the target IS the viewed chat — used
-        when the WS is gone (no socket to stream to, no main loop to attach)."""
+        when the WS is gone (no socket to stream to, no main loop to attach).
+        ``cause`` (``wire.SERVER_TURN_CAUSES``) rides ``server_turn_start``:
+        the viewer draws a review's nudge line only for its own turn."""
         is_viewed = target_chat_id == self.chat_id and not force_headless
         # The chat's claim covers this starter too: a send, a drain or a
         # queued delivery holding the chat for the turn it is starting, or a
@@ -383,8 +409,8 @@ class ServerNotificationController(_Host):
         q = input_queue.get(target_chat_id)
         claim = q.try_claim()
         if claim is None:
-            logger.info(f"WS dashboard: server turn on chat={target_chat_id[:8]} not started, "
-                        f"another starter holds the chat")
+            logger.info("WS dashboard: server turn on chat=%s not started, "
+                        "another starter holds the chat", target_chat_id[:8])
             return None
         try:
             pump = await self._start_new_stream(
@@ -393,6 +419,7 @@ class ServerNotificationController(_Host):
                 target_chat_id=target_chat_id,
                 target_layer=target_layer,
                 images=images,
+                typed=typed,
             )
         finally:
             q.release(claim)
@@ -410,7 +437,8 @@ class ServerNotificationController(_Host):
             # this it streams text but shows no generating timer and leaves Send
             # un-toggled (the turn can't be stopped). Tell the viewed socket a turn
             # is now active; the existing `done`/`aborted` events clear it.
-            await self._send({"type": wire.SERVER_TURN_START, "chat_id": target_chat_id})
+            await self._send({"type": wire.SERVER_TURN_START, "chat_id": target_chat_id,
+                              "cause": cause})
             # Viewed chat — stream to this socket (arms _ensure_bg_monitor at end).
             await self._enter_pump_loop()
         else:
@@ -437,8 +465,9 @@ class ServerNotificationController(_Host):
         from core.events.stream_pump import store_chat_wake
         from storage.pg import run_db
         stored = await run_db(store_chat_wake, chat_id, prompt, self.user_sub or "")
-        logger.info(f"WS dashboard: server turn on chat={chat_id[:8]} did not start — "
-                    f"wake {'stored for the next start' if stored else 'NOT stored'}")
+        logger.info("WS dashboard: server turn on chat=%s did not start — "
+                    "wake %s",
+                    chat_id[:8], 'stored for the next start' if stored else 'NOT stored')
 
     async def _run_kick_headless(self,
         wcid: str, sid: str | None, text: str,
@@ -468,8 +497,8 @@ class ServerNotificationController(_Host):
         k_layer = await self._resolve_layer_for_chat_async(wcid)
         if not k_layer:
             logger.warning(
-                f"WS dashboard: headless server-kick for chat {wcid} could not "
-                f"resolve a layer (chat gone or pinned remote offline) — deferring"
+                "WS dashboard: headless server-kick for chat %s could not "
+                "resolve a layer (chat gone or pinned remote offline) — deferring", wcid
             )
             return
         k_is_agent_scoped = _vis.is_shared_only(k_agent)
@@ -495,8 +524,10 @@ class ServerNotificationController(_Host):
                 target_session_id=sid,
                 target_chat_id=wcid,
                 target_layer=k_layer,
+                cause=wire.CAUSE_KICK,
                 images=attached_images or None,
                 force_headless=force_headless,
+                typed=True,
             )
         except TurnDeferred:
             pump = None
@@ -509,5 +540,6 @@ class ServerNotificationController(_Host):
             from core.events.stream_pump import shelve_undelivered
             shelve_undelivered(wcid, [TurnInput(text, image_meta=list(_meta or []),
                                                  files=list(_vfiles or []))])
-            logger.info(f"WS dashboard: headless server kick for chat={wcid[:8]} not run "
-                        f"(its machine is reconnecting, or the chat is held); the card is written")
+            logger.info("WS dashboard: headless server kick for chat=%s not run "
+                        "(its machine is reconnecting, or the chat is held); the card is written",
+                        wcid[:8])

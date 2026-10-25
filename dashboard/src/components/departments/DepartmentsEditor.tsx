@@ -11,7 +11,7 @@
  * "Save levels" button — never autosaved per keystroke — and removals of
  * levels that still have members go through an inline confirm step.
  */
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import {
   useDepartments,
   useCreateDepartment,
@@ -37,6 +37,9 @@ import {
   type DepartmentReach,
 } from '../../lib/kinds/department'
 import { ModeDiagram, ReachDiagram } from './WiringDiagrams'
+import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT, CARD as UI_CARD } from '../ui/classes'
+import { SaveState } from '../ui/SettingsControls'
+import { useSaveState, type SaveStateApi, type SaveStatus } from '../../hooks/useSaveState'
 
 const MAX_LEVELS = 8
 
@@ -67,10 +70,10 @@ function WiringCard<T extends string>({
 }) {
   return (
     <label
-      className={`flex flex-col gap-1.5 rounded-lg border px-2.5 py-2 transition-colors ${
-        selected ? 'border-brand bg-brand-surface' : 'border-p-border-light'
+      className={`flex flex-col gap-1.5 rounded-card border px-2.5 py-2 transition-colors ${
+        selected ? 'border-action-subtle-hover bg-action-subtle' : 'border-subtle'
       } ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'} ${
-        !selected && !disabled ? 'hover:bg-p-surface-hover' : ''
+        !selected && !disabled ? 'hover:bg-surface-hover' : ''
       }`}
     >
       <span className="flex items-start gap-2 min-w-0">
@@ -82,12 +85,12 @@ function WiringCard<T extends string>({
           disabled={disabled}
           onChange={() => onPick(value)}
           aria-label={label}
-          className="accent-brand shrink-0 mt-0.5"
+          className="accent-action shrink-0 mt-0.5"
         />
-        <span className="text-sm font-medium leading-tight text-p-text">{label}</span>
+        <span className="text-sm font-medium leading-tight text-primary">{label}</span>
       </span>
-      {diagram(selected ? 'text-brand' : 'text-p-text-secondary')}
-      <span className="text-xs text-p-text-light">{hint}</span>
+      {diagram(selected ? 'text-link' : 'text-secondary')}
+      <span className="text-xs text-tertiary">{hint}</span>
     </label>
   )
 }
@@ -165,6 +168,7 @@ function WiringRows({
   disabled = false,
   onMode,
   onReach,
+  save,
 }: {
   idPrefix: string
   groupPrefix: string
@@ -173,13 +177,15 @@ function WiringRows({
   disabled?: boolean
   onMode: (m: DepartmentMode) => void
   onReach: (r: DepartmentReach) => void
+  /** A saved department's save state per row; the new-department form has none. */
+  save?: { mode: SaveStatus; reach: SaveStatus }
 }) {
   return (
     <>
       <div className="flex flex-col gap-2">
         <div>
-          <p className="text-sm font-medium text-p-text">Delegation</p>
-          <p className="text-xs text-p-text-light">Which way agents delegate work between the levels of this department.</p>
+          <p className="text-sm font-medium text-primary">Delegation{save && <SaveState state={save.mode} />}</p>
+          <p className="text-xs text-tertiary">Which way agents delegate work between the levels of this department.</p>
         </div>
         <ModeSelector
           name={`${idPrefix}-mode`}
@@ -191,8 +197,8 @@ function WiringRows({
       </div>
       <div className="flex flex-col gap-2">
         <div>
-          <p className="text-sm font-medium text-p-text">Reach</p>
-          <p className="text-xs text-p-text-light">How far that delegation reaches across the levels.</p>
+          <p className="text-sm font-medium text-primary">Reach{save && <SaveState state={save.reach} />}</p>
+          <p className="text-xs text-tertiary">How far that delegation reaches across the levels.</p>
         </div>
         <ReachSelector
           name={`${idPrefix}-reach`}
@@ -207,22 +213,22 @@ function WiringRows({
 }
 
 // ---------------------------------------------------------------------------
-// Shared class strings (AgentConfig card idiom)
+// Shared class strings (the primitives' looks, components/ui/classes.ts)
 // ---------------------------------------------------------------------------
 
-const CARD = 'bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4'
-const SECTION_LABEL = 'text-xs font-semibold uppercase tracking-wider text-p-text-light mb-3'
+const CARD = `${UI_CARD} p-4`
+const SECTION_LABEL = 'text-xs font-semibold uppercase tracking-wider text-tertiary mb-3'
 const INPUT =
-  'px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30'
-const PRIMARY_BTN =
-  'bg-brand text-white rounded-lg px-3 py-1.5 text-sm hover:bg-brand-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed'
-const SECONDARY_BTN =
-  'px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed'
-const ICON_BTN =
-  'px-1.5 py-1 text-xs leading-none rounded-md border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors disabled:opacity-30 disabled:cursor-not-allowed'
+  'px-2.5 py-1.5 text-sm border border-strong rounded-control bg-surface-card text-primary placeholder:text-tertiary ' +
+  'focus:outline-hidden focus:border-action focus-visible:ring-2 focus-visible:ring-focus-ring/40'
+const PRIMARY_BTN = `${BUTTON_BASE} ${BUTTON_VARIANT.primary} ${BUTTON_SIZE.sm}`
+const SECONDARY_BTN = `${BUTTON_BASE} ${BUTTON_VARIANT.secondary} ${BUTTON_SIZE.sm}`
+const SECONDARY_BTN_XS = `${BUTTON_BASE} ${BUTTON_VARIANT.secondary} ${BUTTON_SIZE.xs}`
+const DANGER_BTN_XS = `${BUTTON_BASE} ${BUTTON_VARIANT.danger} ${BUTTON_SIZE.xs}`
+const ICON_BTN = `${BUTTON_BASE} ${BUTTON_VARIANT.secondary} ${BUTTON_SIZE.xs} px-1.5 leading-none`
 const AMBER_BOX =
-  'bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-lg px-3 py-2 text-xs text-amber-800 dark:text-amber-200'
-const ERROR_TEXT = 'text-xs text-red-600 dark:text-red-400'
+  'bg-status-warning-bg border border-status-warning-border rounded-card px-3 py-2 text-xs text-status-warning-fg'
+const ERROR_TEXT = 'text-xs text-status-danger-fg'
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -244,8 +250,8 @@ function sortedLevels(d: Department) {
 function UnassignedWarning({ agents }: { agents: string[] }) {
   return (
     <div className={AMBER_BOX}>
-      <strong>{agents.join(', ')}</strong> dropped out of the department — reassign them in
-      Agent Settings.
+      <strong>{agents.join(', ')}</strong> dropped out of the department. Reassign them on
+      each agent&apos;s Configuration page.
     </div>
   )
 }
@@ -287,12 +293,12 @@ function CreateDepartmentCard({ onDone }: { onDone: () => void }) {
   return (
     <div className={CARD}>
       <p className={SECTION_LABEL}>New department</p>
-      <div className="divide-y divide-p-border-light [&>*]:py-3 [&>*:first-child]:pt-0 [&>*:last-child]:pb-0">
+      <div className="divide-y divide-subtle [&>*]:py-3 [&>*:first-child]:pt-0 [&>*:last-child]:pb-0">
         {/* Name */}
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
           <div>
-            <p className="text-sm font-medium text-p-text">Name</p>
-            <p className="text-xs text-p-text-light">What this department is called on the map</p>
+            <p className="text-sm font-medium text-primary">Name</p>
+            <p className="text-xs text-tertiary">What this department is called on the map</p>
           </div>
           <input
             type="text"
@@ -307,13 +313,13 @@ function CreateDepartmentCard({ onDone }: { onDone: () => void }) {
         {/* Initial levels */}
         <div className="flex flex-col gap-2">
           <div>
-            <p className="text-sm font-medium text-p-text">Initial levels</p>
-            <p className="text-xs text-p-text-light">Top rank first — you can rework these later</p>
+            <p className="text-sm font-medium text-primary">Initial levels</p>
+            <p className="text-xs text-tertiary">Top rank first. You can change these later.</p>
           </div>
           <div className="space-y-1.5">
             {levels.map((lvl, i) => (
               <div key={i} className="flex items-center gap-2">
-                <span className="text-xs text-p-text-light w-4 text-right shrink-0">{i + 1}</span>
+                <span className="text-xs text-tertiary w-4 text-right shrink-0">{i + 1}</span>
                 <input
                   type="text"
                   value={lvl}
@@ -358,7 +364,7 @@ function CreateDepartmentCard({ onDone }: { onDone: () => void }) {
               type="button"
               disabled={levels.length >= MAX_LEVELS}
               onClick={() => setLevels(ls => [...ls, ''])}
-              className={`${SECONDARY_BTN} text-xs px-2.5 py-1`}
+              className={SECONDARY_BTN_XS}
             >
               + Add initial level
             </button>
@@ -405,19 +411,27 @@ function CreateDepartmentCard({ onDone }: { onDone: () => void }) {
 // Department name (inline editable when can_edit)
 // ---------------------------------------------------------------------------
 
-function DepartmentName({ department }: { department: Department }) {
+// The card holds the save state; the name's shows after its field, never in
+// the card's toggle, whose name it would join.
+function DepartmentName({ department, run, save }: { department: Department; run: SaveStateApi['run']; save: SaveStatus }) {
   const update = useUpdateDepartment()
   const [name, setName] = useState(department.name)
-  useEffect(() => setName(department.name), [department.name])
+  // The server's name replaces the draft when it changes (in render).
+  const [serverName, setServerName] = useState(department.name)
+  if (serverName !== department.name) {
+    setServerName(department.name)
+    setName(department.name)
+  }
 
   if (!department.can_edit) {
-    return <h3 className="text-sm font-semibold text-p-text truncate">{department.name}</h3>
+    return <h3 className="text-sm font-semibold text-primary truncate">{department.name}</h3>
   }
 
   const commit = () => {
     const trimmed = name.trim()
     if (trimmed && trimmed !== department.name) {
-      update.mutate({ id: department.id, name: trimmed })
+      void run('name', () => update.mutateAsync({ id: department.id, name: trimmed }),
+        { failTitle: 'The department name was not saved' })
     } else {
       setName(department.name)
     }
@@ -436,7 +450,7 @@ function DepartmentName({ department }: { department: Department }) {
         aria-label="Department name"
         className={`${INPUT} font-semibold w-full sm:w-64`}
       />
-      {update.error && <p className={`${ERROR_TEXT} mt-1`}>{update.error.message}</p>}
+      <SaveState state={save} />
     </div>
   )
 }
@@ -466,11 +480,12 @@ function LevelsEditor({ department }: { department: Department }) {
   // Re-sync the draft when the server levels actually change (react-query's
   // structural sharing keeps the array reference stable across identical
   // refetches, so a background poll never clobbers an in-progress edit).
-  useEffect(() => {
+  const [syncedLevels, setSyncedLevels] = useState(department.levels)
+  if (syncedLevels !== department.levels) {
+    setSyncedLevels(department.levels)
     setDraft(makeDraft())
     setConfirming(false)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [department.levels])
+  }
 
   const editDraft = (updater: (d: DraftLevel[]) => DraftLevel[]) => {
     setConfirming(false)
@@ -518,7 +533,7 @@ function LevelsEditor({ department }: { department: Department }) {
       <div className="space-y-1.5">
         {draft.map((row, i) => (
           <div key={row.uid} className="flex items-center gap-2">
-            <span className="text-xs text-p-text-light w-4 text-right shrink-0">{i + 1}</span>
+            <span className="text-xs text-tertiary w-4 text-right shrink-0">{i + 1}</span>
             <input
               type="text"
               value={row.name}
@@ -564,7 +579,7 @@ function LevelsEditor({ department }: { department: Department }) {
           type="button"
           disabled={draft.length >= MAX_LEVELS}
           onClick={() => editDraft(d => [...d, { uid: `n-${draftUidSeq++}`, id: '', name: 'New level' }])}
-          className={`${SECONDARY_BTN} text-xs px-2.5 py-1`}
+          className={SECONDARY_BTN_XS}
         >
           + Add level
         </button>
@@ -577,13 +592,13 @@ function LevelsEditor({ department }: { department: Department }) {
           {setLevels.isPending ? 'Saving...' : 'Save levels'}
         </button>
         {dirty && !confirming && (
-          <button type="button" onClick={() => { setDraft(makeDraft()); setConfirming(false) }} className={`${SECONDARY_BTN} text-xs px-2.5 py-1`}>
+          <button type="button" onClick={() => { setDraft(makeDraft()); setConfirming(false) }} className={SECONDARY_BTN_XS}>
             Discard
           </button>
         )}
       </div>
 
-      {invalid && <p className="text-xs text-p-text-light">Every level needs a name.</p>}
+      {invalid && <p className="text-xs text-tertiary">Every level needs a name.</p>}
 
       {confirming && (
         <div className={`${AMBER_BOX} space-y-2`}>
@@ -591,7 +606,7 @@ function LevelsEditor({ department }: { department: Department }) {
             <p key={r.level.id}>
               This removes level “{r.level.name}” with {r.members.length}{' '}
               {r.members.length === 1 ? 'agent' : 'agents'} (
-              {r.members.map(m => m.display_name || m.name).join(', ')}) — they will drop out of
+              {r.members.map(m => m.display_name || m.name).join(', ')}). They will drop out of
               the department.
             </p>
           ))}
@@ -599,14 +614,14 @@ function LevelsEditor({ department }: { department: Department }) {
             <button
               type="button"
               onClick={doSave}
-              className="px-2.5 py-1 text-xs rounded-lg bg-red-600 text-white hover:bg-red-700 transition-colors"
+              className={DANGER_BTN_XS}
             >
               Remove and save
             </button>
             <button
               type="button"
               onClick={() => setConfirming(false)}
-              className={`${SECONDARY_BTN} text-xs px-2.5 py-1`}
+              className={SECONDARY_BTN_XS}
             >
               Cancel
             </button>
@@ -627,14 +642,14 @@ function LevelsEditor({ department }: { department: Department }) {
 function MemberChip({ member }: { member: DepartmentMember }) {
   return (
     <span
-      title={member.accessible ? member.name : `${member.name} (not accessible to you)`}
-      className={`inline-flex items-center gap-1.5 pl-1 pr-2.5 py-0.5 rounded-full border border-p-border-light bg-p-bg text-xs text-p-text ${
+      title={member.accessible ? member.name : `${member.name}: not accessible to you`}
+      className={`inline-flex items-center gap-1.5 pl-1 pr-2.5 py-0.5 rounded-full border border-subtle bg-surface-page text-xs text-primary ${
         member.accessible ? '' : 'opacity-50'
       }`}
     >
       <span
-        className="w-5 h-5 rounded-full flex items-center justify-center text-white text-[9px] font-bold shrink-0"
-        style={{ backgroundColor: member.color || '#6B7280' }}
+        className="w-5 h-5 rounded-full flex items-center justify-center text-on-solid text-3xs font-bold shrink-0"
+        style={{ backgroundColor: member.color || 'var(--color-accent-agent-fill)' }}
       >
         {member.name.slice(0, 2).toUpperCase()}
       </span>
@@ -655,14 +670,14 @@ function MembersByLevel({ department }: { department: Department }) {
   )
 
   if (department.members.length === 0) {
-    return <p className="text-xs text-p-text-light">No agents assigned yet.</p>
+    return <p className="text-xs text-tertiary">No agents assigned yet.</p>
   }
 
   return (
     <div className="space-y-2.5">
       {groups.map(g => (
         <div key={g.level.id}>
-          <p className="text-xs text-p-text-light mb-1">{g.level.name}</p>
+          <p className="text-xs text-tertiary mb-1">{g.level.name}</p>
           <div className="flex flex-wrap gap-1.5">
             {g.members.map(m => (
               <MemberChip key={m.name} member={m} />
@@ -672,7 +687,7 @@ function MembersByLevel({ department }: { department: Department }) {
       ))}
       {orphans.length > 0 && (
         <div>
-          <p className="text-xs text-p-text-light mb-1">Unassigned level</p>
+          <p className="text-xs text-tertiary mb-1">Unassigned level</p>
           <div className="flex flex-wrap gap-1.5">
             {orphans.map(m => (
               <MemberChip key={m.name} member={m} />
@@ -697,6 +712,7 @@ function DepartmentCard({
 }) {
   const update = useUpdateDepartment()
   const del = useDeleteDepartment()
+  const { stateOf, run } = useSaveState()
   // Collapsed pill by default (round 17 — the AI Engines settings idiom):
   // the header row is the summary, expanding reveals the full editor.
   const [expanded, setExpanded] = useState(false)
@@ -705,8 +721,16 @@ function DepartmentCard({
   // server snapshot after the mutation invalidates + refetches.
   const [mode, setMode] = useState<DepartmentMode>(department.mode)
   const [reach, setReach] = useState<DepartmentReach>(department.reach)
-  useEffect(() => setMode(department.mode), [department.mode])
-  useEffect(() => setReach(department.reach), [department.reach])
+  const [serverMode, setServerMode] = useState(department.mode)
+  if (serverMode !== department.mode) {
+    setServerMode(department.mode)
+    setMode(department.mode)
+  }
+  const [serverReach, setServerReach] = useState(department.reach)
+  if (serverReach !== department.reach) {
+    setServerReach(department.reach)
+    setReach(department.reach)
+  }
 
   const canEdit = department.can_edit
   const levelCount = department.levels.length
@@ -720,7 +744,7 @@ function DepartmentCard({
   }
 
   return (
-    <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light">
+    <div className="bg-surface-card rounded-card border border-subtle">
       <button
         type="button"
         className="w-full flex items-center justify-between gap-3 p-4 text-left"
@@ -729,20 +753,20 @@ function DepartmentCard({
       >
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-medium text-p-text truncate">{department.name}</span>
+            <span className="font-medium text-primary truncate">{department.name}</span>
             {!canEdit && (
-              <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-p-bg text-p-text-secondary border border-p-border-light">
+              <span className="shrink-0 text-3xs font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-surface-page text-secondary border border-subtle">
                 View only
               </span>
             )}
           </div>
-          <div className="text-sm text-p-text-secondary">
+          <div className="text-sm text-secondary">
             {memberCount} {memberCount === 1 ? 'agent' : 'agents'} · {levelCount}{' '}
             {levelCount === 1 ? 'level' : 'levels'} · {wiringSummary(department.mode, department.reach)}
           </div>
         </div>
         <svg
-          className={`w-4 h-4 shrink-0 text-p-text-light transition-transform ${expanded ? 'rotate-180' : ''}`}
+          className={`w-4 h-4 shrink-0 text-tertiary transition-transform ${expanded ? 'rotate-180' : ''}`}
           fill="none"
           viewBox="0 0 24 24"
           stroke="currentColor"
@@ -752,11 +776,11 @@ function DepartmentCard({
       </button>
 
       {expanded && (
-        <div className="px-4 pb-4 border-t border-p-border-light pt-3">
+        <div className="px-4 pb-4 border-t border-subtle pt-3">
           {/* Header: name + delete — stacked on phones (the confirm row's
               text + two buttons overflowed the right edge there). */}
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3 mb-3">
-        <DepartmentName department={department} />
+        <DepartmentName department={department} run={run} save={stateOf('name')} />
         {canEdit &&
           (confirmDelete ? (
             <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
@@ -765,14 +789,14 @@ function DepartmentCard({
                 type="button"
                 onClick={handleDelete}
                 disabled={del.isPending}
-                className="px-2.5 py-1 text-xs rounded-lg bg-red-600 text-white hover:bg-red-700 transition-colors disabled:opacity-40"
+                className={DANGER_BTN_XS}
               >
                 {del.isPending ? 'Deleting...' : 'Confirm delete'}
               </button>
               <button
                 type="button"
                 onClick={() => setConfirmDelete(false)}
-                className={`${SECONDARY_BTN} text-xs px-2.5 py-1`}
+                className={SECONDARY_BTN_XS}
               >
                 Cancel
               </button>
@@ -781,7 +805,7 @@ function DepartmentCard({
             <button
               type="button"
               onClick={() => setConfirmDelete(true)}
-              className="shrink-0 px-2.5 py-1 text-xs rounded-lg border border-red-200 dark:border-red-700 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+              className="shrink-0 px-2.5 py-1 text-xs rounded-control border border-status-danger-border text-status-danger-fg hover:bg-status-danger-bg transition-colors"
             >
               Delete department
             </button>
@@ -789,7 +813,7 @@ function DepartmentCard({
       </div>
       {del.error && <p className={`${ERROR_TEXT} mb-3`}>{del.error.message}</p>}
 
-      <div className="divide-y divide-p-border-light [&>*]:py-4 [&>*:first-child]:pt-0 [&>*:last-child]:pb-0">
+      <div className="divide-y divide-subtle [&>*]:py-4 [&>*:first-child]:pt-0 [&>*:last-child]:pb-0">
         {/* Delegation mode + reach, autosaved per pick */}
         <WiringRows
           idPrefix={department.id}
@@ -799,14 +823,20 @@ function DepartmentCard({
           disabled={!canEdit}
           onMode={v => {
             setMode(v)
-            update.mutate({ id: department.id, mode: v })
+            void run('mode', () => update.mutateAsync({ id: department.id, mode: v }), {
+              failTitle: 'The delegation setting was not saved',
+              revert: () => setMode(department.mode),
+            })
           }}
           onReach={v => {
             setReach(v)
-            update.mutate({ id: department.id, reach: v })
+            void run('reach', () => update.mutateAsync({ id: department.id, reach: v }), {
+              failTitle: 'The delegation setting was not saved',
+              revert: () => setReach(department.reach),
+            })
           }}
+          save={{ mode: stateOf('mode'), reach: stateOf('reach') }}
         />
-        {update.error && <p className={ERROR_TEXT}>{update.error.message}</p>}
 
         {/* Levels */}
         <div>
@@ -816,8 +846,8 @@ function DepartmentCard({
           ) : (
             <ol className="space-y-1.5">
               {sortedLevels(department).map((l, i) => (
-                <li key={l.id} className="flex items-center gap-2 text-sm text-p-text">
-                  <span className="text-xs text-p-text-light w-4 text-right shrink-0">{i + 1}</span>
+                <li key={l.id} className="flex items-center gap-2 text-sm text-primary">
+                  <span className="text-xs text-tertiary w-4 text-right shrink-0">{i + 1}</span>
                   {l.name}
                 </li>
               ))}
@@ -829,8 +859,8 @@ function DepartmentCard({
         <div>
           <p className={SECTION_LABEL}>Members</p>
           <MembersByLevel department={department} />
-          <p className="text-xs text-p-text-light mt-2">
-            {"Assignment lives in each agent's settings (Department field)."}
+          <p className="text-xs text-tertiary mt-2">
+            {"Each agent's department is set in its settings, in the Department field."}
           </p>
         </div>
           </div>
@@ -855,7 +885,7 @@ export default function DepartmentsEditor() {
   const [showCreate, setShowCreate] = useState(false)
 
   if (isLoading && !departments) {
-    return <p className="text-sm text-p-text-secondary">Loading...</p>
+    return <p className="text-sm text-secondary">Loading...</p>
   }
 
   const list = departments ?? []
@@ -865,7 +895,7 @@ export default function DepartmentsEditor() {
       {/* Title + create action — stacked on phones (the explanatory
           sentence crammed 5 lines beside the button there; round 18). */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <h2 className="text-lg font-bold text-p-text">Departments</h2>
+        <h2 className="text-lg font-bold text-primary">Departments</h2>
         {canCreate && !showCreate && (
           <button
             type="button"
@@ -886,14 +916,14 @@ export default function DepartmentsEditor() {
       {deletedUnassigned.length > 0 && (
         <div className={`${AMBER_BOX} flex items-start justify-between gap-3`}>
           <span>
-            <strong>{deletedUnassigned.join(', ')}</strong> dropped out of the department —
-            reassign them in Agent Settings.
+            <strong>{deletedUnassigned.join(', ')}</strong> dropped out of the department.
+            Reassign them on each agent&apos;s Configuration page.
           </span>
           <button
             type="button"
             aria-label="Dismiss"
             onClick={() => setDeletedUnassigned([])}
-            className="shrink-0 leading-none text-amber-800 dark:text-amber-200 hover:opacity-70"
+            className="shrink-0 leading-none text-status-warning-fg hover:opacity-70"
           >
             ×
           </button>
@@ -902,8 +932,8 @@ export default function DepartmentsEditor() {
 
       {list.length === 0 ? (
         <div className={`${CARD} text-center py-8`}>
-          <p className="text-sm font-medium text-p-text">No departments yet</p>
-          <p className="text-xs text-p-text-light mt-1">
+          <p className="text-sm font-medium text-primary">No departments yet</p>
+          <p className="text-xs text-tertiary mt-1">
             {canCreate
               ? 'Create your first one with the New department button.'
               : 'An admin or creator can set up departments.'}

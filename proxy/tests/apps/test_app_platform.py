@@ -17,12 +17,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 import config
+from api.apps import app_proxy
 from app import app
 from auth.providers import UserContext, get_current_user
-from tests.conftest import live_session_token
-from api.apps import app_proxy, catalog
-from services.apps import app_supervisor, app_tokens
+from services.apps import app_supervisor, app_tokens, catalog
 from storage import database as task_store
+from tests.conftest import live_session_token
 
 client = TestClient(app)
 AGENT = "platform-agent"
@@ -82,7 +82,7 @@ def agent_tree(tmp_path, monkeypatch):
 def _row(slug: str, actions: list[dict], *, files: dict | None = None,
          username: str = "", owner: str | None = None, approve: bool = True,
          requires: dict | None = None) -> dict:
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     root = f"users/{username}/workspace" if username else "workspace"
     blocks = {}
     if files:
@@ -130,6 +130,7 @@ def test_setup_methods_are_the_viewers_own_and_flip_their_slice(agent_tree, monk
     bearer, the app identity and a viewer without a manager's role for the
     agent-wide scope are refused."""
     from unittest.mock import AsyncMock, patch
+
     from storage.agents import agent_store
     agent_store.create_agent(AGENT, "Platform", collaborative=True)
     row = _row("home", [
@@ -199,6 +200,7 @@ def test_setup_status_grades_the_mcps_the_page_names(agent_tree, monkeypatch):
     needs a per-user account, and the fix — ``connect`` for the viewer,
     ``admin`` for what an admin has to do — with a printable reason."""
     from types import SimpleNamespace as NS
+
     from services.mcp import mcp_registry
     from storage.agents import agent_store
     from storage.identity import credential_store
@@ -364,10 +366,48 @@ def test_files_methods_follow_the_declared_prefixes_on_the_resolved_path(agent_t
     assert json.loads(mine["files"])["read"] == ["users/{owner}/workspace/notes"]
     r = _call(mine["id"], "files.read", minst.token, {"path": "users/alice/workspace/notes/p.md"}).json()
     assert r["ok"] and r["result"]["content"] == "mine"
+    # The path as the app declares it lands in the owner's tree too, never
+    # in the agent's workspace.
+    r = _call(mine["id"], "files.read", minst.token, {"path": "workspace/notes/p.md"}).json()
+    assert r["ok"] and r["result"] == {"path": "users/alice/workspace/notes/p.md", "content": "mine",
+                                       "size": 4}
     assert not _call(mine["id"], "files.read", minst.token, {"path": "workspace/notes/a.md"}).json()["ok"]
+    # Another member's tree is out of reach in both forms: the declared form
+    # lands in the owner's tree, the full form is outside the prefixes.
+    (agent_tree / "users/bob/workspace/notes").mkdir(parents=True)
+    (agent_tree / "users/bob/workspace/notes/b.md").write_text("bob's")
+    r = _call(mine["id"], "files.read", minst.token, {"path": "users/bob/workspace/notes/b.md"}).json()
+    assert not r["ok"] and "outside the app's declared read prefixes" in r["reason"]
+    r = _call(mine["id"], "files.read", minst.token, {"path": "workspace/notes/b.md"}).json()
+    assert not r["ok"] and "bob's" not in json.dumps(r)
     # A frame's own call (the cookie principal, the platform route of phase 1) reads too.
     r = client.post(f"/v1/apps/{row['id']}/catalog/files.read", json={"args": {"path": "workspace/notes/a.md"}})
     assert r.status_code == 200 and r.json()["result"]["content"] == "hello"
+
+
+def test_a_declared_folder_lists_empty_until_it_is_made_again(agent_tree):
+    from services.apps import app_folders
+    actions = [{"id": "l", "label": "List", "type": "platform", "method": "files.list"}]
+    row = _row("timeline", actions, files={"read": ["workspace/videos"],
+                                           "create": ["workspace/videos/projects"]})
+    inst = _install(row)
+    target = agent_tree / "workspace" / "videos" / "projects"
+    # Missing: an empty listing, and a read makes nothing.
+    r = _call(row["id"], "files.list", inst.token, {"path": "workspace/videos/projects"}).json()
+    assert r["ok"] and r["result"] == {"path": "workspace/videos/projects", "entries": []}
+    assert not target.exists()
+    # Made and empty: the same answer.
+    assert app_folders.ensure_created_dirs(row)["created"] == ["workspace/videos/projects"]
+    r = _call(row["id"], "files.list", inst.token, {"path": "workspace/videos/projects"}).json()
+    assert r["ok"] and r["result"]["entries"] == []
+    # A path the manifest does not declare, or a file where the folder was,
+    # is still not a folder.
+    r = _call(row["id"], "files.list", inst.token, {"path": "workspace/videos/other"}).json()
+    assert not r["ok"] and "not a folder" in r["reason"]
+    target.rmdir()
+    target.write_text("x")
+    r = _call(row["id"], "files.list", inst.token, {"path": "workspace/videos/projects"}).json()
+    assert not r["ok"] and "not a folder" in r["reason"]
 
 
 def test_files_answer_the_agents_members_only_never_a_share_alone(agent_tree):
@@ -549,6 +589,7 @@ def test_a_preview_burst_never_spends_the_live_servers_platform_bucket(agent_tre
 
 def test_the_agent_slice_of_a_snapshot(agent_tree):
     import uuid
+
     from core.session.visibility import SHARED_CHAT_OWNER_PREFIX
     row = _row("board", [])
     shared_chat = task_store.create_chat(str(uuid.uuid4()), f"{SHARED_CHAT_OWNER_PREFIX}{AGENT}",
@@ -622,8 +663,8 @@ def test_the_files_methods_never_follow_a_link_swapped_in_after_the_check(agent_
     alice = _viewer_token(row["id"])
     real = files_api.safe_agent_path
 
-    def swapping(agent_dir, agent, raw, user, writing=False):
-        answer = real(agent_dir, agent, raw, user, writing=writing)
+    def swapping(agent_dir, agent, raw, user, writing=False, **kw):
+        answer = real(agent_dir, agent, raw, user, writing=writing, **kw)
         if raw.startswith("workspace/notes"):
             (ws / "notes" / "a.md").unlink()
             (ws / "notes" / "a.md").symlink_to(outside / "secret.md")
@@ -639,6 +680,41 @@ def test_the_files_methods_never_follow_a_link_swapped_in_after_the_check(agent_
               viewer=alice)
     assert r.status_code == 200 and not r.json()["ok"], r.text
     assert sorted(p.name for p in outside.iterdir()) == ["secret.md"]
+
+
+def test_a_files_method_without_the_path_gate_is_refused(agent_tree):
+    """The catalog resolves a files method's path only through the files
+    API's gate, which its callers pass in: without one it refuses before
+    anything is read."""
+    row = _row("gateless", [{"id": "r", "label": "Read", "type": "platform", "method": "files.read"}],
+               files={"read": ["workspace/notes"]})
+    (agent_tree / "workspace" / "notes").mkdir()
+    (agent_tree / "workspace" / "notes" / "a.md").write_text("hello")
+    with pytest.raises(PermissionError, match="path gate is required"):
+        catalog.run_method("files.read", AGENT, row, ALICE, {"path": "workspace/notes/a.md"})
+
+
+def test_the_viewers_own_call_reads_a_file_through_the_files_gate(agent_tree, monkeypatch):
+    """``POST /v1/apps/{id}/catalog/files.read``, the dashboard's call as the
+    viewer, hands the catalog the files API's gate read at call time: the
+    file under the declared prefix answers, and the gate saw its path."""
+    from api.agents import files as files_api
+    row = _row("viewer-read", [{"id": "r", "label": "Read", "type": "platform", "method": "files.read"}],
+               files={"read": ["workspace/notes"]})
+    (agent_tree / "workspace" / "notes").mkdir()
+    (agent_tree / "workspace" / "notes" / "a.md").write_text("hello")
+    real, seen = files_api.safe_agent_path, []
+
+    def gate(agent_dir, agent, raw, user, writing=False, **kw):
+        seen.append((agent, raw, writing))
+        return real(agent_dir, agent, raw, user, writing=writing, **kw)
+
+    monkeypatch.setattr(files_api, "safe_agent_path", gate)
+    r = client.post(f"/v1/apps/{row['id']}/catalog/files.read",
+                    json={"args": {"path": "workspace/notes/a.md"}})
+    assert r.status_code == 200 and r.json()["ok"], r.text
+    assert r.json()["result"]["content"] == "hello"
+    assert seen == [(AGENT, "workspace/notes/a.md", False)]
 
 
 def test_a_placed_agents_session_never_reaches_the_platform_route(agent_tree):
@@ -689,7 +765,7 @@ SLICE = [{"id": "r", "label": "Read", "type": "platform", "method": "viewer.data
 
 
 def _file_row(slug: str, actions: list[dict]) -> dict:
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     actions_json, err = _mf.validate_actions(actions, AGENT, shared=True)
     assert actions_json is not None, err
     row = task_store.upsert_app(AGENT, "", None, slug, title=slug.title(),
@@ -816,6 +892,7 @@ def test_the_per_viewer_slice_is_each_viewers_own(agent_tree, monkeypatch):
     bearer and a folder app are refused, and the files live beside the
     app's data directory, never inside a server's mount."""
     import re
+
     from services.apps import app_deploy, releases
     from storage.sharing import share_store
     row = _file_row("notes", SLICE)

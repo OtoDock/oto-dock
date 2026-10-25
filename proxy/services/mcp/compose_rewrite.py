@@ -74,8 +74,7 @@ import yaml
 
 import config
 from core.config import deployment
-from services.mcp import mcp_manifest_parse as _mmp
-from services.mcp import mcp_manifest_types as _mt
+from services.mcp import mcp_manifest_parse as _mmp, mcp_manifest_types as _mt
 
 logger = logging.getLogger("otodock.compose-rewrite")
 
@@ -198,6 +197,7 @@ def _reject_reserved_name(kind: str, value: object, mcp_name: str) -> None:
 _PLATFORM_VOLUMES = frozenset({
     "otodock-pgdata", "otodock-pgsock", "otodock-mcps", "otodock-skills",
     "otodock-ssh-keys", "otodock-sessions", "otodock-recover-bin",
+    "otodock-collabora-proof",
 })
 
 
@@ -263,6 +263,17 @@ def _default_mem_limit() -> str:
     return "" if raw in ("", "0", "none", "off") else raw
 
 
+def _mapping_at(node: dict, *keys: str) -> dict:
+    """The mapping under ``keys``, ``{}`` where a level is absent or not a
+    mapping (a catalog compose is the author's YAML)."""
+    level: object = node
+    for key in keys:
+        level = level.get(key) if isinstance(level, dict) else None
+        if not isinstance(level, dict):
+            return {}
+    return level if isinstance(level, dict) else {}
+
+
 def _missing_default_bounds(svc: dict) -> dict:
     """Default resource-bound keys ``svc`` doesn't declare itself.
 
@@ -275,9 +286,7 @@ def _missing_default_bounds(svc: dict) -> dict:
     """
     out: dict = {}
     mem = _default_mem_limit()
-    deploy_mem = (
-        ((svc.get("deploy") or {}).get("resources") or {}).get("limits") or {}
-    ).get("memory")
+    deploy_mem = _mapping_at(svc, "deploy", "resources", "limits").get("memory")
     if mem and "mem_limit" not in svc and "memswap_limit" not in svc and not deploy_mem:
         out["mem_limit"] = mem
         out["memswap_limit"] = mem
@@ -830,6 +839,10 @@ _T1_HEADER = (
 # NOT an asyncio.Lock. Without it, two MCPs starting at once could pick the same
 # free /24 from a stale scan.
 _allocate_lock = threading.Lock()
+# The subnet each project picked in this process, by project: held under the
+# lock so two projects started at once never pick the same /24 before either
+# network exists.
+_picked_subnets: dict[str, str] = {}
 
 
 def _collect_used_subnets(exclude_network: str | None = None) -> list[str]:
@@ -853,7 +866,7 @@ def _collect_used_subnets(exclude_network: str | None = None) -> list[str]:
             capture_output=True, text=True, timeout=30,
         )
         nets = json.loads(ins.stdout or "[]")
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
         logger.warning("docker subnet scan failed (%s) — allocating without it", e)
         return []
     out: list[str] = []
@@ -936,7 +949,7 @@ def _read_recorded_subnet(override_path: Path) -> str | None:
         )
         if isinstance(cfgs, list) and cfgs and isinstance(cfgs[0], dict):
             return cfgs[0].get("subnet")
-    except Exception:
+    except (OSError, ValueError, yaml.YAMLError, AttributeError):
         return None
     return None
 
@@ -971,7 +984,7 @@ def ensure_t1_override(manifest, *, force_realloc: bool = False) -> Path | None:
         if not isinstance(services, dict) or not services:
             return None
         svc_key = _pick_target_service(services, srv.service_name or manifest.name)
-    except Exception as e:
+    except (OSError, ValueError, yaml.YAMLError, AttributeError) as e:
         logger.warning("T1 override: cannot parse %s base compose (%s)", manifest.name, e)
         return None
 
@@ -982,7 +995,12 @@ def ensure_t1_override(manifest, *, force_realloc: bool = False) -> Path | None:
     own_net = f"{project}_default"
     with _allocate_lock:
         used = _collect_used_subnets(exclude_network=own_net)
+        # Another project's pick in this process whose network compose has
+        # not created yet (the boot starts the projects concurrently).
+        used += [s for p, s in _picked_subnets.items() if p != project]
         subnet = allocate_mcp_subnet(config.OTODOCK_MCP_ADDRESS_POOL, used, recorded)
+        if subnet:
+            _picked_subnets[project] = subnet
 
     svc: dict = {"container_name": project}
     if srv.image:

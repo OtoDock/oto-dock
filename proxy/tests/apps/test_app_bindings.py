@@ -25,14 +25,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 import config
-from app import app
 from api.apps import app_bindings, app_proxy
+from app import app
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
 from core.session import session_state
 from services.apps import app_handlers, app_supervisor, app_tokens, releases
-from storage import database as task_store
-from storage import db_app_deliveries as deliveries
+from storage import database as task_store, db_app_deliveries as deliveries
 from storage.agents import agent_store
 from storage.pg import get_conn
 
@@ -86,7 +85,7 @@ def _clean(monkeypatch):
     _as(ALICE)
     apps_api._fire_rate.clear()
     app_proxy._buckets.clear()
-    app_proxy._client = None
+    app_supervisor._client = None
     app_bindings._inflight.clear()
     app_handlers._drains.clear()
     app_handlers.mark_dirty()
@@ -95,7 +94,7 @@ def _clean(monkeypatch):
     app.dependency_overrides.pop(get_current_user, None)
     app_supervisor._instances.clear()
     app_supervisor._locks.clear()
-    app_proxy._client = None
+    app_supervisor._client = None
     app_bindings._inflight.clear()
 
 
@@ -182,6 +181,7 @@ def test_the_broker_forwards_over_an_edge_with_the_role_on_the_target(agent_tree
     caller = _row(AGENT_A, "board", bindings=CRM)
     target = _row(AGENT_B, "leads", exports={"methods": {
         "summary": {"description": "the week"},
+        "note": {"description": "contributors and up", "min_role": "contributor"},
         "secret": {"description": "editors only", "min_role": "editor"}}})
     inst = _install(caller)
     _install(target, port=target_server)
@@ -202,9 +202,12 @@ def test_the_broker_forwards_over_an_edge_with_the_role_on_the_target(agent_tree
     viewer = _viewer_claim(caller["id"])
     r = client.get(f"{url}/secret", headers={**hdr, "X-OtoDock-Viewer": viewer})
     assert r.status_code == 403 and "editor" in r.text
+    r = client.get(f"{url}/note", headers={**hdr, "X-OtoDock-Viewer": viewer})
+    assert r.status_code == 403 and "contributor" in r.text
     task_store.add_user_agent("alice-sub", AGENT_B, "editor", "test")
     r = client.get(f"{url}/secret", headers={**hdr, "X-OtoDock-Viewer": viewer})
     assert r.status_code == 200, r.text
+    assert client.get(f"{url}/note", headers={**hdr, "X-OtoDock-Viewer": viewer}).status_code == 200
     claim = app_tokens.verify(_Target.seen[-1]["headers"]["x-otodock-caller"], target["id"],
                               app_tokens.PURPOSE_CALLER)
     assert claim["role"] == "editor" and claim["caller_role"] == "manager" and claim["sub"] == "alice-sub"
@@ -609,3 +612,15 @@ def test_describe_answers_a_placed_app_with_no_edge_and_no_binding(agent_tree):
         assert _hook("describe", {"agent": c, "slug": "mine"}).status_code == 404
     finally:
         session_state._session_security.pop("bind-carol", None)
+
+
+def test_one_slug_pattern_matched_whole():
+    """The manifest, the deploy paths and the template loader share one
+    pattern, matched whole: a trailing newline is no slug."""
+    from services.apps import app_deploy, slugs
+    from services.community import community_agent_template_store
+    assert app_deploy.APP_SLUG_RE is slugs.APP_SLUG_RE
+    assert community_agent_template_store.APP_SLUG_RE is slugs.APP_SLUG_RE
+    assert slugs.APP_SLUG_RE.fullmatch("home-panel")
+    assert not slugs.APP_SLUG_RE.fullmatch("home-panel\n")
+    assert not slugs.APP_SLUG_RE.fullmatch("-x") and not slugs.APP_SLUG_RE.fullmatch("a" * 41)

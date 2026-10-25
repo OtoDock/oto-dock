@@ -216,7 +216,7 @@ def render(agent: str, root_rel: str, root_label: str, names: tuple[str, ...], *
     shares = _shares([len(data) for _, data in files], budget - overhead)
 
     blocks = []
-    for (_label, data), (opening, closing, note), share in zip(files, shells, shares):
+    for (_label, data), (opening, closing, note), share in zip(files, shells, shares, strict=False):
         if share <= 0:
             continue
         cut = len(data) > share

@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './auth'
+import { apiJson } from '../lib/http/apiJson'
 
 export interface MemorySettings {
   id: number
@@ -34,24 +34,18 @@ export interface AgentMemorySettings {
 export const useMemorySettings = () =>
   useQuery<MemorySettings>({
     queryKey: ['memory', 'settings'],
-    queryFn: async () => {
-      const r = await apiFetch('/v1/internal/memory/settings')
-      if (!r.ok) throw new Error(await r.text())
-      return r.json()
-    },
+    queryFn: () => apiJson<MemorySettings>('/v1/internal/memory/settings', {},
+      'Could not load the memory settings'),
   })
 
 export function useUpdateMemorySettings() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (patch: Partial<MemorySettings>) => {
-      const r = await apiFetch('/v1/internal/memory/settings', {
+      return apiJson<MemorySettings>('/v1/internal/memory/settings', {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch),
-      })
-      if (!r.ok) throw new Error(await r.text())
-      return r.json() as Promise<MemorySettings>
+        json: patch,
+      }, 'Could not save the memory settings')
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['memory', 'settings'] }),
   })
@@ -65,24 +59,18 @@ export const useAgentMemorySettings = (agent: string | undefined) =>
   useQuery<AgentMemorySettings>({
     queryKey: ['memory', 'agent-settings', agent],
     enabled: !!agent,
-    queryFn: async () => {
-      const r = await apiFetch(`/v1/internal/memory/agent-settings/${agent}`)
-      if (!r.ok) throw new Error(await r.text())
-      return r.json()
-    },
+    queryFn: () => apiJson<AgentMemorySettings>(`/v1/internal/memory/agent-settings/${agent}`, {},
+      "Could not load the agent's memory settings"),
   })
 
 export function useSetAgentMemoryToggle(agent: string) {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (vars: { key: string; value: boolean | string | null }) => {
-      const r = await apiFetch(`/v1/internal/memory/agent-settings/${agent}`, {
+      return apiJson<AgentMemorySettings>(`/v1/internal/memory/agent-settings/${agent}`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(vars),
-      })
-      if (!r.ok) throw new Error(await r.text())
-      return r.json() as Promise<AgentMemorySettings>
+        json: vars,
+      }, "Could not save the agent's memory setting")
     },
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ['memory', 'agent-settings', agent] }),
@@ -96,11 +84,11 @@ export function useSetAgentMemoryToggle(agent: string) {
 export function useClearAgentMemory(agent: string) {
   return useMutation({
     mutationFn: async () => {
-      const r = await apiFetch(`/v1/internal/memory/clear-agent-memory/${agent}`, {
-        method: 'POST',
-      })
-      if (!r.ok) throw new Error(await r.text())
-      return r.json() as Promise<{ files_unlinked: number; agent: string }>
+      return apiJson<{ files_unlinked: number; agent: string }>(
+        `/v1/internal/memory/clear-agent-memory/${agent}`,
+        { method: 'POST' },
+        "Could not clear the agent's memory",
+      )
     },
   })
 }
@@ -108,14 +96,10 @@ export function useClearAgentMemory(agent: string) {
 export function useClearMyMemory() {
   return useMutation({
     mutationFn: async () => {
-      const r = await apiFetch('/v1/internal/memory/clear-my-memory', {
-        method: 'POST',
-      })
-      if (!r.ok) throw new Error(await r.text())
-      return r.json() as Promise<{
+      return apiJson<{
         files_unlinked: number
         agents_affected: number
-      }>
+      }>('/v1/internal/memory/clear-my-memory', { method: 'POST' }, 'Could not clear your memory')
     },
   })
 }

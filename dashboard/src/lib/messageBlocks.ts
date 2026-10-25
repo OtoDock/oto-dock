@@ -1,7 +1,7 @@
-import type { DisplayMessage, MessageBlock } from '../components/chat/types'
+import type { DelegateCardMark, DisplayMessage, MessageBlock } from '../components/chat/types'
 import type { PendingFile, PendingImage } from '../store/types'
 import { cleanUserMessageText } from './transcriptCleanup'
-import { LIVE_BLOCK, PERSISTED, SYSTEM_SUBTYPE, WIRE } from '../api/wireEvents'
+import { PERSISTED, RESEND_REASONS, SYSTEM_SUBTYPE, WIRE, type DbMessageRow, type LiveBlock, type PersistedEvent } from '../api/wireEvents'
 import { DELEGATE_RESULT, RUN_STATUS, type DelegateBlockStatus } from './status/run'
 
 // Pure mappers from wire/DB event shapes to renderable MessageBlocks.
@@ -24,7 +24,7 @@ export function costBilledOf(evt: { cost_billed?: unknown }): boolean | undefine
  * metadata row is the only place the credential kind survives a reload.
  * `true` when no loaded turn carries the flag (fresh chat, pre-flag history).
  */
-export function latestCostBilled(dbMessages: any[]): boolean {
+export function latestCostBilled(dbMessages: DbMessageRow[]): boolean {
   for (let i = dbMessages.length - 1; i >= 0; i--) {
     const m = dbMessages[i]
     if (m?.role !== 'event' || m.event_type !== WIRE.METADATA || !m.event_data) continue
@@ -35,6 +35,24 @@ export function latestCostBilled(dbMessages: any[]): boolean {
     }
   }
   return true
+}
+
+/**
+ * The tool fees among the loaded rows: an `mcp_cost` row is money whatever
+ * the model runs on. Turns from before the fee had a row of its own carry
+ * none, so an older chat's reload shows less than its live view did (Usage
+ * keeps it all).
+ */
+export function toolFeesOf(dbMessages: DbMessageRow[]): number {
+  let sum = 0
+  for (const m of dbMessages) {
+    if (m?.role !== 'event' || m.event_type !== WIRE.MCP_COST || !m.event_data) continue
+    try {
+      const cost = Number(JSON.parse(m.event_data).cost_usd)
+      if (cost > 0) sum += cost
+    } catch { /* an unreadable row counts nothing */ }
+  }
+  return sum
 }
 
 /**
@@ -75,21 +93,149 @@ export function delegateResultSignature(blocks: MessageBlock[]): string {
   ])
 }
 
-/** The badge a delegate result's bubble wears, by the run's result word. */
-export function delegateResultBadge(status: string | undefined): string {
+/** A result whose worker's own run cut its turn short before any report. */
+export const REPORT_MISSING_BADGE = 'delegate ended without a report'
+
+/** The badge a delegate result's bubble wears, by the run's result word; a
+ * result whose worker ended without a report (`report_missing`) says that
+ * first. */
+export function delegateResultBadge(status: string | undefined, reportMissing = false): string {
+  if (reportMissing) return REPORT_MISSING_BADGE
   return status === DELEGATE_RESULT.CANCELLED ? 'delegate canceled'
     : status === DELEGATE_RESULT.FAILED ? 'delegate failed'
     : status === DELEGATE_RESULT.USER_INTERRUPTED ? 'delegate interrupted'
     : 'delegate response'
 }
 
+/** The badge the platform stamps on a worker lane's incoming prompt (the
+ * stored spelling: the scheduler's prompt row and a lane steer's meta). */
+export const DELEGATED_BY_BADGE = 'delegated by'
+
+/** The badge of a meeting participant's bubble. */
+export const MEETING_BADGE = 'meeting'
+
+function textHash(text: string): string {
+  let h = 5381
+  for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0
+  return (h >>> 0).toString(36)
+}
+
+/** A delegate result's card: keyed by its task and its blocks, the same for
+ * the live frame and the stored row. */
+export function delegateResultCard(taskKey: string | undefined, blocks: MessageBlock[]): DelegateCardMark {
+  return { kind: 'result', key: `r:${taskKey || ''}:${textHash(delegateResultSignature(blocks))}` }
+}
+
+/** A worker's incoming prompt is a card when the platform stamped it so. */
+export function delegatePromptCard(badge: string | undefined, key: string): DelegateCardMark | undefined {
+  return badge === DELEGATED_BY_BADGE ? { kind: 'prompt', key } : undefined
+}
+
+// The shapes the builders give a delegate card. Any other block (a permission,
+// a question, a plan, an artifact) keeps its message uncollapsed.
+const CARD_BLOCK_TYPES: ReadonlySet<MessageBlock['type']> = new Set<MessageBlock['type']>([
+  'text', 'delegate_files', 'file_attachments', 'image_attachments',
+])
+
+/** The card a message renders as, or null. */
+export function delegateCardOf(msg: DisplayMessage): DelegateCardMark | null {
+  const card = msg.delegateCard
+  if (!card) return null
+  return msg.blocks.every((b) => CARD_BLOCK_TYPES.has(b.type)) ? card : null
+}
+
+// The delegation MCP's two wrappers around a worker's prompt, outer first;
+// only a LEADING, CLOSED one is the platform's.
+const DELEGATED_WORK_RE = /^\s*\[DELEGATED_WORK\][\s\S]*?\[\/DELEGATED_WORK\]\s*/
+const TASK_OUTPUT_DIR_RE = /^\s*\[TASK_OUTPUT_DIR\][\s\S]*?\[\/TASK_OUTPUT_DIR\]\s*/
+// The bounded result's own head line (lanes._delegate_output_preview).
+const OUTPUT_TRUNCATED_RE = /^\s*… \[output truncated[^\]\n]*\]\s*/
+const MD_LINE_LEAD_RE = /^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+\.\s+)/
+// A report's tail that is too short to stand alone ("Blocked on: none").
+const SHORT_TAIL = 80
+
+function resultTail(text: string): string {
+  const paras = text.replace(OUTPUT_TRUNCATED_RE, '').split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean)
+  const last = paras[paras.length - 1] ?? ''
+  return last.length < SHORT_TAIL && paras.length > 1 ? `${paras[paras.length - 2]}\n${last}` : last
+}
+
+// What a card's preview shows of its text, by its kind.
+const PREVIEW_BODY: Record<DelegateCardMark['kind'], (text: string) => string> = {
+  prompt: (text) => text.replace(DELEGATED_WORK_RE, '').replace(TASK_OUTPUT_DIR_RE, ''),
+  result: resultTail,
+}
+
+/**
+ * The two-line preview of a delegate card: a prompt's task (its head, the
+ * platform's wrappers stripped) or a result's outcome (its tail: a lane's
+ * report ends its narration). Plain text: the leading markdown marks of
+ * each line, emphasis stars and backticks dropped. The stored text and the
+ * expanded card are untouched; a preview the stripping would empty shows
+ * the text as it is.
+ */
+export function delegatePreviewText(kind: DelegateCardMark['kind'], blocks: MessageBlock[]): string {
+  const text = blocks
+    .filter((b): b is Extract<MessageBlock, { type: 'text' }> => b.type === WIRE.TEXT)
+    .map((b) => b.content)
+    .join('\n\n')
+  let body = PREVIEW_BODY[kind](text)
+  if (!body.trim()) body = text
+  return body
+    .split('\n')
+    .map((line) => line.replace(MD_LINE_LEAD_RE, '').replace(/\*+|`+/g, ''))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+type SystemBlock = Extract<MessageBlock, { type: 'system' }>
+
+/** The block a review's bubble starts with: how many of the agent's
+ *  background agents or commands finished (the nudge row's `count`, the
+ *  live frame's). */
+export function nudgeBlock(subtype: string, count: unknown): SystemBlock {
+  return typeof count === 'number' && count > 0
+    ? { type: 'system', subtype, count }
+    : { type: 'system', subtype }
+}
+
+/** The faint line a nudge block reads as ("14 background commands
+ *  finished"), null for any other block. */
+export function nudgeNote(b: MessageBlock): string | null {
+  if (b.type !== WIRE.SYSTEM) return null
+  const agents = b.subtype === SYSTEM_SUBTYPE.BG_AGENTS_COMPLETED
+  if (!agents && b.subtype !== SYSTEM_SUBTYPE.BG_COMMANDS_COMPLETED) return null
+  const kind = agents ? 'agent' : 'command'
+  const n = b.count ?? 0
+  return n > 0 ? `${n} background ${kind}${n === 1 ? '' : 's'} finished` : `Background ${kind}s finished`
+}
+
+/** Whether `next` may go on from `above`: the agent's own reply (not a
+ *  person's message, not a delegate's card) and the same speaker (a meeting
+ *  turn or another agent keeps its header). */
+export function continuesAbove(above: DisplayMessage | undefined, next: DisplayMessage): boolean {
+  return !!above && above.role === 'assistant' && next.role === 'assistant'
+    && !above.delegateCard && !next.delegateCard
+    && (above.agentSlug || '') === (next.agentSlug || '')
+}
+
+/** The identity a background review's bubble takes from the bubble above
+ *  it: a meeting participant's (the review speaks in the meeting), else
+ *  none (the page's agent). The history and the live stream both ask. */
+export function reviewSpeaker(above: DisplayMessage | undefined): Partial<DisplayMessage> {
+  return above?.role === 'assistant' && above.badge === MEETING_BADGE && above.agentSlug
+    ? { agentSlug: above.agentSlug, agentDisplayName: above.agentDisplayName, agentColor: above.agentColor, badge: above.badge }
+    : {}
+}
+
 /** Convert a live_state inline_block to a MessageBlock for reconnect rendering. */
-export function liveBlockToMessageBlock(ib: any): MessageBlock | null {
+export function liveBlockToMessageBlock(ib: LiveBlock): MessageBlock | null {
   switch (ib.type) {
     case WIRE.IMAGES:
       return {
         type: 'images',
-        images: (Array.isArray(ib.images) ? ib.images : []).map((it: any) => ({
+        images: (Array.isArray(ib.images) ? ib.images : []).map((it) => ({
           url: it.url || undefined,
           imageData: it.image_data || undefined,
           mimeType: it.mime_type || undefined,
@@ -139,12 +285,12 @@ export function liveBlockToMessageBlock(ib: any): MessageBlock | null {
   }
 }
 
-export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | null {
+export function eventToBlock(evt: PersistedEvent, dbMessageId?: number): MessageBlock | null {
   switch (evt.type) {
     case WIRE.IMAGES:
       return {
         type: 'images',
-        images: (Array.isArray(evt.images) ? evt.images : []).map((it: any) => ({
+        images: (Array.isArray(evt.images) ? evt.images : []).map((it) => ({
           url: it.url || undefined,
           imageData: it.image_data || undefined,
           mimeType: it.mime_type || undefined,
@@ -220,8 +366,9 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
     case WIRE.DELEGATE_RESULT:
       return null  // Handled by post-processing (marks matching delegate_spawn as completed)
     case PERSISTED.SCHEDULE_WAKE:
-      // A scheduled self-continuation drove this turn — show the wake row.
-      return { type: 'schedulewake', prompt: evt.prompt || '' }
+      // A scheduled self-continuation drove this turn, or the platform
+      // resumed the chat after the agent moved it (`source` move): the row.
+      return { type: 'schedulewake', prompt: evt.prompt || '', ...(evt.source ? { source: evt.source } : {}) }
     case WIRE.CHECK_VERDICT:
       // A check judged this turn (CHECKS.md): the compact verdict card.
       return {
@@ -257,15 +404,16 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
         filename: evt.filename || '',
         resolved: true,  // Historical = already resolved
         action: evt.action || 'reject',  // No action saved = was never resolved = cancelled
+        ...(evt.action ? {} : { unanswered: true }),  // its plan row may say more (withPlanRows)
       }
     case WIRE.SYSTEM:
       return { type: 'system', subtype: evt.subtype || '', message: evt.message, reason: evt.reason, agentName: evt.agent_display_name || evt.agent, agentColor: evt.agent_color }
     case WIRE.METADATA:
       return { type: 'metadata', costUsd: evt.cost_usd ?? 0, durationMs: evt.duration_ms ?? evt.duration_api_ms ?? 0, costBilled: costBilledOf(evt) }
     case PERSISTED.BG_NUDGE:
-      return { type: 'system', subtype: SYSTEM_SUBTYPE.BG_AGENTS_COMPLETED }
+      return nudgeBlock(SYSTEM_SUBTYPE.BG_AGENTS_COMPLETED, evt.count)
     case PERSISTED.BG_COMMAND_NUDGE:
-      return { type: 'system', subtype: SYSTEM_SUBTYPE.BG_COMMANDS_COMPLETED }
+      return nudgeBlock(SYSTEM_SUBTYPE.BG_COMMANDS_COMPLETED, evt.count)
     case WIRE.CONTEXT_COMPACT:
       // The pump persists the compaction's `completed` block; the live path
       // shows the same separator (core-seams phase 6, D9b).
@@ -317,8 +465,41 @@ export function attachmentBlocks(
   return blocks
 }
 
+/** A bubble whose turn is over: it carries the turn's closing metadata, or the
+ * card of a turn that ended short. */
+export function finishedBubble(m: DisplayMessage): boolean {
+  return m.blocks.some((b) => b.type === WIRE.METADATA
+    || (b.type === WIRE.SYSTEM && b.subtype === SYSTEM_SUBTYPE.TURN_ENDED))
+}
+
+/**
+ * The ids of the bubbles of the turn still open: walking back from the newest
+ * message over the assistant bubbles not finished yet (a message steered into
+ * this turn is passed over), up to the first finished one or the message
+ * that started the turn (an earlier bubble that ended without its metadata,
+ * an error, is not this turn's). None while the chat is not
+ * streaming, nor in the moment a server turn starts before its first frame
+ * (the newest bubble is the last turn's, finished). Their steps chips count
+ * a waited sub-agent or background command as running, and the newest says
+ * "Working…" (lib/activityGroups).
+ */
+export function openTurnBubbles(messages: DisplayMessage[], streaming: boolean): Set<string> {
+  const open = new Set<string>()
+  if (!streaming) return open
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role !== 'assistant') {
+      if (m.steered) continue
+      break
+    }
+    if (m.delegateCard || finishedBubble(m)) break
+    open.add(m.id)
+  }
+  return open
+}
+
 export function dbMessagesToDisplay(
-  dbMessages: any[],
+  dbMessages: DbMessageRow[],
   agents: Array<{ name: string; display_name?: string; color?: string }> | undefined,
 ): DisplayMessage[] {
   const displayMsgs: DisplayMessage[] = []
@@ -328,6 +509,9 @@ export function dbMessagesToDisplay(
     slug ? agents?.find(a => a.name === slug)?.display_name : undefined
   // Events that signal a new LLM turn (delegate result delivery, bg agent nudge)
   let newTurnNext = false
+  // The boundary armed is a background review's: its bubble goes on from
+  // the agent's bubble above (`continuation`).
+  let continueNext = false
   for (const m of dbMessages) {
     if (m.role === 'user') {
       const blocks: MessageBlock[] = []
@@ -346,6 +530,7 @@ export function dbMessagesToDisplay(
       const cleanedText = cleanUserMessageText(m.content)
       if (cleanedText === null && blocks.length === 0) continue
       if (cleanedText !== null) blocks.push({ type: 'text', content: cleanedText })
+      const promptCard = agentMeta.agent_slug ? delegatePromptCard(agentMeta.badge, `db-${m.id}`) : undefined
       displayMsgs.push({
         id: `db-${m.id}`,
         role: 'user',
@@ -357,8 +542,10 @@ export function dbMessagesToDisplay(
           agentColor: agentMeta.agent_color,
           badge: agentMeta.badge,
         } : {}),
+        ...(promptCard ? { delegateCard: promptCard } : {}),
       })
       newTurnNext = false
+      continueNext = false
     } else if (m.role === 'assistant') {
       // Merge with preceding assistant message (same turn, split by events)
       // BUT start a new message if a turn-boundary event preceded this
@@ -368,6 +555,7 @@ export function dbMessagesToDisplay(
       let msgAgentDisplayName: string | undefined
       let msgAgentColor: string | undefined
       let msgBadge: string | undefined
+      let note = false
       if (m.event_data) {
         try {
           const ed = JSON.parse(m.event_data)
@@ -375,33 +563,42 @@ export function dbMessagesToDisplay(
           msgAgentDisplayName = ed.agent_display_name
           msgAgentColor = ed.agent_color
           msgBadge = ed.badge
+          note = ed.note === true
         } catch { /* ignore */ }
       }
+      // A progress note's row (`event_data.note`): the same text, drawn faint.
+      const content = m.content || ''
+      const textBlock: MessageBlock = note ? { type: 'text', content, note: true } : { type: 'text', content }
       // Force new message if: turn boundary, or different agent identity
       const forceNew = newTurnNext || (
         msgAgentSlug && last?.role === 'assistant' && msgAgentSlug !== last.agentSlug
       )
       if (last && last.role === 'assistant' && !forceNew) {
-        if (m.content) last.blocks.push({ type: 'text', content: m.content })
+        if (m.content) last.blocks.push(textBlock)
       } else {
-        displayMsgs.push({
+        const next: DisplayMessage = {
           id: `db-${m.id}`,
           role: 'assistant',
-          blocks: m.content ? [{ type: 'text', content: m.content }] : [],
+          blocks: m.content ? [textBlock] : [],
           createdAt: m.created_at,
           agentSlug: msgAgentSlug,
           agentDisplayName: currentName(msgAgentSlug) ?? msgAgentDisplayName,
           agentColor: msgAgentColor,
           badge: msgBadge,
-        })
+        }
+        if (continueNext && continuesAbove(last, next)) next.continuation = true
+        displayMsgs.push(next)
       }
       newTurnNext = false
+      continueNext = false
     } else if (m.role === 'event' && m.event_data) {
       // delegate_result / bg_nudge / artifact_interaction / app_action /
       // schedule_wake signal a new LLM turn (a wake's marker opens the bubble
-      // its answer lands in)
-      if (m.event_type === WIRE.DELEGATE_RESULT || m.event_type === PERSISTED.BG_NUDGE || m.event_type === PERSISTED.BG_COMMAND_NUDGE || m.event_type === WIRE.ARTIFACT_INTERACTION || m.event_type === WIRE.APP_ACTION || m.event_type === PERSISTED.SCHEDULE_WAKE) {
+      // its answer lands in, a nudge's line the review's)
+      const nudge = m.event_type === PERSISTED.BG_NUDGE || m.event_type === PERSISTED.BG_COMMAND_NUDGE
+      if (m.event_type === WIRE.DELEGATE_RESULT || nudge || m.event_type === WIRE.ARTIFACT_INTERACTION || m.event_type === WIRE.APP_ACTION || m.event_type === PERSISTED.SCHEDULE_WAKE) {
         newTurnNext = true
+        continueNext = nudge
       }
       // Meeting turn start: force new message with agent identity
       let meetingTurnAgent: { slug: string; displayName: string; color: string } | null = null
@@ -410,6 +607,7 @@ export function dbMessagesToDisplay(
           const sysEd = JSON.parse(m.event_data || '{}')
           if (sysEd.subtype === SYSTEM_SUBTYPE.MEETING_TURN_START) {
             newTurnNext = true
+            continueNext = false
             meetingTurnAgent = {
               slug: sysEd.agent || '',
               displayName: currentName(sysEd.agent) ?? (sysEd.agent_display_name || sysEd.agent || ''),
@@ -422,8 +620,8 @@ export function dbMessagesToDisplay(
         const evt = JSON.parse(m.event_data)
         // Skip dismissed events
         if (evt.dismissed) continue
-        // A wake row's data carries no type (its column names it).
-        if (!evt.type && m.event_type === PERSISTED.SCHEDULE_WAKE) evt.type = PERSISTED.SCHEDULE_WAKE
+        // A wake's or a nudge's row data carries no type (its column names it).
+        if (!evt.type && (m.event_type === PERSISTED.SCHEDULE_WAKE || nudge)) evt.type = m.event_type
         const block = eventToBlock(evt, m.id)
         // Find or create the host assistant message — only when the event
         // actually renders an inline block (or opens a meeting identity
@@ -435,8 +633,17 @@ export function dbMessagesToDisplay(
         // reading as the delegate's own text. With no host minted the armed
         // boundary survives to the next row, which starts its own message.
         if (block || meetingTurnAgent || evt._meeting_agent) {
+          // A second kind of the same review (agents, then commands): its
+          // line joins the first one's bubble, which holds nudge lines only.
+          const prior = displayMsgs[displayMsgs.length - 1]
+          if (nudge && prior?.role === 'assistant' && prior.blocks.length > 0
+              && prior.blocks.every((b) => nudgeNote(b) !== null)) {
+            newTurnNext = false
+            continueNext = false
+          }
           let lastAssistant = displayMsgs[displayMsgs.length - 1]
           if (newTurnNext || !lastAssistant || lastAssistant.role !== 'assistant') {
+            const above = lastAssistant
             lastAssistant = {
               id: `db-evt-${m.id}`,
               role: 'assistant',
@@ -460,9 +667,13 @@ export function dbMessagesToDisplay(
               lastAssistant.agentDisplayName = speaker?.display_name
               lastAssistant.agentColor = speaker?.color || ''
               lastAssistant.badge = 'meeting'
+            } else if (continueNext) {
+              Object.assign(lastAssistant, reviewSpeaker(above))
             }
+            if (continueNext && continuesAbove(above, lastAssistant)) lastAssistant.continuation = true
             displayMsgs.push(lastAssistant)
             newTurnNext = false
+            continueNext = false
           }
           if (block) lastAssistant.blocks.push(block)
         }
@@ -482,7 +693,8 @@ export function dbMessagesToDisplay(
               agentSlug: evt.agent || '',
               agentDisplayName: delegateAgent?.display_name,
               agentColor: delegateAgent?.color || '',
-              badge: delegateResultBadge(evt.status),
+              badge: delegateResultBadge(evt.status, evt.report_missing === true),
+              delegateCard: delegateResultCard(evt.task_id || evt.task_name, blocks),
             })
             // The response bubble belongs to the DELEGATE agent — whatever
             // follows (the delegating agent's synthesis echo) starts fresh.
@@ -590,9 +802,66 @@ export function dbMessagesToDisplay(
   return displayMsgs
 }
 
+/** A plan review's answers read from its plan row, not a card's button. */
+export const PLAN_IMPLEMENTED = 'implemented'
+export const PLAN_REVISED = 'revised'
+
+type PlanReviewBlock = Extract<MessageBlock, { type: 'plan_review' }>
+const isPlanReview = (b: MessageBlock): b is PlanReviewBlock => b.type === WIRE.PLAN_REVIEW
+
+/** Whether nothing waits on a plan review's card (a Codex plan, answered
+ *  between turns). */
+export function answeredBetweenTurns(toolInput: unknown): boolean {
+  return !!toolInput && typeof toolInput === 'object' && (toolInput as Record<string, unknown>).between_turns === true
+}
+
+/**
+ * The plan reviews the turn saved unanswered, read from the chat's plan rows
+ * (`chat_plans`, the source of truth for a card nobody waits on), so a
+ * reload, a second tab and a restart show what the live chat shows. A Codex
+ * plan's newest review stays answerable while its row is pending and an
+ * older review of the same plan reads as revised; otherwise an implemented
+ * row names the answer, and anything else (a rejected row, no row, a Claude
+ * review whose turn ended unanswered) stays cancelled.
+ */
+export function withPlanRows(messages: DisplayMessage[], plans: { filename: string; status: string }[]): DisplayMessage[] {
+  const status = new Map(plans.map((p) => [p.filename, p.status]))
+  const newest = new Map<string, string>()
+  for (const m of messages) {
+    for (const b of m.blocks) if (isPlanReview(b) && b.filename) newest.set(b.filename, b.requestId)
+  }
+  const answer = (b: PlanReviewBlock): MessageBlock => {
+    const row = b.filename ? status.get(b.filename) : undefined
+    const between = answeredBetweenTurns(b.toolInput)
+    if (between && b.filename && newest.get(b.filename) !== b.requestId) return { ...b, action: PLAN_REVISED }
+    if (row === PLAN_IMPLEMENTED) return { ...b, action: PLAN_IMPLEMENTED }
+    if (between && row !== undefined && row !== 'rejected') return { ...b, resolved: false, action: undefined }
+    return b
+  }
+  return messages.map((m) => (
+    m.blocks.some((b) => isPlanReview(b) && b.unanswered)
+      ? { ...m, blocks: m.blocks.map((b) => (isPlanReview(b) && b.unanswered ? answer(b) : b)) }
+      : m
+  ))
+}
+
+/** The live chat's earlier reviews of `filename` once a revision arrives
+ *  (unanswered, or answered with an edit): read as revised, as a reload
+ *  shows them. */
+export function reviseOlderPlanReviews(messages: DisplayMessage[], filename: string): DisplayMessage[] {
+  const older = (b: MessageBlock) => isPlanReview(b) && b.filename === filename
+    && (!b.resolved || b.action === 'edit') && answeredBetweenTurns(b.toolInput)
+  if (!filename || !messages.some((m) => m.blocks.some(older))) return messages
+  return messages.map((m) => (
+    m.blocks.some(older)
+      ? { ...m, blocks: m.blocks.map((b) => (older(b) ? { ...b, resolved: true, action: PLAN_REVISED } : b)) }
+      : m
+  ))
+}
+
 /** Data a bgcommand pill borrows from the Bash tool block it spawned from. */
 export interface BgCommandPair {
-  toolInput?: any
+  toolInput?: unknown
   toolResult?: string
   resultSummary?: string
 }
@@ -684,11 +953,81 @@ export function uiTitlesByPath(messages: DisplayMessage[]): Map<string, string> 
   return titles
 }
 
-/** Send again's prompt for the card in message `messageId`: that turn's
- *  messages, an earlier card's included (every message when it is not found). */
-export function sendAgainPrompt(messages: DisplayMessage[], messageId: string) {
+/** What Resume sends: one short message, since the engine's own record
+ *  holds the turn (or the proxy's note of it, after an ending that lost the
+ *  session's copy). The proxy knows the sentence (`wire_events.RESUME_TEXT`),
+ *  so a second Resume still carries the prompt that started the work. */
+export const RESUME_TEXT = 'Continue from where you stopped.'
+
+/** The endings whose card offers Resume once the turn had started. */
+const RESUME_REASONS: ReadonlySet<string> = new Set(['error', 'exited', 'silent', 'lost', 'restarted'])
+/** The endings that lose the engine's copy of the turn (`TurnEnding.abort_stamps`):
+ *  Resume carries the turn's saved attachments again, since the proxy's note
+ *  holds text alone (a duplicate is harmless when the session kept them). */
+const RESUME_WITH_ATTACHMENTS: ReadonlySet<string> = new Set(['exited', 'silent', 'lost'])
+/** Blocks that are not the agent's work: a notice, the closing metadata, a
+ *  person's attachments. */
+const WORKLESS_BLOCKS: ReadonlySet<string> = new Set([WIRE.SYSTEM, WIRE.METADATA, 'image_attachments', 'file_attachments'])
+
+/** The turn-ended card of a bubble, if it has one. */
+export function turnEndedCard(m: DisplayMessage): SystemBlock | undefined {
+  return m.blocks.find((b): b is SystemBlock => b.type === WIRE.SYSTEM && b.subtype === SYSTEM_SUBTYPE.TURN_ENDED)
+}
+
+/** Whether the turn a card ended had started: an assistant block that is
+ *  work (text, a note, a tool, thinking, a plan, a ui) in the span from the
+ *  card's bubble back to the message that started the turn, over the
+ *  messages steered into it and the assistant bubbles not finished (the
+ *  walk of `openTurnBubbles`); an earlier finished bubble or a delegate
+ *  card belongs to the previous turn. */
+export function turnHadWork(messages: DisplayMessage[], cardMessageId: string): boolean {
+  const at = messages.findIndex((m) => m.id === cardMessageId)
+  if (at < 0) return false
+  for (let i = at; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role !== 'assistant') {
+      if (m.steered) continue
+      return false
+    }
+    if (i < at && (m.delegateCard || finishedBubble(m))) return false
+    if (m.blocks.some((b) => !WORKLESS_BLOCKS.has(b.type))) return true
+  }
+  return false
+}
+
+export interface SendAgainAction {
+  kind: 'resume' | 'again'
+  text: string
+  images: PendingImage[]
+  files: PendingFile[]
+}
+
+/** What the turn-ended card in message `messageId` sends. Resume (one short
+ *  message, plus the turn's saved attachments after an ending that lost the
+ *  session's copy) when the turn had started and its ending allows it; Send
+ *  again (that turn's messages verbatim, an earlier card's included) for a
+ *  message that met a stopped engine or a turn that never started; nothing
+ *  for a decline, a limit, or a restart that cut nothing. */
+export function sendAgainAction(messages: DisplayMessage[], messageId: string): SendAgainAction | null {
   const at = messages.findIndex((m) => m.id === messageId)
-  return lastTurnPrompt(at >= 0 ? messages.slice(0, at + 1) : messages)
+  if (at < 0) return null
+  const reason = turnEndedCard(messages[at])?.reason
+  if (!reason) return null
+  const turn = messages.slice(0, at + 1)
+  if (RESUME_REASONS.has(reason) && turnHadWork(messages, messageId)) {
+    const kept = RESUME_WITH_ATTACHMENTS.has(reason) ? lastTurnPrompt(turn) : null
+    return { kind: 'resume', text: RESUME_TEXT, images: kept?.images ?? [], files: kept?.files ?? [] }
+  }
+  if (!RESEND_REASONS.has(reason)) return null
+  const again = lastTurnPrompt(turn)
+  return again && { kind: 'again', ...again }
+}
+
+/** The card's button for the bubble `m`, or none: the list reads it per
+ *  bubble that carries a card. */
+export function sendAgainKind(messages: DisplayMessage[], m: DisplayMessage): SendAgainAction['kind'] | undefined {
+  if (!turnEndedCard(m)) return undefined
+  return sendAgainAction(messages, m.id)?.kind
 }
 
 /** What the turn-ended card's Send again sends: the person's messages of
@@ -733,4 +1072,53 @@ export function lastTurnPrompt(messages: DisplayMessage[]):
   }
   if (!text && !images.length && !files.length) return null
   return { text, images, files }
+}
+
+/** An agent's reply, the thing a person may report: never a person's
+ *  message, nor another agent's prompt shown as an agent's bubble. */
+export function isAgentReply(m: DisplayMessage): boolean {
+  return m.role === 'assistant'
+}
+
+/** A bubble built from stored rows is named by its first row
+ *  (`dbMessagesToDisplay`): `db-<id>`, `db-evt-<id>`, `db-delresult-<id>`. */
+const STORED_BUBBLE = /^db-(?:evt-|delresult-)?(\d+)$/
+
+/** The first stored row of a bubble the history built, else null: every
+ *  other id is a bubble the page streamed, kept until the chat reloads. */
+export function storedRowId(messageId: string): number | null {
+  const m = STORED_BUBBLE.exec(messageId)
+  return m ? Number(m[1]) : null
+}
+
+/** A reply's answer as the person read it, for comparing a streamed bubble
+ *  with the same reply built from its rows: the text without the progress
+ *  notes, with no spacing (the two join their pieces differently). */
+function answerKey(m: DisplayMessage): string {
+  return m.blocks
+    .flatMap((b) => (b.type === WIRE.TEXT && !b.note ? [b.content] : []))
+    .join('')
+    .replace(/\s+/g, '')
+}
+
+/** A bubble whose reply is whole: built from stored rows, or its turn's
+ *  metadata arrived. */
+function completeReply(m: DisplayMessage): boolean {
+  return storedRowId(m.id) !== null || m.blocks.some((b) => b.type === WIRE.METADATA)
+}
+
+/** The first stored row of the streamed reply `messages[index]`, found
+ *  among `rows` (the chat's newest, oldest first): the stored reply with the
+ *  same answer at the same place from the end among equal answers (a later
+ *  equal reply still being written is not stored yet, so it does not count).
+ *  Null when it is not there (not stored yet, or it reads differently):
+ *  never a guess. */
+export function findStoredReply(messages: DisplayMessage[], index: number, rows: DbMessageRow[]): number | null {
+  const key = answerKey(messages[index])
+  if (!key) return null
+  const twinsAfter = messages.slice(index + 1)
+    .filter((m) => isAgentReply(m) && completeReply(m) && answerKey(m) === key).length
+  const stored = dbMessagesToDisplay(rows, undefined).filter((m) => isAgentReply(m) && answerKey(m) === key)
+  const match = stored[stored.length - 1 - twinsAfter]
+  return match ? storedRowId(match.id) : null
 }

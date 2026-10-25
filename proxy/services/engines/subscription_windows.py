@@ -38,9 +38,14 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
-from core.execution_layer import Scoped, Window, WindowSpec, Windows
+import httpx
+import psycopg
+from cryptography.fernet import InvalidToken
+
 from core.background import spawn
+from core.execution_layer import Scoped, Window, Windows, WindowSpec
 
 logger = logging.getLogger("otodock.subscription-windows")
 
@@ -169,8 +174,10 @@ def sample_window(row: dict, key: str) -> Window | None:
         if pct is None:
             return None
         return Window(float(pct), _iso_dt(row.get(f"{key}_resets_at")))
-    data = row.get("data") if isinstance(row.get("data"), dict) else {}
-    extra = data.get("windows") if isinstance(data.get("windows"), dict) else {}
+    raw_data = row.get("data")
+    data = raw_data if isinstance(raw_data, dict) else {}
+    raw_windows = data.get("windows")
+    extra = raw_windows if isinstance(raw_windows, dict) else {}
     entry = extra.get(key)
     if not isinstance(entry, dict):
         return None
@@ -181,7 +188,8 @@ def sample_window(row: dict, key: str) -> Window | None:
 
 
 def from_row(row: dict, specs: dict[str, WindowSpec]) -> Windows:
-    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    raw_data = row.get("data")
+    data = raw_data if isinstance(raw_data, dict) else {}
     w = Windows(
         specs=specs,
         observed_at=_iso_dt(row.get("observed_at")) or datetime.now(timezone.utc),
@@ -368,7 +376,7 @@ def is_enabled() -> bool:
         from storage import database as task_store
         raw = str(task_store.get_platform_setting(SETTING_KEY) or "").strip().lower()
         enabled = raw not in ("0", "false", "no", "off")
-    except Exception:
+    except (ImportError, psycopg.Error):
         enabled = True
     with _setting_lock:
         _setting_cache = (now, enabled)
@@ -443,19 +451,19 @@ def record(sub_id: str, w: Windows) -> bool:
         return False
     from storage.billing import subscription_store
     before = subscription_store.latest_window_samples([sub_id]).get(sub_id)
-    was_exhausted = bool(before) and exhausted_any(effective(from_row(before, w.specs), w.observed_at))
+    was_exhausted = bool(before) and exhausted_any(effective(from_row(cast("dict", before), w.specs), w.observed_at))
     written = subscription_store.insert_window_sample(sub_id, **to_row(w))
     now_reading = effective(w, w.observed_at)
     if written and not was_exhausted and exhausted_any(now_reading):
         try:
             from services.engines import subscription_pool
             subscription_pool.schedule_rebalance("window exhausted")
-        except Exception:
+        except (ImportError, RuntimeError):
             logger.debug("windows: rebalance scheduling failed", exc_info=True)
     try:
         from services.engines import subscription_pool
         subscription_pool.clear_rests_with_headroom(sub_id, now_reading)
-    except Exception:
+    except (ImportError, psycopg.Error):
         logger.debug("windows: rest check failed", exc_info=True)
     return written
 
@@ -470,8 +478,8 @@ def record_for_session(session_id: str, w: Windows) -> bool:
         return False
     try:
         return record(sub_id, w)
-    except Exception:
-        logger.warning(f"windows: recording for session {session_id[:8]} failed", exc_info=True)
+    except psycopg.Error:
+        logger.warning("windows: recording for session %s failed", session_id[:8], exc_info=True)
         return False
 
 
@@ -487,7 +495,7 @@ def record_for_session_async(session_id: str, w: Windows) -> None:
     async def _run() -> None:
         try:
             await asyncio.to_thread(record_for_session, session_id, w)
-        except Exception:
+        except psycopg.Error:
             logger.debug("windows: async record failed", exc_info=True)
 
     spawn(_run(), name="record_for_session", owner="subscription_windows")
@@ -516,7 +524,7 @@ def _user_agent() -> str:
     try:
         import config as app_config
         version = getattr(app_config, "PINNED_OTODOCK_VERSION", "") or "0.0.0"
-    except Exception:
+    except ImportError:
         version = "0.0.0"
     return f"OtoDock/{version}"
 
@@ -525,14 +533,14 @@ def _air_gapped() -> bool:
     try:
         import config as app_config
         return bool(getattr(app_config, "OTODOCK_AIR_GAPPED", False))
-    except Exception:
+    except ImportError:
         return False
 
 
 def _backed_off(sub_id: str, now: float) -> bool:
     with _poll_lock:
         entry = _backoff.get(sub_id)
-    return bool(entry) and now < entry[0]
+    return bool(entry) and now < cast("tuple[float, float]", entry)[0]
 
 
 def _note_failure(sub_id: str, now: float) -> None:
@@ -589,7 +597,7 @@ async def poll_one(sub: dict, client, *, now: float | None = None) -> bool:
     from storage.billing import subscription_store
     try:
         cred = await asyncio.to_thread(subscription_store.get_credential_data, sub_id)
-    except Exception:
+    except (psycopg.Error, InvalidToken, ValueError):
         logger.debug("windows: credential read failed for %s", sub_id[:8], exc_info=True)
         _note_failure(sub_id, now)
         return False
@@ -602,7 +610,7 @@ async def poll_one(sub: dict, client, *, now: float | None = None) -> bool:
         resp = await client.get(url, headers=headers, timeout=_POLL_TIMEOUT_S)
         status = int(getattr(resp, "status_code", 0) or 0)
         payload = resp.json() if status == 200 else None
-    except Exception as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         logger.info("windows: poll of %s failed: %s", sub_id[:8], type(exc).__name__)
         _note_failure(sub_id, now)
         return False
@@ -624,14 +632,16 @@ async def poll_one(sub: dict, client, *, now: float | None = None) -> bool:
     _note_success(sub_id)
     try:
         return await asyncio.to_thread(record, sub_id, windows)
-    except Exception:
+    except psycopg.Error:
         logger.warning("windows: recording the poll for %s failed", sub_id[:8], exc_info=True)
         return False
 
 
 def _new_client():
-    import httpx
-    return httpx.AsyncClient(timeout=_POLL_TIMEOUT_S)
+    """One client for the engines' usage endpoints, public vendor hosts all:
+    checked at the dial (``pinned_http``)."""
+    from services.infra import pinned_http
+    return pinned_http.checked_pool(pinned_http.public_only, timeout=_POLL_TIMEOUT_S)
 
 
 async def poll_due(*, client=None, now: datetime | None = None) -> int:
@@ -681,7 +691,7 @@ async def poll_due(*, client=None, now: datetime | None = None) -> int:
     try:
         cutoff = (now - timedelta(days=8)).isoformat()
         await asyncio.to_thread(subscription_store.prune_window_samples, cutoff)
-    except Exception:
+    except psycopg.Error:
         logger.debug("windows: prune failed", exc_info=True)
     return len(due)
 
@@ -707,7 +717,7 @@ def schedule_poll(sub_id: str) -> None:
                 await poll_one(sub, client)
             finally:
                 await client.aclose()
-        except Exception:
+        except Exception:  # noqa: BLE001  # a spawned connect-time poll: its error would vanish with the task
             logger.debug("windows: connect-time poll failed", exc_info=True)
 
     spawn(_run(), name="connect_time_poll", owner="subscription_windows")

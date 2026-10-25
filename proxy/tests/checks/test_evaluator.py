@@ -14,10 +14,8 @@ import pytest
 
 import config
 from auth.path_policy import SecurityContext
-from core.session import session_events as se
-from core.session import session_state
-from services.checks import documents as d
-from services.checks import evaluator, kinds
+from core.session import session_events as se, session_state
+from services.checks import documents as d, evaluator, kinds
 from storage import database as task_store
 from storage.checks import db_checks
 from storage.pg import get_conn

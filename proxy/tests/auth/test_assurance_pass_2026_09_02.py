@@ -10,13 +10,14 @@ import os
 import time
 
 import pytest
+from fastapi import HTTPException
 
 import config
 from auth.providers import (
-    UserContext, require_admin, session_iat_after_password_change,
+    UserContext,
+    require_admin,
+    session_iat_after_password_change,
 )
-from fastapi import HTTPException
-
 
 # --- require_admin rejects non-cookie principals (session-token / API key) ---
 
@@ -228,6 +229,7 @@ def test_oauth_resolve_writes_no_token_file_into_any_agent_tree(tmp_path, monkey
     writes nothing under the agents root, whatever the agent name: the file
     travels in the session's delivery route."""
     from types import SimpleNamespace
+
     import config
     from services.mcp import mcp_registry
     from services.oauth import credential_resolver as cr

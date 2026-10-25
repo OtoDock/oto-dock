@@ -1,60 +1,45 @@
-import { createContext, useContext, useState, useRef, useCallback, useMemo } from 'react'
+import { useState, useRef, useCallback, useLayoutEffect, useMemo } from 'react'
+import { type SearchContextValue, SearchContext } from './useSearch'
 
 interface RegistryEntry {
   count: number
   order: number  // explicit sort key — msgIdx * 1000 + blockIdx
 }
 
-interface SearchContextValue {
-  query: string
-  currentMatch: number          // 0-based index of active match
-  totalMatches: number
-  setCurrentMatch: (n: number) => void
-  nextMatch: () => void
-  prevMatch: () => void
-  // Match registry — each SearchHighlight block registers its count + order
-  registerMatches: (id: string, count: number, order: number) => void
-  unregisterMatches: (id: string) => void
-  // Given a block id, return its global offset (sum of counts of all blocks before it, sorted by order)
-  getGlobalOffset: (id: string) => number
-}
-
-const SearchContext = createContext<SearchContextValue>({
-  query: '',
-  currentMatch: 0,
-  totalMatches: 0,
-  setCurrentMatch: () => {},
-  nextMatch: () => {},
-  prevMatch: () => {},
-  registerMatches: () => {},
-  unregisterMatches: () => {},
-  getGlobalOffset: () => 0,
-})
-
-export function useSearch() {
-  return useContext(SearchContext)
-}
-
 export function SearchProvider({ query, children }: { query: string; children: React.ReactNode }) {
   const [currentMatch, setCurrentMatch] = useState(0)
   const [totalMatches, setTotalMatches] = useState(0)
-  const registryRef = useRef<Map<string, RegistryEntry>>(new Map())
+  // The registry belongs to the query it was filled for: a new query finds
+  // it empty. The callbacks check that, after the layout effect below has
+  // written the query; the children register in passive effects, so a
+  // fresh registration is never wiped.
+  const registryRef = useRef<{ forQuery: string; map: Map<string, RegistryEntry> }>({ forQuery: query, map: new Map() })
+  const queryRef = useRef(query)
+  useLayoutEffect(() => { queryRef.current = query })
+  const registry = useCallback(() => {
+    const r = registryRef.current
+    if (r.forQuery !== queryRef.current) {
+      r.forQuery = queryRef.current
+      r.map.clear()
+    }
+    return r.map
+  }, [])
   const flushTimerRef = useRef<number>(0)
 
   // Get entries sorted by explicit order, then by id for stability within same block
   const getSortedEntries = useCallback(() => {
-    return [...registryRef.current.entries()].sort((a, b) => {
+    return [...registry().entries()].sort((a, b) => {
       const orderDiff = a[1].order - b[1].order
       if (orderDiff !== 0) return orderDiff
       return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0
     })
-  }, [])
+  }, [registry])
 
   const flushRegistry = useCallback(() => {
     let sum = 0
-    for (const [, entry] of registryRef.current) sum += entry.count
+    for (const [, entry] of registry()) sum += entry.count
     setTotalMatches(sum)
-  }, [])
+  }, [registry])
 
   const scheduleFlush = useCallback(() => {
     cancelAnimationFrame(flushTimerRef.current)
@@ -62,17 +47,19 @@ export function SearchProvider({ query, children }: { query: string; children: R
   }, [flushRegistry])
 
   const registerMatches = useCallback((id: string, count: number, order: number) => {
-    const prev = registryRef.current.get(id)
+    const map = registry()
+    const prev = map.get(id)
     if (prev && prev.count === count && prev.order === order) return  // no change
-    registryRef.current.set(id, { count, order })
+    map.set(id, { count, order })
     scheduleFlush()
-  }, [scheduleFlush])
+  }, [registry, scheduleFlush])
 
   const unregisterMatches = useCallback((id: string) => {
-    if (!registryRef.current.has(id)) return
-    registryRef.current.delete(id)
+    const map = registry()
+    if (!map.has(id)) return
+    map.delete(id)
     scheduleFlush()
-  }, [scheduleFlush])
+  }, [registry, scheduleFlush])
 
   const getGlobalOffset = useCallback((id: string) => {
     let offset = 0
@@ -99,12 +86,11 @@ export function SearchProvider({ query, children }: { query: string; children: R
     })
   }, [totalMatches])
 
-  // Reset currentMatch when query changes
-  const prevQueryRef = useRef(query)
-  if (prevQueryRef.current !== query) {
-    prevQueryRef.current = query
+  // A new query starts at the first match (in render, on the change).
+  const [seenQuery, setSeenQuery] = useState(query)
+  if (seenQuery !== query) {
+    setSeenQuery(query)
     if (currentMatch !== 0) setCurrentMatch(0)
-    registryRef.current.clear()
   }
 
   const value = useMemo<SearchContextValue>(() => ({

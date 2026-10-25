@@ -1,6 +1,8 @@
 import { useEffect, useRef } from 'react'
-import { useSearch } from '../../contexts/SearchContext'
+
+import { POPOVER } from '../ui/classes'
 import { pushEscHandler } from '../../lib/escStack'
+import { useSearch } from '../../contexts/useSearch'
 
 interface Props {
   value: string
@@ -33,8 +35,8 @@ export default function FindBar({ value, onChange, onClose }: Props) {
   const displayIndex = totalMatches > 0 ? currentMatch + 1 : 0
 
   return (
-    <div className="absolute top-12 right-3 left-3 sm:left-auto sm:right-4 z-20 flex items-center gap-1.5 px-3 py-1.5
-                    bg-white/95 dark:bg-gray-900/95 backdrop-blur-xs border border-p-border-light rounded-lg shadow-md max-w-[calc(100vw-1.5rem)]">
+    <div className={`absolute top-12 right-3 left-3 sm:left-auto sm:right-4 z-20 flex items-center gap-1.5 px-3 py-1.5
+                    ${POPOVER} max-w-[calc(100vw-1.5rem)]`}>
       {/* Search input */}
       <input
         ref={inputRef}
@@ -43,13 +45,13 @@ export default function FindBar({ value, onChange, onClose }: Props) {
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={handleKeyDown}
         placeholder="Find in chat..."
-        className="w-44 min-w-0 shrink text-xs px-2 py-1 rounded-sm border border-p-border-light bg-white dark:bg-p-surface
-                   text-p-text placeholder:text-p-text-light
-                   focus:outline-hidden focus:ring-1 focus:ring-brand/40 focus:border-brand/40"
+        className="w-44 min-w-0 shrink text-xs px-2 py-1 rounded-control border border-strong bg-surface-card
+                   text-primary placeholder:text-tertiary
+                   focus:outline-hidden focus:ring-1 focus:ring-focus-ring/40 focus:border-action"
       />
 
       {/* Match counter */}
-      <span className="text-[11px] text-p-text-secondary whitespace-nowrap min-w-[4.5rem] text-center">
+      <span className="text-2xs text-secondary whitespace-nowrap min-w-[4.5rem] text-center">
         {value.trim() ? `${displayIndex} of ${totalMatches}` : ''}
       </span>
 
@@ -57,9 +59,9 @@ export default function FindBar({ value, onChange, onClose }: Props) {
       <button
         onClick={prevMatch}
         disabled={totalMatches === 0}
-        className="p-1 rounded-sm hover:bg-p-surface text-p-text-secondary hover:text-p-text
+        className="p-1 rounded-sm hover:bg-surface-muted text-secondary hover:text-primary
                    disabled:opacity-30 disabled:cursor-default transition-colors"
-        title="Previous match (Shift+Enter)"
+        title="Previous match: Shift+Enter"
       >
         <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
@@ -68,9 +70,9 @@ export default function FindBar({ value, onChange, onClose }: Props) {
       <button
         onClick={nextMatch}
         disabled={totalMatches === 0}
-        className="p-1 rounded-sm hover:bg-p-surface text-p-text-secondary hover:text-p-text
+        className="p-1 rounded-sm hover:bg-surface-muted text-secondary hover:text-primary
                    disabled:opacity-30 disabled:cursor-default transition-colors"
-        title="Next match (Enter)"
+        title="Next match: Enter"
       >
         <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
@@ -80,8 +82,8 @@ export default function FindBar({ value, onChange, onClose }: Props) {
       {/* Close button */}
       <button
         onClick={onClose}
-        className="p-1 rounded-sm hover:bg-p-surface text-p-text-light hover:text-p-text transition-colors"
-        title="Close (Escape)"
+        className="p-1 rounded-sm hover:bg-surface-muted text-tertiary hover:text-primary transition-colors"
+        title="Close: Escape"
       >
         <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />

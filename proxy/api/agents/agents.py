@@ -11,25 +11,31 @@ Auth: API key (server-to-server) OR OAuth2 session cookie (dashboard users)."""
 import asyncio
 import logging
 import shutil
+from typing import Any
 
+import psycopg
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 
 import config
-from core import placement
+from api.agents._router import router
+from auth import roles
 from auth.providers import (
-    UserContext, get_current_user, require_admin, require_auth, require_creator, require_write,
+    UserContext,
+    get_current_user,
+    require_admin,
+    require_auth,
+    require_creator,
+    require_write,
     session_bound_to,
 )
-from storage.agents import agent_store
-from storage import database as task_store
-
-from api.agents._common import _get_execution_paths
-from api.agents._router import router
-from core.session import session_kind
-from auth import roles
-from core import layout
+from core import layout, placement
 from core.background import spawn
+from core.session import session_kind
+from services.infra.path_confinement import PathOutsideRoot
+from storage import database as task_store
+from storage.agents import agent_store
+from storage.agents.agent_store import _get_execution_paths
 
 logger = logging.getLogger("otodock.agents")
 
@@ -45,12 +51,19 @@ def _engine_label(execution_path: str) -> str:
 # Section route modules — imported for their ``@router`` registrations. ORDER
 # MATTERS: discovery -> files -> user-context, then the CRUD routes below, to
 # reproduce the original route-declaration order.
-from api.agents import discovery as _discovery
-from api.agents import files as _files
-from api.agents import user_context as _user_context
-from api.agents import activity as _activity
-from api.agents import knowledge_libraries as _knowledge_libraries
-from core.execution_layer import DEFAULT_EXECUTION_PATH
+from api.agents import (
+    discovery as _discovery,
+    files as _files,
+    user_context as _user_context,
+)
+
+# isort: split
+# (the sections above register their routes first)
+from api.agents import (
+    activity as _activity,
+    knowledge_libraries as _knowledge_libraries,
+)
+from storage.agents.schema import DEFAULT_EXECUTION_PATH
 
 # Backwards-compatible re-exports: api.media.* and the test-suite import these
 # helpers/handlers from ``api.agents.agents``.
@@ -155,12 +168,18 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
         raise HTTPException(400, "Slug must be at least 2 characters")
     # Re-sanitize even if provided
     slug = agent_store.sanitize_slug(slug)
+    refusal = agent_store.reserved_slug_refusal(slug)
+    if refusal:
+        raise HTTPException(400, refusal)
 
     # Check uniqueness
     if agent_store.agent_exists(slug):
         raise HTTPException(409, f"Agent '{slug}' already exists")
 
-    agent_dir = config.AGENTS_DIR / slug
+    try:
+        agent_dir = config.get_agent_dir(slug)
+    except PathOutsideRoot:
+        raise HTTPException(400, "This slug cannot name an agent folder.") from None
     if agent_dir.exists():
         raise HTTPException(409, f"Agent directory '{slug}' already exists on disk")
 
@@ -224,10 +243,12 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
         persona_file = agent_dir / layout.CONFIG / "agent.md"
         persona_file.write_text(f"# {req.display_name}\n\n")
     except Exception as e:
-        # Clean up on failure
+        logger.exception("Creating the folder of agent %s failed", slug)
         if agent_dir.exists():
             shutil.rmtree(agent_dir, ignore_errors=True)
-        raise HTTPException(500, f"Failed to create agent directory: {e}")
+        raise HTTPException(
+            500, "Could not create the agent's files. The server log has the details.",
+        ) from e
 
     # Insert DB record
     try:
@@ -245,8 +266,11 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
             collaborative=req.collaborative,
         )
     except Exception as e:
+        logger.exception("Saving the record of agent %s failed", slug)
         shutil.rmtree(agent_dir, ignore_errors=True)
-        raise HTTPException(500, f"Failed to create agent record: {e}")
+        raise HTTPException(
+            500, "Could not save the new agent. The server log has the details.",
+        ) from e
 
     # Auto-assign core MCPs. ``exclude_from`` values (``phone``, ``task``) are
     # session-time filters and don't affect assignment — they're handled in
@@ -254,9 +278,9 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
     from services.mcp import mcp_registry
     try:
         await asyncio.to_thread(mcp_registry.assign_core_mcps, slug)
-    except Exception as exc:
+    except psycopg.Error as exc:
         # Non-critical
-        logger.debug(f"Seeding core MCPs/skills for new agent {slug} failed: {exc}")
+        logger.debug("Seeding core MCPs/skills for new agent %s failed: %s", slug, exc)
 
     # The creator manages the new agent. One additive insert: rewriting the
     # person's whole role list here would undo an admin's concurrent change.
@@ -265,9 +289,9 @@ async def create_agent(req: CreateAgentRequest, user: UserContext = Depends(get_
         await asyncio.to_thread(task_store.add_user_agent, u.sub, slug, roles.MANAGER, u.sub)
         from services.notifications.notification_manager import invalidate_audience
         invalidate_audience(slug)
-    except Exception as exc:
+    except (ImportError, psycopg.Error) as exc:
         # Non-critical
-        logger.debug(f"Assigning creator as manager of new agent {slug} failed: {exc}")
+        logger.debug("Assigning creator as manager of new agent %s failed: %s", slug, exc)
 
     return agent
 
@@ -289,6 +313,57 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
     if req.admin_only and not u.is_admin:
         raise HTTPException(403, "Only admins can set admin-only flag")
 
+    for check in _UPDATE_CHECKS:
+        await check(name, req, u)
+
+    _req_default_scope = getattr(req, "default_scope", None)
+    switch = await _shared_only_switch(
+        name, u, getattr(req, "collaborative", None), _req_default_scope,
+        getattr(req, "confirm_removals", None))
+
+    fields = req.model_dump(exclude_none=True)
+    fields.pop("confirm_removals", None)
+    if switch is not None and switch["clear_default"]:
+        # The new-user default follows the rule with the mode, in the same write.
+        fields["default_for_new_users_role"] = ""
+    # Keep the PRIMARY execution layer consistent with the default model whenever
+    # EITHER is updated. A no-picker session/task uses (primary layer + default
+    # model), and a model only runs on its OWN layer (e.g. gpt-6.1-sol is codex-cli-
+    # only), so a mismatch makes delegated/no-picker runs hard-reject the model
+    # (the personal-assistant delegate bug). resolve_execution_path reads the
+    # scalar `execution_path`, so reconciling it here is what fixes those runs.
+    # We MUST handle a default_model-only change too: the UI sends just
+    # default_model when the layer checkboxes didn't change, which would
+    # otherwise leave a stale primary that can't run the new model.
+    if "execution_paths" in fields or "default_model" in fields:
+        _reconcile_primary_layer(name, fields)
+
+    # Route execution-target changes through remote_store so BOTH stores stay
+    # in lockstep: `agents.execution_target` (what the resolver reads) AND
+    # `agent_remote_targets` (what the admin Remote Machines page lists).
+    # Writing only the column here left the machine's agent list blind to
+    # assignments made from Agent Settings — the same agent could then be
+    # "added again" from the machine page. The store helpers write both.
+    if "execution_target" in fields:
+        await _move_execution_target(name, fields, u)
+        if not fields:
+            return agent_store.get_agent(name)
+    if not fields:
+        return agent_store.get_agent(name)
+
+    result = await asyncio.to_thread(agent_store.update_agent, name, **fields)
+    if not result:
+        raise HTTPException(404, "Agent not found")
+    await _after_update(name, fields, result)
+    if switch is not None:
+        result = dict(result)
+        result["shared_only_switch"] = await _finish_shared_only_switch(name, u, switch)
+    return result
+
+
+async def _check_engines(name: str, req: UpdateAgentRequest, u: UserContext) -> None:
+    """The engines: known ones, at least one, and a newly added one
+    connected on the platform (a cookie admin excepted)."""
     from core.session.session_manager import valid_execution_paths
     valid_paths = valid_execution_paths()
 
@@ -323,6 +398,9 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
                         "connected on this platform",
                     )
 
+
+async def _check_scope_and_effort(name: str, req: UpdateAgentRequest, u: UserContext) -> None:
+    """The default scope's two words and the default effort."""
     # ``getattr`` defends against test mocks that don't declare every
     # optional field on their ``_Req`` subclass.
     _req_default_scope = getattr(req, "default_scope", None)
@@ -330,6 +408,9 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
         raise HTTPException(400, "default_scope must be 'user' or 'agent'")
     _check_default_effort(getattr(req, "default_effort", None))
 
+
+async def _check_execution_mode(name: str, req: UpdateAgentRequest, u: UserContext) -> None:
+    """A default execution mode the agent's model and engines can run."""
     # Per-agent default execution mode. Only meaningful for CLI execution
     # layers — reject when the agent's default model only runs on direct-llm
     # (which can't run the interactive TUI).
@@ -362,6 +443,10 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
                     f"({' or '.join(sorted(_pty_layers))}) that this agent uses.",
                 )
 
+
+async def _check_execution_target(name: str, req: UpdateAgentRequest, u: UserContext) -> None:
+    """A remote default target: an admin's, an admin-paired machine, an engine
+    that runs on a satellite."""
     # Validate execution_target
     if req.execution_target is not None and not placement.is_local(req.execution_target):
         # Per-user satellite isolation: setting an agent's default
@@ -372,8 +457,8 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
         if not u.is_admin:
             raise HTTPException(
                 403,
-                "Only admins can set an agent's default remote execution target. "
-                "Use User Settings → Remote Machines to set a personal override instead.",
+                "Only an admin can choose where this agent runs for everyone. "
+                "You can choose your own machine in User Settings, Remote Machines.",
             )
         from storage import remote_store
         machine = remote_store.get_remote_machine(req.execution_target)
@@ -395,6 +480,9 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
         if _ec is not None and not _ec.runtime.supports_remote_execution:
             raise HTTPException(400, f"{_ec.display_name} agents always run locally")
 
+
+async def _check_department(name: str, req: UpdateAgentRequest, u: UserContext) -> None:
+    """A department and its level, set together, by an admin or a creator."""
     # Department assignment (agents map). The endpoint gate above
     # (can_manage_agent) still applies — this field gate NARROWS within it,
     # same layering as execution_target: a manager reaches the endpoint and is
@@ -438,73 +526,62 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
                     400, "Level does not belong to that department"
                 )
 
-    switch = await _shared_only_switch(
-        name, u, getattr(req, "collaborative", None), _req_default_scope,
-        getattr(req, "confirm_removals", None))
 
-    fields = req.model_dump(exclude_none=True)
-    fields.pop("confirm_removals", None)
-    if switch is not None and switch["clear_default"]:
-        # The new-user default follows the rule with the mode, in the same write.
-        fields["default_for_new_users_role"] = ""
-    # Keep the PRIMARY execution layer consistent with the default model whenever
-    # EITHER is updated. A no-picker session/task uses (primary layer + default
-    # model), and a model only runs on its OWN layer (e.g. gpt-6.1-sol is codex-cli-
-    # only), so a mismatch makes delegated/no-picker runs hard-reject the model
-    # (the personal-assistant delegate bug). resolve_execution_path reads the
-    # scalar `execution_path`, so reconciling it here is what fixes those runs.
-    # We MUST handle a default_model-only change too: the UI sends just
-    # default_model when the layer checkboxes didn't change, which would
-    # otherwise leave a stale primary that can't run the new model.
-    if "execution_paths" in fields or "default_model" in fields:
-        import json
-        existing = agent_store.get_agent(name) or {}
-        if "execution_paths" in fields:
-            paths = list(fields.pop("execution_paths"))
+# update_agent's field checks in the order they run; each raises on its
+# first refusal, so the first check that fails answers the request.
+_UPDATE_CHECKS = (
+    _check_engines,
+    _check_scope_and_effort,
+    _check_execution_mode,
+    _check_execution_target,
+    _check_department,
+)
+
+
+def _reconcile_primary_layer(name: str, fields: dict) -> None:
+    """Keep the primary engine one that runs the default model (see above)."""
+    import json
+    existing = agent_store.get_agent(name) or {}
+    if "execution_paths" in fields:
+        paths = list(fields.pop("execution_paths"))
+    else:
+        paths = _get_execution_paths(existing)  # current enabled set [primary, …]
+    primary = paths[0] if paths else (
+        existing.get("execution_path") or DEFAULT_EXECUTION_PATH)
+    dm = fields.get("default_model") or existing.get("default_model", "")
+    if dm:
+        dm_layers = config.get_model_layers(dm)
+        # The frontend sends execution_paths in checkbox order, which need not
+        # put the default model's layer first — so if the primary can't run
+        # the default model, promote the model's layer (if it's enabled).
+        if dm_layers and primary not in dm_layers:
+            promoted = next((p for p in paths if p in dm_layers), "")
+            if promoted:
+                primary = promoted
+    if paths:
+        fields["execution_path"] = primary
+        additional = [p for p in paths if p != primary]
+        fields["execution_paths"] = json.dumps(additional) if additional else ""
+
+
+async def _move_execution_target(name: str, fields: dict, u: UserContext) -> None:
+    """Take ``execution_target`` out of the write and route the change
+    through the remote store, which keeps both of its records in step."""
+    from storage import remote_store
+    _target = fields.pop("execution_target")
+    current = (agent_store.get_agent(name) or {}).get("execution_target") or placement.LOCAL
+    if _target != current:
+        if placement.is_local(_target):
+            await asyncio.to_thread(remote_store.remove_agent_remote_target, name)
         else:
-            paths = _get_execution_paths(existing)  # current enabled set [primary, …]
-        primary = paths[0] if paths else (
-            existing.get("execution_path") or DEFAULT_EXECUTION_PATH)
-        dm = fields.get("default_model") or existing.get("default_model", "")
-        if dm:
-            dm_layers = config.get_model_layers(dm)
-            # The frontend sends execution_paths in checkbox order, which need not
-            # put the default model's layer first — so if the primary can't run
-            # the default model, promote the model's layer (if it's enabled).
-            if dm_layers and primary not in dm_layers:
-                promoted = next((p for p in paths if p in dm_layers), "")
-                if promoted:
-                    primary = promoted
-        if paths:
-            fields["execution_path"] = primary
-            additional = [p for p in paths if p != primary]
-            fields["execution_paths"] = json.dumps(additional) if additional else ""
+            await asyncio.to_thread(
+                remote_store.set_agent_remote_target, name, _target, u.sub,
+            )
 
-    # Route execution-target changes through remote_store so BOTH stores stay
-    # in lockstep: `agents.execution_target` (what the resolver reads) AND
-    # `agent_remote_targets` (what the admin Remote Machines page lists).
-    # Writing only the column here left the machine's agent list blind to
-    # assignments made from Agent Settings — the same agent could then be
-    # "added again" from the machine page. The store helpers write both.
-    if "execution_target" in fields:
-        from storage import remote_store
-        _target = fields.pop("execution_target")
-        current = (agent_store.get_agent(name) or {}).get("execution_target") or placement.LOCAL
-        if _target != current:
-            if placement.is_local(_target):
-                await asyncio.to_thread(remote_store.remove_agent_remote_target, name)
-            else:
-                await asyncio.to_thread(
-                    remote_store.set_agent_remote_target, name, _target, u.sub,
-                )
-        if not fields:
-            return agent_store.get_agent(name)
-    if not fields:
-        return agent_store.get_agent(name)
 
-    result = await asyncio.to_thread(agent_store.update_agent, name, **fields)
-    if not result:
-        raise HTTPException(404, "Agent not found")
+async def _after_update(name: str, fields: dict, result: dict) -> None:
+    """What the written fields set off: the department edges recompiled, a
+    Shared-only agent's personal-machine overrides dropped."""
     # Membership changed → the department edge set changed with it.
     if "department_id" in fields or "department_level_id" in fields:
         from services.departments import edge_compiler
@@ -529,10 +606,6 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
                     "agent %s → shared-only: cleared %d personal-machine remote "
                     "override(s)", name, removed,
                 )
-    if switch is not None:
-        result = dict(result)
-        result["shared_only_switch"] = await _finish_shared_only_switch(name, u, switch)
-    return result
 
 
 async def _shared_only_switch(name: str, u: UserContext, collaborative: bool | None,
@@ -558,8 +631,8 @@ async def _shared_only_switch(name: str, u: UserContext, collaborative: bool | N
         return None
     people = await asyncio.to_thread(som.below_editor_members, name)
     default = stored.get("default_for_new_users_role") or ""
-    switch = {"subs": [p["sub"] for p in people],
-              "clear_default": bool(default) and not roles.allowed_on_shared_only(default)}
+    switch: dict[str, Any] = {"subs": [p["sub"] for p in people],
+                              "clear_default": bool(default) and not roles.allowed_on_shared_only(default)}
     if not people:
         return switch
     if u.is_api_key:
@@ -659,6 +732,10 @@ async def delete_agent(name: str, req: DeleteAgentRequest, user: UserContext = D
 
     if not agent_store.agent_exists(name):
         raise HTTPException(404, "Agent not found")
+    try:
+        agent_dir = config.get_agent_dir(name)
+    except PathOutsideRoot:
+        raise HTTPException(404, "Agent not found") from None
 
     # Best-effort vendor DELETE for any service-scope webhook
     # subscriptions bound to this agent. Must run BEFORE agent_store.delete_agent
@@ -706,16 +783,15 @@ async def delete_agent(name: str, req: DeleteAgentRequest, user: UserContext = D
     # config + Claude/Codex session files) AND the recover-bin tree, which lives
     # OUTSIDE the agent folder (under RECOVER_BIN_DIR/<slug>/) so the rmtree below
     # doesn't reach it. delete_agent already dropped the recover_bin metadata rows.
-    agent_dir = config.AGENTS_DIR / name
     if agent_dir.exists():
         try:
             shutil.rmtree(agent_dir)
-        except Exception as e:
+        except OSError as e:
             logger.warning("Failed to remove agent directory %s: %s", name, e)
     try:
         from storage.files import recover_bin_store
         await asyncio.to_thread(recover_bin_store.remove_agent_files, name)
-    except Exception as e:
+    except (ImportError, OSError) as e:
         logger.warning("Failed to remove recover-bin files for %s: %s", name, e)
 
     return {"status": "deleted", "slug": name}
@@ -767,7 +843,7 @@ async def get_chat_detail(
     owner, an admin, an assigned user for a Shared-only agent's shared
     history or an agent-scope task run, a manager for a phone conversation.
     """
-    from api.agents.chats import can_access_chat
+    from core.session.visibility import can_access_chat
     u = require_auth(user)
     chat = await asyncio.to_thread(task_store.get_chat, chat_id)
     if not chat:

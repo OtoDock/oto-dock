@@ -121,6 +121,14 @@ the static checks — a failure is reported with its file and line,
 warnings are not); an `mcp_tool` action may name an MCP that `mcps.json`
 or the app's own `requires.mcps` lists.
 
+An app may also declare `files.create`: a folder the platform makes once
+the app's release is approved. The app-authoring skill's "A folder the app
+needs" says how. For an `apps/` app it lands in the new agent's workspace.
+For a `user-apps/` app it lands in each member's own workspace when their
+copy is approved. A template with such an app sets `"platform_min_version":
+"1.9.0"` in `agent.json`, since an older platform refuses the app. An
+export method floored at `contributor` needs the same.
+
 **Consent is a person's, never yours.** A catalog install carries the
 installer's checkbox; `create_agent` carries none. So apps you ship land
 deployed but **waiting for approval** on their cards (a manager approves a
@@ -171,6 +179,11 @@ consent, so every check you ship lands offered. Ship a check only when
 the agent's work has a rule a script or a rubric can hold it to; a check
 runs on every turn it applies to.
 
+A template whose agents build apps with a server ships the judge check
+`app-server-review` as `checks/app-server-review/check.json`. It reads the
+server code on each turn that changes it. Its document is in the
+app-authoring skill under "Guard what the server does".
+
 ## `agent.json`
 
 ```json
@@ -198,8 +211,9 @@ Optional, and worth a deliberate choice:
 | `category` | `productivity` / `infrastructure` / `creative` / `research` / `customer-support` / `experimental`. |
 | `tags` | Lowercase, searchable. |
 
-Never pin an engine or model — the platform picks what is connected and the
-user can change it later. `default_for_new_users` is admin-only on locally
+Never pin an engine or model for the agent — the platform picks what is
+connected and the user can change it later (one task may pin its own:
+`tasks.json` below). `default_for_new_users` is admin-only on locally
 authored templates; if you set it as a creator it is ignored and reported.
 
 ## `agent.md` — the persona
@@ -288,6 +302,24 @@ changes it); a user-scope task fires in that user's own zone. Never encode
 a zone offset into the hour. Default new tasks to `"paused"` unless the
 user explicitly wants them live immediately — an agent that starts firing
 schedules nobody asked for is a bad first impression.
+
+A task can say how it runs and who hears about it (platform 1.9 and later;
+an older platform installs the task without these):
+
+- `notification_mode` — `"manual"` (the default: the task's agent sends its
+  own notification with the results), `"auto"` (a plain "task complete"
+  notice) or `"none"`. A digest people read wants `manual`; a silent
+  housekeeping job wants `none`.
+- `override_model` (a model id such as `claude-fable-5-1`) and `layer` (an
+  engine id such as `claude-code-cli`) — the one exception to "never pin a
+  model": a task that needs a stronger or a cheaper model than the agent's
+  own work (a cheap default agent with one judgement-heavy weekly brief).
+  The installed agent must be able to run the pair: a layer holds only when
+  it is the engine the install enabled, so prefer a model pin alone (it runs
+  on the agent's engine). `list_building_blocks` lists this install's
+  engines, which one an install picks and the model ids each takes. A pin
+  the agent cannot run is dropped at install, the task runs on the agent's
+  default, and `create_agent` lists it.
 
 `triggers.json` is the same shape without a schedule (fired by webhook, so
 default them paused — the upstream system needs the URL first).

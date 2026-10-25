@@ -8,8 +8,59 @@ CPU/RAM. Pure functions over os / platform / psutil; no SessionManager state.
 """
 import os
 import re
+import time
 from pathlib import Path
+
 from .. import config
+
+# A monotonic gap this much shorter than the sleep clock's gap means the
+# system slept (the monotonic clock stops in suspend, the sleep clock does
+# not); a gap the two clocks share is a daemon that did not run.
+_SLEEP_EXCESS_S = 10.0
+
+
+def sleep_clock() -> float | None:
+    """A clock in seconds that keeps counting while the system sleeps, for
+    telling a suspend from a starved daemon beside ``time.monotonic()`` (which
+    stops in suspend on Linux and macOS): ``CLOCK_BOOTTIME`` on Linux,
+    ``CLOCK_MONOTONIC`` on macOS (Apple's counts sleep; Python's
+    ``monotonic()`` there is mach absolute time and does not). ``None`` where
+    the host has no second clock: Windows, whose monotonic clock itself runs
+    through a sleep (so would the wall clock, and a time step there would
+    read as a sleep), and a Linux without ``CLOCK_BOOTTIME``."""
+    name = config.HOST.name
+    if name == config.LINUX and hasattr(time, "CLOCK_BOOTTIME"):
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    if name == config.DARWIN and hasattr(time, "CLOCK_MONOTONIC"):
+        return time.clock_gettime(time.CLOCK_MONOTONIC)
+    return None
+
+
+def gap_is_sleep(mono_gap: float, sleep_gap: float | None) -> bool | None:
+    """Whether a late heartbeat tick was a system sleep (the sleep clock ran
+    on while the monotonic clock stood) rather than a daemon that did not run
+    (both clocks moved together: a paused host, a starved process). ``None``
+    when the host has no sleep clock: the two cannot be told apart."""
+    if sleep_gap is None:
+        return None
+    return sleep_gap - mono_gap > _SLEEP_EXCESS_S
+
+
+def late_tick_line(mono_gap: float, sleep_gap: float | None, expected_s: float) -> str:
+    """The heartbeat's reconnect line for a tick that came ``mono_gap``
+    seconds after the last one (``expected_s`` apart), naming the cause when
+    the clocks can tell it."""
+    verdict = gap_is_sleep(mono_gap, sleep_gap)
+    if verdict is None:
+        return (f"A {mono_gap:.0f}s gap between heartbeats (a sleep or a daemon that did "
+                f"not run; this host cannot tell; expected a ~{expected_s:.0f}s tick); "
+                "forcing reconnect")
+    if verdict:
+        return (f"The system slept for about {sleep_gap:.0f}s (a {mono_gap:.1f}s tick gap, "
+                f"expected ~{expected_s:.0f}s); forcing reconnect")
+    return (f"The daemon did not run for {mono_gap:.1f}s (expected a ~{expected_s:.0f}s tick; "
+            "the host was paused or the process starved, a blocked loop shows in the "
+            "watchdog's stack lines); forcing reconnect")
 
 
 # XDG keys we surface. Linux's `XDG_DOWNLOAD_DIR` (singular) is renamed to
@@ -155,24 +206,21 @@ def _detect_display() -> dict:
     host = config.HOST
     server = config.DISPLAY_NONE
     has_display = False
-    try:
-        if host.display_server:
-            # The table knows: macOS runs the satellite as a per-user
-            # LaunchAgent inside the Aqua login session (quartz), Windows as
-            # the interactive logon task (windows), a host outside the three
-            # families reports none.
-            server = host.display_server
-            has_display = server != config.DISPLAY_NONE
-        elif os.environ.get("WAYLAND_DISPLAY"):
-            # Linux is probed: systemd --user + linger boots WITHOUT a
-            # graphical session, so a headless box has neither var set →
-            # has_display stays False. A desktop login exports one of these
-            # into the user service env.
-            server, has_display = config.DISPLAY_WAYLAND, True
-        elif os.environ.get("DISPLAY"):
-            server, has_display = config.DISPLAY_X11, True
-    except Exception:
-        return {"has_display": False, "server": config.DISPLAY_NONE, "session_active_unlocked": False}
+    if host.display_server:
+        # The table knows: macOS runs the satellite as a per-user
+        # LaunchAgent inside the Aqua login session (quartz), Windows as
+        # the interactive logon task (windows), a host outside the three
+        # families reports none.
+        server = host.display_server
+        has_display = server != config.DISPLAY_NONE
+    elif os.environ.get("WAYLAND_DISPLAY"):
+        # Linux is probed: systemd --user + linger boots WITHOUT a
+        # graphical session, so a headless box has neither var set →
+        # has_display stays False. A desktop login exports one of these
+        # into the user service env.
+        server, has_display = config.DISPLAY_WAYLAND, True
+    elif os.environ.get("DISPLAY"):
+        server, has_display = config.DISPLAY_X11, True
     return {
         "has_display": has_display,
         "server": server,
@@ -203,7 +251,7 @@ def _machine_resources() -> tuple[int, int]:
     try:
         import psutil
         return (psutil.cpu_count() or 1), int(psutil.virtual_memory().total)
-    except Exception:
+    except (ImportError, OSError, RuntimeError):
         return (os.cpu_count() or 1), 0
 
 

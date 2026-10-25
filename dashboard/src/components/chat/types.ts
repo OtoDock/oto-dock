@@ -4,25 +4,28 @@ import type { DelegateBlockStatus } from '../../lib/status/run'
 // --- Types ---
 
 export type MessageBlock =
-  | { type: 'text'; content: string }
+  // `note`: a progress note, the agent's words between its steps (a Codex
+  // preamble, a Claude narration block): text for every reader, drawn faint
+  // in the steps group.
+  | { type: 'text'; content: string; note?: boolean }
   | { type: 'thinking'; content: string; collapsed: boolean; done?: boolean; tokens?: number }
-  | { type: 'tool'; name: string; toolId: string; summary: string; status: 'running' | 'done' | 'failed'; toolInput?: any; toolResult?: string; resultSummary?: string }
-  | { type: 'subagent'; description: string; subagentType: string; isActive?: boolean; failed?: boolean; _toolId?: string | null; _background?: boolean; toolInput?: any; toolResult?: string }
+  | { type: 'tool'; name: string; toolId: string; summary: string; status: 'running' | 'done' | 'failed'; toolInput?: unknown; toolResult?: string; resultSummary?: string }
+  | { type: 'subagent'; description: string; subagentType: string; isActive?: boolean; failed?: boolean; _toolId?: string | null; _background?: boolean; toolInput?: unknown; toolResult?: string }
   | { type: 'delegate'; taskName: string; agent: string; promptPreview: string; status: DelegateBlockStatus; _taskId?: string; prompt?: string; workerChatId?: string }
   // The files a delegated worker attached to its result, as they landed in
   // THIS chat's agent tree (agent-relative paths the chat can open), and the
   // ones that did not land with the proxy's reason. Rides the worker's
   // response bubble; a files-only result shows the list alone.
   | { type: 'delegate_files'; files: Array<{ path: string; bytes: number }>; skipped: Array<{ path: string; reason: string }> }
-  | { type: 'schedulewake'; prompt: string }
+  | { type: 'schedulewake'; prompt: string; source?: string }
   // A check's verdict on this turn (CHECKS.md): the compact card.
-  | { type: 'checkverdict'; check: string; status: 'pass' | 'fail' | 'error' | 'skipped'; pass: boolean; score?: number | null; summary: string; findings: Array<{ location: string; severity: string; text: string }>; findingsTotal: number; round: number; rounds: number; ranOn: string; costUsd: number; verdictId?: string }
+  | { type: 'checkverdict'; check: string; status: string; pass: boolean; score?: number | null; summary: string; findings: Array<{ location: string; severity: string; text: string }>; findingsTotal: number; round: number; rounds: number; ranOn: string; costUsd: number; verdictId?: string }
   | { type: 'bgcommand'; command: string; description?: string; isActive?: boolean; failed?: boolean; _toolId?: string | null }
   | {
       type: 'permission'
       requestId: string
       toolName: string
-      toolInput: any
+      toolInput: unknown
       description?: string
       resolved?: boolean
       approved?: boolean
@@ -33,12 +36,12 @@ export type MessageBlock =
   // which writes no user row); the renderer treats it as answered on
   // interactive chats only, since a headless turn's closing metadata block
   // follows every card.
-  | { type: 'question'; toolName: string; toolInput: any; answered?: boolean; requestId?: string; followedInTurn?: boolean }
+  | { type: 'question'; toolName: string; toolInput: unknown; answered?: boolean; requestId?: string; followedInTurn?: boolean }
   // `resolved`: a later message followed the approval card — an interactive
   // terminal's read-only hint stands down (`followedInTurn` as above).
-  | { type: 'plan'; action: 'enter' | 'exit'; toolInput?: any; superseded?: boolean; resolved?: boolean; followedInTurn?: boolean }
-  | { type: 'plan_review'; requestId: string; plan: string; toolInput: any; filename?: string; resolved?: boolean; action?: string }
-  | { type: 'system'; subtype: string; agentName?: string; agentColor?: string; message?: string; reason?: string }
+  | { type: 'plan'; action: string; toolInput?: unknown; superseded?: boolean; resolved?: boolean; followedInTurn?: boolean }
+  | { type: 'plan_review'; requestId: string; plan: string; toolInput: unknown; filename?: string; resolved?: boolean; action?: string; unanswered?: boolean }
+  | { type: 'system'; subtype: string; agentName?: string; agentColor?: string; message?: string; reason?: string; returned?: boolean; count?: number }
   | { type: 'images'; images: GalleryImage[] }
   | { type: 'video'; srcKind: 'url' | 'token'; url?: string; mediaUrl?: string; token?: string; mime?: string; caption?: string; title?: string; poster?: string }
   | { type: 'audio'; srcKind: 'url' | 'token'; url?: string; mediaUrl?: string; token?: string; mime?: string; caption?: string; title?: string }
@@ -66,4 +69,30 @@ export interface DisplayMessage {
   agentDisplayName?: string
   agentColor?: string
   badge?: string
+  /** A delegate's report (`result`) or a worker lane's incoming prompt
+   *  (`prompt`): rendered as a collapsed card (`DelegateCard`). Set by the
+   *  builders (`lib/messageBlocks.ts`, the live frame handlers), never by the
+   *  renderer; `key` is the same for the live bubble and its stored row, so
+   *  a card's open state survives the refetch that replaces one by the other. */
+  delegateCard?: DelegateCardMark
+  /** A person's message steered into the running turn (the turn went on, it
+   *  did not start over): the open turn's bubbles span it. */
+  steered?: boolean
+  /** The reply goes on from the agent's bubble above it: the review turn its
+   *  finished background work woke, or a turn's live part below its saved
+   *  rows. Drawn joined to that bubble (no header), still its own bubble.
+   *  Set by the builders (`lib/messageBlocks.ts`, the live handlers). */
+  continuation?: boolean
+}
+
+/** What the page may ask of the message list (`ChatMessages`' ref). */
+export interface ChatMessagesHandle {
+  /** Back to the newest message, following the stream again: the page's own
+   *  sends only (a frame from another tab or a delegate result never). */
+  pinToBottom: () => void
+}
+
+export interface DelegateCardMark {
+  kind: 'result' | 'prompt'
+  key: string
 }

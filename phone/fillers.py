@@ -163,7 +163,7 @@ class FillerCache:
 
             lang = key[2]
             rate = key[3] if len(key) > 3 else config.SAMPLE_RATE
-            logger.info(f"Filler cache: synthesizing {key} ...")
+            logger.info("Filler cache: synthesizing %s ...", key)
 
             self._backchannels[key] = await self._synth(
                 tts, lang, backchannel_phrases.get(lang, []), "backchannel", rate)
@@ -177,7 +177,7 @@ class FillerCache:
             self._sigs[key] = sig
             self._ready.add(key)
             total = len(self._backchannels[key]) + len(self._thinking[key])
-            logger.info(f"Filler cache: {total} clips ready for {key}")
+            logger.info("Filler cache: %s clips ready for %s", total, key)
 
     def prune(self, active_keys: set) -> None:
         """Drop cached combos no longer used by any active route.
@@ -197,7 +197,7 @@ class FillerCache:
             self._last_backchannel.pop(key, None)
             self._last_thinking.pop(key, None)
             self._ready.discard(key)
-            logger.info(f"Filler cache: pruned stale combo {key}")
+            logger.info("Filler cache: pruned stale combo %s", key)
 
     async def _synth(
         self, tts, lang: str, phrases: list[str], label: str,
@@ -213,9 +213,9 @@ class FillerCache:
                     sample_rate)
                 duration = len(pcm) / (sample_rate * config.SAMPLE_WIDTH)
                 clips.append(FillerClip(text=phrase, pcm_audio=pcm, duration_s=duration))
-                logger.debug(f"Filler: synthesized {label} [{lang}] '{phrase}' ({duration:.2f}s)")
-            except Exception as e:
-                logger.warning(f"Filler: failed to synthesize {label} '{phrase}' [{lang}]: {e}")
+                logger.debug("Filler: synthesized %s [%s] '%s' (%.2fs)", label, lang, phrase, duration)
+            except Exception as e:  # noqa: BLE001  # a TTS provider raises whatever its SDK does, the phrase is skipped
+                logger.warning("Filler: failed to synthesize %s '%s' [%s]: %s", label, phrase, lang, e)
         return clips
 
     def _pick_random(

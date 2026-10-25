@@ -19,7 +19,6 @@ from services.community import community_catalog, mcp_source_swap as swap
 from services.mcp import mcp_registry, mcp_updater
 from storage.mcp import mcp_update_state_store as store
 
-
 # ── fixtures ───────────────────────────────────────────────────────
 
 def _manifest(name="drill-mcp", runtime="node", source="npm:drill", image="",

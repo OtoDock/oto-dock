@@ -121,7 +121,7 @@ def validate_register(body: dict) -> dict:
     except (TypeError, ValueError) as e:
         if isinstance(e, ValidationError):
             raise
-        raise ValidationError("dial_event is not serializable")
+        raise ValidationError("dial_event is not serializable") from e
 
     return {
         "audiosocket_uuid": audiosocket_uuid,

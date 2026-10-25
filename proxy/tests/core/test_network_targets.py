@@ -6,10 +6,13 @@ import pytest
 
 from services.mcp import mcp_registry
 from services.mcp.mcp_registry import (
-    McpManifest, ServerConfig, NetworkTargetDecl,
-    _extract_host_port, enumerate_mcp_network_targets, network_access_enabled,
+    McpManifest,
+    NetworkTargetDecl,
+    ServerConfig,
+    _extract_host_port,
+    enumerate_mcp_network_targets,
+    network_access_enabled,
 )
-
 
 # ---------------------------------------------------------------------------
 # _extract_host_port — URL + schemeless host parsing

@@ -57,4 +57,33 @@ describe('the chat queue in the store', () => {
       byChat: Record<string, { queuedMessages: unknown[] }> }
     expect(migrated.byChat.c.queuedMessages).toEqual([{ text: 'old' }, { text: 'v2' }])
   })
+
+  it('removes and clears by id from whichever slice holds the chip', () => {
+    // A task chat viewed through a sibling run files the chip under the
+    // viewed chat; the frames that clear it name the queue's chat.
+    const st = useChatStore.getState()
+    st.addQueuedMessage('task-view', 0, { text: 'a', queueId: 'qa', queueChatId: 'task-run' })
+    st.addQueuedMessage('task-view', 1, { text: 'b', queueId: 'qb', queueChatId: 'task-run' })
+    st.addQueuedMessage('other', 0, { text: 'c', queueId: 'qc' })
+    expect(useChatStore.getState().findQueuedChat('qb')).toBe('task-view')
+    expect(useChatStore.getState().findQueuedChat('nope')).toBeNull()
+    st.removeQueuedMessage('task-run', { queueId: 'qa' })
+    expect(chips('task-view').map((m) => m.queueId)).toEqual(['qb'])
+    st.clearQueuedMessages('task-run', ['qb', 'qc'])
+    expect(chips('task-view')).toEqual([])
+    expect(chips('other')).toEqual([])
+    // An id nobody holds changes nothing; a clear with no ids empties the
+    // named slice alone.
+    st.addQueuedMessage('other', 0, { text: 'd', queueId: 'qd' })
+    const before = useChatStore.getState().byChat
+    st.removeQueuedMessage('other', { queueId: 'gone' })
+    expect(useChatStore.getState().byChat).toBe(before)
+    st.clearQueuedMessages('task-view')
+    expect(chips('other').map((m) => m.queueId)).toEqual(['qd'])
+  })
+
+  it('reads a chip\'s queue chat from the persisted store', () => {
+    expect(toQueuedMessage({ text: 't', queueId: 'q', queueChatId: 'task-run' }))
+      .toEqual({ text: 't', queueId: 'q', queueChatId: 'task-run' })
+  })
 })

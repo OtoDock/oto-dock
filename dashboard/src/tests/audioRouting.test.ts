@@ -20,26 +20,10 @@ import {
   setDictationActive,
   stopActivePlayback,
 } from '@/audio/speechActivity'
+import { fakeWebSocketClass } from './fakeWebSocket'
 
-class FakeWebSocket {
-  static instances: FakeWebSocket[] = []
-  static CONNECTING = 0
-  static OPEN = 1
-  static CLOSING = 2
-  static CLOSED = 3
-  readyState = 0  // CONNECTING — never opens in this harness
-  binaryType = ''
-  onopen: (() => void) | null = null
-  onmessage: unknown = null
-  onclose: unknown = null
-  onerror: unknown = null
-  sent: unknown[] = []
-  constructor(public url: string) { FakeWebSocket.instances.push(this) }
-  send(data: unknown) { this.sent.push(data) }
-  close() { this.readyState = FakeWebSocket.CLOSED }
-  addEventListener() { /* noop */ }
-  removeEventListener() { /* noop */ }
-}
+// Never opens: the routing under test must not depend on a live socket.
+const FakeWebSocket = fakeWebSocketClass<unknown>({ opens: false })
 
 afterEach(() => {
   vi.unstubAllGlobals()

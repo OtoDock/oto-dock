@@ -1,14 +1,13 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '../../api/auth'
 import type { PlatformSettings, ConcurrencyStats, StorageUsage } from './PlatformPage.types'
+import { apiJson, withMessage } from '../../lib/http/apiJson'
 
 export function usePlatformSettings() {
   return useQuery({
     queryKey: ['platform-settings'],
     queryFn: async (): Promise<PlatformSettings> => {
-      const res = await apiFetch('/v1/admin/platform-settings')
-      if (!res.ok) throw new Error('Failed to fetch')
-      return res.json()
+      return apiJson<PlatformSettings>('/v1/admin/platform-settings').catch(withMessage('Failed to fetch'))
     },
   })
 }
@@ -30,9 +29,7 @@ export function useSavePlatformSettings() {
       }
       return res.json()
     },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['platform-settings'] })
-    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['platform-settings'] }),
   })
 }
 
@@ -42,11 +39,9 @@ export function useSetLicense() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (license_key: string) => {
-      const res = await apiFetch('/v1/admin/license', {
+      return apiJson<{ message: string; status: string; activation_state: string }>('/v1/admin/license', {
         method: 'POST', body: JSON.stringify({ license_key }),
-      })
-      if (!res.ok) throw new Error('Failed to save license')
-      return res.json() as Promise<{ message: string; status: string; activation_state: string }>
+      }).catch(withMessage('Failed to save license'))
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['platform-settings'] }) },
   })
@@ -56,9 +51,8 @@ export function useLicenseAction(path: 'deactivate' | 'recheck') {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async () => {
-      const res = await apiFetch(`/v1/admin/license/${path}`, { method: 'POST' })
-      if (!res.ok) throw new Error('Failed')
-      return res.json() as Promise<{ status: string; activation_state: string }>
+      return apiJson<{ status: string; activation_state: string }>(`/v1/admin/license/${path}`, { method: 'POST' })
+        .catch(withMessage('Failed'))
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['platform-settings'] }) },
   })
@@ -68,9 +62,7 @@ export function useConcurrencyStats() {
   return useQuery({
     queryKey: ['concurrency-stats'],
     queryFn: async (): Promise<ConcurrencyStats> => {
-      const res = await apiFetch('/v1/admin/concurrency-stats')
-      if (!res.ok) throw new Error('Failed to fetch')
-      return res.json()
+      return apiJson<ConcurrencyStats>('/v1/admin/concurrency-stats').catch(withMessage('Failed to fetch'))
     },
     refetchInterval: 5_000,
   })
@@ -79,9 +71,7 @@ export function useStorageUsage() {
   return useQuery({
     queryKey: ['storage-usage'],
     queryFn: async (): Promise<StorageUsage> => {
-      const res = await apiFetch('/v1/admin/storage/usage')
-      if (!res.ok) throw new Error('Failed to fetch')
-      return res.json()
+      return apiJson<StorageUsage>('/v1/admin/storage/usage').catch(withMessage('Failed to fetch'))
     },
   })
 }

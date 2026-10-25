@@ -25,26 +25,23 @@ interactive session never carries a meeting id.
 
 import asyncio
 import logging
-import re
 import threading
 import time
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, cast
+
+import psycopg
 
 import config
 from storage import database as task_store
+from storage.chat.chat_titles import _without_preludes
+
+if TYPE_CHECKING:
+    from core.layers.providers import ProviderUsage
+    from core.layers.providers.openai_adapter import OpenAIAdapter
 
 logger = logging.getLogger("title_generator")
 
-# The dashboard injects a "[Current time: …]" prelude (and the viewer focus
-# line, and a task run the parallel-activity line) ahead of interactive
-# sends — strip them or they become the title (twin of
-# ws/dashboard_chat_text.py's send-time recognizer; both must keep matching
-# the injected shapes).
-_TIME_PRELUDE_RE = re.compile(
-    r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
-    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\.)\]"
-    r"(?:[ \t]*(?:\r?\n+|$)|[ \t]+)"
-)
 
 # Early-fire thresholds — the canonical values shared by BOTH trigger surfaces
 # (the headless pump's TEXT/TOOL_USE handlers and the interactive funnel's
@@ -56,33 +53,6 @@ _TIME_PRELUDE_RE = re.compile(
 TITLE_CHAR_THRESHOLD = 280
 TITLE_TOOL_THRESHOLD = 5
 
-
-def _without_preludes(text: str) -> str:
-    """``text`` with its leading injected prelude lines dropped."""
-    stripped = text or ""
-    while True:  # stacked preludes (the time stamp plus the focus line)
-        once = _TIME_PRELUDE_RE.sub("", stripped, count=1)
-        if once == stripped:
-            return stripped
-        stripped = once
-
-
-def deterministic_title(text: str) -> str:
-    """Stable chat title from a first user message — first ~6 words / 48 chars,
-    whitespace-collapsed, ellipsis if truncated. The same rule the chat layer
-    applies at send time (``ws/dashboard_chat_support.py::_deterministic_title``);
-    exposed here so the storage layer can stamp scheduler-driven task chats
-    without importing the WS controller."""
-    cleaned = " ".join(_without_preludes(text).split())
-    if not cleaned:
-        return "New Chat"
-    words = cleaned.split(" ")
-    title = " ".join(words[:6])
-    cut = len(words) > 6
-    if len(title) > 48:
-        title = title[:48].rstrip()
-        cut = True
-    return title + ("…" if cut else "")
 
 # Per-provider title model: the cheapest capable model each provider offers
 # (Anthropic's is Haiku 5.5, tier 4, a tenth of Sonnet 5.5's price; it was
@@ -118,7 +88,7 @@ def _direct_provider(provider: str) -> dict | None:
 def _keyless(provider: str) -> bool:
     """A self-hosted endpoint: any active row serves it, no key needed."""
     entry = _direct_provider(provider)
-    return bool(entry) and not entry.get("requires_key", True)
+    return bool(entry) and not cast("dict", entry).get("requires_key", True)
 
 _TITLE_SYS = (
     "Generate a concise chat title (max 6 words) capturing the topic. "
@@ -175,7 +145,7 @@ def _local_model_for(provider: str) -> str:
         for m in subscription_store.list_models(layer="direct-llm"):
             if m.get("provider") == provider and m.get("enabled", True):
                 return m.get("model_id") or ""
-    except Exception:
+    except psycopg.Error:
         logger.debug("title-gen: local model lookup failed for %s", provider, exc_info=True)
     return ""
 
@@ -247,11 +217,12 @@ def _provider_credentials(provider: str) -> tuple[str, str] | None:
         creds = subscription_pool.relay_llm_credentials("direct-llm", provider, "")
         if creds:
             return creds  # (minted_token, "{RELAY}/v1/relay/<provider>/...")
-    # A keyless local endpoint: the adapter's placeholder key + the sub's endpoint.
+    # A keyless local endpoint: the adapter's placeholder key + the sub's endpoint
+    # (a keyless provider is an OpenAI-compatible endpoint).
     if _keyless(provider):
         from core.layers.providers.registry import get_adapter
         data = subscription_store.get_credential_data(subs[0]["id"])
-        return (get_adapter(provider).default_api_key() or ""), (data.get("endpoint_url", "") or "")
+        return (cast("OpenAIAdapter", get_adapter(provider)).default_api_key() or ""), (data.get("endpoint_url", "") or "")
     return None
 
 
@@ -322,7 +293,7 @@ def check_title_generation() -> dict:
     made clears that."""
     try:
         resolved = resolve_title_provider()
-    except Exception:
+    except Exception:  # noqa: BLE001  # the provider lookup spans settings and engines, it notes its own miss
         resolved = None   # noted by the lookup
     if resolved:
         last = _last_attempt
@@ -406,10 +377,10 @@ def _clean_title(raw: str) -> str:
 async def generate_title(
     user_prompt: str, assistant_excerpt: str,
     provider: str, model: str, api_key: str, base_url: str,
-) -> tuple[str, object]:
+) -> "tuple[str, ProviderUsage]":
     """Call the provider's title model. Returns ``(title, ProviderUsage)``;
     raises on a provider error event (caller swallows)."""
-    from core.layers.providers import get_adapter, ProviderUsage
+    from core.layers.providers import ProviderUsage, get_adapter
 
     content = (user_prompt or "").strip()
     excerpt = (assistant_excerpt or "").strip()
@@ -517,14 +488,14 @@ async def request_chat_title(chat_id: str, *, assistant_excerpt: str = "") -> No
                     chat.get("user_sub") or "", chat_id, title,
                     agent=chat.get("agent") or "",
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001  # the title broadcast is best effort, the title is stored
                 logger.debug("title-gen: title broadcast failed for %s", chat_id, exc_info=True)
         _record_cost(chat, provider, model, usage)
     except Exception:
         logger.exception("title-gen: request_chat_title failed for %s", chat_id)
 
 
-def _record_cost(chat: dict, provider: str, model: str, usage: object) -> None:
+def _record_cost(chat: dict, provider: str, model: str, usage: "ProviderUsage") -> None:
     """One usage_records row (``source_type='title-generation'``, ``message_count=0``
     — a pure cost line that does not inflate turn counts). Skipped automatically
     for $0 local models (``record_turn_usage`` drops cost<=0 & message_count<=0)."""

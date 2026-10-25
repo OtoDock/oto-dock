@@ -17,7 +17,7 @@ from tests._paths import CUSTOM_MCPS, PROXY_DIR, REPO_ROOT
 if str(PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(PROXY_DIR))
 
-from auth import roles  # noqa: E402
+from auth import roles
 
 _MIRROR = REPO_ROOT / "dashboard" / "src" / "lib" / "permissions.ts"
 
@@ -50,8 +50,12 @@ def test_the_members_and_the_frozen_spellings():
     sharing = (PROXY_DIR / "storage" / "sharing" / "schema.py").read_text(encoding="utf-8")
     assert "role_cap IN ('manager', 'editor', 'contributor', 'viewer')" in sharing
     # The validators read the authority, never a literal set of their own.
-    from storage.agents import agent_store, community_agent_template_store
-    assert community_agent_template_store.VALID_DEFAULT_USER_ROLES == set(roles.AGENT_ROLES)
+    from storage import catalog_schema
+    from storage.agents import agent_store
+    template = catalog_schema.load_schema(catalog_schema.TEMPLATE_SCHEMA)["$defs"]
+    assert template["agentRoles"]["items"]["enum"] == list(roles.AGENT_ROLES)
+    assert template["agentJson"]["properties"]["default_for_new_users"]["then"]["properties"]["role"]["enum"] == \
+        list(roles.AGENT_ROLES)
     assert agent_store._DEFAULT_ROLE_CHOICES == (roles.NO_ACCESS, *roles.AGENT_ROLES)
     # The migration's words are the CREATEs' words.
     from storage import schema as pg_schema
@@ -218,9 +222,7 @@ class TestRoleCheckMigration:
     a stale one until it has."""
 
     def test_an_older_check_is_rewritten_once_and_reported_until_then(self, temp_db):
-        from storage import database as task_store
-        from storage import pg
-        from storage import schema as pg_schema
+        from storage import database as task_store, pg, schema as pg_schema
         from storage.agents import agent_store
         from storage.pg import get_conn
         with get_conn() as conn:

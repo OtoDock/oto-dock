@@ -19,31 +19,49 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  collabora-proof:
+    # Collabora's WOPI proof key: Collabora signs every WOPI call with it and
+    # the proxy refuses an unsigned one. Written by Collabora's own openssl
+    # (the image has no shell) into a volume Collabora mounts read-only, so
+    # it is written anew at each docker compose up of this project: the
+    # running Collabora keeps the key it loaded, a restarted one loads the
+    # new one, and the proxy reads it again from Collabora's discovery.
+    image: collabora/code:26.04.5.1.1@sha256:bb8f3c9c5c9016045f25fccb5f0649be94469ebc7c7cc379f3576e470cccf33d
+    entrypoint: ["/usr/bin/openssl", "genpkey", "-quiet", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", "/opt/cool/cache/proof_key"]
+    network_mode: "none"
+    healthcheck:
+      disable: true
+    restart: "no"
+    volumes:
+      # The image's own /opt/cool/cache belongs to Collabora's user (1001):
+      # Docker gives a new volume mounted there that owner.
+      - collabora-proof:/opt/cool/cache
+
   collabora:
-    image: collabora/code:25.04.10.3.1@sha256:a51dd5d1741dea5d19f49d9997de2c321bf582076015ec4015941f3f00a5f4c0
+    image: collabora/code:26.04.5.1.1@sha256:bb8f3c9c5c9016045f25fccb5f0649be94469ebc7c7cc379f3576e470cccf33d
     container_name: collabora-agent
     restart: always
     ports:
       - "9981:9980"
     environment:
       - aliasgroup1=${WOPI_BASE_URL:-http://host.docker.internal:8400}
-      # Collabora's start script unquotes `${extra_params}` and passes each
-      # space-separated token as a separate `coolwsd` arg, so each --o:KEY=VAL
-      # must be a single token (no spaces in the value). We pass ten:
-      # ssl.enable=false, server_name (the frame-ancestors host) and
-      # net.proxy_prefix=true, plus the seven below:
-      #   --o:net.frame_ancestors=<host>   — single host that may embed the
-      #     iframe. Auto-derived from DASHBOARD_PUBLIC_URL host by the proxy.
-      #     Same-domain sub-path setups don't need this (browser auto-allows
-      #     same origin) but it's harmless when set.
+      # The image has no shell: its own entrypoint (coolwsd --use-env-vars)
+      # reads extra_params, each --o:KEY=VAL a single token (no spaces in a
+      # value). Collabora's public address needs no setting: the proxy sends
+      # the dashboard's host on every request it forwards, and Collabora
+      # builds the editor's address, the frame-ancestors list and its socket
+      # origin check from it. We pass:
+      #   --o:ssl.termination=${COLLABORA_SSL_TERMINATION} — whether TLS ends
+      #     in front of Collabora (the scheme of its addresses and origin
+      #     check); the proxy writes it here: the config.env line, else the
+      #     DASHBOARD_PUBLIC_URL scheme.
       #   --o:net.service_root=<path>      — the URL prefix Collabora is
       #     mounted under (e.g. "/collabora") for same-domain sub-path setups.
       #     The reverse proxy passes through the full path; Collabora generates
       #     its WS / cool.html links with this prefix. Empty for subdomain
       #     setups (e.g. https://collabora.example.com).
-      #   --o:ssl.termination=${COLLABORA_SSL_TERMINATION} — scheme of the WS
-      #     origin check + self-URLs; auto-derived by the proxy from the
-      #     DASHBOARD_PUBLIC_URL scheme (plain-http installs need false).
+      #   --o:mount_jail_tree=false — copy mode: a container without
+      #     CAP_SYS_ADMIN cannot bind-mount the document jails.
       #   --o:per_document.idle_timeout_secs=7200 — viewing a document sends no
       #     traffic; the stock 3600 unloads it mid-read and the preview dies.
       #   --o:per_document.background_autosave=false and
@@ -56,7 +74,35 @@ services:
       #     dashboard asks for: the agent reads the stored file. Each save
       #     is the whole file pushed to every machine running a live
       #     session of the agent.
-      - "extra_params=--o:ssl.enable=false --o:ssl.termination=${COLLABORA_SSL_TERMINATION:-true} --o:net.frame_ancestors=${COLLABORA_FRAME_ANCESTORS:-} --o:net.service_root=${COLLABORA_SERVICE_ROOT:-} --o:server_name=${COLLABORA_FRAME_ANCESTORS:-} --o:net.proxy_prefix=true --o:per_document.idle_timeout_secs=7200 --o:per_document.background_autosave=false --o:per_document.background_manualsave=false --o:per_document.idlesave_duration_secs=10 --o:logging.level_startup=warning"
+      - "extra_params=--o:ssl.enable=false --o:ssl.termination=${COLLABORA_SSL_TERMINATION:-true} --o:net.service_root=${COLLABORA_SERVICE_ROOT:-} --o:mount_jail_tree=false --o:per_document.idle_timeout_secs=7200 --o:per_document.background_autosave=false --o:per_document.background_manualsave=false --o:per_document.idlesave_duration_secs=10 --o:logging.level_startup=warning"
+    volumes:
+      # The proof key, a single file of the volume (a volume subpath: Docker
+      # Engine 26 or later).
+      - type: volume
+        source: collabora-proof
+        target: /etc/coolwsd/proof_key
+        read_only: true
+        volume:
+          subpath: proof_key
+      # Collabora's free edition shows an "Explore the new" welcome once per
+      # browser, and no setting turns it off short of its home mode, which
+      # caps the server at 20 connections and 10 open documents. The editor
+      # loads that welcome in a hidden frame from this script: the one beside
+      # this file closes it before it shows (the editor then records its
+      # version as seen), after the message the vendor's own script sends
+      # first, which stops the editor's retry of a frame that never showed.
+      # The path and the two messages were read off collabora/code
+      # 26.04.5.1.1: a Collabora bump re-checks them. A bind of the shipped
+      # file, never a compose config: Compose 2.26 to 2.3x copy a config into
+      # the created container, which mounts the key before collabora-proof
+      # has written it, and the first start fails. The long form never makes
+      # a directory of a missing file: Docker refuses the start and names it.
+      - type: bind
+        source: ./collabora-welcome.js
+        target: /usr/share/coolwsd/browser/dist/welcome/welcome.js
+        read_only: true
+        bind:
+          create_host_path: false
     # `host.docker.internal` resolves to the Linux host gateway so Collabora's
     # WOPI callbacks can reach the proxy when the proxy runs on the bare-metal
     # host (the bare-metal default — `WOPI_BASE_URL` auto-derives to
@@ -66,3 +112,9 @@ services:
       - "host.docker.internal:host-gateway"
     cap_add:
       - MKNOD
+    depends_on:
+      collabora-proof:
+        condition: service_completed_successfully
+
+volumes:
+  collabora-proof:

@@ -18,15 +18,16 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from core.execution_layer import WindowSpec  # noqa: E402
-from core.layers.cli import usage as claude_usage  # noqa: E402
-from core.layers.codex import usage as codex_usage  # noqa: E402
-from core.session.session_manager import get_layer_by_path  # noqa: E402
-from services.engines import subscription_windows as sw  # noqa: E402
+from core.execution_layer import WindowSpec
+from core.layers.cli import usage as claude_usage
+from core.layers.codex import usage as codex_usage
+from core.session.session_manager import get_layer_by_path
+from services.engines import subscription_windows as sw
 
 NOW = datetime(2026, 9, 11, 6, 0, tzinfo=timezone.utc)
 WEEK_RESET = "2026-09-16T05:59:59.755375+00:00"
@@ -221,7 +222,7 @@ class TestCodexNormalizers:
         # The boundary the parser always used: a report up to 6 h is the
         # session window, anything longer the quota window; a length no
         # declared window covers goes to the longest.
-        by = lambda s: sw.spec_for_length(SPECS, s).key  # noqa: E731
+        by = lambda s: sw.spec_for_length(SPECS, s).key
         assert by(18000) == "five_hour" and by(6 * 3600) == "five_hour"
         assert by(6 * 3600 + 1) == "seven_day" and by(24 * 3600) == "seven_day"
         assert by(604800) == "seven_day" and by(30 * 86400) == "seven_day"
@@ -484,7 +485,9 @@ class TestRecording:
 # Polling
 # ---------------------------------------------------------------------------
 
-import asyncio  # noqa: E402
+import asyncio
+
+import httpx
 
 
 class _Resp:
@@ -579,7 +582,7 @@ class TestPollOne:
         assert ok and len(client.calls) == 2
 
     def test_backoff_doubles_to_the_cap(self):
-        client = _Client(*[RuntimeError("boom")] * 8)
+        client = _Client(*[httpx.ConnectError("boom")] * 8)
         now = 0.0
         waits = []
         for _ in range(7):

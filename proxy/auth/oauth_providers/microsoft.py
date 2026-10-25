@@ -33,8 +33,15 @@ import httpx
 import jwt
 
 from auth.oauth_providers.base import OAuthProvider, TokenSet, UserInfo
+from services.infra import pinned_http
 
 logger = logging.getLogger("otodock.oauth-providers.microsoft")
+
+
+def _client(url: str, timeout: float) -> httpx.AsyncClient:
+    """A client for one call to Microsoft's public sign-in or Graph host:
+    the dial is checked (``pinned_http.public_only``)."""
+    return pinned_http.checked_client(url, pinned_http.public_only, timeout=timeout)
 
 
 class MicrosoftOAuthProvider(OAuthProvider):
@@ -148,7 +155,7 @@ class MicrosoftOAuthProvider(OAuthProvider):
         }
         if code_verifier:
             data["code_verifier"] = code_verifier
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with _client(self.token_url, 30) as client:
             resp = await client.post(self.token_url, data=data)
         payload = resp.json()
         if resp.status_code != 200 or "error" in payload:
@@ -164,7 +171,7 @@ class MicrosoftOAuthProvider(OAuthProvider):
         client_id: str,
         client_secret: str,
     ) -> TokenSet:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with _client(self.token_url, 30) as client:
             resp = await client.post(
                 self.token_url,
                 data={
@@ -188,7 +195,7 @@ class MicrosoftOAuthProvider(OAuthProvider):
         return ts
 
     async def fetch_userinfo(self, *, access_token: str) -> UserInfo:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with _client(self.userinfo_url, 15) as client:
             resp = await client.get(
                 self.userinfo_url,
                 headers={"Authorization": f"Bearer {access_token}"},
@@ -235,7 +242,7 @@ class MicrosoftOAuthProvider(OAuthProvider):
                 if k == "tenant_id":
                     continue
                 data[k] = v
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with _client(self._devicecode_url_for(tenant_id), 30) as client:
             resp = await client.post(
                 self._devicecode_url_for(tenant_id), data=data,
             )
@@ -255,7 +262,7 @@ class MicrosoftOAuthProvider(OAuthProvider):
         client_secret: str,
     ) -> TokenSet | None:
         # Polling against /common/ works for any tenant's device codes.
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with _client(self.token_url, 30) as client:
             resp = await client.post(
                 self.token_url,
                 data={

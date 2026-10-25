@@ -1,0 +1,2219 @@
+{
+ "chat": {
+  "cache_read": 0,
+  "cache_write": 0,
+  "codex_thread_id": null,
+  "context_max": 0,
+  "context_used": 0,
+  "engine_cost_session_id": "sid-pw-bash",
+  "engine_cost_total": 0.032997,
+  "last_abort_graceful": false,
+  "last_response_at": false,
+  "last_turn_aborted": false,
+  "output_tokens": 0,
+  "permission_mode": "ask",
+  "thread_goal": null,
+  "title_generated": false,
+  "total_cost": 0.0
+ },
+ "events": [
+  [
+   "tool_use",
+   {
+    "name": "Bash",
+    "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK"
+   }
+  ],
+  [
+   "tool_input",
+   {
+    "name": "Bash",
+    "summary": "sleep 12 && echo BG_MARKER_DONE",
+    "tool_input": {
+     "command": "sleep 12 && echo BG_MARKER_DONE",
+     "run_in_background": true
+    }
+   }
+  ],
+  [
+   "bg_command_start",
+   {
+    "command": "sleep 12 && echo BG_MARKER_DONE",
+    "description": "sleep 12 && echo BG_MARKER_DONE",
+    "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK"
+   }
+  ],
+  [
+   "tool_result",
+   {
+    "name": "Bash",
+    "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "ST"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "ARTED"
+   }
+  ],
+  [
+   "metadata",
+   {
+    "cache_read": 51646,
+    "cache_write": 3226,
+    "context_max": 1000000,
+    "context_used": 27698,
+    "cost_usd": 0.0252422,
+    "duration_ms": 2826,
+    "input_tokens": 4,
+    "output_tokens": 97
+   }
+  ],
+  [
+   "done",
+   {}
+  ],
+  [
+   "text",
+   {
+    "content": "\n\n"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "Background task fin"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "ished:"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": " `B"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "G_MARKER_DONE`."
+   }
+  ],
+  [
+   "metadata",
+   {
+    "cache_read": 27696,
+    "cache_write": 498,
+    "context_max": 1000000,
+    "context_used": 28196,
+    "cost_usd": 0.032997399999999996,
+    "duration_ms": 2531,
+    "input_tokens": 2,
+    "output_tokens": 22
+   }
+  ],
+  [
+   "done",
+   {}
+  ]
+ ],
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "active": false,
+    "name": "Bash",
+    "summary": "sleep 12 && echo BG_MARKER_DONE",
+    "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+    "tool_input": {
+     "command": "sleep 12 && echo BG_MARKER_DONE",
+     "run_in_background": true
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "command": "sleep 12 && echo BG_MARKER_DONE",
+    "description": "sleep 12 && echo BG_MARKER_DONE",
+    "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+    "type": "bg_command_spawn"
+   },
+   "event_type": "bg_command_spawn",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "STARTED",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cache_read": 51646,
+    "cache_write": 3226,
+    "context_max": 1000000,
+    "context_used": 27698,
+    "cost_billed": true,
+    "cost_usd": 0.0252422,
+    "duration_ms": 2826,
+    "input_tokens": 4,
+    "output_tokens": 97,
+    "type": "metadata"
+   },
+   "event_type": "metadata",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "\n\nBackground task finished: `BG_MARKER_DONE`.",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cache_read": 27696,
+    "cache_write": 498,
+    "context_max": 1000000,
+    "context_used": 28196,
+    "cost_billed": true,
+    "cost_usd": 0.007755199999999997,
+    "duration_ms": 2531,
+    "input_tokens": 2,
+    "output_tokens": 22,
+    "type": "metadata"
+   },
+   "event_type": "metadata",
+   "role": "event"
+  }
+ ],
+ "seams": {
+  "ephemeral": [],
+  "kept": [],
+  "reconciles": [],
+  "relocated": [],
+  "replays": [],
+  "rests": [],
+  "status": [],
+  "titles": [],
+  "tool_starts": []
+ },
+ "trace": [
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "name": "Bash",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "tool_start"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 0,
+      "active": true,
+      "name": "Bash",
+      "summary": "",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "_insert_idx": 0,
+      "active": true,
+      "name": "Bash",
+      "summary": "",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_01B2sHECvQY8H6TgjJS7uXtK"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_use/Bash"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool_info"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 0,
+      "active": true,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "_insert_idx": 0,
+      "active": true,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_01B2sHECvQY8H6TgjJS7uXtK"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_input/Bash"
+  },
+  {
+   "blocks": [
+    {
+     "command": "sleep 12 && echo BG_MARKER_DONE",
+     "description": "sleep 12 && echo BG_MARKER_DONE",
+     "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+     "type": "bg_command_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "bg_command_spawn"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 0,
+      "active": true,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "_insert_idx": 0,
+      "active": true,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_01B2sHECvQY8H6TgjJS7uXtK"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:bg_command_start"
+  },
+  {
+   "blocks": [
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "sleep 12 && echo BG_MARKER_DONE",
+     "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+     "tool_input": {
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "run_in_background": true
+     },
+     "type": "tool"
+    },
+    {
+     "command": "sleep 12 && echo BG_MARKER_DONE",
+     "description": "sleep 12 && echo BG_MARKER_DONE",
+     "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+     "type": "bg_command_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Bash",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "tool_end"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_result/Bash"
+  },
+  {
+   "blocks": [
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "sleep 12 && echo BG_MARKER_DONE",
+     "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+     "tool_input": {
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "run_in_background": true
+     },
+     "type": "tool"
+    },
+    {
+     "command": "sleep 12 && echo BG_MARKER_DONE",
+     "description": "sleep 12 && echo BG_MARKER_DONE",
+     "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+     "type": "bg_command_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "ST",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     },
+     {
+      "content": "ST",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "ST"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "sleep 12 && echo BG_MARKER_DONE",
+     "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+     "tool_input": {
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "run_in_background": true
+     },
+     "type": "tool"
+    },
+    {
+     "command": "sleep 12 && echo BG_MARKER_DONE",
+     "description": "sleep 12 && echo BG_MARKER_DONE",
+     "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+     "type": "bg_command_spawn"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "ARTED",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     },
+     {
+      "content": "STARTED",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "ST",
+     "ARTED"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "active": false,
+     "name": "Bash",
+     "summary": "sleep 12 && echo BG_MARKER_DONE",
+     "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+     "tool_input": {
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "run_in_background": true
+     },
+     "type": "tool"
+    },
+    {
+     "command": "sleep 12 && echo BG_MARKER_DONE",
+     "description": "sleep 12 && echo BG_MARKER_DONE",
+     "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+     "type": "bg_command_spawn"
+    },
+    {
+     "content": "STARTED",
+     "type": "text"
+    },
+    {
+     "cache_read": 51646,
+     "cache_write": 3226,
+     "context_max": 1000000,
+     "context_used": 27698,
+     "cost_billed": true,
+     "cost_usd": 0.0252422,
+     "duration_ms": 2826,
+     "input_tokens": 4,
+     "output_tokens": 97,
+     "type": "metadata"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "cache_read": 51646,
+      "cache_write": 3226,
+      "context_max": 1000000,
+      "context_used": 27698,
+      "cost_billed": true,
+      "cost_usd": 0.0252422,
+      "duration_ms": 2826,
+      "input_tokens": 4,
+      "output_tokens": 97,
+      "type": "metadata"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     },
+     {
+      "content": "STARTED",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     51646,
+     3226
+    ],
+    "completed": false,
+    "context": [
+     27698,
+     1000000
+    ],
+    "cost_delta": 0.025242,
+    "cumulative_cost": 0.0252422,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0252422,
+    "leftover": [],
+    "llm_cost_delta": 0.025242,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     97
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:metadata"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "pump_type": "is_done"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     },
+     {
+      "content": "STARTED\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     51646,
+     3226
+    ],
+    "completed": false,
+    "context": [
+     27698,
+     1000000
+    ],
+    "cost_delta": 0.025242,
+    "cumulative_cost": 0.0252422,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0252422,
+    "leftover": [],
+    "llm_cost_delta": 0.025242,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     97
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:done"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "\n\n",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     },
+     {
+      "content": "STARTED\n\n\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     51646,
+     3226
+    ],
+    "completed": false,
+    "context": [
+     27698,
+     1000000
+    ],
+    "cost_delta": 0.025242,
+    "cumulative_cost": 0.0252422,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0252422,
+    "leftover": [],
+    "llm_cost_delta": 0.025242,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     97
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "Background task fin",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     },
+     {
+      "content": "STARTED\n\n\n\nBackground task fin",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     51646,
+     3226
+    ],
+    "completed": false,
+    "context": [
+     27698,
+     1000000
+    ],
+    "cost_delta": 0.025242,
+    "cumulative_cost": 0.0252422,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0252422,
+    "leftover": [],
+    "llm_cost_delta": 0.025242,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "Background task fin"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     97
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "ished:",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     },
+     {
+      "content": "STARTED\n\n\n\nBackground task finished:",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     51646,
+     3226
+    ],
+    "completed": false,
+    "context": [
+     27698,
+     1000000
+    ],
+    "cost_delta": 0.025242,
+    "cumulative_cost": 0.0252422,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0252422,
+    "leftover": [],
+    "llm_cost_delta": 0.025242,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "Background task fin",
+     "ished:"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     97
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": " `B",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     },
+     {
+      "content": "STARTED\n\n\n\nBackground task finished: `B",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     51646,
+     3226
+    ],
+    "completed": false,
+    "context": [
+     27698,
+     1000000
+    ],
+    "cost_delta": 0.025242,
+    "cumulative_cost": 0.0252422,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0252422,
+    "leftover": [],
+    "llm_cost_delta": 0.025242,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "Background task fin",
+     "ished:",
+     " `B"
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     97
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "G_MARKER_DONE`.",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     },
+     {
+      "content": "STARTED\n\n\n\nBackground task finished: `BG_MARKER_DONE`.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     51646,
+     3226
+    ],
+    "completed": false,
+    "context": [
+     27698,
+     1000000
+    ],
+    "cost_delta": 0.025242,
+    "cumulative_cost": 0.0252422,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0252422,
+    "leftover": [],
+    "llm_cost_delta": 0.025242,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "\n\n",
+     "Background task fin",
+     "ished:",
+     " `B",
+     "G_MARKER_DONE`."
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     4,
+     97
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "\n\nBackground task finished: `BG_MARKER_DONE`.",
+     "type": "text"
+    },
+    {
+     "cache_read": 27696,
+     "cache_write": 498,
+     "context_max": 1000000,
+     "context_used": 28196,
+     "cost_billed": true,
+     "cost_usd": 0.007755199999999997,
+     "duration_ms": 2531,
+     "input_tokens": 2,
+     "output_tokens": 22,
+     "type": "metadata"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "cache_read": 27696,
+      "cache_write": 498,
+      "context_max": 1000000,
+      "context_used": 28196,
+      "cost_billed": true,
+      "cost_usd": 0.007755199999999997,
+      "duration_ms": 2531,
+      "input_tokens": 2,
+      "output_tokens": 22,
+      "type": "metadata"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     },
+     {
+      "content": "STARTED\n\n\n\nBackground task finished: `BG_MARKER_DONE`.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     27696,
+     498
+    ],
+    "completed": false,
+    "context": [
+     28196,
+     1000000
+    ],
+    "cost_delta": 0.032997,
+    "cumulative_cost": 0.032997399999999996,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.032997399999999996,
+    "leftover": [],
+    "llm_cost_delta": 0.032997,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     2,
+     22
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:metadata"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "pump_type": "is_done"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     }
+    ],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "active": false,
+      "name": "Bash",
+      "summary": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "tool_input": {
+       "command": "sleep 12 && echo BG_MARKER_DONE",
+       "run_in_background": true
+      },
+      "type": "tool"
+     },
+     {
+      "active": true,
+      "command": "sleep 12 && echo BG_MARKER_DONE",
+      "description": "sleep 12 && echo BG_MARKER_DONE",
+      "tool_use_id": "toolu_01B2sHECvQY8H6TgjJS7uXtK",
+      "type": "command"
+     },
+     {
+      "content": "STARTED\n\n\n\nBackground task finished: `BG_MARKER_DONE`.\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pw-bash",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     27696,
+     498
+    ],
+    "completed": false,
+    "context": [
+     28196,
+     1000000
+    ],
+    "cost_delta": 0.032997,
+    "cumulative_cost": 0.032997399999999996,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.032997399999999996,
+    "leftover": [],
+    "llm_cost_delta": 0.032997,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     2,
+     22
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:done"
+  }
+ ]
+}

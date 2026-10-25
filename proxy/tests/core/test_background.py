@@ -194,12 +194,10 @@ def test_the_shutdown_tail_cancels_the_spawned_tasks(monkeypatch):
 
 PROXY = Path(__file__).resolve().parents[2]
 _STARTERS = {"create_task", "ensure_future"}
-# Files that still start a task at statement level, each for a reason: the
-# vendored stdlib-only twin cannot import the proxy; the rest belong to a lane
-# that had them open when the sweep ran and convert at their next change.
-_UNCONVERTED = {
-    "core/layers/codex/app_server_client.py",
-}
+# Files that may still start a task at statement level, each with its reason
+# (none today: the vendored stdlib-only Codex client, which cannot import the
+# proxy, holds its tasks in sets of its own).
+_UNCONVERTED: set[str] = set()
 
 
 def _statement_level_starts(path: Path) -> list[int]:

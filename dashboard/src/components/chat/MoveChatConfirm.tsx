@@ -1,52 +1,41 @@
-import { useEffect } from 'react'
-import { createPortal } from 'react-dom'
-import { pushEscHandler } from '../../lib/escStack'
+import AlertDialog from '../ui/AlertDialog'
+import { MOVE_MEMORY, placePhrase, type MoveMemory } from '../../api/remoteMachines'
 
 interface Props {
-  /** Human label of the target the chat moves TO (the resolved_label). */
+  /** The place the chat moves TO: its stored target and its label. */
+  target: string
   label: string
+  /** What goes with the chat: its session files, or a summary of the
+   *  conversation when the place it leaves is offline or a place's
+   *  satellite cannot move the files (moveMemoryOf). */
+  memory: MoveMemory
+  /** The place the chat leaves, and whether it is offline (leavesOffline). */
+  fromTarget: string
+  fromLabel: string
+  fromOffline: boolean
   onConfirm: () => void
   onCancel: () => void
 }
 
-/** Confirm dialog for "Move this chat to <target>" — opened by the
- * ChatTargetBanner button and the sidebar kebab's move row. Mirrors
- * DeleteConfirmDialog's portal shape; the wording is the honest
- * fork-from-history statement: the move starts a FRESH session and the old
- * one is abandoned. */
-export default function MoveChatConfirm({ label, onConfirm, onCancel }: Props) {
-  useEffect(() => pushEscHandler(onCancel), [onCancel])
-
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs"
-      onClick={(e) => { e.stopPropagation(); onCancel() }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="w-[min(400px,90vw)] rounded-xl bg-white dark:bg-p-surface border border-p-border-light shadow-xl p-4"
-      >
-        <h3 className="text-sm font-semibold text-p-text mb-2">Move chat to {label}?</h3>
-        <p className="text-sm text-p-text-secondary mb-4">
-          This starts a fresh session on {label} and loads this chat's history
-          from the database. The old session stays behind.
-        </p>
-        <div className="flex items-center justify-end gap-2">
-          <button
-            onClick={(e) => { e.stopPropagation(); onCancel() }}
-            className="px-3 py-1.5 text-xs rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-p-text hover:bg-p-surface-hover"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={(e) => { e.stopPropagation(); onConfirm() }}
-            className="px-3 py-1.5 text-xs rounded-lg bg-brand text-white hover:bg-brand-hover"
-          >
-            Move chat
-          </button>
-        </div>
-      </div>
-    </div>,
-    document.body,
+/** Confirm dialog for a move of the chat: opened by the "Runs on" chip's
+ * menu, the ChatTargetBanner's menu and the sidebar kebab's move row,
+ * rendered only while the move is still possible (it goes when its
+ * condition clears). It names where the chat goes, and says when the chat
+ * continues from a summary: because the place it leaves is offline, or
+ * because a place's satellite is too old to move the files. */
+export default function MoveChatConfirm({
+  target, label, memory, fromTarget, fromLabel, fromOffline, onConfirm, onCancel,
+}: Props) {
+  const to = placePhrase(target, label)
+  let words = `The chat continues on ${to}.`
+  if (memory === MOVE_MEMORY.SUMMARY) {
+    words = fromOffline
+      ? `${placePhrase(fromTarget, fromLabel, true)} is offline, so the chat continues on ${to} from a summary of the conversation.`
+      : `The chat continues on ${to} from a summary of the conversation.`
+  }
+  return (
+    <AlertDialog title={`Move this chat to ${to}?`} confirmLabel="Move chat" onConfirm={onConfirm} onCancel={onCancel}>
+      {words}
+    </AlertDialog>
   )
 }

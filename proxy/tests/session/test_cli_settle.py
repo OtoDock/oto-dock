@@ -154,7 +154,8 @@ def test_enter_settle_triggers_translator_reset_for_settle():
 
 def test_is_foreign_result_shapes():
     from core.layers.cli.settle import (
-        RESUME_HANDSHAKE_RESULT, is_foreign_result,
+        RESUME_HANDSHAKE_RESULT,
+        is_foreign_result,
     )
     ok = {"type": "result", "subtype": "success", "is_error": False}
     # Zero content streamed → foreign regardless of text.
@@ -314,6 +315,7 @@ _TURN = (
 async def _task_turn(*, eof: bool) -> int:
     import asyncio
     import uuid
+
     from core.layers.cli.session import PersistentSession
     s = PersistentSession(session_id=f"sess-{uuid.uuid4().hex[:12]}", agent_prompt=None,
                           mcp_config_path=None, model="claude-sonnet-5", agent_name="agent")

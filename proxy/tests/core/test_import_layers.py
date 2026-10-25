@@ -1,10 +1,10 @@
 """The proxy's layer directions, as a test.
 
 ``storage`` is the bottom: it imports nothing from the packages above it.
-``core`` and ``services`` never import the surfaces (``api``, ``ws``). Every
-absolute import counts, at module level or inside a function (a
-function-local import is still a dependency; it only moves the cycle to run
-time); an import under ``if TYPE_CHECKING`` does not (it never runs).
+``core``, ``services`` and ``configuration`` never import the surfaces
+(``api``, ``ws``). Every absolute import counts, at module level or inside a
+function (a function-local import is still a dependency; it only moves the
+cycle to run time); an import under ``if TYPE_CHECKING`` does not (it never runs).
 
 ``LEAVES`` are the shared vocabulary modules any layer may import: each
 imports nothing but the standard library and other leaves, which
@@ -31,10 +31,12 @@ FORBIDDEN = {
     "storage": {"services", "core", "api", "ws", "auth", "adapters", "hooks"},
     "core": {"api", "ws"},
     "services": {"api", "ws"},
+    "configuration": {"api", "ws"},
 }
 LEAVES = {
     "auth.roles",
     "core.events.common_events",
+    "core.permission_modes",
     "core.host_os",
     "core.layout",
     "core.placement",
@@ -131,6 +133,28 @@ def test_the_leaves_are_leaves():
                 continue
             wrong.append(f"{leaf} -> {module}")
     assert wrong == []
+
+
+def test_every_ws_module_imports_first():
+    """``ws/dashboard.py`` assembles the connection from its mixins at its
+    end, so a mixin that imported the connection module at its top could not
+    be the first module a process imports (a test file collected first, a
+    script). Each ``ws`` module is imported alone in a fresh interpreter."""
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor
+
+    modules = sorted(f"ws.{p.stem}" for p in (PROXY / "ws").glob("*.py") if p.stem != "__init__")
+
+    def first_import(module: str) -> str:
+        out = subprocess.run([sys.executable, "-c", f"import {module}"], cwd=str(PROXY),
+                             capture_output=True, text=True, timeout=180)
+        if out.returncode == 0:
+            return ""
+        return f"{module}: {(out.stderr.strip().splitlines() or ['?'])[-1]}"
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        failures = [f for f in pool.map(first_import, modules) if f]
+    assert failures == []
 
 
 if __name__ == "__main__":

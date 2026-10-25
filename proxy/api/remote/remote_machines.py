@@ -20,20 +20,25 @@ import re
 import tarfile
 import uuid
 from pathlib import Path
+from typing import cast
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from auth.providers import UserContext, get_current_user, require_admin, require_auth
+from api.remote import chat_placement as _chat_placement
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_admin,
+    require_human,
+)
+from core import host_os, placement
+from core.background import spawn
 from services.remote.remote_status import get_live_machine_status
-from core import placement
-from core import host_os
 from storage import remote_store
 from storage.agents import agent_store
 from storage.pg import run_db
-from auth import roles
-from core.background import spawn
 
 
 def _merge_live_status(machine: dict) -> dict:
@@ -56,6 +61,8 @@ def _merge_live_status(machine: dict) -> dict:
 
 logger = logging.getLogger("otodock.remote-machines")
 router = APIRouter()
+# Where a chat runs and its move (api/remote/chat_placement.py).
+router.include_router(_chat_placement.router)
 
 
 def _cli_pins_by_binary() -> dict[str, str]:
@@ -318,7 +325,7 @@ async def serve_bootstrap(request: Request):
     try:
         exchanged = await run_db(_exchange)
     except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        raise HTTPException(status_code=401, detail=str(e)) from e
     if not exchanged:
         raise HTTPException(
             status_code=401,
@@ -459,6 +466,10 @@ def _build_bash_header(
         f'export MACHINE_SECRET="{_esc(machine_secret)}"\n'
         f'export PLATFORM_URL="{_esc(platform_url)}"\n'
         + pin_exports +
+        # A paired machine runs no agent sandbox, so no pasta: the baseline
+        # script keeps the host's passt or takes the distro's, never spends
+        # the pairing compiling the pinned one. A value set beforehand stays.
+        'export OTODOCK_PASST_BUILD="${OTODOCK_PASST_BUILD:-distro}"\n'
         "\n"
         # The two base64 payloads are PLAIN (unexported) shell variables, not
         # `export`ed. The Linux kernel caps any single ENVIRONMENT string at
@@ -657,12 +668,12 @@ async def pair_machine(
             remote_store.create_remote_machine,
             machine_id=machine_id,
             name=body.name.strip(),
-            registered_by=user.sub,
+            registered_by=cast("UserContext", user).sub,
             pairing_scope="admin",
             allow_full_fs=allow_full_fs,
         )
     except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=409, detail=str(e)) from e
 
     # Build the install command using the platform's configured public host.
     # Admin must set `platform_public_url` (or DASHBOARD_PUBLIC_URL falls
@@ -862,7 +873,7 @@ async def sync_mcps_now(
     """
     require_admin(user)
 
-    from services.mcp import mcp_sync, mcp_registry
+    from services.mcp import mcp_registry, mcp_sync
 
     # Satellite sync uses the VISIBILITY set (admin-authorized), not the
     # manager-enabled set. Rationale: pre-install on authorization so that the
@@ -1007,7 +1018,7 @@ async def user_set_allow_full_fs(
     machine can flip its filesystem-access policy. Admin-paired
     machines (the user is not the registering admin) reject with 403.
     """
-    u = _require_user_authenticated(user)
+    u = require_human(user)
 
     # The ownership gates sit between the read and the write, so they run
     # in the job; an HTTPException raised there reaches the client unchanged.
@@ -1096,7 +1107,7 @@ async def user_set_device_grants(
     machines reject with 403 (ask an admin). This is the consent gate that
     stops an admin reaching a user's PRIVATE laptop with device control.
     """
-    u = _require_user_authenticated(user)
+    u = require_human(user)
 
     def _job() -> list[str]:
         machine = remote_store.get_remote_machine(machine_id)
@@ -1173,15 +1184,15 @@ def _browser_machine_for_admin(machine_id: str, user: UserContext | None) -> dic
         raise HTTPException(
             status_code=403,
             detail=(
-                "Own-browser mode on a user-paired machine is its owner's "
-                "choice — only they can change it (Settings → Remote machines)."
+                "Only the owner of this machine can change its browser mode. "
+                "They do it in User Settings, Remote Machines."
             ),
         )
     return machine
 
 
 def _browser_machine_for_owner(machine_id: str, user: UserContext | None) -> dict:
-    u = _require_user_authenticated(user)
+    u = require_human(user)
     machine = remote_store.get_remote_machine(machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
@@ -1450,7 +1461,9 @@ async def _note_online_push(machine_id: str, machine: dict, conn, ack) -> None:
     offered again, nothing counted)."""
     from core.remote.satellite_connection import get_connection_manager
     from ws.satellite import (
-        _UPDATE_ACK_WAIT_S, SATELLITE_VERSION_LATEST, _broadcast_satellite_updating,
+        _UPDATE_ACK_WAIT_S,
+        SATELLITE_VERSION_LATEST,
+        _broadcast_satellite_updating,
         note_update_pushed,
     )
     if ack is not None:
@@ -1463,10 +1476,11 @@ async def _note_online_push(machine_id: str, machine: dict, conn, ack) -> None:
                     "ended; no rollback counted", machine_id[:8],
                 )
                 return
-    note_update_pushed(machine_id, SATELLITE_VERSION_LATEST)
+    note_update_pushed(machine_id, cast("str", SATELLITE_VERSION_LATEST))
     with contextlib.suppress(Exception):
         await _broadcast_satellite_updating(
-            machine_id, machine, machine.get("satellite_version") or "", SATELLITE_VERSION_LATEST,
+            machine_id, machine, machine.get("satellite_version") or "",
+            cast("str", SATELLITE_VERSION_LATEST),
         )
 
 
@@ -1478,13 +1492,14 @@ async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
     never pushes to it): 409, nothing sent, queued or announced. Caller is
     responsible for authorization."""
     _require_satellite_source()
+    import base64 as _b64
+
     from core.remote.satellite_connection import get_connection_manager
     from ws.satellite import (
         SATELLITE_VERSION_LATEST,
         UPDATE_ACK_SATELLITE_VERSION,
         _version_at_least,
     )
-    import base64 as _b64
 
     cm = get_connection_manager()
     connected = cm.is_connected(machine_id)
@@ -1518,7 +1533,7 @@ async def _do_trigger_update_now(machine_id: str, machine: dict) -> dict:
                           name="note_online_push", owner="remote_machines")
             except Exception as e:
                 logger.exception("update-now push failed for %s", machine_id[:8])
-                raise HTTPException(status_code=500, detail=str(e))
+                raise HTTPException(status_code=500, detail=str(e)) from e
             return {"ok": True, "queued": False, "pushed_now": True}
 
     # Offline: set pending_update so the next reconnect triggers the
@@ -1593,7 +1608,7 @@ async def assign_agent(
         remote_store.set_agent_remote_target(
             agent_slug=body.agent_slug,
             machine_id=machine_id,
-            added_by=user.sub,
+            added_by=cast("UserContext", user).sub,
         )
 
     await run_db(_job)
@@ -1620,31 +1635,11 @@ class SetUserTargetRequest(BaseModel):
     machine_id: str
 
 
-def _require_creator(user: UserContext | None) -> UserContext:
-    """Require a real user (not API key) with creator+ role."""
-    u = require_auth(user)
-    if getattr(u, "is_api_key", False):
-        raise HTTPException(status_code=403, detail="User authentication required (not API key)")
-    if not roles.is_creator_or_above(u.role):
-        raise HTTPException(status_code=403, detail="Creator role required")
-    return u
-
-
-def _require_user_authenticated(user: UserContext | None) -> UserContext:
-    """Require a real user (any platform role, not API key).
-
-    Viewers are allowed here — their user-level remote-machine override
-    only applies to their own user-scoped sessions on their own hardware,
-    which does not break the bwrap isolation model (they own the machine).
-    The per-agent gate in set_user_remote_target prevents drive-by overrides
-    on agents they aren't assigned to.
-    """
-    u = require_auth(user)
-    if getattr(u, "is_api_key", False):
-        raise HTTPException(status_code=403, detail="User authentication required (not API key)")
-    return u
-
-
+# The user-level routes take any person at the keyboard, viewers included
+# (``require_human``): a viewer's own override reaches only their own
+# user-scoped sessions on their own hardware, which keeps the sandbox model,
+# and the per-agent gate in ``set_user_remote_target`` refuses an override on
+# an agent they are not assigned to.
 @router.get("/v1/users/me/remote-machines")
 async def list_my_machines(user: UserContext | None = Depends(get_current_user)):
     """List machines visible in the user's personal "Remote Machines" view.
@@ -1659,7 +1654,7 @@ async def list_my_machines(user: UserContext | None = Depends(get_current_user))
     machines and hide the "Remove" button for them (deletion of admin
     infrastructure stays in the admin dashboard).
     """
-    u = _require_user_authenticated(user)
+    u = require_human(user)
 
     def _job() -> tuple[list[dict], list[dict]]:
         return (
@@ -1693,7 +1688,7 @@ async def pair_my_machine(
     user: UserContext | None = Depends(get_current_user),
 ):
     """Pair a new machine (any authenticated user). Same flow as admin but user-owned."""
-    u = _require_user_authenticated(user)
+    u = require_human(user)
     _require_satellite_source()
 
     from storage import database as _db
@@ -1719,7 +1714,7 @@ async def pair_my_machine(
     try:
         result = await run_db(_job)
     except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=409, detail=str(e)) from e
     if result is None:
         raise HTTPException(
             status_code=403,
@@ -1762,7 +1757,7 @@ async def delete_my_machine(
 
     Triggers self-uninstall on the satellite before removing the row.
     """
-    u = _require_user_authenticated(user)
+    u = require_human(user)
     machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
@@ -1790,7 +1785,7 @@ async def set_my_machine_auto_update(
     """Mirror of the admin auto-update toggle for owners of user-paired
     machines — sensitive servers can be pinned by their owner without
     needing admin intervention."""
-    u = _require_user_authenticated(user)
+    u = require_human(user)
 
     def _job() -> None:
         machine = remote_store.get_remote_machine(machine_id)
@@ -1811,7 +1806,7 @@ async def trigger_my_machine_update_now(
 ):
     """Mirror of the admin update-now trigger for owners of user-paired
     machines."""
-    u = _require_user_authenticated(user)
+    u = require_human(user)
     machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
@@ -1873,7 +1868,7 @@ async def list_my_remote_targets(
     The legacy ``agent_slug=''`` global override mode is gone —
     users select per-agent in the dashboard UI.
     """
-    u = _require_user_authenticated(user)
+    u = require_human(user)
     targets = await run_db(remote_store.get_user_remote_targets, u.sub)
     return {"targets": targets}
 
@@ -1893,7 +1888,7 @@ async def set_my_per_agent_target(
          be an admin-shared machine — but non-admin users
          cannot target admin-shared machines anyway. Enforce ownership.
     """
-    u = _require_user_authenticated(user)
+    u = require_human(user)
     if not agent_slug:
         raise HTTPException(status_code=400, detail="agent_slug required")
 
@@ -1934,7 +1929,7 @@ async def set_my_per_agent_target(
         try:
             remote_store.set_user_remote_target(u.sub, body.machine_id, agent_slug)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     await run_db(_job)
     _kick_presync(body.machine_id, agent_slug)
@@ -1948,7 +1943,7 @@ async def remove_my_per_agent_target(
 ):
     """Remove the user's target row for one agent. Idempotent (200 even if
     no row exists)."""
-    u = _require_user_authenticated(user)
+    u = require_human(user)
     if not agent_slug:
         raise HTTPException(status_code=400, detail="agent_slug required")
     await run_db(remote_store.remove_user_remote_target, u.sub, agent_slug)

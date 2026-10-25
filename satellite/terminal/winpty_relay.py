@@ -37,7 +37,7 @@ import contextlib
 import logging
 import threading
 from collections import deque
-from typing import Awaitable, Callable, Optional, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 
 from .._vendored.terminal_queries import PasteModeTracker
 from ..config import kill_process_tree
@@ -50,8 +50,8 @@ _READ_CHUNK = 65536
 
 # on_output(rendered_bytes) / on_exit(exit_code|None) — either may be sync or
 # return a coroutine (it's scheduled on the loop). Identical to pty_relay.
-OutputCb = Callable[[bytes], "Optional[Awaitable[None]]"]
-ExitCb = Callable[["Optional[int]"], "Optional[Awaitable[None]]"]
+OutputCb = Callable[[bytes], "Awaitable[None] | None"]
+ExitCb = Callable[["int | None"], "Awaitable[None] | None"]
 
 
 class WinPtyProcess:
@@ -67,11 +67,11 @@ class WinPtyProcess:
     def __init__(
         self,
         *,
-        proc: "object",  # winpty.PtyProcess
+        proc: object,  # winpty.PtyProcess
         rows: int,
         cols: int,
         on_output: OutputCb,
-        on_exit: Optional[ExitCb],
+        on_exit: ExitCb | None,
         scrollback_limit: int,
     ) -> None:
         self._proc = proc
@@ -81,13 +81,13 @@ class WinPtyProcess:
         self._on_output = on_output
         self._on_exit = on_exit
         self._scrollback_limit = scrollback_limit
-        self._scrollback: "deque[bytes]" = deque()
+        self._scrollback: deque[bytes] = deque()
         self._scrollback_len = 0
         self._paste_mode = PasteModeTracker()
         self._loop = asyncio.get_running_loop()
         self._closed = False
         self._exit_fired = False
-        self._reader: Optional[threading.Thread] = None
+        self._reader: threading.Thread | None = None
 
     # -- attach ---------------------------------------------------------------
     def _attach(self) -> None:
@@ -135,7 +135,7 @@ class WinPtyProcess:
                         break
                     except concurrent.futures.TimeoutError:
                         continue  # lane full — keep waiting (until drained or close)
-                    except Exception:
+                    except Exception:  # noqa: BLE001  # the loop side's failure for one chunk must not end the reader thread
                         break  # enqueue failed (loop closing / cancelled)
         except Exception:  # never let the reader thread die silently
             logger.exception("winpty %s: reader thread error", self.pid)
@@ -186,7 +186,7 @@ class WinPtyProcess:
             return
         try:
             self._proc.write(data.decode("utf-8", "replace"))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # pywinpty's write raises whatever its ConPTY binding reports
             logger.warning("winpty %s: write failed: %s", self.pid, exc)
 
     def resize(self, rows: int, cols: int) -> None:
@@ -196,7 +196,7 @@ class WinPtyProcess:
         self.rows, self.cols = rows, cols
         try:
             self._proc.setwinsize(rows, cols)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # pywinpty's setwinsize raises whatever its ConPTY binding reports
             logger.debug("winpty %s: resize failed: %s", self.pid, exc)
 
     # -- lifecycle ------------------------------------------------------------
@@ -232,7 +232,7 @@ class WinPtyProcess:
                 await self._loop.run_in_executor(None, self._kill_tree)
             except Exception:
                 logger.exception("winpty %s: kill_tree failed", self.pid)
-        code: Optional[int] = None
+        code: int | None = None
         try:
             code = await self._loop.run_in_executor(None, self._reap)
         except Exception:
@@ -249,23 +249,23 @@ class WinPtyProcess:
         # them and leave the venv locked — the MCP-update orphan-lock class).
         try:
             kill_process_tree(self.pid, timeout=5.0)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # tree-killing a ConPTY child on a session already closing
             logger.debug("winpty %s: kill_process_tree failed: %s", self.pid, exc)
         try:
             if self._proc.isalive():
                 self._proc.terminate(force=True)
-        except Exception:
+        except Exception:  # noqa: BLE001  # terminating a ConPTY child the tree kill may have already ended
             pass
 
-    def _reap(self) -> Optional[int]:
+    def _reap(self) -> int | None:
         # Runs in a threadpool. The child is already dead (killed, or exited on
         # its own); wait() polls isalive and returns the exit status.
         try:
             return self._proc.wait()
-        except Exception:
+        except Exception:  # noqa: BLE001  # reaping a ConPTY child that is already dead
             return None
 
-    def _fire_exit(self, code: Optional[int]) -> None:
+    def _fire_exit(self, code: int | None) -> None:
         if self._exit_fired:
             return
         self._exit_fired = True
@@ -283,11 +283,11 @@ def spawn_pty(
     argv: Sequence[str],
     *,
     env: dict,
-    cwd: Optional[str] = None,
+    cwd: str | None = None,
     rows: int = DEFAULT_ROWS,
     cols: int = DEFAULT_COLS,
     on_output: OutputCb,
-    on_exit: Optional[ExitCb] = None,
+    on_exit: ExitCb | None = None,
     scrollback_limit: int = DEFAULT_SCROLLBACK_BYTES,
 ) -> WinPtyProcess:
     """Spawn ``argv`` on a fresh ConPTY and return a loop-integrated handle.

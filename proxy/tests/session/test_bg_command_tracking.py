@@ -20,9 +20,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.events.bg_command_state import get_bg_command_registry
 from core.layers.cli.layer import cli_chunk_to_events
 from core.layers.cli.translator import ClaudeCLIEventTranslator
-from core.events.bg_command_state import get_bg_command_registry
 from core.session.session_state import get_subagent_registry
 
 
@@ -208,7 +208,7 @@ if __name__ == "__main__":
         try:
             fn()
             print(f"PASS {fn.__name__}")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the script runner reports each failure and runs the rest
             failed += 1
             print(f"FAIL {fn.__name__}: {e!r}")
     print(f"\n{len(fns) - failed}/{len(fns)} passed")
@@ -394,6 +394,7 @@ class _MonitorLayer:
 
 async def _run_monitor(monkeypatch, sid: str, on_drain) -> list[dict]:
     import asyncio
+
     from core.events import pump_bg_monitors
     from core.session.session_state import _dashboard_notify_queues
     monkeypatch.setattr(pump_bg_monitors.task_store, "get_chat", lambda cid: {})
@@ -495,6 +496,44 @@ async def test_the_abort_check_reads_the_chat_off_the_loop(monkeypatch, temp_db,
     assert queued == []
 
 
+@pytest.mark.asyncio
+async def test_the_agent_monitors_abort_check_skips_the_nudge_and_clears_the_cohort(
+        monkeypatch, temp_db, loop_db_guard):
+    """The agent twin of the command monitor's rule: a cohort that finishes
+    after the person stopped the chat's last turn earns no nudge; its
+    badges clear, its agents count as reviewed (a later monitor nudges for
+    its own alone), and the flag is read off the loop."""
+    from core.events import pump_bg_monitors
+    from core.session.session_state import (
+        _dashboard_notify_queues,
+        get_subagent_registry,
+    )
+    from storage import database as task_store
+    sid = "s-agent-aborted"
+    chat_id = "c-" + sid
+    task_store.create_chat(chat_id, "user-admin", "agent-x")
+    task_store.update_chat(chat_id, last_turn_aborted=True)
+    reg = get_subagent_registry(sid)
+    reg.register_spawn("agA", "tuA", label="agA: audit")
+    reg.mark_done("agA")
+    pushed: list = []
+    monkeypatch.setattr(pump_bg_monitors, "push_pump_event", lambda cid, ev: pushed.append(ev))
+    queued: list = []
+    monkeypatch.setattr(pump_bg_monitors, "queue_pump_prompt",
+                        lambda *a, **k: queued.append(a) or True)
+    import asyncio
+    queue: asyncio.Queue = asyncio.Queue()
+    _dashboard_notify_queues[sid] = queue
+    try:
+        with loop_db_guard.active():
+            await pump_bg_monitors._bg_agent_monitor(_MonitorLayer(lambda: False), sid, chat_id, 1)
+    finally:
+        _dashboard_notify_queues.pop(sid, None)
+    assert queue.qsize() == 0 and queued == []
+    assert [e["type"] for e in pushed] == ["bg_agents_complete"]
+    assert reg.owed == set()
+
+
 # ---------------------------------------------------------------------------
 # The review nobody views: after the monitor's guard, and a visible chat turn
 # ---------------------------------------------------------------------------
@@ -515,7 +554,7 @@ class _ReviewLayer(_MonitorLayer):
         return self._locks.setdefault(sid, asyncio.Lock())
 
     async def send_message(self, sid, prompt, **kwargs):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
         self.sends.append(prompt)
         if self._during_turn:
             self._during_turn()
@@ -587,6 +626,7 @@ def _rows(chat_id: str) -> list[tuple[str, str, str]]:
 
 async def _monitor(layer, sid: str, chat_id: str, *, agents: bool = False) -> None:
     import asyncio
+
     from core.events import chat_writer, pump_bg_monitors
     run = pump_bg_monitors._bg_agent_monitor if agents else pump_bg_monitors._bg_command_monitor
     await asyncio.wait_for(run(layer, sid, chat_id, 1), timeout=10)
@@ -691,6 +731,7 @@ async def test_a_monitor_whose_session_does_not_come_back_exits(
 @pytest.mark.asyncio
 async def test_a_review_that_starts_new_work_gets_its_own_monitor(review_env, monkeypatch):
     import asyncio
+
     from core.events import pump_bg_monitors
     sid, chat_id = "s-rv2", "c-rv2"
     review_env.bind(chat_id, sid)
@@ -751,6 +792,7 @@ class _HeldPump:
 
     def __init__(self, chat_id: str, hold: float = 0.0, on_end=None):
         import asyncio
+
         from core.events.stream_pump import _active_pumps
         self.is_done = False
 
@@ -838,6 +880,7 @@ async def test_an_agent_review_after_another_turn_follows_the_engine(
 @pytest.mark.asyncio
 async def test_a_chat_busy_for_every_round_logs_once(review_env, monkeypatch, caplog):
     import logging
+
     from core.events import pump_bg_monitors
     monkeypatch.setattr(pump_bg_monitors, "REVIEW_WAIT_S", 0.05)
     sid, chat_id = "s-rv8", "c-rv8"
@@ -867,6 +910,7 @@ def fast_window(monkeypatch):
 
 async def _release_after(key: str, delay: float, during=None) -> None:
     import asyncio
+
     from services.scheduler import lanes
     await asyncio.sleep(delay)
     if during:
@@ -877,6 +921,7 @@ async def _release_after(key: str, delay: float, during=None) -> None:
 @pytest.mark.asyncio
 async def test_a_review_waits_for_the_report_window_then_runs(review_env, fast_window):
     import asyncio
+
     from services.scheduler import lanes
     sid, chat_id = "s-rw1", "c-rw1"
     review_env.bind(chat_id, sid, delegate_role="worker")
@@ -899,6 +944,7 @@ async def test_a_review_waits_for_the_report_window_then_runs(review_env, fast_w
 async def test_a_command_the_runs_producer_reviewed_is_not_reviewed_again(
         review_env, fast_window):
     import asyncio
+
     from services.scheduler import lanes
     sid, chat_id = "s-rw2", "c-rw2"
     review_env.bind(chat_id, sid, delegate_role="worker")
@@ -919,6 +965,7 @@ async def test_a_command_the_runs_producer_reviewed_is_not_reviewed_again(
 async def test_an_inherited_codex_agent_is_reviewed_exactly_once(
         review_env, fast_window, producer_named_it):
     import asyncio
+
     from core.session.session_state import get_subagent_registry
     from services.scheduler import lanes
     sid, chat_id = f"s-rw3-{producer_named_it}", f"c-rw3-{producer_named_it}"
@@ -941,6 +988,7 @@ async def test_an_inherited_codex_agent_is_reviewed_exactly_once(
 @pytest.mark.asyncio
 async def test_a_claude_agent_is_not_reviewed_after_the_window(review_env, fast_window):
     import asyncio
+
     from core.session.session_state import get_subagent_registry
     from services.scheduler import lanes
     sid, chat_id = "s-rw4", "c-rw4"

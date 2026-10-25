@@ -30,17 +30,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 
 import httpx
 
-from storage import database as task_store
-from storage import db_app_deliveries as deliveries
-from storage.automation import run_status
-from services.scheduler import task_kinds
-from storage.pg import run_db
 from core.background import spawn
+from services.scheduler import task_kinds
+from storage import database as task_store, db_app_deliveries as deliveries
+from storage.automation import run_status
+from storage.pg import run_db
 
 #: A delivery's verdict as the run row it carries reads it (APPS.md
 #: "Handlers"): the one mapping between the two machines.
@@ -54,7 +54,7 @@ logger = logging.getLogger("otodock.apps")
 HANDLER_TIMEOUT_S = 60.0
 RESULT_KEEP_BYTES = 32 * 1024
 UNAPPROVED_WAIT_S = 30
-# Feed → the event a handler may wake on (the emit sites of api/apps/catalog.py).
+# Feed → the event a handler may wake on (the emit sites of services/apps/catalog.py).
 FEED_EVENTS = {
     "sessions": "chat_created",
     "tasks": "task_finished",
@@ -102,7 +102,7 @@ def has_subscribers(agent: str) -> bool:
 
 
 def _build_index() -> tuple[dict, dict, set]:
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     plat: dict[tuple[str, str], list[tuple[str, str]]] = {}
     cross: dict[tuple[str, str, str], list[tuple[str, str, str]]] = {}
     agents: set[str] = set()
@@ -180,15 +180,18 @@ def on_feed_delta(users, agent: str, feed: str, delta: dict, shared: bool | None
     if not agent or not has_subscribers(agent):
         return
     try:
-        spawn(_dispatch(list(users), agent, feed, event, dict(delta), shared),
-              name="dispatch", owner="app_handlers")
+        asyncio.get_running_loop()
     except RuntimeError:
+        # Before the coroutine exists: one built and never awaited warns.
         logger.debug("handler dispatch skipped: no running loop")
+        return
+    spawn(_dispatch(list(users), agent, feed, event, dict(delta), shared),
+          name="dispatch", owner="app_handlers")
 
 
 async def _dispatch(users: list[str], agent: str, feed: str, event: str, delta: dict,
                     shared: bool | None) -> None:
-    from api.apps import catalog
+    from services.apps import catalog
     await _ensure_index()
     subs = _index.get((agent, event)) or []
     if not subs:
@@ -216,7 +219,7 @@ async def fire_scheduled(task, trigger_type: str = "scheduled") -> str:
     """The runner's branch for ``task_type='app'``: a run row and a delivery,
     never a session. A row whose app is gone deletes itself; a hidden or
     unapproved app is skipped (its wakes resume when it comes back)."""
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     from services.scheduler import scheduler as _api
     row = await run_db(task_store.get_app, task.app_id or "")
     if row is None:
@@ -252,10 +255,9 @@ async def sync_rows(row: dict) -> None:
     approved manifest: create the missing, re-cron the changed (a pause
     survives), remove the departed. Runs at go-live, approve and rollback."""
     import config
-    from api.apps import manifest as _mf
     from core.session.session_state import get_user_tz
-    from services.scheduler import scheduler as _api
-    from services.scheduler import shared as _shared
+    from services.apps import manifest as _mf
+    from services.scheduler import scheduler as _api, shared as _shared
     wanted = (_mf.parse_handlers(row).get("on_schedule") or {}) \
         if task_store.app_actions_approved(row) and not row.get("hidden") else {}
     existing = {t.get("app_handler"): t for t in await run_db(task_store.list_app_handler_tasks, row["id"])}
@@ -365,7 +367,7 @@ def _start_step(app_id: str, d: dict) -> None:
 async def drain(app_id: str) -> int:
     """Fire the app's due rows one after another until none is due; a step
     row goes to its own task (``_start_step``) and the loop continues."""
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     from services.scheduler import shared as _shared
     fired = 0
     async with _drain_lock(app_id):
@@ -451,7 +453,7 @@ async def cancel_drains() -> None:
 def _precheck(row: dict | None, d: dict) -> str:
     """Why the delivery must not fire: a reason (``dead``), ``HOLD_UNAPPROVED``
     (wait), or ``""``."""
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     if row is None:
         return "the app is gone"
     if not task_store.app_kind_of(row).may_serve:
@@ -552,8 +554,8 @@ async def _fire(d: dict, *, as_step: bool = False) -> None:
     ``as_step`` says the drain put the row in the step lane; a manifest
     that changed underneath sends the row back to the queue for the other
     lane instead of running it in the wrong one."""
-    from api.apps.app_proxy import forward
     from services.apps import app_supervisor
+    from services.apps.app_supervisor import forward
     row = await run_db(task_store.get_app, d["app_id"])
     why = await asyncio.to_thread(_precheck, row, d)
     if why == HOLD_UNAPPROVED:
@@ -563,7 +565,7 @@ async def _fire(d: dict, *, as_step: bool = False) -> None:
         await _dead(d, why)
         return
     assert row is not None
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     is_step = _mf.is_step(row, d["handler"])
     if is_step != as_step:
         await _rearm(d, "the handler changed lanes with the manifest", 5)
@@ -626,3 +628,20 @@ def wakes(row: dict, limit: int = 10) -> list[dict]:
              "at": w.get("created_at") or "", "done_at": w.get("done_at") or "",
              "exit_code": w.get("exit_code"), "ran_on": w.get("ran_on") or ""}
             for w in deliveries.recent(row["id"], limit)]
+
+
+# A check's handler wake (CHECKS.md "The handler kind") is a synchronous
+# POST with no delivery row: the run is registered here for its minute so
+# the handler's platform calls verify like a handler's.
+_inflight_checks: dict[str, dict] = {}
+
+
+def register_inflight_check(run_id: str, app_id: str, handler: str, event: str, *, ttl_s: int) -> None:
+    from storage import db_app_deliveries as deliveries
+    _inflight_checks[run_id] = {"id": run_id, "app_id": app_id, "handler": handler, "event": event,
+                                "status": deliveries.INFLIGHT, "payload": {},
+                                "expires": time.monotonic() + ttl_s}
+
+
+def unregister_inflight_check(run_id: str) -> None:
+    _inflight_checks.pop(run_id, None)

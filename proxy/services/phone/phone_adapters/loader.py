@@ -10,9 +10,8 @@ from __future__ import annotations
 import logging
 
 import config
-
-from storage.identity import credential_store
 from storage import database as task_store
+from storage.identity import credential_store
 
 from .asterisk_freepbx import AsteriskFreePBXAdapter
 from .base import PhoneAdapterError, PhoneServerAdapter

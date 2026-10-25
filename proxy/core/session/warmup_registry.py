@@ -25,8 +25,8 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
 
 logger = logging.getLogger("warmup-registry")
 
@@ -189,6 +189,7 @@ async def sweep_stale() -> int:
         for cid in list(_inflight.keys()):
             rec = _inflight[cid]
             if rec.completed.is_set() or now - rec.started_at > _SWEEP_AGE_SECONDS:
+                rec.completed.set()
                 _inflight.pop(cid, None)
                 removed += 1
     if removed:

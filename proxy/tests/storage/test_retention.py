@@ -16,7 +16,6 @@ import config
 from services.infra import retention
 from services.infra.retention import LiveSnapshot
 
-
 # ---------------------------------------------------------------------------
 # Fixture helpers
 # ---------------------------------------------------------------------------
@@ -98,6 +97,26 @@ def test_aged_chat_files_deleted_and_flagged(temp_db, monkeypatch):
     assert stats["chats_flagged"] == 1
     assert stats["session_files_deleted"] == 2
     assert stats["bytes_freed"] == 400
+
+
+def test_a_chat_row_naming_no_agent_directory_never_stops_the_sweep(temp_db, monkeypatch):
+    """``get_agent_dir`` refuses an empty name: the sweep skips that row and
+    still ages out the others."""
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    db = temp_db
+    _set_username(db, "user-admin", "alice")
+    bad_sid, sid = _uuid(), _uuid()
+    db.create_chat("c-bad", "user-admin", "")
+    db.update_chat("c-bad", session_id=bad_sid)
+    _backdate_chat("c-bad", 60)
+    db.create_chat("c-good", "user-admin", "a1")
+    db.update_chat("c-good", session_id=sid)
+    _backdate_chat("c-good", 60)
+    cf = _mk_claude(_home("a1", "alice"), sid)
+
+    _sweep(days=30)
+
+    assert not cf.exists() and db.get_chat("c-good")["session_id"] is None
 
 
 def test_flag_skips_a_chat_resumed_after_the_candidate_query(temp_db, monkeypatch):
@@ -400,10 +419,10 @@ def test_live_snapshot_ignores_stale_security_contexts(temp_db, monkeypatch):
     unless the session is in a live registry. (The first live run-now
     deleted 0 of 292 MB junk because every recently-used home looked busy.)
     """
+    import core.events.stream_pump as stream_pump
     import core.layers.cli.session as cli_session
     import core.layers.codex.session as codex_session
     import core.session.session_state as session_state
-    import core.events.stream_pump as stream_pump
 
     class _Ctx:
         def __init__(self, agent, username):
@@ -457,8 +476,8 @@ def test_storage_usage_shape(temp_db):
 def test_storage_usage_counts_the_upload_staging(temp_db, monkeypatch):
     """Chunked uploads in flight hold disk outside every agent tree; the
     admin breakdown shows them."""
-    from api.media import uploads
-    monkeypatch.setattr(uploads, "staged_bytes_total", lambda: 4321)
+    from services.media import upload_staging
+    monkeypatch.setattr(upload_staging, "staged_bytes_total", lambda: 4321)
     assert retention.compute_storage_usage()["upload_staging_bytes"] == 4321
 
 
@@ -502,8 +521,9 @@ def test_verdict_deletion_runs_in_batches(temp_db, monkeypatch):
     """Aged verdicts go in committed batches, each statement bounded, so the
     first sweep of a large install never runs one delete for minutes."""
     import contextlib
-    from storage.checks import db_checks
+
     from storage import pg
+    from storage.checks import db_checks
     aged = [_verdict(40) for _ in range(5)]
     fresh = _verdict(3)
     monkeypatch.setattr(db_checks, "_VERDICT_DELETE_BATCH", 2, raising=False)
@@ -627,6 +647,7 @@ def test_a_linked_archive_root_is_an_error_not_a_walk(temp_db, tmp_path):
 
 def _admin_client(api_key=False):
     from fastapi.testclient import TestClient
+
     from app import app
     from auth.providers import UserContext, get_current_user
 
@@ -695,6 +716,7 @@ def test_an_unreadable_or_read_only_tree_is_listed_and_purged(temp_db):
     listable and purgeable: the list names it, the purge makes the owner's
     own directories writable and deletes it."""
     import os as _os
+
     from auth.providers import get_current_user
     base = _archive("locked", "a1")
     _retired("locked", archived_days=5)
@@ -739,3 +761,191 @@ def test_a_refused_archive_setting_writes_nothing_else(temp_db):
         assert client.get("/v1/admin/platform-settings").json()["offboarded_retention_days"] == "0"
     finally:
         app.dependency_overrides.pop(get_current_user, None)
+
+
+# ---------------------------------------------------------------------------
+# Pass A, the remote half — chats pinned to a machine and the machines' files
+# ---------------------------------------------------------------------------
+
+
+class _FakeRemoteLayer:
+    def __init__(self, sessions):
+        self._sessions = sessions
+
+
+class _FakeCM:
+    """Connected machines by version; each answers its frame from
+    ``answers`` (a dict is the ack's body, an exception the failure)."""
+
+    def __init__(self, machines: dict, answers: dict):
+        self._machines = machines
+        self._answers = answers
+        self.sent: list = []
+
+    def get_connected_machines(self):
+        return list(self._machines)
+
+    def satellite_supports_session_retention(self, mid):
+        return tuple(int(p) for p in self._machines[mid].split(".")) >= (0, 5, 150)
+
+    def satellite_name(self, mid):
+        return f"name-{mid}"
+
+    async def send_command(self, mid, msg, *, timeout=30.0):
+        self.sent.append((mid, dict(msg)))
+        ans = self._answers.get(mid, {})
+        if isinstance(ans, Exception):
+            raise ans
+        return {"status": "ok", **ans}
+
+
+def _remote_pass(monkeypatch, cm, remote_sessions=(), *, days=30, enabled=True,
+                 live=None, dry_run=False) -> dict:
+    import asyncio
+    from types import SimpleNamespace
+    monkeypatch.setattr(retention, "_pass_tarball_gc", lambda stats, dry_run: None)
+    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
+    sessions = {s[0]: SimpleNamespace(session_id=s[0], machine_id=s[1], resume_handle=s[2])
+                for s in remote_sessions}
+    monkeypatch.setattr(retention, "_remote_layer_for_sweep", lambda: _FakeRemoteLayer(sessions))
+    snap = live or LiveSnapshot()
+    stats = retention._run_sweep_sync(days, enabled, snap, dry_run)
+    asyncio.run(retention._pass_remote_sessions(days, enabled, snap, stats, dry_run))
+    return stats
+
+
+def test_a_remote_chat_ages_out_and_its_machine_is_asked_with_its_keep_list(temp_db, monkeypatch):
+    """An aged chat pinned to a machine is flagged like a local one; the
+    machine then gets every id the rows still reference for it (its own
+    pinned rows and the rows that name no place, the aged chat's ids gone),
+    never another machine's nor a sandbox chat's; an older machine is not
+    asked."""
+    db = temp_db
+    _set_username(db, "user-admin", "alice")
+    aged_sid, aged_tid, fresh_sid, unpinned_sid, unplaced_sid, other_sid = (_uuid() for _ in range(6))
+    db.create_chat("aged", "user-admin", "a1")
+    db.update_chat("aged", session_id=aged_sid, codex_thread_id=aged_tid, execution_target="m-a")
+    backdated = _backdate_chat("aged", 60)
+    db.create_chat("fresh", "user-admin", "a1")
+    db.update_chat("fresh", session_id=fresh_sid, execution_target="m-a")
+    db.create_chat("unpinned", "user-admin", "a1")
+    db.update_chat("unpinned", session_id=unpinned_sid)   # fresh, minted here: no pass ages it
+    db.create_chat("unplaced", "user-admin", "a1")
+    db.update_chat("unplaced", session_id=unplaced_sid, execution_target="")
+    db.create_chat("other", "user-admin", "a1")
+    db.update_chat("other", session_id=other_sid, execution_target="m-b")
+    cm = _FakeCM({"m-a": "0.5.150", "m-b": "0.5.149"}, {
+        "m-a": {"files": 3, "bytes": 300, "deleted": 1, "deleted_bytes": 100, "candidates": ["x"]},
+    })
+
+    stats = _remote_pass(monkeypatch, cm)
+
+    aged = db.get_chat("aged")
+    assert aged["session_id"] is None and aged["codex_thread_id"] is None
+    assert aged["pending_history_seed"] == "retention" and aged["updated_at"] == backdated
+    for cid in ("fresh", "unpinned", "unplaced", "other"):
+        assert db.get_chat(cid)["pending_history_seed"] == ""
+    assert [mid for mid, _ in cm.sent] == ["m-a"]
+    frame = cm.sent[0][1]
+    assert frame["type"] == "session_files_retention" and frame["dry_run"] is False
+    assert frame["min_age_s"] == retention.ORPHAN_GRACE_S
+    assert frame["keep"] == sorted({fresh_sid, unplaced_sid})
+    assert stats["chats_flagged"] == 1 and stats["remote_chats_flagged"] == 1
+    assert stats["remote_session_files_deleted"] == 1 and stats["remote_bytes_freed"] == 100
+    assert stats["remote_session_files_bytes"] == 300
+    assert stats["remote_machines"] == [{
+        "machine_id": "m-a", "name": "name-m-a", "files": 3, "bytes": 300,
+        "deleted": 1, "deleted_bytes": 100, "candidates": ["x"], "reached": True,
+    }]
+    assert stats["remote_machines_unreached"] == 0
+
+
+def test_a_live_remote_session_keeps_its_chat_and_rides_its_machines_keep_list(temp_db, monkeypatch):
+    db = temp_db
+    _set_username(db, "user-admin", "alice")
+    sid, tid, elsewhere = _uuid(), _uuid(), _uuid()
+    db.create_chat("live", "user-admin", "a1")
+    db.update_chat("live", session_id=sid, codex_thread_id=tid, execution_target="m-a")
+    _backdate_chat("live", 60)
+    cm = _FakeCM({"m-a": "0.5.150"}, {"m-a": {"files": 1, "bytes": 10}})
+
+    stats = _remote_pass(monkeypatch, cm, remote_sessions=[(sid, "m-a", tid), (elsewhere, "m-b", "")])
+
+    assert db.get_chat("live")["session_id"] == sid
+    assert stats["chats_flagged"] == 0
+    assert cm.sent[0][1]["keep"] == sorted({sid, tid})   # the live ids, never m-b's
+    assert stats["remote_session_files_bytes"] == 10
+
+
+def test_an_unanswered_machine_is_unreached_and_a_dry_run_flags_nothing(temp_db, monkeypatch):
+    db = temp_db
+    _set_username(db, "user-admin", "alice")
+    sid = _uuid()
+    db.create_chat("aged", "user-admin", "a1")
+    db.update_chat("aged", session_id=sid, execution_target="m-a")
+    _backdate_chat("aged", 60)
+    cm = _FakeCM({"m-a": "0.5.150"}, {"m-a": RuntimeError("no answer in 60 s")})
+
+    stats = _remote_pass(monkeypatch, cm, dry_run=True)
+
+    assert db.get_chat("aged")["session_id"] == sid          # a dry run flags nothing
+    assert stats["chats_flagged"] == 1                        # but counts what it would
+    assert cm.sent[0][1]["dry_run"] is True
+    # The aged chat's id leaves the keep list as a real run's flagging would
+    # take it out: the machine names its transcript as a candidate.
+    assert cm.sent[0][1]["keep"] == []
+    assert stats["remote_machines"][0]["reached"] is False
+    assert stats["remote_machines_unreached"] == 1
+    assert stats["remote_session_files_bytes"] is None
+    # The knob off: no flagging, the machines are still asked (the orphans).
+    cm2 = _FakeCM({"m-a": "0.5.150"}, {"m-a": {"files": 2, "bytes": 20}})
+    stats = _remote_pass(monkeypatch, cm2, enabled=False)
+    assert db.get_chat("aged")["session_id"] == sid and stats["chats_flagged"] == 0
+    assert cm2.sent[0][1]["keep"] == [sid]
+
+
+def test_a_keep_list_past_the_frame_cap_leaves_the_machine_unasked(temp_db, monkeypatch, caplog):
+    import logging
+    db = temp_db
+    _set_username(db, "user-admin", "alice")
+    monkeypatch.setattr(retention, "_KEEP_MAX", 2)
+    for i in range(3):
+        db.create_chat(f"c{i}", "user-admin", "a1")
+        db.update_chat(f"c{i}", session_id=_uuid(), execution_target="m-a")
+    cm = _FakeCM({"m-a": "0.5.150"}, {"m-a": {"files": 9, "bytes": 90}})
+
+    with caplog.at_level(logging.WARNING, logger="otodock"):
+        stats = _remote_pass(monkeypatch, cm)
+
+    assert cm.sent == []
+    assert stats["remote_machines"][0]["reached"] is False
+    assert stats["remote_machines_unreached"] == 1
+    assert stats["remote_session_files_bytes"] is None
+    assert "is not asked: its keep list holds 3 ids" in caplog.text
+
+
+def test_the_refs_by_target_split_the_pinned_rows_from_the_rest(temp_db):
+    db = temp_db
+    a, b, c, d = _uuid(), _uuid(), _uuid(), _uuid()
+    db.create_chat("p", "user-admin", "a1")
+    db.update_chat("p", session_id=a, codex_thread_id=b, execution_target="m-a")
+    db.create_chat("l", "user-admin", "a1")
+    db.update_chat("l", session_id=c, execution_target="local")
+    db.create_chat("u", "user-admin", "a1")
+    db.update_chat("u", session_id=d)
+    by_target = db.get_session_refs_by_target()
+    # A row is minted on the sandbox ('local'); only a pin names a machine.
+    assert by_target["m-a"] == {a, b}
+    assert by_target["local"] == {c, d}
+    assert by_target[""] == set()   # the dynamic tasks' refs: none here
+
+
+def test_storage_usage_shows_what_the_machines_held_at_the_last_sweep(temp_db):
+    import json
+    assert retention.compute_storage_usage()["remote_session_files_bytes"] is None
+    temp_db.set_platform_setting("session_retention_last_sweep",
+                                 json.dumps({"ran_at": "x", "remote_session_files_bytes": 1234}))
+    assert retention.compute_storage_usage()["remote_session_files_bytes"] == 1234
+    temp_db.set_platform_setting("session_retention_last_sweep",
+                                 json.dumps({"ran_at": "x", "remote_session_files_bytes": None}))
+    assert retention.compute_storage_usage()["remote_session_files_bytes"] is None

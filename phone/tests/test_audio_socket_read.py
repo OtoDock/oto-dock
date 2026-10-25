@@ -13,7 +13,11 @@ import struct
 import pytest
 
 from telephony.audio_socket import (
-    HEADER_SIZE, TYPE_AUDIO, TYPE_HANGUP, AudioSocketConnection, AudioSocketError,
+    HEADER_SIZE,
+    TYPE_AUDIO,
+    TYPE_HANGUP,
+    AudioSocketConnection,
+    AudioSocketError,
 )
 
 

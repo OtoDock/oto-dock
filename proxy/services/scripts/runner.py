@@ -24,14 +24,12 @@ import shutil
 import signal
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from core import placement
-from typing import Awaitable, Callable
-
 import config
-from core import layout
+from core import layout, placement
 
 logger = logging.getLogger("otodock.scripts")
 
@@ -181,7 +179,11 @@ def build_local(spec: ScriptSpec) -> tuple[list[str], dict[str, str], Path]:
     the script's folder read-only at ``mount_at`` and the run's scratch
     directory at ``/step``) and the env; synchronous."""
     from core.sandbox import oto_env
-    from core.sandbox.sandbox import SandboxBuilder, SandboxMount, resolve_sandbox_config
+    from core.sandbox.sandbox import (
+        SandboxBuilder,
+        SandboxMount,
+        resolve_sandbox_config,
+    )
     if spec.script_dir is None or spec.scratch_root is None:
         raise ScriptRefused("the local run needs the script's folder and a scratch root")
     agents_dir = Path(config.AGENTS_DIR).resolve()
@@ -314,12 +316,12 @@ async def run_remote(spec: ScriptSpec, machine_id: str, *, needs_checks_fields: 
     except RuntimeError as e:
         text = str(e)
         if "not connected" in text:
-            raise ScriptUnavailable("the machine is offline")
+            raise ScriptUnavailable("the machine is offline") from e
         if "command timeout" in text:
-            raise ScriptRefused(f"the machine did not answer within {spec.timeout} s")
+            raise ScriptRefused(f"the machine did not answer within {spec.timeout} s") from e
         if "Satellite command error" in text:
-            raise ScriptRefused(text.split(":", 1)[-1].strip() or "the satellite refused the script")
-        raise ScriptRefused("the machine's link dropped while the script ran")
+            raise ScriptRefused(text.split(":", 1)[-1].strip() or "the satellite refused the script") from e
+        raise ScriptRefused("the machine's link dropped while the script ran") from e
     finally:
         cm.unregister_step_output(command_id)
     code = ack.get("exit_code")

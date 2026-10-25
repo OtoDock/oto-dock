@@ -28,7 +28,7 @@ import asyncio
 import pytest
 
 from core.events import stream_pump
-from core.events.common_events import CommonEvent, DONE, TEXT
+from core.events.common_events import DONE, TEXT, CommonEvent
 from core.events.stream_pump import ChatStreamPump
 
 
@@ -157,7 +157,9 @@ def test_external_driven_sources_policy():
     delivery path (and pre-fan-out, attach() stole the stream outright). Only externally-driven sources are view-only; 'task'/'meeting'
     pumps MUST stay attachable (the dashboard is their live viewer).
     """
-    from core.session.session_kind import EXTERNAL_DRIVEN_SOURCE_TYPES as _EXTERNAL_DRIVEN_SOURCES
+    from core.session.session_kind import (
+        EXTERNAL_DRIVEN_SOURCE_TYPES as _EXTERNAL_DRIVEN_SOURCES,
+    )
 
     assert "phone" in _EXTERNAL_DRIVEN_SOURCES
     # Regression guard — adding any of these would silently break the dashboard's
@@ -171,7 +173,9 @@ def test_external_driven_sources_policy():
 async def test_phone_pump_is_view_only_default_is_attachable(temp_db):
     """The guard keys on pump.source_type — a phone pump reports 'phone' (→ the
     dashboard views it read-only) while a default pump is 'chat' (→ attachable)."""
-    from core.session.session_kind import EXTERNAL_DRIVEN_SOURCE_TYPES as _EXTERNAL_DRIVEN_SOURCES
+    from core.session.session_kind import (
+        EXTERNAL_DRIVEN_SOURCE_TYPES as _EXTERNAL_DRIVEN_SOURCES,
+    )
 
     temp_db.create_chat("pc-phone", "phone", "a1")
     producer = asyncio.get_event_loop().create_task(asyncio.sleep(3600))
@@ -229,7 +233,7 @@ async def test_done_keeps_live_blocks_and_advances_cutoff(temp_db):
 # Coalesced deltas, bounded dashboard queues
 # ---------------------------------------------------------------------------
 
-from core.events.common_events import PRODUCER_DONE, THINKING, TOOL_USE  # noqa: E402
+from core.events.common_events import PRODUCER_DONE, THINKING, TOOL_USE
 
 
 def _events_of(items: list) -> list[dict]:

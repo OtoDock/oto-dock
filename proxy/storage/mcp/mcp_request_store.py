@@ -24,7 +24,6 @@ from typing import Any
 
 from storage.pg import get_conn
 
-
 # The status vocabulary (``mcp_assignment_requests.status``, named once —
 # core-seams phase 8; the dashboard mirror is ``lib/status/mcpRequest.ts``,
 # bound to this set by a lock-step test) and the transitions allowed in
@@ -133,7 +132,7 @@ def create_request(
             if "idx_mcp_requests_open" in str(exc):
                 raise ValueError(
                     f"An open request for {mcp_name} on {agent_slug} already exists",
-                )
+                ) from exc
             raise
 
 

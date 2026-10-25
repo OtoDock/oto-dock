@@ -25,13 +25,18 @@ reaches them through the adapter, never by engine id.
 import asyncio
 import contextlib
 
+import pytest
+
 from core.layers.codex.layer import CodexEventTranslator
 from core.layers.codex.remote import CodexRemoteState
 from core.layers.codex.session import CodexEvent
 from core.remote.remote_execution import RemoteExecutionLayer, RemoteSessionInfo
-from core.remote.satellite_connection import SatelliteConnection, SatelliteConnectionManager
+from core.remote.satellite_connection import (
+    SatelliteConnection,
+    SatelliteConnectionManager,
+)
 from core.session.session_manager import get_layer_by_path
-from core.session.session_state import get_subagent_registry, _subagent_registries
+from core.session.session_state import _subagent_registries, get_subagent_registry
 
 MAIN = "thread-MAIN"
 SUB = "thread-SUB-agent"
@@ -233,12 +238,12 @@ def test_satellite_supports_pty_inject_version_gate():
 
 
 # ---------------------------------------------------------------------------
-# Plan mode: the remote path synthesizes the SAME implement card as the local
-# codex layer (codex delivers the plan as the turn's final agentMessage on the
-# -p path, so a completed plan-mode turn emits a `plan_mode exit` before DONE).
+# Plan mode: the remote path queues the SAME plan review as the local codex
+# layer: a completed plan-mode turn's `plan` item (else its last agentMessage)
+# becomes the plan, with no plan file on the machine.
 # ---------------------------------------------------------------------------
 
-from core.events.common_events import PLAN_MODE, DONE
+from core.events.common_events import DONE, PLAN_MODE
 
 
 def _drain_codex_turn(info, layer, raws):
@@ -252,37 +257,69 @@ def _drain_codex_turn(info, layer, raws):
     return asyncio.run(run())
 
 
-def test_remote_plan_mode_synthesizes_implement_card():
+@pytest.fixture
+def queued_reviews(monkeypatch):
+    from core.layers.codex import remote as codex_remote
+    queued: list = []
+
+    async def _queue(session_id, plan, plans_dir):
+        queued.append((session_id, plan, plans_dir))
+    monkeypatch.setattr(codex_remote, "queue_plan_review", _queue)
+    return queued
+
+
+@pytest.mark.parametrize("items,plan", [
+    ([("agentMessage", "Here is the plan."), ("plan", "1. Add --version")], "1. Add --version"),
+    ([("agentMessage", "- Add --version\n- Add a CLI test")], "- Add --version\n- Add a CLI test"),
+])
+def test_a_remote_plan_turn_queues_a_plan_review(queued_reviews, items, plan):
     tr = CodexEventTranslator(model="gpt-5.5")
     layer, info = _make_layer_info(tr)
     info.mode = "plan"  # read-only plan mode
     events = _drain_codex_turn(info, layer, [
-        _ev("item/completed", MAIN, type="agentMessage",
-            text="- Add --version\n- Add a CLI test"),
+        *(_ev("item/completed", MAIN, type=kind, text=text) for kind, text in items),
         {"method": "turn/completed",
          "params": {"threadId": MAIN, "turn": {"status": "completed"}}},
         {"type": "_turn_ended", "command_id": ""},
     ])
-    plan = [e for e in events if e.type == PLAN_MODE]
-    assert len(plan) == 1
-    assert plan[0].data["action"] == "exit"
-    assert plan[0].data["synthetic"] is True
-    assert plan[0].data["tool_input"]["plan"].startswith("- Add --version")
-    # The card is emitted BEFORE the terminal DONE (so it persists in the turn).
-    assert events.index(plan[0]) < next(
-        i for i, e in enumerate(events) if e.type == DONE
-    )
+    assert queued_reviews == [(info.session_id, plan, None)]
+    assert not [e for e in events if e.type == PLAN_MODE]
 
 
-def test_remote_default_mode_emits_no_plan_card():
+def test_remote_default_mode_queues_no_plan_review(queued_reviews):
     tr = CodexEventTranslator(model="gpt-5.5")
     layer, info = _make_layer_info(tr)
-    info.mode = "default"  # not a plan turn
-    events = _drain_codex_turn(info, layer, [
+    info.mode = "ask"  # not a plan turn
+    _drain_codex_turn(info, layer, [
         _ev("item/completed", MAIN, type="agentMessage", text="some answer"),
         {"type": "_turn_ended", "command_id": ""},
     ])
-    assert not [e for e in events if e.type == PLAN_MODE]
+    assert queued_reviews == []
+
+
+def test_a_plan_review_is_queued_with_its_file_and_answered_between_turns(tmp_path, monkeypatch):
+    """The local layer's half: the plan file (the same one across revisions)
+    under the session's plans folder, the review on the session's queue as
+    Claude's ExitPlanMode puts it, marked as answered between turns; a
+    satellite's session writes no file (its rows hold the plans)."""
+    from core.layers.codex import layer as codex_layer
+    from core.session.session_state import get_permission_queue
+    from storage import database as task_store
+    monkeypatch.setattr(task_store, "get_chat_by_session", lambda sid: {"id": "abcdef12-0000"})
+
+    async def run():
+        await codex_layer.queue_plan_review("s-plan", "1. Add --version", tmp_path / "plans")
+        await codex_layer.queue_plan_review("s-plan-remote", "1. Remote", None)
+    asyncio.run(run())
+    item = get_permission_queue("s-plan").get_nowait()
+    assert item["event_type"] == "plan_review" and item["request_id"]
+    assert item["plan"] == "1. Add --version"
+    assert item["tool_input"] == {"plan": "1. Add --version", "planFilePath": "plan-abcdef12.md",
+                                  "between_turns": True}
+    assert (tmp_path / "plans" / "plan-abcdef12.md").read_text() == "1. Add --version"
+    remote = get_permission_queue("s-plan-remote").get_nowait()
+    assert remote["tool_input"]["planFilePath"] == "plan-abcdef12.md"
+    assert sorted(p.name for p in (tmp_path / "plans").iterdir()) == ["plan-abcdef12.md"]
 
 
 def test_a_turn_the_satellite_closed_before_completion_is_lost_and_resumes():
@@ -307,6 +344,7 @@ def test_a_silent_remote_codex_turn_ends_typed_and_a_tool_item_keeps_it(monkeypa
     graceful: the next turn gets the cancelled context). An open tool item
     keeps the turn past the ceiling, and a steer past it is refused."""
     import time
+
     import config
     from core.events import turn_ending
     from core.events.common_events import ERROR
@@ -380,7 +418,8 @@ def test_remote_interrupted_plan_turn_emits_no_card():
 from unittest.mock import AsyncMock, MagicMock
 
 from core.events.bg_command_state import (
-    _bg_command_registries, get_bg_command_registry,
+    _bg_command_registries,
+    get_bg_command_registry,
 )
 
 

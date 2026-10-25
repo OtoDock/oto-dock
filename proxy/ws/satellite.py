@@ -13,18 +13,22 @@ import json
 import logging
 import re
 import time
+from collections.abc import MutableMapping
 from pathlib import Path
+from typing import Any, cast
 
+import psycopg
 from fastapi import WebSocket, WebSocketDisconnect
 
 import config as app_config
+from auth import roles
 from core import placement
 from core.remote import file_sync as file_sync_rules
 from core.remote.satellite_connection import get_connection_manager
 from storage import remote_store
 from storage.pg import run_db
-from auth import roles
 from ws import wire_events as wire
+from ws.socket_gone import GONE_WHILE_OPENING
 
 logger = logging.getLogger("otodock.satellite-ws")
 
@@ -232,14 +236,14 @@ class _PushWatch:
         self.gone = False
         self.code: int | None = None
 
-    async def _next(self, timeout: float) -> dict | None:
+    async def _next(self, timeout: float) -> MutableMapping[str, Any] | None:
         if self.gone:
             return None
         try:
             msg = await asyncio.wait_for(self.ws.receive(), timeout)
         except asyncio.TimeoutError:
             return None
-        except Exception:
+        except Exception:  # noqa: BLE001  # an ASGI receive raises by server implementation once the socket is gone
             self.gone = True
             return None
         if msg.get("type") == "websocket.disconnect":
@@ -379,6 +383,65 @@ def _preauth_release(addr: str) -> None:
         _preauth[addr] = n
 
 
+async def _note_version_change(cm, machine_id: str, machine: dict, sat_version: str) -> None:
+    """A satellite that authenticated on another version than its row held
+    came back from an update: clear the update bookkeeping and tell the
+    dashboards (``record_update_result`` also clears ``pending_update``)."""
+    prev_version = machine.get("satellite_version") or ""
+    if not prev_version or prev_version == sat_version:
+        return
+    try:
+        cm.persist_lane(
+            machine_id, "update_result",
+            {"target_version": sat_version, "error": None},
+        )
+        await _broadcast_satellite_updated(machine_id, machine, sat_version)
+    except Exception:
+        logger.exception("Failed to record/announce satellite_updated")
+
+
+async def _admitted_machine(websocket: WebSocket, machine_id: str,
+                            machine_secret: str) -> dict | None:
+    """The machine's row when its credentials admit it; None after the
+    refusal is sent (a deleted machine, user-paired machines off, a wrong
+    secret). The store reads may raise: the caller answers that."""
+    # Machine DB row gone (admin/user deleted it from dashboard).
+    # Tell the satellite to self-uninstall via close code 4006 so it
+    # cleans up local files instead of looping forever in the reconnect
+    # backoff trying with stale credentials.
+    machine = await run_db(remote_store.get_remote_machine, machine_id)
+    if not machine:
+        logger.info(
+            "Satellite %s rejected: machine_id not found — instructing "
+            "self-uninstall",
+            machine_id[:8],
+        )
+        await _refuse(websocket, "machine_deleted", code=4006, close_reason="machine_deleted",
+                      action="uninstall")
+        return None
+
+    # Reject user-paired satellites trying to reconnect when the
+    # admin has disabled the feature. Looking up the machine before
+    # verifying the secret is fine — the pairing_scope read is read-only.
+    if not placement.machine_is_admin_paired(machine):
+        from storage import database as _db
+        if await run_db(_db.get_platform_setting, "allow_user_paired_machines") == "0":
+            logger.info(
+                "Satellite %s rejected: user-paired machines disabled",
+                machine_id[:8],
+            )
+            await _refuse(websocket, "User-paired machines are disabled by admin policy.",
+                          code=4005, close_reason="feature_disabled_by_admin")
+            return None
+
+    # Verify machine secret
+    if not await run_db(remote_store.verify_machine_secret, machine_id, machine_secret):
+        logger.warning("Satellite auth failed for machine %s", machine_id[:8])
+        await _refuse(websocket, "Invalid credentials", code=4001, close_reason="Auth rejected")
+        return None
+    return cast("dict", machine)
+
+
 async def ws_satellite_handler(websocket: WebSocket):
     """WebSocket handler for satellite daemon connections."""
     from auth import lan_check
@@ -405,31 +468,48 @@ async def ws_satellite_handler(websocket: WebSocket):
         _free()
 
 
+async def _refuse_first_frame(websocket: WebSocket, e: BaseException) -> None:
+    """A first frame that never came, was binary or does not parse."""
+    logger.warning("Satellite auth timeout or invalid first frame: %r", e)
+    await _refuse(websocket, "Auth timeout or invalid message", code=4001,
+                  close_reason="Auth failed")
+
+
 async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
-    await websocket.accept()
+    try:
+        await websocket.accept()
+    except GONE_WHILE_OPENING as e:
+        logger.info("Satellite socket closed during the handshake (%s)", type(e).__name__)
+        return
 
     # --- Authentication (5s timeout) ---
+    # Only the read is the peer's to lose: the parse below is the frame's,
+    # and a RecursionError (a RuntimeError) there is a bad frame, not a
+    # closed socket.
     try:
         raw = await asyncio.wait_for(
             websocket.receive_text(), timeout=_AUTH_TIMEOUT_S
         )
-        if len(raw) > _MAX_AUTH_FRAME_CHARS:
-            logger.warning(
-                "Satellite auth frame of %d chars from %s refused before parse "
-                "(cap %d)", len(raw), getattr(websocket, "client", None),
-                _MAX_AUTH_FRAME_CHARS,
-            )
-            await _refuse(websocket, "Auth frame too large", code=4001,
-                          close_reason="Auth frame too large")
-            return
-        msg = json.loads(raw)
-    except WebSocketDisconnect:
+    except GONE_WHILE_OPENING as e:
+        logger.info("Satellite socket closed before its auth frame (%s)", type(e).__name__)
         return
-    except (asyncio.TimeoutError, json.JSONDecodeError, KeyError) as e:
+    except (asyncio.TimeoutError, KeyError) as e:
         # KeyError: a binary first frame (the socket's text read finds none).
-        logger.warning("Satellite auth timeout or invalid first frame: %r", e)
-        await _refuse(websocket, "Auth timeout or invalid message", code=4001,
-                      close_reason="Auth failed")
+        await _refuse_first_frame(websocket, e)
+        return
+    if len(raw) > _MAX_AUTH_FRAME_CHARS:
+        logger.warning(
+            "Satellite auth frame of %d chars from %s refused before parse "
+            "(cap %d)", len(raw), getattr(websocket, "client", None),
+            _MAX_AUTH_FRAME_CHARS,
+        )
+        await _refuse(websocket, "Auth frame too large", code=4001,
+                      close_reason="Auth frame too large")
+        return
+    try:
+        msg = json.loads(raw)
+    except (ValueError, RecursionError) as e:
+        await _refuse_first_frame(websocket, e)
         return
 
     if not isinstance(msg, dict) or msg.get("type") != "auth":
@@ -456,39 +536,17 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
                       close_reason="Missing credentials")
         return
 
-    # Machine DB row gone (admin/user deleted it from dashboard).
-    # Tell the satellite to self-uninstall via close code 4006 so it
-    # cleans up local files instead of looping forever in the reconnect
-    # backoff trying with stale credentials.
-    machine = await run_db(remote_store.get_remote_machine, machine_id)
-    if not machine:
-        logger.info(
-            "Satellite %s rejected: machine_id not found — instructing "
-            "self-uninstall",
-            machine_id[:8],
-        )
-        await _refuse(websocket, "machine_deleted", code=4006, close_reason="machine_deleted",
-                      action="uninstall")
+    try:
+        machine = await _admitted_machine(websocket, machine_id, machine_secret)
+    except (psycopg.Error, OSError) as e:
+        # The store could not answer: the machine is not at fault, so it is
+        # told to come back (it reconnects on its own loop), never refused
+        # for good, and the handler ends here instead of raising past it.
+        logger.warning("Satellite %s auth: the store could not be read (%s)", machine_id[:8], e)
+        await _refuse(websocket, "The platform could not check this machine now; try again",
+                      code=1013, close_reason="try again later")
         return
-
-    # Reject user-paired satellites trying to reconnect when the
-    # admin has disabled the feature. Looking up the machine before
-    # verifying the secret is fine — the pairing_scope read is read-only.
-    if not placement.machine_is_admin_paired(machine):
-        from storage import database as _db
-        if await run_db(_db.get_platform_setting, "allow_user_paired_machines") == "0":
-            logger.info(
-                "Satellite %s rejected: user-paired machines disabled",
-                machine_id[:8],
-            )
-            await _refuse(websocket, "User-paired machines are disabled by admin policy.",
-                          code=4005, close_reason="feature_disabled_by_admin")
-            return
-
-    # Verify machine secret
-    if not await run_db(remote_store.verify_machine_secret, machine_id, machine_secret):
-        logger.warning("Satellite auth failed for machine %s", machine_id[:8])
-        await _refuse(websocket, "Invalid credentials", code=4001, close_reason="Auth rejected")
+    if machine is None:
         return
     # Authenticated: the auth phase is over, so the pre-auth slot frees now
     # (the socket then lives for hours; it must not count against the cap).
@@ -607,8 +665,9 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
                         "proxy's start; offered again at its next connect", machine_id[:8],
                     )
                     return
-                from api.remote.remote_machines import get_satellite_tarball_with_hash
                 import base64 as _b64
+
+                from api.remote.remote_machines import get_satellite_tarball_with_hash
                 # Cached after the first build, but that first build tars
                 # the satellite tree — off the loop.
                 tarball_bytes, expected_sha256 = await asyncio.to_thread(
@@ -629,7 +688,7 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
                 await websocket.send_text(json.dumps(payload))
                 sent = True
                 if _version_at_least(sat_version, UPDATE_ACK_SATELLITE_VERSION):
-                    acked = await watch.acknowledged(SATELLITE_VERSION_LATEST, _UPDATE_ACK_WAIT_S)
+                    acked = await watch.acknowledged(cast("str", SATELLITE_VERSION_LATEST), _UPDATE_ACK_WAIT_S)
             except Exception as e:
                 logger.exception(
                     "Satellite %s: failed to push update: %s",
@@ -644,10 +703,10 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
                 await websocket.close(code=4007, reason="updating")
             if sent and (acked or await watch.closed_live()):
                 # Remember the target so the next reconnect can detect a rollback.
-                note_update_pushed(machine_id, SATELLITE_VERSION_LATEST)
+                note_update_pushed(machine_id, cast("str", SATELLITE_VERSION_LATEST))
                 with contextlib.suppress(Exception):
                     await _broadcast_satellite_updating(
-                        machine_id, machine, sat_version, SATELLITE_VERSION_LATEST,
+                        machine_id, machine, sat_version, cast("str", SATELLITE_VERSION_LATEST),
                     )
             elif sent:
                 logger.warning(
@@ -682,9 +741,19 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
         await run_db(remote_store.set_satellite_version, machine_id, sat_version)
     except Exception:
         logger.exception("Failed to record satellite_version")
-    await websocket.send_text(json.dumps(_auth_ok(machine)))
-
+    answer = json.dumps(_auth_ok(machine))
     cm = get_connection_manager()
+    try:
+        await websocket.send_text(answer)
+    except (WebSocketDisconnect, RuntimeError):
+        # The machine dropped while the version write ran: a gone peer
+        # raises WebSocketDisconnect, or under uvloop a RuntimeError for the
+        # closed transport (starlette converts only an OSError). The write
+        # above already holds the new version, so the next connect could not
+        # tell that an update landed: that is recorded now.
+        logger.info("Satellite %s: its socket closed before the answer", machine_id[:8])
+        await _note_version_change(cm, machine_id, machine, sat_version)
+        return
 
     # Clear a deliberate-pause flag on reconnect: a fresh auth means the
     # machine is back (tray Resume, or a reboot), so the sustained-outage
@@ -694,19 +763,7 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
     if machine.get("paused"):
         cm.persist_lane(machine_id, "paused", False)
 
-    # If the satellite just came back with the new version after an
-    # update was in flight, clear the update bookkeeping + notify
-    # dashboards. (record_update_result also clears pending_update.)
-    prev_version = machine.get("satellite_version") or ""
-    if prev_version and prev_version != sat_version:
-        try:
-            cm.persist_lane(
-                machine_id, "update_result",
-                {"target_version": sat_version, "error": None},
-            )
-            await _broadcast_satellite_updated(machine_id, machine, sat_version)
-        except Exception:
-            logger.exception("Failed to record/announce satellite_updated")
+    await _note_version_change(cm, machine_id, machine, sat_version)
 
     # --- Register connection ---
     conn = await cm.register(
@@ -727,7 +784,7 @@ async def _ws_satellite_handler(websocket: WebSocket, _free) -> None:
             await cm.handle_message(machine_id, msg)
     except WebSocketDisconnect:
         pass
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # one satellite connection's loop: an error ends this connection only
         logger.error("Satellite %s WS error: %s", machine_id[:8], e)
     finally:
         # Identity-guarded: only tear down if WE are still the registered

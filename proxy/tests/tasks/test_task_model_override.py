@@ -15,23 +15,24 @@ Run: cd proxy && python -m pytest tests/tasks/test_task_model_override.py -v
 import sys
 import uuid
 
+import psycopg
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from core.execution_layer import ResumeVerdict
 from tests._paths import PROXY_DIR
 
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from auth.providers import UserContext, get_current_user  # noqa: E402
-from services.scheduler import scheduler  # noqa: E402
-from storage.agents import agent_store  # noqa: E402
-from storage import database as task_store  # noqa: E402
-import config  # noqa: E402
-from storage.pg import get_conn  # noqa: E402
-
+import config
+from auth.providers import UserContext, get_current_user
+from services.scheduler import scheduler
+from storage import database as task_store
+from storage.agents import agent_store
+from storage.pg import get_conn
 
 AGENT = "briefer"
 # Enabled on the agent's layer in the stubbed registry below; the agent's own
@@ -229,6 +230,7 @@ class TestEdit:
         job, which holds the definition it was registered with: the fire
         reads the row again."""
         import asyncio
+
         from services.scheduler import runner
         tid = _create_scheduled(client).json()["task_id"]
         registered = scheduler._row_to_task(task_store.get_dynamic_task(tid))
@@ -383,6 +385,71 @@ class TestListing:
 # ───────────────────────────────────────────────────────────────────────────
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# The task's permission mode: Don't Ask (the default) or Auto
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestPermissionMode:
+    def test_auto_round_trips_from_the_request_to_the_run(self, client):
+        from core.permission_modes import task_run_mode
+        r = _create_scheduled(client, permission_mode="autoReview")
+        assert r.status_code == 200, r.text
+        row = task_store.get_dynamic_task(r.json()["task_id"])
+        assert row["permission_mode"] == "autoReview"
+        task = scheduler._row_to_task(row)
+        assert task.permission_mode == "autoReview"
+        assert task_run_mode(task) == "autoReview"
+        assert client.get("/v1/tasks").json()["tasks"][0]["permission_mode"] == "autoReview"
+
+    @pytest.mark.parametrize("extra", [{}, {"permission_mode": "dontAsk"}])
+    def test_dont_ask_is_the_default_and_runs_unattended(self, client, extra):
+        from core.permission_modes import task_run_mode
+        r = _create_one_time(client, **extra)
+        assert r.status_code == 200, r.text
+        row = task_store.get_dynamic_task(r.json()["task_id"])
+        assert row["permission_mode"] == ""          # every row spells Don't Ask the same way
+        assert task_run_mode(scheduler._row_to_task(row)) == "auto"
+        assert client.get("/v1/tasks").json()["tasks"][0]["permission_mode"] == "dontAsk"
+
+    def test_an_engine_with_no_review_of_its_own_refuses_auto(self, client):
+        r = _create_scheduled(client, layer="direct-llm", model="hosted-mini",
+                              permission_mode="autoReview")
+        assert r.status_code == 400
+        assert "Auto needs an engine with its own review" in r.json()["detail"]
+        assert client.get("/v1/tasks").json()["tasks"] == []
+
+    def test_only_the_two_task_modes_are_accepted(self, client):
+        for mode in ("ask", "plan", "auto"):
+            assert _create_scheduled(client, permission_mode=mode).status_code == 422, mode
+
+    def test_an_edit_moves_the_mode_both_ways(self, client):
+        tid = _create_scheduled(client).json()["task_id"]
+        assert client.post(f"/v1/tasks/{tid}/edit", json={"permission_mode": "autoReview"}).status_code == 200
+        assert task_store.get_dynamic_task(tid)["permission_mode"] == "autoReview"
+        assert client.post(f"/v1/tasks/{tid}/edit", json={"name": "Renamed"}).status_code == 200
+        assert task_store.get_dynamic_task(tid)["permission_mode"] == "autoReview"
+        assert client.post(f"/v1/tasks/{tid}/edit", json={"permission_mode": "dontAsk"}).status_code == 200
+        assert task_store.get_dynamic_task(tid)["permission_mode"] == ""
+        # The task's own engine decides: pinned to Direct LLM, Auto is refused.
+        assert client.post(f"/v1/tasks/{tid}/edit", json={
+            "layer": "direct-llm", "model": "hosted-mini"}).status_code == 200
+        r = client.post(f"/v1/tasks/{tid}/edit", json={"permission_mode": "autoReview"})
+        assert r.status_code == 400
+
+    def test_moving_an_auto_task_to_an_engine_without_review_is_refused(self, client):
+        tid = _create_scheduled(client, permission_mode="autoReview").json()["task_id"]
+        r = client.post(f"/v1/tasks/{tid}/edit", json={"layer": "direct-llm", "model": "hosted-mini"})
+        assert r.status_code == 400
+        row = task_store.get_dynamic_task(tid)
+        assert (row["override_execution_path"], row["permission_mode"]) == ("", "autoReview")
+        # Back to Don't Ask in the same edit: allowed.
+        r = client.post(f"/v1/tasks/{tid}/edit", json={
+            "layer": "direct-llm", "model": "hosted-mini", "permission_mode": "dontAsk"})
+        assert r.status_code == 200
+        assert task_store.get_dynamic_task(tid)["permission_mode"] == ""
+
+
 def _set_row(task_id: str, **cols):
     from storage.database import get_conn
     sets = ", ".join(f"{k} = %s" for k in cols)
@@ -470,8 +537,8 @@ class TestContinuedLaneModelChange:
         from core import concurrency
         from core.config import task_config_builder
         from core.session import session_manager, session_state
+        from services.remote import remote_status
         from services.scheduler import lanes, runner, shared
-        from storage import remote_store
 
         task_store.create_chat(self.CHAT, "user-admin", AGENT, "auto",
                                origin="delegated", model=MODEL_STRONG,
@@ -501,7 +568,7 @@ class TestContinuedLaneModelChange:
 
         class _RoundLayer:
             async def can_resume_session(self, sid, **kw):
-                return True
+                return ResumeVerdict.RESUMABLE
 
             async def start_session(self, sid, cfg):
                 events.append(("start", sid, cfg.resume, cfg.model))
@@ -536,7 +603,7 @@ class TestContinuedLaneModelChange:
                                 "", "manager", "agent", None))
         monkeypatch.setattr(session_manager, "get_execution_layer",
                             lambda *a, **k: _RoundLayer())
-        monkeypatch.setattr(remote_store, "resolve_execution_target",
+        monkeypatch.setattr(remote_status, "resolve_execution_target",
                             lambda *a, **k: ("local", None))
         monkeypatch.setattr(lanes, "_try_reuse_warm_session", _reuse)
         monkeypatch.setattr(session_state, "_save_sessions", lambda: None)
@@ -580,6 +647,126 @@ class TestContinuedLaneModelChange:
         assert seen["acquire"] == []
 
 
+class TestAFreshContinueRound:
+    """A continue round whose conversation is gone (the resume probe answers
+    FRESH) takes a new session id, and everything built for the old one is
+    built again: the MCP config, ``OTO_SESSION_ID``, the meetings MCP's
+    session. The first build's seat goes back once, the new build's is the
+    one the failure path returns."""
+
+    SID = "55555555-5555-4555-8555-555555555555"
+    CHAT = "worker-fresh-round"
+
+    def _drive(self, monkeypatch, *, second_build_fails: bool = False,
+               verdict: ResumeVerdict = ResumeVerdict.FRESH) -> dict:
+        import asyncio
+        import contextlib
+        from types import SimpleNamespace
+
+        from core import concurrency
+        from core.config import config_builder, task_config_builder
+        from core.session import session_manager, session_state
+        from services.remote import remote_status
+        from services.scheduler import lanes, runner, shared
+
+        task_store.create_chat(self.CHAT, "user-admin", AGENT, "auto",
+                               origin="delegated", model=MODEL_STRONG,
+                               execution_path="claude-code-cli")
+        task_store.update_chat(self.CHAT, session_id=self.SID)
+        seen: dict = {"builds": [], "starts": [], "released": []}
+
+        class _Stop(Exception):
+            pass
+
+        class _RoundLayer:
+            async def can_resume_session(self, sid, **kw):
+                return verdict
+
+            async def start_session(self, sid, cfg):
+                seen["starts"].append((sid, cfg.extra_env.get("MEETINGS_MCP_SESSION_ID"),
+                                       cfg.credential_env["OTO_SESSION_ID"], cfg.mcp_config_path))
+                seen["resume_at_start"] = cfg.resume
+                seen["released_before_start"] = list(seen["released"])
+                raise _Stop("the test ends the round at the spawn")
+
+            async def close_session(self, sid):
+                pass
+
+        async def _cfg(agent, task_def, sid, **kw):
+            if second_build_fails and seen["builds"]:
+                seen["builds"].append(sid)
+                raise RuntimeError("the second build failed")
+            seen["builds"].append(sid)
+            return SimpleNamespace(
+                execution_target="local", execution_path="claude-code-cli", interactive=False,
+                resume=False, extra_env={}, chat_id="", subscription_id="sub-1", model=MODEL_STRONG,
+                credential_env={"OTO_SESSION_ID": sid}, mcp_config_path=f"/configs/{sid}.json")
+
+        @contextlib.asynccontextmanager
+        async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):
+            yield
+
+        async def _reuse(*a, **k):
+            return False
+
+        monkeypatch.setattr(concurrency, "task_slot", _instant_slot)
+        monkeypatch.setattr(task_config_builder, "build_task_agent_config", _cfg)
+        monkeypatch.setattr(task_config_builder, "resolve_task_identity",
+                            lambda *a, **k: task_config_builder.TaskIdentity(
+                                "", "manager", "agent", None))
+        monkeypatch.setattr(session_manager, "get_execution_layer",
+                            lambda *a, **k: _RoundLayer())
+        monkeypatch.setattr(remote_status, "resolve_execution_target",
+                            lambda *a, **k: ("local", None))
+        monkeypatch.setattr(lanes, "_try_reuse_warm_session", _reuse)
+        monkeypatch.setattr(session_state, "_save_sessions", lambda: None)
+        monkeypatch.setattr(config_builder, "release_config_seat",
+                            lambda sid, cfg, **kw: seen["released"].append((sid, cfg.credential_env["OTO_SESSION_ID"])))
+
+        task = shared.TaskDefinition(
+            id="t-fresh-round", name="follow", agent=AGENT, prompt="go on",
+            scope="agent", notification_mode="none", continue_session=self.SID,
+            target_chat_id=self.CHAT,
+        )
+        run_id = "run-fresh-round"
+        task_store.create_run(run_id, task.id, task.agent, "manual", None, task.prompt,
+                              "delegate", task.scope, None)
+        shared._active_task_ids[task.id] = run_id
+        try:
+            asyncio.run(asyncio.wait_for(
+                runner._run_task(run_id, self.SID, task, task.prompt, "manual", None, 1),
+                timeout=30))
+        finally:
+            for sid in seen["builds"]:
+                session_state._sessions.pop(sid, None)
+            shared._active_task_ids.pop(task.id, None)
+        return seen
+
+    def test_the_fresh_session_runs_on_a_config_built_for_it(self, temp_db, monkeypatch):
+        seen = self._drive(monkeypatch)
+        first, second = seen["builds"]
+        assert first == self.SID and second != self.SID
+        assert seen["starts"] == [(second, second, second, f"/configs/{second}.json")]
+        # The first build's seat once, the second's on the failure path.
+        assert seen["released"] == [(self.SID, self.SID), (second, second)]
+        assert task_store.get_chat(self.CHAT)["session_id"] == second
+
+    def test_a_resumable_round_keeps_the_config_it_built(self, temp_db, monkeypatch):
+        """No FRESH verdict: one build, the session resumed on it, no seat
+        returned before the start."""
+        seen = self._drive(monkeypatch, verdict=ResumeVerdict.RESUMABLE)
+        assert seen["builds"] == [self.SID]
+        assert seen["starts"] == [(self.SID, self.SID, self.SID, f"/configs/{self.SID}.json")]
+        assert seen["resume_at_start"] is True
+        assert seen["released_before_start"] == []
+        assert task_store.get_chat(self.CHAT)["session_id"] == self.SID
+
+    def test_a_failed_rebuild_returns_no_seat_twice(self, temp_db, monkeypatch):
+        seen = self._drive(monkeypatch, second_build_fails=True)
+        assert seen["starts"] == []
+        assert seen["released"] == [(self.SID, self.SID)]
+
+
 class TestFireOfAGoneRow:
     def test_a_fire_of_a_deleted_or_paused_row_removes_the_job_and_runs_nothing(
             self, client, monkeypatch):
@@ -587,6 +774,7 @@ class TestFireOfAGoneRow:
         nothing: the job goes with it. Only a read that FAILED fires the
         registered definition."""
         import asyncio
+
         from services.scheduler import runner
         gone = scheduler._row_to_task(task_store.get_dynamic_task(
             _create_scheduled(client).json()["task_id"]))
@@ -614,7 +802,340 @@ class TestFireOfAGoneRow:
 
         # A read that raised fires as registered (the job's own definition).
         def _boom(task_id):
-            raise RuntimeError("db down")
+            raise psycopg.OperationalError("db down")
         monkeypatch.setattr(task_store, "get_dynamic_task", _boom)
         asyncio.run(_fire())
         assert fired == [gone.id, paused.id]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# The task's machine (dynamic_tasks.target_machine): validated on write for
+# the run person, shown in the views, decided again at every run
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def machines(client, monkeypatch):
+    """Four paired machines, all online until a test takes one down: the
+    viewer's own laptop, another member's laptop, an admin machine and the
+    admin's own laptop. The viewer is an editor of the agent."""
+    from services.remote import remote_status
+    from storage import remote_store
+    from storage.identity import db_users
+
+    remote_store.create_remote_machine("m-own", "viewer-laptop", "user-viewer", pairing_scope="user")
+    remote_store.create_remote_machine("m-other", "other-laptop", "user-viewer2", pairing_scope="user")
+    remote_store.create_remote_machine("m-rack", "rack-1", "user-admin", pairing_scope="admin")
+    remote_store.create_remote_machine("m-adm", "admin-laptop", "user-admin", pairing_scope="user")
+    db_users.add_user_agent("user-viewer", AGENT, "editor", "user-admin")
+    online = {"m-own", "m-other", "m-rack", "m-adm"}
+
+    def _live(machine_id, machine=None):
+        up = machine_id in online
+        return {"state": "online" if up else "disconnected", "last_heartbeat_age_s": 1 if up else None,
+                "last_seen_iso": "", "reachable": up}
+
+    monkeypatch.setattr(remote_status, "get_live_machine_status", _live)
+    return online
+
+
+def _as(client, user):
+    async def _current_user():
+        return user
+    client.app.dependency_overrides[get_current_user] = _current_user
+
+
+def _viewer():
+    return UserContext(sub="user-viewer", email="viewer@test.com", name="Viewer User",
+                       role="member", agents=[AGENT], agent_roles={AGENT: "editor"})
+
+
+def _edit(client, tid, **body):
+    return client.post(f"/v1/tasks/{tid}/edit", json=body)
+
+
+class TestTaskMachineOnWrite:
+    def test_own_machine_is_stored_by_name_or_id(self, client, machines):
+        _as(client, _viewer())
+        r = _create_scheduled(client, machine="viewer-laptop")
+        assert r.status_code == 200, r.text
+        row = task_store.get_dynamic_task(r.json()["task_id"])
+        assert row["target_machine"] == "m-own"
+        assert scheduler._row_to_task(row).target_machine == "m-own"
+        # By id, and offline now: the run falls back then, the write stands.
+        machines.discard("m-own")
+        r = _create_one_time(client, machine="m-own")
+        assert r.status_code == 200, r.text
+        assert task_store.get_dynamic_task(r.json()["task_id"])["target_machine"] == "m-own"
+
+    def test_omitted_and_default_store_the_agents_default(self, client, machines):
+        for extra in ({}, {"machine": "default"}, {"machine": ""}):
+            r = _create_scheduled(client, **extra)
+            assert r.status_code == 200, r.text
+            assert task_store.get_dynamic_task(r.json()["task_id"])["target_machine"] == ""
+
+    def test_someone_elses_machine_is_refused(self, client, machines):
+        _as(client, _viewer())
+        r = _create_one_time(client, machine="other-laptop")
+        assert r.status_code == 400
+        detail = r.json()["detail"]
+        assert detail.startswith("other-laptop is not a machine this work can run on.")
+        assert "viewer-laptop" in detail and "rack-1" not in detail
+        assert task_store.list_dynamic_tasks(enabled_only=False) == []
+
+    def test_an_admin_machine_is_refused_for_a_non_admin(self, client, machines):
+        _as(client, _viewer())
+        assert _create_scheduled(client, machine="rack-1").status_code == 400
+
+    def test_an_admin_picks_admin_machines_and_agent_work_never_runs_on_a_personal_one(
+            self, client, machines):
+        r = _create_scheduled(client, scope="agent", machine="rack-1")
+        assert r.status_code == 200, r.text
+        assert task_store.get_dynamic_task(r.json()["task_id"])["target_machine"] == "m-rack"
+        # Agent-scope runs have no person: never a personal machine, the
+        # admin's own included.
+        assert _create_scheduled(client, scope="agent", machine="admin-laptop").status_code == 400
+        r = _create_scheduled(client, machine="admin-laptop")
+        assert r.status_code == 200, r.text
+        assert task_store.get_dynamic_task(r.json()["task_id"])["target_machine"] == "m-adm"
+
+    def test_a_caller_without_a_person_names_only_the_default(self, client, machines):
+        from auth import roles
+        _as(client, UserContext(sub="session:abc", email="", name="", role=roles.SERVICE,
+                                is_api_key=True, agent=AGENT, session_id="abc"))
+        r = _create_scheduled(client, scope="agent", machine="rack-1")
+        assert r.status_code == 400
+        assert r.json()["detail"].startswith("Only a person can pick a machine")
+        r = _create_scheduled(client, scope="agent", machine="default")
+        assert r.status_code == 200, r.text
+        assert task_store.get_dynamic_task(r.json()["task_id"])["target_machine"] == ""
+        _as(client, UserContext(sub="api-key", email="", name="", role=roles.ADMIN, is_api_key=True))
+        r = client.post("/v1/tasks/scheduled", headers={"X-Agent-Name": AGENT}, json={
+            "name": "n", "agent": AGENT, "prompt": "p", "schedule": "0 7 * * *",
+            "scope": "agent", "notification_mode": "none", "machine": "rack-1"})
+        assert r.status_code == 400
+
+    def test_edit_sets_keeps_and_clears_the_machine(self, client, machines):
+        _as(client, _viewer())
+        tid = _create_scheduled(client).json()["task_id"]
+        assert _edit(client, tid, machine="viewer-laptop").status_code == 200
+        assert task_store.get_dynamic_task(tid)["target_machine"] == "m-own"
+        assert _edit(client, tid, name="Renamed").status_code == 200
+        assert task_store.get_dynamic_task(tid)["target_machine"] == "m-own"
+        assert _edit(client, tid, machine="other-laptop").status_code == 400
+        assert task_store.get_dynamic_task(tid)["target_machine"] == "m-own"
+        assert _edit(client, tid, machine="default").status_code == 200
+        assert task_store.get_dynamic_task(tid)["target_machine"] == ""
+        assert _edit(client, tid, machine="local").status_code == 200
+        assert task_store.get_dynamic_task(tid)["target_machine"] == "local"
+        assert _edit(client, tid, machine="").status_code == 200
+        assert task_store.get_dynamic_task(tid)["target_machine"] == ""
+
+    def test_an_agent_task_edit_follows_the_writers_authority(self, client, machines):
+        _as(client, _viewer())
+        tid = _create_scheduled(client, scope="agent").json()["task_id"]
+        assert _edit(client, tid, machine="rack-1").status_code == 400
+        _as(client, _admin())
+        assert _edit(client, tid, machine="rack-1").status_code == 200
+        assert task_store.get_dynamic_task(tid)["target_machine"] == "m-rack"
+
+    def test_unpairing_the_machine_returns_its_tasks_to_the_default(self, client, machines):
+        from storage import remote_store
+        _as(client, _viewer())
+        tid = _create_scheduled(client, machine="viewer-laptop").json()["task_id"]
+        keep = _create_scheduled(client, machine="local").json()["task_id"]
+        assert remote_store.delete_remote_machine("m-own")
+        assert task_store.get_dynamic_task(tid)["target_machine"] == ""
+        assert task_store.get_dynamic_task(keep)["target_machine"] == "local"
+
+    def test_a_task_bound_to_a_chat_takes_no_machine(self, client, machines):
+        tid = _create_scheduled(client).json()["task_id"]
+        _set_row(tid, target_chat_id="chat-bound")
+        r = _edit(client, tid, machine="admin-laptop")
+        assert r.status_code == 400
+        assert r.json()["detail"] == "This task runs in its chat, which keeps its own machine."
+        assert _edit(client, tid, machine="default").status_code == 200
+
+
+class TestTaskMachineViews:
+    def test_the_views_name_the_machine_and_its_live_state(self, client, machines):
+        _as(client, _viewer())
+        tid = _create_scheduled(client, machine="viewer-laptop").json()["task_id"]
+        machines.discard("m-own")
+        listed = {t["id"]: t for t in client.get("/v1/tasks").json()["tasks"]}
+        one = client.get(f"/v1/tasks/{tid}").json()
+        for t in (listed[tid], one):
+            assert (t["target_machine"], t["target_machine_label"], t["target_machine_state"]) == (
+                "m-own", "viewer-laptop", "disconnected")
+        local = _create_scheduled(client, machine="local").json()["task_id"]
+        plain = _create_scheduled(client).json()["task_id"]
+        listed = {t["id"]: t for t in client.get("/v1/tasks").json()["tasks"]}
+        assert (listed[local]["target_machine_label"], listed[local]["target_machine_state"]) == (
+            "OtoDock platform", "")
+        assert (listed[plain]["target_machine"], listed[plain]["target_machine_label"],
+                listed[plain]["target_machine_state"]) == ("", "", "")
+
+    def test_the_runs_list_names_where_each_run_ran(self, client, machines):
+        tid = _create_scheduled(client).json()["task_id"]
+        task_store.create_run("run-m1", tid, AGENT, "scheduled", None, "x")
+        task_store.create_run("run-m2", tid, AGENT, "scheduled", None, "x")
+        task_store.update_run("run-m2", execution_target="m-rack")
+        runs = {r["id"]: r for r in client.get("/v1/tasks/runs", params={"task_id": tid}).json()["runs"]}
+        assert runs["run-m1"]["execution_target"] == "local"
+        assert runs["run-m1"]["execution_target_label"] == "OtoDock platform"
+        assert runs["run-m2"]["execution_target"] == "m-rack"
+        assert runs["run-m2"]["execution_target_label"] == "rack-1"
+
+
+def _viewer_identity():
+    from core.config.task_config_builder import TaskIdentity
+    return TaskIdentity(username="viewer", role="editor", scope="user", creds_user_sub="user-viewer")
+
+
+def _agent_identity():
+    from core.config.task_config_builder import TaskIdentity
+    return TaskIdentity(username="", role="manager", scope="agent", creds_user_sub=None)
+
+
+class TestTaskMachineAtRunTime:
+    """``task_config_builder.task_target``: a judge's machine the guard
+    passes, then the task's machine while the guard passes it and it is
+    reachable, then the resolver; and the run's record of the outcome."""
+
+    @staticmethod
+    def _task(**kw):
+        from services.scheduler import shared
+        return shared.TaskDefinition(id="dyn-m", name="t", agent=AGENT, prompt="p",
+                                     notification_mode="none", **kw)
+
+    @pytest.fixture
+    def resolver(self, monkeypatch):
+        from services.remote import remote_status
+        monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
+
+    def test_a_reachable_machine_the_guard_passes_takes_the_run(self, client, machines, resolver):
+        from core.config import task_config_builder as tcb
+        assert tcb.task_target(self._task(target_machine="m-own"), _viewer_identity()) == (
+            "m-own", None, "")
+        assert tcb.task_target(self._task(target_machine="local"), _viewer_identity()) == (
+            "local", None, "")
+        assert tcb.task_target(self._task(), _viewer_identity()) == ("local", None, "")
+        # An admin machine runs a task with no person.
+        assert tcb.task_target(self._task(target_machine="m-rack"), _agent_identity()).target == "m-rack"
+
+    def test_an_offline_machine_gives_way_to_the_resolver(self, client, machines, resolver):
+        from core.config import task_config_builder as tcb
+        machines.discard("m-own")
+        task = self._task(target_machine="m-own")
+        assert tcb.task_target(task, _viewer_identity()) == (
+            "local", tcb.FALLBACK_TASK_MACHINE, "viewer-laptop")
+        assert tcb.task_machine_note(task, _viewer_identity(), "local") == (
+            "viewer-laptop was offline, so this run used the OtoDock platform.")
+
+    def test_a_machine_the_guard_refuses_gives_way_too(self, client, machines, resolver):
+        from core.config import task_config_builder as tcb
+        task = self._task(target_machine="m-own")
+        # A run with no person never lands on a personal machine.
+        assert tcb.task_target(task, _agent_identity()) == (
+            "local", tcb.FALLBACK_TASK_MACHINE, "viewer-laptop")
+        assert tcb.task_machine_note(task, _agent_identity(), "local") == (
+            "viewer-laptop is not a machine this task may use now, so this run used the OtoDock platform.")
+        # Nor does anyone's run while the platform turns personal machines off.
+        task_store.set_platform_setting("allow_user_paired_machines", "0")
+        assert tcb.task_target(task, _viewer_identity()).fallback_reason == tcb.FALLBACK_TASK_MACHINE
+
+    def test_a_judges_machine_the_guard_refuses_falls_back_to_the_resolver(
+            self, client, machines, resolver):
+        from core.config import task_config_builder as tcb
+        judge_task = self._task(execution_target_override="m-own", target_machine="m-rack")
+        assert tcb.task_target(judge_task, _viewer_identity()) == ("m-own", None, "")
+        # An agent-scope judge of a chat on a personal machine: the resolver.
+        assert tcb.task_target(judge_task, _agent_identity()) == ("local", None, "")
+        assert tcb.task_target(self._task(execution_target_override="local"),
+                               _agent_identity()) == ("local", None, "")
+
+    def test_the_run_records_where_it_ran_and_says_why_once(self, client, machines, monkeypatch):
+        import asyncio
+        import contextlib
+        from types import SimpleNamespace
+
+        from core import concurrency
+        from core.config import config_builder, task_config_builder as tcb
+        from core.session import session_manager, session_state
+        from services.remote import remote_status
+        from services.scheduler import runner, shared, task_run
+
+        machines.discard("m-own")
+        monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
+        monkeypatch.setattr(tcb, "resolve_task_identity", lambda *a, **k: _viewer_identity())
+        slots: list = []
+
+        @contextlib.asynccontextmanager
+        async def _slot(session_id, target="", execution_path=None, ring_key=""):
+            slots.append(target)
+            yield
+
+        class _Stop(Exception):
+            pass
+
+        class _Layer:
+            async def start_session(self, sid, cfg):
+                raise _Stop("the test ends the run at the spawn")
+
+            async def close_session(self, sid):
+                pass
+
+        async def _cfg(agent, task_def, sid, **kw):
+            # The builder's own decision, as build_task_agent_config takes it.
+            chosen = await asyncio.to_thread(tcb.task_target, task_def, _viewer_identity())
+            return SimpleNamespace(
+                execution_target=chosen.target, fallback_reason=chosen.fallback_reason,
+                execution_path="claude-code-cli", interactive=False, resume=False, extra_env={},
+                chat_id="", subscription_id="", model=MODEL_DEFAULT, credential_env={},
+                mcp_config_path="")
+
+        monkeypatch.setattr(concurrency, "task_slot", _slot)
+        monkeypatch.setattr(tcb, "build_task_agent_config", _cfg)
+        monkeypatch.setattr(session_manager, "get_execution_layer", lambda *a, **k: _Layer())
+        monkeypatch.setattr(config_builder, "release_config_seat", lambda *a, **k: None)
+        monkeypatch.setattr(session_state, "_save_sessions", lambda: None)
+
+        task = shared.TaskDefinition(id="dyn-fb", name="fb", agent=AGENT, prompt="go",
+                                     scope="user", created_by="user-viewer",
+                                     notification_mode="none", target_machine="m-own")
+        run_id, sid = "run-fb", "66666666-6666-4666-8666-666666666666"
+        task_store.create_run(run_id, task.id, AGENT, "manual", None, task.prompt,
+                              "one_time", "user", "user-viewer")
+        shared._active_task_ids[task.id] = run_id
+        try:
+            asyncio.run(asyncio.wait_for(
+                runner._run_task(run_id, sid, task, task.prompt, "manual", None, 1), timeout=30))
+        finally:
+            session_state._sessions.pop(sid, None)
+            shared._active_task_ids.pop(task.id, None)
+        assert slots == ["local"]          # the slot counted where the run went
+        assert task_store.get_run(run_id)["execution_target"] == "local"
+        chat_id = task_store.get_run(run_id)["chat_id"]
+        import json as _json
+        notes = [_json.loads(m["event_data"]) for m in task_store.get_chat_messages(chat_id)
+                 if m.get("event_type") == "system"]
+        assert [(n["subtype"], n["message"]) for n in notes] == [(
+            "machine_not_answering", "viewer-laptop was offline, so this run used the OtoDock platform.")]
+
+        # A second bind of the same run (a fresh continue round) writes the
+        # record again and no second line.
+        run = task_run.TaskRun(run_id, sid, task, task.prompt, "manual", None, 1, None,
+                               _viewer_identity(), "local")
+        run.chat_id = chat_id
+        run.agent_cfg = SimpleNamespace(execution_target="m-rack",
+                                        fallback_reason=tcb.FALLBACK_TASK_MACHINE)
+
+        async def _twice():
+            await run._record_target()
+            await run._record_target()
+        from core.events import chat_writer
+        chat_writer.reset_for_tests()      # the lanes of the first loop are gone
+        asyncio.run(_twice())
+        assert task_store.get_run(run_id)["execution_target"] == "m-rack"
+        rows = [m for m in task_store.get_chat_messages(chat_id) if m.get("event_type") == "system"]
+        assert len(rows) == 2              # the first run's line, then one line for this run

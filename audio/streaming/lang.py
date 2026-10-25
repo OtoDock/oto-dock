@@ -13,8 +13,8 @@ import re
 # stripping the region (see ``base_lang`` and the provider normalizers). Keep in
 # sync with the dashboard ``LANGUAGES`` const.
 SUPPORTED_LANGUAGES: list[tuple[str, str]] = [
-    ("en-US", "English (US)"),
-    ("en-GB", "English (UK)"),
+    ("en-US", "English, US"),
+    ("en-GB", "English, UK"),
     ("el-GR", "Greek"),
     ("de-DE", "German"),
     ("es-ES", "Spanish"),
@@ -47,18 +47,26 @@ def base_lang(tag: str) -> str:
     return (tag or "").split("-", 1)[0].lower()
 
 
-def pcm16_to_wav(pcm: bytes, sample_rate: int, channels: int = 1) -> bytes:
-    """A WAV container around raw 16-bit PCM — the shape every batch
-    transcription endpoint takes (a call's buffered utterance is raw)."""
-    import io
-    import wave
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(channels)
-        w.setsampwidth(2)
-        w.setframerate(sample_rate)
-        w.writeframes(pcm)
-    return buf.getvalue()
+SUPPORTED_BASES: tuple[str, ...] = tuple(dict.fromkeys(base_lang(code) for code, _label in SUPPORTED_LANGUAGES))
+
+
+def language_candidates(setting: str | None) -> list[str]:
+    """The languages the identifier may pick, from the admin's comma list:
+    supported base codes in the given order, duplicates dropped, every
+    supported language when the list is empty or names none of them."""
+    out: list[str] = []
+    for part in (setting or "").split(","):
+        code = base_lang(part.strip())
+        if code in SUPPORTED_BASES and code not in out:
+            out.append(code)
+    return out or list(SUPPORTED_BASES)
+
+
+def supported_base(tag: str | None, default: str = "en") -> str:
+    """A client's language tag as a supported base code, else ``default``
+    (the browser language the dashboard sends is untrusted input)."""
+    code = base_lang(tag or "")
+    return code if code in SUPPORTED_BASES else default
 
 
 # High-frequency function words per Latin language we ship. A match-count scorer

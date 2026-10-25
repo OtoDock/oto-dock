@@ -14,6 +14,7 @@
 #   - proxy/core/stdio_path_interceptor.py         → satellite/_vendored/stdio_path_interceptor.py
 #   - proxy/core/terminal_queries.py               → satellite/_vendored/terminal_queries.py
 #   - proxy/core/layout.py                         → satellite/_vendored/layout.py
+#   - proxy/core/loop_watchdog.py                  → satellite/_vendored/loop_watchdog.py
 #
 # NOT vendored: the host OS table (proxy/core/host_os.py). satellite/config.py is
 # the boot guard's leaf — __main__ imports it before the rollback runs, so it may
@@ -38,6 +39,7 @@ ENTRIES=(
     "proxy/core/stdio_path_interceptor.py|satellite/_vendored/stdio_path_interceptor.py|SHARED_STDIO_INTERCEPTOR_HASH"
     "proxy/core/terminal_queries.py|satellite/_vendored/terminal_queries.py|SHARED_TERMINAL_QUERIES_HASH"
     "proxy/core/layout.py|satellite/_vendored/layout.py|SHARED_LAYOUT_HASH"
+    "proxy/core/loop_watchdog.py|satellite/_vendored/loop_watchdog.py|SHARED_LOOP_WATCHDOG_HASH"
 )
 
 for entry in "${ENTRIES[@]}"; do

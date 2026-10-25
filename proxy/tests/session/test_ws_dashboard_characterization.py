@@ -28,7 +28,6 @@ from tests.fixtures.ws_dashboard_harness import (
     warm_new_chat,
 )
 
-
 # ---------------------------------------------------------------------------
 # Auth gate — the handler closes 4001 BEFORE accepting.
 # ---------------------------------------------------------------------------
@@ -36,8 +35,8 @@ from tests.fixtures.ws_dashboard_harness import (
 class TestAuthGate:
     def test_missing_cookie_closes_4001(self, temp_db):
         async def scenario():
-            from ws.dashboard import ws_dashboard_handler
             from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket
+            from ws.dashboard import ws_dashboard_handler
             ws = FakeDashboardWebSocket(cookie=None)
             await ws_dashboard_handler(ws)
             assert ws.closed == (4001, "No session cookie")
@@ -47,8 +46,8 @@ class TestAuthGate:
 
     def test_invalid_cookie_closes_4001(self, temp_db):
         async def scenario():
-            from ws.dashboard import ws_dashboard_handler
             from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket
+            from ws.dashboard import ws_dashboard_handler
             ws = FakeDashboardWebSocket(cookie="not-a-jwt")
             await ws_dashboard_handler(ws)
             assert ws.closed == (4001, "Invalid or expired session")
@@ -58,8 +57,8 @@ class TestAuthGate:
 
     def test_unknown_user_closes_4001(self, temp_db):
         async def scenario():
-            from ws.dashboard import ws_dashboard_handler
             from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket
+            from ws.dashboard import ws_dashboard_handler
             ws = FakeDashboardWebSocket(
                 cookie=session_cookie(sub="user-ghost", email="g@test.com",
                                       name="Ghost", role="admin"))
@@ -175,8 +174,8 @@ class TestAuthGate:
     def test_revalidation_finds_a_gate_that_started_mid_session(self, temp_db):
         from auth import providers
         from storage import database as db
-        from ws.dashboard import DashboardConnection
         from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket
+        from ws.dashboard import DashboardConnection
         providers.clear_auth_gate_caches()
         ws = FakeDashboardWebSocket(cookie=session_cookie())
         conn = DashboardConnection(ws, user_sub="user-admin", user=db.get_user("user-admin"))
@@ -376,7 +375,7 @@ class TestNewChatWarmup:
                     "type": "warmup_ready",
                     "session_id": ANY,
                     "chat_id": chat_id,
-                    "mode": "default",
+                    "mode": "autoReview",
                     "model": TEST_MODEL,
                     "execution_path": "claude-code-cli",
                     "execution_target": "local",
@@ -462,7 +461,7 @@ class TestWarmupStartedNewChatFlag:
                 layer.start_gate.set()
                 ready = await ws.expect({
                     "type": "warmup_ready", "session_id": ANY,
-                    "chat_id": cid, "mode": "default", "model": TEST_MODEL,
+                    "chat_id": cid, "mode": "ask", "model": TEST_MODEL,
                     "execution_path": "claude-code-cli",
                     "execution_target": "local", "fallback_reason": None,
                     "offline_machine_name": "", "interactive": False,
@@ -475,6 +474,53 @@ class TestWarmupStartedNewChatFlag:
                 row = temp_db.get_chat(cid)
                 assert row["session_id"] == ready["session_id"]
                 assert row["pending_history_seed"] == "resume_failed"
+                ws.client_send({"type": "close"})
+            ws.no_more_frames()
+        run_ws_scenario(scenario)
+
+    def test_an_undecided_resume_probe_refuses_the_warmup_and_keeps_the_chat(
+            self, temp_db, monkeypatch):
+        """The dead session's machine does not answer the probe within the
+        budget: no fresh spawn, no digest flag, the session id kept, and the
+        card says the message above was not delivered (a silent machine used
+        to take the fresh branch here and lose the chat's context for good)."""
+        from core.session import resume_probe
+        from storage import database as task_store
+        from ws import dashboard_warmup
+        layer = FakeExecutionLayer()
+        layer.start_gate = asyncio.Event()
+        stub_dashboard_seams(monkeypatch, layer)
+        monkeypatch.setattr(dashboard_warmup, "RESUME_PROBE_BUDGET_WARMUP_S", 0.2)
+        monkeypatch.setattr(resume_probe, "_PROBE_PAUSE_S", 0.05)
+        slug = make_test_agent()
+        cid = str(uuid.uuid4())
+        task_store.create_chat(cid, "user-admin", slug, "default",
+                               model=TEST_MODEL,
+                               execution_path="claude-code-cli")
+        task_store.update_chat(cid, session_id="dead-sid")
+        layer.undecided.add("dead-sid")
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                ws.client_send({"type": "warmup", "agent": slug,
+                                "chat_id": cid, "text": "hello there"})
+                await ws.expect({
+                    "type": "warmup_started", "chat_id": cid, "agent": slug,
+                    "execution_path": "claude-code-cli",
+                    "execution_target": "local", "new_chat": False,
+                })
+                await ws.expect({"type": "notification_count", "count": 0})
+                layer.start_gate.set()
+                failed = await ws.expect({
+                    "type": "warmup_failed", "chat_id": cid,
+                    "error": ANY, "reason": "target_unavailable",
+                })
+                assert "not delivered" in failed["error"]
+                assert layer.started == []
+                row = temp_db.get_chat(cid)
+                assert row["session_id"] == "dead-sid"
+                assert row["pending_history_seed"] == ""
                 ws.client_send({"type": "close"})
             ws.no_more_frames()
         run_ws_scenario(scenario)
@@ -500,7 +546,7 @@ class TestWarmupStartedNewChatFlag:
                 layer.start_gate.set()
                 await ws.expect({
                     "type": "warmup_ready", "session_id": ANY,
-                    "chat_id": started["chat_id"], "mode": "default",
+                    "chat_id": started["chat_id"], "mode": "autoReview",
                     "model": TEST_MODEL, "execution_path": "claude-code-cli",
                     "execution_target": "local", "fallback_reason": None,
                     "offline_machine_name": "", "interactive": False,
@@ -516,7 +562,7 @@ class TestWarmupStartedNewChatFlag:
 
 class TestChatTurn:
     def test_chat_turn_streams_text_and_done(self, temp_db, monkeypatch):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
 
         layer = FakeExecutionLayer()
         layer.turn_events = [
@@ -541,7 +587,7 @@ class TestChatTurn:
                 await ws.expect({"type": "notification_count", "count": 0})
                 ready = await ws.expect({
                     "type": "warmup_ready", "session_id": ANY,
-                    "chat_id": chat_id, "mode": "default",
+                    "chat_id": chat_id, "mode": "autoReview",
                     "model": TEST_MODEL, "execution_path": "claude-code-cli",
                     "execution_target": "local", "fallback_reason": None,
                     "offline_machine_name": "", "interactive": False,
@@ -609,7 +655,7 @@ class TestChatTurn:
 
         from PIL import Image
 
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
 
         layer = FakeExecutionLayer()
         layer.turn_events = [

@@ -16,7 +16,7 @@ These tests pin the dispatch logic + preservation of S2S-specific
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 

@@ -1,6 +1,6 @@
 # The base pin follows VERSIONS.md (PYTHON_IMAGE); the build overlay passes
 # it as a build arg and a bare `docker build` falls back to the default.
-ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+ARG PYTHON_IMAGE=python:3.13.17-slim-bookworm@sha256:e32be0e55814a08977501ca863271d9bd02443710db8f2afaf8372e2c4508530
 FROM ${PYTHON_IMAGE}
 
 # LibreOffice (Writer/Calc/Impress only — not the full metapackage)
@@ -34,12 +34,18 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Pre-download the rembg background-removal model (avoids first-use delay +
-# any network at runtime). isnet-general-use = cleaner edges/hair than the
-# default u2net at the same ~176MB / CPU-speed class. Must match
-# images.py::_REMBG_MODEL.
+# any network at runtime). isnet-general-use = cleaner edges/hair than u2net
+# at the same ~176MB / CPU-speed class. Must match images.py::_REMBG_MODEL.
+# U2NET_HOME is the model home rembg reads (under models/<name>/).
 ENV U2NET_HOME=/app/models
 RUN python3 -c "from rembg import new_session; new_session('isnet-general-use')" \
     && chmod -R a+r /app/models
+
+# An init as PID 1: LibreOffice leaves helper processes to its parent, and
+# the server never reaps them; tini reaps every orphan and passes the stop
+# signal on. Its own layer, so the layers above stay cached.
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 COPY *.py .
 
@@ -58,4 +64,5 @@ LABEL org.opencontainers.image.title="OtoDock file tools" \
       org.opencontainers.image.licenses="FSL-1.1-ALv2" \
       org.opencontainers.image.version="${OTODOCK_VERSION}"
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "server.py"]

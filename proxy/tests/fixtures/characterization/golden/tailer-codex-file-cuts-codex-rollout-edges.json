@@ -1,0 +1,386 @@
+{
+ "offsets": {
+  "sid-char-xf": 35
+ },
+ "pending": [],
+ "rebuilds": [
+  "chat-char-1",
+  "chat-char-1",
+  "chat-char-1"
+ ],
+ "registry": {
+  "completed": [],
+  "has_pending": false,
+  "spawned": []
+ },
+ "results": [
+  {
+   "assistant_chars": 0,
+   "compacted": false,
+   "from_line": 0,
+   "last_message": "",
+   "last_signal": "user",
+   "last_signal_at": 1792189865.0,
+   "persisted": 3,
+   "question_pending": false,
+   "title_set": true,
+   "to_line": 8,
+   "tool_rows": 1,
+   "turn_complete": false,
+   "usage_rows": 0
+  },
+  {
+   "assistant_chars": 0,
+   "compacted": false,
+   "from_line": 8,
+   "last_message": "",
+   "last_signal": null,
+   "last_signal_at": null,
+   "persisted": 1,
+   "question_pending": false,
+   "title_set": false,
+   "to_line": 11,
+   "tool_rows": 1,
+   "turn_complete": false,
+   "usage_rows": 0
+  },
+  {
+   "assistant_chars": 9,
+   "compacted": false,
+   "from_line": 11,
+   "last_message": "",
+   "last_signal": "tool_use",
+   "last_signal_at": 1792189882.0,
+   "persisted": 6,
+   "question_pending": false,
+   "title_set": false,
+   "to_line": 23,
+   "tool_rows": 5,
+   "turn_complete": false,
+   "usage_rows": 1
+  },
+  {
+   "assistant_chars": 11,
+   "compacted": true,
+   "from_line": 23,
+   "last_message": "Again done.",
+   "last_signal": "end_turn",
+   "last_signal_at": 1792189892.0,
+   "persisted": 5,
+   "question_pending": false,
+   "title_set": false,
+   "to_line": 35,
+   "tool_rows": 0,
+   "turn_complete": true,
+   "usage_rows": 0
+  },
+  {
+   "assistant_chars": 0,
+   "compacted": false,
+   "from_line": 35,
+   "last_message": "",
+   "last_signal": null,
+   "last_signal_at": null,
+   "persisted": 0,
+   "question_pending": false,
+   "title_set": false,
+   "to_line": 35,
+   "tool_rows": 0,
+   "turn_complete": false,
+   "usage_rows": 0
+  },
+  {
+   "persisted": 0,
+   "reason": "no_file"
+  }
+ ],
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "[Restored from history]\n\n---\n\n[Current time: Friday, October 16, 2026 22:31 (10:31 PM) UTC (UTC+00:00)]\n\nhello codex",
+   "role": "user",
+   "sync_search": false
+  },
+  {
+   "event_data": {
+    "content": "**Deciding**\n\nI will list, then patch.",
+    "type": "thinking"
+   },
+   "event_type": "thinking",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "name": "TodoWrite",
+    "tool_id": "call_plan_1",
+    "tool_input": {
+     "todos": [
+      {
+       "content": "List",
+       "status": "in_progress"
+      },
+      {
+       "content": "Patch",
+       "status": "pending"
+      }
+     ]
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "active": false,
+    "is_error": false,
+    "name": "Bash",
+    "result_summary": "1 lines",
+    "summary": "ls -la",
+    "tool_id": "call_exec_1",
+    "tool_input": {
+     "cmd": "ls -la",
+     "workdir": "/users/dev-admin"
+    },
+    "tool_result": "{\"output\": \"total 0\\n\", \"metadata\": {\"exit_code\": 0, \"duration_seconds\": 0.01}}",
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "active": false,
+    "is_error": false,
+    "name": "apply_patch",
+    "result_summary": "ok",
+    "summary": "a.md, b.md",
+    "tool_id": "call_patch_1",
+    "tool_input": {
+     "input": "*** Begin Patch\n*** Add File: notes/a.md\n+hello\n*** Update File: notes/b.md\n@@\n-x\n+y\n*** End Patch\n"
+    },
+    "tool_result": "Success. Updated the following files:\nA notes/a.md\nM notes/b.md",
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "active": false,
+    "is_error": false,
+    "name": "ToolSearch",
+    "result_summary": "ok",
+    "summary": "display",
+    "tool_id": "call_ts_1",
+    "tool_input": {
+     "query": "display"
+    },
+    "tool_result": "[{\"name\": \"mcp__display__send_url\"}]",
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "active": false,
+    "name": "web_search",
+    "summary": "otodock fair source",
+    "tool_id": "ws_1",
+    "tool_input": {
+     "query": "otodock fair source"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "active": false,
+    "name": "mcp__display__send_url",
+    "summary": "https://example.com",
+    "tool_id": "call_mcp_1",
+    "tool_input": {
+     "title": "Example",
+     "url": "https://example.com"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "active": false,
+    "is_error": false,
+    "name": "mcp__delegation-mcp__delegate",
+    "result_summary": "ok",
+    "summary": "x",
+    "tool_id": "call_del_1",
+    "tool_input": {
+     "name": "x",
+     "prompt": "y",
+     "surface": "task"
+    },
+    "tool_result": "delegated",
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "All done.",
+   "role": "assistant",
+   "sync_search": false
+  },
+  {
+   "author_sub": "",
+   "content": "which one?",
+   "role": "user",
+   "sync_search": false
+  },
+  {
+   "event_data": {
+    "tool_id": "call_q_1",
+    "tool_input": {
+     "questions": [
+      {
+       "header": "Folder",
+       "id": "q1",
+       "options": [
+        {
+         "description": "",
+         "label": "a"
+        }
+       ],
+       "question": "Which folder?"
+      }
+     ]
+    },
+    "tool_name": "request_user_input",
+    "type": "question"
+   },
+   "event_type": "question",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "message": "Conversation compacted",
+    "subtype": "context_compressed",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "again",
+   "role": "user",
+   "sync_search": false
+  },
+  {
+   "author_sub": "",
+   "content": "Again done.",
+   "role": "assistant",
+   "sync_search": false
+  }
+ ],
+ "snapshots": [
+  [
+   {
+    "limit_id": "codex",
+    "primary": {
+     "resets_at": 1792300000,
+     "used_percent": 12,
+     "window_minutes": 300
+    },
+    "secondary": {
+     "resets_at": 1792900000,
+     "used_percent": 3,
+     "window_minutes": 10080
+    }
+   },
+   "2026-10-16T22:31:20.000Z"
+  ]
+ ],
+ "throttles": [
+  "rate limit reached (429)"
+ ],
+ "titles": [
+  [
+   "u-person",
+   "chat-char-1",
+   "[Restored from history] --- [Current time:…",
+   "lite"
+  ]
+ ],
+ "tool_records": [
+  [
+   "Bash",
+   "call_exec_1",
+   false,
+   "tailer",
+   []
+  ],
+  [
+   "apply_patch",
+   "call_patch_1",
+   false,
+   "tailer",
+   [
+    "notes/a.md",
+    "notes/b.md"
+   ]
+  ],
+  [
+   "ToolSearch",
+   "call_ts_1",
+   false,
+   "tailer",
+   []
+  ],
+  [
+   "mcp__display__send_url",
+   "call_mcp_1",
+   false,
+   "tailer",
+   []
+  ],
+  [
+   "mcp__delegation-mcp__delegate",
+   "call_del_1",
+   false,
+   "tailer",
+   []
+  ]
+ ],
+ "updates": [
+  {
+   "codex_thread_id": "01a146c3-edge-7940-8aac-dfb3c9d4e4dd"
+  },
+  {
+   "title": "[Restored from history] --- [Current time:…"
+  }
+ ],
+ "usage": [
+  {
+   "agent": "lite",
+   "cache_read": 16000,
+   "cache_write": 400,
+   "cost_usd": 0.0118,
+   "input_tokens": 1600,
+   "message_count": 1,
+   "model": "gpt-6.1-sol",
+   "output_tokens": 600,
+   "provider": "openai",
+   "scope": "user",
+   "source_id": "chat-char-1",
+   "source_key": "default",
+   "source_type": "chat",
+   "user_sub": "u-person"
+  }
+ ]
+}

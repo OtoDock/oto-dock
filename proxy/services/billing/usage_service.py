@@ -4,12 +4,11 @@ All public functions are synchronous (called via asyncio.to_thread from async co
 Uses task_store (storage/database.py) for DB access.
 """
 
-from datetime import datetime, timezone, timedelta
 from calendar import monthrange
+from datetime import datetime, timedelta, timezone
+from typing import Any, cast
 
-from storage import database as task_store
-from storage import db_apps
-
+from storage import database as task_store, db_apps
 
 # ---------------------------------------------------------------------------
 # Period calculation helpers
@@ -144,9 +143,9 @@ def check_user_limit(user_sub: str, user_role: str) -> dict:
     `get_usage_aggregated(..., provider=<p>)`, and ANDs the result into
     `allowed`/`warning`. No surface area is exposed yet.
     """
-    result = {"allowed": True, "warning": False,
-              "periods": {"monthly": None, "weekly": None,
-                          "self": {"monthly": None, "weekly": None}}}
+    result: dict[str, Any] = {"allowed": True, "warning": False,
+                              "periods": {"monthly": None, "weekly": None,
+                                          "self": {"monthly": None, "weekly": None}}}
 
     def _apply(period_info: dict | None) -> None:
         if period_info and period_info["percent"] >= 100:
@@ -182,7 +181,7 @@ def check_user_limit(user_sub: str, user_role: str) -> dict:
 
 def check_agent_limit(agent: str) -> dict:
     """Check current usage against limits for agent-scoped tasks."""
-    result = {"allowed": True, "warning": False, "periods": {"monthly": None, "weekly": None}}
+    result: dict[str, Any] = {"allowed": True, "warning": False, "periods": {"monthly": None, "weekly": None}}
 
     for period, range_fn in [("monthly", _monthly_range), ("weekly", _weekly_range)]:
         limit = _resolve_limit("agent", agent, None, None, period)
@@ -226,7 +225,7 @@ def get_user_summary(user_sub: str, user_role: str, days: int = 30) -> dict:
         )["total_cost"]
         limit = _resolve_limit("user_override", user_sub, "role_default", user_role, period)
         if limit is not None:
-            info = _check_period(platform, limit, start, end)
+            info = cast("dict", _check_period(platform, limit, start, end))  # None only for a None limit
         else:
             info = {"limit": None, "used": round(platform, 4), "percent": 0, "start": start, "end": end}
         info["self_used"] = round(own, 4)
@@ -239,7 +238,7 @@ def get_user_summary(user_sub: str, user_role: str, days: int = 30) -> dict:
         )["total_cost"]
         limit = _resolve_limit("user_self", user_sub, None, None, period)
         if limit is not None:
-            return _check_period(used, limit, start, end)
+            return cast("dict", _check_period(used, limit, start, end))  # None only for a None limit
         return {"limit": None, "used": round(used, 4), "percent": 0, "start": start, "end": end}
 
     m_start, m_end = _monthly_range()

@@ -30,27 +30,27 @@ vi.hoisted(() => {
     value: (query: string) => ({ matches: false, media: query, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, onchange: null, dispatchEvent: () => false }),
   })
 })
-const reorderMutate = vi.hoisted(() => vi.fn())
+const reorderMutate = vi.hoisted(() => vi.fn((_ids: string[]) => Promise.resolve()))
 // The rollback mutation: the host passes per-call callbacks, a test fires them.
 const rollbackMutate = vi.hoisted(() => vi.fn())
-const unpinMutate = vi.hoisted(() => vi.fn())
+const unpinMutate = vi.hoisted(() => vi.fn((_id: string) => Promise.resolve()))
 vi.mock('@/api/apps', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/apps')>()),
   useApps: () => ({ data: appsData.current, isLoading: false }),
-  useUnpinApp: () => ({ mutate: unpinMutate, isPending: false }),
+  useUnpinApp: () => ({ mutateAsync: unpinMutate, isPending: false }),
   useRollbackApp: () => ({ mutate: rollbackMutate, isPending: false }),
-  useReorderApps: () => ({ mutate: reorderMutate, isPending: false }),
+  useReorderApps: () => ({ mutateAsync: reorderMutate, isPending: false }),
 }))
 vi.mock('@/components/sharing/SharePopover', () => ({
   default: ({ app }: { app: { id: string } }) => <div data-testid="share-popover">{app.id}</div>,
 }))
 // The share mutations a placed row uses (SHARING.md); the apps-route ones
 // stay real so a plain row's hide still posts to its own route.
-const shareCalls = vi.hoisted(() => ({ hide: vi.fn(), unhide: vi.fn(), patch: vi.fn(async () => ({})) }))
+const shareCalls = vi.hoisted(() => ({ hide: vi.fn(async () => ({})), unhide: vi.fn(async () => ({})), patch: vi.fn(async () => ({})) }))
 vi.mock('@/api/shares', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api/shares')>()),
-  useHideShare: () => ({ mutate: shareCalls.hide }),
-  useUnhideShare: () => ({ mutate: shareCalls.unhide }),
+  useHideShare: () => ({ mutateAsync: shareCalls.hide }),
+  useUnhideShare: () => ({ mutateAsync: shareCalls.unhide }),
   usePatchShare: () => ({ mutate: shareCalls.patch, mutateAsync: shareCalls.patch }),
 }))
 
@@ -328,14 +328,14 @@ describe('AppsOverlay — a row placed here by a share (SHARING.md)', () => {
     openMenu('register')
     fireEvent.click(screen.getByRole('menuitem', { name: 'Where it comes from' }))
     expect(screen.getByTestId('app-where-from').textContent).toContain(
-      'You use it as manager. Chats and tasks of this agent may call its 2 exported methods, up to editor. A task with no person calls only those without a role floor.')
+      'You use it as manager. Chats and tasks of this agent may call its 2 exported methods, up to editor. A task with no person may call only the methods open to every role.')
     cleanup()
     appsData.current = [mkApp('brief'), placed({ exports, placement: { ...placement, kind: 'person', role_cap: 'viewer' } })]
     renderOverlay()
     fireEvent.click(screen.getByRole('button', { name: /register/ }))
     openMenu('register')
     fireEvent.click(screen.getByRole('menuitem', { name: 'Where it comes from' }))
-    expect(screen.getByTestId('app-where-from').textContent).toContain('with you. You use it as viewer. Your own chats and tasks here may call its 2 exported methods as viewer, while they run in your personal space (never on a Shared-only agent).')
+    expect(screen.getByTestId('app-where-from').textContent).toContain('with you. You use it as viewer. Your own chats and tasks here may call its 2 exported methods as viewer. This works in your personal space only, never on a Shared-only agent.')
     cleanup()
     appsData.current = [mkApp('brief'), placed()]
     renderOverlay()
@@ -497,7 +497,7 @@ describe('AppsOverlay — the chip of a row a share brought here', () => {
   const chip = (name: RegExp) => screen.getByRole('button', { name })
   const classes = (el: HTMLElement) => el.className.split(/\s+/)
 
-  it('fills by whose it is and borders every shared-in row in teal, the home rows unchanged', () => {
+  it('fills by whose it is and borders every shared-in row in the information colour, the home rows unchanged', () => {
     appsData.current = [
       mkApp('team'),
       mkApp('mine', { scope: 'personal' }),
@@ -507,33 +507,33 @@ describe('AppsOverlay — the chip of a row a share brought here', () => {
       mkApp('colleague', { scope: 'personal', can_manage: false, granted: true }),
     ]
     renderOverlay()
-    // The active home row (the first) is a solid purple chip with its own border.
-    expect(classes(chip(/^team$/))).toEqual(expect.arrayContaining(['bg-p-accent-purple', 'border-p-accent-purple']))
-    expect(classes(chip(/^mine$/))).toEqual(expect.arrayContaining(['bg-brand/10', 'border-brand/30']))
-    expect(classes(chip(/^person$/))).toEqual(expect.arrayContaining(['bg-brand/10', 'text-brand', 'border-p-accent-teal']))
-    expect(classes(chip(/^board$/))).toEqual(expect.arrayContaining(['bg-p-accent-purple/10', 'border-p-accent-teal']))
-    expect(classes(chip(/^dept$/))).toEqual(expect.arrayContaining(['bg-p-accent-purple/10', 'border-p-accent-teal']))
-    expect(classes(chip(/^colleague$/))).toEqual(expect.arrayContaining(['bg-brand/10', 'border-p-accent-teal']))
-    expect(chip(/^team$/).className).not.toContain('teal')
-    expect(chip(/^mine$/).className).not.toContain('teal')
+    // The active home row (the first) is the agent fill with its own border.
+    expect(classes(chip(/^team$/))).toEqual(expect.arrayContaining(['bg-accent-agent-fill', 'text-on-solid', 'border-accent-agent-fill']))
+    expect(classes(chip(/^mine$/))).toEqual(expect.arrayContaining(['bg-action-subtle', 'text-link', 'border-transparent']))
+    expect(classes(chip(/^person$/))).toEqual(expect.arrayContaining(['bg-action-subtle', 'text-link', 'border-status-info-solid']))
+    expect(classes(chip(/^board$/))).toEqual(expect.arrayContaining(['bg-accent-agent-bg', 'border-status-info-solid']))
+    expect(classes(chip(/^dept$/))).toEqual(expect.arrayContaining(['bg-accent-agent-bg', 'border-status-info-solid']))
+    expect(classes(chip(/^colleague$/))).toEqual(expect.arrayContaining(['bg-action-subtle', 'border-status-info-solid']))
+    expect(chip(/^team$/).className).not.toContain('status-info')
+    expect(chip(/^mine$/).className).not.toContain('status-info')
     // The share mark on every shared-in row, never on a home row.
     expect(screen.getAllByTestId('placed-mark')).toHaveLength(4)
     expect(chip(/^team$/).querySelector('[data-testid="placed-mark"]')).toBeNull()
     // Active, a shared-in chip keeps its fill and adds the ring.
     fireEvent.click(chip(/^person$/))
-    expect(classes(chip(/^person$/))).toEqual(expect.arrayContaining(['bg-brand', 'text-white', 'border-p-accent-teal', 'ring-2', 'ring-p-accent-teal']))
+    expect(classes(chip(/^person$/))).toEqual(expect.arrayContaining(['bg-action', 'text-action-fg', 'border-status-info-solid', 'ring-2', 'ring-status-info-solid']))
     fireEvent.click(chip(/^board$/))
-    expect(classes(chip(/^board$/))).toEqual(expect.arrayContaining(['bg-p-accent-purple', 'text-white', 'border-p-accent-teal', 'ring-2']))
+    expect(classes(chip(/^board$/))).toEqual(expect.arrayContaining(['bg-accent-agent-fill', 'text-on-solid', 'border-status-info-solid', 'ring-2']))
   })
 
-  it('appChipClass: the fill follows ownership, the teal border follows the share', () => {
+  it('appChipClass: the fill follows ownership, the information border follows the share', () => {
     const p = (kind: 'person' | 'agent' | 'department') => ({ scope: 'shared' as const, placement: { ...placement, kind } })
-    expect(appChipClass({ scope: 'shared' }, false)).toBe('bg-p-accent-purple/10 text-p-accent-purple border-p-accent-purple/30 hover:bg-p-accent-purple/20')
-    expect(appChipClass({ scope: 'personal' }, true)).toBe('bg-brand text-white border-brand')
-    expect(appChipClass(p('person'), false)).toBe('bg-brand/10 text-brand border-p-accent-teal hover:bg-brand/20')
-    expect(appChipClass(p('agent'), false)).toBe('bg-p-accent-purple/10 text-p-accent-purple border-p-accent-teal hover:bg-p-accent-purple/20')
-    expect(appChipClass(p('department'), true)).toBe('bg-p-accent-purple text-white border-p-accent-teal ring-2 ring-p-accent-teal ring-offset-1 ring-offset-p-bg')
-    expect(appChipClass({ scope: 'personal', granted: true }, true)).toBe('bg-brand text-white border-p-accent-teal ring-2 ring-p-accent-teal ring-offset-1 ring-offset-p-bg')
+    expect(appChipClass({ scope: 'shared' }, false)).toBe('bg-accent-agent-bg text-accent-agent-fg border-accent-agent-border hover:text-primary')
+    expect(appChipClass({ scope: 'personal' }, true)).toBe('bg-action text-action-fg border-action')
+    expect(appChipClass(p('person'), false)).toBe('bg-action-subtle text-link border-status-info-solid hover:bg-action-subtle-hover hover:text-primary')
+    expect(appChipClass(p('agent'), false)).toBe('bg-accent-agent-bg text-accent-agent-fg border-status-info-solid hover:text-primary')
+    expect(appChipClass(p('department'), true)).toBe('bg-accent-agent-fill text-on-solid border-status-info-solid ring-2 ring-status-info-solid ring-offset-1 ring-offset-surface-page')
+    expect(appChipClass({ scope: 'personal', granted: true }, true)).toBe('bg-action text-action-fg border-status-info-solid ring-2 ring-status-info-solid ring-offset-1 ring-offset-surface-page')
   })
 })
 
@@ -566,7 +566,7 @@ describe('AppsOverlay — the soft unpin of an app that runs a server says Stop 
     openMenu('static')
     fireEvent.click(screen.getByRole('menuitem', { name: 'Unpin for everyone' }))
     expect(screen.getByTestId('app-unpin-confirm').textContent).toBe(
-      'Unpin “static” for everyone? The workspace file and the approved actions are kept — ask the agent to pin it back anytime.Unpin for everyoneCancel')
+      'Unpin “static” for everyone? The workspace file and the approved actions are kept. Ask the agent to pin it back anytime.Unpin for everyoneCancel')
     cleanup()
     appsData.current = [mkApp('page', { scope: 'personal', has_server: true })]
     renderOverlay()

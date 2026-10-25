@@ -86,7 +86,13 @@ class FakeConn:
 
 
 class FakeTTS:
-    """Stand-in for a TTSProvider (e.g. Cartesia)."""
+    """Stand-in for a TTSProvider (e.g. Cartesia).
+
+    A streaming context speaks ``_audio_chunks`` for every text chunk sent
+    into it and ends at the end of input (``is_last``) or a cancel, as a
+    real provider's receiver does; ``receive_audio`` with no context started
+    speaks ``_audio_chunks`` once (a standalone segment in a playback test).
+    """
 
     def __init__(self, api_key="", **kw):
         self.voice_id = ""
@@ -96,7 +102,11 @@ class FakeTTS:
         self.cancelled = False
         self.contexts_started = 0
         self.text_chunks = []                 # (text, is_last)
+        # Mid-utterance flushes, each as the number of text chunks sent
+        # before it (the position in ``text_chunks``).
+        self.flushes = []
         self._audio_chunks = [b"\x00\x00" * 160]  # one 320-byte 20ms PCM frame
+        self._q = None                        # the open context's audio
 
     @classmethod
     def from_row(cls, row, resolver):
@@ -116,16 +126,36 @@ class FakeTTS:
 
     def start_streaming_context(self, **kw):
         self.contexts_started += 1
+        self._q = asyncio.Queue()
 
     async def send_text_chunk(self, text, is_last=False):
         self.text_chunks.append((text, is_last))
+        if self._q is not None:
+            if text:
+                for chunk in self._audio_chunks:
+                    self._q.put_nowait(chunk)
+            if is_last:
+                self._q.put_nowait(None)
+
+    async def flush(self):
+        self.flushes.append(len(self.text_chunks))
 
     async def receive_audio(self):
-        for chunk in self._audio_chunks:
-            yield chunk
+        q = self._q
+        if q is None:
+            for chunk in self._audio_chunks:
+                yield chunk
+            return
+        while True:
+            item = await q.get()
+            if item is None:
+                return
+            yield item
 
     def cancel(self):
         self.cancelled = True
+        if self._q is not None:
+            self._q.put_nowait(None)
 
     def pin_voice(self, voice_id):
         self.voice_pin = (voice_id or "").strip()
@@ -167,13 +197,9 @@ class FakeSTT:
         self.last_result_monotonic = 0.0      # bumped by tests to simulate results
         self._transcripts = []                # queued finalized transcripts (full-run tests)
         self.latest_interim = ""              # settable (real provider: polled property)
-        self.guess = None                     # identify_language() answer (LanguageGuess or None)
-        self.identify_delay_s = 0.0           # how long identify_language() takes
-        self.identified = []                  # WAV bytes identify_language() saw
-        self.restarted = []                   # languages restart() saw
-        self.restart_ok = True
         self.streamable = None                # streams_language(): None = every language
         self.sent = []                        # payloads send_audio() saw
+        self.language = None                  # the language start() opened
 
     @property
     def has_pending_finals(self):
@@ -181,26 +207,28 @@ class FakeSTT:
         # are barge-in speech evidence.
         return bool(self._transcripts)
 
-    async def start(self, language="multi", sample_rate=None, interim_results=False):
+    @property
+    def has_drainable_finals(self):
+        return self.has_pending_finals
+
+    async def start(self, language="multi", sample_rate=None, interim_results=False, endpointing_ms=None):
         self.started.append(language)
+        self.language = language
 
     async def send_audio(self, audio):
         self.sent.append(bytes(audio))
 
-    async def identify_language(self, audio_wav):
-        self.identified.append(audio_wav)
-        if self.identify_delay_s:
-            await asyncio.sleep(self.identify_delay_s)
-        return self.guess
-
     def streams_language(self, language):
         return self.streamable is None or language in self.streamable
 
-    async def restart(self, language):
-        self.restarted.append(language)
-        if self.restart_ok:
-            self.started.append(language)
-        return self.restart_ok
+    @property
+    def speech_evidence(self):
+        # Mirrors the base contract: a live partial or a pending final.
+        return bool(self.latest_interim) or self.has_pending_finals
+
+    @property
+    def interim_evidence(self):
+        return self.latest_interim
 
     def drain_transcript(self):
         return self._transcripts.pop(0) if self._transcripts else None
@@ -225,6 +253,26 @@ class FakeSTT:
 
     async def feed_during_opening(self):
         pass
+
+    # The call's second listen (``relisten.TurnRelisten``): ``completed``
+    # rewrites a turn's text, ``wordless`` is a wordless turn's words.
+    def enable_turn_relisten(self):
+        self.turn_relisten = True
+
+    async def complete_turn(self, text, bound):
+        self.completions = getattr(self, "completions", []) + [(text, bound)]
+        return getattr(self, "completed", None) or text
+
+    def turn_taken(self):
+        self.takes = getattr(self, "takes", 0) + 1
+
+    async def release_wordless_turn(self, timeout):
+        words = getattr(self, "wordless", None)
+        if not words:
+            return False
+        self.wordless = None
+        self._transcripts.append(words)
+        return True
 
     def on_tts_finished(self, was_interrupted):
         pass

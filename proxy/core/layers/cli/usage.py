@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from core.execution_layer import Scoped, Window, WindowSpec, Windows
+from core.execution_layer import Scoped, Window, Windows, WindowSpec
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
@@ -40,7 +40,7 @@ def model_family(model: str) -> str:
     return ""
 
 
-def event_reached_key(rate_limit_type: str) -> str:
+def event_reached_key(rate_limit_type: str | None) -> str:
     """The reached key of a rejected stream event's ``rateLimitType``: an
     overall window's own key, ``scoped:<family>`` for a model family's
     weekly window; "" for a type that names neither."""
@@ -68,7 +68,8 @@ def usage_request(stored: dict) -> tuple[str, dict] | None:
     platform's ``User-Agent``), or None when the stored credential has no
     access token."""
     from core.layers.cli.oauth import OAUTH_BETA
-    oauth = stored.get("oauth_token") if isinstance(stored.get("oauth_token"), dict) else {}
+    stored_oauth = stored.get("oauth_token")
+    oauth = stored_oauth if isinstance(stored_oauth, dict) else {}
     token = str(oauth.get("accessToken") or "")
     if not token:
         return None

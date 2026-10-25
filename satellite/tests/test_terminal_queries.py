@@ -11,10 +11,9 @@ bytes stay raw because the attached terminal is the controlling one and must
 answer live queries.
 """
 
+from satellite._vendored.terminal_queries import strip_queries
 from satellite.config import SatelliteConfig
 from satellite.sessions.session_manager import SessionManager
-from satellite._vendored.terminal_queries import strip_queries
-
 
 # ---------------------------------------------------------------------------
 # Vocabulary

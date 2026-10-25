@@ -11,6 +11,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import * as authApi from '@/api/auth'
 import PhoneServersTab from '@/pages/admin/PhoneServersTab'
+import { renderWithDialogs } from './dialogsHarness'
 
 const fetchSpy = vi.spyOn(authApi, 'apiFetch')
 
@@ -51,7 +52,7 @@ function mockApi(routes: unknown[]) {
 
 function renderTab() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}><PhoneServersTab /></QueryClientProvider>)
+  return renderWithDialogs(<QueryClientProvider client={qc}><PhoneServersTab /></QueryClientProvider>)
 }
 
 async function openEdit() {
@@ -72,8 +73,7 @@ function pinRequests() {
 }
 
 describe('route PIN option', () => {
-  beforeEach(() => { vi.stubGlobal('alert', vi.fn()); vi.stubGlobal('confirm', vi.fn(() => true)) })
-  afterEach(() => { fetchSpy.mockReset(); vi.unstubAllGlobals() })
+  afterEach(() => { fetchSpy.mockReset() })
 
   it('renders for inbound routes and for outbound routes tied to a user', async () => {
     mockApi([makeRoute()])
@@ -85,9 +85,10 @@ describe('route PIN option', () => {
     // person who answers enters the code before the agent speaks).
     fireEvent.click(screen.getByRole('button', { name: 'outbound' }))
     expect(screen.queryByText('Require a PIN')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByLabelText(/A platform user/))
+    fireEvent.click(screen.getByRole('radio', { name: /A platform user/ }))
     expect(screen.getByText('Require a PIN')).toBeInTheDocument()
-    expect(screen.getByText(/The person who answers must enter this code/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'About Require a PIN' }), { detail: 0 })
+    expect(screen.getByRole('tooltip')).toHaveTextContent(/The person who answers must enter this code/)
     expect(screen.getByText(/Require a PIN below so they enter it first/)).toBeInTheDocument()
   })
 
@@ -106,7 +107,7 @@ describe('route PIN option', () => {
       expect(body.direction).toBe('outbound')
       expect(body).not.toHaveProperty('acknowledge_no_pin')
     })
-    expect(vi.mocked(confirm)).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alertdialog')).toBeNull()
   })
 
   it('a stored PIN on a route that no longer takes one is removed before the save', async () => {
@@ -132,7 +133,7 @@ describe('route PIN option', () => {
     mockApi([makeRoute({ pin_configured: true })])
     renderTab()
     await openEdit()
-    expect(screen.getByText('(set)')).toBeInTheDocument()
+    expect(screen.getByText('Set')).toBeInTheDocument()
     const input = screen.getByPlaceholderText('••••••') as HTMLInputElement
     expect(input.value).toBe('')
     expect(input.type).toBe('password')
@@ -155,7 +156,7 @@ describe('route PIN option', () => {
       expect(body).not.toHaveProperty('acknowledge_no_pin')
     })
     expect(pinRequests()).toHaveLength(0)
-    expect(vi.mocked(confirm)).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alertdialog')).toBeNull()
   })
 
   it('a new PIN needs 6 digits before the route saves', async () => {
@@ -173,7 +174,7 @@ describe('route PIN option', () => {
     mockApi([])
     renderTab()
     fireEvent.click(await screen.findByText('Add Route'))
-    fireEvent.click(screen.getByLabelText(/A platform user/))
+    fireEvent.click(screen.getByRole('radio', { name: /A platform user/ }))
     const picker = await screen.findByLabelText('Platform user')
     await within(picker).findByText(/Alice/)
     fireEvent.change(picker, { target: { value: 'u-alice' } })
@@ -190,7 +191,7 @@ describe('route PIN option', () => {
       expect(body).not.toHaveProperty('acknowledge_no_pin')
     })
     expect(pinRequests()).toHaveLength(0)
-    expect(vi.mocked(confirm)).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alertdialog')).toBeNull()
   })
 
   it('a PIN typed before a flip to outbound never rides the save', async () => {
@@ -225,7 +226,7 @@ describe('route PIN option', () => {
         ([p, i]) => p === '/v1/admin/phone/routes/r1/pin' && i?.method === 'DELETE')).toBe(true)
     })
     // A caller-mode route needs no acknowledgement: no query string.
-    expect(vi.mocked(confirm)).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alertdialog')).toBeNull()
   })
 
   it('shows the lock marker on protected route rows', async () => {

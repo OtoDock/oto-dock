@@ -21,6 +21,7 @@
 // capture left; everything conversational lives server-side.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useSpeechSession } from '../../hooks/useSpeechSession'
 import { MicGlyph } from './MicGlyph'
 import { SttLanguageMenu } from './SttLanguageMenu'
@@ -66,18 +67,69 @@ export interface VoiceControlProps {
   duplex?: DuplexControlProps  // full-duplex conversation mode (phone engine)
   onDictateInterim: (text: string) => void       // input live partial (feedback)
   onDictateFinal: (text: string) => void          // input committed phrase
+  onDictateReplace?: (text: string) => void       // the language switched: the session's words so far
   onDictateActive: (active: boolean) => void       // input base snapshot
   interruptSignal: number                        // bumped on input focus → stop the mic, KEEP the tail
   discardSignal: number                          // bumped on manual send → stop the mic, DROP the tail
   disabled?: boolean
+  // The composer's row above the pill, where the dictation's sentence shows
+  // (it never covers the text it points to); absent, a popover above the mic.
+  sentenceSlot?: HTMLElement | null
+}
+
+/** The dictation's sentence for the person: a slow link's or a finishing
+ *  session's notice in a live region that stays mounted (a screen reader
+ *  announces a change, not a mount), and an error as a button a tap or
+ *  Escape dismisses. In the host's row above the composer when it gives
+ *  one, else above the mic. */
+export function DictationSentence({ slot, notice, error, onDismiss }: {
+  slot?: HTMLElement | null
+  notice: string | null
+  error: string | null
+  onDismiss: () => void
+}) {
+  const shown = !error && notice ? notice : ''
+  const status = (
+    <p role="status" className={shown ? (slot ? 'px-1 text-xs text-secondary'
+      : 'px-3 py-2 rounded-popover text-xs leading-snug bg-surface-overlay text-primary shadow-elevation-3')
+      : 'sr-only'}>
+      {shown}
+    </p>
+  )
+  const dismiss = error && (
+    <button
+      type="button"
+      onClick={onDismiss}
+      onKeyDown={(e) => { if (e.key === 'Escape') onDismiss() }}
+      title="Dismiss"
+      className={slot
+        ? 'block w-full px-1 text-left text-xs leading-snug text-status-danger-fg cursor-pointer'
+        : 'block w-full px-3 py-2 rounded-control text-left text-xs leading-snug bg-status-danger-fill text-on-solid shadow-elevation-3 cursor-pointer'}
+    >
+      {error}
+    </button>
+  )
+  if (slot) return createPortal(<div className={shown || error ? 'mb-1' : ''}>{status}{dismiss}</div>, slot)
+  return <div className="absolute bottom-full mb-2 right-0 z-50 w-60">{status}{dismiss}</div>
 }
 
 export function VoiceControl({
   duplex,
-  onDictateInterim, onDictateFinal, onDictateActive, interruptSignal, discardSignal, disabled,
+  onDictateInterim, onDictateFinal, onDictateReplace, onDictateActive, interruptSignal, discardSignal, disabled,
+  sentenceSlot,
 }: VoiceControlProps) {
+  // A dictation error stays until tapped (a dictation that stopped on its
+  // own must not pass unseen); a slow link's notice shows while recording.
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
-  const errorTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [noticeMsg, setNoticeMsg] = useState<string | null>(null)
+  // A send or a chat switch clears the sentence with the mic: one chat's
+  // "What was heard is in the box" never stays over another's composer.
+  const [seenDiscard, setSeenDiscard] = useState(discardSignal)
+  if (seenDiscard !== discardSignal) {
+    setSeenDiscard(discardSignal)
+    setErrorMsg(null)
+    setNoticeMsg(null)
+  }
   // The current gesture: a slide-to-enable or a hold consumes it, so the
   // trailing click never toggles dictation.
   const dragRef = useRef<{ x: number; slid: boolean; held: boolean } | null>(null)
@@ -89,20 +141,17 @@ export function VoiceControl({
   const discardMounted = useRef(false)
   const captionShownRef = useRef(false)
 
-  const showError = (msg: string) => {
-    setErrorMsg(msg)
-    if (errorTimer.current) clearTimeout(errorTimer.current)
-    errorTimer.current = setTimeout(() => setErrorMsg(null), 7000)
-  }
-  useEffect(() => () => { if (errorTimer.current) clearTimeout(errorTimer.current) }, [])
+  const showError = (msg: string) => { setErrorMsg(msg) }
   useEffect(() => () => { if (holdRef.current) clearTimeout(holdRef.current.timer) }, [])
 
   const speech = useSpeechSession({
     onInterim: onDictateInterim,
     onFinal: onDictateFinal,
+    onReplace: onDictateReplace,
     onActive: onDictateActive,
     onCommit: () => {},   // dictation never auto-sends
     onError: (msg) => showError(msg),
+    onNotice: setNoticeMsg,
   })
 
   // Duplex live transcript → the composer, through the same display path
@@ -164,6 +213,7 @@ export function VoiceControl({
 
   const recording = speech.status === 'recording'
   const connecting = speech.status === 'connecting'
+  const finishing = speech.status === 'finishing'
   const dupPhase = duplex?.active ? duplex.phase : null
   // The phone toggle slides out when the mic engages or a session is live —
   // the same reveal choreography the old headphones toggle had.
@@ -223,6 +273,7 @@ export function VoiceControl({
     if (!d || d.slid || d.held) return
     if (duplex?.available && !duplex.active && d.x - e.clientX > SLIDE_PX) {
       d.slid = true
+      setErrorMsg(null)
       speech.stop(true)
       duplex.onToggle()
     }
@@ -243,22 +294,23 @@ export function VoiceControl({
 
   const dupMuted = !!duplex?.muted
   const micTitle = errorMsg ? errorMsg
-    : dupPhase && dupMuted ? 'Mic muted — tap to unmute'
+    : dupPhase && dupMuted ? 'Mic muted. Tap to unmute.'
     : dupPhase ? 'Tap to mute the mic'
     : connecting ? 'Connecting…'
+    : finishing ? 'Finishing…'
     : recording ? 'Stop dictation'
-    : 'Dictate (hold for the language)'
+    : 'Dictate. Hold to pick the language.'
 
   const micClass = dupPhase && dupMuted
     // Muted: the slashed glyph alone — no background chip (operator
     // decision 2026-08-14). The red pulsing chip means "live and hearing
     // you"; any colored fill on the muted state reads as activity.
-    ? 'text-p-text-light'
-    : dupPhase ? 'text-red-500 bg-red-500/10 animate-pulse'
-    : recording ? 'text-red-500 bg-red-500/10 animate-pulse'
-    : connecting ? 'text-brand'
-    : errorMsg ? 'text-red-400 hover:text-red-500'
-    : 'text-p-text-secondary hover:text-brand hover:bg-brand/5'
+    ? 'text-tertiary'
+    : dupPhase ? 'text-status-danger-fg bg-status-danger-bg animate-pulse'
+    : recording ? 'text-status-danger-fg bg-status-danger-bg animate-pulse'
+    : connecting || finishing ? 'text-link'
+    : errorMsg ? 'text-status-danger-fg hover:text-status-danger-fg'
+    : 'text-secondary hover:text-primary hover:bg-surface-hover'
 
   return (
     <div ref={wrapRef} className="relative flex items-center shrink-0">
@@ -266,38 +318,34 @@ export function VoiceControl({
       {duplex && duplex.phase === 'error' && duplex.endReason && !errorMsg && (
         <div
           role="alert"
-          className="absolute bottom-full mb-2 right-0 z-50 w-60 px-3 py-2 rounded-lg
-            text-xs leading-snug bg-red-600 text-white shadow-lg"
+          className="absolute bottom-full mb-2 right-0 z-50 w-60 px-3 py-2 rounded-popover
+            text-xs leading-snug bg-status-danger-fill text-on-solid shadow-elevation-3"
         >
           {duplex.endReason}
         </div>
       )}
-      {errorMsg && (
-        <div
-          role="alert"
-          onClick={() => setErrorMsg(null)}
-          className="absolute bottom-full mb-2 right-0 z-50 w-60 px-3 py-2 rounded-lg cursor-pointer
-            text-xs leading-snug bg-red-600 text-white shadow-lg"
-        >
-          {errorMsg}
-        </div>
-      )}
+      <DictationSentence
+        slot={sentenceSlot}
+        notice={speech.status !== 'idle' && !dupPhase ? noticeMsg : null}
+        error={errorMsg}
+        onDismiss={() => setErrorMsg(null)}
+      />
 
       {/* Full-duplex toggle (phone) — slides out to the LEFT of the mic. */}
       <div className={`overflow-hidden transition-all duration-200 ${showDuplexToggle ? 'w-9 opacity-100' : 'w-0 opacity-0'}`}>
         {duplex?.available && (
           <button
             type="button"
-            onClick={() => { speech.stop(true); duplex.onToggle() }}
+            onClick={() => { setErrorMsg(null); speech.stop(true); duplex.onToggle() }}
             disabled={disabled}
             aria-pressed={duplex.active}
             title={duplex.active ? 'End the live conversation'
-              : 'Start a live conversation (full duplex)'}
-            className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors shrink-0
+              : 'Start a live conversation'}
+            className={`w-9 h-9 rounded-control flex items-center justify-center transition-colors shrink-0
               disabled:opacity-40 disabled:cursor-not-allowed
-              ${duplex.active ? 'text-brand bg-brand/10'
-                : duplex.phase === 'connecting' ? 'text-brand animate-pulse'
-                : 'text-p-text-secondary hover:text-brand hover:bg-brand/5'}`}
+              ${duplex.active ? 'text-link bg-action-subtle'
+                : duplex.phase === 'connecting' ? 'text-link animate-pulse'
+                : 'text-secondary hover:text-primary hover:bg-surface-hover'}`}
           >
             {/* phone handset */}
             <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
@@ -323,7 +371,7 @@ export function VoiceControl({
         // iOS: no callout on the hold; the text-selection lock keeps the
         // glyph from highlighting under a long press.
         style={{ WebkitTouchCallout: 'none', userSelect: 'none', WebkitUserSelect: 'none' }}
-        className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors shrink-0 touch-none
+        className={`w-9 h-9 rounded-control flex items-center justify-center transition-colors shrink-0 touch-none
           disabled:cursor-not-allowed ${micClass}`}
       >
         {dupPhase && dupMuted ? (
@@ -336,7 +384,7 @@ export function VoiceControl({
             <line x1="12" y1="19" x2="12" y2="22" />
             <line x1="2" y1="2" x2="22" y2="22" />
           </svg>
-        ) : connecting ? (
+        ) : connecting || finishing ? (
           <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />

@@ -127,7 +127,7 @@ def session_active_unlocked() -> bool | None:
             if on_console is None:
                 return None
             return bool(on_console)
-        except Exception:
+        except Exception:  # noqa: BLE001  # pyobjc calls raise whatever the macOS bridge does
             return None
     # Linux/Windows: reliable lock-state detection needs more than stdlib and
     # varies by DE/config. Treat as unknown for v1 — capture/input will simply
@@ -171,7 +171,7 @@ def check_macos_permissions() -> dict:
         from ApplicationServices import AXIsProcessTrusted  # type: ignore
 
         out["accessibility"] = bool(AXIsProcessTrusted())
-    except Exception:
+    except Exception:  # noqa: BLE001  # pyobjc calls raise whatever the macOS bridge does
         notes.append("could not read Accessibility status")
     # Screen Recording (capture) via Quartz preflight (macOS 10.15+).
     try:
@@ -182,7 +182,7 @@ def check_macos_permissions() -> dict:
             out["screen_recording"] = bool(preflight())
         else:
             notes.append("Screen Recording preflight API unavailable (old macOS)")
-    except Exception:
+    except Exception:  # noqa: BLE001  # pyobjc calls raise whatever the macOS bridge does
         notes.append("could not read Screen Recording status")
     if out["accessibility"] is False or out["screen_recording"] is False:
         notes.append(

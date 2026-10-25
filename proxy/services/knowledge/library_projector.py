@@ -87,16 +87,19 @@ import os
 import shutil
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import config
-from storage.knowledge import db_knowledge_libraries
-from storage.knowledge import db_library_mirror_state
-from storage.files import recover_bin_store
-from storage.knowledge.db_knowledge_libraries import subtree_covers
-from services.infra import safe_fs
-from services.infra.path_confinement import join_under, safe_agent_dir
 from core import layout
 from core.background import spawn
+from services.infra import safe_fs
+from services.infra.path_confinement import join_under
+from storage.files import recover_bin_store
+from storage.knowledge import db_knowledge_libraries, db_library_mirror_state
+from storage.knowledge.db_knowledge_libraries import subtree_covers
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 logger = logging.getLogger("otodock.knowledge-libraries")
 
@@ -128,14 +131,14 @@ def _lock(source_agent: str) -> asyncio.Lock:
 
 
 def source_knowledge_dir(source_agent: str) -> Path:
-    return safe_agent_dir(source_agent) / layout.KNOWLEDGE
+    return config.get_agent_dir(source_agent) / layout.KNOWLEDGE
 
 
 def mirror_dir(consumer_agent: str, source_agent: str) -> Path:
     """The consumer's mirror root for one SOURCE (slug segment). Library
     subtrees of that source live below it at their own ``subdir``."""
     return join_under(
-        safe_agent_dir(consumer_agent) / layout.KNOWLEDGE / SHARED_SUBDIR, source_agent,
+        config.get_agent_dir(consumer_agent) / layout.KNOWLEDGE / SHARED_SUBDIR, source_agent,
     )
 
 
@@ -167,7 +170,7 @@ def parse_library_rel(rel_path: str) -> tuple[str, str] | None:
 
 def _agent_rel(path: Path) -> str:
     """A source or mirror path as a rel below ``AGENTS_DIR`` (every path
-    this module builds is ``safe_agent_dir(slug)/…``)."""
+    this module builds is ``config.get_agent_dir(slug)/…``)."""
     return safe_fs.rel_under(path, config.AGENTS_DIR)
 
 
@@ -346,7 +349,7 @@ def _sync_pair_files(src_file: Path, mir_file: Path, *, writable: bool,
                      consumer: str, source: str, sub_rel: str,
                      base: dict | None = None,
                      deliberate_delete: bool = False,
-                     other_mirrors: list[tuple[str, Path]] = (),
+                     other_mirrors: "Sequence[tuple[str, Path]]" = (),
                      book: "_BaseBook | None" = None,
                      ) -> tuple[list[tuple[str, str, Path | None]], bool]:
     """Reconcile ONE file pair. ``sub_rel`` is SOURCE-ROOT-relative.

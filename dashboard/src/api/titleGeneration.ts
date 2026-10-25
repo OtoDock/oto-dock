@@ -52,7 +52,7 @@ export function useSaveTitleGeneration() {
     mutationFn: (data: { enabled?: boolean; model?: string }) =>
       apiJson<TitleGeneration>('/v1/admin/title-generation', { method: 'PUT', json: data },
         'Failed to update title-generation settings'),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['title-generation'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['title-generation'] }),
   })
 }
 

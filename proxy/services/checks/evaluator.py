@@ -20,18 +20,16 @@ import json
 import logging
 import time
 
-from core.session import session_events
+from auth import roles
+from core import layout
+from core.session import session_events, session_kind
 from core.session.visibility import is_synthetic_owner
-from services.checks import changed_set as cs
-from services.checks import documents, kinds, render
+from services.checks import changed_set as cs, documents, kinds, render
 from services.checks.render import Verdict
+from services.scheduler import task_kinds
 from storage.checks import db_checks
 from storage.pg import run_db
-from core.session import session_kind
-from services.scheduler import task_kinds
-from auth import roles
 from ws import wire_events as wire
-from core import layout
 
 logger = logging.getLogger("checks")
 
@@ -56,7 +54,10 @@ def install() -> None:
 async def resolve_target(session_id: str, engine: str = "") -> cs.Target | None:
     """The judged session, or None when checks never apply to it."""
     from core.session.session_state import (
-        _sessions, get_meeting_session_info, get_session_client_type, get_session_security,
+        _sessions,
+        get_meeting_session_info,
+        get_session_client_type,
+        get_session_security,
     )
     from storage import database as task_store
     entry = _sessions.get(session_id) or {}
@@ -130,11 +131,11 @@ def attached_checks(target: cs.Target) -> list[documents.CheckDoc]:
     for ref in refs if isinstance(refs, list) else []:
         if not isinstance(ref, str):
             continue
-        it = documents.resolve_ref(target.agent, ref, target.username)
-        if it is None or it.ref in seen or target.kind not in it.applies:
+        found = documents.resolve_ref(target.agent, ref, target.username)
+        if found is None or found.ref in seen or target.kind not in found.applies:
             continue
-        out.append(it)
-        seen.add(it.ref)
+        out.append(found)
+        seen.add(found.ref)
     return out
 
 
@@ -166,7 +167,7 @@ async def evaluate(check: documents.CheckDoc, target: cs.Target, changed: dict, 
             v = await runner(check, target, changed, round_no=round_no)
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # noqa: BLE001 — the reason is the verdict
+        except Exception as e:  # the reason is the verdict
             logger.exception("check %s/%s: the %s section failed", target.agent, check.name, section)
             v = Verdict(section=section, status="error", reason=f"{section}: {str(e)[:300]}")
         last = v
@@ -176,7 +177,7 @@ async def evaluate(check: documents.CheckDoc, target: cs.Target, changed: dict, 
 
 
 def _budget_s(check: documents.CheckDoc) -> float:
-    total = EVALUATION_MARGIN_S
+    total: float = EVALUATION_MARGIN_S
     if check.doc.get("script"):
         total += int(check.doc["script"].get("timeout") or 0)
     if check.doc.get("judge"):
@@ -203,9 +204,9 @@ async def record(check: documents.CheckDoc, target: cs.Target, v: Verdict, *,
         )
         v.verdict_id = row["id"]
         try:
-            from api.apps import catalog
+            from services.apps import catalog
             catalog.verdict_landed(row, target.agent, target.user_sub)
-        except Exception:
+        except Exception:  # noqa: BLE001  # the feed delta is best effort, the verdict is already recorded
             logger.debug("check %s: the feed delta was not emitted", check.name, exc_info=True)
     except Exception:
         logger.exception("check %s/%s: the verdict could not be stored", target.agent, check.name)
@@ -224,7 +225,7 @@ async def record(check: documents.CheckDoc, target: cs.Target, v: Verdict, *,
         if target.user_sub:
             from services.notifications import notification_manager
             notification_manager.broadcast_chat_rows(target.user_sub, target.chat_id, target.agent)
-    except Exception:
+    except Exception:  # noqa: BLE001  # the chat card is best effort, the verdict row is stored
         logger.warning("check %s: the chat card could not be placed", check.name, exc_info=True)
     return v
 
@@ -323,12 +324,12 @@ def _announce_turn(target: cs.Target, ctx: session_events.TurnEndContext, verdic
     if target.kind != "chats":
         return
     try:
-        from api.apps import catalog
+        from services.apps import catalog
         catalog.chat_turn_finished(target.chat, {
             "session_id": target.session_id, "engine": ctx.engine or target.engine,
             "rounds": int(ctx.rounds), "verdicts": verdicts, "username": target.username,
         })
-    except Exception:
+    except Exception:  # noqa: BLE001  # the turn's feed event is best effort, the verdicts are stored
         logger.debug("turn_finished was not emitted", exc_info=True)
 
 

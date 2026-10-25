@@ -41,17 +41,19 @@ from webauthn.helpers.structs import (
 )
 
 import config
+from api.auth._router import router
 from auth.lan_check import auth_bucket_key, check_local_auth_allowed
 from auth.providers import UserContext, get_current_user, mask_email, require_auth
 from auth.rate_limiter import hit as rate_limit_hit
 from auth.totp import (
-    StepTokenBusy, release_2fa_session_token, reserve_2fa_session_token,
-    spend_2fa_session_token, validate_2fa_session_token,
+    StepTokenBusy,
+    release_2fa_session_token,
+    reserve_2fa_session_token,
+    spend_2fa_session_token,
+    validate_2fa_session_token,
 )
 from storage import database as task_store
 from storage.identity import webauthn_store
-
-from api.auth._router import router
 
 logger = logging.getLogger("otodock")
 
@@ -226,7 +228,7 @@ async def _confirm_password(u: UserContext, password: str) -> dict:
         return await confirm.confirm_password(u, password)
     except HTTPException as e:
         if e.status_code == 400:
-            raise HTTPException(400, "Passkey management requires a password-backed local account")
+            raise HTTPException(400, "Passkey management requires a password-backed local account") from e
         raise
 
 
@@ -292,8 +294,8 @@ async def passkey_confirm_verify(req: PasskeyConfirmVerifyRequest, request: Requ
             require_user_verification=True,
         )
     except WebAuthnException as e:
-        logger.info(f"Passkey confirm rejected for credential {credential_id[:12]}…: {e}")
-        raise HTTPException(401, "Passkey could not be verified")
+        logger.info("Passkey confirm rejected for credential %s…: %s", credential_id[:12], e)
+        raise HTTPException(401, "Passkey could not be verified") from e
     await asyncio.to_thread(webauthn_store.record_use, credential_id, verification.new_sign_count)
     return {"confirm_token": confirm.mint_confirm_token(u.sub)}
 
@@ -381,8 +383,8 @@ async def passkey_register_verify(
     except WebAuthnException as e:
         # Base class: parse errors (InvalidJSONStructure etc.) and verification
         # failures alike are a client-side 400, never a 500.
-        logger.info(f"Passkey registration rejected for {mask_email(u.email)}: {e}")
-        raise HTTPException(400, "Passkey registration could not be verified")
+        logger.info("Passkey registration rejected for %s: %s", mask_email(u.email), e)
+        raise HTTPException(400, "Passkey registration could not be verified") from e
 
     count = await asyncio.to_thread(webauthn_store.count_credentials, u.sub)
     name = req.name.strip() or f"Passkey {count + 1}"
@@ -397,9 +399,9 @@ async def passkey_register_verify(
             name,
             [str(t) for t in transports],
         )
-    except webauthn_store.CredentialAlreadyRegistered:
-        raise HTTPException(400, "This passkey is already registered")
-    logger.info(f"Passkey registered for {mask_email(u.email)} ({name})")
+    except webauthn_store.CredentialAlreadyRegistered as exc:
+        raise HTTPException(400, "This passkey is already registered") from exc
+    logger.info("Passkey registered for %s (%s)", mask_email(u.email), name)
     return {"status": "registered", "name": name}
 
 
@@ -435,7 +437,7 @@ async def passkey_delete(
     ok = await asyncio.to_thread(webauthn_store.delete_credential, u.sub, credential_id)
     if not ok:
         raise HTTPException(404, "Passkey not found")
-    logger.info(f"Passkey removed for {mask_email(u.email)}")
+    logger.info("Passkey removed for %s", mask_email(u.email))
     return {"status": "deleted"}
 
 
@@ -509,8 +511,8 @@ async def passkey_login_verify(req: PasskeyLoginVerifyRequest, request: Request)
     if req.totp_session_token:
         try:
             step = reserve_2fa_session_token(req.totp_session_token)
-        except StepTokenBusy:
-            raise HTTPException(409, "This sign-in is already being completed")
+        except StepTokenBusy as exc:
+            raise HTTPException(409, "This sign-in is already being completed") from exc
         if step is None:
             raise HTTPException(401, "2FA session expired. Please log in again.")
     step_sub = step.sub if step is not None else ""
@@ -552,8 +554,8 @@ async def passkey_login_verify(req: PasskeyLoginVerifyRequest, request: Request)
                 require_user_verification=True,
             )
         except WebAuthnException as e:
-            logger.info(f"Passkey login rejected for credential {credential_id[:12]}…: {e}")
-            raise HTTPException(401, "Passkey could not be verified")
+            logger.info("Passkey login rejected for credential %s…: %s", credential_id[:12], e)
+            raise HTTPException(401, "Passkey could not be verified") from e
         # The LAN restriction is judged only after the assertion verifies, as the
         # password login judges it after the password: before, a caller holding
         # a credential id alone would learn which accounts are local_only.
@@ -572,13 +574,13 @@ async def passkey_login_verify(req: PasskeyLoginVerifyRequest, request: Request)
         # in; hand back a one-time token the app's webview exchanges for ITS cookie.
         if req.native:
             token = _mint_native_token(user_row["sub"], req.handoff)
-            logger.info(f"Passkey native handoff minted for {mask_email(user_row['email'])}")
+            logger.info("Passkey native handoff minted for %s", mask_email(user_row['email']))
             return {"status": "ok", "native_token": token}
 
         # A verified passkey is multi-factor by construction — no TOTP step.
         from api.auth.identity import _login_response
         response = await _login_response(user_row, "local")
-        logger.info(f"Passkey login: {mask_email(user_row['email'])} role={user_row['role']}")
+        logger.info("Passkey login: %s role=%s", mask_email(user_row['email']), user_row['role'])
         return response
     finally:
         if step is not None and not spent:
@@ -628,5 +630,5 @@ async def passkey_native_exchange(req: PasskeyNativeExchangeRequest, request: Re
     from api.auth.identity import _login_response
     response = await _login_response(user_row, "local")
     _set_handoff_ring(response, [n for n in ring if not hmac.compare_digest(n, handoff)])
-    logger.info(f"Passkey login (native): {mask_email(user_row['email'])} role={user_row['role']}")
+    logger.info("Passkey login (native): %s role=%s", mask_email(user_row['email']), user_row['role'])
     return response

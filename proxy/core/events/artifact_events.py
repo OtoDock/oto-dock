@@ -28,6 +28,7 @@ drainer, the snapshot and the dashboard mirror
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from ws import wire_events as wire
@@ -101,20 +102,28 @@ SAVED = frozenset(k.name for k in KINDS.values() if k.saved)
 SHAREABLE = frozenset(k.name for k in KINDS.values() if k.shareable)
 
 
+#: The person a live frame's WOPI token was minted for: the one connection
+#: that may receive the token is theirs (``for_viewer``).
+TOKEN_PERSON = "token_person"
+
 #: Event fields a live frame carries and a stored row never does: the
-#: document preview's WOPI token (a card from history mints its own).
-LIVE_ONLY_KEYS = ("access_token", "access_token_ttl")
+#: document preview's WOPI token and its person (a card from history mints
+#: its own).
+LIVE_ONLY_KEYS = ("access_token", "access_token_ttl", TOKEN_PERSON)
 
 
-def for_viewer(event: dict, pusher: str, viewer: str) -> dict:
-    """``event`` as one viewer's connection gets it: the live-only fields
-    (the pushing session's edit-capable WOPI token) go only to the person
-    whose session pushed it; every other viewer of the chat gets the frame
-    without them, and their pane mints its own role-gated token. No known
-    pusher keeps the token from everyone."""
-    if not any(k in event for k in LIVE_ONLY_KEYS) or (pusher and viewer == pusher):
+def for_viewer(event: dict, viewer: str) -> dict:
+    """``event`` as one viewer's connection gets it: the token goes only to
+    the person it was minted for (the event's own ``token_person``, so an
+    item still queued when the chat's next turn runs as someone else keeps
+    its person); every other viewer gets the frame without it, and their
+    pane mints its own role-gated token. A token with no person reaches
+    nobody, and the person field itself reaches no connection."""
+    if not any(k in event for k in LIVE_ONLY_KEYS):
         return event
-    return {k: v for k, v in event.items() if k not in LIVE_ONLY_KEYS}
+    person = event.get(TOKEN_PERSON) or ""
+    gone = (TOKEN_PERSON,) if person and viewer == person else LIVE_ONLY_KEYS
+    return {k: v for k, v in event.items() if k not in gone}
 
 
 def kind_of(event_type: str | None) -> ArtifactKind | None:
@@ -180,9 +189,11 @@ def artifact_event_from_perm_item(perm_data: dict) -> dict | None:
         return {
             "type": wire.DOCUMENT_PREVIEW,
             "wopi_url": perm_data["wopi_url"],
-            # The WOPI token rides the live frame only (LIVE_ONLY_KEYS).
+            # The WOPI token and its person ride the live frame only
+            # (LIVE_ONLY_KEYS).
             "access_token": perm_data.get("access_token", ""),
             "access_token_ttl": perm_data.get("access_token_ttl", 0),
+            TOKEN_PERSON: perm_data.get(TOKEN_PERSON, ""),
             "filename": perm_data["filename"],
             "file_id": perm_data["file_id"],
             "download_url": perm_data["download_url"],
@@ -207,3 +218,48 @@ def artifact_event_from_perm_item(perm_data: dict) -> dict | None:
             "path": perm_data.get("path", ""),
         }
     return None
+
+
+QUEUE_CAP = 3
+
+
+def event_row_json(interaction: dict) -> str:
+    """The persisted event row / ws frame payload (``artifact_interaction``
+    or ``app_action`` by kind)."""
+    if interaction.get("kind") == wire.APP_ACTION:
+        return json.dumps({
+            "type": wire.APP_ACTION,
+            "app_id": interaction["app_id"],
+            "slug": interaction["slug"],
+            "title": interaction["title"],
+            "action_id": interaction["action_id"],
+            "label": interaction["label"],
+            "prompt": interaction["prompt"],
+        })
+    return json.dumps({
+        "type": wire.ARTIFACT_INTERACTION,
+        "token": interaction["token"],
+        "title": interaction["title"],
+        "payload": interaction["payload"],
+    })
+
+
+def event_type(interaction: dict) -> str:
+    """The chat_messages.event_type for one interaction's persisted row."""
+    return wire.APP_ACTION if interaction.get("kind") == wire.APP_ACTION else wire.ARTIFACT_INTERACTION
+
+
+def ws_frame(interaction: dict, chat_id: str) -> dict:
+    """The live ws frame for one delivered interaction (chip render)."""
+    if interaction.get("kind") == wire.APP_ACTION:
+        return {
+            "type": wire.APP_ACTION, "app_id": interaction["app_id"],
+            "slug": interaction["slug"], "title": interaction["title"],
+            "action_id": interaction["action_id"], "label": interaction["label"],
+            "prompt": interaction["prompt"], "chat_id": chat_id,
+        }
+    return {
+        "type": wire.ARTIFACT_INTERACTION, "token": interaction["token"],
+        "title": interaction["title"], "payload": interaction["payload"],
+        "chat_id": chat_id,
+    }

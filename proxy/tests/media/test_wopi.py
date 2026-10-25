@@ -17,13 +17,20 @@ import base64
 import os
 from unittest.mock import AsyncMock
 
+import psycopg
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
-
+from tests.media.wopi_signing import sign_request_async, signed_client, signing
 
 _REAL_PERSON_HOLDS: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _collabora_signs(monkeypatch):
+    """Collabora signs every WOPI call (its key is the test key) and the
+    clients here sign like it: the routes run in the default mode."""
+    signing(monkeypatch)
 
 
 @pytest.fixture(autouse=True)
@@ -115,7 +122,7 @@ def _seed_file(tmp_path, rel, content=b"doc"):
 
 
 def _ask_url(app, file_path, edit=True):
-    client = TestClient(app)
+    client = signed_client(app)
     return client.post(
         "/v1/documents/wopi-url",
         json={"file_path": file_path, "agent": "test-agent", "edit": edit},
@@ -214,7 +221,7 @@ async def test_put_file_propagates_and_broadcasts(temp_db, tmp_path, monkeypatch
 
     app = FastAPI()
     app.include_router(wopi.router)
-    resp = TestClient(app).post(
+    resp = signed_client(app).post(
         f"/wopi/files/{file_id}/contents?access_token={token}", content=b"new bytes",
     )
     assert resp.status_code == 200
@@ -253,7 +260,7 @@ async def test_put_file_answers_the_saved_files_last_modified_time(temp_db, tmp_
 
     app = FastAPI()
     app.include_router(wopi.router)
-    client = TestClient(app)
+    client = signed_client(app)
     resp = client.post(f"/wopi/files/{file_id}/contents?access_token={token}", content=b"saved bytes")
     assert resp.status_code == 200
     assert resp.json() == {"LastModifiedTime": "2023-11-14T22:13:20.000Z"}
@@ -280,7 +287,7 @@ async def test_put_file_view_token_rejected(temp_db, tmp_path, monkeypatch):
 
     app = FastAPI()
     app.include_router(wopi.router)
-    resp = TestClient(app).post(
+    resp = signed_client(app).post(
         f"/wopi/files/{file_id}/contents?access_token={token}", content=b"x",
     )
     assert resp.status_code == 403
@@ -294,8 +301,9 @@ def test_validate_rejects_purposeless_jwt(temp_db, tmp_path, monkeypatch):
     _wopi_config(monkeypatch, tmp_path)
     import time as _time
 
-    import config
     import jwt as _jwt
+
+    import config
     from api.media import wopi
 
     rel = "test-agent/workspace/x.docx"
@@ -330,7 +338,7 @@ def test_check_file_info_presence_fields(temp_db, tmp_path, monkeypatch):
 
     app = FastAPI()
     app.include_router(wopi.router)
-    resp = TestClient(app).get(f"/wopi/files/{file_id}?access_token={token}")
+    resp = signed_client(app).get(f"/wopi/files/{file_id}?access_token={token}")
     assert resp.status_code == 200
     j = resp.json()
     assert j["HideUserList"] == "false"
@@ -381,7 +389,7 @@ async def test_put_file_host_cache_pushes_back(temp_db, tmp_path, monkeypatch):
 
     app = FastAPI()
     app.include_router(wopi.router)
-    resp = TestClient(app).post(
+    resp = signed_client(app).post(
         f"/wopi/files/{file_id}/contents?access_token={token}",
         content=b"edited bytes",
     )
@@ -411,7 +419,7 @@ async def test_put_file_host_cache_offline_fails_and_restores(
 
     app = FastAPI()
     app.include_router(wopi.router)
-    resp = TestClient(app).post(
+    resp = signed_client(app).post(
         f"/wopi/files/{file_id}/contents?access_token={token}",
         content=b"edited bytes",
     )
@@ -438,7 +446,7 @@ async def test_put_file_host_cache_view_token_still_403(
 
     app = FastAPI()
     app.include_router(wopi.router)
-    resp = TestClient(app).post(
+    resp = signed_client(app).post(
         f"/wopi/files/{file_id}/contents?access_token={token}", content=b"x",
     )
     assert resp.status_code == 403
@@ -460,7 +468,7 @@ def test_wopiurl_agent_segment_cannot_leave_agents_tree(temp_db, tmp_path, monke
     stray = tmp_path / "stray" / "workspace" / "doc.docx"
     stray.parent.mkdir(parents=True)
     stray.write_bytes(b"doc")
-    r = TestClient(app).post(
+    r = signed_client(app).post(
         "/v1/documents/wopi-url",
         json={"file_path": "workspace/doc.docx", "agent": "../stray", "edit": False},
     )
@@ -494,7 +502,7 @@ def _serve_client():
     from api.media import wopi
     app = FastAPI()
     app.include_router(wopi.router)
-    return TestClient(app)
+    return signed_client(app)
 
 
 def test_wopi_get_file_refuses_post_mint_symlink_swap(temp_db, tmp_path, monkeypatch):
@@ -629,6 +637,7 @@ def _swap_on_open(monkeypatch, tree, victim):
     """``tree/workspace/sub`` becomes a link to the victim as the helper opens
     the root, after every check: the strict open must refuse it."""
     import contextlib
+
     from services.infra import safe_fs
     real = safe_fs.open_root
     state = {"done": False}
@@ -662,7 +671,7 @@ async def test_put_file_refuses_a_component_swapped_after_the_check(temp_db, tmp
     token, _ = wopi.create_wopi_token(rel, "user-bob-sub", "Bob", "edit", "test-agent")
     app = FastAPI()
     app.include_router(wopi.router)
-    resp = TestClient(app, raise_server_exceptions=False).post(
+    resp = signed_client(app, raise_server_exceptions=False).post(
         f"/wopi/files/{_encode_file_id(rel)}/contents?access_token={token}", content=b"NEW",
     )
     assert resp.status_code >= 400
@@ -678,7 +687,7 @@ async def test_put_file_malformed_token_path_is_refused_not_written(temp_db, tmp
         token, _ = wopi.create_wopi_token(rel, "user-bob-sub", "Bob", "edit", "test-agent")
         app = FastAPI()
         app.include_router(wopi.router)
-        resp = TestClient(app, raise_server_exceptions=False).post(
+        resp = signed_client(app, raise_server_exceptions=False).post(
             f"/wopi/files/{_encode_file_id(rel)}/contents?access_token={token}", content=b"NEW",
         )
         assert resp.status_code == 403, rel
@@ -703,7 +712,7 @@ async def test_put_file_host_cache_refuses_a_linked_cache_file(temp_db, tmp_path
     token, _ = wopi.create_wopi_token(rel, "agent", "Agent", "edit", "test-agent")
     app = FastAPI()
     app.include_router(wopi.router)
-    resp = TestClient(app, raise_server_exceptions=False).post(
+    resp = signed_client(app, raise_server_exceptions=False).post(
         f"/wopi/files/{_encode_file_id(rel)}/contents?access_token={token}", content=b"NEW",
     )
     assert resp.status_code == 403
@@ -723,7 +732,7 @@ def test_preview_mint_stamps_the_agent_of_the_path(temp_db, tmp_path, monkeypatc
     monkeypatch.setattr(db, "get_username_by_sub", lambda s: "alice")
     monkeypatch.setattr(db, "get_chat", lambda cid: {"id": cid, "agent": "parent", "session_id": ""})
     monkeypatch.setattr(db, "get_preview_event_by_file", lambda cid, fid: {"id": 1})
-    monkeypatch.setattr("api.agents.chats.can_access_chat", lambda u, c: True)
+    monkeypatch.setattr("core.session.visibility.can_access_chat", lambda u, c: True)
     user = UserContext(sub="alice-sub", email="a@t.com", name="Alice", role="creator",
                        agents=["parent", "participant"],
                        agent_roles={"parent": "manager", "participant": "manager"})
@@ -735,7 +744,7 @@ def test_preview_mint_stamps_the_agent_of_the_path(temp_db, tmp_path, monkeypatc
     app.include_router(wopi.router)
     app.dependency_overrides[get_current_user] = _stub
     rel = "participant/workspace/r.docx"
-    resp = TestClient(app).get(
+    resp = signed_client(app).get(
         f"/v1/documents/preview-wopi-url?chat_id=c1&file_id={_encode_file_id(rel)}",
     )
     assert resp.status_code == 200, resp.text
@@ -780,7 +789,7 @@ def _chat_mint_client(monkeypatch, tmp_path):
     monkeypatch.setattr(
         db, "get_chat", lambda cid: {"id": cid, "agent": "test-agent", "session_id": ""},
     )
-    monkeypatch.setattr("api.agents.chats.can_access_chat", lambda u, c: True)
+    monkeypatch.setattr("core.session.visibility.can_access_chat", lambda u, c: True)
     user = UserContext(sub="alice-sub", email="a@t.com", name="Alice", role="creator",
                        agents=["test-agent"], agent_roles={"test-agent": "manager"})
 
@@ -790,7 +799,7 @@ def _chat_mint_client(monkeypatch, tmp_path):
     app = FastAPI()
     app.include_router(wopi.router)
     app.dependency_overrides[get_current_user] = _stub
-    return TestClient(app)
+    return signed_client(app)
 
 
 def test_the_workspace_mint_reads_off_the_loop(temp_db, tmp_path, monkeypatch):
@@ -866,7 +875,7 @@ def _save_rig(monkeypatch, tmp_path, content=b"agent bytes", mtime=1_700_000_000
     file_id = _encode_file_id(rel)
     app = FastAPI()
     app.include_router(wopi.router)
-    return TestClient(app), target, file_id, token, pw, bc
+    return signed_client(app), target, file_id, token, pw, bc
 
 
 def _loaded_time(client, file_id, token):
@@ -895,13 +904,14 @@ def test_a_save_answers_while_its_fan_out_waits_on_a_stalled_machine(temp_db, tm
     answers once its bytes are stored, the fan-out runs after the answer."""
     import threading
     import time as _time
+
     from services.remote import workspace_fanout
     client, target, file_id, token, _pw, _bc = _save_rig(monkeypatch, tmp_path)
     started, release = threading.Event(), threading.Event()
 
     async def _stalled_fan_out(agent, rel, source, **kw):
         started.set()
-        while not release.is_set():
+        while not release.is_set():  # noqa: ASYNC110  # a thread sets this event: there is nothing to await
             await asyncio.sleep(0.01)
 
     monkeypatch.setattr(workspace_fanout, "mark_fan_out_targets",
@@ -1048,7 +1058,7 @@ async def test_a_host_cache_save_after_a_pull_is_refused_and_not_pushed(temp_db,
     file_id = _encode_file_id(rel)
     app = FastAPI()
     app.include_router(wopi.router)
-    client = TestClient(app)
+    client = signed_client(app)
     loaded = _loaded_time(client, file_id, token)
     cache_file.write_bytes(b"pulled again, changed")
     os.utime(cache_file, (1_700_000_100, 1_700_000_100))
@@ -1063,13 +1073,15 @@ async def test_the_comparison_waits_for_a_write_in_flight(temp_db, tmp_path, mon
     # A platform write holding the path lock lands before the save is
     # compared, so the save sees it and is refused.
     import httpx
+
     from core.remote import remote_file_flow
 
     client, target, file_id, token, pw, _bc = _save_rig(monkeypatch, tmp_path)
     loaded = _loaded_time(client, file_id, token)
     app = client.app
     lock = await remote_file_flow._acquire_global_path_lock("test-agent", "workspace/x.docx")
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as ac:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t",
+                                 event_hooks={"request": [sign_request_async]}) as ac:
         async with lock:
             task = asyncio.create_task(ac.post(
                 f"/wopi/files/{file_id}/contents?access_token={token}",
@@ -1091,6 +1103,7 @@ async def test_a_write_queued_during_the_comparison_lands_after_the_save(temp_db
     # compared: it lands after the person's save, never between the check
     # and the write, so the save cannot overwrite it unseen.
     import httpx
+
     from api.media import wopi
     from core.remote import remote_file_flow
 
@@ -1127,7 +1140,8 @@ async def test_a_write_queued_during_the_comparison_lands_after_the_save(temp_db
         await real_write(agent, tree_rel, body)
     pw.side_effect = _person_write
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app), base_url="http://t") as ac:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app), base_url="http://t",
+                                 event_hooks={"request": [sign_request_async]}) as ac:
         resp = await ac.post(
             f"/wopi/files/{file_id}/contents?access_token={token}",
             content=b"person bytes", headers={"X-COOL-WOPI-Timestamp": loaded},
@@ -1249,7 +1263,7 @@ async def test_a_host_cache_save_after_a_pull_and_a_joining_view_is_refused(temp
     file_id = _encode_file_id(rel)
     app = FastAPI()
     app.include_router(wopi.router)
-    client = TestClient(app)
+    client = signed_client(app)
     _fetch(client, file_id, token)
     _agent_rewrite(cache_file, b"pulled again, changed")
     resp = _save(client, file_id, token, b"edited bytes", _loaded_time(client, file_id, token))
@@ -1267,6 +1281,7 @@ def _pane_save_rig(monkeypatch, tmp_path):
     """The save rig plus a chat whose newest push of the file has a version
     copy, an edit token carrying the chat, and the writer lane run inline."""
     import json
+
     import config
     from api.media import wopi
     from core.events import chat_writer
@@ -1367,6 +1382,7 @@ def test_a_file_the_check_cannot_read_saves_without_it(temp_db, tmp_path, monkey
     # Only a file gone since the load is a conflict; one that is there but
     # cannot be read (descriptors exhausted, an I/O error) fails open.
     import errno
+
     from api.media import wopi
     client, target, file_id, token, pw, _bc = _save_rig(monkeypatch, tmp_path)
     loaded = _loaded_time(client, file_id, token)
@@ -1379,15 +1395,14 @@ def test_a_file_the_check_cannot_read_saves_without_it(temp_db, tmp_path, monkey
 
 
 def test_the_live_remint_names_its_chat(temp_db, tmp_path, monkeypatch):
-    import jwt as _jwt
-    import config
+    from auth import tokens
     from storage import database as db
     client = _chat_mint_client(monkeypatch, tmp_path)
     _seed_file(tmp_path, "workspace/r.docx")
     monkeypatch.setattr(db, "get_preview_event_by_file", lambda cid, fid: {"id": 1})
     fid = _encode_file_id("test-agent/workspace/r.docx")
     body = client.get(f"/v1/documents/preview-wopi-url?chat_id=c1&file_id={fid}").json()
-    claims = _jwt.decode(body["access_token"], config.WOPI_SECRET, algorithms=["HS256"])
+    claims = tokens.decode(body["access_token"], tokens.WOPI)
     assert claims["chat_id"] == "c1"
 
 
@@ -1398,11 +1413,12 @@ def test_the_live_remint_names_its_chat(temp_db, tmp_path, monkeypatch):
 
 def _listing_rig(monkeypatch, tmp_path, *, access=True):
     import json
+
     import config
-    from storage import database as db
     from services.media import preview_snapshots
+    from storage import database as db
     client = _chat_mint_client(monkeypatch, tmp_path)
-    monkeypatch.setattr("api.agents.chats.can_access_chat", lambda u, c: access)
+    monkeypatch.setattr("core.session.visibility.can_access_chat", lambda u, c: access)
     monkeypatch.setattr(config, "PREVIEW_SNAPSHOT_DIR", tmp_path / "snaps", raising=False)
     db.create_chat("c1", "alice-sub", "test-agent")
     src = _seed_file(tmp_path, "workspace/a.docx")
@@ -1469,9 +1485,10 @@ def test_an_earlier_rounds_document_opens_from_the_runs_page(temp_db, tmp_path, 
     # session, and the page shows them all: a card from round 1 opens
     # (listing, live mint, version mint) from round 2's page.
     import json
-    import jwt as _jwt
+
     import config
     from api.media import wopi
+    from auth import tokens
     from services.media import preview_snapshots
     from storage import database as db
     client = _chat_mint_client(monkeypatch, tmp_path)
@@ -1500,7 +1517,7 @@ def test_an_earlier_rounds_document_opens_from_the_runs_page(temp_db, tmp_path, 
 
     live = client.get(f"/v1/documents/preview-wopi-url?chat_id=task-r2&file_id={fid}")
     assert live.status_code == 200, live.text
-    claims = _jwt.decode(live.json()["access_token"], config.WOPI_SECRET, algorithms=["HS256"])
+    claims = tokens.decode(live.json()["access_token"], tokens.WOPI)
     assert claims["chat_id"] == "task-r1"
 
     # Round 2 pushes the same file: the listing numbers the versions and
@@ -1514,12 +1531,12 @@ def test_an_earlier_rounds_document_opens_from_the_runs_page(temp_db, tmp_path, 
     assert [(v["snapshot_id"], v["version"], v["turn"], v["available"]) for v in docs[0]["versions"]] \
         == [(sid2, 2, 2, True), (sid, 1, 1, True)]
     live = client.get(f"/v1/documents/preview-wopi-url?chat_id=task-r2&file_id={fid}")
-    claims = _jwt.decode(live.json()["access_token"], config.WOPI_SECRET, algorithms=["HS256"])
+    claims = tokens.decode(live.json()["access_token"], tokens.WOPI)
     assert claims["chat_id"] == "task-r2"
 
     version = client.get(f"/v1/documents/snapshot-wopi-url?chat_id=task-r2&snapshot_id={sid}")
     assert version.status_code == 200, version.text
-    claims = _jwt.decode(version.json()["access_token"], config.WOPI_SECRET, algorithms=["HS256"])
+    claims = tokens.decode(version.json()["access_token"], tokens.WOPI)
     assert claims["file_path"] == wopi.snapshot_rel_path("task-r1", sid)
 
     # A run on another session is not on the page.
@@ -1603,6 +1620,7 @@ def test_another_spelling_of_the_same_id_is_refused(temp_db, tmp_path, monkeypat
     generation, or base64's unused trailing bits, would be other documents
     of the same path and generation. Only the encoder's own id opens."""
     import base64
+
     from api.media import wopi
     client, _target, _bare, _token, pw, _bc = _save_rig(monkeypatch, tmp_path)
     rel = "test-agent/workspace/x.docx"
@@ -1626,7 +1644,9 @@ def test_a_token_minted_before_the_claim_opens_every_generation_of_its_path(temp
     documents of its own path, so a document open across the upgrade keeps
     saving; another path stays refused."""
     import time as _time
+
     import jwt
+
     import config
     client, _target, _bare, _token, _pw, _bc = _save_rig(monkeypatch, tmp_path)
     rel = "test-agent/workspace/x.docx"
@@ -1697,6 +1717,7 @@ def test_a_save_through_a_keyed_id_refreshes_the_chats_version(temp_db, tmp_path
 def test_the_preview_mint_opens_the_newest_push_of_the_file(temp_db, tmp_path, monkeypatch):
     import urllib.parse
     from collections import OrderedDict
+
     from api.hooks import preview
     from storage import database as db
     monkeypatch.setattr(preview, "_pushed_generations", OrderedDict())
@@ -1737,6 +1758,7 @@ def test_the_preview_mint_opens_the_newest_push_of_the_file(temp_db, tmp_path, m
 
 def test_the_workspace_tab_opens_the_panes_document(temp_db, tmp_path, monkeypatch):
     import urllib.parse
+
     from api.hooks import preview
     app = _make_url_app(monkeypatch, tmp_path, role="manager", username="alice")
     _seed_file(tmp_path, "workspace/x.docx")
@@ -1772,12 +1794,19 @@ def test_a_lingering_views_refused_saves_log_once_a_minute(temp_db, tmp_path, mo
 # ---------------------------------------------------------------------------
 
 
-def test_every_route_takes_the_token_from_the_authorization_header(temp_db, tmp_path, monkeypatch):
-    """A frame posted with ``access_header`` puts the token in no URI:
-    Collabora sends it as the bearer header alone. No token at all is 401,
-    never a validation error."""
+def test_a_token_in_the_header_alone_is_an_unsigned_call(temp_db, tmp_path, monkeypatch):
+    """A frame posted with ``access_header`` puts the token in no URI, and
+    Collabora signs only a call whose URI carries ``access_token``: the
+    header-only call is unsigned, refused by default, and taken from the
+    header only while ``WOPI_ACCEPT_UNSIGNED`` is on and Collabora has no
+    key. No token at all is 401, never a validation error."""
+    import config
+    from tests.media.wopi_signing import discovery
     client, target, file_id, token, _pw, _bc = _save_rig(monkeypatch, tmp_path)
     auth = {"Authorization": f"Bearer {token}"}
+    assert client.get(f"/wopi/files/{file_id}", headers=auth).status_code == 401
+    signing(monkeypatch, discovery(None))
+    monkeypatch.setattr(config, "WOPI_ACCEPT_UNSIGNED", True, raising=False)
     info = client.get(f"/wopi/files/{file_id}", headers=auth)
     assert info.status_code == 200
     assert client.get(f"/wopi/files/{file_id}/contents", headers=auth).content == b"agent bytes"
@@ -1799,6 +1828,7 @@ def _person(email="pat@t.com", **kw):
 
 def _token_for(sub, iat, rel="test-agent/workspace/x.docx"):
     import jwt
+
     import config
     return jwt.encode({"purpose": "wopi", "file_path": rel, "generation": 0, "user_sub": sub,
                        "user_name": "Pat", "permissions": "edit", "agent": "test-agent",
@@ -1810,6 +1840,7 @@ def test_a_token_stops_at_its_persons_sign_out_everywhere(temp_db, tmp_path, mon
     tokens on every route, whatever reaches the WOPI host: the editor's
     relay is not in front of Collabora's own calls."""
     import time as _time
+
     from api.media import wopi
     from storage import database as task_store
     client, _target, file_id, _token, pw, _bc = _save_rig(monkeypatch, tmp_path)
@@ -1828,6 +1859,7 @@ def test_a_token_stops_at_its_persons_sign_out_everywhere(temp_db, tmp_path, mon
 def test_a_held_or_gone_person_is_refused_and_no_person_is_not_judged(temp_db, tmp_path, monkeypatch):
     import asyncio
     import time as _time
+
     from api.media import wopi
     monkeypatch.setattr(wopi, "_person_holds_now", _REAL_PERSON_HOLDS["fn"])
     held = _person("held@t.com", must_change_password=True)
@@ -1846,6 +1878,7 @@ def test_a_person_whose_sub_spells_a_principal_is_still_judged(monkeypatch):
     """An identity provider's raw sub could be "agent": a users row bearing
     the sub is a person, judged on their timeline and their gate."""
     import time as _time
+
     from storage import database as task_store
     monkeypatch.setattr(task_store, "get_user", lambda sub: {
         "sub": sub, "auth_provider": "local", "must_change_password": True} if sub == "agent" else None)
@@ -1858,6 +1891,7 @@ def test_a_person_whose_sub_spells_a_principal_is_still_judged(monkeypatch):
 @pytest.mark.asyncio
 async def test_the_person_is_read_once_per_issue_time_and_a_failure_is_not_kept(monkeypatch):
     import asyncio
+
     from api.media import wopi
     calls = []
 
@@ -1874,7 +1908,7 @@ async def test_the_person_is_read_once_per_issue_time_and_a_failure_is_not_kept(
 
     def _down(sub, iat):
         calls.append("down")
-        raise RuntimeError("store down")
+        raise psycopg.OperationalError("store down")
 
     monkeypatch.setattr(wopi, "_person_holds_now", _down)
     assert await wopi.person_holds("pat", 8) is False
@@ -1902,6 +1936,7 @@ async def test_a_forget_during_a_read_in_flight_keeps_nothing(monkeypatch):
     arriving after the forget starts its own read."""
     import asyncio
     import threading
+
     from api.media import wopi
     wopi._holder_answers.clear()
     wopi._holder_reads.clear()
@@ -1916,7 +1951,7 @@ async def test_a_forget_during_a_read_in_flight_keeps_nothing(monkeypatch):
         return True
 
     async def _reading():
-        while not started.is_set():
+        while not started.is_set():  # noqa: ASYNC110  # a thread sets this event: there is nothing to await
             await asyncio.sleep(0.005)
 
     monkeypatch.setattr(wopi, "_person_holds_now", _slow)
@@ -1935,16 +1970,16 @@ async def test_a_forget_during_a_read_in_flight_keeps_nothing(monkeypatch):
 
 def test_the_mints_claim_the_generation_their_url_opens(temp_db, tmp_path, monkeypatch):
     import urllib.parse
-    import jwt
-    import config
+
     from api.hooks import preview
+    from auth import tokens
     app = _make_url_app(monkeypatch, tmp_path, role="manager", username="alice")
     _seed_file(tmp_path, "workspace/x.docx")
     fid = _encode_file_id("test-agent/workspace/x.docx")
     preview.note_pushed_generation(fid, 77, "abc")
     body = _ask_url(app, "workspace/x.docx").json()
     src = urllib.parse.parse_qs(urllib.parse.urlparse(body["wopi_url"]).query)["WOPISrc"][0]
-    claims = jwt.decode(body["access_token"], config.WOPI_SECRET, algorithms=["HS256"])
+    claims = tokens.decode(body["access_token"], tokens.WOPI)
     assert src.rsplit("/", 1)[-1] == _keyed("test-agent/workspace/x.docx", 77)
     assert claims["generation"] == 77
 
@@ -1955,6 +1990,7 @@ def test_the_per_document_tables_stay_bounded(monkeypatch, tmp_path):
     then the oldest entries out first."""
     import os as _os
     import time as _time
+
     from api.media import wopi
     monkeypatch.setattr(wopi, "_WOPI_LOCKS_MAX", 8)
     monkeypatch.setattr(wopi, "_STABLE_TIMES_MAX", 8)
@@ -1984,7 +2020,7 @@ def test_a_file_on_the_sessions_machine_is_edited_only_by_its_person():
     every user of the agent) views it, and a run with no person edits
     nothing there."""
     from api.media.wopi import live_permissions
-    rule = lambda user, role, person: live_permissions(  # noqa: E731
+    rule = lambda user, role, person: live_permissions(
         "x.docx", role, user, "agent-1", host_cache=True, session_person=person)
     assert rule("alice", "editor", "alice") == "edit"
     assert rule("bob", "manager", "alice") == "view"

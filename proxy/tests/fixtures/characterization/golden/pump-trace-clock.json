@@ -1,0 +1,678 @@
+{
+ "chat": {
+  "cache_read": 0,
+  "cache_write": 0,
+  "codex_thread_id": null,
+  "context_max": 0,
+  "context_used": 0,
+  "engine_cost_session_id": "",
+  "engine_cost_total": 0.0,
+  "last_abort_graceful": false,
+  "last_response_at": false,
+  "last_turn_aborted": false,
+  "output_tokens": 0,
+  "permission_mode": "ask",
+  "thread_goal": null,
+  "title_generated": false,
+  "total_cost": 0.0
+ },
+ "events": [
+  [
+   "text",
+   {
+    "content": "a "
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "b "
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "c "
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "d "
+   }
+  ],
+  [
+   "thinking",
+   {
+    "phase": "start"
+   }
+  ],
+  [
+   "thinking",
+   {
+    "text": "t1"
+   }
+  ],
+  [
+   "thinking",
+   {
+    "text": "t2"
+   }
+  ],
+  [
+   "thinking",
+   {
+    "estimated_tokens": 10,
+    "phase": "progress"
+   }
+  ],
+  [
+   "thinking",
+   {
+    "estimated_tokens": 20,
+    "phase": "progress"
+   }
+  ],
+  [
+   "thinking",
+   {
+    "phase": "end",
+    "text": ""
+   }
+  ],
+  [
+   "workflow_start",
+   {
+    "tool_use_id": "toolu_wf_0001",
+    "workflow_name": "review-changes"
+   }
+  ],
+  [
+   "workflow_progress",
+   {
+    "tool_use_id": "toolu_wf_0001",
+    "workflow_progress": [
+     {
+      "agents": [
+       {
+        "label": "review:bugs",
+        "status": "running"
+       }
+      ],
+      "phase": "Review"
+     }
+    ]
+   }
+  ],
+  [
+   "workflow_progress",
+   {
+    "tool_use_id": "toolu_wf_0001",
+    "workflow_progress": [
+     {
+      "agents": [
+       {
+        "label": "review:bugs",
+        "status": "running"
+       }
+      ],
+      "phase": "Review"
+     }
+    ]
+   }
+  ],
+  [
+   "workflow_end",
+   {
+    "tool_use_id": "toolu_wf_0001"
+   }
+  ],
+  [
+   "done",
+   {}
+  ]
+ ],
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "a b c d ",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "content": "t1t2",
+    "type": "thinking"
+   },
+   "event_type": "thinking",
+   "role": "event"
+  }
+ ],
+ "seams": {
+  "ephemeral": [],
+  "kept": [],
+  "reconciles": [],
+  "relocated": [],
+  "replays": [],
+  "rests": [],
+  "status": [],
+  "titles": [],
+  "tool_starts": []
+ },
+ "trace": [
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "a ",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    },
+    {
+     "event": {
+      "content": "b c ",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "a b c ",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-clock",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "a ",
+     "b ",
+     "c "
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "burst:text,text,text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "a b c d ",
+     "type": "text"
+    },
+    {
+     "content": "t1t2",
+     "type": "thinking"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "d ",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    },
+    {
+     "event": {
+      "phase": "start",
+      "type": "thinking"
+     },
+     "pump_type": "ws_event"
+    },
+    {
+     "event": {
+      "text": "t1t2",
+      "type": "thinking"
+     },
+     "pump_type": "ws_event"
+    },
+    {
+     "event": {
+      "estimated_tokens": 20,
+      "phase": "progress",
+      "type": "thinking"
+     },
+     "pump_type": "ws_event"
+    },
+    {
+     "event": {
+      "phase": "end",
+      "text": "",
+      "type": "thinking"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "a b c d ",
+      "type": "text"
+     },
+     {
+      "content": "t1t2",
+      "type": "thinking"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-clock",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "burst:text,thinking,thinking,thinking,thinking,thinking,thinking"
+  },
+  {
+   "blocks": [
+    {
+     "content": "a b c d ",
+     "type": "text"
+    },
+    {
+     "content": "t1t2",
+     "type": "thinking"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "tool_use_id": "toolu_wf_0001",
+      "type": "workflow_start",
+      "workflow_name": "review-changes"
+     },
+     "pump_type": "ws_event"
+    },
+    {
+     "event": {
+      "tool_use_id": "toolu_wf_0001",
+      "type": "workflow_progress",
+      "workflow_progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ]
+     },
+     "pump_type": "ws_event"
+    },
+    {
+     "event": {
+      "tool_use_id": "toolu_wf_0001",
+      "type": "workflow_end"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "a b c d ",
+      "type": "text"
+     },
+     {
+      "content": "t1t2",
+      "type": "thinking"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-clock",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {
+     "toolu_wf_0001": {
+      "active": false,
+      "progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ],
+      "tool_use_id": "toolu_wf_0001",
+      "workflow_name": "review-changes"
+     }
+    }
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "burst:workflow_start,workflow_progress,workflow_progress,workflow_end"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "pump_type": "is_done"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-clock",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {
+     "toolu_wf_0001": {
+      "active": false,
+      "progress": [
+       {
+        "agents": [
+         {
+          "label": "review:bugs",
+          "status": "running"
+         }
+        ],
+        "phase": "Review"
+       }
+      ],
+      "tool_use_id": "toolu_wf_0001",
+      "workflow_name": "review-changes"
+     }
+    }
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:done"
+  }
+ ]
+}

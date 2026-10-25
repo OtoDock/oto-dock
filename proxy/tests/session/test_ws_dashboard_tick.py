@@ -16,7 +16,6 @@ import time
 import pytest
 
 import ws.dashboard  # noqa: F401  (resolves the dashboard and dashboard_chat cycle)
-from ws import dashboard as dash
 from auth import session_revocation
 from auth.providers import validate_session_jwt
 from storage.pg import get_conn
@@ -31,6 +30,7 @@ from tests.fixtures.ws_dashboard_harness import (
     stub_dashboard_seams,
     warm_new_chat,
 )
+from ws import dashboard as dash
 
 
 @pytest.fixture(autouse=True)
@@ -152,10 +152,11 @@ class TestConnectPhase:
         monkeypatch.setattr(notification_store, "get_unread_count", _boom)
 
         async def scenario():
-            with pytest.raises(RuntimeError):
-                async with dashboard_connection(session_cookie()) as ws_:
-                    await asyncio.sleep(0.2)
-                    assert ws_.accepted
+            # The raise lands inside the socket's main try: the handler ends
+            # the socket as a dashboard error, it does not raise.
+            async with dashboard_connection(session_cookie()) as ws_:
+                await asyncio.sleep(0.2)
+                assert ws_.accepted
             assert "user-admin" not in dash._connections_by_user
             tickers = [t for t in asyncio.all_tasks()
                        if "_revalidation_ticker" in getattr(t.get_coro(), "__qualname__", "")]

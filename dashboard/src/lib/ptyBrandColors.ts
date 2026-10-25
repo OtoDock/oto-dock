@@ -65,8 +65,10 @@ function latin1ToBytes(s: string): Uint8Array {
 // A CSI can split across pty_output frames; hold back an incomplete trailing
 // sequence so its triple still matches when the rest arrives. Bounded — a
 // longer run isn't an SGR we remap. Holding bytes never changes rendering:
-// xterm's parser can't paint a half sequence either.
-const TRAILING_PARTIAL = /\x1b(?:\[[0-9;]{0,24})?$/
+// xterm's parser can't paint a half sequence either. ESC is built, not
+// written into a regex literal: no control character in the source.
+const ESC = String.fromCharCode(0x1b)
+const TRAILING_PARTIAL = new RegExp(`${ESC}(?:\\[[0-9;]{0,24})?$`)
 
 export interface PtyBrandFilter {
   push(bytes: Uint8Array): Uint8Array

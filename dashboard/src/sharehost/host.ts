@@ -48,6 +48,13 @@ export interface ActionCall {
   args?: unknown
 }
 
+/** The page's theme: the one the person chose in the dashboard on this
+ *  browser (`localStorage.theme`), else the device's. Only the two words
+ *  pass: anything else (the dashboard's `system`, a stray value) is the
+ *  device's scheme, so no stored string reaches the class list or a URL. */
+export const pickTheme = (stored: string | null, prefersDark: boolean): 'light' | 'dark' =>
+  stored === 'light' || stored === 'dark' ? stored : prefersDark ? 'dark' : 'light'
+
 export const frameSrc = (cfg: ShareConfig, theme: 'light' | 'dark', nonce = 0): string =>
   cfg.folder && cfg.release_sha
     ? `/s/${encodeURIComponent(cfg.token)}/client/${encodeURIComponent(cfg.release_sha)}/?theme=${theme}&v=${nonce}`
@@ -59,8 +66,8 @@ export const stateUrl = (cfg: ShareConfig): string => `/s/${encodeURIComponent(c
 export const unlockUrl = (cfg: ShareConfig): string => `/s/${encodeURIComponent(cfg.token)}/unlock`
 export const batchUrl = (cfg: ShareConfig): string => `/s/${encodeURIComponent(cfg.token)}/actions/batch`
 export const snapshotUrl = (cfg: ShareConfig): string => `/s/${encodeURIComponent(cfg.token)}/snapshot`
-export const snapshotUiUrl = (cfg: ShareConfig, token: string): string =>
-  `/s/${encodeURIComponent(cfg.token)}/ui/${encodeURIComponent(token)}`
+export const snapshotUiUrl = (cfg: ShareConfig, token: string, theme: 'light' | 'dark'): string =>
+  `/s/${encodeURIComponent(cfg.token)}/ui/${encodeURIComponent(token)}?theme=${theme}`
 export const snapshotMediaUrl = (cfg: ShareConfig, token: string): string =>
   `/s/${encodeURIComponent(cfg.token)}/media/${encodeURIComponent(token)}`
 

@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -168,6 +169,7 @@ def test_verify_bearer_for_agent_rejects_revoked(temp_db):
 def test_verify_bearer_for_agent_rejects_missing_permission(temp_db):
     """A key without 'triggers' permission can't fire trigger webhooks."""
     from services.infra import api_key_manager as akm
+
     # Bypass the validator (which would reject empty perms) by constructing
     # the row directly with no permissions.
     from storage.identity import api_key_store
@@ -382,6 +384,7 @@ def test_a_webhook_address_carries_the_username_and_the_display_name_still_resol
     and an address written with the display name — what they matched
     until 2026-09-19 — keeps working through the fallback."""
     from datetime import datetime, timezone
+
     from services.infra import api_key_manager as akm
     from storage.automation import notification_store
     from storage.pg import get_conn
@@ -426,6 +429,7 @@ def _off_loop(fn):
 
 def test_user_key_routes_run_off_the_loop(temp_db, monkeypatch):
     from fastapi.testclient import TestClient
+
     from app import app
     from auth.providers import UserContext, get_current_user
     from services.infra import api_key_manager as akm

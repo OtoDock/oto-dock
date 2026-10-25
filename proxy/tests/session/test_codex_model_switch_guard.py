@@ -5,13 +5,14 @@ endpoint ↔ OpenAI) and tells the user to start a new chat."""
 import sys
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
 import config
+import ws.dashboard  # noqa: F401  — the chat module is imported through the WS package
 from services.engines import subscription_pool
 from storage.billing import subscription_store
-import ws.dashboard  # noqa: F401  — the chat module is imported through the WS package
 from ws.dashboard_chat import _provider_switch_blocker
 
 
@@ -29,7 +30,7 @@ def test_cross_provider_switch_is_refused(monkeypatch):
     _wire(monkeypatch, "openai")
     reason = _provider_switch_blocker("s1", "qwen3.6-35b-a3b", layer="codex-cli")
     assert "Start a new chat" in reason
-    assert "OpenAI" in reason and "OpenAI-compatible endpoint" in reason  # the descriptor's labels
+    assert "OpenAI" in reason and "OpenAI-compatible server" in reason  # the descriptor's labels
 
 
 def test_same_provider_switch_is_allowed(monkeypatch):

@@ -1,8 +1,9 @@
 """The Claude CLI truncates MCP tool descriptions at 2048 characters, so
 anything past that never reaches the model. The three document writers keep
 their parameter shapes in a `help` op and a summary under the cap that names
-every operation; a writer's catalogue and its dispatcher are held together
-here, so an operation can never fall out of the model's view."""
+every operation; a writer's catalogue and its dispatcher are one table, held
+here to the description, so an operation can never fall out of the model's
+view."""
 
 import ast
 import asyncio
@@ -25,15 +26,6 @@ def _descriptions() -> dict[str, str]:
             kw = {k.arg: k.value for k in node.keywords}
             out[ast.literal_eval(kw["name"])] = ast.literal_eval(kw["description"])
     return out
-
-
-def _dispatched(module: str) -> set[str]:
-    """Every op name the module's `ot == "…"` / `ot in (…)` branches handle."""
-    src = (_HERE / f"{module}.py").read_text()
-    names = set(re.findall(r'\bot == "([a-z_]+)"', src))
-    for group in re.findall(r"\bot in \(([^)]*)\)", src):
-        names.update(re.findall(r'"([a-z_]+)"', group))
-    return names
 
 
 def _catalogue(module: str) -> set[str]:
@@ -67,7 +59,29 @@ def test_the_description_names_every_operation_and_the_help_op(tool, module):
 ])
 def test_the_catalogue_is_the_dispatcher(module, aliases):
     pytest.importorskip("docx" if module == "word" else "pptx")
-    assert _catalogue(module) | aliases == _dispatched(module)
+    mod = __import__(module)
+    assert set(mod._HANDLERS) == _catalogue(module) | aliases
+    for name, handler in mod._HANDLERS.items():
+        assert callable(handler) and handler.__module__ == module, name
+
+
+def test_the_xlsx_catalogue_is_the_dispatcher():
+    """`_OPS` is write_xlsx's catalogue (keys, help); every operation but
+    help has its handler, and every one sits in exactly one help group."""
+    import excel
+
+    assert set(excel._HANDLERS) | {"help"} == set(excel._OPS)
+    grouped = [name for _, names in excel._OP_GROUPS for name in names]
+    assert sorted(grouped) == sorted(excel._OPS)
+
+
+@pytest.mark.parametrize("tool, module", [("edit_pdf", "pdf"), ("edit_image", "images")])
+def test_the_editors_descriptions_name_every_operation_they_dispatch(tool, module):
+    pytest.importorskip("fitz" if module == "pdf" else "PIL")
+    mod = __import__(module)
+    d = _descriptions()[tool]
+    missing = [name for name in sorted(mod._HANDLERS) if not re.search(rf"\b{name}\b", d)]
+    assert missing == []
 
 
 async def _refuse(*a, **k):

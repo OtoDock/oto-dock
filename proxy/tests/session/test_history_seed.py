@@ -3,8 +3,8 @@
 Covers the digest builder (rendering rules, caps, budget, trailing-user skip),
 the atomic pending-seed claim, the consume flow (prepend + notice row + flag
 clear), and the chat transitions that produce the flag: delete_remote_machine
-(all pinned chats) and rebind_chat_to_current_target (one chat — the
-"Move this chat" escape hatch).
+(all pinned chats) and a move's reseed rebind (one chat,
+``remote_store.rebind_chat_to_target``).
 """
 
 import json
@@ -28,8 +28,8 @@ def _tool_event(name, summary="", tool_input=None):
 # ---------------------------------------------------------------------------
 
 def test_seed_renders_user_assistant_in_order(temp_db):
-    from storage import database as db
     from core.session.history_seed import build_history_seed
+    from storage import database as db
     db.create_chat("c1", "user-1", "agent-x")
     _add(db, "c1", "user", "first question")
     _add(db, "c1", "assistant", "first answer")
@@ -49,8 +49,8 @@ def test_seed_renders_user_assistant_in_order(temp_db):
 def test_seed_skips_trailing_user_row(temp_db):
     """The current turn's prompt is persisted just before consumption — it
     must appear only as the live prompt, never duplicated in the digest."""
-    from storage import database as db
     from core.session.history_seed import build_history_seed
+    from storage import database as db
     db.create_chat("c2", "user-1", "agent-x")
     _add(db, "c2", "user", "old question")
     _add(db, "c2", "assistant", "old answer")
@@ -77,8 +77,8 @@ def test_seed_per_message_truncation(temp_db):
 
 
 def test_seed_tool_lines(temp_db):
-    from storage import database as db
     from core.session.history_seed import build_history_seed
+    from storage import database as db
     db.create_chat("c4", "user-1", "agent-x")
     _add(db, "c4", "user", "do things")
     _add(db, "c4", "event", event_type="tool",
@@ -109,8 +109,8 @@ def test_seed_tool_line_truncation(temp_db):
 
 
 def test_seed_skips_non_tool_events(temp_db):
-    from storage import database as db
     from core.session.history_seed import build_history_seed
+    from storage import database as db
     db.create_chat("c6", "user-1", "agent-x")
     _add(db, "c6", "user", "hello")
     _add(db, "c6", "event", event_type="thinking",
@@ -130,8 +130,8 @@ def test_seed_skips_non_tool_events(temp_db):
 
 
 def test_seed_budget_drops_oldest_first(temp_db):
-    from storage import database as db
     from core.session.history_seed import build_history_seed
+    from storage import database as db
     db.create_chat("c7", "user-1", "agent-x")
     for i in range(20):
         _add(db, "c7", "user", f"question number {i:02d} " + "pad " * 30)
@@ -144,8 +144,8 @@ def test_seed_budget_drops_oldest_first(temp_db):
 
 
 def test_seed_empty_chat(temp_db):
-    from storage import database as db
     from core.session.history_seed import build_history_seed
+    from storage import database as db
     db.create_chat("c8", "user-1", "agent-x")
     assert build_history_seed("c8") == ""
     # Only the current (trailing-user) prompt → still nothing to restore.
@@ -179,8 +179,8 @@ def test_claim_pending_seed_missing_chat(temp_db):
 # ---------------------------------------------------------------------------
 
 def test_consume_noop_without_flag(temp_db):
-    from storage import database as db
     from core.session.history_seed import consume_pending_seed
+    from storage import database as db
     db.create_chat("c10", "user-1", "agent-x")
     _add(db, "c10", "user", "history msg")
     _add(db, "c10", "assistant", "history reply")
@@ -193,8 +193,8 @@ def test_consume_noop_without_flag(temp_db):
 
 
 def test_consume_machine_removed_flow(temp_db):
-    from storage import database as db
     from core.session.history_seed import consume_pending_seed
+    from storage import database as db
     db.create_chat("c11", "user-1", "agent-x")
     _add(db, "c11", "user", "earlier question")
     _add(db, "c11", "assistant", "earlier answer")
@@ -222,8 +222,8 @@ def test_consume_machine_removed_flow(temp_db):
 
 
 def test_consume_retention_reason(temp_db):
-    from storage import database as db
     from core.session.history_seed import consume_pending_seed
+    from storage import database as db
     db.create_chat("c12", "user-1", "agent-x")
     _add(db, "c12", "user", "old msg")
     _add(db, "c12", "assistant", "old reply")
@@ -243,8 +243,8 @@ def test_consume_retention_reason(temp_db):
 def test_consume_resume_failed_reason(temp_db):
     """The warmup fresh branch flags 'resume_failed' when the resume gate
     refuses — dedicated wording (nothing was 'cleaned up'), digest restored."""
-    from storage import database as db
     from core.session.history_seed import consume_pending_seed
+    from storage import database as db
     db.create_chat("c12b", "user-1", "agent-x")
     _add(db, "c12b", "user", "old msg")
     _add(db, "c12b", "assistant", "old reply")
@@ -266,8 +266,8 @@ def test_consume_moved_reason(temp_db):
     consumer's dedicated branch names the source label in the notice and the
     persisted card carries reason='moved' + machine_name (an unknown kind
     would fall to the wrong "files were cleaned up" copy)."""
-    from storage import database as db
     from core.session.history_seed import consume_pending_seed
+    from storage import database as db
     db.create_chat("c12c", "user-1", "agent-x")
     _add(db, "c12c", "user", "old msg")
     _add(db, "c12c", "assistant", "old reply")
@@ -289,8 +289,8 @@ def test_consume_moved_reason(temp_db):
 def test_consume_with_empty_history_still_notices(temp_db):
     """Flag set but nothing restorable: no digest, but the notice still
     persists and the flag clears (the fresh session is still a fact)."""
-    from storage import database as db
     from core.session.history_seed import consume_pending_seed
+    from storage import database as db
     db.create_chat("c13", "user-1", "agent-x")
     _add(db, "c13", "user", "first ever prompt")  # current turn's row
     db.update_chat("c13", pending_history_seed="machine_removed:Box")
@@ -317,8 +317,7 @@ def _insert_machine(machine_id, name):
 
 
 def test_delete_machine_transitions_pinned_chats(temp_db):
-    from storage import database as db
-    from storage import remote_store
+    from storage import database as db, remote_store
 
     _insert_machine("m-dead", "Office-PC")
     _insert_machine("m-alive", "Laptop")
@@ -354,19 +353,16 @@ def test_delete_machine_transitions_pinned_chats(temp_db):
 
 
 # ---------------------------------------------------------------------------
-# rebind_chat_to_current_target — the per-chat "Move this chat" transition
+# The move's two rebinds (services/remote/chat_move.py)
 # ---------------------------------------------------------------------------
 
-def test_rebind_chat_transitions_one_chat(temp_db):
-    """The user-facing move op applies the machine-removed shape to ONE chat:
-    pin cleared (next warmup fresh-resolves + re-stamps), session ids dropped,
-    abort flags + context meter reset, and 'moved:<from_label>' queued for the
-    history-seed injection. Siblings on the same machine are untouched."""
-    from storage import database as db
-    from storage import remote_store
+def test_a_move_without_its_files_reseeds_one_chat_at_the_chosen_place(temp_db):
+    """The reseed rebind pins the chat to the CHOSEN place, drops its ids and
+    resets its flags, and seeds ``moved:<move id>``; a sibling on the same
+    machine is untouched; a compare-and-set on the old place and ids."""
+    from storage import database as db, remote_store
 
     _insert_machine("m-office", "Office-PC")
-
     db.create_chat("moving", "user-1", "agent-x")
     db.update_chat("moving", execution_target="m-office", session_id="sess-1",
                    codex_thread_id="thread-1", last_turn_aborted=True,
@@ -374,24 +370,168 @@ def test_rebind_chat_transitions_one_chat(temp_db):
     db.create_chat("staying", "user-1", "agent-x")
     db.update_chat("staying", execution_target="m-office", session_id="sess-2")
 
-    assert remote_store.rebind_chat_to_current_target(
-        "moving", "Office-PC") is True
+    stale = dict(expect_target="local", expect_session_id="sess-1", expect_thread="thread-1")
+    assert remote_store.rebind_chat_to_target("moving", "local", "mv-1", **stale) is False
+    ok = dict(expect_target="m-office", expect_session_id="sess-1", expect_thread="thread-1")
+    assert remote_store.rebind_chat_to_target("moving", "local", "mv-1", **ok) is True
 
     moved = db.get_chat("moving")
-    assert moved["execution_target"] == ""
-    assert moved["session_id"] is None
-    assert moved["codex_thread_id"] is None
-    assert moved["last_turn_aborted"] is False
-    assert moved["context_used"] == 0
-    assert moved["pending_history_seed"] == "moved:Office-PC"
-
+    assert moved["execution_target"] == "local"
+    assert moved["session_id"] is None and moved["codex_thread_id"] is None
+    assert moved["last_turn_aborted"] is False and moved["context_used"] == 0
+    assert moved["pending_history_seed"] == "moved:mv-1"
     staying = db.get_chat("staying")
-    assert staying["execution_target"] == "m-office"
-    assert staying["session_id"] == "sess-2"
-    assert staying["pending_history_seed"] == ""
+    assert staying["execution_target"] == "m-office" and staying["session_id"] == "sess-2"
 
 
-def test_rebind_unknown_chat_returns_false(temp_db):
+def test_a_move_with_its_files_keeps_the_ids(temp_db):
+    from storage import database as db, remote_store
+    db.create_chat("m2", "user-1", "agent-x")
+    db.update_chat("m2", execution_target="local", session_id="sess-9",
+                   context_used=5000, pending_history_seed="resume_failed")
+    assert remote_store.rebind_chat_with_files(
+        "m2", "m-office", expect_target="local", expect_session_id="sess-9",
+        expect_thread=None) is True
+    row = db.get_chat("m2")
+    assert row["execution_target"] == "m-office" and row["session_id"] == "sess-9"
+    assert row["context_used"] == 5000 and not row["pending_history_seed"]
+
+
+def test_a_rebind_of_an_unknown_chat_changes_nothing(temp_db):
     from storage import remote_store
-    assert remote_store.rebind_chat_to_current_target(
-        "no-such-chat", "Office-PC") is False
+    assert remote_store.rebind_chat_with_files(
+        "no-such-chat", "local", expect_target="", expect_session_id=None,
+        expect_thread=None) is False
+
+
+def test_the_card_of_a_summarised_move_reads_its_row(temp_db):
+    from core.session.history_seed import consume_pending_seed_digest
+    from storage import database as db, move_schema, remote_store
+    db.create_chat("m3", "user-1", "agent-x")
+    _add(db, "m3", "user", "hello")
+    remote_store.create_chat_move({
+        "id": "0b8a1c3e-7f2d-4f6a-9a51-0c1d2e3f4a5b", "chat_id": "m3", "source": "m-1",
+        "target": "local", "from_label": "Office-PC", "to_label": "OtoDock platform",
+        "state": move_schema.SETTLED, "memory": move_schema.MEMORY_SUMMARY,
+        "why": move_schema.WHY_OFFLINE, "created_at": "2026-10-19T00:00:00+00:00"})
+    db.update_chat("m3", pending_history_seed="moved:0b8a1c3e-7f2d-4f6a-9a51-0c1d2e3f4a5b")
+    _digest, notice = consume_pending_seed_digest("m3")
+    assert notice == ("This chat moved from Office-PC to the OtoDock platform. Office-PC was "
+                      "offline, so it continues from a summary of the conversation.")
+
+
+def test_a_legacy_moved_seed_keeps_its_words(temp_db):
+    from core.session.history_seed import consume_pending_seed_digest
+    from storage import database as db
+    db.create_chat("m4", "user-1", "agent-x")
+    _add(db, "m4", "user", "hello")
+    db.update_chat("m4", pending_history_seed="moved:Office-PC")
+    _digest, notice = consume_pending_seed_digest("m4")
+    assert notice.startswith("This chat moved from Office-PC")
+
+
+# ---------------------------------------------------------------------------
+# build_history_seed — delegate results
+# ---------------------------------------------------------------------------
+
+def _delegate_event(**over):
+    data = {"task_id": "t1", "task_name": "review", "agent": "worker", "output_text": "the report",
+            "status": "completed", **over}
+    return json.dumps(data)
+
+
+def test_seed_names_a_delegates_result(temp_db):
+    """A re-warmed delegating session knows its lanes' results: one line per
+    delegate_result, with how it ended and the files it attached."""
+    from core.session.history_seed import build_history_seed
+    from storage import database as db
+    db.create_chat("dr1", "user-1", "agent-x")
+    _add(db, "dr1", "user", "split the review")
+    _add(db, "dr1", "event", event_type="delegate_result",
+         event_data=_delegate_event(files=[{"path": "workspace/inbox/worker/r.md", "bytes": 9}]))
+    _add(db, "dr1", "event", event_type="delegate_result",
+         event_data=_delegate_event(task_name="gates", output_text="Now I will run",
+                                    status="failed", report_missing=True))
+    _add(db, "dr1", "assistant", "both lanes answered")
+
+    seed = build_history_seed("dr1")
+    assert ("[delegate result: worker · review · completed] the report"
+            " · files: workspace/inbox/worker/r.md") in seed
+    assert "[delegate result: worker · gates · ended without a report] Now I will run" in seed
+    assert seed.index("User: split the review") < seed.index("· review ·") < seed.index("Assistant: both")
+
+
+def test_seed_caps_a_delegate_line_whole_keeping_the_reports_end(temp_db):
+    from core.session.history_seed import SEED_PER_MESSAGE_CHARS, build_history_seed
+    from storage import database as db
+    db.create_chat("dr2", "user-1", "agent-x")
+    files = [{"path": f"workspace/inbox/w/file-{i:03d}.md", "bytes": 1} for i in range(400)]
+    _add(db, "dr2", "event", event_type="delegate_result",
+         event_data=_delegate_event(output_text="START " + "x" * 9000 + " THE-END", files=files))
+    _add(db, "dr2", "assistant", "ok")
+
+    seed = build_history_seed("dr2")
+    line = next(ln for ln in seed.splitlines() if ln.startswith("[delegate result:"))
+    assert len(line) <= SEED_PER_MESSAGE_CHARS
+    assert "THE-END" in line and "START" not in line
+    assert "file-000.md" in line and "file-399.md" not in line
+
+
+def test_seed_caps_a_delegate_line_with_a_long_task_name(temp_db):
+    from core.session.history_seed import SEED_PER_MESSAGE_CHARS, build_history_seed
+    from storage import database as db
+    db.create_chat("dr4", "user-1", "agent-x")
+    _add(db, "dr4", "event", event_type="delegate_result",
+         event_data=_delegate_event(task_name="t" * 3000, agent="a" * 3000,
+                                    output_text="the report's END"))
+    _add(db, "dr4", "assistant", "ok")
+
+    line = next(ln for ln in build_history_seed("dr4").splitlines()
+                if ln.startswith("[delegate result:"))
+    assert len(line) <= SEED_PER_MESSAGE_CHARS
+    assert line.endswith("the report's END")
+
+
+def test_seed_skips_a_result_callback_stored_as_a_user_row(temp_db):
+    """An interactive delegating chat's tailer stores the callback prompt as
+    a user row: its delegate line carries it once."""
+    from core.session.history_seed import build_history_seed
+    from storage import database as db
+    db.create_chat("dr3", "user-1", "agent-x")
+    _add(db, "dr3", "user", "go")
+    _add(db, "dr3", "event", event_type="delegate_result", event_data=_delegate_event())
+    _add(db, "dr3", "user", "[BACKGROUND_TASK_RESULT]\nTask 'review' finished\n\nOutput:\nthe report")
+    _add(db, "dr3", "user", "[Current time: Friday]\n\n[The worker ended without a report: x]\n\nmore")
+    _add(db, "dr3", "user", "[DELEGATED_WORK] is a word I typed")
+    _add(db, "dr3", "assistant", "done")
+
+    seed = build_history_seed("dr3")
+    assert seed.count("the report") == 1
+    assert "BACKGROUND_TASK_RESULT" not in seed and "ended without a report: x" not in seed
+    assert "User: [DELEGATED_WORK] is a word I typed" in seed
+
+
+def test_a_refused_resume_reseeds_the_chat(temp_db):
+    """The engine opened a new session instead of the one the chat names:
+    the next turn restores the history with the resume_failed card."""
+    from core.session.history_seed import consume_pending_seed, mark_resume_refused
+    from storage import database as db
+    db.create_chat("c-rr", "user-1", "agent-x")
+    _add(db, "c-rr", "user", "what we said before")
+    _add(db, "c-rr", "assistant", "the answer before")
+    mark_resume_refused("c-rr")
+    assert db.get_chat("c-rr")["pending_history_seed"] == "resume_failed"
+    text, notice = consume_pending_seed("c-rr", "go on")
+    assert "could not be resumed" in notice and "the answer before" in text
+
+
+def test_a_revive_on_a_new_thread_reseeds_the_chat_bound_to_the_session(temp_db):
+    import asyncio
+
+    from core.layers.codex import remote as codex_remote
+    from storage import database as db
+    db.create_chat("c-rv", "user-1", "agent-x")
+    db.update_chat("c-rv", session_id="sid-rv")
+    asyncio.run(codex_remote._reseed_after_revive("sid-rv"))
+    assert db.get_chat("c-rv")["pending_history_seed"] == "resume_failed"
+    asyncio.run(codex_remote._reseed_after_revive("sid-nobody"))   # no chat: nothing

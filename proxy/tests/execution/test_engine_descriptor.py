@@ -10,15 +10,20 @@ frozen satellite vocabulary; ``to_dict()`` carries the four groups.
 import sys
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
 from core.events import tool_roles
 from core.execution_layer import (
-    AUTH_TYPES, PERMISSION_MODES, PROVIDER_KINDS, WINDOW_ROLES, ExecutionLayer, LayerCapabilities,
+    AUTH_TYPES,
+    PERMISSION_MODES,
+    PROVIDER_KINDS,
+    WINDOW_ROLES,
+    ExecutionLayer,
+    LayerCapabilities,
 )
 from core.session.session_manager import account_label_for, get_all_layers
-
 
 # The satellite reads the pinned CLI versions under exactly these keys
 # (satellite/host/cli_versions.py _PIN_KEYS, fail-open on anything else).
@@ -429,6 +434,7 @@ def test_the_installer_defaults_mirror_the_pins():
     # defaults must equal the row of each engine's pin key, or an image
     # ships one CLI version while the proxy and the satellites pin another.
     import re
+
     from tests._paths import REPO_ROOT
     sh = (REPO_ROOT / "scripts" / "install-baseline-tools.sh").read_text(encoding="utf-8")
     ps1 = (REPO_ROOT / "scripts" / "install-baseline-tools.ps1").read_text(encoding="utf-8")
@@ -457,17 +463,25 @@ def test_the_installer_toolchain_defaults_mirror_the_pins():
     # overrides. Only the Node default's major is used (the NodeSource line);
     # the whole value is held equal so "keep in sync" stays true.
     import re
+
     import config as app_config
     from tests._paths import REPO_ROOT
     sh = (REPO_ROOT / "scripts" / "install-baseline-tools.sh").read_text(encoding="utf-8")
     ps1 = (REPO_ROOT / "scripts" / "install-baseline-tools.ps1").read_text(encoding="utf-8")
     sh_vars = {"UV_VERSION": "uv_ver", "PNPM_VERSION": "pnpm_ver", "BUN_VERSION": "bun_ver",
-               "SYMPY_VERSION": "sympy_ver", "NODE_VERSION": "node_ver"}
+               "SYMPY_VERSION": "sympy_ver", "NODE_VERSION": "node_ver",
+               "PASST_VERSION": "passt_ver", "PASST_MIN_VERSION": "passt_min"}
     for key, var in sh_vars.items():
         want = app_config._read_pinned_version(key)
         assert want, key
         hits = re.findall(rf'^\s*local {var}="\$\{{{key}:-([^}}]+)\}}"', sh, re.MULTILINE)
         assert hits == [want], (key, hits, want)
+    # The image builds the pinned passt from its tag and refuses any other
+    # commit: the commit the installer carries is the tag's own.
+    commits = re.findall(r'^\s*local passt_commit="([0-9a-f]{40})"$', sh, re.MULTILINE)
+    short = app_config._read_pinned_version("PASST_VERSION").rsplit(".", 1)[1]
+    assert len(commits) == 1 and commits[0].startswith(short), (commits, short)
+    assert commits[0] in (REPO_ROOT / "VERSIONS.md").read_text(encoding="utf-8")
     for key, var in {"UV_VERSION": "UvVersion", "PNPM_VERSION": "PnpmVersion"}.items():
         want = app_config._read_pinned_version(key)
         hits = re.findall(
@@ -476,6 +490,13 @@ def test_the_installer_toolchain_defaults_mirror_the_pins():
         assert hits == [want], (key, hits, want)
     sympy = app_config._read_pinned_version("SYMPY_VERSION")
     assert re.findall(r"sympy==([0-9][0-9.]*)", ps1) == [sympy]
+    # pnpm 12 puts its native binary in place in its own install step, which
+    # npm 12 skips unless the package is allowed: every pnpm install line
+    # allows it (the .sh installs and upgrades, the .ps1 has one line).
+    sh_pnpm = re.findall(r"npm install -g[^\n]*pnpm@\$\{pnpm_ver\}", sh)
+    ps1_pnpm = re.findall(r"npm install -g[^\n]*pnpm@\$PnpmVersion", ps1)
+    assert len(sh_pnpm) == 2 and len(ps1_pnpm) == 1, (sh_pnpm, ps1_pnpm)
+    assert all("--allow-scripts=pnpm " in line for line in sh_pnpm + ps1_pnpm), (sh_pnpm, ps1_pnpm)
 
 
 def test_the_image_defaults_mirror_the_pins():
@@ -485,6 +506,7 @@ def test_the_image_defaults_mirror_the_pins():
     # VERSIONS.md row; so do CI's Postgres service images and dev-setup's
     # fallbacks. A workflow missing from this checkout is not read.
     import re
+
     import config as app_config
     from tests._paths import REPO_ROOT
     python_image = app_config._read_pinned_version("PYTHON_IMAGE")
@@ -511,8 +533,9 @@ def test_the_image_defaults_mirror_the_pins():
 
 def test_the_agents_column_default_is_the_platform_default():
     # DDL cannot read a constant: the agents.execution_path default is typed
-    # in storage/agents/schema.py and pinned here to DEFAULT_EXECUTION_PATH.
-    from core.execution_layer import DEFAULT_EXECUTION_PATH
+    # in storage/agents/schema.py and pinned here to DEFAULT_EXECUTION_PATH,
+    # defined beside it.
+    from storage.agents.schema import DEFAULT_EXECUTION_PATH
     ddl = (_PROXY_DIR / "storage" / "agents" / "schema.py").read_text(encoding="utf-8")
     assert f"execution_path TEXT NOT NULL DEFAULT '{DEFAULT_EXECUTION_PATH}'" in ddl
 
@@ -604,6 +627,119 @@ def test_permission_modes_are_the_platforms():
         modes = layer.capabilities.permission_modes
         assert modes, path
         assert set(modes) <= set(PERMISSION_MODES), (path, modes)
+        # Declared in the menu's order.
+        assert modes == [m for m in PERMISSION_MODES if m in modes], (path, modes)
+
+
+def test_auto_review_is_offered_only_by_an_engine_with_a_reviewer():
+    from core.permission_modes import AUTO_REVIEW_MODE
+    caps = {path: layer.capabilities for path, layer in get_all_layers().items()}
+    assert AUTO_REVIEW_MODE in caps["claude-code-cli"].permission_modes
+    assert AUTO_REVIEW_MODE in caps["codex-cli"].permission_modes
+    assert caps["direct-llm"].permission_modes == ["ask", "dontAsk"]
+
+
+def test_old_mode_words_read_and_enter_in_the_current_vocabulary():
+    from core.permission_modes import chat_row, cli_mode, current_mode, entry_mode
+    assert current_mode("default") == "ask"
+    assert current_mode("acceptEdits") == "autoReview"
+    # The unattended word and the judge keep their own meaning.
+    assert current_mode("auto") == "auto"
+    assert current_mode("judge") == "judge"
+    assert entry_mode("acceptEdits") == "autoReview"
+    assert entry_mode("acceptEdits", ["ask", "dontAsk"]) == "ask"
+    assert entry_mode("", ["ask", "dontAsk"]) == "ask"
+    assert entry_mode("auto") == "ask"           # never the unattended word from a person
+    assert entry_mode("bogus", ["ask", "autoReview"]) == "ask"
+    assert chat_row({"id": "c", "permission_mode": "acceptEdits"})["permission_mode"] == "autoReview"
+    assert chat_row({"id": "c", "permission_mode": "auto"})["permission_mode"] == "auto"
+    assert {m: cli_mode(m) for m in ("ask", "autoReview", "dontAsk", "plan", "auto", "default")} == {
+        "ask": "default", "autoReview": "auto", "dontAsk": "dontAsk", "plan": "plan",
+        "auto": "default", "default": "default"}
+
+
+def test_each_engine_says_when_its_own_reviewer_runs(monkeypatch):
+    """The hook's live word decides: Claude Code reports ``auto`` in its own
+    auto mode; Codex reports ``default`` under on-request, and its reviewer
+    runs when the turn started with it (local) or when the machine speaks
+    the 1.9 modes and the session is in Auto (remote). A call no hook raised
+    (the Codex bridge) carries no word: never reviewed. Direct LLM has none."""
+    from unittest.mock import MagicMock
+
+    from core.layers.codex import session as codex_session
+    from core.session import session_manager
+    layers = get_all_layers()
+    cli, codex, direct = layers["claude-code-cli"], layers["codex-cli"], layers["direct-llm"]
+    assert cli.engine_reviews("s", "auto") is True
+    assert [cli.engine_reviews("s", w) for w in ("", "default", "acceptEdits", "plan")] == [False] * 4
+    assert direct.engine_reviews("s", "auto") is False
+
+    local = MagicMock(review_turn=True)
+    monkeypatch.setitem(codex_session._codex_sessions, "codex-local", local)
+    assert codex.engine_reviews("codex-local", "default") is True
+    assert codex.engine_reviews("codex-local", "bypassPermissions") is False
+    assert codex.engine_reviews("codex-local", "") is False
+    local.review_turn = False
+    assert codex.engine_reviews("codex-local", "default") is False
+
+    remote = MagicMock()
+    remote._sessions = {"codex-remote": MagicMock(mode="autoReview", machine_id="m1")}
+    cm = MagicMock()
+    monkeypatch.setattr(session_manager, "_get_remote_layer", lambda: remote)
+    monkeypatch.setattr("core.remote.satellite_connection.get_connection_manager", lambda: cm)
+    cm.satellite_version.return_value = "0.5.156"
+    assert codex.engine_reviews("codex-remote", "default") is True
+    cm.satellite_version.return_value = "0.5.155"
+    assert codex.engine_reviews("codex-remote", "default") is False
+    cm.satellite_version.return_value = "0.5.156"
+    remote._sessions["codex-remote"].mode = "ask"
+    assert codex.engine_reviews("codex-remote", "default") is False
+
+
+def test_the_cli_gets_its_own_word_for_a_mode_change(monkeypatch):
+    """A change queued during a turn carries the platform's word; Claude
+    Code is sent its own (Auto is its auto mode, Ask its default)."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from core.layers.cli import layer as cli_layer
+    session = MagicMock()
+    session.send_control_request = AsyncMock(return_value={})
+    session.lock = asyncio.Lock()
+
+    async def _session(sid):
+        return session
+    monkeypatch.setattr(cli_layer, "get_persistent_session", _session)
+    cli = get_all_layers()["claude-code-cli"]
+
+    async def run():
+        await cli.send_control_request("s", "set_permission_mode", mode="autoReview")
+        await cli.send_control_request("s", "set_permission_mode", mode="ask")
+        await cli.change_mode("s", "acceptEdits")
+        await cli.send_control_request("s", "set_model", model="m")
+    asyncio.run(run())
+    assert [c.args + tuple(sorted(c.kwargs.items())) for c in session.send_control_request.call_args_list] == [
+        ("set_permission_mode", ("mode", "auto")), ("set_permission_mode", ("mode", "default")),
+        ("set_permission_mode", ("mode", "auto")), ("set_model", ("model", "m"))]
+
+
+def test_a_satellite_before_1_9_gets_the_words_before_1_9():
+    """An older satellite runs today's Ask and today's Accept Edits under the
+    words it knows; a 0.5.156 one gets the current words."""
+    from unittest.mock import MagicMock
+
+    from core.remote.remote_start_payload import speaks_review_modes, wire_mode
+    cm = MagicMock()
+    words = ("ask", "autoReview", "dontAsk", "plan", "auto", "judge")
+    for version in ("0.5.155", "", "garbage"):
+        cm.satellite_version.return_value = version
+        assert not speaks_review_modes(cm, "m")
+        assert [wire_mode(cm, "m", w) for w in words] == [
+            "default", "acceptEdits", "dontAsk", "plan", "auto", "judge"]
+    for version in ("0.5.156", "0.6.0"):
+        cm.satellite_version.return_value = version
+        assert speaks_review_modes(cm, "m")
+        assert [wire_mode(cm, "m", w) for w in words] == list(words)
 
 
 def test_installed_name_follows_the_binary():

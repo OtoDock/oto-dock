@@ -132,11 +132,11 @@ async def eligible_chat(*, sid: str, agent: str, user_sub: str, route: dict | No
     ``spoken_conversation_live(chat_id)`` is the caller's check for a duplex
     bridge on the chat (the socket layer owns those; this module never
     imports it)."""
-    from storage import database as task_store
-    from storage.pg import run_db
-    from services.phone import phone_config, phone_identity
     from core.session import session_kind
     from core.session.visibility import is_shared_chat_owner
+    from services.phone import phone_config, phone_identity
+    from storage import database as task_store
+    from storage.pg import run_db
 
     if not user_sub or route is None:
         return "", "no person or no route"

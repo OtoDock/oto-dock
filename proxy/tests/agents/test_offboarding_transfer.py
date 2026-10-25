@@ -23,8 +23,7 @@ from fastapi.testclient import TestClient
 
 import config
 from auth.providers import UserContext, get_current_user
-from services.agents import offboarding
-from services.agents import offboarding_transfer as transfer
+from services.agents import offboarding, offboarding_transfer as transfer
 from services.agents.offboarding import AgentLoss, OffboardEvent
 from storage import database as db
 from storage.agents import agent_store
@@ -407,8 +406,8 @@ async def test_a_deletion_archives_the_folders_outside_the_agent_trees(world):
     assert stat.S_IMODE(archive.stat().st_mode) == 0o700
     assert stat.S_IMODE((archive / w.pat_name).stat().st_mode) == 0o700
     assert (archive / w.pat_name / A / "workspace" / "notes.md").read_text() == "mine"
-    assert os.path.islink(archive / w.pat_name / B)
-    assert not home_a.exists() and not os.path.lexists(root / B / "users" / w.pat_name)
+    assert os.path.islink(archive / w.pat_name / B)  # noqa: ASYNC240  # a test's own temporary files
+    assert not home_a.exists() and not os.path.lexists(root / B / "users" / w.pat_name)  # noqa: ASYNC240  # a test's own temporary files
     assert (root / A / "users" / "someone-else").is_dir()
     [retired] = db.list_retired_usernames()
     assert retired["archived_at"]
@@ -583,6 +582,7 @@ def test_an_adopting_prompt_edit_clears_the_transfer(world, as_user):
 @pytest.mark.asyncio
 async def test_register_subscribes_after_the_closer_and_the_lifespan_calls_it(world, monkeypatch):
     import ast
+
     from tests._paths import PROXY_DIR
     monkeypatch.setattr(transfer, "BOOT_RECONCILE_AFTER_S", 3600)
     transfer.register()

@@ -29,8 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import config
-from storage.pg import get_conn
 from core import layout
+from storage.pg import get_conn
 
 logger = logging.getLogger(__name__)
 
@@ -127,9 +127,9 @@ def iter_scopes() -> list[QuotaScope]:
     agent/user tables, so it works in both tiers (the soft tier needs no project
     rows).
     """
-    from storage.agents import agent_store
-    from storage import database
     from core.session.visibility import is_shared_only
+    from storage import database
+    from storage.agents import agent_store
 
     scopes: list[QuotaScope] = []
     for agent in agent_store.get_all_agents():
@@ -459,7 +459,7 @@ def report_usage(project_id: int) -> tuple[int, int] | None:
         return None
     try:
         cp = _run_helper("report", str(config.AGENTS_DIR), project_id, check=True, timeout=30)
-    except Exception:
+    except (OSError, subprocess.SubprocessError, RuntimeError):
         return None
     parts = cp.stdout.split()
     if len(parts) < 2:
@@ -562,7 +562,7 @@ def quotas_preflight() -> None:
         # FileNotFoundError (not CalledProcessError); narrowing this would let
         # that propagate and brick boot on an XFS-prjquota volume. Covered by the
         # capable-fs degradation test in tests/.
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001  # a missing sudo or helper must not stop the boot, see the comment above
             logger.warning("storage_quota: XFS project quota is active but the oto-quota "
                            "helper isn't reachable via 'sudo -n' (%s) — soft tier only "
                            "(install /etc/sudoers.d/otodock-quota, or run the proxy as root)", e)

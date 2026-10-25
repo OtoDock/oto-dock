@@ -36,9 +36,12 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Awaitable, Callable
+
+import psycopg
+
 from auth.providers import acting_role_of
 from ws import wire_events as wire
 
@@ -164,7 +167,7 @@ def _machine_name(machine_id: str) -> str:
         from storage import remote_store
         m = remote_store.get_remote_machine(machine_id) or {}
         return m.get("name") or machine_id[:8]
-    except Exception:
+    except (ImportError, psycopg.Error):
         return machine_id[:8]
 
 

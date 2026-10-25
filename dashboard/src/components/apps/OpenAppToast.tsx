@@ -1,4 +1,6 @@
 import type { OpenAppFrame } from '../../lib/appLive'
+import Button from '../ui/Button'
+import { TOAST } from '../ui/classes'
 
 /**
  * The notice an agent's open_app leaves on a page that cannot show the app
@@ -23,25 +25,22 @@ export default function OpenAppToast({ items, onOpen, onDismiss }: Props) {
       {items.map((f) => (
         <div
           key={f.app_id}
-          className="w-full rounded-lg shadow-lg border border-p-border-light/50 border-l-[4px] border-l-brand bg-brand-surface/80 backdrop-blur-xs"
+          className={`w-full ${TOAST} border-l-4 border-l-action`}
         >
           <div className="flex items-start gap-2 p-3">
             <div className="flex-1 min-w-0">
-              <p className="text-sm font-semibold text-brand truncate">{f.title || 'An app'}</p>
-              <p className="text-sm text-p-text-secondary">
-                The agent <span className="font-medium text-p-text">{f.opened_by || f.agent}</span> wants to show you this app.
+              <p className="text-sm font-semibold text-primary truncate">{f.title || 'An app'}</p>
+              <p className="text-sm text-secondary">
+                The agent <span className="font-medium text-primary">{f.opened_by || f.agent}</span> wants to show you this app.
               </p>
-              <button
-                onClick={() => onOpen(f)}
-                className="mt-2 rounded-md bg-blue-500 px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-blue-600"
-              >
+              <Button variant="primary" size="xs" className="mt-2" onClick={() => onOpen(f)}>
                 Open
-              </button>
+              </Button>
             </div>
             <button
               onClick={() => onDismiss(f.app_id)}
               aria-label="Dismiss"
-              className="shrink-0 w-5 h-5 flex items-center justify-center text-p-text-light hover:text-p-text transition-colors"
+              className="shrink-0 w-5 h-5 flex items-center justify-center text-tertiary hover:text-primary transition-colors"
             >
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />

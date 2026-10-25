@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 
@@ -36,7 +36,7 @@ describe('AudioPrefsSection', () => {
     mockApi(() => ({ ok: false, status: 500 } as Response))
     render(<AudioPrefsSection />, { wrapper })
     await waitFor(() =>
-      expect(screen.getByText(/Couldn't check chat audio availability/)).toBeInTheDocument())
+      expect(screen.getByText(/Couldn't check if chat audio is available/)).toBeInTheDocument())
     expect(screen.queryByText(/turned off by the administrator/)).toBeNull()
   })
 
@@ -53,9 +53,19 @@ describe('AudioPrefsSection', () => {
   it('user-choice policy renders the TTS/STT mode radios', async () => {
     mockApi(() => ({ ok: true, json: async () => CAP_OK } as Response))
     render(<AudioPrefsSection />, { wrapper })
-    await waitFor(() => expect(screen.getByText('Play voice (TTS)')).toBeInTheDocument())
-    expect(screen.getByText('Dictation (STT)')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByText('Voice playback')).toBeInTheDocument())
+    expect(screen.getByText('Dictation')).toBeInTheDocument()
     expect(screen.queryByText(/turned off by the administrator/)).toBeNull()
+  })
+
+  it('each mode row is a named segmented control with the chosen mode pressed', async () => {
+    mockApi(() => ({ ok: true, json: async () => CAP_OK } as Response))
+    render(<AudioPrefsSection />, { wrapper })
+    const group = await screen.findByRole('group', { name: 'Voice playback' })
+    const pressed = within(group).getAllByRole('button').filter((b) => b.getAttribute('aria-pressed') === 'true')
+    expect(pressed).toHaveLength(1)
+    expect(pressed[0].className).toContain('bg-action')
+    for (const b of within(group).getAllByRole('button')) expect(b).toHaveAttribute('type', 'button')
   })
 })
 

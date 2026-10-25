@@ -12,18 +12,17 @@ contract.
 import base64
 import sys
 from types import SimpleNamespace
-
-from core import placement
 from unittest.mock import patch
 
 import pytest
 
+from core import placement
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
-from core.remote.file_sync import can_write_back  # noqa: E402
-
+from core.remote.file_sync import can_write_back
 
 # ---------------------------------------------------------------------------
 # The write matrix (role × dir × outcome)

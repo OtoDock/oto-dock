@@ -19,14 +19,18 @@ binding (blank = platform default).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import uuid
+from pathlib import Path
 
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+
+from _tool_args import ToolArgs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tts-mcp")
@@ -46,6 +50,7 @@ DEFAULT_SUBDIR = "generated-assets"
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
 
 server = Server("tts")
+TOOL_ARGS = ToolArgs()
 
 
 class TtsError(Exception):
@@ -89,7 +94,7 @@ async def _proxy_request(method: str, path: str, **kwargs) -> httpx.Response:
 def _proxy_error(resp: httpx.Response) -> str:
     try:
         detail = resp.json().get("detail", "")
-    except Exception:
+    except (ValueError, AttributeError):
         detail = resp.text[:300]
     return f"speech service returned {resp.status_code}: {detail}"
 
@@ -161,7 +166,7 @@ async def _push_audio_player(file_path: str, title: str, caption: str = "") -> b
             )
             resp.raise_for_status()
             return True
-    except Exception as e:
+    except httpx.HTTPError as e:
         logger.warning("Media hook failed: %s", e)
         return False
 
@@ -195,7 +200,7 @@ async def list_tools() -> list[Tool]:
         "description": "Optional TTS provider id to override the platform/instance default.",
     }
     _setting = {"type": "number", "minimum": 0, "maximum": 1}
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="list_voices",
             description=(
@@ -208,6 +213,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {"provider_id": _provider},
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
         ),
         Tool(
             name="search_voice_library",
@@ -232,6 +238,7 @@ async def list_tools() -> list[Tool]:
                     "provider_id": _provider,
                 },
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
         ),
         Tool(
             name="add_library_voice",
@@ -251,6 +258,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["public_owner_id", "voice_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
         ),
         Tool(
             name="generate_speech",
@@ -302,12 +310,16 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["text"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
         ),
-    ]
+    ])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     try:
         if name == "list_voices":
             return await _handle_list_voices(arguments)
@@ -422,8 +434,7 @@ async def _handle_generate(args: dict) -> list[TextContent]:
         return _err("speech service returned no audio")
 
     path = _get_save_path(args.get("save_path"))
-    with open(path, "wb") as f:
-        f.write(resp.content)
+    await asyncio.to_thread(Path(path).write_bytes, resp.content)
 
     seconds = resp.headers.get("X-Audio-Seconds", "?")
     provider = resp.headers.get("X-Provider-Used", "unknown")

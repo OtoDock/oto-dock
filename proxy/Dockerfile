@@ -28,10 +28,10 @@
 # fresh isolated /proc. NO cap_add (SYS_ADMIN dropped), NOT --privileged. Net a
 # privilege REDUCTION vs a root-run proxy.
 
-ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
-ARG NODE_IMAGE=node:24.21.0-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
+ARG PYTHON_IMAGE=python:3.13.17-slim-bookworm@sha256:e32be0e55814a08977501ca863271d9bd02443710db8f2afaf8372e2c4508530
+ARG NODE_IMAGE=node:26.12.1-bookworm-slim@sha256:28147155d47dc31abe0a46e0d12b59b2fb3d0a2dcc5dc65fce76a074180b16fe
 
-# --- Node stage: source the pinned Node 24 (same bookworm/glibc base) ---
+# --- Node stage: source the pinned Node (same bookworm/glibc base) ---
 FROM ${NODE_IMAGE} AS node
 
 # --- Dashboard build stage: compile the SPA (only dist/ is copied forward) ---
@@ -63,19 +63,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     OTO_FFMPEG_PATH=/opt/otodock/bin/ffmpeg \
     OTO_FFPROBE_PATH=/opt/otodock/bin/ffprobe
 
-# Node 24 from the pinned image (binaries + global modules; recreate npm/npx).
-COPY --from=node /usr/local/bin/node /usr/local/bin/node
-COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
-RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
- && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
- && node --version && npm --version
-
 # Docker CLI + compose plugin — the proxy drives sibling MCP containers via
 # `docker compose` over the socket-proxy (DOCKER_HOST=tcp://...). CLI only; no
 # daemon. Pinned to Debian bookworm's Docker apt channel.
 # (wget is a prerequisite of install-baseline-tools.sh's gh-repo step — present
-# on bare-metal/satellite hosts, absent from the slim base, so add it here.)
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl wget gnupg \
+# on bare-metal/satellite hosts, absent from the slim base, so add it here;
+# libgomp1 is the OpenMP runtime onnxruntime loads for the language identifier;
+# libatomic1 is linked by Node's own binary since 26, so Node comes after it.)
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl wget gnupg libgomp1 libatomic1 \
  && install -m 0755 -d /etc/apt/keyrings \
  && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
  && chmod a+r /etc/apt/keyrings/docker.asc \
@@ -86,9 +81,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && rm -rf /var/lib/apt/lists/* \
  && docker --version && docker compose version
 
+# Node from the pinned image (binaries + global modules; recreate npm/npx).
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+ && node --version && npm --version
+
 # Baseline agent tooling — the single shared installer (git, gh, uv, pnpm, Bun,
 # sympy, bubblewrap, poppler-utils, sqlite3, the pinned claude/codex CLIs, the
 # git credential helper, passt/iproute2 (required), xfsprogs (best-effort)).
+# bookworm's own passt is older than PASST_MIN_VERSION, so the installer builds
+# the pinned release from its tag; OTODOCK_PASST_BUILD=required fails the build
+# rather than ship any other pasta.
 # Same script the satellite + bare-metal installs run, so the sandbox sees
 # identical tools everywhere. Copied first (small, changes rarely) for layer
 # caching. (VERSIONS.md is NOT needed here — the installer carries its own
@@ -96,7 +101,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # equal; Node comes from the node stage above, so its Node step is skipped) —
 # so it's copied later to keep doc edits from busting this expensive layer.)
 COPY scripts/ /opt/otodock/scripts/
-RUN bash /opt/otodock/scripts/install-baseline-tools.sh \
+RUN OTODOCK_PASST_BUILD=required bash /opt/otodock/scripts/install-baseline-tools.sh \
  && rm -rf /var/lib/apt/lists/*
 
 # Proxy-side ffmpeg/ffprobe — installed then MOVED out of /usr/bin into
@@ -117,11 +122,12 @@ RUN python -m venv /opt/otodock/proxy/venv \
  && /opt/otodock/proxy/venv/bin/pip install --upgrade pip \
  && /opt/otodock/proxy/venv/bin/pip install -r /opt/otodock/proxy/requirements.txt
 
-# The proxy also needs the lean `oto-audio` CORE (cloud STT/TTS for chat audio +
-# phone config) — an editable local package that is NOT in requirements.txt.
-# Install the base only: the heavy on-box `[localmodels]` ONNX stack is
-# phone-only. Its own dir (changes rarely) for layer caching. Mirrors
-# proxy/setup.sh on bare-metal — both install paths now pull this.
+# The proxy also needs the `oto-audio` CORE (cloud STT/TTS for chat audio,
+# phone config, and the local language identifier with its ONNX runtime) —
+# an editable local package that is NOT in requirements.txt. Install the base
+# only: the `[localmodels]` extra (transformers, Smart Turn's feature stack)
+# is phone-only. Its own dir (changes rarely) for layer
+# caching. Mirrors proxy/setup.sh on bare-metal — both install paths pull this.
 COPY audio/ /opt/otodock/audio/
 RUN /opt/otodock/proxy/venv/bin/pip install -e /opt/otodock/audio
 

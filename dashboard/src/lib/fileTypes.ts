@@ -99,8 +99,10 @@ export function ensureMediaDownloadName(base: string, mime?: string, src?: strin
 }
 
 // ---------------------------------------------------------------------------
-// Icon hints — VS-Code-inspired letter/glyph + tailwind color class.
-// Shared by FileTree (tree mode) and FileGrid (grid mode).
+// Icon hints: a VS-Code-inspired letter or glyph, coloured by what the file
+// is for, never by a hue per type (one accent per meaning): media reads the
+// media accent, documents the primary text, code and config the secondary,
+// archives and the unknown the tertiary. Shared by FileTree and FileGrid.
 // ---------------------------------------------------------------------------
 
 export interface FileIconStyle {
@@ -108,65 +110,70 @@ export interface FileIconStyle {
   color: string
 }
 
+const MEDIA = 'text-accent-media-fg'
+const DOCUMENT = 'text-primary'
+const CODE = 'text-secondary'
+const QUIET = 'text-tertiary'
+
 const ICON_STYLES: Record<string, FileIconStyle> = {
   // Markdown / docs
-  '.md':    { icon: 'M',  color: 'text-blue-500' },
-  '.txt':   { icon: 'T',  color: 'text-gray-500' },
-  '.log':   { icon: 'L',  color: 'text-gray-400' },
+  '.md':    { icon: 'M',  color: DOCUMENT },
+  '.txt':   { icon: 'T',  color: CODE },
+  '.log':   { icon: 'L',  color: QUIET },
   // Code
-  '.py':    { icon: 'Py', color: 'text-yellow-500' },
-  '.js':    { icon: 'JS', color: 'text-yellow-400' },
-  '.ts':    { icon: 'TS', color: 'text-blue-400' },
-  '.tsx':   { icon: 'TX', color: 'text-blue-400' },
-  '.sh':    { icon: '$',  color: 'text-green-500' },
+  '.py':    { icon: 'Py', color: CODE },
+  '.js':    { icon: 'JS', color: CODE },
+  '.ts':    { icon: 'TS', color: CODE },
+  '.tsx':   { icon: 'TX', color: CODE },
+  '.sh':    { icon: '$',  color: CODE },
   // Data / config
-  '.json':  { icon: '{}', color: 'text-yellow-600' },
-  '.yaml':  { icon: 'Y',  color: 'text-purple-500' },
-  '.yml':   { icon: 'Y',  color: 'text-purple-500' },
-  '.toml':  { icon: 'C',  color: 'text-gray-500' },
-  '.ini':   { icon: 'C',  color: 'text-gray-500' },
-  '.conf':  { icon: 'C',  color: 'text-gray-500' },
-  '.cfg':   { icon: 'C',  color: 'text-gray-500' },
-  '.env':   { icon: 'E',  color: 'text-yellow-700' },
-  '.xml':   { icon: '<>', color: 'text-orange-500' },
-  '.html':  { icon: '<>', color: 'text-orange-400' },
-  '.css':   { icon: '#',  color: 'text-blue-300' },
-  '.csv':   { icon: ',',  color: 'text-green-600' },
+  '.json':  { icon: '{}', color: CODE },
+  '.yaml':  { icon: 'Y',  color: CODE },
+  '.yml':   { icon: 'Y',  color: CODE },
+  '.toml':  { icon: 'C',  color: CODE },
+  '.ini':   { icon: 'C',  color: CODE },
+  '.conf':  { icon: 'C',  color: CODE },
+  '.cfg':   { icon: 'C',  color: CODE },
+  '.env':   { icon: 'E',  color: CODE },
+  '.xml':   { icon: '<>', color: CODE },
+  '.html':  { icon: '<>', color: CODE },
+  '.css':   { icon: '#',  color: CODE },
+  '.csv':   { icon: ',',  color: DOCUMENT },
   // Documents
-  '.pdf':   { icon: 'P',  color: 'text-red-500' },
-  '.docx':  { icon: 'W',  color: 'text-blue-600' },
-  '.xlsx':  { icon: 'X',  color: 'text-green-600' },
-  '.pptx':  { icon: 'S',  color: 'text-orange-500' },
+  '.pdf':   { icon: 'P',  color: DOCUMENT },
+  '.docx':  { icon: 'W',  color: DOCUMENT },
+  '.xlsx':  { icon: 'X',  color: DOCUMENT },
+  '.pptx':  { icon: 'S',  color: DOCUMENT },
   // Images
-  '.png':   { icon: 'I',  color: 'text-pink-500' },
-  '.jpg':   { icon: 'I',  color: 'text-pink-500' },
-  '.jpeg':  { icon: 'I',  color: 'text-pink-500' },
-  '.gif':   { icon: 'I',  color: 'text-pink-400' },
-  '.svg':   { icon: 'S',  color: 'text-pink-400' },
-  '.webp':  { icon: 'I',  color: 'text-pink-500' },
-  '.bmp':   { icon: 'I',  color: 'text-pink-500' },
+  '.png':   { icon: 'I',  color: MEDIA },
+  '.jpg':   { icon: 'I',  color: MEDIA },
+  '.jpeg':  { icon: 'I',  color: MEDIA },
+  '.gif':   { icon: 'I',  color: MEDIA },
+  '.svg':   { icon: 'S',  color: MEDIA },
+  '.webp':  { icon: 'I',  color: MEDIA },
+  '.bmp':   { icon: 'I',  color: MEDIA },
   // Video
-  '.mp4':   { icon: 'V',  color: 'text-purple-500' },
-  '.m4v':   { icon: 'V',  color: 'text-purple-500' },
-  '.mov':   { icon: 'V',  color: 'text-purple-500' },
-  '.webm':  { icon: 'V',  color: 'text-purple-500' },
-  '.mkv':   { icon: 'V',  color: 'text-purple-500' },
-  '.avi':   { icon: 'V',  color: 'text-purple-500' },
+  '.mp4':   { icon: 'V',  color: MEDIA },
+  '.m4v':   { icon: 'V',  color: MEDIA },
+  '.mov':   { icon: 'V',  color: MEDIA },
+  '.webm':  { icon: 'V',  color: MEDIA },
+  '.mkv':   { icon: 'V',  color: MEDIA },
+  '.avi':   { icon: 'V',  color: MEDIA },
   // Audio
-  '.mp3':   { icon: 'A',  color: 'text-teal-500' },
-  '.m4a':   { icon: 'A',  color: 'text-teal-500' },
-  '.aac':   { icon: 'A',  color: 'text-teal-500' },
-  '.wav':   { icon: 'A',  color: 'text-teal-500' },
-  '.ogg':   { icon: 'A',  color: 'text-teal-500' },
-  '.opus':  { icon: 'A',  color: 'text-teal-500' },
-  '.flac':  { icon: 'A',  color: 'text-teal-500' },
+  '.mp3':   { icon: 'A',  color: MEDIA },
+  '.m4a':   { icon: 'A',  color: MEDIA },
+  '.aac':   { icon: 'A',  color: MEDIA },
+  '.wav':   { icon: 'A',  color: MEDIA },
+  '.ogg':   { icon: 'A',  color: MEDIA },
+  '.opus':  { icon: 'A',  color: MEDIA },
+  '.flac':  { icon: 'A',  color: MEDIA },
   // Archives
-  '.zip':   { icon: 'Z',  color: 'text-amber-600' },
-  '.tar':   { icon: 'Z',  color: 'text-amber-600' },
-  '.gz':    { icon: 'Z',  color: 'text-amber-600' },
+  '.zip':   { icon: 'Z',  color: QUIET },
+  '.tar':   { icon: 'Z',  color: QUIET },
+  '.gz':    { icon: 'Z',  color: QUIET },
 }
 
-const DEFAULT_STYLE: FileIconStyle = { icon: 'F', color: 'text-gray-400' }
+const DEFAULT_STYLE: FileIconStyle = { icon: 'F', color: QUIET }
 
 export function getFileIconStyle(name: string): FileIconStyle {
   return ICON_STYLES[getFileExtension(name)] ?? DEFAULT_STYLE

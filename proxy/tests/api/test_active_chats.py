@@ -8,6 +8,7 @@ two deterministic-title broadcast sites the widget's title path rides on.
 """
 
 import asyncio
+import json
 import uuid
 
 import pytest
@@ -69,8 +70,8 @@ def _as(monkeypatch):
     """Authenticate as a given user + pin the two streaming registries."""
     def setup(user: UserContext, pump: list[str], interactive: list[str] = ()):
         app.dependency_overrides[get_current_user] = lambda: user
-        import core.session.session_state as ss
         import core.session.interactive_session as isess
+        import core.session.session_state as ss
         monkeypatch.setattr(ss, "streaming_chat_ids", lambda: list(pump))
         monkeypatch.setattr(isess, "streaming_chat_ids", lambda: list(interactive))
     yield setup
@@ -432,11 +433,17 @@ def test_first_turn_title_branch_broadcasts_and_keeps_socket_send(temp_db, monke
     # title_updated (the sending socket's notify queue drains only between
     # turns — the broadcast alone would leave that tab untitled for the whole
     # first turn) AND broadcast to every other viewer.
-    from core.events.common_events import CommonEvent, TEXT, DONE
+    from core.events.common_events import DONE, TEXT, CommonEvent
     from tests.fixtures.ws_dashboard_harness import (
-        FakeExecutionLayer, dashboard_connection, drain_startup,
-        make_test_agent, run_ws_scenario, session_cookie, set_username,
-        stub_dashboard_seams, warm_new_chat,
+        FakeExecutionLayer,
+        dashboard_connection,
+        drain_startup,
+        make_test_agent,
+        run_ws_scenario,
+        session_cookie,
+        set_username,
+        stub_dashboard_seams,
+        warm_new_chat,
     )
 
     layer = FakeExecutionLayer()
@@ -496,7 +503,7 @@ def test_active_seed_runs_off_the_loop(temp_db, _as, loop_db_guard):
         with loop_db_guard.active():
             return await api.list_active_chats(user=u)
 
-    rows = asyncio.run(scenario())["chats"]
+    rows = json.loads(asyncio.run(scenario()).body)["chats"]
     assert [(r["id"], r["status"]) for r in rows] == [
         (own, "streaming"), (run_chat, "streaming"), (shared, "streaming"),
         (warm, "warming"), (done, "finished"),
@@ -525,7 +532,7 @@ def test_active_seed_never_reads_per_chat(temp_db, _as, monkeypatch):
     _warming(warm)
     u = _user()
     _as(u, pump=[own, run_chat, "ghost-id"])
-    rows = asyncio.run(api.list_active_chats(user=u))["chats"]
+    rows = json.loads(asyncio.run(api.list_active_chats(user=u)).body)["chats"]
     assert [r["id"] for r in rows] == [own, run_chat, warm]
     assert rows[1]["title"] == "Nightly report"
 

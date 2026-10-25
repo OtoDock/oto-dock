@@ -30,7 +30,7 @@ from tests.fixtures.ws_dashboard_harness import (
 
 class TestServerKickFirstTurn:
     def test_warmup_with_text_runs_kicked_turn(self, temp_db, monkeypatch):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
 
         layer = FakeExecutionLayer()
         layer.turn_events = [
@@ -117,12 +117,12 @@ class TestPtyViewer:
             "plans": [], "total_cost": 0, "context_used": 0,
             "context_max": 0, "cache_read": 0, "cache_write": 0,
             "output_tokens": 0, "execution_path": "claude-code-cli",
-            "execution_mode": "", "model": TEST_MODEL, "mode": "default",
+            "execution_mode": "", "model": TEST_MODEL, "mode": "ask",
             "process_alive": True,   # live PTY in the harness
         })
         await ws.expect({
             "type": "warmup_ready", "session_id": sid, "chat_id": cid,
-            "mode": "default", "model": TEST_MODEL,
+            "mode": "ask", "model": TEST_MODEL,
             "execution_path": "claude-code-cli", "interactive": True,
             "turn_open": turn_open,
         })
@@ -161,7 +161,7 @@ class TestPtyViewer:
                 assert isess.resizes == [(50, 132)]
 
                 # live PTY output mirrors to the socket
-                await isess.output_listener(b"file-a\r\n")
+                isess.output_listener(b"file-a\r\n")
                 await ws.expect({
                     "type": "pty_output", "chat_id": cid, "session_id": sid,
                     "data": base64.b64encode(b"file-a\r\n").decode(),
@@ -222,6 +222,40 @@ class TestPtyViewer:
                                 "chat_id": "some-other-chat"})
                 await sync_dispatch(ws)
                 assert isess.output_listener is None
+                ws.client_send({"type": "close"})
+            ws.no_more_frames()
+        run_ws_scenario(scenario)
+
+    def test_a_pushed_documents_token_reaches_only_its_own_person(self, temp_db, monkeypatch):
+        """A push queued for Bob before a takeover that the next controller's
+        drainer hands on: the frame reaches the controller without Bob's
+        token. A push for the controller keeps theirs; the person field
+        reaches nobody."""
+        slug, cid, sid, isess = self._setup(monkeypatch)
+        push = {"event_type": "document_preview", "wopi_url": "https://c/x",
+                "filename": "x.docx", "file_id": "fid", "download_url": "/d",
+                "snapshot_id": "", "generation": 1, "version": 1}
+        frame = {"type": "document_preview", "wopi_url": "https://c/x",
+                 "filename": "x.docx", "file_id": "fid", "download_url": "/d",
+                 "snapshot_id": "", "generation": 1, "version": 1}
+
+        async def scenario():
+            async with dashboard_connection(session_cookie()) as ws:
+                await drain_startup(ws)
+                await self._resume_interactive(ws, cid, sid)
+                ws.client_send({"type": "pty_attach", "chat_id": cid})
+                await ws.expect({
+                    "type": "pty_status", "chat_id": cid, "session_id": sid,
+                    "state": "attached", "tui_theme": "light",
+                })
+                await isess.on_perm_event({**push, "access_token": "bobs",
+                                           "access_token_ttl": 9, "token_person": "user-bob"})
+                await ws.expect({"type": "pty_artifact", "chat_id": cid,
+                                 "session_id": sid, "event": frame})
+                await isess.on_perm_event({**push, "access_token": "mine",
+                                           "access_token_ttl": 9, "token_person": "user-admin"})
+                await ws.expect({"type": "pty_artifact", "chat_id": cid, "session_id": sid,
+                                 "event": {**frame, "access_token": "mine", "access_token_ttl": 9}})
                 ws.client_send({"type": "close"})
             ws.no_more_frames()
         run_ws_scenario(scenario)
@@ -324,8 +358,7 @@ class TestInteractiveColdFirstPrompt:
     frontend staleness guard, and the old stash died with resetSession)."""
 
     def test_warmup_text_submits_server_side_stamped(self, temp_db, monkeypatch):
-        from core.session import interactive_session
-        from core.session import transcript_tool_events as tte
+        from core.session import interactive_session, transcript_tool_events as tte
         from storage.db_settings import set_platform_setting
 
         registered: list[FakeInteractiveSession] = []
@@ -412,8 +445,8 @@ class TestInteractiveColdFirstPromptArgv:
 
     def _run(self, temp_db, monkeypatch, *, focus: str):
         import dataclasses
-        from core.session import interactive_session
-        from core.session import transcript_tool_events as tte
+
+        from core.session import interactive_session, transcript_tool_events as tte
         from storage.db_settings import set_platform_setting
 
         registered: list[FakeInteractiveSession] = []

@@ -5,8 +5,9 @@
  * a span with zero counted content produces NO run (no phantom chip).
  */
 import { describe, it, expect } from 'vitest'
-import { deriveActivityRuns } from '@/lib/activityGroups'
-import type { MessageBlock } from '@/components/chat/types'
+import { asksPerson, deriveActivityRuns, noteAsides, turnBusy } from '@/lib/activityGroups'
+import { openTurnBubbles } from '@/lib/messageBlocks'
+import type { DisplayMessage, MessageBlock } from '@/components/chat/types'
 
 type ToolBlock = Extract<MessageBlock, { type: 'tool' }>
 type ThinkingBlock = Extract<MessageBlock, { type: 'thinking' }>
@@ -166,5 +167,210 @@ describe('deriveActivityRuns — running + currentLabel', () => {
   it('reports done runs as not running', () => {
     const runs = deriveActivityRuns([tool(), thinking()], noHidden)
     expect(runs[0]).toMatchObject({ running: false, currentLabel: '' })
+  })
+})
+
+const note = (content = 'Next I list it.'): MessageBlock => ({ type: 'text', content, note: true })
+
+describe('deriveActivityRuns — progress notes', () => {
+  it('keeps a note inside the span, counted apart and never running', () => {
+    const runs = deriveActivityRuns([tool(), note('First.'), tool(), note('Then.')], noHidden)
+    expect(runs).toHaveLength(1)
+    expect(runs[0]).toMatchObject({ start: 0, end: 3, toolCount: 2, noteCount: 2, running: false, latestNote: 'Then.' })
+  })
+
+  it('drops a span of notes alone, so they render flat', () => {
+    expect(deriveActivityRuns([note(), note()], noHidden)).toEqual([])
+    const runs = deriveActivityRuns([note('Lead.'), text(), tool()], noHidden)
+    expect(runs).toHaveLength(1)
+    expect(runs[0]).toMatchObject({ start: 2, end: 2, noteCount: 0 })
+  })
+
+  it('a plain text block still ends a run, a note does not', () => {
+    const runs = deriveActivityRuns([tool(), note(), tool(), text('Answer'), tool()], noHidden)
+    expect(runs.map((r) => [r.start, r.end])).toEqual([[0, 2], [4, 4]])
+  })
+})
+
+describe('deriveActivityRuns — while the turn is open', () => {
+  it('counts an active sub-agent or background command as running only while open', () => {
+    const blocks = [subagent({ isActive: true, description: 'scan the repo' })]
+    expect(deriveActivityRuns(blocks, noHidden)[0].running).toBe(false)
+    expect(deriveActivityRuns(blocks, noHidden, { turnOpen: true })[0]).toMatchObject({
+      running: true, currentLabel: 'scan the repo' })
+    const cmd = [bgcommand({ isActive: true, command: 'sleep 40' })]
+    expect(deriveActivityRuns(cmd, noHidden, { turnOpen: true })[0]).toMatchObject({
+      running: true, currentLabel: 'sleep 40' })
+    expect(deriveActivityRuns(cmd, noHidden, { turnOpen: false })[0].running).toBe(false)
+  })
+
+  it('a finished sub-agent never runs, open or not', () => {
+    expect(deriveActivityRuns([subagent({ isActive: false })], noHidden, { turnOpen: true })[0].running).toBe(false)
+  })
+
+  it('labels open thinking with its latest summary heading', () => {
+    const runs = deriveActivityRuns(
+      [thinking({ done: false, content: '**Planning the steps**\n\nfirst\n\n**Checking the folder**\n\nthen' })],
+      noHidden)
+    expect(runs[0].currentLabel).toBe('Checking the folder')
+  })
+})
+
+const bubble = (id: string, blocks: MessageBlock[], over: Partial<DisplayMessage> = {}): DisplayMessage =>
+  ({ id, role: 'assistant', blocks, createdAt: '2026-10-20T00:00:00Z', ...over })
+const user = (id: string): DisplayMessage => ({ id, role: 'user', blocks: [text('hi')], createdAt: '2026-10-20T00:00:00Z' })
+const meta: MessageBlock = { type: 'metadata', costUsd: 0, durationMs: 1 }
+
+describe('openTurnBubbles', () => {
+  it('is empty while the chat does not stream', () => {
+    expect(openTurnBubbles([user('u1'), bubble('a1', [tool()])], false).size).toBe(0)
+  })
+
+  it('takes the unfinished bubbles back to the last finished one, over a steer', () => {
+    const msgs = [bubble('a0', [text(), meta]), user('u1'), bubble('a1', [subagent({ isActive: true })]),
+      { ...user('steer'), steered: true }, bubble('a2', [tool({ status: 'running' })])]
+    expect([...openTurnBubbles(msgs, true)]).toEqual(['a2', 'a1'])
+  })
+
+  it("stops at the turn's own message: an earlier errored bubble is not this turn's", () => {
+    // An untyped error ends a turn with neither metadata nor a turn-ended card.
+    const errored = bubble('a0', [bgcommand({ isActive: true }), text('**Error:** boom')])
+    const msgs = [user('u0'), errored, user('u1'), bubble('a1', [tool({ status: 'running' })])]
+    expect([...openTurnBubbles(msgs, true)]).toEqual(['a1'])
+  })
+
+  it('names none while a server turn starts before its first frame', () => {
+    expect(openTurnBubbles([user('u1'), bubble('a1', [text(), meta])], true).size).toBe(0)
+  })
+
+  it('stops at a turn that ended short and at a delegate card', () => {
+    const ended: MessageBlock = { type: 'system', subtype: 'turn_ended', message: 'x' }
+    expect(openTurnBubbles([bubble('a1', [ended]), bubble('a2', [])], true)).toEqual(new Set(['a2']))
+    const card = bubble('d1', [text()], { delegateCard: { kind: 'result', key: 'k' } })
+    expect(openTurnBubbles([card, bubble('a2', [])], true)).toEqual(new Set(['a2']))
+  })
+})
+
+describe('turnBusy and asksPerson', () => {
+  it('is busy with a running tool, open thinking or a picture being made', () => {
+    expect(turnBusy([tool({ status: 'running' }), text()])).toBe(true)
+    expect(turnBusy([thinking({ done: false })])).toBe(true)
+    expect(turnBusy([{ type: 'image_generating', promptPreview: 'p', model: 'm' }])).toBe(true)
+    expect(turnBusy([tool(), text()])).toBe(false)
+  })
+
+  it('counts an active background item only in the trailing steps', () => {
+    expect(turnBusy([text(), bgcommand({ isActive: true }), note()])).toBe(true)
+    // A dev server started early, then text: quiet now, "Working…" may show.
+    expect(turnBusy([bgcommand({ isActive: true }), text('Started it.'), tool()])).toBe(false)
+  })
+
+  it('asks the person while a card waits, wherever it sits', () => {
+    const perm: MessageBlock = { type: 'permission', requestId: 'r', toolName: 'Bash', toolInput: {} }
+    expect(asksPerson([perm, tool({ status: 'done' })])).toBe(true)
+    expect(asksPerson([{ ...perm, resolved: true } as MessageBlock])).toBe(false)
+    expect(asksPerson([{ type: 'question', toolName: 'q', toolInput: {} }])).toBe(true)
+    expect(asksPerson([{ type: 'plan_review', requestId: 'p', plan: 'x', toolInput: {} }])).toBe(true)
+  })
+})
+
+describe('noteAsides: a note that is a real message is drawn as text', () => {
+  const long = 'x'.repeat(281)
+
+  it('folds a short preamble before a tool, and keeps it folded in a turn still open', () => {
+    expect([...noteAsides([note('I will list it.'), tool()])]).toEqual([0])
+    expect([...noteAsides([note('I will list it.'), tool(), note('Then the count.')], {})]).toEqual([0, 2])
+  })
+
+  it('draws every note of a meeting bubble as text', () => {
+    expect(noteAsides([note('My view: ship it.'), tool({ name: 'mcp__meetings-mcp__direct_to' })],
+      { meeting: true }).size).toBe(0)
+  })
+
+  it("draws a finished bubble's last words as text when they are a note", () => {
+    const blocks = [note('I will write it.'), tool(), note('Here is the report.'), tool(), meta]
+    expect([...noteAsides(blocks, { finished: true })]).toEqual([0])
+    // With a longer answer after it, the last note is a preamble again.
+    expect([...noteAsides([note('Checking.'), tool(), text('The folder holds three files.'), meta],
+      { finished: true })]).toEqual([0])
+    // A sign-off shorter than the note: the note is the answer.
+    expect(noteAsides([note('Checking.'), tool(), text('Done.'), meta], { finished: true }).size).toBe(0)
+    // While the turn runs, it is a preamble.
+    expect([...noteAsides([note('Checking.'), tool(), text('Done.')])]).toEqual([0])
+  })
+
+  it('reads an answer written before a closing tool as text when only a sign-off follows', () => {
+    const answer = note('Your meeting is at 3 pm tomorrow with Anna.')
+    const save = tool({ name: 'mcp__memory-mcp__memory' })
+    expect(noteAsides([answer, save, text('Noted.'), meta], { finished: true }).size).toBe(0)
+    // Only the last note: an earlier preamble still folds.
+    expect([...noteAsides([note('I will look it up.'), tool(), answer, save, text('Noted.'), meta],
+      { finished: true })]).toEqual([0])
+    // A worker's report before attach_result_files, then a short close.
+    const report = note('The build passes and the two flaky tests are fixed.')
+    expect(noteAsides([report, tool({ name: 'mcp__delegation-mcp__attach_result_files' }),
+      text('Attached.'), meta], { finished: true }).size).toBe(0)
+  })
+
+  it('draws a note longer than a preamble, or of more than one paragraph, as text', () => {
+    expect(noteAsides([note(long), tool()]).size).toBe(0)
+    expect(noteAsides([note('First part.\n\nSecond part.'), tool()]).size).toBe(0)
+    expect(noteAsides([note('\n\nOne line after its separator.'), tool()]).size).toBe(1)
+  })
+
+  it('a note drawn as text ends a run like any text', () => {
+    const blocks = [tool(), note('My message to the room.'), tool()]
+    const runs = deriveActivityRuns(blocks, noHidden, { asides: new Set() })
+    expect(runs.map((r) => [r.start, r.end, r.noteCount])).toEqual([[0, 0, 0], [2, 2, 0]])
+  })
+
+  it('draws a note right before a step or card that asks the person as text', () => {
+    const ask = note('Two configs: 8080 or 8400?')
+    expect(noteAsides([ask, tool({ name: 'AskUserQuestion', status: 'running' })]).size).toBe(0)
+    expect(noteAsides([ask, tool({ name: 'request_user_input' })]).size).toBe(0)
+    expect(noteAsides([ask, { type: 'question', toolName: 'AskUserQuestion', toolInput: {}, answered: true }]).size)
+      .toBe(0)
+    expect(noteAsides([ask, { type: 'plan_review', requestId: 'r', plan: 'p', toolInput: {} }]).size).toBe(0)
+    // A preamble to a command that then asks permission: its tool sits between.
+    expect([...noteAsides([note('I will remove the build.'), tool({ status: 'running' }),
+      { type: 'permission', requestId: 'r1', toolName: 'Bash', toolInput: { command: 'rm -r build' } }])])
+      .toEqual([0])
+  })
+
+  it('reads a note before a plan the same live and from history', () => {
+    const review: MessageBlock = { type: 'plan_review', requestId: 'r', plan: 'p', toolInput: {} }
+    const live = [note("Here's my plan."), review]
+    const history = [note("Here's my plan."), { type: 'plan', action: 'exit' } as MessageBlock, review]
+    expect(noteAsides(live).size).toBe(0)
+    expect(noteAsides(history).size).toBe(0)
+    // Entering plan mode asks nothing.
+    expect([...noteAsides([note('Planning first.'), { type: 'plan', action: 'enter' } as MessageBlock, tool()])])
+      .toEqual([0])
+  })
+})
+
+describe("the chip's running line: the agent's words before a step's name", () => {
+  it('reads the latest note while a tool runs, the tool when the span has no note', () => {
+    const running = tool({ status: 'running', summary: 'ls -la' })
+    expect(deriveActivityRuns([note('I will list the folder.'), running], noHidden)[0])
+      .toMatchObject({ running: true, headline: 'I will list the folder.', currentLabel: 'ls -la' })
+    expect(deriveActivityRuns([running], noHidden)[0]).toMatchObject({ headline: 'ls -la' })
+    const later = deriveActivityRuns([note('First.'), tool(), note('Now the count.'), running], noHidden)[0]
+    expect(later.headline).toBe('Now the count.')
+  })
+
+  it('a reasoning summary streaming after the note is newer; a bare "Thinking…" is not', () => {
+    const heading = thinking({ done: false, content: '**Checking the folder**\n\nthen' })
+    expect(deriveActivityRuns([note('First.'), tool(), heading], noHidden)[0].headline).toBe('Checking the folder')
+    const bare = thinking({ done: false, content: 'no heading yet' })
+    expect(deriveActivityRuns([note('First.'), tool(), bare], noHidden)[0]).toMatchObject({
+      headline: 'First.', currentLabel: 'Thinking…' })
+  })
+
+  it("a waited sub-agent's description shows only when the span has no note", () => {
+    const sub = subagent({ isActive: true, description: 'scan the repo' })
+    expect(deriveActivityRuns([sub], noHidden, { turnOpen: true })[0].headline).toBe('scan the repo')
+    expect(deriveActivityRuns([note('A sub-agent scans it.'), sub], noHidden, { turnOpen: true })[0].headline)
+      .toBe('A sub-agent scans it.')
   })
 })

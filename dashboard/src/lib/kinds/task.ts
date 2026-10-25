@@ -40,13 +40,16 @@ export const RUN_KIND_LABEL: Record<RunKind, string> = {
   [RUN_KIND.CHECK]: 'Check',
 }
 
+// A run kind's chip, by meaning: neutral information for the platform's
+// own runs, an outside event as a warning, delegation as agent work. Never
+// the action blue: a chip is not a button.
 export const RUN_KIND_STYLE: Record<RunKind, string> = {
-  [RUN_KIND.SCHEDULED]: 'bg-blue-100 text-blue-700',
-  [RUN_KIND.ONE_TIME]: 'bg-amber-100 text-amber-700',
-  [RUN_KIND.TRIGGER]: 'bg-orange-100 text-orange-700',
-  [RUN_KIND.DELEGATE]: 'bg-purple-100 text-purple-700',
-  [RUN_KIND.APP]: 'bg-teal-100 text-teal-700',
-  [RUN_KIND.CHECK]: 'bg-indigo-100 text-indigo-700',
+  [RUN_KIND.SCHEDULED]: 'bg-status-info-bg text-status-info-fg',
+  [RUN_KIND.ONE_TIME]: 'bg-surface-muted text-secondary',
+  [RUN_KIND.TRIGGER]: 'bg-status-warning-bg text-status-warning-fg',
+  [RUN_KIND.DELEGATE]: 'bg-accent-agent-bg text-accent-agent-fg',
+  [RUN_KIND.APP]: 'bg-accent-media-bg text-accent-media-fg',
+  [RUN_KIND.CHECK]: 'bg-surface-muted text-secondary',
 }
 
 export function isRunKind(t: string | null | undefined): t is RunKind {
@@ -69,7 +72,7 @@ export const TRIGGER_KIND_LABEL: Record<TriggerKind, string> = {
   [TRIGGER_KIND.MANUAL]: 'Manual',
   [TRIGGER_KIND.TRIGGER]: 'Trigger',
   [TRIGGER_KIND.CHECK]: 'Check',
-  [TRIGGER_KIND.APP_HANDLER]: 'App handler',
+  [TRIGGER_KIND.APP_HANDLER]: 'App server',
   [TRIGGER_KIND.APP_ACTION]: 'App action',
 }
 

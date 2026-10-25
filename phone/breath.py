@@ -46,15 +46,16 @@ def load_breath(gain: float) -> bytes | None:
                     )
                 _pcm_cache = w.readframes(w.getnframes())
             logger.info(
-                f"Breath clip loaded: "
-                f"{len(_pcm_cache) / (config.SAMPLE_RATE * config.SAMPLE_WIDTH):.2f}s"
+                "Breath clip loaded: "
+                "%.2fs",
+                len(_pcm_cache) / (config.SAMPLE_RATE * config.SAMPLE_WIDTH)
             )
         except FileNotFoundError:
             _load_failed = True
-            logger.warning(f"Breath clip missing ({BREATH_PATH})")
-        except Exception as e:
+            logger.warning("Breath clip missing (%s)", BREATH_PATH)
+        except (wave.Error, EOFError, OSError, ValueError) as e:
             _load_failed = True
-            logger.warning(f"Breath clip failed to load: {e}")
+            logger.warning("Breath clip failed to load: %s", e)
     if _pcm_cache is None:
         return None
     samples = np.frombuffer(_pcm_cache, dtype=np.int16).astype(np.float32) * gain

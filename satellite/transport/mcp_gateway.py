@@ -353,7 +353,7 @@ class LocalMcpGateway:
             )
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning("mcp-gateway: upstream error for mcp %s: %s", mcp, type(e).__name__)
             return self._refuse(method, body, _REFUSAL_NO_ANSWER)
         if upstream is None:

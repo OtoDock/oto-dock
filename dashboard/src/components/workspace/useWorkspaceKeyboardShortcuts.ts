@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import type { FileNode } from '../../api/agents'
 import type { WorkspaceSection } from './sections'
 import type { useWorkspaceState } from '../../hooks/useWorkspaceState'
+import { blockedByModal } from '../../lib/ui/modalLayers'
 
 type WSState = ReturnType<typeof useWorkspaceState>['state']
 type WSActions = Omit<ReturnType<typeof useWorkspaceState>, 'state'>
@@ -36,7 +37,8 @@ export function useWorkspaceKeyboardShortcuts({
       return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable
     }
     const handler = (e: KeyboardEvent) => {
-      if (isEditable()) return
+      // The delete confirm and the other dialogs over the workspace.
+      if (blockedByModal(e) || isEditable()) return
       const meta = e.ctrlKey || e.metaKey
       const sel = state.selected
       const cb = actions.clipboard
@@ -93,6 +95,6 @@ export function useWorkspaceKeyboardShortcuts({
     return () => window.removeEventListener('keydown', handler)
   }, [
     state.open, state.selected, state.path, children, tree,
-    activeSection, actions, queueDelete, handlePaste,
+    activeSection, actions, queueDelete, handlePaste, findNode,
   ])
 }

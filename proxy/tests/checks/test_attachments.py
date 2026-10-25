@@ -18,10 +18,8 @@ from fastapi.testclient import TestClient
 import config
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
-from core.session import session_events as se
-from core.session import session_state
-from services.checks import documents as d
-from services.checks import evaluator
+from core.session import session_events as se, session_state
+from services.checks import documents as d, evaluator
 from services.scheduler import scheduler, shared
 from storage import database as task_store
 from storage.agents import agent_store
@@ -61,8 +59,7 @@ def rig(temp_db, tmp_path, monkeypatch):
 
 
 def _client(user: UserContext):
-    from api.tasks import delegation as delegation_api
-    from api.tasks import tasks as tasks_api
+    from api.tasks import delegation as delegation_api, tasks as tasks_api
     app = FastAPI()
     app.include_router(tasks_api.router)
     app.include_router(delegation_api.router)
@@ -126,7 +123,7 @@ def test_a_delegation_names_its_checks(rig, monkeypatch):
 
 def test_the_runner_copies_the_checks_onto_the_runs_chat(rig, monkeypatch):
     from services.scheduler import runner
-    monkeypatch.setattr(config, "get_cli_model", lambda *a, **k: "m")
+    monkeypatch.setattr("configuration.models.get_cli_model", lambda *a, **k: "m")
     task = shared.TaskDefinition(id="dyn-c1", name="t", agent=AGENT, prompt="p", scope="user",
                                  created_by="alice-sub", checks=["agent:answer"])
     task_store.create_run("run-c1", "dyn-c1", AGENT, "scheduled", None, "p", task_type="scheduled",
@@ -166,7 +163,7 @@ def test_the_final_failure_and_the_latest_failure(rig):
 
 def test_a_button_carries_its_checks_in_the_signed_text_and_the_press_merges_them(rig, monkeypatch):
     from api.apps import app_actions
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     monkeypatch.setattr(_mf, "check_task_target", lambda *a, **k: "")
     good = [{"id": "go", "label": "Go", "type": "fire_task", "task_id": "dyn-x",
              "checks": ["answer", "answer"]}]

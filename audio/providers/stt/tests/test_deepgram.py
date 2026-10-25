@@ -1,6 +1,7 @@
 """DeepgramSTT contract tests (no network — construction + pure surface only)."""
 
 import asyncio
+
 from audio.providers.stt.deepgram import DeepgramSTT
 
 
@@ -312,8 +313,35 @@ async def test_dictation_revised_final_wins_when_not_an_extension():
     stt.pop_interim()
     await stt._on_transcript(None, _res("Θα πάμε τώρα.", True, start=0.0, end=2.5,
                                         words=_timed("Θα πάμε τώρα.", 0.5)))  # reword
-    assert stt.drain_transcript() == "Θα πάμε τώρα."
-    assert stt.latest_interim == ""  # "εκεί" (1.7) was inside the range: Deepgram's revision wins
+    # The rewording covers the head it transcribed; "εκεί" (1.7) sits after
+    # the final's last word inside its window, so it is committed, not dropped.
+    assert stt.drain_transcript() == "Θα πάμε τώρα. εκεί"
+    assert stt.latest_interim == ""
+
+
+async def test_dictation_short_reworded_final_keeps_the_painted_middle():
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    head = _timed("Πήγα στο γραφείο", 0.3)                           # ends 1.5
+    middle = _timed("και είδα ότι η πόρτα ήταν ήδη ανοιχτή", 1.5)    # eight words, end 4.7
+    last = [("σήμερα", 4.9, 5.3)]
+    shown = head + middle + last
+    await stt._on_transcript(None, _res(" ".join(w for w, *_ in shown), False, words=shown))
+    assert stt.pop_interim()
+    reworded = [("Πήγαν", 0.3, 0.7), ("στο", 0.7, 1.1), ("γραφείο.", 1.1, 1.5)]
+    await stt._on_transcript(None, _res("Πήγαν στο γραφείο.", True, start=0.0, end=4.8, words=reworded))
+    assert stt.drain_transcript() == "Πήγαν στο γραφείο. και είδα ότι η πόρτα ήταν ήδη ανοιχτή"
+    assert stt.pop_interim() == "σήμερα"
+
+
+async def test_dictation_final_differing_by_an_accent_extends_the_interim():
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    await stt._on_transcript(None, _res("πηγα στο σπιτι μου", False, words=_timed("πηγα στο σπιτι μου", 0.5)))
+    stt.pop_interim()
+    await stt._on_transcript(None, _res("Πήγα στο", True, start=0.0, end=1.4, words=_timed("Πήγα στο", 0.5)))
+    assert stt.drain_transcript() == "Πήγα στο σπιτι"
+    assert stt.latest_interim == "μου"
 
 
 async def test_dictation_shrunk_interim_not_resent():
@@ -399,7 +427,6 @@ def test_ensure_alive_reconnects_with_active_params():
     """A mid-call reconnect must restart with the ACTIVE negotiated params —
     the old recover path dropped the sample rate back to the 8 kHz
     constructor default, decoding a 16 kHz duplex mic as garbage (audit F5)."""
-    import asyncio
 
     stt = DeepgramSTT(api_key="k")
     stt._active_rate = 16000
@@ -424,7 +451,6 @@ def test_ensure_alive_reconnects_with_active_params():
 def test_ensure_alive_queue_semantics():
     """Healthy probe: clear_queue=False keeps queued finals (audit F6 — after
     a barge-in they are the interrupting utterance); True discards them."""
-    import asyncio
 
     async def run():
         stt = DeepgramSTT(api_key="k")
@@ -443,7 +469,6 @@ def test_ensure_alive_queue_semantics():
 def test_recover_after_opening_wraps_ensure_alive():
     """The base wrapper keeps the historical opening semantics
     (clear stale echo transcripts on a healthy connection)."""
-    import asyncio
 
     async def run():
         stt = DeepgramSTT(api_key="k")
@@ -458,7 +483,6 @@ def test_recover_after_opening_wraps_ensure_alive():
 def test_send_skip_warning_rate_limited(caplog):
     """A dead socket logs ONE send-skip warning per incident, not one per
     20 ms frame (a dead 35 s call tail used to log 1,700+)."""
-    import asyncio
     import logging
 
     async def run():
@@ -489,6 +513,7 @@ def test_the_sdk_logs_once_through_the_process_and_drops_its_finish_noise(caplog
     stderr handler (every record printed twice) and logs the task it just
     cancelled at ERROR on every finish."""
     import logging
+
     from audio.providers.stt.deepgram import _route_sdk_logger
 
     conn = _sdk_connection()
@@ -504,7 +529,6 @@ def test_the_sdk_logs_once_through_the_process_and_drops_its_finish_noise(caplog
 
 
 def test_start_routes_the_connections_logger():
-    import asyncio
     from types import SimpleNamespace
 
     conn = _sdk_connection()
@@ -525,84 +549,10 @@ def test_to_deepgram_lang_auto_is_the_code_switching_stream():
     assert _to_deepgram_lang("auto") == "multi"
 
 
-def test_streams_language_follows_the_identification_set():
+def test_streams_language_follows_the_streamable_set():
     stt = DeepgramSTT(api_key="x")
     assert stt.streams_language("el") and stt.streams_language("en-US") and stt.streams_language("de")
     assert not stt.streams_language("xx") and not stt.streams_language("")
-
-
-async def test_identify_language_reads_the_batch_answer(monkeypatch):
-    from audio.providers.stt.base import TranscriptResult
-    stt = DeepgramSTT(api_key="x")
-    seen = {}
-
-    async def fake_transcribe(audio, *, language=None):
-        seen["language"] = language
-        return TranscriptResult(text="Καλημέρα σας", language="el", audio_seconds=1.4,
-                                provider_used="deepgram", language_confidence=0.93)
-
-    monkeypatch.setattr(stt, "transcribe_file", fake_transcribe)
-    guess = await stt.identify_language(b"RIFF")
-    assert seen["language"] is None                 # no language given: the engine names it
-    assert (guess.language, guess.confidence, guess.text) == ("el", 0.93, "Καλημέρα σας")
-
-
-async def test_identify_language_without_an_answer_is_none(monkeypatch):
-    from audio.providers.stt.base import TranscriptResult
-
-    async def fake_transcribe(audio, *, language=None):
-        return TranscriptResult(text="", language="", audio_seconds=0.0)
-
-    stt = DeepgramSTT(api_key="x")
-    monkeypatch.setattr(stt, "transcribe_file", fake_transcribe)
-    assert await stt.identify_language(b"RIFF") is None
-
-
-class _OldConnection:
-    """The connection a restart replaces: its finish is awaited off the
-    caller's path, after the new stream is open."""
-
-    def __init__(self, calls):
-        self.calls = calls
-
-    async def finish(self):
-        self.calls.append("finish-old")
-
-
-async def test_restart_opens_the_new_stream_before_the_old_one_closes(monkeypatch):
-    stt = DeepgramSTT(api_key="x")
-    stt._active_rate = 8000
-    stt._interim_results = True
-    stt._endpointing_override = 350
-    stt._is_open = True
-    calls = []
-    stt._connection = _OldConnection(calls)
-
-    async def fake_start(*, language, sample_rate=None, interim_results=False, endpointing_ms=None):
-        calls.append(("start", language, sample_rate, interim_results, endpointing_ms))
-
-    monkeypatch.setattr(stt, "start", fake_start)
-    assert await stt.restart("el") is True
-    assert calls == [("start", "el", 8000, True, 350)]      # the old one is still open here
-    await asyncio.sleep(0)
-    assert calls[-1] == "finish-old"                          # closed in the background
-    assert stt._is_open is True
-
-
-async def test_restart_reports_a_failed_start_and_closes_the_old_stream(monkeypatch):
-    stt = DeepgramSTT(api_key="x")
-    stt._is_open = True
-    calls = []
-    stt._connection = _OldConnection(calls)
-
-    async def fake_start(**kw):
-        raise RuntimeError("socket refused")
-
-    monkeypatch.setattr(stt, "start", fake_start)
-    assert await stt.restart("el") is False
-    assert stt._is_open is False
-    await asyncio.sleep(0)
-    assert calls == ["finish-old"]
 
 
 async def test_a_call_mode_final_clears_the_partial_it_covers():
@@ -630,3 +580,421 @@ async def test_a_transcript_from_a_replaced_connection_is_ignored():
     assert stt.drain_transcript() is None
     await stt._on_transcript(None, _res("new stream", True, start=0.0, end=1.0), _gen=2)
     assert stt.drain_transcript() == "new stream"
+
+
+# ── The evidence ledger and the audio clock ──────────────────────────────
+#
+# Every live result, an empty one included, is a ``Heard`` entry on the
+# provider's audio clock: the words count and their mean confidence, never
+# the text. Automatic language detection compares two streams' ledgers.
+
+
+def _res_conf(text: str, final: bool, *, start: float, end: float, confidences=None,
+              result_confidence: float = 0.0):
+    """A live result whose words carry confidences (one per word of ``text``)."""
+
+    class _Word:
+        def __init__(self, w, c):
+            self.punctuated_word, self.word, self.confidence = w, w, c
+            self.start, self.end = start, end
+
+    class _Alt:
+        transcript = text
+        confidence = result_confidence
+
+    _Alt.words = [_Word(w, c) for w, c in zip(text.split(), confidences or [], strict=False)]
+
+    class _Chan:
+        alternatives = [_Alt()]
+
+    class _Res:
+        channel = _Chan()
+        is_final = final
+
+    _Res.start, _Res.duration = start, end - start
+    return _Res()
+
+
+async def test_every_result_enters_the_ledger_as_numbers_empty_ones_included():
+    from audio.providers.stt.base import Heard
+    stt = DeepgramSTT(api_key="k")
+    assert DeepgramSTT.capabilities.reports_confidence is True
+    await stt._on_transcript(None, _res_conf("one two", False, start=0.0, end=1.0, confidences=[0.9, 0.7]))
+    (h,) = stt.heard
+    assert (h.start, h.end, h.words, round(h.confidence, 2), h.final) == (0.0, 1.0, 2, 0.8, False)
+    assert [m[2] for m in h.marks] == [0.9, 0.7]                       # each word placed, with its confidence
+    # The final replaces the interim it completes.
+    await stt._on_transcript(None, _res_conf("one two", True, start=0.0, end=1.2, confidences=[0.95, 0.85]))
+    assert [(h.words, round(h.confidence, 2), h.final) for h in stt.heard] == [(2, 0.9, True)]
+    # An empty interim is coverage: heard, nothing found.
+    await stt._on_transcript(None, _res_conf("", False, start=1.2, end=2.0))
+    assert stt.heard[-1] == Heard(1.2, 2.0, 0, 0.0, False, ())
+    await stt._on_transcript(None, _res_conf("", True, start=1.2, end=2.6))
+    assert [(h.start, h.end, h.words, h.final) for h in stt.heard] == [(0.0, 1.2, 2, True), (1.2, 2.6, 0, True)]
+    # Clearing the queue or finishing leaves the evidence alone.
+    stt.clear_queue()
+    assert len(stt.heard) == 2
+
+
+async def test_a_result_whose_words_carry_no_confidence_falls_back_to_its_own():
+    stt = DeepgramSTT(api_key="k")
+    await stt._on_transcript(None, _res_conf("three words here", True, start=0.0, end=1.0, result_confidence=0.6))
+    assert (stt.heard[0].words, stt.heard[0].confidence) == (3, 0.6)
+
+
+async def test_the_dictation_words_carry_their_confidence():
+    from audio.providers.stt.deepgram import _result_words
+
+    class _W:
+        def __init__(self, w, s, e, c):
+            self.word = self.punctuated_word = w
+            self.start, self.end, self.confidence = s, e, c
+
+    class _Alt:
+        words = [_W("γεια", 0.0, 0.3, 0.97), _W("σας", 0.3, 0.6, 0.81)]
+
+    assert [w.confidence for w in _result_words(_Alt())] == [0.97, 0.81]
+
+
+class _FakeLive:
+    """The SDK's live connection, offline: records the handlers, opens."""
+
+    def __init__(self):
+        self.handlers = {}
+        self.sent = []
+
+    def on(self, event, handler):
+        self.handlers[event] = handler
+
+    async def start(self, options):
+        return True
+
+    async def send(self, data):
+        self.sent.append(len(data))
+
+    async def finish(self):
+        return True
+
+
+async def test_the_clock_counts_every_offered_byte_and_a_reconnect_keeps_the_ledger_on_it():
+    from types import SimpleNamespace
+    stt = DeepgramSTT(api_key="k")
+    await stt.send_audio(b"\x00" * 3200)                 # before the first start: not on the clock
+    assert stt.audio_offered_s == 0.0
+    connections = []
+
+    def _connection(version):
+        connections.append(_FakeLive())
+        return connections[-1]
+    stt._client = SimpleNamespace(listen=SimpleNamespace(asyncwebsocket=SimpleNamespace(v=_connection)))
+    await stt.start(language="en", sample_rate=16000)
+    await stt.send_audio(b"\x00" * 32000)                # 1.0 s sent
+    stt._is_open = False                                 # the socket died
+    await stt.send_audio(b"\x00" * 16000)                # 0.5 s skipped, still offered
+    assert stt.audio_offered_s == 1.5 and connections[0].sent == [32000]
+    assert await stt.ensure_alive("en") is True          # the reconnect: result times restart at zero
+    await stt._on_transcript(None, _res_conf("hello", True, start=0.2, end=0.7, confidences=[0.9]),
+                             _gen=stt._connection_gen)
+    assert (stt.heard[-1].start, stt.heard[-1].end) == (1.7, 2.2)
+    assert stt.heard[-1].marks == ((1.7, 2.2, 0.9),)                   # the words on the same clock
+
+
+
+async def test_the_time_base_is_where_the_new_connection_starts_receiving():
+    """During a reconnect the listen loop keeps offering frames while the
+    connect is in flight: skipped, counted, and before the new connection's
+    time zero."""
+    from types import SimpleNamespace
+    stt = DeepgramSTT(api_key="k")
+    gate = asyncio.Event()
+
+    class _SlowLive(_FakeLive):
+        async def start(self, options):
+            await gate.wait()
+            return True
+
+    stt._client = SimpleNamespace(listen=SimpleNamespace(asyncwebsocket=SimpleNamespace(v=lambda version: _SlowLive())))
+    gate.set()
+    await stt.start(language="en", sample_rate=16000)
+    await stt.send_audio(b"\x00" * 32000)                     # 1.0 s
+    stt._is_open = False
+    gate.clear()
+    task = asyncio.create_task(stt.ensure_alive("en"))
+    await asyncio.sleep(0)
+    await stt.send_audio(b"\x00" * 16000)                     # 0.5 s offered while connecting
+    gate.set()
+    assert await task is True
+    assert stt._time_base == 1.5
+    await stt._on_transcript(None, _res_conf("hello", True, start=0.0, end=0.5, confidences=[0.9]),
+                             _gen=stt._connection_gen)
+    assert stt.heard[-1].start == 1.5
+
+
+# ── Dictation's second listen (``relisten.py``) wired into the provider ──
+# The audio encodes its own time (every 0.1 s block holds ``1000 + block``),
+# so the fake speech model and the fake batch endpoint know what they hear.
+
+def _coded_audio(seconds: float) -> bytes:
+    import numpy as np
+    out = np.zeros(int(seconds * 16000), dtype=np.int16)
+    for i in range(0, len(out), 1600):
+        out[i:i + 1600] = 1000 + i // 1600
+    return out.tobytes()
+
+
+class _Speech:
+    window_size_samples = 512
+
+    def __init__(self, spans):
+        self.spans = spans
+
+    def reset(self):
+        pass
+
+    def process(self, window):
+        t = (round(window[0] * 32768) - 1000) / 10
+        return 0.9 if any(a <= t < b for a, b in self.spans) else 0.05
+
+
+class _AcceptingLive(_FakeLive):
+    async def send(self, data):
+        self.sent.append(len(data))
+        return self.accept
+
+    accept = True
+
+
+async def _dictating(speech_spans, words, *, delay=0.0, accept=True):
+    """A started dictation-mode provider fed 6 s of coded audio, its speech
+    check and batch endpoint faked: ``words`` are (word, start, end) on the
+    connection's clock."""
+    import io
+    import wave
+    from types import SimpleNamespace
+
+    import numpy as np
+    from audio.providers.stt.base import TranscriptResult, Word
+    from audio.providers.stt.relisten import SpeechCheck
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    live = _AcceptingLive()
+    live.accept = accept
+    stt._client = SimpleNamespace(listen=SimpleNamespace(asyncwebsocket=SimpleNamespace(v=lambda version: live)))
+    await stt.start(language="el", sample_rate=16000, interim_results=True)
+    stt._relisten._speech = SpeechCheck(16000, model_factory=lambda _r: _Speech(speech_spans))
+    cuts = []
+
+    async def transcribe_file(audio, *, language=None):
+        with wave.open(io.BytesIO(audio)) as w:
+            pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+        start = (int(pcm[0]) - 1000) / 10
+        cuts.append((start, language))
+        if delay:
+            await asyncio.sleep(delay)
+        inside = [(w, s, e) for w, s, e in words if start <= s < start + len(pcm) / 16000]
+        return TranscriptResult(text="", language="el", audio_seconds=0.0,
+                                words=[Word(w, s - start, e - start) for w, s, e in inside])
+
+    stt.transcribe_file = transcribe_file
+    audio = _coded_audio(6.0)
+    for i in range(0, len(audio), 3200):
+        await stt.send_audio(audio[i:i + 3200])
+    return stt, cuts
+
+
+async def _released(stt, timeout=3.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while stt._relisten.holding:
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.01)
+    return stt.drain_transcript()
+
+
+async def test_dictation_listens_again_to_a_window_the_live_stream_answered_empty():
+    stt, cuts = await _dictating([(2.0, 4.0)], [("ένα", 2.2, 2.6), ("δύο", 2.6, 3.0)])
+    await stt._on_transcript(None, _res("", True, start=2.0, end=4.0), _gen=stt._connection_gen)
+    assert stt.drain_transcript() is None                       # held for the second listen
+    assert await _released(stt) == "ένα δύο"
+    assert cuts[0] == (1.5, "el") and stt.relisten_seconds > 0
+
+
+async def test_a_held_window_stays_on_screen_ahead_of_the_live_partial():
+    stt, _ = await _dictating([(0.0, 3.0)], [("είναι", 0.2, 0.6), ("σωστή", 0.6, 1.0)], delay=0.2)
+    final = _res("μετά πήγαμε", True, start=0.0, end=3.0, words=[("μετά", 2.0, 2.4), ("πήγαμε", 2.4, 2.9)])
+    await stt._on_transcript(None, final, _gen=stt._connection_gen)
+    nxt = _res("για φαγητό", False, start=3.0, words=[("για", 3.1, 3.3), ("φαγητό", 3.3, 3.8)])
+    await stt._on_transcript(None, nxt, _gen=stt._connection_gen)
+    assert stt.pop_interim() == "μετά πήγαμε για φαγητό"        # the held words never blink
+    assert stt.display_interim == "μετά πήγαμε για φαγητό"
+    assert await _released(stt) == "είναι σωστή μετά πήγαμε"
+    assert stt.pop_interim() == "για φαγητό"                    # the release sends the display again
+
+
+async def test_a_call_never_holds_or_listens_again():
+    from types import SimpleNamespace
+    stt = DeepgramSTT(api_key="k")
+    live = _AcceptingLive()
+    stt._client = SimpleNamespace(listen=SimpleNamespace(asyncwebsocket=SimpleNamespace(v=lambda version: live)))
+    await stt.start(language="el", sample_rate=16000)
+    for i in range(0, 6 * 32000, 3200):
+        await stt.send_audio(_coded_audio(6.0)[i:i + 3200])
+    gen = stt._connection_gen
+    await stt._on_transcript(None, _res("", True, start=0.0, end=2.0), _gen=gen)        # an empty window
+    await stt._on_transcript(None, _res("γεια", True, start=2.0, end=5.0, words=[("γεια", 2.0, 2.4)]), _gen=gen)
+    assert stt._relisten is None and stt.relisten_seconds == 0.0
+    assert stt.drain_transcript() == "γεια"                    # at once, the queue as it was
+    assert stt.pop_interim() is None
+    await stt.finish()
+    await stt.close()
+    assert stt._relisten is None
+
+
+async def test_only_the_audio_the_connection_accepted_is_kept():
+    stt, cuts = await _dictating([(2.0, 4.0)], [("ένα", 2.2, 2.6)], accept=False)
+    assert stt._relisten.ring.end_s == 0.0
+    await stt._on_transcript(None, _res("", True, start=2.0, end=4.0), _gen=stt._connection_gen)
+    assert not stt._relisten.holding and cuts == []
+
+
+async def test_the_finish_waits_for_a_held_window_within_its_bound():
+    stt, _ = await _dictating([(2.0, 4.0)], [("ένα", 2.2, 2.6)], delay=5.0)
+    await stt._on_transcript(None, _res("ένας", False, start=2.0, words=[("ένας", 2.2, 2.6)]),
+                             _gen=stt._connection_gen)
+    stt.pop_interim()
+    await stt._on_transcript(None, _res("", True, start=2.0, end=2.1), _gen=stt._connection_gen)
+    await stt._on_transcript(None, _res("", True, start=2.1, end=4.0), _gen=stt._connection_gen)
+    stt.bound_finish(0.1)
+    began = asyncio.get_running_loop().time()
+    text = await stt.finish()
+    assert asyncio.get_running_loop().time() - began < 1.0
+    assert text == "ένας"                                       # the shown word, never lost
+
+
+async def test_close_ends_every_second_listen():
+    stt, _ = await _dictating([(2.0, 4.0)], [("ένα", 2.2, 2.6)], delay=5.0)
+    await stt._on_transcript(None, _res("", True, start=2.0, end=4.0), _gen=stt._connection_gen)
+    await stt.close()
+    assert not stt._relisten.holding
+
+
+async def test_the_finish_bound_counts_the_vendors_own_finish():
+    stt, _ = await _dictating([(2.0, 4.0)], [("ένα", 2.2, 2.6)], delay=5.0)
+
+    async def slow_finish():
+        await asyncio.sleep(0.3)
+        return True
+    stt._connection.finish = slow_finish
+    await stt._on_transcript(None, _res("", True, start=2.0, end=4.0), _gen=stt._connection_gen)
+    stt.bound_finish(0.4)
+    began = asyncio.get_running_loop().time()
+    await stt.finish()
+    assert asyncio.get_running_loop().time() - began < 0.6     # 0.3 of the vendor, the rest for the held window
+
+
+
+async def test_the_second_listen_spends_the_dictations_budget_not_the_streams(caplog):
+    caplog.set_level("INFO", logger="audio.providers.stt.relisten")
+    stt, cuts = await _dictating([(2.0, 4.0)], [("ένα", 2.2, 2.6)])
+    stt.dictation_seconds = lambda: 6.0                     # the dictation's streams so far
+    stt.dictation_relistened = lambda: 16.0                 # another stream of it spent the rest
+    await stt._on_transcript(None, _res("", True, start=2.0, end=4.0), _gen=stt._connection_gen)
+    assert await _released(stt) is None                     # nothing heard, nothing to send
+    assert cuts == [] and stt.relisten_seconds == 0.0
+    assert sum("budget is spent" in rec.message for rec in caplog.records) == 1
+
+
+async def test_a_final_during_the_close_starts_no_second_listen():
+    stt, cuts = await _dictating([(2.0, 4.0)], [("ένα", 2.2, 2.6)])
+
+    async def finish_with_a_late_result():
+        await stt._on_transcript(None, _res("", True, start=2.0, end=4.0), _gen=stt._connection_gen)
+        return True
+    stt._connection.finish = finish_with_a_late_result
+    await stt.close()
+    await asyncio.sleep(0.05)
+    assert cuts == [] and not stt._relisten.holding and stt.relisten_seconds == 0.0
+
+
+async def test_no_audio_is_kept_where_the_speech_check_cannot_run():
+    from types import SimpleNamespace
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    live = _AcceptingLive()
+    stt._client = SimpleNamespace(listen=SimpleNamespace(asyncwebsocket=SimpleNamespace(v=lambda version: live)))
+    await stt.start(language="el", sample_rate=48000, interim_results=True)
+    await stt.send_audio(b"\x01\x00" * 4800)
+    assert stt._relisten.ring.end_s == 0.0
+
+
+# ── A call's second listen (``relisten.TurnRelisten``) ───────────────
+
+async def _calling(speech_spans, words, *, delay=0.0, enable=True):
+    """A started call-mode provider (no dictation) fed 6 s of coded audio,
+    its speech check and batch endpoint faked as ``_dictating``'s."""
+    import io
+    import wave
+    from types import SimpleNamespace
+
+    import numpy as np
+    from audio.providers.stt.base import TranscriptResult, Word
+    from audio.providers.stt.relisten import SpeechCheck
+    stt = DeepgramSTT(api_key="k")
+    if enable:
+        stt.enable_turn_relisten()
+    live = _AcceptingLive()
+    stt._client = SimpleNamespace(listen=SimpleNamespace(asyncwebsocket=SimpleNamespace(v=lambda version: live)))
+    await stt.start(language="el", sample_rate=16000, interim_results=True)
+    cuts = []
+    if enable:
+        stt._turn_relisten._speech = SpeechCheck(16000, model_factory=lambda _r: _Speech(speech_spans))
+
+    async def transcribe_file(audio, *, language=None):
+        with wave.open(io.BytesIO(audio)) as w:
+            pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+        start = (int(pcm[0]) - 1000) / 10
+        cuts.append((start, language))
+        if delay:
+            await asyncio.sleep(delay)
+        inside = [(w, s, e) for w, s, e in words if start <= s < start + len(pcm) / 16000]
+        return TranscriptResult(text="", language="el", audio_seconds=0.0,
+                                words=[Word(w, s - start, e - start) for w, s, e in inside])
+    stt.transcribe_file = transcribe_file
+    audio = _coded_audio(6.0)
+    for i in range(0, len(audio), 3200):
+        await stt.send_audio(audio[i:i + 3200])
+    return stt, cuts
+
+
+async def test_a_calls_empty_final_over_speech_is_heard_again_and_the_take_splices_it():
+    stt, cuts = await _calling([(0.0, 6.0)], [("δύο", 2.2, 2.6)])
+    await stt._on_transcript(None, _res("ένα", True, start=0.0, words=[("ένα", 0.2, 0.6)]), _gen=stt._connection_gen)
+    await stt._on_transcript(None, _res("", True, start=2.0, end=4.0), _gen=stt._connection_gen)
+    await stt._on_transcript(None, _res("τρία", True, start=4.0, words=[("τρία", 4.2, 4.6)]), _gen=stt._connection_gen)
+    assert stt.drain_transcript() == "ένα τρία"                # nothing held on a call
+    assert await stt.complete_turn("ένα τρία", 2.0) == "ένα δύο τρία"
+    assert cuts and cuts[0][1] == "el" and stt.relisten_seconds > 0
+    stt.turn_taken()
+    assert await stt.complete_turn("τέσσερα", 2.0) == "τέσσερα"
+
+
+async def test_a_calls_wordless_turn_queues_its_words_as_the_turns_final():
+    stt, _ = await _calling([(0.0, 6.0)], [("δύο", 2.2, 2.6)])
+    await stt._on_transcript(None, _res("", True, start=2.0, end=4.0), _gen=stt._connection_gen)
+    assert stt.drain_transcript() is None
+    assert await stt.release_wordless_turn(2.0) is True
+    assert stt.drain_transcript() == "δύο"
+    assert await stt.release_wordless_turn(2.0) is False
+
+
+async def test_a_call_without_the_second_listen_keeps_no_audio_and_completes_nothing():
+    stt, cuts = await _calling([(0.0, 6.0)], [("δύο", 2.2, 2.6)], enable=False)
+    await stt._on_transcript(None, _res("", True, start=2.0, end=4.0), _gen=stt._connection_gen)
+    assert stt._turn_relisten is None and stt._relisten is None
+    assert await stt.complete_turn("ένα", 2.0) == "ένα" and cuts == []
+
+
+async def test_dictation_mode_never_takes_the_calls_second_listen():
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    stt.enable_turn_relisten()
+    assert stt._turn_relisten is None and stt._relisten is not None

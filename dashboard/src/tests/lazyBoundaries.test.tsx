@@ -20,6 +20,11 @@ describe('lazy boundaries', () => {
       { timeout: 15_000 })
   }, 20_000)
 
+  it('a code block carries the slab edge that marks it on the ink page', () => {
+    const { container } = render(<CodeBlock language="text">{'ls'}</CodeBlock>)
+    expect(container.firstElementChild?.className).toContain('border-code-border')
+  })
+
   it('inline code never touches the highlighter', () => {
     const { container } = render(<CodeBlock inline>{'ls -la'}</CodeBlock>)
     expect(container.querySelector('code')?.textContent).toBe('ls -la')

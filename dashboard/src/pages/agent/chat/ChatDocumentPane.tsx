@@ -14,63 +14,8 @@ import { chatDocumentsKey } from '../../../api/documents'
 import { leaveDocumentPane, useDocumentPaneStore, useDocumentPushStore } from '../../../store/documentPaneStore'
 import { pushEscHandler } from '../../../lib/escStack'
 
-export type DocumentPaneForm = 'docked' | 'floating'
-
-/** Docked only with room for two halves and a mouse; tablets and phones get
- * the window. Read on the first render, so a phone never paints a docked
- * pane first. */
-function formNow(terminal: boolean): DocumentPaneForm {
-  if (terminal || typeof window === 'undefined') return 'floating'
-  const coarse = window.matchMedia?.('(pointer: coarse)').matches ?? false
-  return !coarse && window.innerWidth >= 1024 ? 'docked' : 'floating'
-}
-
-export function useDocumentPaneForm(terminal: boolean, chatId: string | null): DocumentPaneForm {
-  // A change of form remounts the editor: a document with unsaved edits
-  // holds the form it has until it is saved.
-  const dirty = useDocumentPushStore((s) => !!(chatId && s.dirty[chatId]))
-  const [form, setForm] = useState<DocumentPaneForm>(() => formNow(terminal))
-  useEffect(() => {
-    if (dirty) return
-    setForm(formNow(terminal))
-    let t: ReturnType<typeof setTimeout> | undefined
-    const onResize = () => {
-      clearTimeout(t)
-      t = setTimeout(() => setForm(formNow(terminal)), 100)
-    }
-    window.addEventListener('resize', onResize)
-    return () => {
-      clearTimeout(t)
-      window.removeEventListener('resize', onResize)
-    }
-  }, [terminal, dirty])
-  return form
-}
-
-/** The minimized pane's chips for the left stack: one per open document,
- * at most four, then a chip that restores the pane. */
-export function useDocumentChips(chatId: string | null, hidden: boolean) {
-  const { tabs, pane, active } = useDocumentTabs(chatId)
-  if (!chatId || hidden || !pane.open || !pane.minimized) return null
-  const store = useDocumentPaneStore.getState()
-  const restore = (fileId?: string) => {
-    useDocumentPushStore.getState().setAttended(chatId, true)
-    if (!fileId || fileId === active?.fileId) { store.restore(chatId, fileId); return }
-    void leaveDocumentPane(chatId).then((ok) => store.restore(chatId, ok ? fileId : undefined))
-  }
-  return {
-    chips: tabs.slice(0, 4).map((t) => ({ fileId: t.fileId, title: t.filename || 'Document' })),
-    more: Math.max(0, tabs.length - 4),
-    onRestore: restore,
-    onClose: (fileId: string) => {
-      const close = () => store.closeFile(chatId, fileId, tabs.map((t) => t.fileId))
-      if (fileId !== active?.fileId) { close(); return }
-      // The document on show may hold unsaved edits: a refused leave brings
-      // the pane back with its note.
-      void leaveDocumentPane(chatId).then((ok) => (ok ? close() : restore(fileId)))
-    },
-  }
-}
+export type { DocumentPaneForm } from './useDocumentPaneForm'
+import type { DocumentPaneForm } from './useDocumentPaneForm'
 
 interface Props {
   chatId: string
@@ -127,13 +72,19 @@ export default function ChatDocumentPane({ chatId, placement, hidden, userSub }:
   // The pane's content stays mounted while it is open (minimized, behind an
   // overlay) so an open editor keeps its edits; a close unmounts it once the
   // slide is over.
-  const [mounted, setMounted] = useState(pane.open && !ownerMismatch)
+  const showing = pane.open && !ownerMismatch
+  const [lingering, setLingering] = useState(false)
+  const [wasShowing, setWasShowing] = useState(showing)
+  if (wasShowing !== showing) {
+    setWasShowing(showing)
+    setLingering(!showing && !ownerMismatch)
+  }
   useEffect(() => {
-    if (ownerMismatch) { setMounted(false); return }
-    if (pane.open) { setMounted(true); return }
-    const t = setTimeout(() => setMounted(false), CLOSE_MS)
+    if (showing || !lingering) return
+    const t = setTimeout(() => setLingering(false), CLOSE_MS)
     return () => clearTimeout(t)
-  }, [pane.open, ownerMismatch])
+  }, [showing, lingering])
+  const mounted = showing || (lingering && !ownerMismatch)
 
   if (ownerMismatch) return null
   if (placement === 'docked') return <Docked chatId={chatId} shown={shown} mounted={mounted} />

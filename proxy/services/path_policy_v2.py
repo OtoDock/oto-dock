@@ -24,11 +24,10 @@ import posixpath
 import re
 from dataclasses import dataclass, field
 from typing import Literal
-from auth import roles
-from core.placement import PlacementCapabilities
-from core import host_os
-from core import layout
 
+from auth import roles
+from core import host_os, layout
+from core.placement import PlacementCapabilities
 
 # ---------------------------------------------------------------------------
 # Result + context dataclasses
@@ -471,8 +470,8 @@ def _protected_path_denial(normalized: str, *, writing: bool) -> str:
     """
     from services import path_roles
     if path_roles.is_protected_credentials_path(normalized):
-        return ("OAuth credentials are protected — manage accounts via "
-                "Settings → Integrations")
+        return ("OAuth credentials are protected. Manage accounts in "
+                "User Settings, Integrations")
     # The agent's own CLI config (.claude/*.json, .codex/config.toml|
     # auth.json at a scope root) holds this session's broker cap-token, swapped
     # HTTP bearer, session JWT + model token — deny via the MCP-arg / remote

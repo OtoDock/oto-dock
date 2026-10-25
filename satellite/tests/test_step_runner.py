@@ -259,7 +259,7 @@ async def test_the_scripts_exit_is_the_verdict_and_nothing_it_left_behind_surviv
     await asyncio.sleep(0.2)
     try:
         os.kill(pid, 0)
-        alive = open(f"/proc/{pid}/stat").read().split()[2] != "Z" if os.path.exists(f"/proc/{pid}/stat") else True
+        alive = open(f"/proc/{pid}/stat").read().split()[2] != "Z" if os.path.exists(f"/proc/{pid}/stat") else True  # noqa: ASYNC230,ASYNC240  # a test reads a child's state from /proc
     except ProcessLookupError:
         alive = False
     assert not alive

@@ -19,7 +19,6 @@ import pytest
 
 from services.scheduler.scheduler import _post_run_session_action
 
-
 # --- The close decision -----------------------------------------------------
 
 def test_completed_run_never_closes():
@@ -96,7 +95,8 @@ def test_rebind_releases_replaced_seat(monkeypatch, second_sub):
 def test_reaper_leash_pending_subagents(temp_db):
     from core.remote.remote_execution import _idle_session_has_pending_work
     from core.session.session_state import (
-        get_subagent_registry, reset_subagent_registry,
+        get_subagent_registry,
+        reset_subagent_registry,
     )
     sid = "leash-sess-1"
     reset_subagent_registry(sid)
@@ -257,8 +257,7 @@ def test_lane_pump_wedged_states(monkeypatch):
 @pytest.mark.asyncio
 async def test_settle_prior_lane_waits_healthy_and_reaps_wedged(monkeypatch):
     from core.events.stream_pump import _active_pumps
-    from services.scheduler import scheduler as sched
-    from services.scheduler import lanes
+    from services.scheduler import lanes, scheduler as sched
 
     waited: list[str] = []
     reaped: list[str] = []

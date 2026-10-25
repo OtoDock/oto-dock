@@ -10,6 +10,11 @@
 
 import { type STTBackend, type STTSession, type STTCreateOptions, isNativePlatform, probeWithTimeout } from '../types'
 import { ensureNativeMicPermission } from '../micPermission'
+import { DICTATION_LOST, DICTATION_NO_CONNECT } from './dictationWords'
+
+// The recognizer's errors that mean the link went: Greek and many other
+// languages need the network even for the device recognizer.
+const NETWORK_ERRORS = new Set(['NETWORK', 'NETWORK_TIMEOUT', 'SERVER', 'SERVER_DISCONNECTED'])
 
 // ── Browser (Web Speech) ──────────────────────────────────────────
 
@@ -51,7 +56,9 @@ function webSpeechSession(opts: STTCreateOptions): STTSession {
       // talking" bug; Deepgram doesn't hit it because it streams finals). Each
       // final is delivered exactly once via finalizedCount.
       let finalizedCount = 0
+      let heard = false
       recog.onresult = (e) => {
+        heard = true
         let interim = ''
         for (let i = 0; i < e.results.length; i++) {
           const t = e.results[i][0].transcript
@@ -63,7 +70,10 @@ function webSpeechSession(opts: STTCreateOptions): STTSession {
         }
         if (interim) h.partial(interim)
       }
-      recog.onerror = (e) => h.error(new Error(e.error || 'speech recognition error'))
+      // A network error before anything was heard is a start that never
+      // connected: nothing is in the box to keep.
+      recog.onerror = (e) => h.error(new Error(e.error === 'network' ? (heard ? DICTATION_LOST : DICTATION_NO_CONNECT)
+        : e.error || 'speech recognition error'))
       recog.onend = () => h.end()
       recog.start()
     },
@@ -156,7 +166,7 @@ function capacitorSession(opts: STTCreateOptions): STTSession {
         await new Promise(r => setTimeout(r, 400))
         perm = await sr.checkPermissions().catch(() => ({ speechRecognition: 'denied' }))
         if (perm.speechRecognition !== 'granted') {
-          throw new Error('Microphone permission denied. Enable it in Settings → Apps → OtoDock → Permissions.')
+          throw new Error("Microphone access was denied. Allow it in your phone's Settings, Apps, OtoDock, Permissions.")
         }
       }
       if (stopped) return
@@ -178,10 +188,16 @@ function capacitorSession(opts: STTCreateOptions): STTSession {
         if ((d.state || d.status) === 'stopped') scheduleFinalize(700)
       })
       await sr.addListener('error', (d) => {
-        // Real recognizer errors are finally visible with this fork. If we
-        // already captured a partial, just use it; otherwise surface the reason.
-        if (last) { void finalize() }
-        else { h.error(new Error(d.message || `Speech recognition error${d.code ? ` (${d.code})` : ''}`)); void finalize() }
+        // Real recognizer errors are finally visible with this fork. A
+        // partial already captured is kept; a lost link is said in plain
+        // words whether or not one was (never a silent stop mid-sentence),
+        // other errors only when nothing was heard.
+        const lostLink = NETWORK_ERRORS.has(d.code || d.errorCode || '')
+        // Nothing heard yet: the recognizer never connected (Android's
+        // SERVER also answers a locale its service will not serve).
+        if (lostLink) h.error(new Error(last ? DICTATION_LOST : DICTATION_NO_CONNECT))
+        else if (!last) h.error(new Error(d.message || `Speech recognition error${d.code ? ` (${d.code})` : ''}`))
+        void finalize()
       })
       if (stopped) { // stopped while connecting — never open the recognizer
         await sr.removeAllListeners().catch(() => {})

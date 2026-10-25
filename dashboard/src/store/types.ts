@@ -56,6 +56,8 @@ export interface PendingFile {
 export interface AttachedImageMeta {
   name: string
   path?: string
+  /** A refused send's photo, never saved: the data it was sent with. */
+  base64?: string
 }
 
 /** An uploaded file as the server validated it (`{path, name}`). */
@@ -83,6 +85,9 @@ export interface QueuedMessage {
   authorSub?: string
   /** What it waits for besides a free turn (`QUEUE_WAITING`). */
   waiting?: string
+  /** The queue's own chat when it is not the slice's (a task chat viewed
+   *  through a sibling run's pump): a cancel names it. */
+  queueChatId?: string
 }
 
 /** A queue entry as the wire or the persisted store carries it: a frame
@@ -99,6 +104,7 @@ export function toQueuedMessage(m: unknown): QueuedMessage {
     const authorSub = o.author_sub ?? o.authorSub
     if (typeof authorSub === 'string' && authorSub) out.authorSub = authorSub
     if (typeof o.waiting === 'string' && o.waiting) out.waiting = o.waiting
+    if (typeof o.queueChatId === 'string' && o.queueChatId) out.queueChatId = o.queueChatId
     return out
   }
   return { text: '' }

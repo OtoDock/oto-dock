@@ -1,12 +1,20 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
+
+import Dialog from './ui/Dialog'
+import Button from './ui/Button'
+import { DIALOG_PANEL } from './ui/classes'
+import { Input } from './ui/Field'
 
 /**
  * Reusable type-the-slug confirmation modal for destructive actions.
  *
  * Used by:
- *   - Stop sharing an agent and switching its visibility mode (AgentConfig)
+ *   - Deleting an agent, stopping sharing and switching its visibility mode (AgentConfig)
  *   - "Clear the shared agent memory" (AgentConfig.memory)
  *   - "Clear my memory" (UserSettings)
+ *
+ * Escape closes it; a click on the backdrop does not (what was typed would
+ * go), and nothing closes it while the action runs.
  */
 export default function StrongConfirmModal({
   title,
@@ -36,49 +44,54 @@ export default function StrongConfirmModal({
   confirmDisabled?: boolean
 }) {
   const [typed, setTyped] = useState('')
+  const id = useId()
   // Case-insensitive + trimmed match: the confirm word is a deliberate-friction
   // gate, not a password. Requiring exact case (e.g. "CONFIRM" but not "confirm")
   // silently leaves the submit button disabled and reads as "there is no button".
   const matches = typed.trim().toLowerCase() === confirmWord.trim().toLowerCase()
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl border border-p-border-light w-full max-w-sm mx-4 p-5">
-        <h3 className={`text-base font-semibold mb-2 ${destructive ? 'text-red-600' : 'text-p-text'}`}>
+    <Dialog
+      onClose={onCancel}
+      dismissible="escape"
+      busy={isPending}
+      role="alertdialog"
+      aria-labelledby={`${id}-title`}
+      aria-describedby={`${id}-body`}
+      panelClassName={`${DIALOG_PANEL} max-w-sm p-5`}
+    >
+        <h3 id={`${id}-title`} className={`text-base font-semibold mb-2 ${destructive ? 'text-status-danger-fg' : 'text-primary'}`}>
           {title}
         </h3>
-        <p className="text-sm text-p-text mb-3">
+        <p id={`${id}-body`} className="text-sm text-primary mb-3">
           {description}
           {' '}
           Type{' '}
-          <span className={`font-mono font-bold ${destructive ? 'text-red-600' : 'text-p-text'}`}>
+          <span className={`font-mono font-bold ${destructive ? 'text-status-danger-fg' : 'text-primary'}`}>
             {confirmWord}
           </span>
           {' '}to confirm.
         </p>
         {extra && <div className="mb-3">{extra}</div>}
-        <input
+        <Input
           autoFocus
+          aria-label={`Type ${confirmWord} to confirm`}
           value={typed}
           onChange={(e) => setTyped(e.target.value)}
           placeholder={confirmWord}
-          className={`w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 ${destructive ? 'focus:ring-red-400' : 'focus:ring-blue-400'} mb-4`}
+          className="mb-4"
         />
         <div className="flex justify-end gap-2">
-          <button
-            onClick={onCancel}
-            className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors"
-          >
+          <Button type="button" onClick={onCancel} disabled={isPending}>
             Cancel
-          </button>
-          <button
+          </Button>
+          <Button
+            variant={destructive ? 'danger' : 'primary'}
             onClick={onConfirm}
             disabled={!matches || isPending || confirmDisabled}
-            className={`px-3 py-1.5 text-sm font-medium rounded-lg text-white transition-colors disabled:cursor-not-allowed disabled:bg-gray-200 disabled:text-gray-400 dark:disabled:bg-gray-700 dark:disabled:text-gray-500 ${destructive ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`}
           >
             {isPending ? (busyLabel ?? `${confirmLabel}...`) : confirmLabel}
-          </button>
+          </Button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }

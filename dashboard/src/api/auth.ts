@@ -1,6 +1,7 @@
 // Authentication API — local + OIDC
 import type { AgentRole, PlatformRole } from '../lib/permissions'
 import { callNative, hasNativeBridge, openNativeBrowser } from '../lib/nativeBridge'
+import { isNativePlatform } from '../audio/types'
 
 export interface User {
   sub: string
@@ -128,15 +129,15 @@ async function startRefusal(res: Response, fallback: string): Promise<Error> {
   const d = await res.json().catch(() => ({}))
   let message = typeof d?.detail === 'string' && d.detail ? d.detail : fallback
   const wait = Number(res.headers?.get?.('Retry-After') ?? '')
-  if (Number.isInteger(wait) && wait > 0) message += ` (retry in ${waitWords(wait)})`
+  if (Number.isInteger(wait) && wait > 0) message += ` Try again in ${waitWords(wait)}.`
   return new Error(message)
 }
 
 export async function startOidcLogin(mobile?: boolean): Promise<void> {
-  const isNative = !!(window as any).Capacitor?.isNativePlatform?.()
+  const isNative = isNativePlatform()
   const url = isNative || mobile ? '/auth/oidc-url?mobile=true' : '/auth/oidc-url'
   const res = await fetch(url)
-  if (!res.ok) throw await startRefusal(res, `Could not start the sign-in (HTTP ${res.status}).`)
+  if (!res.ok) throw await startRefusal(res, 'Could not start the sign-in.')
   const data = await res.json()
 
   if (isNative && hasNativeBridge()) {
@@ -148,10 +149,10 @@ export async function startOidcLogin(mobile?: boolean): Promise<void> {
 
 /** Legacy startLogin — now handles bypass mode or delegates to OIDC */
 export async function startLogin(): Promise<void> {
-  const isNative = !!(window as any).Capacitor?.isNativePlatform?.()
+  const isNative = isNativePlatform()
   const loginUrl = isNative ? '/auth/login?mobile=true' : '/auth/login'
   const res = await fetch(loginUrl)
-  if (!res.ok) throw await startRefusal(res, `Could not start the sign-in (HTTP ${res.status}).`)
+  if (!res.ok) throw await startRefusal(res, 'Could not start the sign-in.')
   const data = await res.json()
 
   if (data.url) {
@@ -192,7 +193,7 @@ export async function handleCallback(code: string, state: string): Promise<Callb
   if (res.status === 402) throw new Error('USER_LIMIT_REACHED')
   if (!res.ok) {
     const detail = await res.json().catch(() => ({}))
-    throw new Error(detail.detail || 'Callback failed')
+    throw new Error(detail.detail || 'Could not finish the sign-in')
   }
   const data = await res.json()
   if (data.purpose === 'confirm') {
@@ -206,7 +207,7 @@ export async function handleCallback(code: string, state: string): Promise<Callb
  * page: on the web the whole tab goes to the provider, on Android the
  * system browser opens and the deep link brings the app back. */
 export async function startOidcConfirm(returnTo: string): Promise<void> {
-  const isNative = !!(window as any).Capacitor?.isNativePlatform?.()
+  const isNative = isNativePlatform()
   const res = await apiFetch(
     `/auth/confirm/oidc-url?return_to=${encodeURIComponent(returnTo)}${isNative ? '&mobile=true' : ''}`,
   )

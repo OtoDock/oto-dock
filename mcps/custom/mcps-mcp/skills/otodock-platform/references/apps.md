@@ -27,6 +27,13 @@ button** beside the chat composer opens and closes them; several sit in tabs (sh
 first; an amber dot means an approval is waiting). An app pinned to one chat or one
 delegation project sits on that chat's **Dock** instead and is reached only through it.
 
+**The look.** An app an agent builds wears OtoDock's look in both themes by default.
+For a client or a customer outside the company, the agent asks whose brand the app
+should carry and matches it when asked. An offer, a comparison, a proposal or a form
+that someone else will open is an app shared by link, not a document. An app built
+before 1.9.0 on OtoDock's styles takes the new look at its next load. If one looks
+wrong, ask the agent that built it.
+
 ## What an app can do
 
 - **Buttons** that fire a task, send a prompt into the open chat, or call one tool
@@ -125,9 +132,9 @@ Default visibility never changes; a share adds access on top.
   app's menu there offers **Remove for me**, which removes it, unless a share to that
   agent or its department also places it there); a chat opens from there. A team app
   can also be shared with a whole **agent** (by an editor or manager of both agents: it
-  appears in that agent's Apps panel for every member, as a purple chip with a teal
-  border and a small mark (one a person accepted into their own agent is blue with the
-  same border) and a reduced menu, and the agent's chats and tasks may call what the app exports) or,
+  appears in that agent's Apps panel for every member, as a purple chip with a slate
+  edge and a small mark (one a person accepted into their own agent is blue with the
+  same edge) and a reduced menu, and the agent's chats and tasks may call what the app exports) or,
   by an admin, with a **department** (every agent in it, following the department as it
   changes). The sharer picks the role the recipients act as, up to
   their own.

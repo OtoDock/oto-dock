@@ -21,8 +21,11 @@ pytest.importorskip("weasyprint")
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import pdf as pdf_mod  # noqa: E402
-import shared  # noqa: E402
+from weasyprint.urls import URLFetchingError
+
+import pdf as pdf_mod
+import safe_fs
+import shared
 
 
 class _Listener:
@@ -33,7 +36,7 @@ class _Listener:
         outer = self
 
         class _H(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802
+            def do_GET(self):
                 outer.hits.append(self.path)
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
@@ -180,12 +183,12 @@ def test_the_fetcher_decodes_a_file_url_once_and_reads_beneath_the_root(tmp_path
     assert fetcher.fetch(once).read() == _png_bytes()
     assert pdf_mod._rewrite_references('src="a b%c.png"', {"a b%c.png": str(ok)}) == f'src="{once}"'
     twice = "file://" + pathname2url(pathname2url(str(ok)))
-    with pytest.raises(Exception):
+    with pytest.raises(URLFetchingError):
         fetcher.fetch(twice)
     outside = tmp_path.parent / "outside.png"
     outside.write_bytes(_png_bytes())
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(PermissionError):
             pdf_mod._allowed_files_fetcher([str(outside)]).fetch("file://" + pathname2url(str(outside)))
     finally:
         outside.unlink()
@@ -384,7 +387,7 @@ def test_an_html_input_is_read_beneath_the_mount_under_the_cap(rig, tmp_path, mo
     page = tree / "page.html"
     page.symlink_to(outside)
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(safe_fs.SymlinkRefused):
             asyncio.run(pdf_mod.handle_convert_document(
                 {"input_path": str(page), "output_format": "pdf"},
             ))

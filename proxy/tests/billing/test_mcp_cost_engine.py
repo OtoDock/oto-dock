@@ -8,8 +8,7 @@ need the temp_db fixture. They build CostsBlock fixtures inline and call
 import pytest
 
 from services.mcp.mcp_cost_engine import evaluate
-from services.mcp.mcp_registry import CostsBlock, CostRule
-
+from services.mcp.mcp_registry import CostRule, CostsBlock
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Fixtures — image-gen-mcp's actual rule set so tests double as a regression

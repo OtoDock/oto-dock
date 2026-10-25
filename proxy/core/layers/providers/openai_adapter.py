@@ -25,11 +25,14 @@ runner, the DB resume and the context truncation see one shape.
 
 import json
 import logging
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import config as app_config
 from core.layers.providers.base import (
-    ProviderAdapter, ProviderStreamEvent, ProviderUsage, ProviderError,
+    ProviderAdapter,
+    ProviderError,
+    ProviderStreamEvent,
+    ProviderUsage,
 )
 
 logger = logging.getLogger("direct-runner")
@@ -711,7 +714,7 @@ class OpenAIAdapter(ProviderAdapter):
                 message=str(e),
                 status_code=getattr(e, "status_code", 0),
                 retryable=getattr(e, "status_code", 0) in (429, 500, 502, 503),
-            )
+            ) from e
 
         # A search whose ``done`` item never came (the stream ended first):
         # close its row rather than leave it spinning.
@@ -889,7 +892,7 @@ class OpenAIAdapter(ProviderAdapter):
                 message=str(e),
                 status_code=getattr(e, "status_code", 0),
                 retryable=getattr(e, "status_code", 0) in (429, 500, 502, 503),
-            )
+            ) from e
 
         for kind, piece in splitter.flush():
             if kind == "thinking":

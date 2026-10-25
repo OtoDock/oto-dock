@@ -18,8 +18,9 @@ import asyncio
 import gc
 import json
 import socket
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import pytest_asyncio
 import uvicorn
@@ -30,7 +31,6 @@ from sse_starlette.sse import AppStatus
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
-
 
 ToolHandler = Callable[..., Awaitable[str]]
 

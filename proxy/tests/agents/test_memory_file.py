@@ -319,7 +319,8 @@ def test_index_stale_and_heal(root):
     _create(root, "a.md", "# Alpha\n")
     assert not memory_file.index_is_stale(root)
     # Simulate a human hand-edit: bump the topic mtime past the index.
-    import os, time
+    import os
+    import time
     future = time.time() + 5
     (root / "a.md").write_text("# Renamed heading by hand\n")
     os.utime(root / "a.md", (future, future))
@@ -408,7 +409,7 @@ def test_concurrent_creates_serialize(root):
     def worker(i: int):
         try:
             _create(root, f"t{i}.md", f"# Topic {i}\n")
-        except Exception as e:  # pragma: no cover
+        except Exception as e:  # noqa: BLE001  # pragma: no cover, a worker thread's error is collected for the test
             errors.append(e)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
@@ -472,6 +473,7 @@ def agents_root(tmp_path, monkeypatch):
 def _swap_on_open(monkeypatch, root, victim):
     import contextlib
     import os
+
     from services.infra import safe_fs
     real = safe_fs.open_root
     state = {"done": False}

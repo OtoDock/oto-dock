@@ -46,7 +46,7 @@ export default function ArtifactWindows({ windows, minimized, onClose, onMinimiz
   const [order, setOrder] = useState<number[]>([]) // z-order, last = topmost
   const dragRef = useRef<{ id: number; dx: number; dy: number } | null>(null)
   const windowsRef = useRef(windows)
-  windowsRef.current = windows
+  useLayoutEffect(() => { windowsRef.current = windows })
 
   const open = windows.filter((w) => !minimized.has(w.id))
 
@@ -88,9 +88,11 @@ export default function ArtifactWindows({ windows, minimized, onClose, onMinimiz
   // via refs so the single registration always targets the current top window.
   const hasOpen = open.length > 0
   const openRef = useRef(open)
-  openRef.current = open
   const orderRef = useRef(order)
-  orderRef.current = order
+  useLayoutEffect(() => {
+    openRef.current = open
+    orderRef.current = order
+  })
   useEffect(() => {
     if (!hasOpen) return
     return pushEscHandler(() => {
@@ -154,21 +156,21 @@ export default function ArtifactWindows({ windows, minimized, onClose, onMinimiz
         return (
           <div
             key={w.id}
-            className={`oto-pop-in pointer-events-auto absolute flex flex-col rounded-xl border border-p-border-light bg-white/95 shadow-2xl backdrop-blur-xs dark:bg-gray-900/95 ${sizeCls} ${hidden ? 'hidden' : ''}`}
+            className={`oto-pop-in pointer-events-auto absolute flex flex-col rounded-dialog bg-surface-overlay text-primary shadow-elevation-4 ${sizeCls} ${hidden ? 'hidden' : ''}`}
             style={{ left: pos.x, top: pos.y, zIndex: 10 + z }}
             onPointerDown={() => bringToFront(w.id)}
           >
             <div
-              className="flex cursor-move touch-none select-none items-center gap-2 rounded-t-xl border-b border-p-border-light bg-black/5 px-3 py-1.5 dark:bg-white/5"
+              className="flex cursor-move touch-none select-none items-center gap-2 rounded-t-dialog border-b border-subtle bg-surface-hover px-3 py-1.5"
               onPointerDown={(e) => onHeaderPointerDown(e, w.id)}
               onPointerMove={onHeaderPointerMove}
               onPointerUp={onHeaderPointerUp}
             >
-              <span className="min-w-0 flex-1 truncate text-xs font-medium text-p-text">{w.title}</span>
+              <span className="min-w-0 flex-1 truncate text-xs font-medium text-primary">{w.title}</span>
               <button
                 onClick={() => onMinimize(w.id)}
                 title="Minimize"
-                className="flex h-6 w-6 items-center justify-center rounded-md text-p-text-light hover:bg-black/10 dark:hover:bg-white/10"
+                className="flex h-6 w-6 items-center justify-center rounded-control text-secondary hover:bg-surface-hover hover:text-primary"
               >
                 <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" d="M5 12h14" />
@@ -177,7 +179,7 @@ export default function ArtifactWindows({ windows, minimized, onClose, onMinimiz
               <button
                 onClick={() => onClose(w.id)}
                 title="Close"
-                className="flex h-6 w-6 items-center justify-center rounded-md text-p-text-light hover:bg-black/10 dark:hover:bg-white/10"
+                className="flex h-6 w-6 items-center justify-center rounded-control text-secondary hover:bg-surface-hover hover:text-primary"
               >
                 <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />

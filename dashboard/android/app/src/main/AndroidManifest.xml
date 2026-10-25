@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation|density"
+            android:name=".MainActivity"
+            android:label="@string/title_activity_main"
+            android:theme="@style/AppTheme.NoActionBarLaunch"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize"
+            android:exported="true">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Deep link handler for sign-in and OAuth callbacks: only the two
+                 otodock:// hosts the app routes (auth/callback, oauth/...). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="otodock" android:host="auth" />
+                <data android:scheme="otodock" android:host="oauth" />
+            </intent-filter>
+
+        </activity>
+
+        <!-- Lock-screen alarm UI: a lightweight full-screen activity shown OVER the
+             keyguard for danger alarms (so the dashboard never appears on the lock
+             screen). Launched by AlarmService's full-screen intent. -->
+        <activity
+            android:name=".AlarmActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleInstance"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@android:style/Theme.Material.NoActionBar" />
+
+        <!-- Firebase Messaging fetches no token at start: the push plugin's
+             register(), which the dashboard calls only once notifications are
+             allowed, turns this on (Firebase keeps it on from then), so a person
+             who never allows notifications never reaches Firebase. -->
+        <meta-data
+            android:name="firebase_messaging_auto_init_enabled"
+            android:value="false" />
+
+        <!-- The small icon of a notification Firebase draws itself (a
+             notification message; the app posts its own from data messages). -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@drawable/ic_stat" />
+
+        <!-- Custom FCM service: handles data messages, TTS, alarm routing -->
+        <service
+            android:name=".NotificationService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <!-- Foreground alarm service: loops alarm + TTS for danger notifications.
+             Uses the "specialUse" FGS type (subtype "alarm") — the documented type
+             for continuing alarms (incl. siren/TTS), not "mediaPlayback" which is
+             for media-player audio/video continuation. -->
+        <service
+            android:name=".AlarmService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="alarm" />
+        </service>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths"></meta-data>
+        </provider>
+    </application>
+
+    <!-- Permissions -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Required ALONGSIDE RECORD_AUDIO: Capacitor's WebChromeClient.onPermissionRequest
+         requests MODIFY_AUDIO_SETTINGS + RECORD_AUDIO together for getUserMedia({audio}),
+         and grants the capture only if BOTH resolve. Without this (normal, install-time)
+         permission declared, getUserMedia is denied even when RECORD_AUDIO is granted. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- No media-library access, from any library either: a chat attach goes through
+         the system picker (a grant per picked file) and Save writes to Downloads.
+         Play refuses these permissions to an app that is not a gallery. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" tools:node="remove" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
+
+    <!-- The camera, microphone and location are used when present, never needed:
+         the attach falls back to the picker, typing replaces dictation, and an
+         agent is told the location is unavailable. Declared optional, since a
+         permission otherwise implies a required feature and Play hides the app
+         from devices without it (many tablets and Chromebooks). -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+
+    <!-- Android 11+ package visibility: lets @capacitor-community/speech-recognition
+         discover the on-device speech recognizer service. -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <!-- The camera app, so the chat's "take photo" input (Capacitor's file
+             chooser resolves ACTION_IMAGE_CAPTURE first) opens the camera rather
+             than falling back to the picker. -->
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+    </queries>
+
+</manifest>

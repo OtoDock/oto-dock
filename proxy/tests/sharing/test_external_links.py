@@ -16,10 +16,10 @@ from fastapi.testclient import TestClient
 
 import config
 from api.apps import apps as apps_api
-from api.apps import manifest as _mf
 from app import app
 from auth.password import hash_password
 from auth.providers import UserContext, get_current_user
+from services.apps import manifest as _mf
 from storage import database as task_store
 from storage.sharing import share_store
 
@@ -315,10 +315,47 @@ def test_the_page_pins_its_frames_and_its_config_carries_no_markup():
     assert json.loads(block)["title"] == "a<!--<script>b</script>"
 
 
+def test_the_link_pages_paint_with_the_kits_page_and_text_colours():
+    """Both link pages load the UI kit's sheet and, until the host script
+    sets the person's theme, paint the kit's page and text colours of the
+    device's theme: a token change that left the shell behind fails here."""
+    import re
+
+    from api.sharing import external
+    from tests._paths import REPO_ROOT
+
+    kit = REPO_ROOT / "dashboard" / "ui-kit" / "otodock-tokens.css"
+    if not kit.exists():
+        pytest.skip("the UI kit's sheet is not in this tree")
+    text = kit.read_text()
+    light = text.split(":root {", 1)[1].split("}", 1)[0]
+    dark = text.split(".dark {", 1)[1].split("}", 1)[0]
+
+    def value(block: str, name: str) -> str:
+        return re.search(rf"--p-{name}:\s*([^;]+);", block).group(1).strip()
+
+    shell = external._SHELL_HEAD
+    assert '<link rel="stylesheet" href="/ui-kit/otodock-tokens.css">' in shell
+    assert f"var(--p-bg,{value(light, 'bg')})" in shell
+    assert f"var(--p-text,{value(light, 'text')})" in shell
+    assert (f"--p-bg:{value(dark, 'bg')};--p-text:{value(dark, 'text')};"
+            f"--p-text-secondary:{value(dark, 'text-secondary')};color-scheme:dark") in shell
+
+    row = _app()
+    page = client.get(f"/s/{_token(_link(row['id'])['link'])}")
+    gone = client.get("/s/not-a-token")
+    assert f"var(--p-text-secondary,{value(light, 'text-secondary')})" in gone.text
+    for html in (page.text, gone.text):
+        assert shell in html
+        # The kit's sheet comes before the page's own rules, which sit on it.
+        assert html.index("otodock-tokens.css") < html.index("<style>")
+
+
 def test_a_burst_of_wrong_passwords_is_counted_before_any_passes():
     """Parallel attempts on one link run one at a time: a burst larger than
     the cap never gets more guesses than the cap."""
     import asyncio
+
     import httpx
     row = _app()
     out = _link(row["id"])
@@ -453,8 +490,8 @@ def test_soft_unpin_and_hard_unpin_close_the_link():
 
 
 def test_a_full_hash_gate_answers_the_unlock_with_503():
-    from auth.password import HashBusy
     from api.sharing import external
+    from auth.password import HashBusy
 
     async def busy(*_a, **_k):
         raise HashBusy()

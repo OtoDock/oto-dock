@@ -110,8 +110,9 @@ class TestLocalEndpointApi:
         assert store.add_subscription.call_args.kwargs["credential_data"] == {"endpoint_url": url}
 
     def test_add_rejects_empty_layers_duplicates_and_cloud(self):
-        import api.admin.execution_layers as api_mod
         from fastapi import HTTPException
+
+        import api.admin.execution_layers as api_mod
         with patch.object(api_mod, "subscription_store") as store, \
              patch.object(api_mod.config, "OTODOCK_CLOUD", False):
             store.normalize_endpoint_url.side_effect = store_mod.normalize_endpoint_url
@@ -142,8 +143,9 @@ class TestLocalEndpointApi:
         # The credential key is one row per (engine, provider, auth type,
         # owner): a second URL of the same provider used to reach the INSERT
         # and answer 500.
-        import api.admin.execution_layers as api_mod
         from fastapi import HTTPException
+
+        import api.admin.execution_layers as api_mod
         first = self._group({"direct-llm": "active"}, url="http://first:8080/v1")
         req = api_mod.AddLocalEndpointRequest(
             provider="openai_compatible", endpoint_url="http://second:8080/v1",
@@ -180,8 +182,9 @@ class TestLocalEndpointApi:
         assert out["endpoint_url"] == "http://mine:8080/v1"
 
     def test_a_race_on_the_key_answers_409_and_removes_what_it_added(self):
-        import api.admin.execution_layers as api_mod
         from fastapi import HTTPException
+
+        import api.admin.execution_layers as api_mod
         req = api_mod.AddLocalEndpointRequest(
             provider="openai_compatible", endpoint_url="http://h:8080/v1",
             layers=["direct-llm", "codex-cli"],
@@ -207,8 +210,9 @@ class TestLocalEndpointApi:
         assert ei.value.status_code == 409
 
     def test_enabling_an_engine_held_by_another_of_ones_servers_answers_409(self):
-        import api.admin.execution_layers as api_mod
         from fastapi import HTTPException
+
+        import api.admin.execution_layers as api_mod
         first = self._group({"codex-cli": "active"}, url="http://first:8080/v1")
         second = self._group({"direct-llm": "active"}, url="http://second:8080/v1")
         with patch.object(api_mod, "subscription_store") as store:
@@ -257,8 +261,9 @@ class TestLocalEndpointApi:
             store.update_model.assert_not_called()
 
     def test_other_admins_endpoint_is_read_only(self):
-        import api.admin.execution_layers as api_mod
         from fastapi import HTTPException
+
+        import api.admin.execution_layers as api_mod
         g = self._group({"direct-llm": "active"}, owner="admin-2")
         with patch.object(api_mod, "subscription_store") as store, \
              patch.object(api_mod, "subscription_pool"):
@@ -276,8 +281,9 @@ class TestLocalEndpointApi:
         # Live bindings decide (the stored counter is reconciled first):
         # every sibling row goes when nothing is live; a live session on
         # any engine refuses with 409 unless force=true.
-        import api.admin.execution_layers as api_mod
         from fastapi import HTTPException
+
+        import api.admin.execution_layers as api_mod
         g = self._group({"direct-llm": "active", "codex-cli": "active"})
         live = {"codex-cli-id": 0, "direct-llm-id": 0}
         with patch.object(api_mod, "subscription_store") as store, \

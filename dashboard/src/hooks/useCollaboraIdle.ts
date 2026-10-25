@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, type RefObject } from 'react'
+import { useCallback, useEffect, useRef, type RefObject, useLayoutEffect } from 'react'
 
 /** How long an idle editor gets to resume by itself (a pointer crossing
  * its overlay) before it is asked once more. */
@@ -21,10 +21,10 @@ export const tokenEndMs = (token: string | null | undefined): number | null => {
   }
 }
 
-const parse = (data: unknown): { MessageId?: string; Values?: any } | null => {
+const parse = (data: unknown): { MessageId?: string; Values?: Record<string, unknown> } | null => {
   try {
     const d = typeof data === 'string' ? JSON.parse(data) : data
-    return d && typeof d === 'object' ? d as { MessageId?: string; Values?: any } : null
+    return d && typeof d === 'object' ? d as { MessageId?: string; Values?: Record<string, unknown> } : null
   } catch {
     return null
   }
@@ -116,9 +116,11 @@ export function useCollaboraIdle({ iframeRef, hostRef, loadKey, token, shown = t
   const timers = useRef<number[]>([])
   const answer = useRef<((s: string | null) => void) | null>(null)
   const recoverRef = useRef(recover)
-  recoverRef.current = recover
   const tokenRef = useRef(token)
-  tokenRef.current = token
+  useLayoutEffect(() => {
+    recoverRef.current = recover
+    tokenRef.current = token
+  })
 
   const clearTimers = useCallback(() => {
     for (const t of timers.current) clearTimeout(t)

@@ -1,7 +1,7 @@
 /**
  * Top-level multi-account manager card. Renders the integration title,
- * status chip, "Add another account" affordance, and the list of
- * ``AccountCard``s.
+ * status chip, the "Add an account" or "Add another account" button, and
+ * the list of ``AccountCard``s.
  *
  * Driven by ``UserAccountsManager`` (per-user MCPs), which supplies the
  * scope-specific mutation hooks via the ``ops`` bundle.
@@ -12,6 +12,10 @@ import type { Integration } from '../../api/credentials'
 import type { AccountsOps } from './types'
 import { AccountCard } from './AccountCard'
 import { AccountForm } from './AccountForm'
+import Button from '../ui/Button'
+import { CARD } from '../ui/classes'
+import { Badge } from '../ui/SettingsControls'
+import InfoTip from '../ui/InfoTip'
 
 interface Props {
   integration: Integration
@@ -26,31 +30,38 @@ export function AccountsManager({ integration, ops }: Props) {
   const hasMulti = integration.supports_multi_account
 
   return (
-    <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface">
-      <button
-        className="w-full flex items-center justify-between p-4 text-left"
-        onClick={() => setExpanded(!expanded)}
-      >
-        <div className="min-w-0 flex-1 pr-3">
-          <div className="font-medium text-p-text">
+    <div className={CARD}>
+      {/* The toggle is stretched over the whole header (its ::after), so a
+          press anywhere opens the card; the info button sits above it. */}
+      <div className="relative flex items-center justify-between p-4">
+        <div className="min-w-0 flex-1 pr-3 font-medium text-primary">
+          <button
+            type="button"
+            aria-expanded={expanded}
+            className="text-left after:absolute after:inset-0 after:rounded-card focus-visible:outline-none focus-visible:after:ring-2 focus-visible:after:ring-focus-ring"
+            onClick={() => setExpanded(!expanded)}
+          >
             {integration.display_name}
-          </div>
-          <div className="text-sm text-p-text-secondary break-words">
-            {integration.description}
-          </div>
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {accounts.length > 0 ? (
-            <span className="text-xs px-2 py-0.5 rounded-lg bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">
-              {accounts.length} account{accounts.length === 1 ? '' : 's'}
-            </span>
-          ) : (
-            <span className="text-xs px-2 py-0.5 rounded-lg bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
-              Not Connected
+          </button>
+          {integration.description && (
+            <span className="relative z-10">
+              <InfoTip label={integration.display_name}>{integration.description}</InfoTip>
             </span>
           )}
+        </div>
+        {/* A rotated chevron stacks above the stretched toggle: no pointer here. */}
+        <div className="pointer-events-none flex items-center gap-2 shrink-0">
+          {accounts.length > 0 ? (
+            <Badge variant="success">
+              {accounts.length} account{accounts.length === 1 ? '' : 's'}
+            </Badge>
+          ) : (
+            <Badge variant="warning">
+              Not Connected
+            </Badge>
+          )}
           <svg
-            className={`w-4 h-4 text-p-text-light transition-transform ${
+            className={`w-4 h-4 text-tertiary transition-transform ${
               expanded ? 'rotate-180' : ''
             }`}
             fill="none"
@@ -65,22 +76,25 @@ export function AccountsManager({ integration, ops }: Props) {
             />
           </svg>
         </div>
-      </button>
+      </div>
 
       {expanded && (
-        <div className="px-4 pb-4 border-t border-p-border-light pt-3 space-y-3">
-          {/* "Add new account" button */}
+        <div className="px-4 pb-4 border-t border-subtle pt-3 space-y-3">
+          {/* The group's primary action. The integration's own name stays
+              out of the label: several end in "Account" already. */}
           {(hasMulti || accounts.length === 0) && !adding && (
-            <button
-              className="w-full px-3 py-2 border border-dashed border-p-border-light rounded-lg text-sm text-p-text-secondary hover:bg-gray-50 dark:hover:bg-gray-800"
+            <Button variant="primary" size="md"
+              className="w-full"
               onClick={() => {
                 setAdding(true)
                 setEditingLabel(null)
               }}
             >
-              + Add {accounts.length === 0 ? '' : 'another '}
-              {integration.display_name} account
-            </button>
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+              </svg>
+              {accounts.length === 0 ? 'Add an account' : 'Add another account'}
+            </Button>
           )}
 
           {adding && (

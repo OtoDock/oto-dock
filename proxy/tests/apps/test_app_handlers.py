@@ -21,18 +21,27 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import config
+from api.apps import app_proxy
 from app import app
-from api.apps import app_proxy, catalog
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
 from core.session import session_state
-from services.apps import app_deploy, app_handlers, app_lifecycle, app_sandbox, app_supervisor, app_tokens, releases
+from services.apps import (
+    app_deploy,
+    app_handlers,
+    app_lifecycle,
+    app_sandbox,
+    app_supervisor,
+    app_tokens,
+    catalog,
+    releases,
+)
 from services.scheduler import runner, scheduler, shared
-from storage import database as task_store
-from storage import db_app_deliveries as deliveries
+from storage import database as task_store, db_app_deliveries as deliveries
 from storage.automation import trigger_store
 from storage.pg import get_conn
 
@@ -90,7 +99,7 @@ def _clean(monkeypatch):
     _as(ALICE)
     apps_api._fire_rate.clear()
     app_proxy._buckets.clear()
-    app_proxy._client = None
+    app_supervisor._client = None
     catalog._loop = None
     catalog._app_subs.clear()
     app_handlers._drains.clear()
@@ -111,7 +120,7 @@ def _clean(monkeypatch):
     app_supervisor._instances.clear()
     app_supervisor._locks.clear()
     app_handlers._drains.clear()
-    app_proxy._client = None
+    app_supervisor._client = None
 
 
 @pytest.fixture
@@ -155,7 +164,7 @@ def _folder(agent_tree: Path, slug: str, manifest: dict, server: str | None = No
 
 def _row(slug: str, actions: list[dict], *, files: dict | None = None, handlers: dict | None = None,
          username: str = "", owner: str | None = None, approve: bool = True) -> dict:
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     root = f"users/{username}/workspace" if username else "workspace"
     blocks: dict[str, str] = {}
     if files:
@@ -609,11 +618,12 @@ def test_a_trigger_wakes_a_handler_and_a_replay_is_a_no_op(agent_tree, monkeypat
     r = client.post(f"/v1/triggers/{trig['id']}/edit", json={"app_slug": "hooked", "handler": "github"})
     assert r.status_code == 200, r.text
     assert trigger_store.get_trigger(trig["id"])["app_id"] == hooked["id"]
-    from api.events import triggers as triggers_api
     from fastapi import Request as _Req
+
+    from api.events import triggers as triggers_api
     scope_ = {"type": "http", "headers": [(b"x-otodock-event-id", b"bad id!")], "method": "POST",
               "path": "/", "query_string": b""}
-    with pytest.raises(Exception):
+    with pytest.raises(HTTPException):
         triggers_api._event_id(_Req(scope_))
     # A dead delivery reports on the trigger; purging the app pauses and
     # detaches its triggers.
@@ -693,6 +703,7 @@ def test_a_dormant_personal_app_presses_nothing_and_its_server_stays_down(agent_
     claim in flight presses none of its buttons, the sweep stops a server
     that is still up, and nothing starts it again."""
     import time
+
     from storage.pg import get_conn
     row = _row("mine", [{"id": "note", "label": "Note", "type": "platform",
                          "method": "notifications.create"}], username="alice", owner="alice-sub")
@@ -718,6 +729,7 @@ def test_an_anonymous_action_call_learns_nothing_of_a_dormant_personal_app(monke
     caller falls to the cookie path and its 401."""
     import asyncio
     from unittest.mock import AsyncMock
+
     from api.apps import app_actions, app_proxy
     monkeypatch.setattr(task_store, "get_app", lambda app_id: {"id": app_id, "username": "bob"})
     monkeypatch.setattr(task_store, "personal_row_dormant", lambda row: True)
@@ -755,3 +767,16 @@ def test_two_subscriptions_delivering_one_vendor_event_wake_the_handler_once(age
     assert asyncio.run(deliver(ids[1])) == (0, [])          # the duplicate, neither fired nor failed
     first = deliveries.find_event(hooked["id"], "github", "github:g-1")
     assert first and [d["id"] for d in deliveries.recent(hooked["id"])] == [first["id"]]
+
+
+def test_a_delta_with_no_running_loop_builds_no_coroutine(monkeypatch):
+    """Called off the loop (a script, a test), the dispatch is skipped before
+    its coroutine exists: none is left unawaited."""
+    import gc
+    import warnings
+    monkeypatch.setattr(app_handlers, "has_subscribers", lambda agent: True)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        app_handlers.on_feed_delta(["u"], AGENT, "tasks", {"last_run": "x"}, None)
+        gc.collect()
+    assert not [w for w in caught if "never awaited" in str(w.message)]

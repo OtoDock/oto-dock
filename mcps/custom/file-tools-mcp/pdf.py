@@ -17,10 +17,12 @@ import os
 import re
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from isolation import run_parse
 import safe_fs
+from isolation import run_parse
 from shared import (
     HOST_CACHE_SEGMENT,
     MOUNT_AGENTS_DIR,
@@ -35,8 +37,8 @@ from shared import (
     _resolve_or_mark,
     _resolve_path,
     _to_agents_relative,
-    logger,
     cleanup_partials,
+    logger,
     safe_mkdirs,
     safe_open_write,
     worker_temp_path,
@@ -97,7 +99,7 @@ def _ocr_raster_dpi(page, requested) -> int:
             width_px = max(img[2] for img in images)
             src_dpi = width_px * 72.0 / max(page.rect.width, 1.0)
             cap = min(cap, max(72, round(src_dpi)))
-    except Exception:
+    except Exception:  # noqa: BLE001  # PyMuPDF on a user's PDF raises anything from its parser
         pass
     return max(72, min(cap, 600))
 
@@ -657,7 +659,7 @@ async def handle_edit_pdf(args: dict) -> str:
     # input is a write target — resolve it as one so the proxy's write-RBAC
     # fires instead of the read check.
     path = await _resolve_path(args["path"], writing=True)
-    if not Path(path).exists():
+    if not await asyncio.to_thread(os.path.exists, path):
         return f"Error: File not found: {args['path']}"
 
     # Normalize ONCE here (it handles double-JSON-encoded op lists) and
@@ -692,6 +694,496 @@ async def handle_edit_pdf(args: dict) -> str:
     return msg
 
 
+@dataclass
+class _PdfJob:
+    """What one edit_pdf call's operations share: the document, its path (an
+    extraction's default folder sits beside it) and the result's lists (the
+    core reads the same lists after the loop)."""
+    doc: Any
+    path: str
+    errors: list[str]
+    notes: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Edit — page operations
+# ---------------------------------------------------------------------------
+
+
+def _op_merge(job: _PdfJob, idx: int, op: dict) -> None:
+    import fitz
+
+    files = op.get("files", [])
+    position = op.get("position", "end")
+    for f in files:
+        src_path = _checked_resolved(f)
+        if not Path(src_path).exists():
+            job.errors.append(f"Op #{idx} merge: file not found: {f}")
+            continue
+        src = fitz.open(src_path)
+        if position == "start":
+            job.doc.insert_pdf(src, to_page=-1, start_at=0)
+        elif isinstance(position, int):
+            job.doc.insert_pdf(src, start_at=position)
+        else:
+            job.doc.insert_pdf(src)
+        src.close()
+
+
+def _op_split(job: _PdfJob, idx: int, op: dict) -> None:
+    import fitz
+
+    page_spec = op.get("pages", "all")
+    output_path = op.get("output_path")
+    if not output_path:
+        job.errors.append(f"Op #{idx} split: output_path required")
+        return
+    out = _checked_resolved(output_path)
+    page_indices = _parse_pages(page_spec, job.doc.page_count)
+    new_doc = fitz.open()
+    for pi in page_indices:
+        new_doc.insert_pdf(job.doc, from_page=pi, to_page=pi)
+    # Atomic and beneath the mount: `out` may name an existing
+    # file, a killed child must never leave it truncated, and a
+    # link at the name or on the way never redirects it.
+    try:
+        _save_pdf_beneath(new_doc, out)
+    finally:
+        new_doc.close()
+
+
+def _op_rotate_page(job: _PdfJob, idx: int, op: dict) -> None:
+    page_spec = op.get("pages", "all")
+    degrees = int(op.get("degrees", 90))
+    for pi in _parse_pages(page_spec, job.doc.page_count):
+        job.doc[pi].set_rotation(degrees)
+
+
+def _op_delete_page(job: _PdfJob, idx: int, op: dict) -> None:
+    page_spec = op.get("pages", [])
+    indices = _parse_pages(page_spec, job.doc.page_count)
+    # Delete in reverse order to preserve indices
+    for pi in sorted(indices, reverse=True):
+        job.doc.delete_page(pi)
+
+
+def _op_reorder_pages(job: _PdfJob, idx: int, op: dict) -> None:
+    order = op.get("order", [])
+    if order:
+        job.doc.select([int(i) for i in order])
+
+
+def _op_insert_page(job: _PdfJob, idx: int, op: dict) -> None:
+    position = int(op.get("position", -1))
+    width = float(op.get("width", 595))
+    height = float(op.get("height", 842))
+    job.doc.insert_page(position, width=width, height=height)
+
+
+def _op_crop_page(job: _PdfJob, idx: int, op: dict) -> None:
+    import fitz
+
+    page_spec = op.get("pages", "all")
+    rect = op.get("rect")
+    for pi in _parse_pages(page_spec, job.doc.page_count):
+        page = job.doc[pi]
+        if rect == "auto":
+            # Auto-detect content boundaries
+            blocks = page.get_text("blocks")
+            if blocks:
+                x0 = min(b[0] for b in blocks) - 10
+                y0 = min(b[1] for b in blocks) - 10
+                x1 = max(b[2] for b in blocks) + 10
+                y1 = max(b[3] for b in blocks) + 10
+                page.set_cropbox(fitz.Rect(x0, y0, x1, y1))
+        elif rect and len(rect) == 4:
+            page.set_cropbox(fitz.Rect(*rect))
+
+
+# ---------------------------------------------------------------------------
+# Edit — content operations
+# ---------------------------------------------------------------------------
+
+
+def _op_add_text(job: _PdfJob, idx: int, op: dict) -> None:
+    import fitz
+
+    pi = int(op.get("page", 0))
+    if pi >= job.doc.page_count:
+        job.errors.append(f"Op #{idx} add_text: page {pi} out of range")
+        return
+    page = job.doc[pi]
+    text = op.get("text", "")
+    x = float(op.get("x", 72))
+    y = float(op.get("y", 72))
+    font_size = float(op.get("font_size", 12))
+    color = op.get("color", [0, 0, 0])
+    if isinstance(color, list) and len(color) == 3:
+        color = tuple(float(c) for c in color)
+    else:
+        color = (0, 0, 0)
+    fontname = op.get("font", "helv")
+    page.insert_text(
+        fitz.Point(x, y), text,
+        fontsize=font_size, fontname=fontname, color=color,
+    )
+
+
+def _op_add_image(job: _PdfJob, idx: int, op: dict) -> None:
+    import fitz
+
+    pi = int(op.get("page", 0))
+    if pi >= job.doc.page_count:
+        job.errors.append(f"Op #{idx} add_image: page {pi} out of range")
+        return
+    page = job.doc[pi]
+    img_path = _checked_resolved(op.get("image_path", ""))
+    rect = op.get("rect", [50, 50, 200, 200])
+    page.insert_image(fitz.Rect(*rect), filename=img_path)
+
+
+def _op_add_watermark(job: _PdfJob, idx: int, op: dict) -> None:
+    import fitz
+
+    text = op.get("text", "DRAFT")
+    page_spec = op.get("pages", "all")
+    font_size = float(op.get("font_size", 60))
+    color = op.get("color", [0.8, 0.8, 0.8])
+    if isinstance(color, list):
+        color = tuple(float(c) for c in color)
+    rotation = float(op.get("rotation", 45))
+    opacity = float(op.get("opacity", 0.3))
+
+    text_len = fitz.get_text_length(
+        text, fontname="helv", fontsize=font_size)
+    for pi in _parse_pages(page_spec, job.doc.page_count):
+        page = job.doc[pi]
+        rect = page.rect
+        center = fitz.Point(rect.width / 2, rect.height / 2)
+        # Straight text centered on the page, then rotated as one
+        # unit around the center via morph. insert_text's own
+        # `rotate` only takes quarter turns — and combining it
+        # with a morph used to shear each glyph individually.
+        m = fitz.Matrix(1, 1)
+        m.prerotate(rotation)  # positive = the usual ↗ diagonal
+        page.insert_text(
+            fitz.Point(center.x - text_len / 2,
+                       center.y + font_size * 0.35),
+            text,
+            fontsize=font_size,
+            fontname="helv",
+            color=color,
+            overlay=True,
+            fill_opacity=opacity,
+            stroke_opacity=opacity,
+            morph=(center, m),
+        )
+
+
+def _op_replace_text(job: _PdfJob, idx: int, op: dict) -> None:
+    import fitz
+
+    find = op.get("find", "")
+    replace = op.get("replace", "")
+    if not find:
+        job.errors.append(f"Op #{idx} replace_text: 'find' text required")
+        return
+    page_spec = op.get("pages", "all")
+    case_sensitive = bool(op.get("case_sensitive", False))
+    total, pages_hit = 0, 0
+
+    for pi in _parse_pages(page_spec, job.doc.page_count):
+        page = job.doc[pi]
+        hits = page.search_for(find)
+        if case_sensitive:
+            # search_for matches case-insensitively; keep only
+            # hits whose underlying text contains the exact form.
+            hits = [
+                r for r in hits
+                if find in page.get_text(
+                    "text", clip=fitz.Rect(r) + (-1, -1, 1, 1))
+            ]
+        if not hits:
+            continue
+
+        # Capture style + free width BEFORE redacting (redaction
+        # removes the spans the probes read), then redact, then
+        # reinsert.
+        words = page.get_text("words")
+        plans = []
+        for r in hits:
+            size, color, fontname, baseline_y = _text_style_at(page, r)
+            # The replacement may run past the original footprint
+            # up to the next word on the same line (minus one
+            # space width) — or to the right margin when the hit
+            # ends its line.
+            next_x0 = min(
+                (w[0] for w in words
+                 if w[1] < r.y1 and w[3] > r.y0 and w[0] >= r.x1 - 1),
+                default=page.rect.x1 - 36,
+            )
+            max_w = max(r.width, next_x0 - r.x0 - 0.25 * size)
+            plans.append((fitz.Rect(r), size, color, fontname,
+                          baseline_y, max_w))
+            page.add_redact_annot(r)
+        # IMAGE_NONE: never damage figures the hit rect overlaps.
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+        if replace:
+            for r, size, color, fontname, baseline_y, max_w in plans:
+                fs = size
+                # Shrink until the replacement fits the free width
+                # so it never collides with its neighbors.
+                while fs > 5 and fitz.get_text_length(
+                        replace, fontname=fontname,
+                        fontsize=fs) > max_w:
+                    fs -= 0.5
+                page.insert_text(
+                    fitz.Point(r.x0, baseline_y), replace,
+                    fontsize=fs, fontname=fontname, color=color,
+                )
+        total += len(hits)
+        pages_hit += 1
+
+    if total == 0:
+        job.errors.append(f"Op #{idx} replace_text: '{find}' not found")
+    else:
+        what = "deleted" if not replace else f"replaced with '{replace}'"
+        job.notes.append(
+            f"replace_text: {total} occurrence(s) of '{find}' "
+            f"{what} across {pages_hit} page(s)")
+
+
+def _op_redact(job: _PdfJob, idx: int, op: dict) -> None:
+    import fitz
+
+    find = op.get("find")
+    rect = op.get("rect")
+    if not find and not (rect and len(rect) == 4):
+        job.errors.append(
+            f"Op #{idx} redact: needs 'find' text or a 4-number 'rect'")
+        return
+    page_spec = op.get("pages", "all")
+    fill = op.get("fill", [0, 0, 0])
+    if isinstance(fill, list) and len(fill) == 3:
+        fill = tuple(float(c) for c in fill)
+    else:
+        fill = (0, 0, 0)
+    count = 0
+
+    for pi in _parse_pages(page_spec, job.doc.page_count):
+        page = job.doc[pi]
+        targets = page.search_for(find) if find else [fitz.Rect(*rect)]
+        if not targets:
+            continue
+        for r in targets:
+            page.add_redact_annot(r, fill=fill)
+        # Privacy-grade: blank image pixels under the region too.
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
+        count += len(targets)
+
+    if count == 0:
+        job.errors.append(
+            f"Op #{idx} redact: nothing matched"
+            + (f" '{find}'" if find else ""))
+    else:
+        job.notes.append(f"redact: {count} region(s) permanently removed")
+
+
+def _op_add_annotation(job: _PdfJob, idx: int, op: dict) -> None:
+    import fitz
+
+    pi = int(op.get("page", 0))
+    if pi >= job.doc.page_count:
+        job.errors.append(f"Op #{idx} add_annotation: page {pi} out of range")
+        return
+    page = job.doc[pi]
+    annot_type = op.get("annotation_type", "highlight")
+    rect = op.get("rect", [100, 700, 400, 720])
+    r = fitz.Rect(*rect)
+    color = op.get("color", [1, 1, 0])
+    if isinstance(color, list):
+        color = tuple(float(c) for c in color)
+    content = op.get("content", "")
+
+    if annot_type == "highlight":
+        annot = page.add_highlight_annot(r)
+    elif annot_type == "underline":
+        annot = page.add_underline_annot(r)
+    elif annot_type == "strikeout":
+        annot = page.add_strikeout_annot(r)
+    elif annot_type == "text_note":
+        annot = page.add_text_annot(fitz.Point(r.x0, r.y0), content)
+    elif annot_type == "rectangle":
+        annot = page.add_rect_annot(r)
+    else:
+        job.errors.append(f"Op #{idx} add_annotation: unknown type '{annot_type}'")
+        return
+
+    if annot and color and annot_type != "text_note":
+        annot.set_colors(stroke=color)
+        annot.update()
+    if annot and content and annot_type != "text_note":
+        annot.set_info(content=content)
+        annot.update()
+
+
+# ---------------------------------------------------------------------------
+# Edit — security & optimization
+# ---------------------------------------------------------------------------
+
+
+def _op_encrypt(job: _PdfJob, idx: int, op: dict) -> None:
+    import fitz
+
+    user_pw = op.get("user_password") or op.get("password", "")
+    owner_pw = op.get("owner_password", user_pw)
+    perms_raw = op.get("permissions", {})
+
+    # Accept both dict {"print": true} and list ["print", "copy"]
+    if isinstance(perms_raw, list):
+        perms = {p: True for p in perms_raw}
+    elif isinstance(perms_raw, dict):
+        perms = perms_raw
+    else:
+        perms = {}
+
+    perm_flags = fitz.PDF_PERM_ACCESSIBILITY
+    if perms.get("print", True):
+        perm_flags |= fitz.PDF_PERM_PRINT | fitz.PDF_PERM_PRINT_HQ
+    if perms.get("copy", True):
+        perm_flags |= fitz.PDF_PERM_COPY
+    if perms.get("annotate", True):
+        perm_flags |= fitz.PDF_PERM_ANNOTATE
+    if perms.get("modify", False):
+        perm_flags |= fitz.PDF_PERM_MODIFY
+
+    # Save encrypted — applied at save time, store params for later
+    job.doc._encrypt_user_pw = user_pw
+    job.doc._encrypt_owner_pw = owner_pw
+    job.doc._encrypt_perms = perm_flags
+
+
+def _op_decrypt(job: _PdfJob, idx: int, op: dict) -> None:
+    password = op.get("password", "")
+    if job.doc.is_encrypted:
+        if not job.doc.authenticate(password):
+            job.errors.append(f"Op #{idx} decrypt: incorrect password")
+
+
+def _op_compress(job: _PdfJob, idx: int, op: dict) -> None:
+    # Compression applied at save time — store params
+    job.doc._compress_garbage = int(op.get("garbage", 4))
+    job.doc._compress_deflate = op.get("deflate", True)
+    job.doc._compress_deflate_images = op.get("deflate_images", True)
+    job.doc._compress_deflate_fonts = op.get("deflate_fonts", True)
+
+
+def _op_set_metadata(job: _PdfJob, idx: int, op: dict) -> None:
+    new_meta = {}
+    for key in ("title", "author", "subject", "keywords", "creator", "producer"):
+        if op.get(key):
+            new_meta[key] = op[key]
+    if new_meta:
+        job.doc.set_metadata(new_meta)
+
+
+# ---------------------------------------------------------------------------
+# Edit — extraction
+# ---------------------------------------------------------------------------
+
+
+def _op_extract_images(job: _PdfJob, idx: int, op: dict) -> None:
+    page_spec = op.get("pages", "all")
+    output_dir = op.get("output_dir")
+    if not output_dir:
+        output_dir = str(Path(job.path).parent / (Path(job.path).stem + "_images"))
+    out_dir = _checked_resolved(output_dir)
+    safe_mkdirs(out_dir)
+
+    extracted = []
+    for pi in _parse_pages(page_spec, job.doc.page_count):
+        page = job.doc[pi]
+        for img_idx, img in enumerate(page.get_images(full=True)):
+            xref = img[0]
+            try:
+                base_image = job.doc.extract_image(xref)
+                ext = base_image["ext"]
+                img_bytes = base_image["image"]
+                fname = f"page{pi + 1}_img{img_idx + 1}.{ext}"
+                img_path = Path(out_dir) / fname
+                with safe_open_write(str(img_path)) as fh:
+                    fh.write(img_bytes)
+                extracted.append(str(img_path))
+            except Exception as e:  # noqa: BLE001  # PyMuPDF on a user's PDF raises anything from its parser
+                logger.warning(f"Failed to extract image xref={xref}: {e}")
+
+    if extracted:
+        job.errors.append(f"Op #{idx} extract_images: extracted {len(extracted)} images to {_to_agents_relative(out_dir)}")
+
+
+def _op_ocr(job: _PdfJob, idx: int, op: dict) -> None:
+    import fitz
+
+    language = op.get("language", "eng")
+    page_spec = op.get("pages", "all")
+    output_path = op.get("output_path")
+    requested_dpi = op.get("dpi")
+
+    for pi in _parse_pages(page_spec, job.doc.page_count):
+        page = job.doc[pi]
+        try:
+            # Render the page and let Tesseract produce a 1-page
+            # PDF with an invisible text layer, then swap it in.
+            # (A TextPage from get_textpage_ocr() is extraction-
+            # only — it never modifies the document, so the saved
+            # PDF would stay unsearchable.) The raster must stay
+            # RGB — a csGRAY pixmap makes pdfocr_tobytes return
+            # an EMPTY text layer (pymupdf 1.27) — so output size
+            # is controlled by capping dpi at the scan's own
+            # resolution instead of upsampling to 300.
+            pix = page.get_pixmap(
+                dpi=_ocr_raster_dpi(page, requested_dpi),
+            )
+            ocr_pdf = fitz.open(
+                "pdf", pix.pdfocr_tobytes(language=language)
+            )
+            job.doc.delete_page(pi)
+            job.doc.insert_pdf(
+                ocr_pdf, from_page=0, to_page=0, start_at=pi
+            )
+            ocr_pdf.close()
+        except Exception as e:  # noqa: BLE001  # a page's OCR failure becomes its error line, the rest still run
+            job.errors.append(f"Op #{idx} ocr: page {pi} failed: {e}")
+
+    if output_path:
+        out = _checked_resolved(output_path)
+        _save_pdf_beneath(job.doc, out)
+
+
+_HANDLERS = {
+    "merge": _op_merge,
+    "split": _op_split,
+    "rotate_page": _op_rotate_page,
+    "delete_page": _op_delete_page,
+    "reorder_pages": _op_reorder_pages,
+    "insert_page": _op_insert_page,
+    "crop_page": _op_crop_page,
+    "add_text": _op_add_text,
+    "add_image": _op_add_image,
+    "add_watermark": _op_add_watermark,
+    "replace_text": _op_replace_text,
+    "redact": _op_redact,
+    "add_annotation": _op_add_annotation,
+    "encrypt": _op_encrypt,
+    "decrypt": _op_decrypt,
+    "compress": _op_compress,
+    "set_metadata": _op_set_metadata,
+    "extract_images": _op_extract_images,
+    "ocr": _op_ocr,
+}
+
+
 def _edit_pdf_core(path: str, ops: list, dropped: int) -> str:
     """Worker core: the whole op loop + atomic save. Pure sync — paths were
     pre-resolved by the parent (markers re-raise at the op's use site), no
@@ -701,430 +1193,18 @@ def _edit_pdf_core(path: str, ops: list, dropped: int) -> str:
     doc = fitz.open(path)
     errors = []
     notes = []
+    job = _PdfJob(doc, path, errors, notes)
 
     for idx, op in enumerate(ops):
         ot = _op_type(op)
         try:
-            # =============================================================
-            # PAGE OPERATIONS
-            # =============================================================
-
-            if ot == "merge":
-                files = op.get("files", [])
-                position = op.get("position", "end")
-                for f in files:
-                    src_path = _checked_resolved(f)
-                    if not Path(src_path).exists():
-                        errors.append(f"Op #{idx} merge: file not found: {f}")
-                        continue
-                    src = fitz.open(src_path)
-                    if position == "start":
-                        doc.insert_pdf(src, to_page=-1, start_at=0)
-                    elif isinstance(position, int):
-                        doc.insert_pdf(src, start_at=position)
-                    else:
-                        doc.insert_pdf(src)
-                    src.close()
-
-            elif ot == "split":
-                page_spec = op.get("pages", "all")
-                output_path = op.get("output_path")
-                if not output_path:
-                    errors.append(f"Op #{idx} split: output_path required")
-                    continue
-                out = _checked_resolved(output_path)
-                page_indices = _parse_pages(page_spec, doc.page_count)
-                new_doc = fitz.open()
-                for pi in page_indices:
-                    new_doc.insert_pdf(doc, from_page=pi, to_page=pi)
-                # Atomic and beneath the mount: `out` may name an existing
-                # file, a killed child must never leave it truncated, and a
-                # link at the name or on the way never redirects it.
-                try:
-                    _save_pdf_beneath(new_doc, out)
-                finally:
-                    new_doc.close()
-
-            elif ot == "rotate_page":
-                page_spec = op.get("pages", "all")
-                degrees = int(op.get("degrees", 90))
-                for pi in _parse_pages(page_spec, doc.page_count):
-                    doc[pi].set_rotation(degrees)
-
-            elif ot == "delete_page":
-                page_spec = op.get("pages", [])
-                indices = _parse_pages(page_spec, doc.page_count)
-                # Delete in reverse order to preserve indices
-                for pi in sorted(indices, reverse=True):
-                    doc.delete_page(pi)
-
-            elif ot == "reorder_pages":
-                order = op.get("order", [])
-                if order:
-                    doc.select([int(i) for i in order])
-
-            elif ot == "insert_page":
-                position = int(op.get("position", -1))
-                width = float(op.get("width", 595))
-                height = float(op.get("height", 842))
-                doc.insert_page(position, width=width, height=height)
-
-            elif ot == "crop_page":
-                page_spec = op.get("pages", "all")
-                rect = op.get("rect")
-                for pi in _parse_pages(page_spec, doc.page_count):
-                    page = doc[pi]
-                    if rect == "auto":
-                        # Auto-detect content boundaries
-                        blocks = page.get_text("blocks")
-                        if blocks:
-                            x0 = min(b[0] for b in blocks) - 10
-                            y0 = min(b[1] for b in blocks) - 10
-                            x1 = max(b[2] for b in blocks) + 10
-                            y1 = max(b[3] for b in blocks) + 10
-                            page.set_cropbox(fitz.Rect(x0, y0, x1, y1))
-                    elif rect and len(rect) == 4:
-                        page.set_cropbox(fitz.Rect(*rect))
-
-            # =============================================================
-            # CONTENT OPERATIONS
-            # =============================================================
-
-            elif ot == "add_text":
-                pi = int(op.get("page", 0))
-                if pi >= doc.page_count:
-                    errors.append(f"Op #{idx} add_text: page {pi} out of range")
-                    continue
-                page = doc[pi]
-                text = op.get("text", "")
-                x = float(op.get("x", 72))
-                y = float(op.get("y", 72))
-                font_size = float(op.get("font_size", 12))
-                color = op.get("color", [0, 0, 0])
-                if isinstance(color, list) and len(color) == 3:
-                    color = tuple(float(c) for c in color)
-                else:
-                    color = (0, 0, 0)
-                fontname = op.get("font", "helv")
-                page.insert_text(
-                    fitz.Point(x, y), text,
-                    fontsize=font_size, fontname=fontname, color=color,
-                )
-
-            elif ot == "add_image":
-                pi = int(op.get("page", 0))
-                if pi >= doc.page_count:
-                    errors.append(f"Op #{idx} add_image: page {pi} out of range")
-                    continue
-                page = doc[pi]
-                img_path = _checked_resolved(op.get("image_path", ""))
-                rect = op.get("rect", [50, 50, 200, 200])
-                page.insert_image(fitz.Rect(*rect), filename=img_path)
-
-            elif ot == "add_watermark":
-                text = op.get("text", "DRAFT")
-                page_spec = op.get("pages", "all")
-                font_size = float(op.get("font_size", 60))
-                color = op.get("color", [0.8, 0.8, 0.8])
-                if isinstance(color, list):
-                    color = tuple(float(c) for c in color)
-                rotation = float(op.get("rotation", 45))
-                opacity = float(op.get("opacity", 0.3))
-
-                text_len = fitz.get_text_length(
-                    text, fontname="helv", fontsize=font_size)
-                for pi in _parse_pages(page_spec, doc.page_count):
-                    page = doc[pi]
-                    rect = page.rect
-                    center = fitz.Point(rect.width / 2, rect.height / 2)
-                    # Straight text centered on the page, then rotated as one
-                    # unit around the center via morph. insert_text's own
-                    # `rotate` only takes quarter turns — and combining it
-                    # with a morph used to shear each glyph individually.
-                    m = fitz.Matrix(1, 1)
-                    m.prerotate(rotation)  # positive = the usual ↗ diagonal
-                    page.insert_text(
-                        fitz.Point(center.x - text_len / 2,
-                                   center.y + font_size * 0.35),
-                        text,
-                        fontsize=font_size,
-                        fontname="helv",
-                        color=color,
-                        overlay=True,
-                        fill_opacity=opacity,
-                        stroke_opacity=opacity,
-                        morph=(center, m),
-                    )
-
-            elif ot == "replace_text":
-                find = op.get("find", "")
-                replace = op.get("replace", "")
-                if not find:
-                    errors.append(f"Op #{idx} replace_text: 'find' text required")
-                    continue
-                page_spec = op.get("pages", "all")
-                case_sensitive = bool(op.get("case_sensitive", False))
-                total, pages_hit = 0, 0
-
-                for pi in _parse_pages(page_spec, doc.page_count):
-                    page = doc[pi]
-                    hits = page.search_for(find)
-                    if case_sensitive:
-                        # search_for matches case-insensitively; keep only
-                        # hits whose underlying text contains the exact form.
-                        hits = [
-                            r for r in hits
-                            if find in page.get_text(
-                                "text", clip=fitz.Rect(r) + (-1, -1, 1, 1))
-                        ]
-                    if not hits:
-                        continue
-
-                    # Capture style + free width BEFORE redacting (redaction
-                    # removes the spans the probes read), then redact, then
-                    # reinsert.
-                    words = page.get_text("words")
-                    plans = []
-                    for r in hits:
-                        size, color, fontname, baseline_y = _text_style_at(page, r)
-                        # The replacement may run past the original footprint
-                        # up to the next word on the same line (minus one
-                        # space width) — or to the right margin when the hit
-                        # ends its line.
-                        next_x0 = min(
-                            (w[0] for w in words
-                             if w[1] < r.y1 and w[3] > r.y0 and w[0] >= r.x1 - 1),
-                            default=page.rect.x1 - 36,
-                        )
-                        max_w = max(r.width, next_x0 - r.x0 - 0.25 * size)
-                        plans.append((fitz.Rect(r), size, color, fontname,
-                                      baseline_y, max_w))
-                        page.add_redact_annot(r)
-                    # IMAGE_NONE: never damage figures the hit rect overlaps.
-                    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-
-                    if replace:
-                        for r, size, color, fontname, baseline_y, max_w in plans:
-                            fs = size
-                            # Shrink until the replacement fits the free width
-                            # so it never collides with its neighbors.
-                            while fs > 5 and fitz.get_text_length(
-                                    replace, fontname=fontname,
-                                    fontsize=fs) > max_w:
-                                fs -= 0.5
-                            page.insert_text(
-                                fitz.Point(r.x0, baseline_y), replace,
-                                fontsize=fs, fontname=fontname, color=color,
-                            )
-                    total += len(hits)
-                    pages_hit += 1
-
-                if total == 0:
-                    errors.append(f"Op #{idx} replace_text: '{find}' not found")
-                else:
-                    what = "deleted" if not replace else f"replaced with '{replace}'"
-                    notes.append(
-                        f"replace_text: {total} occurrence(s) of '{find}' "
-                        f"{what} across {pages_hit} page(s)")
-
-            elif ot == "redact":
-                find = op.get("find")
-                rect = op.get("rect")
-                if not find and not (rect and len(rect) == 4):
-                    errors.append(
-                        f"Op #{idx} redact: needs 'find' text or a 4-number 'rect'")
-                    continue
-                page_spec = op.get("pages", "all")
-                fill = op.get("fill", [0, 0, 0])
-                if isinstance(fill, list) and len(fill) == 3:
-                    fill = tuple(float(c) for c in fill)
-                else:
-                    fill = (0, 0, 0)
-                count = 0
-
-                for pi in _parse_pages(page_spec, doc.page_count):
-                    page = doc[pi]
-                    targets = page.search_for(find) if find else [fitz.Rect(*rect)]
-                    if not targets:
-                        continue
-                    for r in targets:
-                        page.add_redact_annot(r, fill=fill)
-                    # Privacy-grade: blank image pixels under the region too.
-                    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS)
-                    count += len(targets)
-
-                if count == 0:
-                    errors.append(
-                        f"Op #{idx} redact: nothing matched"
-                        + (f" '{find}'" if find else ""))
-                else:
-                    notes.append(f"redact: {count} region(s) permanently removed")
-
-            elif ot == "add_annotation":
-                pi = int(op.get("page", 0))
-                if pi >= doc.page_count:
-                    errors.append(f"Op #{idx} add_annotation: page {pi} out of range")
-                    continue
-                page = doc[pi]
-                annot_type = op.get("annotation_type", "highlight")
-                rect = op.get("rect", [100, 700, 400, 720])
-                r = fitz.Rect(*rect)
-                color = op.get("color", [1, 1, 0])
-                if isinstance(color, list):
-                    color = tuple(float(c) for c in color)
-                content = op.get("content", "")
-
-                if annot_type == "highlight":
-                    annot = page.add_highlight_annot(r)
-                elif annot_type == "underline":
-                    annot = page.add_underline_annot(r)
-                elif annot_type == "strikeout":
-                    annot = page.add_strikeout_annot(r)
-                elif annot_type == "text_note":
-                    annot = page.add_text_annot(fitz.Point(r.x0, r.y0), content)
-                elif annot_type == "rectangle":
-                    annot = page.add_rect_annot(r)
-                else:
-                    errors.append(f"Op #{idx} add_annotation: unknown type '{annot_type}'")
-                    continue
-
-                if annot and color and annot_type != "text_note":
-                    annot.set_colors(stroke=color)
-                    annot.update()
-                if annot and content and annot_type != "text_note":
-                    annot.set_info(content=content)
-                    annot.update()
-
-            # =============================================================
-            # SECURITY & OPTIMIZATION
-            # =============================================================
-
-            elif ot == "encrypt":
-                user_pw = op.get("user_password") or op.get("password", "")
-                owner_pw = op.get("owner_password", user_pw)
-                perms_raw = op.get("permissions", {})
-
-                # Accept both dict {"print": true} and list ["print", "copy"]
-                if isinstance(perms_raw, list):
-                    perms = {p: True for p in perms_raw}
-                elif isinstance(perms_raw, dict):
-                    perms = perms_raw
-                else:
-                    perms = {}
-
-                perm_flags = fitz.PDF_PERM_ACCESSIBILITY
-                if perms.get("print", True):
-                    perm_flags |= fitz.PDF_PERM_PRINT | fitz.PDF_PERM_PRINT_HQ
-                if perms.get("copy", True):
-                    perm_flags |= fitz.PDF_PERM_COPY
-                if perms.get("annotate", True):
-                    perm_flags |= fitz.PDF_PERM_ANNOTATE
-                if perms.get("modify", False):
-                    perm_flags |= fitz.PDF_PERM_MODIFY
-
-                # Save encrypted — applied at save time, store params for later
-                doc._encrypt_user_pw = user_pw
-                doc._encrypt_owner_pw = owner_pw
-                doc._encrypt_perms = perm_flags
-
-            elif ot == "decrypt":
-                password = op.get("password", "")
-                if doc.is_encrypted:
-                    if not doc.authenticate(password):
-                        errors.append(f"Op #{idx} decrypt: incorrect password")
-
-            elif ot == "compress":
-                # Compression applied at save time — store params
-                doc._compress_garbage = int(op.get("garbage", 4))
-                doc._compress_deflate = op.get("deflate", True)
-                doc._compress_deflate_images = op.get("deflate_images", True)
-                doc._compress_deflate_fonts = op.get("deflate_fonts", True)
-
-            elif ot == "set_metadata":
-                new_meta = {}
-                for key in ("title", "author", "subject", "keywords", "creator", "producer"):
-                    if op.get(key):
-                        new_meta[key] = op[key]
-                if new_meta:
-                    doc.set_metadata(new_meta)
-
-            # =============================================================
-            # EXTRACTION
-            # =============================================================
-
-            elif ot == "extract_images":
-                page_spec = op.get("pages", "all")
-                output_dir = op.get("output_dir")
-                if not output_dir:
-                    output_dir = str(Path(path).parent / (Path(path).stem + "_images"))
-                out_dir = _checked_resolved(output_dir)
-                safe_mkdirs(out_dir)
-
-                extracted = []
-                for pi in _parse_pages(page_spec, doc.page_count):
-                    page = doc[pi]
-                    for img_idx, img in enumerate(page.get_images(full=True)):
-                        xref = img[0]
-                        try:
-                            base_image = doc.extract_image(xref)
-                            ext = base_image["ext"]
-                            img_bytes = base_image["image"]
-                            fname = f"page{pi + 1}_img{img_idx + 1}.{ext}"
-                            img_path = Path(out_dir) / fname
-                            with safe_open_write(str(img_path)) as fh:
-                                fh.write(img_bytes)
-                            extracted.append(str(img_path))
-                        except Exception as e:
-                            logger.warning(f"Failed to extract image xref={xref}: {e}")
-
-                if extracted:
-                    errors.append(f"Op #{idx} extract_images: extracted {len(extracted)} images to {_to_agents_relative(out_dir)}")
-
-            elif ot == "ocr":
-                language = op.get("language", "eng")
-                page_spec = op.get("pages", "all")
-                output_path = op.get("output_path")
-                requested_dpi = op.get("dpi")
-
-                for pi in _parse_pages(page_spec, doc.page_count):
-                    page = doc[pi]
-                    try:
-                        # Render the page and let Tesseract produce a 1-page
-                        # PDF with an invisible text layer, then swap it in.
-                        # (A TextPage from get_textpage_ocr() is extraction-
-                        # only — it never modifies the document, so the saved
-                        # PDF would stay unsearchable.) The raster must stay
-                        # RGB — a csGRAY pixmap makes pdfocr_tobytes return
-                        # an EMPTY text layer (pymupdf 1.27) — so output size
-                        # is controlled by capping dpi at the scan's own
-                        # resolution instead of upsampling to 300.
-                        pix = page.get_pixmap(
-                            dpi=_ocr_raster_dpi(page, requested_dpi),
-                        )
-                        ocr_pdf = fitz.open(
-                            "pdf", pix.pdfocr_tobytes(language=language)
-                        )
-                        doc.delete_page(pi)
-                        doc.insert_pdf(
-                            ocr_pdf, from_page=0, to_page=0, start_at=pi
-                        )
-                        ocr_pdf.close()
-                    except Exception as e:
-                        errors.append(f"Op #{idx} ocr: page {pi} failed: {e}")
-
-                if output_path:
-                    out = _checked_resolved(output_path)
-                    _save_pdf_beneath(doc, out)
-
-            # =============================================================
-            # UNKNOWN
-            # =============================================================
-
+            handler = _HANDLERS.get(ot) if isinstance(ot, str) else None
+            if handler is not None:
+                handler(job, idx, op)
             else:
                 logger.warning(f"edit_pdf: unknown operation '{ot}', skipping")
                 errors.append(f"Op #{idx}: unknown operation '{ot}'")
-
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # an op's failure becomes its error line, the other ops still run
             errors.append(f"Op #{idx} {ot}: {exc}")
             logger.warning(f"edit_pdf op #{idx} '{ot}' failed: {exc}")
 
@@ -1245,7 +1325,7 @@ def _land_files(src_dir: str, out_dir: str, names: list[str]) -> None:
 
 async def handle_pdf_to_images(args: dict) -> str:
     path = await _resolve_path(args["path"])
-    if not Path(path).exists():
+    if not await asyncio.to_thread(os.path.exists, path):
         return f"Error: File not found: {args['path']}"
 
     output_dir = args.get("output_dir")
@@ -1386,7 +1466,7 @@ async def handle_screenshot_document(args: dict) -> list:
     from mcp.types import ImageContent, TextContent
 
     path = await _resolve_path(args.get("path", ""))
-    if not os.path.isfile(path):
+    if not await asyncio.to_thread(os.path.isfile, path):
         return [TextContent(type="text", text=f"Error: file not found: {_to_agents_relative(path)}")]
 
     ext = Path(path).suffix.lower()
@@ -1438,7 +1518,7 @@ async def handle_screenshot_document(args: dict) -> list:
                         pages_spec = str(
                             _sheet_index_from_names(sheetnames, sheet) + 1
                         )
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001  # the spreadsheet prep raises anything openpyxl does, the original renders
                     logger.warning(f"screenshot excel prep failed: {e}, using original")
                     convert_path = path
             elif sheet is not None and ext in (".ods", ".csv"):
@@ -1491,11 +1571,11 @@ async def handle_screenshot_document(args: dict) -> list:
         content_items.append(TextContent(type="text", text="\n".join(lines)))
         return content_items
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error rendering {_to_agents_relative(path)}: {e}")]
     finally:
-        if temp_dir and os.path.isdir(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        if temp_dir:
+            await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
 
 
 def _sheet_index_from_names(names: list, sheet) -> int:
@@ -1635,10 +1715,10 @@ async def handle_images_to_pdf(args: dict) -> str:
     for img_input in images:
         try:
             img_path = await _resolve_path(img_input)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # an input that cannot be resolved is skipped, the rest still render
             logger.warning(f"images_to_pdf: skipping {img_input} ({exc})")
             continue
-        if not Path(img_path).exists():
+        if not await asyncio.to_thread(os.path.exists, img_path):
             logger.warning(f"images_to_pdf: skipping {img_input} (not found)")
             continue
         image_paths.append(img_path)
@@ -1734,7 +1814,7 @@ def _read_source(container_path: str, *, html: bool) -> str:
 
 async def handle_convert_document(args: dict) -> str:
     input_path = await _resolve_path(args["input_path"])
-    if not Path(input_path).exists():
+    if not await asyncio.to_thread(os.path.exists, input_path):
         return f"Error: File not found: {args['input_path']}"
 
     output_format = args.get("output_format", "pdf")
@@ -1781,7 +1861,7 @@ async def handle_convert_document(args: dict) -> str:
     # LibreOffice headless for everything else. Deliberately NOT a worker
     # child: soffice is already a separate OS process, so the container cap
     # bounds it and a cgroup OOM kill targets its RSS, not the server;
-    # _libreoffice_lock serializes runs and the 120s timeout kills hangs.
+    # the conversion slots bound how many run and the 120s timeout ends hangs.
     # A worker wrapper could only strip the child's RLIMIT_AS (it survives
     # fork+exec, see isolation.py) or cap soffice confusingly. It writes by
     # name, so it writes into a temp directory outside the tree; the result

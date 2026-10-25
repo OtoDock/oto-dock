@@ -21,8 +21,8 @@ llm / outbound) don't change.
 
 from __future__ import annotations
 
-import contextlib
 import asyncio
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 
 

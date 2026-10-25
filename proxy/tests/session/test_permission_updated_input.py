@@ -15,8 +15,8 @@ import pytest
 
 from api.hooks import permission, routing
 from auth.path_policy import SecurityContext
-from tests._paths import PROXY_DIR
 from core import placement
+from tests._paths import PROXY_DIR
 
 _GATE_SCRIPT = PROXY_DIR / "hooks" / "permission_gate.py"
 
@@ -420,3 +420,32 @@ def test_gate_defer_emits_nothing():
         {"decision": "defer"},
     )
     assert out is None
+
+
+def test_gate_defer_carries_a_rewrite_with_no_decision():
+    # Auto's review set on a satellite: the rewrite rides the defer as a bare
+    # updatedInput, so Claude Code applies it and its classifier still judges
+    # the call (probed on 2.1.296); Codex (deny-only) gets nothing.
+    stdin = {"tool_name": "Write", "tool_input": {"file_path": "/workspace/x.md"}}
+    resp = {"decision": "defer", "updated_input": {"file_path": "/home/dave/w/x.md"}}
+    out = _run_gate(stdin, resp)
+    assert out["hookSpecificOutput"]["updatedInput"] == {"file_path": "/home/dave/w/x.md"}
+    assert "permissionDecision" not in out["hookSpecificOutput"]
+    assert _run_gate(stdin, resp, extra_env={"OTO_HOOK_DENY_ONLY": "1"}) is None
+
+
+@pytest.mark.asyncio
+async def test_an_auto_defer_to_the_reviewer_carries_the_rewrite(_stub, monkeypatch):
+    from core.session import session_manager
+    monkeypatch.setattr(permission, "get_session_mode", lambda sid: "autoReview")
+    monkeypatch.setattr(permission, "get_session_client_type", lambda sid: "dashboard")
+    claude = session_manager.get_all_layers()["claude-code-cli"]
+    monkeypatch.setattr(session_manager, "engine_layer_for_session", lambda sid: claude)
+    # A rewritten call outside Auto's allow set (forced here: the native
+    # path tools are file edits Auto runs) goes to the classifier with it.
+    monkeypatch.setattr(permission._ToolCall, "auto_allows", lambda self: False)
+    res = await permission.decide_tool_permission(
+        "s", "Write", {"file_path": "/workspace/notes.md", "content": "x"},
+        live_permission_mode="auto")
+    assert res["decision"] == "defer"
+    assert res["updated_input"]["file_path"] == "/home/dave/.oto-dock/agents/my-agent/workspace/notes.md"

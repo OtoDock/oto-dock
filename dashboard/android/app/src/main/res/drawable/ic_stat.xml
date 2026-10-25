@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Generated from the master mark (dashboard/design/brand/otodock-mark.svg)
+     by the brand script: regenerate, never edit. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="115.2"
+    android:viewportHeight="115.2">
+    <group
+        android:translateX="9.6"
+        android:translateY="9.6"
+        android:scaleX="1"
+        android:scaleY="1">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:fillType="evenOdd"
+            android:pathData="M 45 13.196 A 6 6 0 1 1 51 13.196 L 51 20.125 A 36 36 0 0 1 81.941 44 L 92 44 A 4 4 0 0 1 96 48 L 96 60 A 4 4 0 0 1 92 64 L 83.1 64 A 36 36 0 0 1 12.9 64 L 4 64 A 4 4 0 0 1 0 60 L 0 48 A 4 4 0 0 1 4 44 L 14.059 44 A 36 36 0 0 1 45 20.125 Z M 32 40 L 64 40 A 8 8 0 0 1 72 48 L 72 52 A 8 8 0 0 1 64 60 L 56 60 L 48 64 L 32 64 A 8 8 0 0 1 24 56 L 24 48 A 8 8 0 0 1 32 40 Z M 29 52 A 7 7 0 1 1 43 52 A 7 7 0 1 1 29 52 Z M 55 52 A 5 5 0 1 1 65 52 A 5 5 0 1 1 55 52 Z"/>
+    </group>
+</vector>

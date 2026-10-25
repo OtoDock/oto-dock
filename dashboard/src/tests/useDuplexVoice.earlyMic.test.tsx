@@ -19,22 +19,10 @@ import { useDuplexVoice } from '@/hooks/useDuplexVoice'
 import {
   FakeAudioContext, emitFrame, installMicEnv, uninstallMicEnv, type MicEnv,
 } from './fakeMicEnv'
+import { fakeWebSocketClass } from './fakeWebSocket'
 
-class FakeWebSocket {
-  static OPEN = 1
-  static CONNECTING = 0
-  static instances: FakeWebSocket[] = []
-  readyState = FakeWebSocket.OPEN
-  binaryType = ''
-  sent: (string | ArrayBuffer)[] = []
-  onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
-  onmessage: ((e: { data: string }) => void) | null = null
-  constructor(public url: string) { FakeWebSocket.instances.push(this) }
-  send(data: string | ArrayBuffer) { this.sent.push(data) }
-  close() { /* keep teardown quiet */ }
-}
+const FakeWebSocket = fakeWebSocketClass<string | ArrayBuffer>()
+type FakeWebSocket = InstanceType<typeof FakeWebSocket>
 
 const binaryFrames = (ws: FakeWebSocket) =>
   ws.sent.filter((s): s is ArrayBuffer => s instanceof ArrayBuffer)

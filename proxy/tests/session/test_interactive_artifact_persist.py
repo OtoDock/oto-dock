@@ -72,12 +72,12 @@ class TestPersistDrainedArtifact:
         temp_db.create_chat("chat-art-4", "user-admin", "agent-x")
         item = {"event_type": "document_preview", "wopi_url": "w", "filename": "f.docx",
                 "file_id": "fid", "download_url": "/d", "access_token": "wopi-tok",
-                "access_token_ttl": 1790000000000}
+                "access_token_ttl": 1790000000000, "token_person": "user-admin"}
         assert artifact_event_from_perm_item(item)["access_token"] == "wopi-tok"
         assert isess.persist_drained_artifact("chat-art-4", item) is not None
         (row,) = temp_db.get_chat_messages("chat-art-4")
         stored = json.loads(row["event_data"])
-        assert "access_token" not in stored and "access_token_ttl" not in stored
+        assert not {"access_token", "access_token_ttl", "token_person"} & stored.keys()
         assert "wopi-tok" not in row["event_data"] and stored["wopi_url"] == "w"
 
     def test_transient_and_blocking_items_never_persist(self, temp_db):

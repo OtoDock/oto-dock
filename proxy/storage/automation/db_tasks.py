@@ -33,10 +33,16 @@ def update_run(run_id: str, *, status: str | None = None, output_text: str | Non
                started_at: str | None = None, completed_at: str | None = None,
                duration_ms: int | None = None, cost_usd: float | None = None,
                chat_id: str | None = None,
-               background_pending: int | None = None) -> None:
+               background_pending: int | None = None,
+               execution_target: str | None = None) -> None:
+    """Write the given columns of a run. ``execution_target`` is where the
+    run actually ran (``local`` or a machine id), stamped when its layer is
+    bound."""
     fields: list[tuple[str, Any]] = []
     if status is not None:
         fields.append(("status", status))
+    if execution_target is not None:
+        fields.append(("execution_target", execution_target))
     if background_pending is not None:
         fields.append(("background_pending", background_pending))
     if output_text is not None:
@@ -469,9 +475,11 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
                         until_at: str | None = None,
                         override_model: str | None = None,
                         override_execution_path: str | None = None,
+                        permission_mode: str = "",
                         app_id: str | None = None,
                         app_handler: str | None = None,
-                        checks: str = "") -> None:
+                        checks: str = "",
+                        target_machine: str = "") -> None:
     """Insert a dynamic_tasks row.
 
     ``app_id`` + ``app_handler`` mark an app handler's schedule row
@@ -490,7 +498,12 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
     ``override_model`` / ``override_execution_path`` pin this task's runs to
     a specific model / execution layer. Empty (the default) = inherit the
     agent's default at fire time; the caller validates against the agent's
-    envelope before writing.
+    envelope before writing. ``permission_mode`` is the run's mode: '' for
+    Don't Ask, ``autoReview`` for Auto.
+
+    ``target_machine`` is the machine the task's runs use: "" for the
+    agent's default, ``local`` for the server, else a machine id; the
+    caller validates it for the task's run person before writing.
     """
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
@@ -503,8 +516,9 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
                 notification_mode, notify_severity, user_tz,
                 community_template, community_template_item_slug,
                 target_chat_id, max_runs, until_at,
-                override_model, override_execution_path, app_id, app_handler, checks)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                override_model, override_execution_path, permission_mode, app_id, app_handler,
+                checks, target_machine)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (task_id, agent, name, prompt, llm_mode, task_type, schedule, run_at,
              delay_seconds, interval_seconds, timeout_seconds, now, created_by,
              on_complete_agent, on_complete_prompt, on_complete_session_id,
@@ -512,8 +526,8 @@ def create_dynamic_task(task_id: str, agent: str, name: str, prompt: str, llm_mo
              notification_mode, notify_severity, user_tz,
              community_template, community_template_item_slug,
              target_chat_id, max_runs, until_at,
-             override_model or "", override_execution_path or "", app_id, app_handler,
-             checks or ""),
+             override_model or "", override_execution_path or "", permission_mode or "",
+             app_id, app_handler, checks or "", target_machine or ""),
         )
         conn.commit()
 
@@ -677,7 +691,7 @@ def _transferable(kinds: list[str]) -> tuple[str, list[Any]]:
     take the editor tier to drive) or is gone: one on a phone call's chat
     is its caller's wake at their own role, whatever that role is, and
     stays theirs."""
-    from core.session.visibility import SHARED_CHAT_OWNER_PREFIX, TASK_CHAT_OWNER_PREFIX
+    from core.session import session_kind
     from services.scheduler import task_kinds
     others = [k for k in kinds if k != task_kinds.CONTINUATION]
     if task_kinds.CONTINUATION not in kinds:
@@ -685,7 +699,8 @@ def _transferable(kinds: list[str]) -> tuple[str, list[Any]]:
     return ("app_id IS NULL AND (task_type = ANY(%s) OR (task_type = %s AND NOT EXISTS ("
             "SELECT 1 FROM chats c WHERE c.id = dynamic_tasks.target_chat_id "
             "AND NOT starts_with(c.user_sub, %s) AND NOT starts_with(c.user_sub, %s))))",
-            [others, task_kinds.CONTINUATION, SHARED_CHAT_OWNER_PREFIX, TASK_CHAT_OWNER_PREFIX])
+            [others, task_kinds.CONTINUATION, session_kind.SHARED_CHAT_OWNER_PREFIX,
+             session_kind.TASK_CHAT_OWNER_PREFIX])
 
 
 def agents_with_automations_by(sub: str, kinds: list[str]) -> list[str]:
@@ -917,6 +932,11 @@ _EDITABLE_TASK_COLUMNS = {
     # are re-validated against the agent's envelope by the API layer.
     "override_model",
     "override_execution_path",
+    # The machine the task's runs use ("" = the agent's default), validated
+    # for the task's run person by the API layer.
+    "target_machine",
+    # The run's permission mode ('' = Don't Ask, autoReview = Auto).
+    "permission_mode",
     # An adopting prompt edit (the offboarding transfer) clears the record
     # and makes the row the adopter's.
     "transferred_from",

@@ -21,8 +21,8 @@ import os
 from pathlib import Path
 
 import config as app_config
-from core.sandbox.sandbox import Mount, SandboxBuilder, SandboxConfig
 from core import layout
+from core.sandbox.sandbox import Mount, SandboxBuilder, SandboxConfig
 
 # Inside the namespace the server always listens here; the host side of the
 # splice is a fresh port per start (the supervisor picks it).
@@ -117,6 +117,9 @@ def build_env(row: dict, token: str, public_key: str, *, port: int = APP_PORT,
         "OTODOCK_APP_PUBLIC_KEY": public_key,
         "OTODOCK_PROXY_URL": f"http://127.0.0.1:{app_config.PORT}",
         "OTODOCK_DATA_DIR": "/app/data",
+        # Bun answers an uncaught error with a plain 500, never its
+        # development page (the message, the paths and the source lines).
+        "NODE_ENV": "production",
     }
     if preview:
         env["OTODOCK_PREVIEW"] = "1"

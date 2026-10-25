@@ -1,84 +1,28 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo, type SetStateAction } from 'react'
 import { useDashboardWs } from './useDashboardWs'
 import type { ThreadGoal } from './useDashboardWs.types'
 import type { LimitPayload } from '../api/usage'
-import { useChatStore } from '@/store/chatStore'
-import { notePushedDocument, pushedDocumentFromFrame } from '@/store/documentPaneStore'
 import { getDeviceLocation } from '../lib/geolocation'
 import { TARGET_LOCAL } from '../lib/placement'
-import type { DisplayMessage, MessageBlock } from '../components/chat/types'
-import { attachmentBlocks, dbMessagesToDisplay, delegateResultBadge, delegateResultBlocks, delegateResultSignature, eventToBlock, costBilledOf, latestCostBilled } from '../lib/messageBlocks'
-import { toQueuedMessage, type QueuedMessage } from '@/store/types'
-import type { SteeredFrame } from '../api/wireEvents'
+import type { DisplayMessage } from '../components/chat/types'
 
-/** A steer accepted by the engine, waiting for the block boundary where it
- * lands: the text, the attachment meta and (a delegated steer) the
- * delegating agent's identity. */
-type HeldSteer = {
-  text: string
-  images?: SteeredFrame['images']
-  files?: SteeredFrame['files']
-  meta?: SteeredFrame['event_data']
-}
-
-function steeredUserMessage(h: HeldSteer, id: string): DisplayMessage {
-  return {
-    id,
-    role: 'user',
-    blocks: [...attachmentBlocks(h.images, h.files), { type: 'text', content: h.text }],
-    createdAt: new Date().toISOString(),
-    agentSlug: h.meta?.agent_slug,
-    agentDisplayName: h.meta?.agent_display_name,
-    agentColor: h.meta?.agent_color,
-    badge: h.meta?.badge,
-  }
-}
 import type { ActiveAgent } from '../components/chat/ChatStatusBar'
 import type { WorkflowLive } from '../components/chat/plan/WorkflowPanel'
 import type { SessionPlan } from '../components/chat/plan/PlanPanel'
 import { useChatMessages } from './useChatMessages'
-import { buildLiveStateMessages } from './chatStream/liveStateBuilder'
 import type { UseChatStreamOptions } from './chatStream/types'
-import { DELEGATE_TOOL, ROLE, toolRole } from '../lib/tools/roles'
-import { HOOK_ITEM, SYSTEM_SUBTYPE, WIRE } from '../api/wireEvents'
-import { DELEGATE_RESULT, RUN_STATUS, type DelegateBlockStatus } from '../lib/status/run'
-import { CHAT_PHASE } from '../lib/status/chat'
-import { evictedBy, isArtifactBlock } from '../lib/kinds/artifact'
+import type { StreamCore } from './chatStream/core'
+import { useMeetingIdentity } from './chatStream/useMeetingIdentity'
+import { useQueueAndSteer } from './chatStream/useQueueAndSteer'
+import { useChatHistory } from './chatStream/useChatHistory'
+import { useTurnEnd } from './chatStream/useTurnEnd'
+import { useStreamBlocks } from './chatStream/useStreamBlocks'
+import { useArtifactChannels } from './chatStream/useArtifactChannels'
+import { DELEGATE_RESULT, RUN_STATUS } from '../lib/status/run'
+import { errorText } from '../lib/http/apiJson'
+import { ASK_MODE, AUTO_REVIEW_MODE } from '../lib/engines/modes'
 
-// Tools that should NOT generate tool_start/tool_end blocks (they have dedicated display
-// events): the plan-mode tools by ROLE (lib/tools/roles), and the platform's delegate MCP
-// tool, which renders as the (expandable) delegate pill from the proxy's delegate_spawn —
-// without this skip it ALSO got a bare generic tool pill (live only; the backend never
-// persisted it, so history and live disagreed).
-const skipsToolEvents = (name: string): boolean => {
-  const role = toolRole(name)
-  return role === ROLE.PLAN_ENTER || role === ROLE.PLAN_EXIT || name === DELEGATE_TOOL
-}
-// Tools that have dedicated subagent blocks — skip tool block but keep tracking logic
-const isSubagentTool = (name: string): boolean => toolRole(name) === ROLE.SUBAGENT
-
-// Reasons the backend's NoSubscriptionError classifier emits — all of them are
-// "connect/reconnect an account" prompts and render the amber setup card, not
-// the red crash card. 'throttled' is deliberately absent (a transient rest is
-// not a setup problem) and falls through to session_error with the backend's
-// try-again message.
-const SUBSCRIPTION_REASONS = new Set([
-  'no_subscription', 'auth_off', 'admin_oauth_only', 'no_pool', 'none',
-  'own_sub_expired',
-])
-
-export function warmupFailSubtype(
-  reason: string | undefined,
-): 'no_subscription' | 'pool_cap' | 'target_unavailable' | 'session_error' | 'below_editor' {
-  if (reason && SUBSCRIPTION_REASONS.has(reason)) return 'no_subscription'
-  // The pool's subscription cap refused the spawn: its own card, with the
-  // cap's wording and a way to the Usage tab.
-  if (reason === 'pool_cap') return 'pool_cap'
-  if (reason === 'target_unavailable') return 'target_unavailable'
-  // A chat that runs as the agent, below the editor role: a role card.
-  if (reason === 'below_editor') return 'below_editor'
-  return 'session_error'
-}
+export { warmupFailSubtype } from './chatStream/useTurnEnd'
 
 /**
  * The shared `/ws/dashboard` streaming state machine — the single source of
@@ -89,45 +33,12 @@ export function warmupFailSubtype(
  * model dropdown, workspace, draft/queue storage, send/abort entry points)
  * stays in the page and is wired in through the options above.
  */
-/**
- * The rebuilt (DB-authoritative) message list plus the trailing OPTIMISTIC
- * user bubbles of the previous list (send-minted `user-<ts>` ids; history
- * rows are `db-*`) that the rebuilt tail does not already hold, text-deduped
- * against it: a send can race a slow history load, and a wholesale replace
- * would erase the prompt until the next reload. Empty `stream-<ts>`
- * assistant placeholders are never carried (streaming re-mints its bubble).
- */
-function withCarriedUserBubbles(prev: DisplayMessage[], displayMsgs: DisplayMessage[]): DisplayMessage[] {
-  const carried: DisplayMessage[] = []
-  for (let i = prev.length - 1; i >= 0; i--) {
-    const m = prev[i]
-    if (!/^(user|stream)-\d+$/.test(m.id)) break
-    if (m.role === 'user') carried.unshift(m)
-  }
-  if (carried.length === 0) return displayMsgs
-  const textOf = (m: DisplayMessage) => {
-    const t = m.blocks.find((b) => b.type === 'text')
-    return t && t.type === 'text' ? t.content : ''
-  }
-  const dbUserTail = new Set(
-    displayMsgs.filter((m) => m.role === 'user').slice(-6).map(textOf),
-  )
-  const fresh = carried.filter((m) => {
-    const t = textOf(m)
-    return !(t && dbUserTail.has(t))
-  })
-  return fresh.length > 0 ? [...displayMsgs, ...fresh] : displayMsgs
-}
-
-// How long a history whose live attach was promised waits for its
-// live_state before it paints alone.
-const HELD_HISTORY_MS = 1500
 
 export function useChatStream(options: UseChatStreamOptions) {
   const { agents } = options
 
   // --- Core state ---
-  const [chatId, setChatId] = useState<string | null>(options.initialChatId ?? null)
+  const [chatId, setChatIdState] = useState<string | null>(options.initialChatId ?? null)
   // Mirror chatId in a ref so the WS callbacks see the current value without
   // re-binding, and can discard stale events from a previously-resumed chat.
   const chatIdRef = useRef<string | null>(chatId)
@@ -142,15 +53,15 @@ export function useChatStream(options: UseChatStreamOptions) {
   // loadingOlderRef / setHasMoreOlder / setLoadingOlder) are returned because
   // onChatHistory — which stays in this hook — resets them.
   const {
-    messages, setMessages, currentMsgRef,
-    rawRowsRef, oldestLoadedIdRef, loadingOlderRef,
+    messages, setMessages, currentMsgRef, reviewNudgeRef, historyHeldRef,
+    rawRowsRef, planRowsRef, oldestLoadedIdRef, loadingOlderRef, resetWindow,
     hasMoreOlder, loadingOlder, setHasMoreOlder, setLoadingOlder,
     appendBlock, seedDbHistory: seedDbRows, loadOlder, removePlaceholders,
     appendToLastTextBlock, updateToolBlock, updateToolBlockByName,
     resolvePermission, updateSubagentActive, updateCommandActive,
     ensureAssistantMsg, upsertPreviewBlock,
   } = useChatMessages({ agents, meetingSpeakerRef, chatIdRef })
-  const [mode, setMode] = useState(options.defaultMode ?? 'default')
+  const [mode, setMode] = useState(options.defaultMode ?? AUTO_REVIEW_MODE)
   const [model, setModel] = useState('')
 
   // Execution target for the active session (set by warmup_ready). When the
@@ -207,22 +118,16 @@ export function useChatStream(options: UseChatStreamOptions) {
   const messagesRef = useRef<DisplayMessage[]>([])
   useEffect(() => { messagesRef.current = messages }, [messages])
   const [totalCost, setTotalCost] = useState(0)
+  // What the gauge shows: the money (an API key's or the relay's turns and
+  // every tool fee), never a subscription's or a local model's activity
+  // estimate, which totalCost still carries for Usage. toolCost is the fees'
+  // share of it.
+  const [billedCost, setBilledCost] = useState(0)
+  const [toolCost, setToolCost] = useState(0)
   // Whether the cost gauge shows: the newest turn's credential kind (an API
   // key / the relay bill real money; a subscription or a local model only
   // estimates activity). totalCost keeps accumulating either way.
   const [costBilled, setCostBilled] = useState(true)
-  // A per-tool MCP fee (image/video generation) is money whatever the LLM
-  // runs on: once one lands in this view the gauge stays visible for the
-  // rest of it, even across later subscription turns. Not persisted per
-  // turn, so a reload falls back to the newest turn's flag (Usage keeps it).
-  const toolFeeRef = useRef(false)
-  // Every DB history seed (the interactive rich-view toggle, the persisted-
-  // rows nudge) re-derives the flag from the newest row, like onChatHistory.
-  const seedDbHistory = useCallback((rows: any[], hasMore: boolean) => {
-    seedDbRows(rows, hasMore)
-    toolFeeRef.current = false
-    setCostBilled(latestCostBilled(rows))
-  }, [seedDbRows])
   const [contextUsed, setContextUsed] = useState(0)
   const [contextMax, setContextMax] = useState(0)
   const [cacheStats, setCacheStats] = useState({ cacheRead: 0, cacheWrite: 0, inputTokens: 0, outputTokens: 0 })
@@ -236,8 +141,10 @@ export function useChatStream(options: UseChatStreamOptions) {
 
   // Plans panel state
   const [sessionPlans, setSessionPlans] = useState<SessionPlan[]>([])
+  // A scroll-back rebuild reads the plan rows as the panel shows them now.
+  useEffect(() => { planRowsRef.current = sessionPlans }, [sessionPlans, planRowsRef])
   // Track mode before plan mode so we can restore
-  const prePlanModeRef = useRef<string>('default')
+  const prePlanModeRef = useRef<string>(ASK_MODE)
 
   // Todo panel state (from TodoWrite tool events)
   const [currentTodos, setCurrentTodos] = useState<Array<{content: string; status: string; activeForm?: string}>>([])
@@ -246,48 +153,12 @@ export function useChatStream(options: UseChatStreamOptions) {
   // Live dynamic-workflow (Workflow tool) trees, keyed by tool_use_id.
   const [workflows, setWorkflows] = useState<WorkflowLive[]>([])
 
-  // Meeting state
-  const [meetingActive, setMeetingActive] = useState(false)
-  const [meetingParticipants, setMeetingParticipants] = useState<Array<{slug: string; display_name: string; color: string}>>([])
-  const [meetingSpeaker, setMeetingSpeaker] = useState<string | null>(null)
-  const [meetingRound, setMeetingRound] = useState(0)
-  const [meetingMaxRounds, setMeetingMaxRounds] = useState(10)
-  const [meetingLeftParticipants, setMeetingLeftParticipants] = useState<Set<string>>(new Set())
-
-  // Queue editing state
-  const [editText, setEditText] = useState<string | null>(null)
-
   // Guard against stale chunks after abort creating phantom bubbles. Armed by
   // the page's handleAbort, disarmed only at a terminal frame (aborted/done),
   // on the next send, or on a chat (re)load — a graceful abort keeps the
   // engine draining for a beat, and those straggler chunks must not reopen a
   // fresh assistant header after finalizeAbortedTurn sealed the message.
   const abortedRef = useRef(false)
-  // Steers accepted mid-turn, held until the next block boundary. Codex
-  // consumes an accepted steer at the next sampling-round boundary — while
-  // the current text block is still streaming, the model has NOT read it
-  // yet. Splitting immediately cut sentences in half; instead the user
-  // bubble + fresh assistant header render at the boundary where the steer
-  // actually lands: the next tool/thinking/subagent block, or turn end.
-  const pendingSteerRef = useRef<HeldSteer[]>([])
-  // The held steers, mirrored into state so the page can SHOW them while
-  // they wait for the boundary (a long tool call otherwise hides a steered
-  // message for minutes). Display only: the message already sits in the
-  // engine, so nothing here is editable or cancellable.
-  const [pendingSteers, setPendingSteers] = useState<QueuedMessage[]>([])
-  // Held steers belong to the chat they were sent in. A chat that loads its
-  // history drops them there (onChatHistory); a new chat loads none, so a
-  // steer held in the chat just left rendered into the new chat's first turn.
-  useEffect(() => {
-    pendingSteerRef.current = []
-    setPendingSteers([])
-    erroredRef.current = false
-    const held = heldHistoryRef.current
-    if (held && held.chatId !== chatId) {
-      clearTimeout(held.timer)
-      heldHistoryRef.current = null
-    }
-  }, [chatId])
   // Guard against stale WS events during chat switch / run switch. Set true by
   // the page on navigation, cleared in onChatHistory / onWarmupReady. While
   // true, all streaming callbacks are no-ops (prevents ghost messages, stale
@@ -301,113 +172,121 @@ export function useChatStream(options: UseChatStreamOptions) {
   // reconcile. Consumed in onDone: a seeded view refetches history once at
   // turn end (DB is authoritative — the pump persists before signaling).
   const liveStateSeededRef = useRef(false)
-  // The TEXT of the last send that already added a user bubble. If the
-  // backend unexpectedly queues THAT SAME message (stale pump from WS
-  // reconnect), onQueued/onQueueSent skip the duplicate bubble/queue entry —
-  // matched by text, because a boolean here suppressed every queued chip for
-  // the rest of the turn: a mid-turn send (claude's queue fallback) arrived
-  // while the flag was still armed from the turn-opening send and its chip
-  // silently vanished until the post-turn drain.
-  const sentWithBubbleRef = useRef<string | null>(null)
-  // That send's queue id (``sendMessage`` mints it): a `queued` frame naming
-  // it is that message whatever its text, and a teammate's message with the
-  // same text is not.
-  const sentWithBubbleIdRef = useRef<string | null>(null)
+
   // The turn ended on an error (a pump's `error` frame, which names the
   // chat and its ending): the card renders live from the frame, so the
   // `done` that follows must not refetch the history (a full remount of the
   // list for nothing). Cleared at the next send and on a chat switch.
   const erroredRef = useRef(false)
-  // A history frame whose live attach follows (`live_pending`): its rebuilt
-  // rows wait here for the turn's live_state, so opening a generating chat
-  // paints once (the rows and the live answer together, the timer already
-  // running). Painted as they are by the next history frame, done, error,
-  // abort or the timer; dropped on a chat switch.
-  const heldHistoryRef = useRef<{ chatId: string; msgs: DisplayMessage[];
-                                  timer: ReturnType<typeof setTimeout> } | null>(null)
+  // A chat switch (the page's, or a minted chat's) leaves the error card
+  // with the chat it belongs to.
+  const setChatId = useCallback((next: SetStateAction<string | null>) => {
+    erroredRef.current = false
+    setChatIdState(next)
+  }, [])
+  // What the concern hooks under hooks/chatStream/ share (core.ts): one
+  // plain object per render, so every handler closes over this render.
+  const core: StreamCore = {
+    options, agents, seedDbRows, chatId,
+    chatIdRef, discardingRef, abortedRef, erroredRef, liveStateSeededRef, thinkingBufRef, meetingSpeakerRef,
+    messagesRef,
+    prePlanModeRef, mode, setMode, setSessionId,
+    setTurnStartTime, setThinkingActive, setCompressingActive, setPermissionPending, setAborting, setWorkflows,
+    setTotalCost, setBilledCost, setToolCost, setCostBilled, setContextUsed, setContextMax, setCacheStats, setSessionPlans, setCurrentTodos,
+    setCurrentGoal, setLimitWarning, setLimitReached, setLimitReachedInfo,
+    messages, setMessages, currentMsgRef, reviewNudgeRef, historyHeldRef, rawRowsRef, planRowsRef, oldestLoadedIdRef,
+    loadingOlderRef, resetWindow, hasMoreOlder, loadingOlder, setHasMoreOlder, setLoadingOlder, loadOlder,
+    appendBlock, removePlaceholders, appendToLastTextBlock, updateToolBlock, updateToolBlockByName,
+    resolvePermission, updateSubagentActive, updateCommandActive, ensureAssistantMsg, upsertPreviewBlock,
+  }
+  const meeting = useMeetingIdentity(core)
+  const {
+    meetingActive, setMeetingActive, meetingParticipants, setMeetingParticipants,
+    meetingSpeaker, setMeetingSpeaker, meetingRound, setMeetingRound, meetingMaxRounds, meetingLeftParticipants,
+  } = meeting
+  const queue = useQueueAndSteer(core, meetingActive)
+  const {
+    pendingSteers, editText, setEditText, sentWithBubbleRef, sentWithBubbleIdRef, flushPendingSteer,
+  } = queue
+  const history = useChatHistory(core, {
+    resetSteers: queue.resetSteers,
+    applyMeetingRestore: meeting.applyMeetingRestore,
+    noteLiveSpeaker: meeting.noteLiveSpeaker,
+    applyLiveStateMeeting: meeting.applyLiveStateMeeting,
+  })
+  const { seedDbHistory } = history
 
-  const dropHeldHistory = () => {
-    const held = heldHistoryRef.current
-    if (held) {
-      clearTimeout(held.timer)
-      heldHistoryRef.current = null
-    }
-  }
-  /** The held history's rows taken for a paint (once), null when none is
-   *  held for the chat this view shows. */
-  const takeHeldHistory = (): DisplayMessage[] | null => {
-    const held = heldHistoryRef.current
-    if (!held) return null
-    dropHeldHistory()
-    return held.chatId === chatIdRef.current ? held.msgs : null
-  }
-  /** Paint the held rows as they are: no live_state came (the turn ended
-   *  first, the attach failed). The timer and the chat's state as an
-   *  ordinary history leaves them. */
-  const paintHeldHistory = () => {
-    const msgs = takeHeldHistory()
-    if (!msgs) return
-    setMessages((prev) => withCarriedUserBubbles(prev, msgs))
+  /** Shared cleanup for a stopped turn. Marks any still-running tool /
+   * subagent / delegate blocks as `failed` (red X) across all assistant
+   * messages, clears thinking/compressing/meeting state, and empties the
+   * activity sidebars. Idempotent — safe to call multiple times.
+   *
+   * Called proactively from the page's handleAbort so the UI clears
+   * immediately even if the server's `aborted` event is delayed or dropped,
+   * and again from the `onAborted` handler as a safety net.
+   */
+  const finalizeAbortedTurn = useCallback(() => {
+    // NOTE: abortedRef stays ARMED here — the graceful abort keeps the engine
+    // draining for a beat, and its straggler chunks must not reopen a fresh
+    // assistant header after this seals the message. The guard disarms at a
+    // terminal frame (aborted/done), the next send, or a chat (re)load.
+    flushPendingSteer(false)  // an accepted steer still owes its user bubble
+    setAborting(false)
+    setMessages((prev) => prev
+      .map((msg) => {
+        if (msg.role !== 'assistant') return msg
+        const hasRunning = msg.blocks.some(
+          (b) =>
+            (b.type === 'tool' && b.status === 'running')
+            || (b.type === 'subagent' && b.isActive)
+            || (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING)
+            || (b.type === 'bgcommand' && b.isActive),
+        )
+        if (!hasRunning) return msg
+        return {
+          ...msg,
+          blocks: msg.blocks.map((b) => {
+            if (b.type === 'tool' && b.status === 'running') return { ...b, status: 'failed' as const }
+            if (b.type === 'subagent' && b.isActive) return { ...b, isActive: false, failed: true }
+            if (b.type === 'bgcommand' && b.isActive) return { ...b, isActive: false, failed: true }
+            if (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING) return { ...b, status: DELEGATE_RESULT.FAILED }
+            return b
+          }),
+        }
+      })
+      .filter((msg) => !(msg.role === 'assistant' && msg.blocks.length === 0))
+    )
+    currentMsgRef.current = null
+    thinkingBufRef.current = ''
+    setThinkingActive(false)
+    setCompressingActive(false)
+    setWorkflows([])
     setTurnStartTime(null)
-    if (chatIdRef.current) useChatStore.getState().setReady(chatIdRef.current)
-  }
-  const holdHistory = (cid: string, msgs: DisplayMessage[]) => {
-    const timer = setTimeout(() => {
-      if (heldHistoryRef.current?.timer === timer) paintHeldHistory()
-    }, HELD_HISTORY_MS)
-    heldHistoryRef.current = { chatId: cid, msgs, timer }
-  }
+    setPermissionPending(false)
+    meeting.resetMeeting()
+    if (options.clearQueueOnAbort) options.queue.clearQueued()
+  }, [meeting, options, flushPendingSteer, setMessages, currentMsgRef])
 
-  /** Render any held steers: user bubble(s) in accept order, then (while the
-   * turn keeps streaming) a fresh assistant continuation that subsequent
-   * blocks land in. `withContinuation=false` at turn end/abort — nothing
-   * streams after, so only the bubbles are owed. No-op when nothing is held. */
-  const flushPendingSteer = (withContinuation = true) => {
-    if (!pendingSteerRef.current.length) return
-    const held = pendingSteerRef.current
-    pendingSteerRef.current = []
-    setPendingSteers([])
-    const now = Date.now()
-    const userMsgs: DisplayMessage[] = held.map((h, i) => steeredUserMessage(h, `user-${now}-${i}`))
-    if (!withContinuation) {
-      setMessages((prev) => [...prev, ...userMsgs])
-      return
-    }
-    const continuation: DisplayMessage = {
-      id: `stream-${now}`,
-      role: 'assistant',
-      blocks: [],
-      createdAt: new Date().toISOString(),
-    }
-    currentMsgRef.current = continuation
-    setMessages((prev) => [...prev, ...userMsgs, continuation])
-  }
-
-  // The meeting half of a history frame's server-computed `restore` (the
-  // full history and a delta apply it alike): an active meeting sets the
-  // indicator's state, anything else ends it.
-  const applyMeetingRestore = (mt: any) => {
-    if (mt && mt.active) {
-      setMeetingActive(true)
-      // Normalize: older proxies sent the DB's slug STRINGS here while the
-      // live meeting_started event sends {slug, display_name, color}
-      // objects — the string form crashed MeetingIndicator (undefined
-      // .charAt) and blanked the app pre-ErrorBoundary.
-      const parts = Array.isArray(mt.participants) ? mt.participants : []
-      setMeetingParticipants(parts.map((p: any) =>
-        typeof p === 'string'
-          ? { slug: p, display_name: p, color: '' }
-          : { slug: p?.slug || '', display_name: p?.display_name || p?.slug || '', color: p?.color || '' }
-      ))
-      setMeetingMaxRounds(mt.max_turns || 30)
-    } else {
-      setMeetingActive(false)
-    }
-  }
+  const turnEnd = useTurnEnd(core, {
+    meetingActive,
+    paintHeldHistory: history.paintHeldHistory,
+    flushPendingSteer,
+    clearSentMarkers: queue.clearSentMarkers,
+    finalizeAbortedTurn,
+    // The rows this view lacks are enough; the server answers in full when
+    // it holds no base for the chat.
+    refetchHistory: (cid) => { try { ws.resumeChat(cid, { delta: true }) } catch { /* ignore */ } },
+  })
+  const blocks = useStreamBlocks(core, {
+    flushPendingSteer,
+    onMeetingSystem: meeting.onMeetingSystem,
+    meetingParticipants,
+  })
 
   // --- WebSocket callbacks ---
 
   const ws = useDashboardWs({
+    newChatTarget: options.newChatTarget,
     // The chat this view is showing — useDashboardWs drops stream frames
     // tagged for any OTHER chat (background generation must not render here).
     // null until warmup_started mints the id for a brand-new chat.
@@ -508,1214 +387,20 @@ export function useChatStream(options: UseChatStreamOptions) {
       options.onLiveness?.(data)
     },
 
-    onChatHistory: (data) => {
-      // Discard stale chat_history events from a previously-resumed chat/run.
-      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
-        return  // stale — belongs to a previous chat
-      }
-      discardingRef.current = false  // Chat loaded — accept events for this chat
-      // Page-owned restore (chat: chatActiveLayer + model from execution_path).
-      options.onChatHistoryMeta?.(data)
-      // Reset all streaming refs — critical for app-background-return where React
-      // state survives but refs point to stale objects from the previous stream.
-      currentMsgRef.current = null
-      thinkingBufRef.current = ''
-      abortedRef.current = false
-      pendingSteerRef.current = []  // held steers belong to the previous view
-      setPendingSteers([])
-      liveStateSeededRef.current = false  // view is DB-authoritative again
-      if (!data.live_pending) setTurnStartTime(null)
-      setThinkingActive(false)
-      setCompressingActive(false)
-      setPermissionPending(false)
-      setAborting(false)
-      setWorkflows([])
-      // Reconcile the per-chat streaming status to the DB-authoritative resume.
-      // The send/stop button reads byChat[chatId].status (per-chat), which is
-      // only cleared by the `done`/`aborted` WS frames — and those are LOST when
-      // the socket is suspended (Android background) while a turn finishes. So a
-      // turn that ended (often on an AskUserQuestion) while backgrounded left the
-      // status stuck at 'streaming' → the button stayed red even though the timer
-      // (turnStartTime, reset above) was gone. resume_chat always sends
-      // chat_history BEFORE any live_state, so reset to 'ready' here; a genuinely
-      // live turn's trailing live_state re-arms it to 'streaming' (same pattern as
-      // turnStartTime). Only the VIEWED chat (the staleness guard above) — a
-      // non-viewed streaming chat keeps its sidebar dot (its pump isn't attached
-      // on this socket, so no live_state would re-arm it).
-      // A frame whose live attach follows holds its paint (below), the
-      // timer and the chat's state with it: the live_state sets them.
-      const livePending = !!data.live_pending
-      if (!livePending) {
-        const _cid = data.chat_id || chatIdRef.current
-        if (_cid) useChatStore.getState().setReady(_cid)
-      }
-      const dbMessages = Array.isArray(data.messages) ? data.messages : []
-      const dbPlans = Array.isArray(data.plans) ? data.plans : []
-      // Reset pagination on EVERY chat_history fire (resume / warmup attach /
-      // mode-switch / reattach / onDone refetch) — the frame is the newest page,
-      // so a re-fire collapses the window back to it (any scrolled-in older pages
-      // are dropped). Rows arrive ascending, so [0] is the oldest loaded id.
-      rawRowsRef.current = dbMessages
-      oldestLoadedIdRef.current = dbMessages.length ? dbMessages[0].id : null
-      loadingOlderRef.current = false
-      setLoadingOlder(false)
-      setHasMoreOlder(!!data.has_more)
-      const displayMsgs = dbMessagesToDisplay(dbMessages, agents)
-      // History is authoritative for everything PERSISTED — but a send can
-      // race a slow history load (long chat): the optimistic user bubble that
-      // handleSend appended would be erased by a wholesale replace, because
-      // this history JSON was read server-side before the prompt persisted
-      // ("my message vanished until the next reload"). Carry forward trailing
-      // OPTIMISTIC user bubbles (send-minted `user-<ts>` ids; history rows are
-      // `db-*`) that the rebuilt list doesn't already contain — text-deduped
-      // against the rebuilt tail in case the prompt DID make it into the read.
-      // Empty `stream-<ts>` assistant placeholders are NOT carried:
-      // currentMsgRef was just reset above, so streaming re-mints its bubble.
-      dropHeldHistory()
-      if (livePending) {
-        holdHistory(data.chat_id || chatIdRef.current || '', displayMsgs)
-      } else {
-        setMessages((prev) => withCarriedUserBubbles(prev, displayMsgs))
-      }
-      // Restore total cost from DB; the gauge follows the newest turn's flag
-      // (reset on every load — a chat switch must not inherit the last one's)
-      if (data.total_cost) setTotalCost(data.total_cost)
-      toolFeeRef.current = false
-      setCostBilled(latestCostBilled(dbMessages))
-      if (data.context_used) setContextUsed(data.context_used)
-      if (data.context_max) setContextMax(data.context_max)
-      if (data.cache_write) setCacheStats({
-        cacheRead: data.cache_read ?? 0,
-        cacheWrite: data.cache_write ?? 0,
-        inputTokens: 0,
-        outputTokens: data.output_tokens ?? 0,
-      })
-      // Restore pinned plans from DB
-      if (dbPlans.length > 0) {
-        setSessionPlans(dbPlans.map((p: any) => ({
-          filename: p.filename,
-          content: p.content,
-          status: p.status as 'pending' | 'implemented' | 'rejected',
-        })))
-      }
-      // Panel restore comes from the server-computed `restore` object (full-history,
-      // window-independent — the lazy-load window may not contain the last snapshot),
-      // NOT from scanning the loaded messages. A frame without `restore` (older/
-      // partial paths) leaves the panels as-is rather than wiping them. For an active
-      // session the trailing live_state overrides this (sent after chat_history).
-      if (data.restore) {
-        setCurrentTodos(Array.isArray(data.restore.todos) ? data.restore.todos : [])
-        setCurrentGoal(data.restore.goal ?? null)
-        applyMeetingRestore(data.restore.meeting)
-      }
-
-      options.onChatHistoryLoaded?.(data)
-    },
-
-    onChatHistoryDelta: (data) => {
-      // A watched task chat's turn end: the rows this view lacks, appended
-      // to the raw rows it holds (deduped by id, kept in id order), and the
-      // view re-derived from all of them (the converter has cross-row
-      // state). Never the first frame of a view: the pagination cursor and
-      // the discard guard are untouched, and a frame for another chat is
-      // dropped.
-      if (!data.chat_id || !chatIdRef.current || data.chat_id !== chatIdRef.current) return
-      if (discardingRef.current) return
-      options.onChatHistoryMeta?.(data)
-      const incoming = Array.isArray(data.messages) ? data.messages : []
-      const byId = new Map<number, any>()
-      for (const r of rawRowsRef.current) byId.set(r.id, r)
-      for (const r of incoming) byId.set(r.id, r)
-      const rows = [...byId.values()].sort((a, b) => a.id - b.id)
-      rawRowsRef.current = rows
-      const displayMsgs = dbMessagesToDisplay(rows, agents)
-      currentMsgRef.current = null
-      // The same carry rule as onChatHistory: trailing optimistic user
-      // bubbles the rows do not hold yet stay; the finished turn's live
-      // bubble is replaced by its rows. A held history is superseded (the
-      // view re-derives from every row).
-      dropHeldHistory()
-      if (data.live_pending) {
-        holdHistory(data.chat_id, displayMsgs)
-      } else {
-        setMessages((prev) => withCarriedUserBubbles(prev, displayMsgs))
-      }
-      if (data.total_cost) setTotalCost(data.total_cost)
-      setCostBilled(latestCostBilled(rows))
-      if (data.context_used) setContextUsed(data.context_used)
-      if (data.context_max) setContextMax(data.context_max)
-      if (data.cache_write) setCacheStats({
-        cacheRead: data.cache_read ?? 0,
-        cacheWrite: data.cache_write ?? 0,
-        inputTokens: 0,
-        outputTokens: data.output_tokens ?? 0,
-      })
-      const dbPlans = Array.isArray(data.plans) ? data.plans : []
-      if (dbPlans.length > 0) {
-        setSessionPlans(dbPlans.map((p: any) => ({
-          filename: p.filename,
-          content: p.content,
-          status: p.status as 'pending' | 'implemented' | 'rejected',
-        })))
-      }
-      // The panels and the meeting indicator as the full history restores
-      // them: a meeting that concluded during the turn ends here too.
-      if (data.restore) {
-        setCurrentTodos(Array.isArray(data.restore.todos) ? data.restore.todos : [])
-        setCurrentGoal(data.restore.goal ?? null)
-        applyMeetingRestore(data.restore.meeting)
-      }
-    },
-
-    onText: (content) => {
-      if (discardingRef.current || abortedRef.current) return
-      if (!currentMsgRef.current) {
-        const speaker = meetingSpeakerRef.current
-        const msg: DisplayMessage = {
-          id: `stream-${Date.now()}`,
-          role: 'assistant',
-          blocks: [{ type: 'text', content }],
-          createdAt: new Date().toISOString(),
-          ...(speaker ? {
-            agentSlug: speaker.slug,
-            agentDisplayName: speaker.displayName,
-            agentColor: speaker.color,
-            badge: 'meeting',
-          } : {}),
-        }
-        currentMsgRef.current = msg
-        setMessages((prev) => [...prev, msg])
-      } else {
-        appendToLastTextBlock(content)
-      }
-    },
-
-    onThinking: (data) => {
-      if (discardingRef.current || abortedRef.current) return
-      flushPendingSteer()  // a new block = the boundary a held steer lands at
-      ensureAssistantMsg()
-      if (data.phase === 'start') {
-        thinkingBufRef.current = ''
-        setThinkingActive(true)
-        appendBlock({ type: 'thinking', content: '', collapsed: true })
-      } else if (data.phase === 'progress') {
-        // Live ~token gauge for content-less thinking (when adaptive effort
-        // hides the thinking text): update the open thinking block's count;
-        // create the block
-        // if a CLI shape ever sends progress without a preceding start.
-        setThinkingActive(true)
-        const tokens = data.estimated_tokens || 0
-        setMessages((prev) => {
-          const last = prev[prev.length - 1]
-          if (!last || last.role !== 'assistant') return prev
-          const blocks = [...last.blocks]
-          let found = false
-          for (let i = blocks.length - 1; i >= 0; i--) {
-            const b = blocks[i] as any
-            if (b.type === 'thinking' && !b.done) {
-              blocks[i] = { ...b, tokens } as MessageBlock
-              found = true
-              break
-            }
-          }
-          if (!found) blocks.push({ type: 'thinking', content: '', collapsed: true, tokens } as MessageBlock)
-          const updated = { ...last, blocks }
-          if (last === currentMsgRef.current) currentMsgRef.current = updated
-          return [...prev.slice(0, -1), updated]
-        })
-      } else if (data.text) {
-        thinkingBufRef.current += data.text
-        setMessages((prev) => {
-          const last = prev[prev.length - 1]
-          if (last && last.role === 'assistant') {
-            const blocks = [...last.blocks]
-            for (let i = blocks.length - 1; i >= 0; i--) {
-              if (blocks[i].type === 'thinking') {
-                blocks[i] = { ...blocks[i], content: thinkingBufRef.current } as MessageBlock
-                break
-              }
-            }
-            const updated = { ...last, blocks }
-            if (last === currentMsgRef.current) currentMsgRef.current = updated
-            return [...prev.slice(0, -1), updated]
-          }
-          return prev
-        })
-      } else if (data.phase === 'end') {
-        setThinkingActive(false)
-        setMessages((prev) => {
-          const last = prev[prev.length - 1]
-          if (last && last.role === 'assistant') {
-            const blocks = last.blocks.map((b) =>
-              b.type === 'thinking' ? { ...b, collapsed: true, done: true } : b,
-            )
-            const updated = { ...last, blocks }
-            if (last === currentMsgRef.current) currentMsgRef.current = updated
-            return [...prev.slice(0, -1), updated]
-          }
-          return prev
-        })
-      }
-    },
-
-    onToolStart: (data) => {
-      if (discardingRef.current || abortedRef.current) return
-      // Filter out plan mode tools (they have dedicated plan_mode events)
-      if (skipsToolEvents(data.name)) return
-      flushPendingSteer()  // a new block = the boundary a held steer lands at
-
-      const toolId = data.tool_id || data.name
-
-      // Agent/Task tools get a dedicated subagent block + status-bar entry —
-      // both created by onTaskSpawn (the authoritative spawn event, which
-      // upserts the badge keyed by tool_use_id). We do NOT pre-add the badge
-      // here: a premature entry keyed by tool_id created an orphan / double-
-      // count whenever task_spawn's id or ordering differed (e.g. missing/
-      // empty tool_use_id, Codex mixed paths). Skip the tool block entirely;
-      // the badge + block now appear together at task_spawn and clear together
-      // by the same key. (No badge before task_spawn = a ~sub-second delay
-      // while the tool input streams — a worthwhile trade for no desync.)
-      if (isSubagentTool(data.name)) {
-        return
-      }
-
-      ensureAssistantMsg()
-      appendBlock({
-        type: 'tool',
-        name: data.name,
-        toolId,
-        summary: '',
-        status: 'running',
-      })
-    },
-
-    onToolInfo: (data) => {
-      if (discardingRef.current) return
-      // tool_info has name but not tool_id, so match by name
-      updateToolBlockByName(data.name, { summary: data.summary || '', toolInput: data.tool_input })
-    },
-
-    onToolResult: (data) => {
-      if (discardingRef.current) return
-      // A FOREGROUND subagent's final report — Agent tools have no generic
-      // tool block; attach the result to the subagent block (by tool_use_id)
-      // so the pill expands to the report. Background spawns keep their
-      // "launched" ack out of the pill (the real report arrives next turn).
-      if (isSubagentTool(data.tool_name)) {
-        const toolId = data.tool_use_id || ''
-        if (!toolId || !data.result_content) return
-        setMessages((prev) =>
-          prev.map((msg) => ({
-            ...msg,
-            blocks: msg.blocks.map((b): MessageBlock =>
-              b.type === 'subagent' && b._toolId === toolId && !b._background
-                ? { ...b, toolResult: data.result_content }
-                : b,
-            ),
-          })),
-        )
-        return
-      }
-      // Attach result content to the most recent matching tool block
-      updateToolBlockByName(data.tool_name, { toolResult: data.result_content, resultSummary: data.summary })
-    },
-
-    onToolEnd: (data) => {
-      if (discardingRef.current) return
-      // Filter out plan mode tools
-      if (skipsToolEvents(data.name)) return
-
-      const toolId = data.tool_id || data.name
-
-      // A subagent's tool_end means "content block streamed", NOT "agent finished".
-      // Agents haven't even started executing yet. Ignore entirely.
-      if (isSubagentTool(data.name)) return
-
-      updateToolBlock(toolId, { status: 'done' })
-    },
-
-    onTaskSpawn: (data) => {
-      if (discardingRef.current || abortedRef.current) return
-      flushPendingSteer()  // a new block = the boundary a held steer lands at
-      ensureAssistantMsg()
-      // task_spawn is the AUTHORITATIVE spawn event — it creates the subagent
-      // block, and the status-bar badge DERIVES from that block (keyed by
-      // _toolId). The CLI binds task_spawn → tool_use_id (== the Agent tool_use
-      // id from onToolStart) so bg_agent_done can clear the right block; Codex's
-      // spawn_agent has no tool_use_id (_toolId null) and clears via
-      // fg/bg_agents_complete.
-      appendBlock({
-        type: 'subagent',
-        description: data.description,
-        subagentType: data.subagent_type || '',
-        isActive: true,  // Always start spinning — completion comes later
-        _toolId: data.tool_use_id || null,
-        _background: data.run_in_background || false,
-        toolInput: data.tool_input,  // full Agent input — the pill expands to it
-      })
-    },
-
-    onDelegateSpawn: (data) => {
-      if (discardingRef.current || abortedRef.current) return
-      flushPendingSteer()  // a new block = the boundary a held steer lands at
-      ensureAssistantMsg()
-      // Proxy-emitted on actual task-create; the badge derives from this block
-      // (keyed by task_id). onDelegateResult completes it by the same task_id.
-      appendBlock({
-        type: 'delegate',
-        taskName: data.task_name,
-        agent: data.agent,
-        promptPreview: data.prompt_preview,
-        status: 'running',
-        _taskId: data.task_id,
-        prompt: data.prompt || '',  // full prompt — the pill expands to it
-        workerChatId: data.chat_id || undefined,
-      })
-    },
-
-    onDelegateResult: (data) => {
-      if (discardingRef.current) return
-      // Mark the matching delegate block completed — by task_id when present
-      // (stable key), else by task_name. The badge derives from the block.
-      setMessages((prev) =>
-        prev.map((msg) => ({
-          ...msg,
-          blocks: msg.blocks.map((b): MessageBlock =>
-            b.type === 'delegate'
-              && ((data.task_id && b._taskId === data.task_id)
-                  || (!data.task_id && b.taskName === data.task_name))
-              ? { ...b, status: ((data.status || DELEGATE_RESULT.COMPLETED) as DelegateBlockStatus) }
-              : b,
-          ),
-        })),
-      )
-
-      // Insert delegate result as inline agent message (the worker's report
-      // text and the files it attached). One delivery can reach this socket
-      // as TWO frames (the ladder's pump push + the WS handler's own send) —
-      // dedupe on task_id + identical blocks so the bubble renders once (a
-      // recurring task's later round has different output or files and
-      // still renders). A result with neither text nor files mints nothing.
-      const blocks = delegateResultBlocks(data)
-      if (blocks.length) {
-        const delegateAgent = agents?.find(a => a.name === data.agent)
-        const dedupPrefix = `delegate-result-${data.task_id || data.task_name}-`
-        const signature = delegateResultSignature(blocks)
-        const isDup = (m: { id: string, blocks: MessageBlock[] }) =>
-          m.id.startsWith(dedupPrefix) && delegateResultSignature(m.blocks) === signature
-        setMessages((prev) => prev.some(isDup) ? prev : [
-          ...prev,
-          {
-            id: `${dedupPrefix}${Date.now()}`,
-            role: 'assistant' as const,
-            blocks,
-            createdAt: new Date().toISOString(),
-            agentSlug: data.agent || '',
-            agentDisplayName: delegateAgent?.display_name,
-            agentColor: delegateAgent?.color || '',
-            badge: delegateResultBadge(data.status),
-          },
-        ])
-      }
-    },
-
-    onBgAgentDone: (data) => {
-      if (discardingRef.current) return
-      // One subagent finished (CLI: SubagentStop hook / task_notification).
-      // Deterministic + order-independent: clear the block for THIS tool_use_id
-      // (the badge derives from it), so parallel agents that finish out of order
-      // each clear their own widget (no FIFO guessing).
-      const toolId = data?.tool_use_id || ''
-      if (!toolId) return
-      updateSubagentActive(toolId, false)
-    },
-
-    onBgCommandSpawn: (data) => {
-      if (discardingRef.current || abortedRef.current) return
-      flushPendingSteer()  // a new block = the boundary a held steer lands at
-      ensureAssistantMsg()
-      // A backgrounded Bash — create a live bg-command block (the badge derives
-      // from it, keyed by _toolId). bg_command_done clears it by the same id.
-      // Rendered on top of the command's normal tool card.
-      appendBlock({
-        type: 'bgcommand',
-        command: data.command || '',
-        description: data.description || '',
-        isActive: true,
-        _toolId: data.tool_use_id || null,
-      })
-    },
-
-    onBgCommandDone: (data) => {
-      if (discardingRef.current) return
-      // One background command finished (CLI task_updated — no completion hook
-      // exists for bg bash). Order-independent clear by tool_use_id so
-      // concurrent commands each clear their own widget.
-      const toolId = data?.tool_use_id || ''
-      if (!toolId) return
-      updateCommandActive(toolId, false)
-    },
-
-    onBgAgentsComplete: (_msg) => {
-      if (discardingRef.current) return
-      // All background agents completed (sent by bg_nudge before auto-response).
-      // Mark ALL remaining bg subagent blocks as done. Array identity is
-      // preserved when nothing matched (same rationale as onDone's map).
-      setMessages((prev) => {
-        let changed = false
-        const next = prev.map((msg) => {
-          if (msg.role !== 'assistant') return msg
-          const hasBg = msg.blocks.some(
-            (b) => b.type === 'subagent' && b.isActive && (b as any)._background,
-          )
-          if (!hasBg) return msg
-          const blocks = msg.blocks.map((b) =>
-            b.type === 'subagent' && b.isActive && (b as any)._background
-              ? { ...b, isActive: false }
-              : b,
-          )
-          const updatedMsg = { ...msg, blocks }
-          if (msg === currentMsgRef.current) currentMsgRef.current = updatedMsg
-          changed = true
-          return updatedMsg
-        })
-        return changed ? next : prev
-      })
-    },
-
-    onBgCommandsComplete: (_msg) => {
-      if (discardingRef.current) return
-      // All background commands finished (sent by bg_command_nudge before the
-      // review turn). The per-command bg_command_done can't deliver post-turn
-      // (the turn's pump is gone), so this is the reliable clear — mark ALL
-      // active bgcommand blocks done. Mirror of onBgAgentsComplete.
-      setMessages((prev) => {
-        let changed = false
-        const next = prev.map((msg) => {
-          if (msg.role !== 'assistant') return msg
-          const hasCmd = msg.blocks.some(
-            (b) => b.type === 'bgcommand' && b.isActive,
-          )
-          if (!hasCmd) return msg
-          const blocks = msg.blocks.map((b) =>
-            b.type === 'bgcommand' && b.isActive
-              ? { ...b, isActive: false }
-              : b,
-          )
-          const updatedMsg = { ...msg, blocks }
-          if (msg === currentMsgRef.current) currentMsgRef.current = updatedMsg
-          changed = true
-          return updatedMsg
-        })
-        return changed ? next : prev
-      })
-    },
-
-    onServerTurnStart: () => {
-      if (discardingRef.current) return
-      // A server-initiated turn (bg-command / bg-subagent review nudge, or a
-      // delegate-result synthesis) is now streaming — no user-send set the live
-      // timer, so start it here (mirrors the send path). done/aborted clear it.
-      setTurnStartTime(Date.now())
-    },
-
-    onWorkflowStart: (data) => {
-      if (discardingRef.current) return
-      setWorkflows((prev) => {
-        if (prev.some((w) => w.toolUseId === data.tool_use_id)) return prev
-        return [...prev, { toolUseId: data.tool_use_id, workflowName: data.workflow_name || '', progress: [], active: true }]
-      })
-    },
-
-    onWorkflowProgress: (data) => {
-      if (discardingRef.current) return
-      setWorkflows((prev) => prev.map((w) =>
-        w.toolUseId === data.tool_use_id ? { ...w, progress: Array.isArray(data.workflow_progress) ? data.workflow_progress : [] } : w,
-      ))
-    },
-
-    onWorkflowEnd: (data) => {
-      if (discardingRef.current) return
-      setWorkflows((prev) => prev.map((w) =>
-        w.toolUseId === data.tool_use_id ? { ...w, active: false } : w,
-      ))
-    },
-
-    onFgAgentsComplete: () => {
-      if (discardingRef.current) return
-      // Codex path: the collab `wait` tool emits fg_agents_complete (no
-      // per-agent id). Claude CLI clears each subagent individually via
-      // bg_agent_done(tool_use_id). Mark ALL foreground subagent blocks done.
-      setMessages((prev) =>
-        prev.map((msg) => {
-          if (msg.role !== 'assistant') return msg
-          const hasFg = msg.blocks.some(
-            (b) => b.type === 'subagent' && b.isActive && !(b as any)._background,
-          )
-          if (!hasFg) return msg
-          const blocks = msg.blocks.map((b) =>
-            b.type === 'subagent' && b.isActive && !(b as any)._background
-              ? { ...b, isActive: false }
-              : b,
-          )
-          const updatedMsg = { ...msg, blocks }
-          if (msg === currentMsgRef.current) currentMsgRef.current = updatedMsg
-          return updatedMsg
-        }),
-      )
-    },
-
+    ...history.callbacks,
+    ...blocks.callbacks,
     onLocationRequest: async (data) => {
       try {
         const loc = await getDeviceLocation()
         ws.sendLocationResponse(data.request_id, loc)
-      } catch (err: any) {
+      } catch (err) {
         ws.sendLocationResponse(data.request_id, {
-          error: err.message || 'Could not determine location',
+          error: errorText(err) || 'Could not determine location',
         })
       }
     },
 
-    onPermissionPrompt: (data) => {
-      if (discardingRef.current) return
-      setPermissionPending(true)
-      setTurnStartTime(null)  // Pause timer — LLM is blocked waiting
-      ensureAssistantMsg()
-      // Resolve meeting agent identity for the permission dialog
-      const meetingAgentSlug = data.meeting_agent as string | undefined
-      const meetingAgent = meetingAgentSlug
-        ? (() => {
-            const p = meetingParticipants.find(pp => pp.slug === meetingAgentSlug)
-            return p ? { slug: p.slug, displayName: p.display_name, color: p.color } : { slug: meetingAgentSlug, displayName: meetingAgentSlug, color: '' }
-          })()
-        : undefined
-      appendBlock({
-        type: 'permission',
-        requestId: data.request_id,
-        toolName: data.tool_name,
-        toolInput: data.tool_input,
-        description: data.description,
-        meetingAgent,
-      })
-    },
-
-    onPlanMode: (data) => {
-      if (discardingRef.current) return
-      ensureAssistantMsg()
-      if (data.action === 'enter') {
-        appendBlock({ type: 'plan', action: 'enter', toolInput: data.tool_input })
-        prePlanModeRef.current = mode
-        setMode('plan')
-      } else if (data.action === 'exit' && (data as any).synthetic) {
-        // Codex has no ExitPlanMode / held plan_review — the plan is the turn's
-        // final message, so the backend synthesizes this exit at turn-end. Render
-        // the implement card (PlanView). Supersede any earlier plan card so a
-        // multi-turn refinement replaces rather than stacks actionable cards, then
-        // append the new card — both in ONE setMessages so currentMsgRef stays in
-        // sync (a separate supersede-map would replace the streaming message object
-        // out from under appendBlock's identity check, dropping the card live).
-        setMessages((prev) => {
-          const superseded = prev.map((msg) => ({
-            ...msg,
-            blocks: msg.blocks.map((b) =>
-              b.type === 'plan' && b.action === 'exit' && !b.superseded
-                ? { ...b, superseded: true }
-                : b,
-            ),
-          }))
-          const last = superseded[superseded.length - 1]
-          if (last && last.role === 'assistant') {
-            const updated = {
-              ...last,
-              blocks: [...last.blocks, {
-                type: 'plan' as const, action: 'exit' as const,
-                toolInput: data.tool_input,
-              }],
-            }
-            currentMsgRef.current = updated
-            return [...superseded.slice(0, -1), updated]
-          }
-          return superseded
-        })
-      }
-      // For Claude, plan_mode exit is a no-op — the actionable card is the held
-      // plan_review; the mode change comes from plan_review_response / auto-approve.
-    },
-
-    onPlanReview: (data) => {
-      if (discardingRef.current) return
-      setPermissionPending(true)
-      setTurnStartTime(null)  // Pause timer — LLM is blocked waiting
-      ensureAssistantMsg()
-      appendBlock({
-        type: 'plan_review',
-        requestId: data.request_id,
-        plan: data.plan,
-        toolInput: data.tool_input,
-        filename: (data as any).filename || '',
-      })
-    },
-
-    // A prompt whose wait ended with no answer (the hook's caller went away,
-    // the wait ran out, a Stop or a close released it): its permission or
-    // held question card leaves, a plan review closes as cancelled (as the
-    // history shows an unanswered one). Only a card that still gates acts:
-    // a stale frame for an answered or unknown id changes nothing.
-    onPromptRetired: (data) => {
-      if (discardingRef.current || !data.request_id) return
-      const rid = data.request_id
-      const isCard = (b: MessageBlock) =>
-        (b.type === 'permission' || b.type === 'plan_review' || b.type === 'question')
-        && b.requestId === rid
-      const gates = (b: MessageBlock) =>
-        ((b.type === 'permission' || b.type === 'plan_review') && !b.resolved)
-        || (b.type === 'question' && !!b.requestId && !b.answered)
-      const before = messagesRef.current
-      if (!before.some((m) => m.blocks.some((b) => isCard(b) && gates(b)))) return
-      setMessages((prev) => prev.map((msg) => {
-        if (!msg.blocks.some(isCard)) return msg
-        const updated = {
-          ...msg,
-          blocks: msg.blocks.flatMap((b): MessageBlock[] => {
-            if (!isCard(b)) return [b]
-            return b.type === 'plan_review' ? [{ ...b, resolved: true, action: 'reject' }] : []
-          }),
-        }
-        if (msg === currentMsgRef.current) currentMsgRef.current = updated
-        return updated
-      }))
-      if (before.some((m) => m.blocks.some((b) => gates(b) && !isCard(b)))) return
-      setPermissionPending(false)
-      // The turn goes on (the hook got its answer or retries): the timer
-      // runs again, only while this chat streams.
-      const cid = chatIdRef.current
-      if (cid && useChatStore.getState().byChat[cid]?.status === CHAT_PHASE.STREAMING) {
-        setTurnStartTime(Date.now())
-      }
-    },
-
-    onSystem: (data) => {
-      if (discardingRef.current) return
-      const subtype = data.subtype
-
-      // Meeting events: update state, selectively create blocks
-      if (subtype === SYSTEM_SUBTYPE.MEETING_STARTED) {
-        setMeetingActive(true)
-        setMeetingParticipants(Array.isArray(data.participants) ? data.participants : [])
-        setMeetingMaxRounds(data.max_turns || data.max_rounds || 30)
-        setMeetingRound(0)
-        setMeetingLeftParticipants(new Set())
-        // Append banner to the last assistant message — but only if it
-        // doesn't already have one (onLiveState may have added it).
-        setMessages((prev) => {
-          for (let i = prev.length - 1; i >= 0; i--) {
-            if (prev[i].role === 'assistant') {
-              const alreadyHas = prev[i].blocks.some(
-                (b) => b.type === 'system' && (b as any).subtype === SYSTEM_SUBTYPE.MEETING_STARTED
-              )
-              if (alreadyHas) return prev
-              const updated = { ...prev[i], blocks: [...prev[i].blocks, { type: 'system' as const, subtype: SYSTEM_SUBTYPE.MEETING_STARTED }] }
-              return [...prev.slice(0, i), updated, ...prev.slice(i + 1)]
-            }
-          }
-          return prev
-        })
-        return
-      }
-      if (subtype === SYSTEM_SUBTYPE.MEETING_TURN_START) {
-        const agentSlug = data.agent || ''
-        setMeetingSpeaker(agentSlug || null)
-        setMeetingRound(data.round || 0)
-        meetingSpeakerRef.current = {
-          slug: agentSlug,
-          displayName: data.agent_display_name || agentSlug,
-          color: data.agent_color || '',
-        }
-        // Force new assistant message — unless the current message is
-        // already for this agent (live_state reconstruction created it,
-        // and this is a duplicate event from the queue).
-        if (currentMsgRef.current?.agentSlug === agentSlug) {
-          // Keep the existing message (it has blocks from live_state like thinking)
-        } else {
-          currentMsgRef.current = null
-        }
-        return  // no block — agent header on the message is enough
-      }
-      if (subtype === SYSTEM_SUBTYPE.MEETING_TURN_END) {
-        setMeetingSpeaker(null)
-        meetingSpeakerRef.current = null
-        return  // no block
-      }
-      if (subtype === SYSTEM_SUBTYPE.MEETING_AGENT_LEFT) {
-        if (data.agent) setMeetingLeftParticipants(prev => new Set([...prev, data.agent!]))
-        ensureAssistantMsg()
-        appendBlock({ type: 'system', subtype, agentName: data.agent_display_name || data.agent, agentColor: data.agent_color })
-        return
-      }
-      if (subtype === SYSTEM_SUBTYPE.MEETING_CONCLUDED) {
-        setMeetingActive(false)
-        setMeetingSpeaker(null)
-        setMeetingParticipants([])
-        setMeetingLeftParticipants(new Set())
-        meetingSpeakerRef.current = null
-        // Show conclusion banner
-        ensureAssistantMsg()
-        appendBlock({ type: 'system', subtype: SYSTEM_SUBTYPE.MEETING_CONCLUDED })
-        return
-      }
-      if (subtype === SYSTEM_SUBTYPE.MEETING_AGENT_FAILED) {
-        ensureAssistantMsg()
-        appendBlock({ type: 'system', subtype, agentName: data.agent_display_name || data.agent, agentColor: data.agent_color })
-        return
-      }
-      if (subtype === SYSTEM_SUBTYPE.MEETING_FAILED) {
-        // The meeting never started (admission denial, spawn failure…) —
-        // clear the pill state and show the reason where the "meeting is
-        // set up" ack was left hanging.
-        setMeetingActive(false)
-        setMeetingSpeaker(null)
-        setMeetingParticipants([])
-        setMeetingLeftParticipants(new Set())
-        meetingSpeakerRef.current = null
-        ensureAssistantMsg()
-        appendBlock({ type: 'system', subtype: SYSTEM_SUBTYPE.MEETING_FAILED, message: data.message })
-        return
-      }
-
-      // Non-meeting system events: default behavior. `message` carries the
-      // body for informational cards (e.g. session_reseeded); `reason` picks
-      // a card's wording (undelivered_input's `queued`, sent live when the
-      // drive gate refuses a held message).
-      ensureAssistantMsg()
-      appendBlock({ type: 'system', subtype, message: data.message, reason: data.reason })
-    },
-
-    onImages: (data) => {
-      if (discardingRef.current) return
-      ensureAssistantMsg()
-      // Remove the placeholder a gallery evicts (the first one — the inline
-      // chat's own quantity rule) before appending the gallery
-      setMessages(prev => {
-        const last = prev[prev.length - 1]
-        if (!last || last.role !== 'assistant') return prev
-        const genIdx = last.blocks.findIndex(b => b.type === evictedBy(WIRE.IMAGES))
-        if (genIdx === -1) return prev
-        const blocks = [...last.blocks]
-        blocks.splice(genIdx, 1)
-        const updated = { ...last, blocks }
-        currentMsgRef.current = updated
-        return [...prev.slice(0, -1), updated]
-      })
-      // Normalize wire field names (snake_case from backend → camelCase for the renderer).
-      const galleryImages = (data.images || []).map(it => ({
-        url: it.url || undefined,
-        imageData: it.image_data || undefined,
-        mimeType: it.mime_type || undefined,
-        caption: it.caption || undefined,
-        attribution: it.attribution || undefined,
-        linkUrl: it.link_url || undefined,
-        downloadUrl: it.download_url || undefined,
-      }))
-      if (galleryImages.length > 0) {
-        appendBlock({ type: 'images', images: galleryImages })
-      }
-    },
-    onImageGenerating: (data) => {
-      if (discardingRef.current) return
-      ensureAssistantMsg()
-      appendBlock({ type: 'image_generating', promptPreview: data.prompt_preview, model: data.model })
-    },
-    onMcpCost: (data) => {
-      if (discardingRef.current) return
-      const cost = data.cost_usd ?? 0
-      if (cost > 0) {
-        setTotalCost(prev => prev + cost)
-        // Real money (the frame says cost_billed: true) — show the gauge.
-        if (data.cost_billed !== false) {
-          toolFeeRef.current = true
-          setCostBilled(true)
-        }
-      }
-    },
-    onImageGenFailed: () => {
-      if (discardingRef.current) return
-      removePlaceholders(evictedBy(WIRE.IMAGE_GEN_FAILED))
-    },
-    onLimitWarning: (data) => {
-      if (discardingRef.current) return
-      setLimitWarning(data)
-      setTimeout(() => setLimitWarning(null), 10000)
-    },
-    onLimitReached: (msg) => {
-      if (discardingRef.current) return
-      setLimitReachedInfo(msg)
-      setLimitReached(true)
-    },
-    onUrl: (data) => {
-      if (discardingRef.current) return
-      ensureAssistantMsg()
-      appendBlock({ type: 'url', url: data.url, title: data.title, description: data.description })
-    },
-    onFile: (data) => {
-      if (discardingRef.current) return
-      ensureAssistantMsg()
-      appendBlock({ type: 'file', filename: data.filename, downloadUrl: data.download_url, description: data.description })
-    },
-    onVideo: (data) => {
-      if (discardingRef.current) return
-      ensureAssistantMsg()
-      removePlaceholders(evictedBy(WIRE.VIDEO))
-      appendBlock({
-        type: 'video',
-        srcKind: data.src_kind === 'token' ? 'token' : 'url',
-        url: data.url || undefined,
-        mediaUrl: data.media_url || undefined,
-        token: data.token || undefined,
-        mime: data.mime || undefined,
-        caption: data.caption || undefined,
-        title: data.title || undefined,
-        poster: data.poster || undefined,
-      })
-    },
-    onAudio: (data) => {
-      if (discardingRef.current) return
-      ensureAssistantMsg()
-      removePlaceholders(evictedBy(WIRE.AUDIO))
-      appendBlock({
-        type: 'audio',
-        srcKind: data.src_kind === 'token' ? 'token' : 'url',
-        url: data.url || undefined,
-        mediaUrl: data.media_url || undefined,
-        token: data.token || undefined,
-        mime: data.mime || undefined,
-        caption: data.caption || undefined,
-        title: data.title || undefined,
-      })
-    },
-    onMediaProcessing: (data) => {
-      if (discardingRef.current) return
-      ensureAssistantMsg()
-      appendBlock({
-        type: 'media_processing',
-        mediaKind: data.media_kind === 'audio' ? 'audio' : 'video',
-        caption: data.caption || undefined,
-      })
-    },
-    onMediaFailed: (_msg) => {
-      if (discardingRef.current) return
-      removePlaceholders(evictedBy(WIRE.MEDIA_FAILED))
-    },
-    onDocumentPreview: (data) => {
-      if (discardingRef.current) return
-      ensureAssistantMsg()
-      // The turn's flush delivers the pushes: the card goes into the chat
-      // and the chat's document pane opens on the newest (the frame is the
-      // "turn ended with a push" signal; history never comes this way).
-      upsertPreviewBlock({
-        type: 'document_preview',
-        filename: data.filename,
-        fileId: data.file_id,
-        downloadUrl: data.download_url,
-        snapshotId: data.snapshot_id || undefined,
-        generation: data.generation || undefined,
-        version: data.version || undefined,
-      })
-      const doc = pushedDocumentFromFrame(data)
-      const chat = data.chat_id || chatIdRef.current
-      if (doc && chat) notePushedDocument(chat, doc)
-    },
-
-    onQuestion: (data) => {
-      if (discardingRef.current) return
-      ensureAssistantMsg()
-      // A codex request_user_input carries a request_id → the held turn resumes
-      // only on question_response. Claude's AskUserQuestion has none (answer =
-      // fresh chat turn). A codex question keeps the composer gated + timer paused.
-      if (data.request_id) setPermissionPending(true)
-      appendBlock({
-        type: 'question', toolName: data.tool_name, toolInput: data.tool_input,
-        requestId: data.request_id,
-      })
-    },
-
-    onMetadata: (data) => {
-      if (discardingRef.current) return
-      ensureAssistantMsg()
-      const cost = data.cost_usd ?? 0
-      const billed = costBilledOf(data)
-      appendBlock({ type: 'metadata', costUsd: cost, durationMs: data.duration_ms ?? data.duration_api_ms ?? 0, costBilled: billed })
-      if (cost > 0) setTotalCost((prev) => prev + cost)
-      setCostBilled(billed !== false || toolFeeRef.current)
-      if (data.context_used && data.context_max) {
-        setContextUsed(data.context_used)
-        setContextMax(data.context_max)
-      }
-      setCacheStats((prev) => {
-        const next = {
-          cacheRead: data.cache_read ?? 0,
-          cacheWrite: data.cache_write ?? 0,
-          inputTokens: data.input_tokens ?? 0,
-          outputTokens: data.output_tokens ?? 0,
-        }
-        return prev &&
-          prev.cacheRead === next.cacheRead && prev.cacheWrite === next.cacheWrite &&
-          prev.inputTokens === next.inputTokens && prev.outputTokens === next.outputTokens
-          ? prev
-          : next
-      })
-    },
-
-    onContextCompact: (data) => {
-      if (discardingRef.current) return
-      if (data.phase === 'usage') {
-        // Post-compaction gauge state (Codex reports the compacted prompt
-        // size on its next tokenUsage) — counter only, no chip: the
-        // 'completed' event already rendered the visible separator.
-        if (data.post_tokens != null) setContextUsed(data.post_tokens)
-        if (data.context_max) setContextMax(data.context_max)
-      } else if (data.phase === 'started') {
-        setCompressingActive(true)
-      } else if (data.phase === 'completed') {
-        setCompressingActive(false)
-        ensureAssistantMsg()
-        appendBlock({ type: 'system', subtype: SYSTEM_SUBTYPE.CONTEXT_COMPRESSED })
-        // A between-turns manual compaction has no follow-up metadata frame —
-        // the completed event carries the post-compaction size itself.
-        if (data.post_tokens != null) setContextUsed(data.post_tokens)
-      } else if (data.phase === 'failed') {
-        // Manual compaction failed/unsupported — clear the badge, no separator
-        // (the server sends the error toast separately).
-        setCompressingActive(false)
-      }
-    },
-
-    onDone: () => {
-      // Clear the optimistic-bubble dedup marker on EVERY turn end, even a
-      // discarded/non-viewed one — if it leaks (turn ended while
-      // discarding, or via abort/error/warmup-failed below), onQueued/onQueueSent
-      // suppress a same-text queued message.
-      sentWithBubbleRef.current = null
-      sentWithBubbleIdRef.current = null
-      if (discardingRef.current) return
-      paintHeldHistory()
-      abortedRef.current = false  // terminal frame — straggler window over
-      // A steer the turn consumed at its very last round boundary (no block
-      // followed) still owes its user bubble — render it before the cleanup.
-      flushPendingSteer(false)
-      // Turn-done tail (chat: ping when not in a meeting and no bg subagent is
-      // running, then refetchChats). The ping gate inputs are computed here so
-      // the page doesn't need stale-closure-free reads of meeting/bg state.
-      // A bg subagent block still active (in any assistant message) gates the
-      // turn-complete ping. Derived from the blocks (the badge's source).
-      const bgStillRunning = messagesRef.current.some((m) =>
-        m.role === 'assistant' && m.blocks.some(
-          (b) => (b.type === 'subagent' && b.isActive && b._background)
-            // A live Commands badge gates the refetch too: history
-            // rehydrates bg_command_spawn rows isActive:false, so a
-            // refetch would clobber a still-running command's badge.
-            || (b.type === 'bgcommand' && b.isActive),
-        ),
-      )
-      options.onTurnDone?.({ meetingActive, bgStillRunning })
-      // Defer clearing currentMsgRef so that pending state updaters from
-      // onText/onMetadata (which check this ref) settle first.  When multiple
-      // WS frames arrive in the same event-loop tick (common for Codex where
-      // text/metadata/done fire in rapid succession), React batches the
-      // setMessages calls — the updaters run after all onmessage handlers, at
-      // which point the ref is already null and the appendToLastTextBlock
-      // identity check fails, losing text.
-      queueMicrotask(() => { currentMsgRef.current = null })
-      thinkingBufRef.current = ''
-      setThinkingActive(false)
-      setCompressingActive(false)
-      setAborting(false)
-      // Mark foreground subagent blocks as done (bg agents keep spinning).
-      // Return `prev` UNCHANGED when no message carried one: the common
-      // turn has no fg subagent, and a fresh array here forces a full
-      // list re-render in the exact tick the turn-end burst competes with
-      // TTS scheduling (per-message identity was already preserved; the
-      // array identity is what lets React bail out entirely).
-      setMessages((prev) => {
-        let changed = false
-        const next = prev.map((msg) => {
-          if (msg.role !== 'assistant') return msg
-          const hasFg = msg.blocks.some(
-            (b) => b.type === 'subagent' && b.isActive && !(b as any)._background,
-          )
-          if (!hasFg) return msg
-          const blocks = msg.blocks.map((b) =>
-            b.type === 'subagent' && b.isActive && !(b as any)._background
-              ? { ...b, isActive: false }
-              : b,
-          )
-          const updatedMsg = { ...msg, blocks }
-          if (msg === currentMsgRef.current) currentMsgRef.current = updatedMsg
-          changed = true
-          return updatedMsg
-        })
-        return changed ? next : prev
-      })
-      // Background subagents + running delegates stay in the badge because onDone
-      // leaves their blocks active/running (only fg is marked done above).
-      setTurnStartTime(null)
-      setPermissionPending(false)
-
-      // Defensive: if the streaming bubble never received a text block (e.g.
-      // tool-only turn that DID produce text the user didn't see, or text
-      // events dropped between WS frames and React render), auto-refetch this
-      // chat's history from DB. The backend pump persists every event before
-      // signaling done, so a clean refetch gives the canonical end-of-turn
-      // state. No-op when the bubble has content.
-      // Skip the refetch while a background sub-agent is still running: the
-      // refetch rebuilds from DB history, where a task_spawn is always isActive:
-      // false ("Historical = completed"), so it would clobber the still-running
-      // bg badge (Codex: the main turn ends while the sub keeps going). Once the
-      // sub finishes, the next turn's onDone (bgStillRunning false) runs the
-      // refetch and history then correctly shows it done.
-      const errored = erroredRef.current
-      erroredRef.current = false
-      if (options.enableDefensiveRefetch && !bgStillRunning && !errored) {
-        // Capture the bubble NOW (synchronously). The queueMicrotask above nulls
-        // currentMsgRef BEFORE this 400ms timeout fires, so reading the ref inside
-        // the timeout always saw null → "no content" → refetch EVERY turn →
-        // rebuild messages (new ids) → remount the bubble → kill playing media
-        // (voice-mode TTS, audio/video players). The recovery is only meant to
-        // rescue a genuinely empty bubble (text OR any rich block = keep)…
-        const bubble = currentMsgRef.current
-        const hasContent = (bubble?.blocks ?? []).some((b: any) =>
-          (b.type === 'text' && (b.content || '').trim().length > 0) || isArtifactBlock(b.type),
-        )
-        // …or a view seeded from a live_state snapshot (mid-turn attach): the
-        // snapshot races the turn's end, so a truncated tail LOOKS like
-        // content and the empty-bubble heuristic never fires. DB is
-        // authoritative at turn end — reconcile once. One-shot: chat_history
-        // clears the flag, so this can't loop. (Snapshot-seeded views were
-        // already fully rebuilt at attach — no playing media to interrupt.)
-        const seededMidTurn = liveStateSeededRef.current
-        liveStateSeededRef.current = false
-        if (!hasContent || seededMidTurn) {
-          setTimeout(() => {
-            const cid = chatIdRef.current
-            if (!cid) return
-            // The rows this view lacks are enough; the server answers in full
-            // when it holds no base for the chat.
-            const refetch = () => { try { ws.resumeChat(cid, { delta: true }) } catch { /* ignore */ } }
-            // The refetch rebuilds every message id → full remount — a
-            // hard cut for any playing audio. Route through the caller's
-            // defer hook so it waits out live TTS (runs immediately when
-            // nothing is speaking).
-            if (options.deferHeavy) options.deferHeavy(refetch)
-            else refetch()
-          }, 400)
-        }
-      }
-    },
-
-    onError: (message, ending) => {
-      sentWithBubbleRef.current = null
-      sentWithBubbleIdRef.current = null  // turn ended — clear the bubble-dedup marker
-      if (discardingRef.current) return
-      paintHeldHistory()
-      // If we were warming up, the session failed to start — reset state so the
-      // user sees the error and can retry instead of being stuck on "Starting
-      // session..." forever. The optimistic user bubble + placeholder (if any)
-      // are removed here; the page tail resets its own warmup flags + refs.
-      if (options.isWarmingUp) {
-        setMessages((prev) => {
-          if (prev.length >= 2 && prev[prev.length - 1].role === 'assistant' && prev[prev.length - 2].role === 'user') {
-            return prev.slice(0, -2)
-          }
-          return prev
-        })
-        options.onWarmupReset?.()
-      }
-      options.onErrorExtra?.()
-      if (ending?.reason) {
-        // A typed ending is the card the chat keeps after a reload (the
-        // server persists the `turn_ended` row inside the turn), rendered
-        // live from the frame in the open bubble, or a bubble of its own.
-        erroredRef.current = true
-        ensureAssistantMsg()
-        appendBlock({ type: 'system', subtype: SYSTEM_SUBTYPE.TURN_ENDED,
-                      reason: ending.reason, message })
-      } else if (currentMsgRef.current) {
-        appendToLastTextBlock(`\n\n**Error:** ${message}`)
-      }
-      // The error ends the turn (no done follows): an accepted steer still
-      // owes its user bubble, like at done and abort.
-      flushPendingSteer(false)
-      // Deferred like at done: the append above is a batched updater that
-      // checks this ref when it runs.
-      queueMicrotask(() => { currentMsgRef.current = null })
-      setTurnStartTime(null)
-    },
-
-    onWarmupFailed: (data) => {
-      // Stale: warmup_failed for a chat we're no longer on.
-      if (data.chat_id && chatIdRef.current && data.chat_id !== chatIdRef.current) {
-        return
-      }
-      // A refusal before any chat was minted (a send below the editor role
-      // on a Shared-only agent) belongs to the new-chat page: once the page
-      // is on a chat it is another chat's.
-      if (!data.chat_id && chatIdRef.current) return
-      // Cold-start that set the optimistic-bubble marker just failed — clear it
-      // so the next queued message isn't suppressed.
-      sentWithBubbleRef.current = null
-      sentWithBubbleIdRef.current = null
-      // Page tail: clear warmup state so input re-enables (chat); unblock the
-      // loading spinner (task).
-      options.onWarmupFailedReset?.()
-      // The backend tags warmup_failed with a `reason`. Subscription-block
-      // reasons (the NoSubscriptionError classifier: auth_off,
-      // admin_oauth_only, no_pool, none, own_sub_expired) render the amber
-      // setup card — they are "connect/reconnect an account" prompts, not
-      // crashes. 'target_unavailable' means the remote machine is
-      // offline/unreachable. Anything unrecognized (incl. a reason-less local
-      // failure, and 'throttled' — a transient rest, not a setup problem)
-      // falls back to 'session_error' rather than the misleading "Remote
-      // machine unavailable". Convert the empty assistant placeholder into
-      // that system block carrying the backend's human-readable message; the
-      // user's bubble stays. If no placeholder is present (resume path /
-      // task), append one.
-      const reason = (data as { reason?: string }).reason
-      const subtype = warmupFailSubtype(reason)
-      setMessages((prev) => {
-        if (prev.length === 0) {
-          // chat: leave the empty chat untouched. task: append the error inline.
-          return options.appendErrorOnEmptyWarmupFail
-            ? [{
-                id: `warmup-fail-${Date.now()}`,
-                role: 'assistant',
-                blocks: [{ type: 'system', subtype, message: data.error }],
-                createdAt: new Date().toISOString(),
-              }]
-            : prev
-        }
-        const last = prev[prev.length - 1]
-        if (last.role === 'assistant' && last.blocks.length === 0) {
-          return [
-            ...prev.slice(0, -1),
-            { ...last, blocks: [{ type: 'system', subtype, message: data.error }] },
-          ]
-        }
-        return [
-          ...prev,
-          {
-            id: `warmup-fail-${Date.now()}`,
-            role: 'assistant',
-            blocks: [{ type: 'system', subtype, message: data.error }],
-            createdAt: new Date().toISOString(),
-          },
-        ]
-      })
-      currentMsgRef.current = null
-      setTurnStartTime(null)
-    },
-
-    // Guard against a stale mode/model frame from the PREVIOUS chat landing
-    // mid-switch (discardingRef set, before the new chat_history) and
-    // contaminating the new chat's mode/model.
+    ...turnEnd.callbacks,
     onModeChanged: (m) => { if (discardingRef.current) return; setMode(m) },
     onModelChanged: (m) => { if (discardingRef.current) return; setModel(m) },
     // Not a per-chat frame on the wire (a new chat's pick carries no id), so
@@ -1725,132 +410,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       options.onExecutionModeChanged?.(f.execution_mode)
     },
 
-    onQueued: (data) => {
-      if (discardingRef.current) return
-      if (data.queue_id) {
-        // The chip is in the store (the socket hook files it by chat). A
-        // send the page showed as a new turn that the proxy queued instead
-        // (another turn drives the chat): its bubble becomes the chip.
-        const mine = sentWithBubbleIdRef.current
-          ? sentWithBubbleIdRef.current === data.queue_id
-          : sentWithBubbleRef.current === data.text
-        if (mine) {
-          sentWithBubbleRef.current = null
-          sentWithBubbleIdRef.current = null
-          setMessages((prev) => {
-            const n = prev.length
-            if (n >= 2 && prev[n - 1].role === 'assistant' && prev[n - 1].blocks.length === 0
-                && prev[n - 2].role === 'user') {
-              if (currentMsgRef.current === prev[n - 1]) currentMsgRef.current = null
-              return prev.slice(0, -2)
-            }
-            return prev
-          })
-        }
-        return
-      }
-      // A 1.7.0 proxy: skip the chip ONLY when this exact message already
-      // has a bubble (the reconnect/stale-pump dedup).
-      if (sentWithBubbleRef.current === data.text) return
-      options.queue.addQueued(data.index, toQueuedMessage(data))
-    },
-    onQueueRemoved: (_msg) => {
-      // The chip left the store in the socket hook (by its id); a 1.7.0
-      // proxy's chip was removed by the page's cancel handler. The author's
-      // copy hands the text back (onQueueEditReturn).
-    },
-    onQueueSent: (data) => {
-      if (discardingRef.current) return
-      // A 1.7.0 proxy names no message: every chip goes.
-      if (!data.queue_ids) options.queue.clearQueued()
-      // If the page already added a user bubble + placeholder for THIS message,
-      // don't duplicate — just refresh the timer for the actual streaming start.
-      if (sentWithBubbleRef.current === data.text) {
-        sentWithBubbleRef.current = null
-        sentWithBubbleIdRef.current = null
-        setTurnStartTime(Date.now())
-        return
-      }
-      if (sentWithBubbleRef.current !== null && data.queue_ids?.length) {
-        // A fresh send took this person's waiting messages ahead of itself
-        // (one turn, their rows first): their bubble goes before the one the
-        // page just added.
-        const fresh = sentWithBubbleRef.current
-        const drained: DisplayMessage = {
-          id: `user-${Date.now()}`,
-          role: 'user',
-          blocks: [...attachmentBlocks(data.images, data.files), { type: 'text', content: data.text }],
-          createdAt: new Date().toISOString(),
-        }
-        setMessages((prev) => {
-          const at = prev.length - 2
-          const optimistic = prev[at]
-          if (at >= 0 && optimistic.role === 'user'
-              && optimistic.blocks.some((b) => b.type === WIRE.TEXT && b.content === fresh)) {
-            return [...prev.slice(0, at), drained, ...prev.slice(at)]
-          }
-          return [...prev, drained]
-        })
-        return
-      }
-      // Queue processed — add user bubble (chips + text) + assistant placeholder.
-      const userMsg: DisplayMessage = {
-        id: `user-${Date.now()}`,
-        role: 'user',
-        blocks: [...attachmentBlocks(data.images, data.files), { type: 'text', content: data.text }],
-        createdAt: new Date().toISOString(),
-      }
-      // During meetings, skip the assistant placeholder — meeting agents create
-      // their own messages. An empty placeholder would persist with loading dots
-      // since no agent fills it.
-      if (meetingActive) {
-        setMessages((prev) => [...prev, userMsg])
-        return
-      }
-      const placeholder: DisplayMessage = {
-        id: `stream-${Date.now()}`,
-        role: 'assistant',
-        blocks: [],
-        createdAt: new Date().toISOString(),
-      }
-      currentMsgRef.current = placeholder
-      setMessages((prev) => [...prev, userMsg, placeholder])
-      setTurnStartTime(Date.now())
-    },
-
-    onSteered: (data) => {
-      if (discardingRef.current) return
-      // Mid-turn steer accepted: the message went INTO the running turn (so
-      // no queue entry and no timer reset). A frame naming its row
-      // (`message_id`) comes at the point of the stream where the proxy saved
-      // the turn so far and wrote the steer's row after it: the bubble
-      // renders here and the answer continues below it, as a reload shows
-      // it. A 1.7.0 proxy's frame names no row and arrives before the engine
-      // read it: the bubble waits for the next block boundary (the
-      // flushPendingSteer calls in the block handlers + turn end).
-      const held: HeldSteer = {
-        text: data.text, images: data.images, files: data.files, meta: data.event_data,
-      }
-      if (currentMsgRef.current && !data.message_id) {
-        pendingSteerRef.current.push(held)
-        setPendingSteers(pendingSteerRef.current.map(toQueuedMessage))
-        return
-      }
-      // Idle position (between blocks), or the proxy's own place for it:
-      // render at the live position and continue the assistant's response
-      // in a NEW message below it.
-      const userMsg = steeredUserMessage(
-        held, data.message_id ? `db-${data.message_id}` : `user-${Date.now()}`)
-      const continuation: DisplayMessage = {
-        id: `stream-${Date.now()}`,
-        role: 'assistant',
-        blocks: [],
-        createdAt: new Date().toISOString(),
-      }
-      currentMsgRef.current = continuation
-      setMessages((prev) => [...prev, userMsg, continuation])
-    },
-
+    ...queue.callbacks,
     onPlanStatus: (data) => {
       if (discardingRef.current) return
       setSessionPlans((prev) =>
@@ -1873,190 +433,6 @@ export function useChatStream(options: UseChatStreamOptions) {
       options.onChatRows?.(data)
     },
 
-    onAborted: (data) => {
-      sentWithBubbleRef.current = null
-      sentWithBubbleIdRef.current = null  // turn ended — clear the bubble-dedup marker
-      if (discardingRef.current) return
-      paintHeldHistory()
-      // The actual cleanup ran in handleAbort already (proactive — so the UI
-      // clears even if the server's confirmation event never arrives). Re-running
-      // it here is cheap (idempotent) and covers any blocks that arrived between
-      // the local handleAbort call and this event.
-      finalizeAbortedTurn()
-      // Only THIS terminal frame (not the proactive finalize) disarms the
-      // straggler guard: a graceful abort keeps the engine draining briefly,
-      // and its late chunks must not reopen a fresh assistant header.
-      abortedRef.current = false
-      if (data.session_id) {
-        setSessionId(data.session_id)
-      }
-    },
-
-    onQueueEditReturn: (data) => {
-      // Pull the text back into the composer for editing, and the
-      // attachments the queued message carried with it. A draft the person
-      // is typing stays, the returned text after it (a failed turn or a
-      // Stop returns messages they did not ask back). An attachment-only
-      // message returns no text: the composer's draft stays as it is.
-      if (data.text) {
-        const cid = chatIdRef.current
-        const draft = cid ? (useChatStore.getState().byChat[cid]?.draftInput ?? '') : ''
-        setEditText(draft.trim() ? `${draft}\n\n${data.text}` : data.text)
-      }
-      if (data.images?.length || data.files?.length) {
-        options.queue.restoreAttachments?.(data.images ?? [], data.files ?? [])
-      }
-    },
-
-    onLiveState: (data) => {
-      if (discardingRef.current) return
-      // The rows of a history that waited for this frame: painted below in
-      // the same update as the live answer.
-      const heldRows = takeHeldHistory()
-      // Reconnected to an actively streaming chat — restore live state.
-      // A residual snapshot (streaming === false: turn ended, bg subagents
-      // still running) must not start a turn timer.
-      if (data.streaming !== false) {
-        setTurnStartTime(data.started_at ? data.started_at * 1000 : Date.now())
-      }
-
-      // Restore thinking state
-      if (data.thinking_active || data.thinking_text) {
-        setThinkingActive(!!data.thinking_active)
-        thinkingBufRef.current = data.thinking_text || ''
-      }
-
-      // Reconstruct messages from ordered live_blocks.
-      // For meetings: split at meeting_turn_start to create separate messages per agent.
-      const liveBlocks = Array.isArray(data.live_blocks) ? data.live_blocks : []
-      const hasContent = liveBlocks.length > 0 || data.thinking_active || data.thinking_text
-      if (heldRows && !hasContent) setMessages((prev) => withCarriedUserBubbles(prev, heldRows))
-      // Mid-turn attach with reconstructed content: mark the view snapshot-
-      // seeded so onDone reconciles it against DB once the turn ends. A
-      // residual snapshot (streaming === false) is already post-persist.
-      if (hasContent && data.streaming !== false) {
-        liveStateSeededRef.current = true
-      }
-      if (hasContent) {
-        const newMsgs = buildLiveStateMessages(liveBlocks, {
-          active: data.thinking_active,
-          text: data.thinking_text,
-          tokens: data.thinking_tokens,
-        })
-        // Check if live_blocks contain meeting_started — append banner to last
-        // assistant message from DB (prev), not as a new message.
-        const hasMeetingStartedBlock = liveBlocks.some(
-          (lb: any) => lb.type === 'system' && lb.subtype === SYSTEM_SUBTYPE.MEETING_STARTED
-        )
-
-        if (newMsgs.length > 0 || hasMeetingStartedBlock || heldRows) {
-          if (newMsgs.length > 0) {
-            currentMsgRef.current = newMsgs[newMsgs.length - 1]
-          }
-          // Set meetingSpeakerRef if last message has meeting agent identity
-          const lastMsg = newMsgs[newMsgs.length - 1]
-          if (lastMsg?.badge === 'meeting' && lastMsg.agentSlug) {
-            meetingSpeakerRef.current = {
-              slug: lastMsg.agentSlug,
-              displayName: lastMsg.agentDisplayName || lastMsg.agentSlug,
-              color: lastMsg.agentColor || '',
-            }
-          }
-          setMessages((prev) => {
-            let updated = heldRows ? withCarriedUserBubbles(prev, heldRows) : [...prev]
-            if (hasMeetingStartedBlock) {
-              for (let i = updated.length - 1; i >= 0; i--) {
-                if (updated[i].role === 'assistant') {
-                  updated[i] = { ...updated[i], blocks: [...updated[i].blocks, { type: 'system' as const, subtype: SYSTEM_SUBTYPE.MEETING_STARTED }] }
-                  break
-                }
-              }
-            }
-            return [...updated, ...newMsgs]
-          })
-        }
-      }
-
-      // (Status-bar badges DERIVE from the reconstructed subagent/delegate
-      // blocks above — the backend live_blocks carry each agent's `active` flag,
-      // so a reconnect mid-run shows exactly the still-running set and clears it
-      // when the snapshot goes empty. No parallel array to sync.)
-
-      // Restore live dynamic-workflow trees (workflows is a {tuid: {...}} map).
-      const wfRaw = (data as any).workflows
-      const wfMap = wfRaw && typeof wfRaw === 'object' && !Array.isArray(wfRaw) ? wfRaw : {}
-      const wfList = Object.values(wfMap).map((w: any) => ({
-        toolUseId: w.tool_use_id,
-        workflowName: w.workflow_name || '',
-        progress: Array.isArray(w.progress) ? w.progress : [],
-        active: w.active !== false,
-      }))
-      setWorkflows(wfList)
-
-      // Re-present pending permission or plan_review if any
-      if (data.pending_permission) {
-        const pp = data.pending_permission
-        const ppType = pp.event_type || 'permission_prompt'
-        setPermissionPending(true)
-        setTurnStartTime(null)  // Pause timer — LLM is blocked
-        ensureAssistantMsg()
-        if (ppType === HOOK_ITEM.PLAN_REVIEW) {
-          appendBlock({
-            type: 'plan_review',
-            requestId: pp.request_id || '',
-            plan: pp.plan || '',
-            toolInput: pp.tool_input || {},
-            filename: pp.filename || '',
-          })
-        } else if (ppType === HOOK_ITEM.QUESTION_PROMPT) {
-          // Reconnect mid-question (codex held turn) — re-render the card with
-          // its request_id so the answer still resolves the held request.
-          appendBlock({
-            type: 'question',
-            toolName: pp.tool_name || 'request_user_input',
-            toolInput: pp.tool_input || {},
-            requestId: pp.request_id || '',
-          })
-        } else {
-          appendBlock({
-            type: 'permission',
-            requestId: pp.request_id || '',
-            toolName: pp.tool_name || '',
-            toolInput: pp.tool_input || {},
-            description: pp.description,
-          })
-        }
-      }
-
-      // Restore todo state from live streaming
-      if (Array.isArray(data.todos) && data.todos.length > 0) setCurrentTodos(data.todos)
-
-      // Restore the thread goal — only when non-null: the goal is chat-durable
-      // and already seeded from restore.goal (chat_history), so a fresh pump's
-      // null must not wipe it. A genuine clear is consistent either way (the
-      // cleared event NULLs the DB, so restore.goal agrees).
-      if (data.goal) setCurrentGoal(data.goal)
-
-      // Restore meeting state from live streaming
-      if (data.meeting_agent || (data.meeting_participants && data.meeting_participants.length > 0)) {
-        setMeetingActive(true)
-        if (data.meeting_agent) setMeetingSpeaker(data.meeting_agent)
-        if (Array.isArray(data.meeting_participants)) setMeetingParticipants(data.meeting_participants)
-      }
-    },
-
-    // --- Todo list ---
-    onTodoUpdate: (data) => {
-      if (discardingRef.current) return
-      setCurrentTodos(Array.isArray(data.todos) ? data.todos : [])
-    },
-
-    // --- Thread goal (live frame applies unconditionally — null clears) ---
-    onGoalUpdate: (data) => {
-      if (discardingRef.current) return
-      setCurrentGoal(data.goal ?? null)
-    },
-
     // --- Notifications (page-owned) ---
     onNotification: (data) => {
       options.onNotification?.(data)
@@ -2069,170 +445,9 @@ export function useChatStream(options: UseChatStreamOptions) {
     },
   })
 
-  // display_ui artifacts ride the generic frame registry rather than a
-  // useDashboardWs switch case — the registry fires for EVERY frame type, so
-  // a self-contained feature needs no dispatcher growth. `ui` is not in
-  // PER_CHAT_FRAMES, so the handler self-gates by chat_id (background chats'
-  // frames must not render here). Ref-indirected so the once-registered
-  // subscriber always sees the latest closure state.
-  const onUiFrameRef = useRef<(msg: any) => void>(() => {})
-  onUiFrameRef.current = (msg: any) => {
-    if (discardingRef.current) return
-    if (msg.chat_id && chatIdRef.current && msg.chat_id !== chatIdRef.current) return
-    const block = eventToBlock(msg)
-    if (!block) return
-    ensureAssistantMsg()
-    appendBlock(block)
-  }
-  const wsSubscribe = ws.subscribe
-  useEffect(() => wsSubscribe(WIRE.UI, (msg: any) => onUiFrameRef.current(msg)), [wsSubscribe])
-  // A check's verdict card (CHECKS.md) rides the same path: the evaluator
-  // pushes the `check_verdict` event onto the chat's pump after the turn,
-  // and history replays the persisted event row through eventToBlock.
-  useEffect(() => wsSubscribe(WIRE.CHECK_VERDICT, (msg: any) => onUiFrameRef.current(msg)), [wsSubscribe])
-
-  // display_ui backchannel. Two disjoint chip-append sources: the
-  // `artifact_interaction` frame renders QUEUED interactions at boundary
-  // delivery (pump drain), the `sent` ack below renders the idle path — the
-  // server only ever emits one of the two per send, so no dedupe is needed.
-  const appendArtifactChipTurn = (token: string, title: string | undefined, payload: unknown) => {
-    const chipMsg: DisplayMessage = {
-      id: `artifact-int-${Date.now()}`,
-      role: 'assistant',
-      blocks: [{ type: 'artifact_interaction', token, title, payload }],
-      createdAt: new Date().toISOString(),
-    }
-    const placeholder: DisplayMessage = {
-      id: `stream-${Date.now()}`,
-      role: 'assistant',
-      blocks: [],
-      createdAt: new Date().toISOString(),
-    }
-    currentMsgRef.current = placeholder
-    setMessages((prev) => [...prev, chipMsg, placeholder])
-    setTurnStartTime(Date.now())
-  }
-  const onArtifactFrameRef = useRef<(msg: any) => void>(() => {})
-  onArtifactFrameRef.current = (msg: any) => {
-    if (discardingRef.current) return
-    if (msg.chat_id && chatIdRef.current && msg.chat_id !== chatIdRef.current) return
-    appendArtifactChipTurn(msg.token || '', msg.title || undefined, msg.payload)
-  }
-  useEffect(() => wsSubscribe(WIRE.ARTIFACT_INTERACTION, (msg: any) => onArtifactFrameRef.current(msg)), [wsSubscribe])
-
-  // In-flight send acks, keyed by token (the server's ≥1s per-token
-  // min-interval guarantees one in-flight send per token).
-  const artifactAckWaiters = useRef<Map<string, (ack: { status: string; reason?: string }) => void>>(new Map())
-  useEffect(() => wsSubscribe(WIRE.ARTIFACT_ACK, (msg: any) => {
-    const waiter = artifactAckWaiters.current.get(msg.token || '')
-    if (waiter) {
-      artifactAckWaiters.current.delete(msg.token || '')
-      waiter({ status: msg.status || 'denied', reason: msg.reason })
-    }
-  }), [wsSubscribe])
-
-  const sendArtifactInteraction = useCallback(
-    (token: string, title: string, payload: unknown): Promise<{ status: string; reason?: string }> => {
-      const cid = chatIdRef.current
-      if (!cid || !ws.connected) {
-        return Promise.resolve({ status: 'unavailable', reason: 'no live chat' })
-      }
-      return new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          artifactAckWaiters.current.delete(token)
-          resolve({ status: 'denied', reason: 'timeout' })
-        }, 10000)
-        artifactAckWaiters.current.set(token, (ack) => {
-          clearTimeout(timer)
-          if (ack.status === 'sent') {
-            // The interaction started a real turn — render its chip + a fresh
-            // placeholder and flip the same streaming state a user send flips.
-            abortedRef.current = false
-            appendArtifactChipTurn(token, title || undefined, payload)
-            ws.setStreaming(true)
-            useChatStore.getState().setStreaming(cid)
-          }
-          resolve(ack)
-        })
-        ws.sendArtifactInteraction(cid, token, title, payload)
-      })
-    },
-    [ws],
-  )
-
-  // Pinned app send_prompt actions — the app_action twin of the artifact
-  // backchannel above: same chip-turn semantics (queued interactions render
-  // via the `app_action` frame at boundary drain; the `sent` ack renders the
-  // idle path), acks keyed by app+action.
-  const appendAppActionChipTurn = (msg: { app_id?: string; slug?: string; title?: string; action_id?: string; label?: string; prompt?: string }) => {
-    const chipMsg: DisplayMessage = {
-      id: `app-action-${Date.now()}`,
-      role: 'assistant',
-      blocks: [{
-        type: 'app_action', appId: msg.app_id || '', slug: msg.slug || undefined,
-        title: msg.title || undefined, actionId: msg.action_id || '',
-        label: msg.label || undefined, prompt: msg.prompt || undefined,
-      }],
-      createdAt: new Date().toISOString(),
-    }
-    const placeholder: DisplayMessage = {
-      id: `stream-${Date.now()}`,
-      role: 'assistant',
-      blocks: [],
-      createdAt: new Date().toISOString(),
-    }
-    currentMsgRef.current = placeholder
-    setMessages((prev) => [...prev, chipMsg, placeholder])
-    setTurnStartTime(Date.now())
-  }
-  const onAppActionFrameRef = useRef<(msg: any) => void>(() => {})
-  onAppActionFrameRef.current = (msg: any) => {
-    if (discardingRef.current) return
-    if (msg.chat_id && chatIdRef.current && msg.chat_id !== chatIdRef.current) return
-    appendAppActionChipTurn(msg)
-  }
-  useEffect(() => wsSubscribe(WIRE.APP_ACTION, (msg: any) => onAppActionFrameRef.current(msg)), [wsSubscribe])
-
-  const appActionAckWaiters = useRef<Map<string, (ack: { status: string; reason?: string }) => void>>(new Map())
-  useEffect(() => wsSubscribe(WIRE.APP_ACTION_ACK, (msg: any) => {
-    const key = `${msg.app_id || ''}:${msg.action_id || ''}`
-    const waiter = appActionAckWaiters.current.get(key)
-    if (waiter) {
-      appActionAckWaiters.current.delete(key)
-      waiter({ status: msg.status || 'denied', reason: msg.reason })
-    }
-  }), [wsSubscribe])
-
-  const sendAppAction = useCallback(
-    (app: { id: string; slug?: string; title?: string }, actionId: string, label: string, prompt: string, args: unknown): Promise<{ status: string; reason?: string }> => {
-      const cid = chatIdRef.current
-      if (!cid || !ws.connected) {
-        return Promise.resolve({ status: 'unavailable', reason: 'no live chat' })
-      }
-      const key = `${app.id}:${actionId}`
-      return new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          appActionAckWaiters.current.delete(key)
-          resolve({ status: 'denied', reason: 'timeout' })
-        }, 10000)
-        appActionAckWaiters.current.set(key, (ack) => {
-          clearTimeout(timer)
-          if (ack.status === 'sent') {
-            abortedRef.current = false
-            appendAppActionChipTurn({
-              app_id: app.id, slug: app.slug, title: app.title,
-              action_id: actionId, label, prompt,
-            })
-            ws.setStreaming(true)
-            useChatStore.getState().setStreaming(cid)
-          }
-          resolve(ack)
-        })
-        ws.sendAppAction(cid, app.id, actionId, args)
-      })
-    },
-    [ws],
-  )
+  // The artifact channels (chatStream/useArtifactChannels.ts): subscribed
+  // through the socket's registry, so they come after it.
+  const { sendArtifactInteraction, sendAppAction } = useArtifactChannels(core, ws)
 
   // --- Shared handlers ---
 
@@ -2277,7 +492,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         ws.sendMessage(response, chatId)
       }
     },
-    [chatId, ws],
+    [chatId, ws, setMessages],
   )
 
   // Codex request_user_input: answer the HELD turn over question_response (no
@@ -2300,7 +515,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       setTurnStartTime(Date.now())
       ws.sendQuestionResponse(requestId, answers)
     },
-    [chatId, ws],
+    [chatId, ws, setMessages],
   )
 
   const handleSendMessage = useCallback(
@@ -2329,7 +544,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         ws.sendMessage(text, chatId)
       }
     },
-    [chatId, ws],
+    [chatId, ws, setMessages, currentMsgRef],
   )
 
   const handleImplementPlan = useCallback(
@@ -2376,7 +591,9 @@ export function useChatStream(options: UseChatStreamOptions) {
       }
     }
     setPermissionPending(false)
-    setTurnStartTime(Date.now())  // Restart timer — LLM resumes
+    // The held turn resumes; a card answered between turns (a Codex plan)
+    // starts its turn's timer with the turn's own frames.
+    if (ws.streaming) setTurnStartTime(Date.now())
     ws.sendPlanReviewResponse(requestId, action, planFilename)
     // Update plan status in local state (only for reject — implementation
     // status is tracked by the backend via plan_status event on done)
@@ -2399,68 +616,11 @@ export function useChatStream(options: UseChatStreamOptions) {
               : b,
           ),
         }
-        if (msg === currentMsgRef.current) currentMsgRef.current = updated
         return updated
       }),
     )
     // Mode change is handled by the backend (sends mode_changed event)
-  }, [ws, messages])
-
-  /** Shared cleanup for a stopped turn. Marks any still-running tool /
-   * subagent / delegate blocks as `failed` (red X) across all assistant
-   * messages, clears thinking/compressing/meeting state, and empties the
-   * activity sidebars. Idempotent — safe to call multiple times.
-   *
-   * Called proactively from the page's handleAbort so the UI clears
-   * immediately even if the server's `aborted` event is delayed or dropped,
-   * and again from the `onAborted` handler as a safety net.
-   */
-  const finalizeAbortedTurn = useCallback(() => {
-    // NOTE: abortedRef stays ARMED here — the graceful abort keeps the engine
-    // draining for a beat, and its straggler chunks must not reopen a fresh
-    // assistant header after this seals the message. The guard disarms at a
-    // terminal frame (aborted/done), the next send, or a chat (re)load.
-    flushPendingSteer(false)  // an accepted steer still owes its user bubble
-    setAborting(false)
-    setMessages((prev) => prev
-      .map((msg) => {
-        if (msg.role !== 'assistant') return msg
-        const hasRunning = msg.blocks.some(
-          (b) =>
-            (b.type === 'tool' && b.status === 'running')
-            || (b.type === 'subagent' && b.isActive)
-            || (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING)
-            || (b.type === 'bgcommand' && b.isActive),
-        )
-        if (!hasRunning) return msg
-        return {
-          ...msg,
-          blocks: msg.blocks.map((b) => {
-            if (b.type === 'tool' && b.status === 'running') return { ...b, status: 'failed' as const }
-            if (b.type === 'subagent' && b.isActive) return { ...b, isActive: false, failed: true }
-            if (b.type === 'bgcommand' && b.isActive) return { ...b, isActive: false, failed: true }
-            if (b.type === 'delegate' && b.status === RUN_STATUS.RUNNING) return { ...b, status: DELEGATE_RESULT.FAILED }
-            return b
-          }),
-        }
-      })
-      .filter((msg) => !(msg.role === 'assistant' && msg.blocks.length === 0))
-    )
-    currentMsgRef.current = null
-    thinkingBufRef.current = ''
-    setThinkingActive(false)
-    setCompressingActive(false)
-    setWorkflows([])
-    setTurnStartTime(null)
-    setPermissionPending(false)
-    if (meetingActive) {
-      setMeetingActive(false)
-      setMeetingSpeaker(null)
-      setMeetingParticipants([])
-      meetingSpeakerRef.current = null
-    }
-    if (options.clearQueueOnAbort) options.queue.clearQueued()
-  }, [meetingActive, options])
+  }, [ws, messages, setMessages])
 
   return {
     ws,
@@ -2481,6 +641,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     compressingActive, setCompressingActive,
     activeAgents,
     totalCost, setTotalCost,
+    billedCost, setBilledCost,
+    toolCost, setToolCost,
     costBilled,
     contextUsed, setContextUsed,
     contextMax, setContextMax,

@@ -1,5 +1,6 @@
 """The tool schemas of agent-config-mcp — pure data: every tool's
-``description`` and ``inputSchema`` as the MCP ``tools/list`` serves them.
+``description``, ``inputSchema`` and ``annotations`` (the MCP tool hints, as
+``ToolAnnotations`` keyword arguments) as the MCP ``tools/list`` serves them.
 ``server.py`` deep-copies the table and fills the engine-typed tools from the
 platform's catalog at list time (``_engine_schemas``); nothing here reads
 the platform. Kept beside ``server.py`` so the server stays readable — the
@@ -18,6 +19,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "provenance). Read-only."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     "list_available_models": {
         "description": (
@@ -28,6 +30,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "the valid model IDs."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     "update_display_name": {
         "description": (
@@ -47,6 +50,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["new_name"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     "update_description": {
         "description": "Change this agent's description (1–500 chars).",
@@ -61,6 +65,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["new_description"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     "update_color": {
         "description": (
@@ -78,6 +83,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["hex_color"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     "update_default_model": {
         "description": (
@@ -92,6 +98,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["model_id"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     # The two engine-typed tools name no engine here: `{engines}` and the
     # `enum` are filled from the platform's catalog at tools/list
@@ -115,6 +122,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["layers"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     "update_default_layer": {
         "description": (
@@ -129,6 +137,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["layer"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     "update_default_scope": {
         "description": (
@@ -148,6 +157,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["default_scope"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     "update_default_execution_mode": {
         "description": (
@@ -166,6 +176,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["mode"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     "set_visibility_mode": {
         "description": (
@@ -192,6 +203,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["mode"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     "list_context_files": {
         "description": (
@@ -199,6 +211,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "`config/context/`. Read-only."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     "update_persona": {
         "description": (
@@ -228,6 +241,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["content"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     "get_memory_settings": {
         "description": (
@@ -236,6 +250,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "`user_memory_enabled` and `agent_memory_enabled`. Read-only."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     "update_user_memory_enabled": {
         "description": (
@@ -250,6 +265,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["enabled"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     "update_agent_memory_enabled": {
         "description": (
@@ -265,6 +281,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["enabled"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     "complete_setup": {
         "description": (
@@ -291,6 +308,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     "list_knowledge_libraries": {
         "description": (
@@ -302,6 +320,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
         "inputSchema": {"type": "object", "properties": {},
                         "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     "share_knowledge_folder": {
         "description": (
@@ -345,6 +364,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["enable"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     "attach_knowledge_library": {
         "description": (
@@ -376,6 +396,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["source_agent"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     "detach_knowledge_library": {
         "description": (
@@ -400,6 +421,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["source_agent"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     "set_department": {
         "description": (
@@ -423,5 +445,6 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["department"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
 }

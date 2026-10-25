@@ -1,0 +1,17 @@
+{
+ "agent": {
+  "agent": "char-agent",
+  "config_visible": false,
+  "is_admin_agent": false,
+  "role": "manager",
+  "session_scope": "agent",
+  "username": ""
+ },
+ "person": {
+  "agent": "char-agent",
+  "config_visible": false,
+  "is_admin_agent": false,
+  "role": "editor",
+  "username": "vic"
+ }
+}

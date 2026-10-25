@@ -1,8 +1,10 @@
 import { useState, useCallback } from 'react'
 import { safeHref } from '../../../lib/safeUrl'
-import ImageLightbox, { triggerDownload, LightboxImage } from './ImageLightbox'
+import ImageLightbox, { LightboxImage } from './ImageLightbox'
+import { triggerDownload } from './imageDownload'
+import { MEDIA_HOVER, OVER_MEDIA } from './stage'
 
-export interface GalleryImage extends LightboxImage {}
+export type GalleryImage = LightboxImage
 
 interface Props {
   images: GalleryImage[]
@@ -25,9 +27,9 @@ function GalleryCard({
   const hasCaptionRow = !!(img.caption || img.attribution)
 
   return (
-    <div className="relative rounded-xl border border-p-border-light bg-white dark:bg-p-surface overflow-hidden flex flex-col">
+    <div className="relative rounded-card bg-surface-card shadow-elevation-1 overflow-hidden flex flex-col">
       <div
-        className="relative cursor-pointer group bg-black/5"
+        className="relative cursor-pointer group bg-surface-sunken"
         onClick={() => onOpen(index)}
       >
         <img
@@ -37,12 +39,12 @@ function GalleryCard({
           loading="lazy"
         />
         {/* Hover overlay for desktop zoom hint */}
-        <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors" />
+        <div className={`absolute inset-0 ${MEDIA_HOVER} transition-colors`} />
 
         {/* Top-right: download (always visible) */}
         <button
           onClick={(e) => { e.stopPropagation(); triggerDownload(img, index) }}
-          className="absolute top-1.5 right-1.5 p-1.5 rounded-md bg-black/40 hover:bg-black/60 text-white transition-colors"
+          className={`absolute top-1.5 right-1.5 p-1.5 rounded-control ${OVER_MEDIA} transition-colors`}
           title="Download image"
           aria-label="Download image"
         >
@@ -60,7 +62,7 @@ function GalleryCard({
             target="_blank"
             rel="noopener noreferrer"
             onClick={(e) => e.stopPropagation()}
-            className="absolute top-1.5 left-1.5 p-1.5 rounded-md bg-black/40 hover:bg-black/60 text-white transition-colors"
+            className={`absolute top-1.5 left-1.5 p-1.5 rounded-control ${OVER_MEDIA} transition-colors`}
             title="Open source"
             aria-label="Open source"
           >
@@ -76,12 +78,12 @@ function GalleryCard({
       {hasCaptionRow && (
         <div className="px-2 py-1.5 min-w-0">
           {img.caption && (
-            <div className="text-xs text-p-text-secondary truncate" title={img.caption}>
+            <div className="text-xs text-secondary truncate" title={img.caption}>
               {img.caption}
             </div>
           )}
           {img.attribution && (
-            <div className="text-[10px] text-p-text-light opacity-70 truncate" title={img.attribution}>
+            <div className="text-3xs text-tertiary truncate" title={img.attribution}>
               {img.attribution}
             </div>
           )}

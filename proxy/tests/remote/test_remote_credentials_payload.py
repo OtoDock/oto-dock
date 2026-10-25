@@ -106,8 +106,7 @@ class TestCodexPayload:
 
 class TestBindSubscription:
     def setup_method(self):
-        from services.engines import subscription_pool as pool
-        from services.engines import token_fanout
+        from services.engines import subscription_pool as pool, token_fanout
         pool._session_subscriptions.clear()
         pool._session_token_expiry.clear()
         pool._issued_token_expiry.clear()
@@ -115,8 +114,8 @@ class TestBindSubscription:
 
     def test_binds_and_registers_claude_target(self):
         from types import SimpleNamespace
-        from services.engines import subscription_pool as pool
-        from services.engines import token_fanout
+
+        from services.engines import subscription_pool as pool, token_fanout
         # The target's dir is the scope root the payload builder used (the
         # SecurityContext's mount username) + the engine's declared dirname.
         config = _config(subscription_id="sub-1",
@@ -132,8 +131,7 @@ class TestBindSubscription:
         assert target.dir_relative == "users/alice/.claude"
 
     def test_binds_and_registers_codex_target(self):
-        from services.engines import subscription_pool as pool
-        from services.engines import token_fanout
+        from services.engines import subscription_pool as pool, token_fanout
         config = _config(subscription_id="sub-2")     # agent-scope mount → workspace
         RemoteExecutionLayer._bind_subscription(
             "sess-2", config, "codex-cli", True,
@@ -143,8 +141,7 @@ class TestBindSubscription:
         assert target.layer == "codex-cli" and target.dir_relative == "workspace/.codex"
 
     def test_api_key_session_binds_without_target(self):
-        from services.engines import subscription_pool as pool
-        from services.engines import token_fanout
+        from services.engines import subscription_pool as pool, token_fanout
         config = _config(subscription_id="sub-3")
         RemoteExecutionLayer._bind_subscription(       # no credential file delivered
             "sess-3", config, "claude-code-cli", False,

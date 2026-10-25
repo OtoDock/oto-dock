@@ -7,9 +7,10 @@ re-checks access at attach (the token may outlive a role change by up to its
 TTL, and re-checking is cheap).
 """
 
-import contextlib
 import asyncio
+import contextlib
 
+import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -104,11 +105,11 @@ async def duplex_prewarm(
         ))
         _prewarm_inflight[key] = task
         task.add_done_callback(
-            lambda _t, _k=key: _prewarm_inflight.pop(_k, None))
+            lambda _t, _k=key: _prewarm_inflight.pop(_k, None))  # type: ignore[misc]  # mypy cannot infer a lambda whose extra defaulted parameter is absent from the callback type (checker limitation)
     try:
         sid = await asyncio.wait_for(asyncio.shield(task), timeout=10.0)
     except asyncio.TimeoutError:
         sid = None  # spawn continues in background — still claimable
-    except Exception:
+    except psycopg.Error:
         sid = None
     return {"status": "ok", "session_id": sid}

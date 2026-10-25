@@ -12,6 +12,7 @@ broadcast_chat_title. Listings + search stamp can_rename/can_delete with
 the same logic.
 """
 
+import json
 import uuid
 
 import pytest
@@ -19,8 +20,8 @@ from fastapi.testclient import TestClient
 
 from app import app
 from auth.providers import UserContext, get_current_user
-from storage.agents import agent_store
 from storage import database as task_store
+from storage.agents import agent_store
 
 client = TestClient(app)
 
@@ -326,8 +327,7 @@ def test_definition_rename_broadcasts_live_run_chats(temp_db, _as, monkeypatch):
 # Off the loop: listing, search, rename, delete, create, dismiss-preview
 # ---------------------------------------------------------------------------
 
-import asyncio  # noqa: E402
-
+import asyncio
 
 
 def _record_title_broadcasts(monkeypatch) -> list:
@@ -352,7 +352,8 @@ def test_chat_listing_and_search_run_off_the_loop(temp_db, loop_db_guard):
             listed = await api.list_chats(agent=AGENT, kind="chats", limit=50, user=EDITOR)
             found = await api.search_chats(q="findme", agent=AGENT, kind="chats",
                                            limit=20, user=EDITOR)
-        return listed["chats"], found["chats"]
+        # Both answers are encoded inside the job: pre-built JSON bodies.
+        return json.loads(listed.body)["chats"], json.loads(found.body)["chats"]
 
     listed, found = asyncio.run(scenario())
     rows = {r["id"]: r for r in listed}
@@ -391,6 +392,7 @@ def test_rename_lands_through_the_chat_writer_off_the_loop(temp_db, loop_db_guar
 
 def test_rename_refusals_come_from_the_job(temp_db, monkeypatch):
     from fastapi import HTTPException
+
     from api.agents import chats as api
     _record_title_broadcasts(monkeypatch)
     cid = str(uuid.uuid4())
@@ -524,6 +526,7 @@ def test_delete_waits_for_a_chat_that_is_still_starting(temp_db, monkeypatch):
     delete refuses with its own sentence until the session exists; the row
     stays. The same for a one-shot wake in flight."""
     from fastapi import HTTPException
+
     from api.agents import chats as api
     from core.session import session_delivery, warmup_registry
     cid = str(uuid.uuid4())
@@ -548,11 +551,70 @@ def test_delete_waits_for_a_chat_that_is_still_starting(temp_db, monkeypatch):
     assert task_store.get_chat(cid) is not None
 
 
+def test_delete_waits_for_a_first_turn_still_enqueued(temp_db):
+    """The hold (the spawn done, the first turn enqueued and not started)
+    counts as starting too: the kick would run on a deleted chat."""
+    from fastapi import HTTPException
+
+    from api.agents import chats as api
+    from core.events import input_queue
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    input_queue.hold_first_turn(cid)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(api.delete_chat(cid, user=EDITOR))
+    finally:
+        input_queue.first_turn_started(cid)
+    assert exc.value.status_code == 409 and "still starting" in exc.value.detail
+    assert task_store.get_chat(cid) is not None
+
+
+@pytest.mark.parametrize("pump_state, refused", [
+    ("meeting running", True),
+    ("meeting ended", False),      # a meeting that ended a second earlier: a done pump
+    ("chat turn running", False),  # a person's own turn: the delete ends it, as before
+])
+def test_delete_refuses_while_a_meeting_runs_on_the_chat(temp_db, monkeypatch, pump_state, refused):
+    """A meeting runs on its parent chat's pump: a delete under it would end
+    the meeting mid-round, so it is refused until the meeting stops."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from api.agents import chats as api
+    from core.events.stream_pump import _active_pumps
+    from core.session import session_kind
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    ended = []
+
+    async def _end_for_delete():
+        ended.append(cid)
+
+    pump = SimpleNamespace(
+        is_done=pump_state == "meeting ended",
+        source_type=(session_kind.DASHBOARD.source_type if pump_state == "chat turn running"
+                     else session_kind.MEETING.source_type),
+        end_for_delete=_end_for_delete)
+    monkeypatch.setitem(_active_pumps, cid, pump)
+    if refused:
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(api.delete_chat(cid, user=EDITOR))
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "A meeting is running on this chat. Stop it first, then delete the chat."
+        assert task_store.get_chat(cid) is not None and ended == []
+    else:
+        assert asyncio.run(api.delete_chat(cid, user=EDITOR)) == {"status": "ok"}
+        assert task_store.get_chat(cid) is None
+
+
 def test_delete_lands_behind_the_chats_queued_writer_job(temp_db, caplog):
     """The row delete rides the chat's writer lane: a row job queued before
     it lands first, so nothing fails on the vanished row."""
     import logging
     import time
+
     from api.agents import chats as api
     from core.events import chat_writer
     cid = str(uuid.uuid4())
@@ -574,6 +636,56 @@ def test_delete_lands_behind_the_chats_queued_writer_job(temp_db, caplog):
     assert "failed" not in caplog.text
 
 
+def test_a_failed_delete_lifts_the_mark_and_reloads_the_queue(temp_db, monkeypatch):
+    """A delete that fails past the mark leaves the chat usable: the mark is
+    lifted and the queue object forgotten, so the next touch reloads the
+    rows the cascade never took."""
+    from api.agents import chats as api
+    from core.events import input_queue
+    from core.events.common_events import TurnInput
+    from services.scheduler import shared
+    monkeypatch.setattr(shared, "_shutting_down", False)
+    monkeypatch.setattr(input_queue, "VIEWER_GRACE_S", 0.0)
+
+    async def _boom(chat):
+        raise RuntimeError("the session's layer is gone")
+    monkeypatch.setattr(api, "_close_chat_session", _boom)
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+
+    async def scenario():
+        q = await input_queue.loaded(cid)
+        await q.add("q-1", "user-ed", TurnInput("waiting"))
+        with pytest.raises(RuntimeError):
+            await api.delete_chat(cid, user=EDITOR)
+        await asyncio.sleep(0.05)
+        reloaded = await input_queue.loaded(cid)
+        return reloaded is not q, [qi.queue_id for qi in reloaded.items]
+
+    fresh, ids = asyncio.run(scenario())
+    assert not input_queue.deleting(cid)
+    assert fresh and ids == ["q-1"]
+    assert task_store.get_chat(cid) is not None
+
+
+def test_a_landed_delete_keeps_the_mark_a_while(temp_db):
+    import time
+
+    from api.agents import chats as api
+    from core.events import input_queue
+    cid = str(uuid.uuid4())
+    task_store.create_chat(cid, "user-ed", AGENT)
+    input_queue._deleting["c-lapsed"] = time.monotonic() - 1.0
+    assert asyncio.run(api.delete_chat(cid, user=EDITOR)) == {"status": "ok"}
+    try:
+        assert input_queue.deleting(cid)
+        assert 0 < input_queue._deleting[cid] - time.monotonic() <= input_queue.DELETED_LINGER_S
+        # A landed delete prunes the marks that lapsed (nothing asks again).
+        assert "c-lapsed" not in input_queue._deleting
+    finally:
+        input_queue._deleting.pop(cid, None)
+
+
 def test_a_new_shared_only_chat_carries_no_pick_below_the_editor_tier(temp_db, _as):
     """On creation, a Shared-only chat runs as the
     agent, so a caller below the editor tier never leaves a permission mode
@@ -584,7 +696,7 @@ def test_a_new_shared_only_chat_carries_no_pick_below_the_editor_tier(temp_db, _
     _as(contributor)
     r = client.post("/v1/chats", json={"agent": "so-new", "permission_mode": "dontAsk"})
     assert r.status_code == 200, r.text
-    assert task_store.get_chat(r.json()["chat"]["id"])["permission_mode"] == "default"
+    assert task_store.get_chat(r.json()["chat"]["id"])["permission_mode"] == "ask"
     _as(editor)
-    r = client.post("/v1/chats", json={"agent": "so-new", "permission_mode": "acceptEdits"})
-    assert task_store.get_chat(r.json()["chat"]["id"])["permission_mode"] == "acceptEdits"
+    r = client.post("/v1/chats", json={"agent": "so-new", "permission_mode": "autoReview"})
+    assert task_store.get_chat(r.json()["chat"]["id"])["permission_mode"] == "autoReview"

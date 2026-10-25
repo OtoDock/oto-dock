@@ -3,7 +3,8 @@
 ``reap_idle_remote_sessions`` is the background task ``startup.py`` runs: it
 closes remote sessions that went idle past the platform timeout or lost
 their satellite, with the same in-flight and pending-work leashes the local
-reaper applies. Split out of remote_execution.py, which re-exports both
+reaper applies, and walks the chat moves waiting for their target's proof
+(``services/remote/chat_move.sweep``). Split out of remote_execution.py, which re-exports both
 names.
 """
 
@@ -24,7 +25,8 @@ def _idle_session_has_pending_work(
     while hooks still fire. A silent subagent fires no hooks until its Stop —
     the registry-pending check is the leg that covers that window."""
     from core.session.session_state import (
-        get_hook_activity, get_subagent_registry,
+        get_hook_activity,
+        get_subagent_registry,
     )
     last_hook = get_hook_activity(sid)
     # Truthiness, not `is not None`: get_hook_activity returns 0 for a
@@ -49,6 +51,12 @@ async def reap_idle_remote_sessions() -> None:
     """Background task: reap idle remote sessions periodically."""
     import config as app_config
     from core.session.session_manager import _get_remote_layer
+    # A chat move a restart cut short failed, and its staging goes.
+    try:
+        from services.remote import chat_move
+        await asyncio.to_thread(chat_move.settle_at_start)
+    except Exception:
+        logger.exception("chat move settle at start failed")
     while True:
         await asyncio.sleep(60)
         # Fail parked runs whose satellite never reconnected (Mode C deadline).
@@ -57,6 +65,18 @@ async def reap_idle_remote_sessions() -> None:
             await run_recovery.sweep_expired()
         except Exception:
             logger.exception("recovery sweep failed")
+        # The moves waiting for the target's proof: the source copy goes.
+        try:
+            from services.remote import chat_move
+            await chat_move.sweep()
+        except Exception:
+            logger.exception("chat move sweep failed")
+        # The session files an engine switch left, once the new engine answered.
+        try:
+            from services.remote import switch_leftovers
+            await switch_leftovers.sweep()
+        except Exception:
+            logger.exception("engine switch leftovers sweep failed")
         try:
             layer = _get_remote_layer()
             now = time.monotonic()
@@ -85,8 +105,8 @@ async def reap_idle_remote_sessions() -> None:
                         if (idle > idle_timeout
                                 and await layer.probe_session_process_dead(sid)):
                             logger.warning(
-                                f"Idle reaper: in-flight turn {sid[:8]} idle "
-                                f"{idle:.0f}s with a dead process — reaping"
+                                "Idle reaper: in-flight turn %s idle "
+                                "%.0fs with a dead process — reaping", sid[:8], idle
                             )
                             to_reap.append(sid)
                         continue
@@ -102,7 +122,7 @@ async def reap_idle_remote_sessions() -> None:
                     to_reap.append(sid)
 
             for sid in to_reap:
-                logger.info(f"Reaping idle remote session {sid[:8]}")
+                logger.info("Reaping idle remote session %s", sid[:8])
                 await layer.close_session(sid)
-        except Exception as e:
-            logger.error(f"Remote session reaper error: {e}")
+        except Exception as e:  # noqa: BLE001  # the reaper loop's tick: one failed pass must not stop reaping
+            logger.error("Remote session reaper error: %s", e)

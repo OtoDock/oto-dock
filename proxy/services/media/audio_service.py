@@ -16,9 +16,10 @@ import time
 from dataclasses import dataclass
 
 from audio.providers import registry
-from storage.prefs import audio_provider_store
-from storage.identity import credential_store
+
 from storage import database as task_store
+from storage.identity import credential_store
+from storage.prefs import audio_provider_store
 
 # Browser playback rate — chat requests this rate from the TTS provider directly
 # (Cartesia emits it natively), so no server-side resampling is needed.
@@ -31,13 +32,45 @@ class AudioUnavailableError(Exception):
     """Raised when a requested provider can't be resolved/built."""
 
 
+class ProviderNotFoundError(AudioUnavailableError):
+    """A provider id names no row of the right kind (a stale id): the TTS
+    routes answer 404 on it, a missing default is 503."""
+
+
 def _no_provider(kind: str, provider_id: int | None = None) -> AudioUnavailableError:
     """The refusal a tool relays as is: what is missing and where an admin
-    picks one. A stale id keeps "with id" (the TTS route answers 404 on it)."""
-    named = f" with id {provider_id} is" if provider_id is not None else ""
+    picks one."""
+    if provider_id is not None:
+        return ProviderNotFoundError(
+            f"No {kind.upper()} provider with id {provider_id} is configured: "
+            f"select one in Setup, Audio."
+        )
     return AudioUnavailableError(
-        f"No {kind.upper()} provider{named} configured: select one in Admin, Audio."
+        f"No {kind.upper()} provider configured: select one in Setup, Audio."
     )
+
+
+_AUTH_WORDS = ("401", "403", "unauthorized", "authenticated", "authentication",
+               "api key", "api_key", "invalid key", "forbidden")
+
+
+def provider_error_message(error: BaseException | str, provider_name: str = "") -> str:
+    """A provider's failure as the person reads it, the same on every path
+    (the voices list, file transcription, the dictation socket): a refused
+    key names the credential and where it is set, anything else is the
+    vendor's own text, trimmed."""
+    text = str(error).strip()
+    vendor = provider_name.strip().title() if provider_name else "The provider"
+    if is_key_refusal(text):
+        return f"{vendor} rejected the API key: check the provider credential in Setup, Audio."
+    return text[:300] or f"{vendor} failed without a message."
+
+
+def is_key_refusal(error: BaseException | str) -> bool:
+    """The vendor refused the configured key (the dictation socket words it
+    for the person; ``provider_error_message`` for its other readers)."""
+    text = str(error).strip()
+    return any(word in text.lower() for word in _AUTH_WORDS) or "rejected the API key" in text
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +153,7 @@ def build_generate_provider(*, provider_id: int | None = None,
     try:
         cls = registry.get_provider_class("tts", row["provider_name"])
     except (KeyError, ImportError) as e:
-        raise AudioUnavailableError(f"{row['provider_name']} unavailable: {e}")
+        raise AudioUnavailableError(f"{row['provider_name']} unavailable: {e}") from e
     if advanced_overrides:
         if getattr(cls.capabilities, "is_local", False):
             logging.getLogger("otodock").warning(
@@ -133,8 +166,33 @@ def build_generate_provider(*, provider_id: int | None = None,
     try:
         inst = registry.get_or_build_provider(row, credential_resolver)
     except (KeyError, NotImplementedError, ImportError) as e:
-        raise AudioUnavailableError(f"{row['provider_name']} unavailable: {e}")
+        raise AudioUnavailableError(f"{row['provider_name']} unavailable: {e}") from e
     return inst, row
+
+
+def chat_provider_factory(provider_type: str, *, provider_id: int | None = None):
+    """The chat provider's row and a factory that builds a fresh instance of
+    it with the credential resolved HERE (the caller runs this off the loop
+    once; the factory itself touches no store, so the language streams can
+    build a second stream on the loop). Returns ``(factory, row)``."""
+    if provider_id is not None:
+        row = audio_provider_store.get_provider(provider_id)
+        if not row or row["provider_type"] != provider_type:
+            raise _no_provider(provider_type, provider_id)
+    else:
+        row = audio_provider_store.get_default_provider(provider_type, "chat")
+        if not row:
+            raise _no_provider(provider_type)
+    try:
+        cls = registry.get_provider_class(row["provider_type"], row["provider_name"])
+    except (KeyError, NotImplementedError, ImportError) as e:
+        raise AudioUnavailableError(f"{row['provider_name']} unavailable: {e}") from e
+    key = credential_resolver(row.get("credential_key", "")) or ""
+
+    def factory():
+        return cls.from_row(row, lambda _k: key)
+
+    return factory, row
 
 
 def build_chat_provider(provider_type: str, *, provider_id: int | None = None):
@@ -154,7 +212,7 @@ def build_chat_provider(provider_type: str, *, provider_id: int | None = None):
     try:
         inst = registry.get_or_build_provider(row, credential_resolver)
     except (KeyError, NotImplementedError, ImportError) as e:
-        raise AudioUnavailableError(f"{row['provider_name']} unavailable: {e}")
+        raise AudioUnavailableError(f"{row['provider_name']} unavailable: {e}") from e
     return inst, row
 
 
@@ -170,6 +228,44 @@ class ChatAudioCapability:
     stt_provider_id: int | None
     reason: str
     icons_enabled: bool
+    # The local language identifier is on and loads here: the Automatic
+    # dictation pick reads the language from the audio (else it falls back
+    # to the provider's automatic stream).
+    language_identify: bool = False
+
+
+def language_identify_enabled() -> bool:
+    """The identifier setting is on (absent counts as on) and the model and
+    its runtime are present in this process."""
+    from audio.providers.lid.ecapa import identifier_available
+    raw = task_store.get_platform_setting("audio_language_identify_enabled")
+    if raw is not None and str(raw).strip().lower() in ("false", "0", "no"):
+        return False
+    return identifier_available()
+
+
+def language_identify_threads() -> int:
+    """One identifier run's threads, clamped to 1 to the CPU count."""
+    import os
+    raw = task_store.get_platform_setting("audio_language_identify_threads")
+    try:
+        threads = int(raw) if raw else 1
+    except (TypeError, ValueError):
+        threads = 1
+    return max(1, min(threads, os.cpu_count() or 1))
+
+
+def language_identify_prewarm_wanted() -> bool:
+    """The proxy loads the model at start only where a dictation can use
+    it: the setting on, the runtime and the file present, and a chat STT
+    provider configured. An install without one never pays the memory; a
+    socket that lands first loads it then, off the loop."""
+    return language_identify_enabled() and audio_provider_store.get_default_provider("stt", "chat") is not None
+
+
+def language_candidates() -> list[str]:
+    from audio.streaming.lang import language_candidates as parse
+    return parse(task_store.get_platform_setting("audio_language_candidates") or "")
 
 
 def _resolve_modality(provider_type: str, policy: str, has_native: bool) -> tuple[str, int | None, str]:
@@ -219,7 +315,8 @@ def resolve_chat_audio_capability(*, has_native_tts: bool, has_native_stt: bool)
     policy = task_store.get_platform_setting("audio_chat_user_policy") or "native_preferred"
     tts, tpid, treason = _resolve_modality("tts", policy, has_native_tts)
     stt, spid, sreason = _resolve_modality("stt", policy, has_native_stt)
-    return ChatAudioCapability(tts, stt, tpid, spid, f"TTS: {treason}. STT: {sreason}.", True)
+    return ChatAudioCapability(tts, stt, tpid, spid, f"TTS: {treason}. STT: {sreason}.", True,
+                               language_identify=language_identify_enabled())
 
 
 def duplex_capability() -> dict:
@@ -264,10 +361,12 @@ def is_native_only_policy() -> bool:
 
 def record_audio_usage(
     user_sub: str, source_type: str, provider_name: str, provider, *,
-    chars: int = 0, seconds: float = 0.0,
+    chars: int = 0, seconds: float = 0.0, agent: str = "", scope: str = "user",
+    source_id: str | None = None,
 ) -> None:
     """Compute cost from the provider's billing metadata and record one usage
-    row (captures ``audio_seconds`` even when free/$0)."""
+    row (captures ``audio_seconds`` even when free/$0). A call's row is the
+    agent's (``scope='agent'``, the phone owner), a person's their own."""
     unit = provider.billing_unit()
     rate = provider.cost_per_unit()
     if unit == "char":
@@ -277,7 +376,7 @@ def record_audio_usage(
     else:  # "second"
         cost = seconds * rate
     task_store.insert_usage_record(
-        user_sub, "", "user", source_type, None, round(cost, 6),
+        user_sub, agent, scope, source_type, source_id, round(cost, 6),
         provider=provider_name,
         audio_seconds=round(seconds, 2) if seconds else None,
         billing_unit=unit,

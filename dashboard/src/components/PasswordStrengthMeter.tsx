@@ -2,11 +2,11 @@ import { useMemo } from 'react'
 import zxcvbn from 'zxcvbn'
 
 const SCORE_COLORS = [
-  'bg-red-500',      // 0 - very weak
-  'bg-red-400',      // 1 - weak
-  'bg-amber-400',    // 2 - fair
-  'bg-green-400',    // 3 - strong
-  'bg-green-600',    // 4 - very strong
+  'bg-status-danger-solid',   // 0 - very weak
+  'bg-status-danger-solid',   // 1 - weak
+  'bg-status-warning-solid',  // 2 - fair
+  'bg-status-success-solid',  // 3 - strong
+  'bg-status-success-solid',  // 4 - very strong
 ]
 
 const SCORE_LABELS = [
@@ -58,21 +58,21 @@ export default function PasswordStrengthMeter({ password, minScore = 3, minLengt
       <div className="flex gap-1 h-1">
         {[0, 1, 2, 3, 4].map(i => (
           <div key={i} className={`flex-1 rounded-full transition-colors ${
-            i <= score ? SCORE_COLORS[score] : 'bg-gray-200 dark:bg-gray-700'
+            i <= score ? SCORE_COLORS[score] : 'bg-surface-muted'
           }`} />
         ))}
       </div>
       <div className="flex justify-between items-center">
-        <span className={`text-[10px] font-medium ${passes ? 'text-green-600 dark:text-green-400' : 'text-p-text-secondary'}`}>
+        <span className={`text-3xs font-medium ${passes ? 'text-status-success-fg' : 'text-secondary'}`}>
           {score >= 0 ? SCORE_LABELS[score] : ''}
         </span>
         {score >= 0 && (
-          <span className={`text-[10px] ${passes ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'}`}>
+          <span className={`text-3xs ${passes ? 'text-status-success-fg' : 'text-status-warning-fg'}`}>
             {passes ? 'Meets requirements' : `Minimum: ${SCORE_LABELS[minScore]}`}
           </span>
         )}
       </div>
-      {feedback && <p className="text-[10px] text-p-text-light">{feedback}</p>}
+      {feedback && <p className="text-3xs text-tertiary">{feedback}</p>}
     </div>
   )
 }

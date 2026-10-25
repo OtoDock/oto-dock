@@ -118,7 +118,7 @@ async def _round(tmp_path, host: str, port: int, sessions: list[dict], *, deltas
                     # Released by drive_turns only after turn_end judged it.
                     mark["judged"] = time.monotonic()
                 await eq.put(event)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # the producer hands its failure to the consumer as an error event
             await eq.put(CommonEvent(type=ERROR, data={"message": str(exc)}))
         finally:
             mark["producer_done"] = time.monotonic()
@@ -172,7 +172,7 @@ async def _round(tmp_path, host: str, port: int, sessions: list[dict], *, deltas
         for v in viewers:
             await h.read_line(v, 120)
         async with asyncio.timeout(60):
-            while not all(p._ws_queues for p in pumps):
+            while not all(p._ws_queues for p in pumps):  # noqa: ASYNC110  # the pumps' viewer queues: the pump has no attach event
                 await asyncio.sleep(0.05)
 
         async with h.Window() if measure else contextlib.nullcontext() as window:

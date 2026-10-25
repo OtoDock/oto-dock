@@ -6,90 +6,9 @@
  */
 
 import { useState } from 'react'
-import {
-  fetchSigningSecret,
-  linkedTriggersOf,
-  SubscriptionRequestError,
-  useDeleteSubscription,
-  type WebhookSubscription,
-} from '../../api/subscriptions'
-
-/** Plain words for a refused subscription request. Structured refusals
- * (missing scopes, a duplicate) say what to do; anything else is the
- * server's message. */
-export function describeSubscriptionError(
-  err: unknown,
-  opts: { scope: 'user' | 'service'; accountLabel: string },
-): string {
-  if (err instanceof SubscriptionRequestError && typeof err.detail !== 'string') {
-    const d = err.detail
-    if (d.error === 'missing_scopes') {
-      const scopes = Array.isArray(d.required) ? d.required.join(', ') : ''
-      return opts.scope === 'service'
-        ? `The bound account ${opts.accountLabel} is missing the scopes ${scopes}. Its owner must reconnect it with the matching permission ticked.`
-        : `Your account is missing the scopes ${scopes}. Reconnect it with the matching permission ticked and try again.`
-    }
-    if (d.error === 'exists') {
-      return 'A subscription for this target already exists here.'
-    }
-  }
-  return (err as Error).message
-}
-
-/**
- * Delete with the two confirmations: the plain one, then, when the server
- * answers that triggers still fire from the row, a second one before the
- * forced delete leaves those triggers without a source.
- */
-export function useDeleteWithConfirm() {
-  const del = useDeleteSubscription()
-  const [error, setError] = useState<string | null>(null)
-
-  const remove = async (row: WebhookSubscription) => {
-    setError(null)
-    const consequence =
-      row.delivery_mode === 'relay'
-        ? 'OtoDock stops forwarding its events to this install.'
-        : 'This unregisters the webhook at the vendor.'
-    if (!confirm(`Delete subscription for ${row.vendor_target}? ${consequence}`)) {
-      return
-    }
-    // The row goes even when the vendor keeps the registration
-    // (orphan-tolerant); that outcome is the one thing worth saying.
-    const report = (res: { vendor_detached?: boolean }) => {
-      if (res.vendor_detached === false) {
-        setError(
-          `The subscription is deleted but the webhook at the vendor could not be removed. Delete it by hand in the vendor's settings for ${row.vendor_target}.`,
-        )
-      }
-    }
-    try {
-      report(await del.mutateAsync({ id: row.id }))
-      return
-    } catch (err) {
-      const linked = linkedTriggersOf(err)
-      if (linked.length === 0) {
-        setError((err as Error).message)
-        return
-      }
-      const names = linked.map((t) => t.name).join(', ')
-      if (
-        !confirm(
-          `${linked.length} trigger${linked.length === 1 ? '' : 's'} still fire${linked.length === 1 ? 's' : ''} from this subscription: ${names}. Delete it anyway? The trigger${linked.length === 1 ? ' stays' : 's stay'} but no longer receive${linked.length === 1 ? 's' : ''} events.`,
-        )
-      ) {
-        return
-      }
-    }
-    try {
-      report(await del.mutateAsync({ id: row.id, force: true }))
-    } catch (err) {
-      setError((err as Error).message)
-    }
-  }
-
-  return { remove, isPending: del.isPending, error, setError }
-}
+import { fetchSigningSecret, type WebhookSubscription } from '../../api/subscriptions'
+import { isRelayDelivery } from './useDeleteWithConfirm'
+import { BADGE_BASE, BADGE_TONE } from '../ui/classes'
 
 export function SubscriptionRow({
   sub,
@@ -102,7 +21,7 @@ export function SubscriptionRow({
 }: {
   sub: WebhookSubscription
   webhookBase: string
-  registrationMode: 'relay' | 'auto' | 'manual'
+  registrationMode: 'relay' | 'auto' | 'manual' | 'app'
   perSubscriptionSecret: boolean
   /** Display name of the agent a service row belongs to. */
   agentLabel?: string
@@ -111,7 +30,7 @@ export function SubscriptionRow({
 }) {
   const [copied, setCopied] = useState<string | null>(null)
   const events = sub.selected_events.join(', ')
-  const isRelay = sub.delivery_mode === 'relay'
+  const isRelay = isRelayDelivery(sub)
   // Manual vendor-mode rows need the URL pasted into the vendor console.
   const showWebhookUrl = !isRelay && registrationMode === 'manual'
   const webhookUrl = webhookBase
@@ -136,17 +55,18 @@ export function SubscriptionRow({
           <ScopePill sub={sub} agentLabel={agentLabel} />
           <span className="font-mono truncate">{sub.vendor_target}</span>
           {sub.target_kind && (
-            <span className="inline-block px-1.5 rounded-sm text-[10px] uppercase font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200">
+            <span className={`${BADGE_BASE} ${BADGE_TONE.info}`}>
               {sub.target_kind}
             </span>
           )}
           {isRelay && (
-            <span className="inline-block px-1.5 rounded-sm text-[10px] uppercase font-semibold bg-purple-100 text-purple-800">
+            <span className={`${BADGE_BASE} ${BADGE_TONE.info}`}>
+              {/* plain-sentences: allow: the operator keeps this pill's words as they are */}
               via OtoDock
             </span>
           )}
         </div>
-        <div className="text-p-text-light truncate" title={events}>
+        <div className="text-tertiary truncate" title={events}>
           {events || '—'}
           {sub.event_count > 0 && (
             <span className="ml-1">
@@ -161,7 +81,7 @@ export function SubscriptionRow({
           webhookUrl ? (
             <div className="flex items-center gap-1 mt-0.5 min-w-0">
               <span
-                className="font-mono text-[10px] text-p-text-light truncate"
+                className="font-mono text-3xs text-tertiary truncate"
                 title={webhookUrl}
               >
                 {webhookUrl}
@@ -169,7 +89,7 @@ export function SubscriptionRow({
               <button
                 type="button"
                 onClick={() => copy('url', webhookUrl)}
-                className="text-brand hover:underline shrink-0"
+                className="text-link hover:underline shrink-0"
               >
                 {copied === 'url' ? 'Copied' : 'Copy URL'}
               </button>
@@ -191,7 +111,7 @@ export function SubscriptionRow({
                       /* manage-gated or platform-wide secret */
                     }
                   }}
-                  className="text-brand hover:underline shrink-0"
+                  className="text-link hover:underline shrink-0"
                 >
                   {copied === 'secret'
                     ? 'Copied'
@@ -202,13 +122,13 @@ export function SubscriptionRow({
               )}
             </div>
           ) : (
-            <div className="text-amber-600 dark:text-amber-400 mt-0.5">
+            <div className="text-status-warning-fg mt-0.5">
               Set DASHBOARD_PUBLIC_URL to get this subscription's webhook URL.
             </div>
           )
         )}
         {sub.last_error && (
-          <div className="text-red-600 dark:text-red-400 truncate"
+          <div className="text-status-danger-fg truncate"
                title={sub.last_error}>
             {sub.last_error}
           </div>
@@ -218,7 +138,7 @@ export function SubscriptionRow({
         type="button"
         onClick={onDelete}
         disabled={isPending}
-        className="text-red-600 hover:underline disabled:opacity-50"
+        className="text-status-danger-fg hover:underline disabled:opacity-50"
       >
         Delete
       </button>
@@ -237,11 +157,7 @@ export function ScopePill({
   const isAgent = sub.scope === 'service'
   return (
     <span
-      className={`inline-block px-1.5 rounded-sm text-[10px] uppercase font-semibold ${
-        isAgent
-          ? 'bg-brand/10 text-brand'
-          : 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300'
-      }`}
+      className={`${BADGE_BASE} ${BADGE_TONE[isAgent ? 'agent' : 'neutral']}`}
       title={isAgent ? `Created for agent ${sub.agent ?? ''}` : 'Your personal subscription'}
     >
       {isAgent ? `Agent ${agentLabel || sub.agent || ''}` : 'Personal'}
@@ -250,17 +166,17 @@ export function ScopePill({
 }
 
 export function StatusPill({ status }: { status: WebhookSubscription['status'] }) {
-  const map: Record<WebhookSubscription['status'], string> = {
-    active: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
-    creating: 'bg-blue-100 text-blue-800',
-    failed: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
-    renew_failed: 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400',
-    expired: 'bg-gray-100 text-gray-800',
-    disabled: 'bg-gray-100 text-gray-800',
+  const map: Record<WebhookSubscription['status'], keyof typeof BADGE_TONE> = {
+    active: 'success',
+    creating: 'info',
+    failed: 'danger',
+    renew_failed: 'warning',
+    expired: 'neutral',
+    disabled: 'neutral',
   }
   return (
     <span
-      className={`inline-block px-1.5 rounded-sm text-[10px] uppercase font-semibold ${map[status]}`}
+      className={`${BADGE_BASE} ${BADGE_TONE[map[status]]}`}
     >
       {status.replace('_', ' ')}
     </span>

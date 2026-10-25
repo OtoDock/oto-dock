@@ -4,7 +4,8 @@ import { MemoryRouter, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactElement } from 'react'
 
-import AppFrame, { _resetViewerClaimsForTests } from '@/components/apps/AppFrame'
+import AppFrame from '@/components/apps/AppFrame'
+import { _resetViewerClaimsForTests } from '@/components/apps/appFrameClaims'
 import { emitFileUpdate } from '@/lib/fileUpdates'
 import { emitAppLive } from '@/lib/appLive'
 import { _resetFocusForTests, currentFocus } from '@/lib/focus'
@@ -747,7 +748,7 @@ describe('AppFrame open_target navigation', () => {
     expect(loc()).toBe('/chat/a1')
     const allow = Array.from(chip!.querySelectorAll('button')).find((b) => b.textContent === 'Allow')!
     await act(async () => { allow.click() })
-    expect(loc()).toBe('/user-settings?tab=integrations&provider=gmail-mcp')
+    expect(loc()).toBe('/user-settings/integrations?provider=gmail-mcp')
     expect(spy).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'open_ack', status: 'opened' }), '*',
     )
@@ -984,7 +985,7 @@ describe('AppFrame folder apps', () => {
     expect(container.querySelector('[data-testid="app-server-banner"]')).toBeNull()
     post(f, { type: 'server_status', state: 'backoff' })
     await flush()
-    expect(container.querySelector('[data-testid="app-server-banner"]')?.textContent).toContain('see Logs')
+    expect(container.querySelector('[data-testid="app-server-banner"]')?.textContent).toContain('See Logs')
     rerender(
       <QueryClientProvider client={queryClient}>
         <MemoryRouter initialEntries={['/chat/a1']}><AppFrame app={folderApp({ can_manage: false })} agent="a1" /></MemoryRouter>

@@ -50,17 +50,17 @@ export default function DocumentCard({
 
   const label = (
     <>
-      <svg className="h-5 w-5 shrink-0 text-p-text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
+      <svg className="h-5 w-5 shrink-0 text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
         <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
       </svg>
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-2">
-          <span className="truncate text-sm font-medium text-p-text">{filename || 'Document'}</span>
-          <span className="shrink-0 rounded-sm bg-brand/10 px-1.5 py-0.5 text-[10px] font-semibold text-brand">
+          <span className="truncate text-sm font-medium text-primary">{filename || 'Document'}</span>
+          <span className="shrink-0 rounded-sm bg-surface-muted px-1.5 py-0.5 text-3xs font-semibold text-secondary">
             {extensionBadge(filename)}
           </span>
         </span>
-        <span className="block text-[11px] text-p-text-light">
+        <span className="block text-2xs text-tertiary">
           {number ? `Version ${number}` : 'Document'}
           {gone ? ', no longer available' : ''}
           {generation ? ` · ${pushTime(generation)}` : ''}
@@ -71,7 +71,7 @@ export default function DocumentCard({
 
   if (gone || !chatId) {
     return (
-      <div className="my-1 flex w-full max-w-sm items-center gap-3 rounded-xl border border-p-border-light bg-p-surface/50 px-3 py-2 opacity-70">
+      <div className="my-1 flex w-full max-w-sm items-center gap-3 rounded-card border border-subtle bg-surface-muted/50 px-3 py-2 opacity-70">
         {label}
       </div>
     )
@@ -81,7 +81,7 @@ export default function DocumentCard({
       type="button"
       onClick={open}
       title={newest ? 'Open the document' : 'Open this version, read-only'}
-      className="my-1 flex w-full max-w-sm items-center gap-3 rounded-xl border border-p-border-light bg-white px-3 py-2 text-left transition-colors hover:bg-p-surface dark:bg-p-surface dark:hover:bg-p-surface-hover"
+      className="my-1 flex w-full max-w-sm items-center gap-3 rounded-card bg-surface-card shadow-elevation-1 px-3 py-2 text-left transition-colors hover:bg-surface-hover"
     >
       {label}
     </button>

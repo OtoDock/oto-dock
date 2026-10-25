@@ -13,10 +13,9 @@ from fastapi.testclient import TestClient
 
 from auth.providers import UserContext, get_current_user
 from services.delegation import lane_status
+from storage import database as task_store
 from storage.agents import agent_store
 from storage.mcp import mcp_store
-from storage import database as task_store
-
 
 AGENT = "pa"
 PARENT_SESSION = "22222222-2222-2222-2222-222222222222"

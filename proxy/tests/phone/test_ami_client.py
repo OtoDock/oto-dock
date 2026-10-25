@@ -14,8 +14,7 @@ import socket
 
 import pytest
 
-from services.phone.phone_adapters import PhoneAdapterError
-from services.phone.phone_adapters import ami as ami_mod
+from services.phone.phone_adapters import PhoneAdapterError, ami as ami_mod
 from services.phone.phone_adapters.ami import AMIClient
 
 GOOD_SECRET = "s3cr3t"

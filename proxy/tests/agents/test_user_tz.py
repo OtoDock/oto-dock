@@ -17,6 +17,7 @@ Run: cd proxy && python -m pytest tests/agents/test_user_tz.py -v
 """
 
 import contextlib
+import logging
 import os
 import sys
 import zoneinfo
@@ -25,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -132,9 +134,10 @@ def test_format_current_time_includes_ampm_gloss(temp_db):
     forces unambiguous reading. Mock datetime.now to hit specific clock
     points across the day plus the noon/midnight boundaries.
     """
-    import config
-    from unittest import mock
     from datetime import datetime
+    from unittest import mock
+
+    import config
     _set_platform_tz("Europe/Athens")
     tz = zoneinfo.ZoneInfo("Europe/Berlin")
 
@@ -249,8 +252,9 @@ def test_register_task_naive_run_at_uses_row_tz(temp_db):
     Bypasses APScheduler's job machinery and asserts the trigger's run_date
     directly — that's what determines fire-time semantics.
     """
-    from services.scheduler import scheduler
     from apscheduler.triggers.date import DateTrigger
+
+    from services.scheduler import scheduler
     _set_platform_tz("Europe/Athens")
 
     # 1 hour from now in NY local. Naive ISO.
@@ -317,15 +321,18 @@ def test_register_task_user_tz_null_falls_back_to_platform(temp_db):
 
 
 @pytest.mark.asyncio
-async def test_update_dynamic_task_rejects_invalid_user_tz(temp_db):
+async def test_update_dynamic_task_rejects_invalid_user_tz(temp_db, caplog):
     from services.scheduler import scheduler
     _create_dynamic_task(task_id="t-invalid-tz", schedule="0 9 * * *",
                          user_tz="Europe/Athens")
-    ok, err = await scheduler.update_dynamic_task(
-        "t-invalid-tz", {"user_tz": "Mars/Olympus"},
-    )
+    with caplog.at_level(logging.WARNING, logger="otodock.scheduler"):
+        ok, err = await scheduler.update_dynamic_task(
+            "t-invalid-tz", {"user_tz": "Mars/Olympus"},
+        )
     assert not ok
-    assert err and "user_tz" in err.lower()
+    assert err == "That time zone is not known. Use a name like Europe/Athens."
+    assert ("t-invalid-tz refused, time zone 'Mars/Olympus': "
+            "'No time zone found with key Mars/Olympus'") in caplog.text
 
 
 @pytest.mark.asyncio
@@ -345,15 +352,18 @@ async def test_update_dynamic_task_accepts_valid_user_tz(temp_db):
 
 
 @pytest.mark.asyncio
-async def test_update_notification_rejects_invalid_user_tz(temp_db):
+async def test_update_notification_rejects_invalid_user_tz(temp_db, caplog):
     from services.notifications import notification_manager
     _create_notification(nid="n-bad", schedule="0 9 * * *",
                          user_tz="Europe/Athens")
-    ok, err = await notification_manager.update_notification(
-        "n-bad", {"user_tz": "Foo/Bar"},
-    )
+    with caplog.at_level(logging.WARNING, logger="otodock.notifications"):
+        ok, err = await notification_manager.update_notification(
+            "n-bad", {"user_tz": "Foo/Bar"},
+        )
     assert not ok
-    assert err and "user_tz" in err.lower()
+    assert err == "That time zone is not known. Use a name like Europe/Athens."
+    assert ("n-bad refused, time zone 'Foo/Bar': "
+            "'No time zone found with key Foo/Bar'") in caplog.text
 
 
 # ───────────────────────────────────────────────────────────────────────────

@@ -5,17 +5,18 @@ or read outside the satellite's authorized roots.
 """
 
 import os
+
+# Add satellite parent dir to sys.path so we can import as a package.
+import sys
 from pathlib import Path
 
 import pytest
 
-# Add satellite parent dir to sys.path so we can import as a package.
-import sys
 _SAT_PARENT = Path(__file__).resolve().parent.parent.parent
 if str(_SAT_PARENT) not in sys.path:
     sys.path.insert(0, str(_SAT_PARENT))
 
-from satellite.host import auth_paths  # noqa: E402
+from satellite.host import auth_paths
 
 
 def test_is_safe_slug_accepts_plain():

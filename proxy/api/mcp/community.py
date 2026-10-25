@@ -12,33 +12,53 @@ update_available); the admin/manager actions live under
 from __future__ import annotations
 
 import asyncio
+import errno
 import functools
 import logging
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from auth.providers import UserContext, get_current_user, require_admin, require_human, require_user
+from api._guards import require_creator_or_admin
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_admin,
+    require_human,
+    require_user,
+)
 from services.community import community_catalog, community_installer
-from auth import roles
 
 logger = logging.getLogger("otodock.community-api")
 router = APIRouter(dependencies=[Depends(require_user)])
 
 
-def _require_creator_or_admin(user: UserContext | None) -> UserContext:
-    """Browse access is available to creators and admins.
+# Browse access is for creators and admins: creators see the catalog from
+# the agent settings flow, admins from the MCP servers admin page; members
+# have neither entry point, so the API stays symmetric with the UI.
+_CREATOR_DETAIL = "Admin or creator only"
 
-    Creators see the catalog from the agent settings flow; admins see it
-    from the MCP servers admin page. Members don't have either entry point,
-    so we keep the API symmetric with the UI.
-    """
-    if not user:
-        raise HTTPException(403, "Authentication required")
-    if not roles.is_creator_or_above(user.role):
-        raise HTTPException(403, "Admin or creator only")
-    return user
+# A background install that stopped on an error nobody raised on purpose.
+_INSTALL_STOPPED = "The install stopped on an unexpected error. The server log has the details."
+_DISK_FULL = "The server's disk is full."
+
+
+def _catalog_refusal(route: str, what: str, url: str, exc: BaseException) -> HTTPException:
+    """The 502 of a catalog that could not be read: the sentence by cause
+    (the host this server must reach when it did not answer), the cause in
+    the log."""
+    logger.warning("%s: could not load the %s: %s", route, what, exc)
+    return HTTPException(502, community_catalog.load_refusal(what, url, exc))
+
+
+def _install_failure(exc: Exception) -> str:
+    """What a background install's job line and notification say when the
+    install raised an error of its own (the traceback is in the log)."""
+    if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return _DISK_FULL
+    return _INSTALL_STOPPED
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +78,7 @@ async def list_community_mcps(
     (no ``agent`` param) sets ``pending_request`` to ``None`` everywhere but
     populates ``pending_request_count`` (across all agents).
     """
-    _require_creator_or_admin(user)
+    require_creator_or_admin(user, detail=_CREATOR_DETAIL)
 
     if agent and not user.can_manage_agent(agent):
         raise HTTPException(403, "Manager access required for this agent")
@@ -66,8 +86,9 @@ async def list_community_mcps(
     try:
         registry = await community_catalog.fetch_registry()
     except Exception as exc:
-        logger.exception("Failed to load community registry")
-        raise HTTPException(502, f"Could not load community catalog: {exc}")
+        raise _catalog_refusal(
+            "GET /v1/community/mcps", "community list", community_catalog.REGISTRY_RAW_URL, exc,
+        ) from exc
 
     installed_versions, enabled_for_agents, pending_requests, installed_manifest_hashes = (
         await community_catalog.collect_local_state()
@@ -107,13 +128,14 @@ async def get_community_mcp(
     descriptor the platform installer would consume; the README is the
     markdown shown in the detail dialog of the Browse UI.
     """
-    _require_creator_or_admin(user)
+    require_creator_or_admin(user, detail=_CREATOR_DETAIL)
 
     try:
         registry = await community_catalog.fetch_registry()
     except Exception as exc:
-        logger.exception("Failed to load community registry")
-        raise HTTPException(502, f"Could not load community catalog: {exc}")
+        raise _catalog_refusal(
+            "GET /v1/community/mcps/{name}", "community list", community_catalog.REGISTRY_RAW_URL, exc,
+        ) from exc
 
     entry = next(
         (m for m in registry.get("mcps", []) if m.get("name") == name),
@@ -133,13 +155,13 @@ async def get_community_mcp(
 
     try:
         manifest = await community_catalog.fetch_manifest(name)
-    except Exception as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
         logger.warning("Failed to fetch manifest for %s: %s", name, exc)
         manifest = None
 
     try:
         readme = await community_catalog.fetch_readme(name)
-    except Exception as exc:
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         logger.warning("Failed to fetch README for %s: %s", name, exc)
         readme = None
 
@@ -175,8 +197,8 @@ async def _notify_install_failed(name: str, error: str, admin_sub: str) -> None:
     """
     from services.notifications import notification_manager
     body = (
-        f"Install failed for **{name}**. The catalog is unchanged (rolled back); "
-        f"you can retry from Browse Community MCPs."
+        f"**{name}** was not installed, and nothing was changed. "
+        f"You can try again from Browse Community MCPs."
     )
     excerpt = (error or "")[:300]
     if excerpt:
@@ -222,7 +244,7 @@ async def _run_catalog_install(name: str, admin_sub: str) -> None:
         await _notify_install_failed(name, msg, admin_sub)
     except Exception as exc:
         logger.exception("Background install of %s failed", name)
-        msg = f"{type(exc).__name__}: {exc}"
+        msg = _install_failure(exc)
         await catalog_install_registry.fail(name, msg)
         await _notify_install_failed(name, msg, admin_sub)
 
@@ -249,7 +271,10 @@ async def install_community_mcp(
     try:
         registry = await community_catalog.fetch_registry()
     except Exception as exc:
-        raise HTTPException(502, f"Could not load community catalog: {exc}")
+        raise _catalog_refusal(
+            "POST /v1/admin/community/mcps/{name}/install", "community list",
+            community_catalog.REGISTRY_RAW_URL, exc,
+        ) from exc
     entry = next((m for m in registry.get("mcps", []) if m.get("name") == name), None)
     if entry is None:
         raise HTTPException(404, f"MCP '{name}' not found in community catalog")
@@ -302,7 +327,7 @@ async def list_community_skills(
     registry degrades to an EMPTY catalog with ``catalog_unreachable: true``
     instead of a 502 — the Skills tab renders a banner, never an error.
     """
-    _require_creator_or_admin(user)
+    require_creator_or_admin(user, detail=_CREATOR_DETAIL)
     if agent and not user.can_manage_agent(agent):
         raise HTTPException(403, "Manager access required for this agent")
 
@@ -335,7 +360,7 @@ async def get_community_skill(
     user: UserContext = Depends(get_current_user),
 ) -> dict:
     """Registry entry + manifest + README for one community skill package."""
-    _require_creator_or_admin(user)
+    require_creator_or_admin(user, detail=_CREATOR_DETAIL)
 
     registry = await community_catalog.fetch_skills_registry()
     entry = next(
@@ -354,11 +379,11 @@ async def get_community_skill(
     )
     try:
         manifest = await community_catalog.fetch_skills_manifest(name)
-    except Exception:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
         manifest = None
     try:
         readme = await community_catalog.fetch_skills_readme(name)
-    except Exception:
+    except (httpx.HTTPError, httpx.InvalidURL):
         readme = ""
     return {"entry": augmented, "manifest": manifest, "readme": readme}
 
@@ -391,7 +416,7 @@ async def _run_skill_catalog_install(name: str, admin_sub: str) -> None:
         await _notify_install_failed(name, msg, admin_sub)
     except Exception as exc:
         logger.exception("Background skill install of %s failed", name)
-        msg = f"{type(exc).__name__}: {exc}"
+        msg = _install_failure(exc)
         await catalog_install_registry.fail(name, msg)
         await _notify_install_failed(name, msg, admin_sub)
 
@@ -606,7 +631,10 @@ async def create_mcp_request(
             try:
                 registry = await community_catalog.fetch_registry()
             except Exception as exc:
-                raise HTTPException(502, f"Could not load community catalog: {exc}")
+                raise _catalog_refusal(
+                    "POST /v1/agents/{slug}/mcp-requests", "community list",
+                    community_catalog.REGISTRY_RAW_URL, exc,
+                ) from exc
             if not any(m.get("name") == body.mcp_name for m in registry.get("mcps", [])):
                 raise HTTPException(
                     404,
@@ -616,11 +644,10 @@ async def create_mcp_request(
 
     # Short-circuit when the MCP is already enabled on the agent — no need to
     # bother the admin.
-    from storage.mcp import mcp_store
-    from storage.mcp import mcp_request_store
+    from storage.mcp import mcp_request_store, mcp_store
     current = await asyncio.to_thread(mcp_store.get_manager_enabled_mcps, slug)
     if body.mcp_name in current:
-        raise HTTPException(409, f"{body.mcp_name} is already enabled on {slug}")
+        raise HTTPException(409, f"{body.mcp_name} is already turned on for this agent.")
 
     try:
         row = await asyncio.to_thread(
@@ -631,7 +658,7 @@ async def create_mcp_request(
             body.kind,
         )
     except ValueError as exc:
-        raise HTTPException(409, str(exc))
+        raise HTTPException(409, str(exc)) from exc
 
     if user.is_admin:
         # Admin requester → no queue paperwork; resolve inline.
@@ -651,7 +678,11 @@ async def create_mcp_request(
             raise
         except Exception as exc:
             logger.exception("Admin auto-approve failed for %s", row["id"])
-            raise HTTPException(500, f"Auto-approve failed: {exc}")
+            raise HTTPException(
+                500,
+                "Your request was saved, but its approval stopped on an error. "
+                "The server log has the details.",
+            ) from exc
         return await _augmented_row(resolved)
 
     # Manager flow: queue + notify every admin.
@@ -765,14 +796,16 @@ async def list_community_agents(
     Each entry is augmented with ``installed_as`` — the list of agent slugs
     on this platform that were installed from this template.
     """
-    _require_creator_or_admin(user)
+    require_creator_or_admin(user, detail=_CREATOR_DETAIL)
     from services.community import community_agents_catalog
 
     try:
         registry = await community_agents_catalog.fetch_registry()
     except Exception as exc:
-        logger.exception("Failed to load agents registry")
-        raise HTTPException(502, f"Could not load community-agents catalog: {exc}")
+        raise _catalog_refusal(
+            "GET /v1/community/agents", "community agents",
+            community_agents_catalog.REGISTRY_RAW_URL, exc,
+        ) from exc
 
     installed_as = await community_agents_catalog.collect_local_state()
     from services.community import community_agent_updater
@@ -887,14 +920,16 @@ async def get_community_agent(
     user: UserContext = Depends(get_current_user),
 ) -> dict:
     """Return the registry entry + manifest + README for one template."""
-    _require_creator_or_admin(user)
+    require_creator_or_admin(user, detail=_CREATOR_DETAIL)
     from services.community import community_agents_catalog
 
     try:
         registry = await community_agents_catalog.fetch_registry()
     except Exception as exc:
-        logger.exception("Failed to load agents registry")
-        raise HTTPException(502, f"Could not load community-agents catalog: {exc}")
+        raise _catalog_refusal(
+            "GET /v1/community/agents/{template_slug}", "community agents",
+            community_agents_catalog.REGISTRY_RAW_URL, exc,
+        ) from exc
 
     entry = next(
         (a for a in registry.get("agents", []) if a.get("slug") == template_slug),
@@ -905,12 +940,12 @@ async def get_community_agent(
 
     try:
         manifest = await community_agents_catalog.fetch_manifest(template_slug)
-    except Exception as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
         logger.warning("manifest fetch failed for %s: %s", template_slug, exc)
         manifest = None
     try:
         readme = await community_agents_catalog.fetch_readme(template_slug)
-    except Exception as exc:
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         logger.warning("readme fetch failed for %s: %s", template_slug, exc)
         readme = ""
 
@@ -933,7 +968,7 @@ async def preview_community_agent_install(
     Used by the unified ``AgentInstallModal`` to render the cascade preview
     before the user commits.
     """
-    _require_creator_or_admin(user)
+    require_creator_or_admin(user, detail=_CREATOR_DETAIL)
     from services.community import community_agents_catalog
     from services.mcp import mcp_registry
     from storage.agents import agent_store
@@ -942,7 +977,10 @@ async def preview_community_agent_install(
     try:
         registry = await community_agents_catalog.fetch_registry()
     except Exception as exc:
-        raise HTTPException(502, f"Could not load community-agents catalog: {exc}")
+        raise _catalog_refusal(
+            "GET /v1/community/agents/{template_slug}/preview", "community agents",
+            community_agents_catalog.REGISTRY_RAW_URL, exc,
+        ) from exc
 
     entry = next(
         (a for a in registry.get("agents", []) if a.get("slug") == template_slug),
@@ -952,7 +990,8 @@ async def preview_community_agent_install(
         raise HTTPException(404, f"Template '{template_slug}' not in catalog")
 
     proposed_slug = target_slug or template_slug
-    slug_taken = await asyncio.to_thread(agent_store.agent_exists, proposed_slug)
+    slug_taken = (agent_store.reserved_slug_refusal(proposed_slug) is not None
+                  or await asyncio.to_thread(agent_store.agent_exists, proposed_slug))
     suggested = None
     if slug_taken:
         from services.community.community_agent_installer import _propose_free_slug
@@ -973,8 +1012,8 @@ async def preview_community_agent_install(
                 (m["name"] for m in mcps_registry.get("mcps", []) if m.get("name") == name),
                 None,
             )
-        except Exception as exc:
-            logger.debug(f"Community registry lookup for MCP {name} failed: {exc}")
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, RuntimeError) as exc:
+            logger.debug("Community registry lookup for MCP %s failed: %s", name, exc)
         if local_manifest is None:
             mcp_status.append({
                 "name": name,
@@ -1089,9 +1128,9 @@ async def admin_reseed_template_items(
     Admin only — a person, not a bearer.
     """
     require_admin(user)
-    from storage.agents import agent_store
-    from storage import database as user_store
     from services.community import community_agent_installer
+    from storage import database as user_store
+    from storage.agents import agent_store
 
     if not await asyncio.to_thread(agent_store.agent_exists, slug):
         raise HTTPException(404, f"Agent '{slug}' not found")
@@ -1099,14 +1138,14 @@ async def admin_reseed_template_items(
     if not agent or not agent.get("community_template"):
         raise HTTPException(
             400,
-            f"Agent '{slug}' is not a community-template install — "
-            "nothing to re-seed.",
+            f"Agent '{slug}' was not installed from a community template, "
+            "so there is nothing to restore.",
         )
     if not await asyncio.to_thread(agent_store.get_community_template_data, slug):
         raise HTTPException(
             400,
-            f"Agent '{slug}' has no persisted template data. Reinstall the "
-            "template to populate community_template_data, then retry.",
+            f"Agent '{slug}' has no saved template data. Reinstall the "
+            "template, then try again.",
         )
 
     pairs = await asyncio.to_thread(user_store.get_agent_users, slug)
@@ -1125,11 +1164,11 @@ async def admin_reseed_template_items(
                     slug, sub, role, seed_user_setup=False,
                 ),
             )
-        except Exception as exc:
+        except Exception:
             logger.exception("reseed failed for (%s, %s)", slug, sub)
             per_user.append({
                 "sub": sub, "role": role,
-                "error": f"{type(exc).__name__} (see proxy logs)",
+                "error": "Could not restore this person's items. The server log has the details.",
             })
             continue
         for key in ("tasks", "triggers", "notifications", "dashboards", "apps"):
@@ -1165,7 +1204,7 @@ async def install_from_community(
     sees one combined notification instead of N. The consent is always the
     caller's own, whoever ``manager_user`` names.
     """
-    u = _require_creator_or_admin(require_human(user))
+    u = require_creator_or_admin(require_human(user), detail=_CREATOR_DETAIL)
     from services.community import community_agent_installer
 
     installer_sub = u.sub
@@ -1191,6 +1230,6 @@ async def install_from_community(
         raise
     except Exception as exc:
         logger.exception("Community agent install failed for %s", body.template_slug)
-        raise HTTPException(500, f"Install failed: {exc}")
+        raise HTTPException(500, "Could not install the agent. The server log has the details.") from exc
 
 

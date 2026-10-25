@@ -9,9 +9,9 @@ import contextlib
 import json
 
 import pytest
+from pipeline_fakes import FakeCallManager, FakeLLM, make_route
 
 from config_manager import transfer_target_for
-from pipeline_fakes import FakeCallManager, FakeLLM, make_route
 from proxy.client import TOOL_USE_SIGNAL, ProxyClient
 from telephony.transfer import (
     AmiTransfer,
@@ -768,8 +768,8 @@ def test_the_twilio_fallback_is_the_unanswered_goodbye(make_pipeline):
 
 
 def test_a_transferred_outbound_call_reports_the_transferred_outcome(monkeypatch):
-    from calls.call_manager import CallManager, CallStatus
     import proxy.client as pc
+    from calls.call_manager import CallManager, CallStatus
     reported = []
 
     async def fake_report(payload):
@@ -831,3 +831,261 @@ def test_a_log_names_a_transfer_target_by_its_label_never_its_number():
     assert loggable_label("+306912345678") == "an unlabelled target"
     assert loggable_label("2101234567") == "an unlabelled target"
     assert loggable_label("") == "an unlabelled target"
+
+
+# ---------------------------------------------------------------------------
+# The acceptance cuts the turn at once
+# ---------------------------------------------------------------------------
+
+class HoldingLLM(ControlLLM):
+    """A ControlLLM whose stream holds between tokens: an ``asyncio.Event``
+    in a response parks the stream until the test sets it (the engine
+    running a tool), or for good."""
+
+    async def send_message(self, text):
+        self.prompts.append(text)
+        tokens = self._responses.pop(0) if self._responses else []
+        for i, token in enumerate(tokens):
+            if isinstance(token, asyncio.Event):
+                await token.wait()
+                continue
+            if self.on_token:
+                self.on_token(text, i, token)
+            yield token
+
+
+def _accept_later(p, frame, delay=0.05):
+    asyncio.get_running_loop().call_later(delay, p._on_call_control, frame)
+
+
+def _held_pipeline(make_pipeline, tokens, *, route=None):
+    llm = HoldingLLM(responses=[tokens])
+    p = make_pipeline(route=route or make_route(), llm=llm)
+    p._install_call_control()
+    p.state._warmup_done.set()
+    return p, llm
+
+
+def test_an_end_accepted_while_the_engine_holds_cuts_the_turn_with_words_at_the_tts(make_pipeline, monkeypatch):
+    """The goodbye went to the TTS as a chunk; the engine then parks (the
+    tool runs, no frame for seconds). The acceptance alone closes the
+    context, leaves the stream and hangs up: the engine never resumes."""
+    from pipeline import llm as llm_mod
+    monkeypatch.setattr(llm_mod, "TTS_PAUSE_FLUSH_S", 5.0)
+    hold = asyncio.Event()
+    p, llm = _held_pipeline(make_pipeline, ["Goodbye, have a nice day. ", hold, "I ended it."])
+
+    async def run():
+        _accept_later(p, _frame("end"))
+        start = asyncio.get_running_loop().time()
+        await asyncio.wait_for(_run_turn(p, "thanks, bye"), timeout=3)
+        return asyncio.get_running_loop().time() - start
+    elapsed = asyncio.run(run())
+
+    assert p.tts.text_chunks == [("Goodbye, have a nice day. ", False), ("", True)]
+    assert p.conn.hangups == 1 and p.state._running is False
+    assert llm.discarded == 1 and not hold.is_set()
+    assert elapsed < 1.5                       # not the stream's end, not a pause timer
+
+
+def test_an_end_accepted_with_words_in_the_buffer_sends_them_as_the_end_of_input(make_pipeline):
+    hold = asyncio.Event()
+    p, llm = _held_pipeline(make_pipeline, ["Goodbye", hold])
+
+    async def run():
+        _accept_later(p, _frame("end"))
+        await asyncio.wait_for(_run_turn(p, "bye"), timeout=3)
+    asyncio.run(run())
+
+    assert p.tts.text_chunks == [("Goodbye", True)]
+    assert p.conn.hangups == 1 and llm.discarded == 1
+
+
+def test_an_end_accepted_before_any_words_keeps_the_one_sentence_rule(make_pipeline):
+    """Nothing spoken when the acceptance arrives: the wake is consumed and
+    the first sentence after the tool's boundary plays, then the line
+    closes (the tool-first rule as before)."""
+    hold = asyncio.Event()
+    p, llm = _held_pipeline(
+        make_pipeline, [hold, TOOL_USE_SIGNAL, "Goodbye for now. ", "Here is my report: all fine."])
+
+    async def run():
+        _accept_later(p, _frame("end"))
+        asyncio.get_running_loop().call_later(0.2, hold.set)
+        await asyncio.wait_for(_run_turn(p, "bye"), timeout=3)
+    asyncio.run(run())
+
+    assert _spoken(p).strip() == "Goodbye for now."
+    assert p.conn.hangups == 1 and llm.discarded == 1
+    assert not p.state._control_wake.is_set()
+
+
+def test_a_transfer_accepted_while_the_engine_holds_cuts_and_redirects(make_pipeline):
+    hold = asyncio.Event()
+    p, llm = _held_pipeline(
+        make_pipeline, ["One moment, I am putting you through to reception. ", hold],
+        route=_route())
+    p._transfer = FakeTransfer()
+
+    async def run():
+        _accept_later(p, _frame("transfer", target="reception"))
+        await asyncio.wait_for(_run_turn(p, "reception please"), timeout=3)
+    asyncio.run(run())
+
+    assert p.tts.text_chunks[-1] == ("", True)
+    assert p._transfer.executed == ["200"] and llm.discarded == 1
+    assert p.state._transferred_to == "Reception" and p.state._running is False
+
+
+def test_an_ask_never_wakes_the_loop(make_pipeline):
+    """The agent's one short sentence after an ask must come through: the
+    acceptance of an ask sets no wake, the stream is read to its end."""
+    cm = QuestionCallManager()
+    hold = asyncio.Event()
+    llm = HoldingLLM(responses=[["Let me check that. ", hold, "One moment please. "], []])
+    p = make_pipeline(route=make_route(direction="outbound"), llm=llm,
+                      call_manager=cm, outbound_call_id="c1")
+    p._install_call_control()
+    p.state._warmup_done.set()
+    p._handle_question = lambda q: asyncio.sleep(0, result="Yes, fine")
+    woke = []
+
+    async def run():
+        def accept():
+            p._on_call_control(_frame("ask", question="Is Tuesday ok?"))
+            woke.append(p.state._control_wake.is_set())
+            hold.set()
+        asyncio.get_running_loop().call_later(0.05, accept)
+        await asyncio.wait_for(_run_turn(p, "can you do Tuesday"), timeout=3)
+    asyncio.run(run())
+
+    assert woke == [False]
+    assert llm.results[0][1] is True and "checking" in llm.results[0][2]
+    assert "One moment please." in _spoken(p) and llm.discarded == 0
+
+
+def test_the_acceptance_after_the_tools_own_boundary_closes_the_fresh_context(make_pipeline):
+    """The CLI order: the tool_start frame closes the first context and opens
+    a fresh one for the text after the tool; the acceptance then arrives
+    while the tool runs. The fresh context gets the empty end of input (a
+    second close on the first one would change nothing) and the line closes."""
+    hold = asyncio.Event()
+    p, llm = _held_pipeline(
+        make_pipeline, ["Thanks, goodbye.", TOOL_USE_SIGNAL, hold, "Done."])
+
+    async def run():
+        _accept_later(p, _frame("end"), delay=0.15)
+        await asyncio.wait_for(_run_turn(p, "bye"), timeout=3)
+    asyncio.run(run())
+
+    assert p.tts.text_chunks == [("Thanks, goodbye.", True), ("", True)]
+    assert p.tts.contexts_started == 2
+    assert p.conn.hangups == 1 and llm.discarded == 1
+
+
+def test_the_farewell_check_ignores_speech_from_before_the_acceptance(make_pipeline):
+    """The goodbye played while the context stayed open, the caller said
+    "thanks, bye" over that silence, then the tool was accepted: the
+    caller's words started BEFORE the acceptance, the line closes."""
+    hold = asyncio.Event()
+    p, llm = _held_pipeline(make_pipeline, ["Goodbye, have a nice day. ", hold])
+
+    async def run():
+        def caller_spoke_then_accept():
+            p.state._user_silent.clear()
+            p.state._user_silent.set()
+            p.state._queued_speech.append("thanks bye")
+            p._on_call_control(_frame("end"))
+        asyncio.get_running_loop().call_later(0.05, caller_spoke_then_accept)
+        await asyncio.wait_for(_run_turn(p, "bye"), timeout=3)
+    asyncio.run(run())
+
+    assert p.conn.hangups == 1 and p.state._running is False
+
+
+def test_the_farewell_check_resumes_on_speech_that_started_after_the_acceptance(make_pipeline):
+    hold = asyncio.Event()
+    p, llm = _held_pipeline(make_pipeline, ["Goodbye, have a nice day. ", hold])
+    llm._responses.append(["Sure, what else? "])
+
+    async def run():
+        def accept_then_caller_spoke():
+            p._on_call_control(_frame("end"))
+            p.state._user_silent.clear()
+            p.state._user_silent.set()
+            p.state._queued_speech.append("wait one more thing")
+        asyncio.get_running_loop().call_later(0.05, accept_then_caller_spoke)
+        await asyncio.wait_for(_run_turn(p, "bye"), timeout=3)
+    asyncio.run(run())
+
+    assert p.conn.hangups == 0 and p.state._call_complete is False
+    assert p.state._control_action == ""                 # the end was dropped
+    assert "what else" in _spoken(p)                     # the queued words became a turn
+
+
+def test_the_parallel_collector_leaves_the_stream_at_the_acceptance(make_pipeline):
+    """The parallel path (a reply collected while the previous one plays):
+    an acceptance with words already collected ends the collection at once,
+    the words before the tool are the whole reply."""
+    hold = asyncio.Event()
+    llm = HoldingLLM(responses=[["Goodbye now. ", hold, "Report: fine."]])
+    p = make_pipeline(route=make_route(), llm=llm)
+    p._install_call_control()
+
+    async def run():
+        p.state._utterance_task = asyncio.current_task()
+        _accept_later(p, _frame("end"))
+        text = await asyncio.wait_for(p._collect_llm_response("bye"), timeout=3)
+        await _settle()
+        return text
+    text = asyncio.run(run())
+
+    assert text == "Goodbye now. " and llm.discarded == 1
+    assert p.state._parallel_pre_tool_ready.is_set() and not hold.is_set()
+
+
+def test_words_queued_before_the_control_frame_are_spoken_with_the_cut(make_pipeline):
+    """Over the real client: text frames the proxy sent BEFORE the control
+    frame sit in the client's queue when the acceptance wakes the loop; they
+    are the goodbye's own words and go out with the cut, never left unread."""
+    client = _client()
+    p = make_pipeline(route=make_route(), llm=client)
+    p._install_call_control()
+    p.state._warmup_done.set()
+
+    async def run():
+        reader = asyncio.create_task(client._recv_loop())
+        turn = asyncio.create_task(_run_turn(p, "thanks, bye"))
+        await asyncio.sleep(0.05)
+        frame = lambda text: {"type": "text", "turn": 1, "data": {"content": text}}
+        client._ws.push(frame("Goodbye, "))
+        client._ws.push(frame("have a nice day. "))
+        client._ws.push(_frame("end", turn=1))
+        await asyncio.wait_for(turn, timeout=3)
+        client._ws.end()
+        await reader
+    asyncio.run(run())
+
+    assert _spoken(p) == "Goodbye, have a nice day."        # the cut strips the end of input
+    assert p.tts.text_chunks[-1][1] is True and p.conn.hangups == 1
+    assert any(f.get("type") == "call_control_result" and f["data"]["ok"] for f in client._ws.sent)
+
+
+def test_the_farewell_check_resumes_on_a_typed_message_after_the_acceptance(make_pipeline):
+    """A duplex message typed after the acceptance has no voice stamp: its
+    own stamp counts, the farewell resumes instead of hanging up over it."""
+    import time
+    hold = asyncio.Event()
+    p, llm = _held_pipeline(make_pipeline, ["Goodbye, have a nice day. ", hold])
+    llm._responses.append(["Sure, what else? "])
+
+    async def run():
+        def accept_then_typed():
+            p._on_call_control(_frame("end"))
+            p.state._typed_input_at = time.monotonic()
+            p.state._queued_speech.append("wait one more thing")
+        asyncio.get_running_loop().call_later(0.05, accept_then_typed)
+        await asyncio.wait_for(_run_turn(p, "bye"), timeout=3)
+    asyncio.run(run())
+
+    assert p.conn.hangups == 0 and "what else" in _spoken(p)

@@ -6,22 +6,28 @@ duplicated across dashboard warmup, pre-warmup, and plan implementation.
 
 import asyncio
 import logging
-import time
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, cast
+
+import psycopg
 
 import config
-from storage.agents import agent_store
-from storage import database as task_store
-from core import placement
-from storage import remote_store
-from services.mcp import mcp_registry
-from services.mcp import dynamic_context
-from services.engines import subscription_pool
-from auth.path_policy import SecurityContext, build_permission_context
-from core.execution_layer import AgentConfig
-from core.config.task_config_builder import TaskIdentity
-from core.execution_layer import DEFAULT_EXECUTION_PATH
-from core.session import session_kind
 from auth import roles
+from auth.path_policy import SecurityContext, build_permission_context
+from core import placement
+from core.config.task_config_builder import TaskIdentity
+from core.execution_layer import AgentConfig, LayerCapabilities
+from core.permission_modes import ASK_MODE
+from core.session import session_kind
+from services.engines import subscription_pool
+from services.mcp import dynamic_context, mcp_registry
+from services.remote import remote_status
+from storage import database as task_store, remote_store
+from storage.agents import agent_store
+from storage.agents.schema import DEFAULT_EXECUTION_PATH
+
+if TYPE_CHECKING:
+    from core.session.visibility import VisibilityResolution
 
 
 def release_config_seat(session_id: str, cfg, *, keep_binding: bool = False) -> None:
@@ -73,12 +79,197 @@ def _resolve_target_fields(resolved: tuple[str, str | None]) -> dict:
 logger = logging.getLogger("otodock")
 
 
+@dataclass(frozen=True)
+class _SessionIdentity:
+    """What :func:`_session_identity` read for one build."""
+    username: str | None
+    user_role: str
+    creds_sub: str | None
+    display_name: str
+    email: str
+    platform_role: str
+    resolved_targets: list[str]
+    agent_info: dict
+    execution_path: str
+    caps: LayerCapabilities
+    is_admin_only: bool
+    vis: "VisibilityResolution"
+    shared_only: bool
+
+
+def _session_identity(
+    agent_name: str,
+    user: dict,
+    user_sub: str,
+    user_role: str,
+    task_identity: TaskIdentity | None,
+    execution_path: str,
+) -> _SessionIdentity:
+    """The identity a chat session builds in, resolved from the store (a
+    worker-thread job of :func:`build_agent_config`)."""
+    # Task re-warm overrides the viewer's identity with the task's stored
+    # scope/identity. Without this, a dead agent-scoped task reopened by an
+    # admin would rebuild with the admin's full-FS mounts (/users, /config
+    # RW) instead of the agent-scope sandbox (/workspace RW, /knowledge RO).
+    username: str | None
+    creds_sub: str | None
+    scope_override: str | None
+    if task_identity is not None:
+        username = task_identity.username or None
+        user_role = task_identity.role
+        creds_sub = task_identity.creds_user_sub  # None for agent scope
+        display_name = ""
+        email = ""
+        scope_override = task_identity.scope
+        # Platform role follows the task's creds user, not the viewer who
+        # reopened it; empty for agent-scope tasks (no human identity).
+        platform_role = ""
+        if task_identity.creds_user_sub:
+            creds_row = task_store.get_user(task_identity.creds_user_sub) or {}
+            platform_role = creds_row.get("role") or ""
+    else:
+        username = user.get("username") or None
+        creds_sub = user_sub
+        display_name = user.get("display_name", "")
+        email = user.get("email", "")
+        scope_override = None
+        platform_role = user.get("role") or ""
+
+    # Resolve delegation targets: DB targets ∩ the session identity's agents.
+    # Task re-warm mirrors the scheduler (user-scope → creator's agents;
+    # agent-scope → all configured targets); chats use the viewer (admin →
+    # all; else the user's own accessible agents).
+    db_targets = agent_store.get_delegation_targets(agent_name)
+    if task_identity is not None:
+        if task_identity.scope == "user" and creds_sub:
+            user_agents = set(task_store.get_user_agents(creds_sub))
+            resolved_targets = [t for t in db_targets if t in user_agents]
+        else:
+            resolved_targets = db_targets
+    elif roles.is_admin(user_role):
+        resolved_targets = db_targets
+    else:
+        user_agents = set(task_store.get_user_agents(cast("str", creds_sub)))
+        resolved_targets = [t for t in db_targets if t in user_agents]
+
+    # Self-delegation is always permitted, so the agent's own slug must appear in
+    # the delegate roster + DELEGATION_TARGETS env. The delegation-mcp tool already
+    # allows self via its `target_agent != AGENT` bypass; this just makes it
+    # visible. (_delegation_mcp_context renders self separately + skips it in the peer
+    # loop; _meeting_context excludes self.)
+    if agent_name not in resolved_targets:
+        resolved_targets = [agent_name] + resolved_targets
+
+    # Resolve sandbox + execution path early (needed for MCP config)
+    agent_info = agent_store.get_agent(agent_name) or {}
+    execution_path = (execution_path
+                      or agent_info.get("execution_path")
+                      or DEFAULT_EXECUTION_PATH)
+    # The engine's descriptor answers the engine questions of the build; a
+    # stored id no layer claims fails here, closed, with the registry's
+    # message, before the visibility read below.
+    from core.session.session_manager import capabilities_for_path
+    caps = capabilities_for_path(execution_path)
+    is_admin_only = agent_store.is_admin_only(agent_name)
+
+    # Resolve the agent's visibility mode ONCE — the single owner of mount
+    # scope/username, config visibility, available scopes, memory availability
+    # and the chat-history owner. ``username`` passed here is the REAL human
+    # (attribution); the resolver derives the agent-scope MOUNT username ("")
+    # for Shared-only chats and service sessions. ``scope_override`` carries a
+    # continued task's stored scope.
+    from core.session.visibility import is_shared_only, resolve_visibility
+    vis = resolve_visibility(
+        agent_name,
+        username=username or "",
+        user_role=user_role or "",
+        user_sub=creds_sub or "",
+        scope_override=scope_override,
+    )
+    return _SessionIdentity(
+        username=username, user_role=user_role, creds_sub=creds_sub,
+        display_name=display_name, email=email, platform_role=platform_role,
+        resolved_targets=resolved_targets, agent_info=agent_info,
+        execution_path=execution_path, caps=caps, is_admin_only=is_admin_only,
+        vis=vis, shared_only=is_shared_only(agent_name),
+    )
+
+
+def _model_and_effort(agent_name: str, model: str, execution_path: str) -> tuple[str, str]:
+    """The session's model (the caller's, else the agent's default on this
+    layer) and effort, read from the store (a worker-thread job)."""
+    return (model or config.get_cli_model(agent_name, layer=execution_path),
+            config.get_cli_effort(agent_name))
+
+
+def _moved_pin(chat_id: str) -> str:
+    """The pin a person chose for the chat (its latest move row that did not
+    fail: a move, a summarised move, a new chat's pick), the platform or a
+    reachable machine; ``""`` otherwise. Asked only on a fresh spawn, when
+    there is no session to resume (a summary, an engine switch, a cleared
+    context). Synchronous."""
+    from storage import move_schema
+    chat = task_store.get_chat(chat_id)
+    if not chat:
+        return ""
+    pin = chat.get("execution_target") or ""
+    last = remote_store.latest_chat_move(chat_id)
+    if not last or last.get("state") == move_schema.FAILED:
+        return ""
+    if placement.is_local(pin):
+        # A chat moved to (or started on) the platform stays there, even when
+        # the person's default is a machine.
+        return placement.LOCAL if placement.is_local(last.get("target")) else ""
+    if last.get("target") != pin:
+        return ""
+    if not remote_status.is_reachable(pin):
+        logger.info("build_agent_config: chat %s was moved to %s, which is offline: "
+                    "the agent's default takes it", chat_id[:8], pin[:8])
+        return ""
+    return pin
+
+
+def personal_machine_bundles(secret_bundles: dict, target: placement.PlacementCapabilities,
+                             mount_username: str, agent_name: str, *, who: str) -> dict:
+    """The secret bundles a session may carry to ``target``: none for an
+    agent-scope session (no mount username: a Shared-only chat) on a
+    person's own machine, where the agent's own accounts stay on the
+    platform. No per-session secret file goes to a personal disk; the MCPs
+    that sign in with them fail there instead of carrying the agent's
+    account. Every build of such a session asks it (the chat's, a wake's)."""
+    if secret_bundles and target.user_paired and not mount_username:
+        logger.warning("%s: %s runs agent-scoped on the personal machine %s: secret files "
+                       "withheld for %s", who, agent_name, target.machine_id[:8],
+                       ", ".join(sorted(secret_bundles)))
+        return {}
+    return secret_bundles
+
+
+def _placement_refusal(target: str, run_sub: str | None, role: str | None) -> str:
+    """The sentence when a session of this person may not run on ``target``
+    (``placement.may_run_on``); ``""`` when it may. Synchronous."""
+    machine = remote_store.get_remote_machine(target)
+    if machine is None:
+        return ""
+    allowed_user = task_store.get_platform_setting("allow_user_paired_machines") != "0"
+    if placement.may_run_on(machine, run_sub=run_sub, run_can_manage=roles.can_manage(role),
+                            user_paired_allowed=allowed_user):
+        return ""
+    name = str(machine.get("name") or target[:8])
+    if not placement.machine_is_admin_paired(machine):
+        from services.remote.chat_targets import owner_name
+        return (f"This chat is on {owner_name(machine.get('registered_by') or '')}'s computer "
+                f"({name}). Move it to one of your places from the Runs on menu.")
+    return (f"This chat is on {name}, which your role on this agent can't use. "
+            "Move it from the Runs on menu.")
+
+
 async def build_agent_config(
     agent_name: str,
     user: dict,
     user_sub: str,
     user_role: str,
-    permission_mode: str = "default",
+    permission_mode: str = ASK_MODE,
     client_type: str = "dashboard",
     resume: bool = False,
     model: str = "",
@@ -121,7 +312,7 @@ async def build_agent_config(
         user: User dict from DB (has username, display_name, email, role).
         user_sub: User sub (OAuth subject identifier).
         user_role: the effective per-agent role (auth/roles.EFFECTIVE_ROLES; acting_role_of on the WS side).
-        permission_mode: Hook permission mode (auto, default, plan, acceptEdits).
+        permission_mode: the chat's mode (core/permission_modes; ``auto`` for an unattended run).
         client_type: Client identifier (dashboard, phone, task, sse).
         resume: Whether to resume an existing CLI session.
         model: Override model (empty = agent default).
@@ -138,91 +329,26 @@ async def build_agent_config(
             always rebuilds in ITS OWN scope — never the identity of whoever
             re-opened it. ``None`` for ordinary chats.
     """
-    # Task re-warm overrides the viewer's identity with the task's stored
-    # scope/identity. Without this, a dead agent-scoped task reopened by an
-    # admin would rebuild with the admin's full-FS mounts (/users, /config
-    # RW) instead of the agent-scope sandbox (/workspace RW, /knowledge RO).
-    if task_identity is not None:
-        username = task_identity.username or None
-        user_role = task_identity.role
-        creds_sub = task_identity.creds_user_sub  # None for agent scope
-        _display_name = ""
-        _email = ""
-        _scope_override: str | None = task_identity.scope
-        # Platform role follows the task's creds user, not the viewer who
-        # reopened it; empty for agent-scope tasks (no human identity).
-        _platform_role = ""
-        if task_identity.creds_user_sub:
-            _creds_row = task_store.get_user(task_identity.creds_user_sub) or {}
-            _platform_role = _creds_row.get("role") or ""
-    else:
-        username = user.get("username") or None
-        creds_sub = user_sub
-        _display_name = user.get("display_name", "")
-        _email = user.get("email", "")
-        _scope_override = None
-        _platform_role = user.get("role") or ""
-
-    # Resolve delegation targets: DB targets ∩ the session identity's agents.
-    # Task re-warm mirrors the scheduler (user-scope → creator's agents;
-    # agent-scope → all configured targets); chats use the viewer (admin →
-    # all; else the user's own accessible agents).
-    db_targets = agent_store.get_delegation_targets(agent_name)
-    if task_identity is not None:
-        if task_identity.scope == "user" and creds_sub:
-            user_agents = set(task_store.get_user_agents(creds_sub))
-            resolved_targets = [t for t in db_targets if t in user_agents]
-        else:
-            resolved_targets = db_targets
-    elif roles.is_admin(user_role):
-        resolved_targets = db_targets
-    else:
-        user_agents = set(task_store.get_user_agents(creds_sub))
-        resolved_targets = [t for t in db_targets if t in user_agents]
-
-    # Self-delegation is always permitted, so the agent's own slug must appear in
-    # the delegate roster + DELEGATION_TARGETS env. The delegation-mcp tool already
-    # allows self via its `target_agent != AGENT` bypass; this just makes it
-    # visible. (_delegation_mcp_context renders self separately + skips it in the peer
-    # loop; _meeting_context excludes self.)
-    if agent_name not in resolved_targets:
-        resolved_targets = [agent_name] + resolved_targets
-
-    # Resolve sandbox + execution path early (needed for MCP config)
-    _agent_info_early = agent_store.get_agent(agent_name) or {}
-    execution_path = (execution_path
-                      or _agent_info_early.get("execution_path")
-                      or DEFAULT_EXECUTION_PATH)
-    # The engine's descriptor answers the engine questions below; a stored
-    # id no layer claims fails here, closed, with the registry's message.
-    from core.session.session_manager import capabilities_for_path
-    _caps = capabilities_for_path(execution_path)
-    mcp_format = _caps.mcp_config_format
-
-    agent_info = _agent_info_early
-    is_admin_only = agent_store.is_admin_only(agent_name)
-
-    # Resolve the agent's visibility mode ONCE — the single owner of mount
-    # scope/username, config visibility, available scopes, memory availability
-    # and the chat-history owner. ``username`` passed here is the REAL human
-    # (attribution); the resolver derives the agent-scope MOUNT username ("")
-    # for Shared-only chats and service sessions. ``_scope_override`` carries a
-    # continued task's stored scope.
-    from core.session.visibility import resolve_visibility
-    vis = resolve_visibility(
-        agent_name,
-        username=username or "",
-        user_role=user_role or "",
-        user_sub=creds_sub or "",
-        scope_override=_scope_override,
+    # The reads before the placement — the task re-warm's creds row, the
+    # delegation targets, the agent row, the visibility mode and memory
+    # toggles — in one worker-thread job, in their order.
+    ident = await asyncio.to_thread(
+        _session_identity, agent_name, user, user_sub, user_role, task_identity, execution_path,
     )
+    username, user_role, creds_sub = ident.username, ident.user_role, ident.creds_sub
+    _display_name, _email, _platform_role = ident.display_name, ident.email, ident.platform_role
+    resolved_targets, execution_path = ident.resolved_targets, ident.execution_path
+    _caps = ident.caps
+    mcp_format = _caps.mcp_config_format
+    agent_info = ident.agent_info
+    is_admin_only = ident.is_admin_only
+    vis = ident.vis
     # Below the editor tier nobody runs from the agent's own CLI state (a
     # Shared-only chat, a task re-warm, a phone call as that person):
     # refused here, before a pool seat is taken, with the person's message.
     from core.sandbox.session_config_dir import refuse_agent_state_below_editor
-    from core.session.visibility import is_shared_only
     refuse_agent_state_below_editor(vis.mount_scope, user_role or "",
-                                    shared_only=is_shared_only(agent_name))
+                                    shared_only=ident.shared_only)
 
     # Resolve the execution target + its placement facts BEFORE building the
     # MCP config / prompt / skills / path_env below. Device-local MCPs
@@ -244,7 +370,7 @@ async def build_agent_config(
                 "build_agent_config: %s pinned to %s runs on the Direct LLM "
                 "engine — placed local", agent_name, pinned_target[:8],
             )
-        resolved_target = (placement.LOCAL, None)
+        resolved_target: tuple[str, str | None] = (placement.LOCAL, None)
     elif pinned_target:
         # RESUME pins to the chat/run's ORIGIN target — never
         # re-resolve. Re-resolving would silently fall back to local when the
@@ -262,10 +388,24 @@ async def build_agent_config(
                 else (placement.offline_sentinel(pinned_target), "pinned-target-offline")
             )
     else:
-        resolved_target = await asyncio.to_thread(
-            remote_store.resolve_execution_target, agent_name, creds_sub, user_role,
-        )
+        moved = await asyncio.to_thread(_moved_pin, chat_id) if chat_id else ""
+        if moved:
+            # A person chose the chat's place and it has no session to resume
+            # there: the fresh spawn goes there, not to the agent's default.
+            resolved_target = (moved, None)
+        else:
+            resolved_target = await asyncio.to_thread(
+                remote_status.resolve_execution_target, agent_name, creds_sub, user_role,
+            )
     target_value = resolved_target[0]
+    if not placement.is_local(target_value) and not placement.is_offline_sentinel(target_value):
+        # The placement guard: never a session on a place its person may not
+        # use (a shared chat another person placed on their computer, an
+        # admin machine below the owner tier). Sent with the sentence that
+        # says where the chat is.
+        refusal = await asyncio.to_thread(_placement_refusal, target_value, creds_sub, user_role)
+        if refusal:
+            raise placement.PlacementRefused(refusal)
     # The resolved placement — the kind (local / admin-paired / user-paired)
     # and the machine's facts (paths, OS, the pairing flag, the grants, the
     # display), from one read of its row. It feeds the SecurityContext, the
@@ -281,6 +421,11 @@ async def build_agent_config(
     target_browser = await asyncio.to_thread(
         remote_store.get_target_browser_settings, target,
     ) if is_remote else None
+    # The agent's MCP set on this placement, read once and used by the
+    # call-control check, the path_env values and the assigned names below.
+    agent_mcps = await asyncio.to_thread(
+        mcp_registry.get_agent_mcps, agent_name, placement=target,
+    ) or []
 
     # Resolve per-user MCP credentials + config.
     # For TOML (Codex), credential env is injected into the TOML env sections
@@ -291,7 +436,7 @@ async def build_agent_config(
     # (ws/phone_attach.py), and the tools end or transfer that call.
     if client_type == session_kind.DASHBOARD.name and not phone_mode:
         from services.phone.call_control import CALL_CONTROL_MCP, PHONE_MCP
-        _names = {m.name for m in (mcp_registry.get_agent_mcps(agent_name, placement=target) or [])}
+        _names = {m.name for m in agent_mcps}
         if PHONE_MCP in _names and CALL_CONTROL_MCP not in (extra_mcps or []):
             extra_mcps = [*(extra_mcps or []), CALL_CONTROL_MCP]
     mcp_config, credential_env, excluded_mcps, secret_bundles, bash_env_keys = (
@@ -318,6 +463,8 @@ async def build_agent_config(
             call_ask_back=call_ask_back,
         )
     )
+    secret_bundles = personal_machine_bundles(secret_bundles, target, vis.mount_username,
+                                              agent_name, who="build_agent_config")
 
     # Inject manifest-declared path_env values. The framework auto-resolves
     # each role to a sandbox-style virtual path based on user/agent scope
@@ -334,7 +481,7 @@ async def build_agent_config(
     multi_value_envs: dict[str, str] = {}
     if credential_env is None:
         credential_env = {}
-    for manifest in (mcp_registry.get_agent_mcps(agent_name, placement=target) or []):
+    for manifest in agent_mcps:
         if not manifest.path_env:
             continue
         for env_var, decl in manifest.path_env.items():
@@ -383,11 +530,10 @@ async def build_agent_config(
     # (the memory API role check keys on the JWT's user). credential_env is
     # applied LAST in build_session_env, so this is the authoritative token for
     # the agent process AND every stdio MCP it spawns.
-    from auth.session_token import create_session_token
-    token_minted_at = int(time.time())
-    credential_env["PROXY_API_KEY"] = create_session_token(
-        session_id or "", agent_name, creds_sub or "",
-        external=external_claim or "", issued_at=token_minted_at,
+    from auth.session_token import mint_session_env
+    token_minted_at = mint_session_env(
+        credential_env, session_id or "", agent_name, creds_sub or "",
+        external=external_claim or "",
     )
     multi_value_envs.update(oto_env.OTO_MULTI_VALUE_ENVS)
 
@@ -404,7 +550,7 @@ async def build_agent_config(
     # Chat sessions never carry a trigger_payload; ``${trigger.*}`` tokens
     # resolve empty and any trigger-gated blocks skip naturally.
     assigned_mcp_names = [
-        m.name for m in (mcp_registry.get_agent_mcps(agent_name, placement=target) or [])
+        m.name for m in agent_mcps
         # Only the MCPs that actually attach describe themselves (the phone
         # exclusions drop e.g. display-mcp on a call).
         if m.name not in (excluded_mcps or {})
@@ -431,7 +577,11 @@ async def build_agent_config(
     # Build agent system prompt. MOUNT username drives the workspace tree +
     # user-context sections (agent-scope for Shared-only); the REAL human
     # identity is rendered by build_permission_context from the SecurityContext.
-    agent_prompt = config.build_agent_prompt(
+    # In a worker thread: the build reads the agent's files, the person's
+    # context and memory and walks the workspace tree (tens of milliseconds
+    # on a large agent), which the loop must not wait for.
+    agent_prompt = await asyncio.to_thread(
+        config.build_agent_prompt,
         agent_name, username=vis.mount_username, role=user_role,
         excluded_mcps=excluded_mcps or None,
         dynamic_contexts=dynamic_contexts or None,
@@ -488,7 +638,7 @@ async def build_agent_config(
         _knowledge_libraries = tuple(
             (a["source_agent"], a["subdir"] or "", bool(a["writable"]))
             for a in _kl_rows)
-    except Exception:
+    except (ImportError, psycopg.Error):
         _knowledge_libraries = ()
     security_ctx = SecurityContext(
         role=user_role,
@@ -545,8 +695,9 @@ async def build_agent_config(
     # differs from the agent's engine (task/delegate overrides, engine-
     # switched chats warming with model="") the agent-default model may be
     # foreign to the layer — never stamp it (the provider 400s every turn).
-    resolved_model = model or config.get_cli_model(agent_name, layer=execution_path)
-    resolved_effort = config.get_cli_effort(agent_name)
+    resolved_model, resolved_effort = await asyncio.to_thread(
+        _model_and_effort, agent_name, model, execution_path,
+    )
     extra_env: dict[str, str] = {}
     subscription_id = ""
 
@@ -567,8 +718,8 @@ async def build_agent_config(
     except subscription_pool.NoSubscriptionError:
         if not subscription_pool_fallback:
             raise
-    except Exception as e:
-        logger.warning(f"Subscription pool error for {agent_name}: {e}")
+    except Exception as e:  # noqa: BLE001  # the pool spans db, relay and engine: a miss becomes a clean block
+        logger.warning("Subscription pool error for %s: %s", agent_name, e)
     # A phone route tied to a user without a subscription of their own rides
     # the platform pool (today's phone behaviour) instead of failing the call.
     if creds_sub and not subscription_id and subscription_pool_fallback:
@@ -583,13 +734,13 @@ async def build_agent_config(
             if execution_path == "direct-llm":
                 extra_env["_USER_SUB"] = ""
             logger.info(
-                f"Phone route user session for {agent_name}: no subscription for "
-                f"the tied user — using the platform pool"
+                "Phone route user session for %s: no subscription for "
+                "the tied user — using the platform pool", agent_name
             )
         except subscription_pool.NoSubscriptionError:
             raise
-        except Exception as e:
-            logger.warning(f"Subscription pool fallback error for {agent_name}: {e}")
+        except Exception as e:  # noqa: BLE001  # the pool fallback spans db, relay and engine: a miss is a clean block
+            logger.warning("Subscription pool fallback error for %s: %s", agent_name, e)
     # User-scoped work with no resolved credentials → surface a clean, actionable
     # block (the warmup handler turns this into a dashboard message) instead of
     # letting the layer start with an empty key and fail cryptically mid-turn.
@@ -604,9 +755,10 @@ async def build_agent_config(
     # (Plan B) is measured against, on every engine.
     _prompt_chars = len(agent_prompt or "")
     logger.info(
-        f"Prompt built for {agent_name}: client={client_type or '-'} "
-        f"layer={execution_path or '-'} ≈{_prompt_chars // 4} tokens "
-        f"({_prompt_chars} chars)"
+        "Prompt built for %s: client=%s "
+        "layer=%s ≈%s tokens "
+        "(%s chars)",
+        agent_name, client_type or '-', execution_path or '-', _prompt_chars // 4, _prompt_chars
     )
 
     return AgentConfig(

@@ -14,12 +14,13 @@ import pytest
 from fastapi import HTTPException
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from auth.providers import UserContext  # noqa: E402
-from api.agents import agents  # noqa: E402
+from api.agents import agents
+from auth.providers import UserContext
 
 
 def _user(sub, agent, agent_role, platform_role="member"):
@@ -96,6 +97,7 @@ async def test_chat_detail_follows_the_chat_owner_and_phone_calls_open_for_manag
     a phone call; a manager reads the call. The agent's mode decides nothing
     by itself — the REST ``can_access_chat`` rule plus the phone clause."""
     import uuid
+
     from core.session import session_kind
     from core.session.visibility import PHONE_CHAT_OWNER, shared_chat_owner
     from storage import database as task_store
@@ -126,6 +128,7 @@ async def test_one_rule_opens_a_phone_call_to_the_agents_managers(temp_db):
     (a long transcript pages for them), never to an editor, and never to a
     manager's session token or API key."""
     import uuid
+
     from api.agents import chats
     from core.session import session_kind
     from core.session.visibility import PHONE_CHAT_OWNER

@@ -3,8 +3,8 @@
 // native voice and to tell the platform TTS which language to pronounce.
 
 export const LANGUAGES: { code: string; label: string }[] = [
-  { code: 'en-US', label: 'English (US)' },
-  { code: 'en-GB', label: 'English (UK)' },
+  { code: 'en-US', label: 'English, US' },
+  { code: 'en-GB', label: 'English, UK' },
   { code: 'el-GR', label: 'Greek' },
   { code: 'de-DE', label: 'German' },
   { code: 'es-ES', label: 'Spanish' },
@@ -23,6 +23,18 @@ export function isAutoLanguage(tag: string | null | undefined): boolean {
 
 export function baseLang(tag: string): string {
   return (tag || '').split('-')[0].toLowerCase()
+}
+
+// The supported base codes, in the menu's order.
+export const SUPPORTED_BASES: string[] = Array.from(new Set(LANGUAGES.map(l => baseLang(l.code))))
+
+// The admin's comma list of languages the automatic detection may pick
+// (mirrors audio/streaming/lang.py language_candidates): supported base codes
+// in the given order, duplicates dropped, every supported language when the
+// list is empty or names none of them.
+export function parseLanguageCandidates(raw: string | null | undefined): string[] {
+  const picked = (raw || '').split(',').map(s => baseLang(s.trim())).filter(c => SUPPORTED_BASES.includes(c))
+  return picked.length ? Array.from(new Set(picked)) : [...SUPPORTED_BASES]
 }
 
 // Default STT language from the browser/OS when the user hasn't picked one — the

@@ -15,13 +15,14 @@ import pytest
 from fastapi import HTTPException
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-import config  # noqa: E402
-from core.credentials import mcp_broker # noqa: E402
-from core.credentials.mcp_broker import SecretBundle  # noqa: E402
+import config
+from core.credentials import mcp_broker
+from core.credentials.mcp_broker import SecretBundle
 
 
 @pytest.fixture(autouse=True)
@@ -184,6 +185,7 @@ def _token_world(monkeypatch):
     the collector's per-manifest shape, plus neighbours that contribute
     nothing (no credentials_dir, no bound file)."""
     from types import SimpleNamespace
+
     from services.mcp import mcp_registry
     from services.oauth import credential_resolver as cr
 
@@ -218,6 +220,7 @@ def _token_world(monkeypatch):
 
 def test_token_file_env_is_keyed_by_config_key_and_is_a_json_string(monkeypatch):
     import json
+
     from core.credentials import credential_files as cf
     _token_world(monkeypatch)
     out = cf.token_file_env("agent", user_sub="sub-1", session_scope="user")
@@ -243,6 +246,7 @@ def test_merge_token_files_extends_and_creates_bundles(monkeypatch):
 
 def test_attach_token_files_reads_the_session_off_the_config(monkeypatch):
     from types import SimpleNamespace
+
     from core.credentials import credential_files as cf
     from core.execution_layer import AgentConfig
     seen = _token_world(monkeypatch)
@@ -264,6 +268,7 @@ def test_attach_token_files_reads_the_session_off_the_config(monkeypatch):
 
 def test_token_files_round_trip_through_the_interceptor(monkeypatch):
     import json
+
     from core import stdio_path_interceptor as icpt
     from core.credentials import credential_files as cf
     _token_world(monkeypatch)
@@ -284,6 +289,7 @@ def test_a_shared_subpath_delivers_each_mcp_only_its_own_account(monkeypatch, tm
     channel's flat map keeps every file (one directory per subpath)."""
     import json
     from types import SimpleNamespace
+
     from core.credentials import credential_files as cf
     from services.mcp import mcp_registry
     from services.oauth import credential_resolver as cr

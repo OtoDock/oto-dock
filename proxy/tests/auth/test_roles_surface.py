@@ -169,7 +169,7 @@ def test_the_dashboard_compares_the_mirror_and_types_through_it():
     unions: dict[str, int] = {}
     for p in list(src.rglob("*.ts")) + list(src.rglob("*.tsx")):
         rel = p.relative_to(REPO_ROOT).as_posix()
-        if "/tests/" in rel or rel == _TS_MIRROR:
+        if "/tests/" in rel or ".test." in p.name or rel == _TS_MIRROR:
             continue
         text = p.read_text(encoding="utf-8", errors="surrogateescape")
         n = len(_TS_COMPARE.findall(text)) + len(_TS_CASE.findall(text)) + len(_TS_INCLUDES.findall(text))

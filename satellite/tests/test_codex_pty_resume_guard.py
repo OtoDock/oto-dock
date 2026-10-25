@@ -17,8 +17,8 @@ import pytest
 if sys.platform == "win32":  # pragma: no cover - unix backend under test
     pytest.skip("unix pty backend", allow_module_level=True)
 
-from satellite.terminal.codex_pty_session import CodexPtySession
 from satellite._vendored.terminal_queries import PasteModeTracker
+from satellite.terminal.codex_pty_session import CodexPtySession
 from satellite.terminal.pty_relay import PtyProcess
 
 
@@ -117,10 +117,11 @@ class TestLeadingFeaturesDedupe:
     (root-caused live 2026-07-19: config.toml:13:2 duplicate key)."""
 
     def test_leading_features_block_is_stripped_and_valid(self):
-        from satellite.tests._toml import toml_loads
         from satellite.terminal.codex_pty_session import (
-            _build_codex_config_toml, _strip_leading_features_block,
+            _build_codex_config_toml,
+            _strip_leading_features_block,
         )
+        from satellite.tests._toml import toml_loads
         shipped = (
             "[features]\ndefault_mode_request_user_input = true\n\n"
             '[mcp_servers.x]\ncommand = "node"\n'

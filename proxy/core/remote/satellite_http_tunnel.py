@@ -95,6 +95,10 @@ _ALLOWLIST_REGEXES = [
     # both endpoints are session-JWT gated proxy-side (spawn_authz et al.).
     re.compile(r"^/v1/delegation(/.*)?$"),
     re.compile(r"^/v1/continuations(/.*)?$"),
+    # delegation-mcp's move_chat (the chat the session runs in, satellite
+    # 0.5.157): session-token only proxy-side; never the person's
+    # /v1/chats/<id>/move.
+    re.compile(r"^/v1/chats/agent-move$"),
     re.compile(r"^/v1/meetings(/.*)?$"),
     re.compile(r"^/v1/triggers(/.*)?$"),
     # checks-mcp (CHECKS.md): what is attached to this session's chat, attach,
@@ -247,8 +251,8 @@ def _resolve_upstream_url(path: str) -> str | None:
         mcp_name = mcp_match.group(1)
         rest = mcp_match.group(2) or "/"
         try:
-            from services.mcp import mcp_registry
             from core.config import deployment
+            from services.mcp import mcp_registry
             # The path slug is the mcpServers config key, which may be the
             # manifest's `server_name` rather than its canonical `name` (e.g.
             # camoufox registers as ``[mcp_servers.playwright]`` even though the
@@ -257,7 +261,7 @@ def _resolve_upstream_url(path: str) -> str | None:
             # tunnel routing and URL rewriting stay in lockstep. Without it
             # Docker MCPs with a distinct server_name 404 here ("mcp-not-found").
             manifest = mcp_registry.get_manifest_by_config_key(mcp_name)
-        except Exception:
+        except ImportError:
             manifest = None
         if manifest is None:
             return None
@@ -287,7 +291,7 @@ def _takes_gateway_credential(name: str) -> bool:
     try:
         from services.mcp import mcp_registry
         manifest = mcp_registry.get_manifest_by_config_key(name)
-    except Exception:
+    except ImportError:
         return False
     creds = getattr(manifest, "credentials", None)
     oauth = getattr(creds, "oauth", None)
@@ -296,12 +300,13 @@ def _takes_gateway_credential(name: str) -> bool:
                 or isinstance(header, dict))
 
 
-async def _gateway_forward(session_id: str, path: str, method: str, headers: dict):
+async def _gateway_forward(session_id: str, path: str, method: str, headers: dict, body: bytes = b""):
     """The credential gateway's part of a tunneled ``/mcp/<name>/`` request:
     None when the MCP takes no credential (the direct hop to the sidecar, as
-    for file-tools), a refusal when the session holds a vendor credential (a
-    machine session's vendor traffic leaves the machine through its own
-    gateway; the proxy forwards none of it), when the MCP takes a credential
+    for file-tools), a refusal when the session holds a vendor credential the
+    proxy does not forward itself (a machine session's vendor traffic leaves
+    the machine through its own gateway; only a credential an agent's GitHub
+    reach narrows comes through here, judged), when the MCP takes a credential
     the session does not hold (a store miss: a session adopted with no
     gateway descriptor; the session token is never handed to the sidecar as
     its token) or when the gateway refuses, else the prepared forward (the
@@ -317,15 +322,23 @@ async def _gateway_forward(session_id: str, path: str, method: str, headers: dic
         if _takes_gateway_credential(name):
             return mcp_gateway.Refusal("no_credential", mcp_gateway._REFUSAL_NO_CREDENTIAL)
         return None
-    if not cred.proxy_local:
+    if not cred.forwarded_here:
         return mcp_gateway.Refusal(
             "vendor_not_tunneled",
             "A machine session reaches a vendor MCP through the machine's own "
             "gateway; the platform forwards none of that traffic.",
         )
     return await mcp_gateway.prepare_forward(
-        session_id, name, method, m.group(2) or "/", query.encode("latin-1"), headers.items(),
+        session_id, name, method, m.group(2) or "/", query.encode("latin-1"), headers.items(), body,
     )
+
+
+def _gateway_only(path: str) -> bool:
+    """A tunneled ``/mcp/<name>/`` path of an MCP with no sidecar to dial
+    but a credential the gateway adds: the gateway's forward is its only
+    way (a vendor MCP an agent's GitHub reach narrows)."""
+    m = _MCP_PATH_RE.match(path.split("?", 1)[0])
+    return m is not None and _takes_gateway_credential(m.group(1))
 
 
 class _AmbiguousAuthorization(Exception):
@@ -649,7 +662,7 @@ class SatelliteHttpTunnelDispatcher:
             }
             timeout_s = stream.timeout_s
             url = _resolve_upstream_url(path)
-            if url is None:
+            if url is None and not (stream.kind == "mcp" and _gateway_only(path)):
                 # MCP not installed on the platform (manifest missing).
                 await self._send_response(
                     manager, machine_id, stream_id,
@@ -739,7 +752,7 @@ class SatelliteHttpTunnelDispatcher:
             gateway_sid = str(payload.get("sid") or "") if (is_mcp and payload) else ""
             if gateway_sid:
                 from core.credentials import mcp_gateway
-                prepared = await _gateway_forward(gateway_sid, path, method, headers)
+                prepared = await _gateway_forward(gateway_sid, path, method, headers, body_bytes)
                 if isinstance(prepared, mcp_gateway.Refusal):
                     logger.info(
                         "tunnel: gateway refused %s for session %s", prepared.reason,
@@ -755,6 +768,16 @@ class SatelliteHttpTunnelDispatcher:
                     return
                 if prepared is not None:
                     url, headers, client = str(prepared.url), prepared.headers, prepared.client
+                    if prepared.content is not None:
+                        body_bytes = prepared.content
+            if url is None:
+                # A gateway-only MCP with no session to forward for.
+                await self._send_response(
+                    manager, machine_id, stream_id,
+                    status=404, headers={}, body=b"",
+                    error="mcp-not-found", body_eof=True,
+                )
+                return
             # Streaming MCP calls (e.g. camoufox browser actions) can legitimately
             # run far longer than a hook callback and stream their result sparsely
             # — a fixed read-timeout would sever a slow-but-valid browser op midway

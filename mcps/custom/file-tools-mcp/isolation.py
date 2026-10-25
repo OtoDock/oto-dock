@@ -197,13 +197,13 @@ def _child_main(conn, budget_bytes: int, target, args: tuple, kwargs: dict,
             )
         else:
             conn.send_bytes(frame)
-    except BaseException as exc:  # noqa: BLE001 — everything becomes a message
+    except BaseException as exc:  # noqa: BLE001  # everything becomes a message
         try:
             if _looks_like_oom(exc):
                 _send("error", _too_large_message(budget_bytes, advice))
             else:
                 _send("error", str(exc) or exc.__class__.__name__)
-        except Exception:
+        except Exception:  # noqa: BLE001  # a worker child's last report: the parent reads its exit anyway
             pass
     finally:
         conn.close()

@@ -16,7 +16,7 @@ export default function DefaultAgentRedirect() {
 
   if (isLoading) {
     if (claimed) return <Navigate to={`/chat/${claimed}`} replace />
-    return <div className="flex h-screen items-center justify-center text-gray-400 text-sm">Loading...</div>
+    return <div className="flex h-screen items-center justify-center text-tertiary text-sm" data-boot-wait="">Loading...</div>
   }
 
   // List loaded: the favorite wins if it still exists, then the first agent

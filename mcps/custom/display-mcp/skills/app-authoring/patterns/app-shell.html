@@ -1,0 +1,102 @@
+<p class="muted">The app shell. From 768 px a sidebar lists the sections. On a phone the list fills the screen, and a section opens under a back arrow. Use it for an app with more than one page. Settings, a board with an archive, a dashboard with a detail view. Inside an app the back arrow is the only way back. The browser's back and the phone's gesture belong to the page that holds the frame.</p>
+
+<div id="shell" class="shell">
+  <nav id="shell-nav" class="shell-nav" aria-label="Sections">
+    <div class="shell-group">
+      <h2 class="shell-group-title">Work</h2>
+      <a href="#overview" class="shell-row" data-section="overview"><span class="shell-tile">O</span><span class="shell-label">Overview</span><span class="shell-chevron" aria-hidden="true">›</span></a>
+      <a href="#bookings" class="shell-row" data-section="bookings"><span class="shell-tile">B</span><span class="shell-label">Bookings</span><span class="badge warning">2</span><span class="shell-chevron" aria-hidden="true">›</span></a>
+    </div>
+    <div class="shell-group">
+      <h2 class="shell-group-title">Setup</h2>
+      <a href="#hours" class="shell-row" data-section="hours"><span class="shell-tile">H</span><span class="shell-label">Opening hours</span><span class="shell-chevron" aria-hidden="true">›</span></a>
+      <a href="#people" class="shell-row" data-section="people"><span class="shell-tile">P</span><span class="shell-label">People</span><span class="shell-chevron" aria-hidden="true">›</span></a>
+    </div>
+  </nav>
+  <main id="shell-main" class="shell-main">
+    <div class="shell-header">
+      <button type="button" class="btn ghost shell-back" id="shell-back" aria-label="Back">‹</button>
+      <h1 id="shell-title" class="shell-title" tabindex="-1">Overview</h1>
+    </div>
+    <section data-section="overview"><div class="card"><p>The first screen shows the thing the person opens the app for.</p></div></section>
+    <section data-section="bookings" hidden><div class="card"><p>Two bookings wait for a payment.</p></div></section>
+    <section data-section="hours" hidden><div class="card"><p>Monday to Friday, 09:00 to 17:00.</p></div></section>
+    <section data-section="people" hidden><div class="card"><p>Three people can edit this app.</p></div></section>
+  </main>
+</div>
+
+<style>
+.shell { display: grid; grid-template-columns: var(--p-sidebar-width) 1fr; min-height: 60vh; }
+.shell-nav { background: var(--p-card); border-right: 1px solid var(--p-border-light); padding: 12px 8px; }
+.shell-group { margin-bottom: 16px; }
+.shell-group-title { font: 600 var(--p-font-size-2xs)/var(--p-line-height-2xs) var(--p-font); text-transform: uppercase; letter-spacing: .04em; color: var(--p-text-secondary); margin: 0 12px 4px; }
+.shell-row { display: flex; align-items: center; gap: 12px; min-height: var(--p-control-md); padding: 0 12px; border-radius: var(--p-radius-sm); color: var(--p-text-secondary); text-decoration: none; font-size: var(--p-font-size-sm); }
+.shell-row:hover { background: var(--p-hover); color: var(--p-text); text-decoration: none; }
+.shell-row[aria-current="page"] { background: var(--p-action-subtle); color: var(--p-link); }
+.shell-tile { display: none; }
+.shell-label { flex: 1; }
+.shell-chevron { display: none; color: var(--p-text-light); }
+.shell-main { padding: 16px 24px; min-width: 0; }
+.shell-header { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+.shell-back { display: none; }
+.shell-title { margin: 0; font-size: var(--p-font-size-xl); line-height: var(--p-line-height-xl); }
+.shell-title:focus-visible { outline: none; }
+
+@media (max-width: 767px) {
+  .shell { display: block; }
+  .shell-nav { border-right: 0; background: transparent; padding: 0; }
+  .shell-group { background: var(--p-card); border-radius: var(--p-radius); box-shadow: var(--p-elevation-1); padding: 4px 0; }
+  .shell-group-title { margin: 8px 16px 4px; }
+  .shell-row { min-height: var(--p-control-lg); padding: 0 16px; border-radius: 0; color: var(--p-text); }
+  .shell-row[aria-current="page"] { background: transparent; color: var(--p-text); }
+  .shell-tile { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: var(--p-radius-sm); background: var(--p-action-subtle); color: var(--p-link); font-size: var(--p-font-size-xs); font-weight: 600; }
+  .shell-chevron { display: inline; }
+  .shell-main { padding: 0; }
+  .shell-back { display: inline-flex; }
+  .shell.is-section .shell-nav { display: none; }
+  .shell:not(.is-section) .shell-main { display: none; }
+}
+</style>
+
+<script>
+(function () {
+  var shell = document.getElementById('shell')
+  var nav = document.getElementById('shell-nav')
+  var title = document.getElementById('shell-title')
+  var narrow = matchMedia('(max-width: 767px)')
+  var listScroll = 0
+  function open(name, fromRow) {
+    document.querySelectorAll('#shell-main section').forEach(function (s) { s.hidden = s.dataset.section !== name })
+    nav.querySelectorAll('.shell-row').forEach(function (r) {
+      if (r.dataset.section === name) r.setAttribute('aria-current', 'page'); else r.removeAttribute('aria-current')
+    })
+    var row = nav.querySelector('[data-section="' + name + '"] .shell-label')
+    title.textContent = row ? row.textContent : name
+    // On a phone the list is the first screen; a section opens from a row.
+    if (narrow.matches && fromRow) {
+      listScroll = window.scrollY
+      shell.classList.add('is-section')
+      title.focus()
+    }
+  }
+  function back() {
+    shell.classList.remove('is-section')
+    window.scrollTo(0, listScroll)
+    var current = nav.querySelector('[aria-current="page"]')
+    if (current) current.focus()
+  }
+  nav.addEventListener('click', function (e) {
+    var row = e.target.closest('.shell-row')
+    if (!row) return
+    e.preventDefault()
+    open(row.dataset.section, true)
+  })
+  document.getElementById('shell-back').addEventListener('click', back)
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && narrow.matches && shell.classList.contains('is-section')) back()
+  })
+  // A fold or a window resize moves between the two layouts without losing the section.
+  narrow.addEventListener('change', function () { if (!narrow.matches) shell.classList.remove('is-section') })
+  open('overview', false)
+})()
+</script>

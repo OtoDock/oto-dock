@@ -5,7 +5,12 @@ import {
   useRevokeAgentApiKey,
   type CreatedAgentApiKey,
 } from '../../api/agentApiKeys'
-import { Modal, Field } from './AgentTriggers.modals'
+import { Modal, Field, FormError } from './AgentTriggers.modals'
+import { errorText, toastError } from '../../lib/http/apiJson'
+import { useDialogs } from '../../components/ui/dialogs'
+import Button from '../../components/ui/Button'
+import { Input } from '../../components/ui/Field'
+import { BADGE_BASE, BADGE_TONE, CARD, BUTTON_DANGER_QUIET } from '../../components/ui/classes'
 
 
 // =====================================================================
@@ -13,17 +18,20 @@ import { Modal, Field } from './AgentTriggers.modals'
 // =====================================================================
 
 export function AgentApiKeysSection({ agent }: { agent: string }) {
+  const dialogs = useDialogs()
   const { data: keys = [], isLoading } = useAgentApiKeys(agent)
   const createM = useCreateAgentApiKey()
   const revokeM = useRevokeAgentApiKey()
   const [showCreate, setShowCreate] = useState(false)
   const [newName, setNewName] = useState('')
   const [createdKey, setCreatedKey] = useState<CreatedAgentApiKey | null>(null)
+  const [createError, setCreateError] = useState('')
 
   const onCreate = async (e: React.FormEvent) => {
     e.preventDefault()
+    setCreateError('')
     if (!newName.trim()) {
-      alert('Key name required')
+      setCreateError('Give the key a name.')
       return
     }
     try {
@@ -31,8 +39,8 @@ export function AgentApiKeysSection({ agent }: { agent: string }) {
       setCreatedKey(created)
       setNewName('')
       setShowCreate(false)
-    } catch (e: any) {
-      alert(`Create failed: ${e?.message ?? e}`)
+    } catch (e) {
+      setCreateError(errorText(e) || 'The key was not created.')
     }
   }
 
@@ -42,60 +50,55 @@ export function AgentApiKeysSection({ agent }: { agent: string }) {
   }
 
   const onRevoke = async (id: string, name: string) => {
-    if (!confirm(`Revoke key "${name}"? Webhooks using it will immediately fail.`)) return
-    try {
-      await revokeM.mutateAsync({ agent, keyId: id })
-    } catch (e: any) {
-      alert(`Revoke failed: ${e?.message ?? e}`)
-    }
+    if (!(await dialogs.confirm({
+      title: `Revoke the key "${name}"?`,
+      body: 'Webhooks using it fail at once.',
+      confirmLabel: 'Revoke',
+      tone: 'danger',
+    }))) return
+    await revokeM.mutateAsync({ agent, keyId: id }).catch(toastError('The key was not revoked'))
   }
 
   return (
-    <div className="space-y-3 border-t border-p-border-light pt-6 mt-6">
+    <div className="space-y-3 border-t border-subtle pt-6 mt-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h2 className="text-lg font-semibold text-p-text">Agent API Keys</h2>
-          <p className="text-xs text-p-text-secondary mt-1">
-            Keys that authenticate webhook fires for agent-scoped triggers.
-            External systems pass them as <code>Authorization: Bearer otok_…</code>.
-            The master <code>PROXY_API_KEY</code> does not work on webhook endpoints.
+          <h2 className="text-lg font-semibold font-display text-primary">Agent API Keys</h2>
+          <p className="text-xs text-secondary mt-1">
+            Keys that let other systems fire this agent's webhook triggers.
+            They send a key as <code>Authorization: Bearer otok_…</code>.
+            The master <code>PROXY_API_KEY</code> does not work on webhook URLs.
           </p>
         </div>
-        <button
-          onClick={() => setShowCreate(true)}
-          className="self-start sm:self-auto shrink-0 px-3 py-1.5 rounded-lg bg-brand text-white text-sm font-medium hover:bg-brand-hover"
-        >
+        <Button variant="primary" onClick={() => { setCreateError(''); setShowCreate(true) }} className="self-start sm:self-auto shrink-0">
           + Create key
-        </button>
+        </Button>
       </div>
 
       {isLoading ? (
-        <p className="text-sm text-p-text-secondary">Loading...</p>
+        <p className="text-sm text-secondary">Loading...</p>
       ) : keys.length === 0 ? (
-        <p className="text-sm text-p-text-secondary">No API keys for this agent yet.</p>
+        <p className="text-sm text-tertiary">No API keys for this agent yet.</p>
       ) : (
-        <div className="space-y-2">
+        <div className={`${CARD} divide-y divide-subtle`}>
           {keys.map((k) => (
-            <div key={k.id} className="bg-white dark:bg-p-surface rounded-lg border border-p-border-light p-3 flex items-center gap-3">
+            <div key={k.id} className="p-3 flex items-center gap-3">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className="font-medium text-p-text">{k.name}</span>
-                  <span className="text-xs font-mono text-p-text-secondary">otok_{k.prefix}…</span>
+                  <span className="font-medium text-primary">{k.name}</span>
+                  <span className="text-xs font-mono text-secondary">otok_{k.prefix}…</span>
                   {k.permissions.map((p) => (
-                    <span key={p} className="px-1.5 py-0.5 text-xs rounded-sm bg-p-bg text-p-text-secondary">{p}</span>
+                    <span key={p} className={`${BADGE_BASE} ${BADGE_TONE.neutral}`}>{p}</span>
                   ))}
-                  {k.revoked_at && <span className="px-1.5 py-0.5 text-xs rounded-sm bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">revoked</span>}
+                  {k.revoked_at && <span className={`${BADGE_BASE} ${BADGE_TONE.danger}`}>revoked</span>}
                 </div>
-                <p className="text-xs text-p-text-secondary mt-0.5">
+                <p className="text-xs text-secondary mt-0.5">
                   Created {new Date(k.created_at).toLocaleDateString()}
                   {k.last_used_at ? ` · last used ${new Date(k.last_used_at).toLocaleString()}` : ' · never used'}
                 </p>
               </div>
               {!k.revoked_at && (
-                <button
-                  onClick={() => onRevoke(k.id, k.name)}
-                  className="px-2 py-1 rounded-sm text-xs font-medium bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/30 dark:text-red-400 dark:hover:bg-red-900/50"
-                >
+                <button type="button" className={BUTTON_DANGER_QUIET} onClick={() => onRevoke(k.id, k.name)}>
                   Revoke
                 </button>
               )}
@@ -105,46 +108,42 @@ export function AgentApiKeysSection({ agent }: { agent: string }) {
       )}
 
       {showCreate && (
-        <Modal onClose={() => setShowCreate(false)} title={`Create API key for ${agent}`}>
+        <Modal onClose={() => setShowCreate(false)} title={`Create API key for ${agent}`} busy={createM.isPending}>
           <form onSubmit={onCreate} className="space-y-3">
             <Field label="Name">
-              <input
+              <Input
+                autoFocus
+                aria-label="Name"
                 value={newName}
-                onChange={(e) => setNewName(e.target.value)}
+                onChange={(e) => { setNewName(e.target.value); setCreateError('') }}
                 placeholder="e.g. Uptime monitor"
-                className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
               />
             </Field>
             <Field label="Permissions">
-              <p className="text-sm text-p-text-secondary">
-                <code>triggers</code> — fire agent-scoped webhook triggers
+              <p className="text-sm text-secondary">
+                <code>triggers</code>: fire this agent's webhook triggers
               </p>
             </Field>
+            <FormError text={createError} />
             <div className="flex justify-end gap-2 pt-2">
-              <button type="button" onClick={() => setShowCreate(false)} className="px-3 py-1.5 rounded-lg border border-p-border-light text-sm">
-                Cancel
-              </button>
-              <button type="submit" disabled={createM.isPending} className="px-3 py-1.5 rounded-lg bg-brand text-white text-sm font-medium hover:bg-brand-hover disabled:opacity-50">
+              <Button onClick={() => setShowCreate(false)} disabled={createM.isPending}>Cancel</Button>
+              <Button type="submit" variant="primary" disabled={createM.isPending}>
                 {createM.isPending ? 'Creating…' : 'Create'}
-              </button>
+              </Button>
             </div>
           </form>
         </Modal>
       )}
 
       {createdKey && (
-        <Modal onClose={() => setCreatedKey(null)} title="API key created">
-          <p className="text-sm text-amber-700 bg-amber-50 rounded-sm p-2 mb-3">
+        <Modal onClose={() => setCreatedKey(null)} title="API key created" dismissible="escape">
+          <p className="text-sm text-status-warning-fg bg-status-warning-bg border border-status-warning-border rounded-card p-2 mb-3">
             <span className="font-medium">Copy this key now.</span> It won't be shown again.
           </p>
-          <div className="bg-p-bg rounded-sm p-2 mb-3 font-mono text-xs break-all">{createdKey.key}</div>
+          <div className="bg-surface-sunken rounded-sm p-2 mb-3 font-mono text-xs break-all">{createdKey.key}</div>
           <div className="flex justify-end gap-2">
-            <button onClick={onCopy} className="px-3 py-1.5 rounded-lg bg-brand text-white text-sm font-medium hover:bg-brand-hover">
-              Copy
-            </button>
-            <button onClick={() => setCreatedKey(null)} className="px-3 py-1.5 rounded-lg border border-p-border-light text-sm">
-              Done
-            </button>
+            <Button variant="primary" onClick={onCopy}>Copy</Button>
+            <Button onClick={() => setCreatedKey(null)}>Done</Button>
           </div>
         </Modal>
       )}

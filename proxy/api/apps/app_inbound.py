@@ -25,13 +25,14 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from api.apps import manifest as _mf
 from auth import rate_limiter
 from auth.lan_check import client_address
-from services.apps import app_handlers, app_inbound
-from storage import database as task_store
-from storage import db_app_deliveries as deliveries
-from storage import db_app_secrets
+from services.apps import app_handlers, app_inbound, manifest as _mf
+from storage import (
+    database as task_store,
+    db_app_deliveries as deliveries,
+    db_app_secrets,
+)
 from storage.pg import run_db
 
 logger = logging.getLogger("otodock.apps")

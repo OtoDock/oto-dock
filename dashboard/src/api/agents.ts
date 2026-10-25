@@ -5,6 +5,7 @@ import { useAuth } from '../contexts/AuthContext'
 import type { AgentRole, EffectiveRole } from '../lib/permissions'
 import type { PairingScope } from '../lib/placement'
 import type { MachineState } from '../lib/status/machine'
+import { apiJson, withMessage } from '../lib/http/apiJson'
 
 export interface AgentSummary {
   name: string
@@ -308,12 +309,10 @@ export const useSaveAgentFile = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ agent, path, content }: { agent: string; path: string; content: string }) => {
-      const res = await apiFetch(`/v1/agents/${agent}/files/${path}`, {
+      return apiJson(`/v1/agents/${agent}/files/${path}`, {
         method: 'PUT',
-        body: JSON.stringify({ content }),
-      })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+        json: { content },
+      }, 'Could not save the file')
     },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-file-content', vars.agent, vars.path] })
@@ -326,12 +325,10 @@ export const useCreateAgentDir = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ agent, path }: { agent: string; path: string }) => {
-      const res = await apiFetch(`/v1/agents/${agent}/mkdir`, {
+      return apiJson(`/v1/agents/${agent}/mkdir`, {
         method: 'POST',
-        body: JSON.stringify({ path }),
-      })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+        json: { path },
+      }, 'Could not create the folder')
     },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-files', vars.agent] })
@@ -343,12 +340,10 @@ export const useCreateAgentFile = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ agent, path, fileType }: { agent: string; path: string; fileType?: string }) => {
-      const res = await apiFetch(`/v1/agents/${agent}/create-file`, {
+      return apiJson(`/v1/agents/${agent}/create-file`, {
         method: 'POST',
-        body: JSON.stringify({ path, file_type: fileType || '' }),
-      })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+        json: { path, file_type: fileType || '' },
+      }, 'Could not create the file')
     },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-files', vars.agent] })
@@ -359,12 +354,10 @@ export const useCreateAgentFile = () => {
 export const useSetDefaultAgent = () => {
   return useMutation({
     mutationFn: async (agent: string) => {
-      const res = await apiFetch('/v1/users/me/default-agent', {
+      return apiJson('/v1/users/me/default-agent', {
         method: 'PUT',
-        body: JSON.stringify({ default_agent: agent }),
-      })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+        json: { default_agent: agent },
+      }, 'Could not set the default agent')
     },
   })
 }
@@ -385,12 +378,10 @@ export const useDeleteAgentPath = () => {
     mutationFn: async ({ agent, path, recursive }: {
       agent: string; path: string; recursive?: boolean; skipInvalidate?: boolean
     }) => {
-      const res = await apiFetch(`/v1/agents/${agent}/delete`, {
+      return apiJson(`/v1/agents/${agent}/delete`, {
         method: 'POST',
-        body: JSON.stringify({ path, recursive: recursive ?? false }),
-      })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+        json: { path, recursive: recursive ?? false },
+      }, 'Could not delete it')
     },
     onSuccess: (_data, vars) => {
       if (!vars.skipInvalidate) invalidateAfterDelete(qc, vars.agent)
@@ -402,12 +393,10 @@ export const useRenameAgentPath = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ agent, oldPath, newPath }: { agent: string; oldPath: string; newPath: string }) => {
-      const res = await apiFetch(`/v1/agents/${agent}/rename`, {
+      return apiJson(`/v1/agents/${agent}/rename`, {
         method: 'POST',
-        body: JSON.stringify({ old_path: oldPath, new_path: newPath }),
-      })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+        json: { old_path: oldPath, new_path: newPath },
+      }, 'Could not rename it')
     },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-files', vars.agent] })
@@ -444,12 +433,10 @@ export const useMoveAgentPaths = () => {
     mutationFn: async (
       { agent, srcPaths, destDir }: { agent: string; srcPaths: string[]; destDir: string },
     ): Promise<BatchOpResult> => {
-      const res = await apiFetch(`/v1/agents/${agent}/move`, {
+      return apiJson<BatchOpResult>(`/v1/agents/${agent}/move`, {
         method: 'POST',
-        body: JSON.stringify({ src_paths: srcPaths, dest_dir: destDir }),
-      })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+        json: { src_paths: srcPaths, dest_dir: destDir },
+      }, 'Could not move the items')
     },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-files', vars.agent] })
@@ -464,12 +451,10 @@ export const useCopyAgentPaths = () => {
     mutationFn: async (
       { agent, srcPaths, destDir }: { agent: string; srcPaths: string[]; destDir: string },
     ): Promise<BatchOpResult> => {
-      const res = await apiFetch(`/v1/agents/${agent}/copy`, {
+      return apiJson<BatchOpResult>(`/v1/agents/${agent}/copy`, {
         method: 'POST',
-        body: JSON.stringify({ src_paths: srcPaths, dest_dir: destDir }),
-      })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+        json: { src_paths: srcPaths, dest_dir: destDir },
+      }, 'Could not copy the items')
     },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-files', vars.agent] })
@@ -491,15 +476,11 @@ export const useZipAgentPaths = () => {
       // Content-Disposition so browsers trigger a download and Android's
       // DownloadManager handles it natively (it can't download blob: URLs
       // from the older POST→blob flow).
-      const res = await apiFetch(`/v1/agents/${agent}/zip-url`, {
-        method: 'POST',
-        body: JSON.stringify({ paths }),
-      })
-      if (!res.ok) throw new Error(await res.text())
-      const { download_url, filename } = await res.json() as {
-        download_url: string
-        filename: string
-      }
+      const { download_url, filename } = await apiJson<{ download_url: string; filename: string }>(
+        `/v1/agents/${agent}/zip-url`,
+        { method: 'POST', json: { paths } },
+        'Could not prepare the download',
+      )
       const a = document.createElement('a')
       a.href = download_url
       a.download = filename
@@ -523,9 +504,7 @@ export function useCreateAgent() {
       execution_path?: string
       default_scope?: 'user' | 'agent'
     }) => {
-      const res = await apiFetch('/v1/agents', { method: 'POST', body: JSON.stringify(data) })
-      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Failed to create agent') }
-      return res.json()
+      return apiJson('/v1/agents', { method: 'POST', body: JSON.stringify(data) }, 'Failed to create agent')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['agents'] })
@@ -579,7 +558,7 @@ export interface SharedOnlySwitchResult {
 export function useUpdateAgent() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async ({ name, ...fields }: { name: string; [key: string]: any }) => {
+    mutationFn: async ({ name, ...fields }: { name: string; [key: string]: unknown }) => {
       const res = await apiFetch(`/v1/agents/${name}`, { method: 'PATCH', body: JSON.stringify(fields) })
       if (!res.ok) {
         const e = await res.json().catch(() => ({}))
@@ -587,9 +566,10 @@ export function useUpdateAgent() {
       }
       return res.json()
     },
+    // Resolves with the agent's own row, the one its settings page shows.
     onSuccess: (_, { name }) => {
       qc.invalidateQueries({ queryKey: ['agents'] })
-      qc.invalidateQueries({ queryKey: ['agent-info', name] })
+      return qc.invalidateQueries({ queryKey: ['agent-info', name] })
     },
   })
 }
@@ -599,9 +579,7 @@ export function useDeleteAgent() {
   const { refreshUser } = useAuth()
   return useMutation({
     mutationFn: async ({ name, confirm_slug }: { name: string; confirm_slug: string }) => {
-      const res = await apiFetch(`/v1/agents/${name}`, { method: 'DELETE', body: JSON.stringify({ confirm_slug }) })
-      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Failed to delete') }
-      return res.json()
+      return apiJson(`/v1/agents/${name}`, { method: 'DELETE', body: JSON.stringify({ confirm_slug }) }, 'Failed to delete')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['agents'] })
@@ -617,9 +595,8 @@ export function useDelegationTargets(agent: string) {
   return useQuery({
     queryKey: ['delegation-targets', agent],
     queryFn: async (): Promise<DelegationTargetsData> => {
-      const res = await apiFetch(`/v1/agents/${agent}/delegation-targets`)
-      if (!res.ok) throw new Error('Failed to fetch delegation targets')
-      return res.json()
+      return apiJson<DelegationTargetsData>(`/v1/agents/${agent}/delegation-targets`)
+        .catch(withMessage('Failed to fetch delegation targets'))
     },
     enabled: !!agent,
   })
@@ -629,19 +606,17 @@ export function useSetDelegationTargets() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ agent, targets }: { agent: string; targets: string[] }) => {
-      const res = await apiFetch(`/v1/agents/${agent}/delegation-targets`, {
+      return apiJson(`/v1/agents/${agent}/delegation-targets`, {
         method: 'PUT',
         body: JSON.stringify({ targets }),
-      })
-      if (!res.ok) throw new Error('Failed to save delegation targets')
-      return res.json()
+      }).catch(withMessage('Failed to save delegation targets'))
     },
     onSuccess: (_, { agent }) => {
-      qc.invalidateQueries({ queryKey: ['delegation-targets', agent] })
       qc.invalidateQueries({ queryKey: ['agent-info', agent] })
       // The 3D map draws from the all-edges feed — a config-page save must
       // reach it immediately (staleTime hid a removal for up to a minute).
       qc.invalidateQueries({ queryKey: ['delegation-edges-all'] })
+      return qc.invalidateQueries({ queryKey: ['delegation-targets', agent] })
     },
   })
 }
@@ -657,9 +632,8 @@ export function useKnowledgeAttachments(agent: string) {
   return useQuery({
     queryKey: ['knowledge-attachments', agent],
     queryFn: async (): Promise<KnowledgeAttachmentsData> => {
-      const res = await apiFetch(`/v1/agents/${agent}/knowledge-attachments`)
-      if (!res.ok) throw new Error('Failed to fetch knowledge attachments')
-      return res.json()
+      return apiJson<KnowledgeAttachmentsData>(`/v1/agents/${agent}/knowledge-attachments`)
+        .catch(withMessage('Failed to fetch knowledge attachments'))
     },
     enabled: !!agent,
   })
@@ -672,9 +646,8 @@ export function useKnowledgeLibraries(enabled: boolean) {
   return useQuery({
     queryKey: ['knowledge-libraries'],
     queryFn: async (): Promise<KnowledgeLibrarySummary[]> => {
-      const res = await apiFetch('/v1/knowledge-libraries')
-      if (!res.ok) throw new Error('Failed to fetch knowledge libraries')
-      const data = await res.json()
+      const data = await apiJson<{ libraries?: KnowledgeLibrarySummary[] }>('/v1/knowledge-libraries')
+        .catch(withMessage('Failed to fetch knowledge libraries'))
       return data.libraries ?? []
     },
     enabled,
@@ -698,8 +671,8 @@ export function useSetKnowledgeLibrary() {
       return res.json()
     },
     onSuccess: (_, { agent }) => {
-      qc.invalidateQueries({ queryKey: ['knowledge-attachments', agent] })
       qc.invalidateQueries({ queryKey: ['knowledge-libraries'] })
+      return qc.invalidateQueries({ queryKey: ['knowledge-attachments', agent] })
     },
   })
 }
@@ -712,16 +685,14 @@ export function useAttachKnowledgeLibrary() {
     mutationFn: async ({ agent, source_agent, subdir, writable }: {
       agent: string; source_agent: string; subdir?: string; writable: boolean
     }) => {
-      const res = await apiFetch(`/v1/agents/${agent}/knowledge-attachments`, {
+      return apiJson(`/v1/agents/${agent}/knowledge-attachments`, {
         method: 'PUT',
         body: JSON.stringify({ source_agent, subdir: subdir ?? '', writable }),
-      })
-      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Failed to attach library') }
-      return res.json()
+      }, 'Failed to attach library')
     },
     onSuccess: (_, { agent }) => {
-      qc.invalidateQueries({ queryKey: ['knowledge-attachments', agent] })
       qc.invalidateQueries({ queryKey: ['knowledge-libraries'] })
+      return qc.invalidateQueries({ queryKey: ['knowledge-attachments', agent] })
     },
   })
 }
@@ -733,15 +704,13 @@ export function useDetachKnowledgeLibrary() {
       agent: string; source: string; subdir?: string
     }) => {
       const qs = subdir ? `?subdir=${encodeURIComponent(subdir)}` : ''
-      const res = await apiFetch(`/v1/agents/${agent}/knowledge-attachments/${source}${qs}`, {
+      return apiJson(`/v1/agents/${agent}/knowledge-attachments/${source}${qs}`, {
         method: 'DELETE',
-      })
-      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Failed to detach library') }
-      return res.json()
+      }, 'Failed to detach library')
     },
     onSuccess: (_, { agent }) => {
-      qc.invalidateQueries({ queryKey: ['knowledge-attachments', agent] })
       qc.invalidateQueries({ queryKey: ['knowledge-libraries'] })
+      return qc.invalidateQueries({ queryKey: ['knowledge-attachments', agent] })
     },
   })
 }
@@ -757,19 +726,12 @@ export function useSetDefaultForNewUsers() {
       { agent, enabled, role }:
       { agent: string; enabled: boolean; role: AgentRole | null },
     ) => {
-      const res = await apiFetch(
-        `/v1/admin/agents/${agent}/default-for-new-users`,
-        {
+      return apiJson(`/v1/admin/agents/${agent}/default-for-new-users`, {
           method: 'PUT',
           body: JSON.stringify({ enabled, role }),
-        },
-      )
-      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'Failed to update') }
-      return res.json()
+        }, 'Failed to update')
     },
-    onSuccess: (_, { agent }) => {
-      qc.invalidateQueries({ queryKey: ['agent-info', agent] })
-    },
+    onSuccess: (_, { agent }) => qc.invalidateQueries({ queryKey: ['agent-info', agent] }),
   })
 }
 
@@ -816,12 +778,10 @@ export const useRestoreFiles = () => {
     mutationFn: async (
       { agent, entryIds }: { agent: string; entryIds: string[] },
     ): Promise<RestoreResult> => {
-      const res = await apiFetch(`/v1/agents/${agent}/recover-bin/restore`, {
+      return apiJson<RestoreResult>(`/v1/agents/${agent}/recover-bin/restore`, {
         method: 'POST',
-        body: JSON.stringify({ entry_ids: entryIds }),
-      })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+        json: { entry_ids: entryIds },
+      }, 'Could not restore the items')
     },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-files', vars.agent] })
@@ -836,12 +796,10 @@ export const useDiscardFiles = () => {
     mutationFn: async (
       { agent, entryIds }: { agent: string; entryIds: string[] },
     ): Promise<{ discarded: string[]; denied: string[] }> => {
-      const res = await apiFetch(`/v1/agents/${agent}/recover-bin/discard`, {
+      return apiJson<{ discarded: string[]; denied: string[] }>(`/v1/agents/${agent}/recover-bin/discard`, {
         method: 'POST',
-        body: JSON.stringify({ entry_ids: entryIds }),
-      })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+        json: { entry_ids: entryIds },
+      }, 'Could not discard the items')
     },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['agent-recover-bin', vars.agent] })

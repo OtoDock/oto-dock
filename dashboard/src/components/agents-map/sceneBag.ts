@@ -52,7 +52,8 @@ export interface SceneBag {
   lookTarget: THREE.Vector3 | null
   camDeadline: number
   /** The user has grabbed the controls at least once — after that the map
-   * never repositions the camera on its own (favorite centering skips). */
+   * never repositions the camera on its own (render reads the component's
+   * `userMoved` state, set by the same listener). */
   userMoved: boolean
   frame: number
   lastNow: number
@@ -189,7 +190,7 @@ export function updateSparks(bag: SceneBag) {
       // A point on one of the four edges + its outward normal.
       const side = (Math.random() * 4) | 0
       const u = Math.random()
-      let px = 0, py = 0, nx = 0, ny = 0
+      let px: number, py: number, nx = 0, ny = 0
       if (side === 0) { px = rx + u * rw; py = ry; ny = -1 }
       else if (side === 1) { px = rx + u * rw; py = ry + rh; ny = 1 }
       else if (side === 2) { px = rx; py = ry + u * rh; nx = -1 }

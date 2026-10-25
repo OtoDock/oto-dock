@@ -7,8 +7,8 @@ per call (``source_type='turn-classifier'``, ``scope='agent'``, ``user_sub='phon
 so it rolls up in the per-agent breakdown — mirroring how phone turns + title
 generation already attribute.
 
-Auth = the internal proxy master key ONLY (the same Bearer the daemon uses
-for warmup) — session JWTs are refused, see ``_require_master_key``. The hosted relay bills the classifier independently (×1.25
+Auth = the internal proxy master key ONLY (the same Bearer the daemon presents
+on its management socket) — session JWTs are refused, see ``_require_master_key``. The hosted relay bills the classifier independently (×1.25
 credit); this records the BASE price locally for display — a separate ledger.
 """
 
@@ -23,14 +23,13 @@ from pydantic import BaseModel
 import config
 from adapters.phone import DIRECTIONS, INBOUND, OUTBOUND, is_outbound
 from core.layers.providers import ProviderUsage, get_adapter
+from core.session import session_kind
+from core.session.visibility import PHONE_CHAT_OWNER
 from services.billing import usage_service
 from services.infra import external_retention
 from services.phone.phone_identity import pop_call_identity
 from storage import database as task_store
-from storage.phone import phone_call_log_store
-from storage.phone import phone_route_store
-from core.session import session_kind
-from core.session.visibility import PHONE_CHAT_OWNER
+from storage.phone import phone_call_log_store, phone_route_store
 
 logger = logging.getLogger("otodock")
 router = APIRouter()
@@ -97,6 +96,47 @@ async def report_turn_classifier_usage(
         return {"recorded": False}
     return await asyncio.to_thread(
         _record, req.agent or "", model, in_tok, out_tok, req.session_id or None)
+
+
+class RelistenUsage(BaseModel):
+    agent: str = ""
+    provider: str = ""
+    seconds: float = 0.0
+    session_id: str = ""
+
+
+#: A report beyond this many seconds is clipped (a call's second listen is
+#: bounded by its own stream: 1.25 times it plus 10 s).
+_RELISTEN_MAX_S = 4 * 3600.0
+RELISTEN_SOURCE = "phone-stt-relisten"
+
+
+def _record_relisten(agent: str, provider_name: str, seconds: float, session_id: str | None) -> dict:
+    """Price the seconds at the STT provider's rate and persist the row."""
+    from audio.providers.registry import get_provider_class
+
+    from services.media import audio_service
+    try:
+        cls = get_provider_class("stt", provider_name)
+    except KeyError:
+        return {"recorded": False}
+    audio_service.record_audio_usage(
+        PHONE_CHAT_OWNER, RELISTEN_SOURCE, provider_name, cls, seconds=seconds,
+        agent=agent, scope="agent", source_id=session_id,
+    )
+    return {"recorded": True}
+
+
+@router.post("/v1/phone/usage/relisten")
+async def report_relisten_usage(req: RelistenUsage, authorization: str | None = Header(None)):
+    """Record one call's second-listen seconds: the STT provider's batch
+    endpoint heard again what the live stream answered empty."""
+    _require_master_key(authorization)
+    seconds = max(0.0, min(float(req.seconds), _RELISTEN_MAX_S))
+    if not seconds or not req.provider:
+        return {"recorded": False}
+    return await asyncio.to_thread(
+        _record_relisten, req.agent or "", req.provider, seconds, req.session_id or None)
 
 
 # ---------------------------------------------------------------------------

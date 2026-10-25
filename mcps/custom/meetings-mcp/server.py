@@ -7,9 +7,12 @@ import os
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+
+from _tool_args import ToolArgs
 
 server = Server("meetings-mcp")
+TOOL_ARGS = ToolArgs()
 
 AGENT = os.environ.get("MEETINGS_MCP_AGENT", "system-admin")
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
@@ -54,13 +57,13 @@ async def _get_current_session_info() -> tuple[str | None, str | None]:
     try:
         result = await _get("/v1/session/current")
         return result.get("session_id"), result.get("chat_id")
-    except Exception:
+    except (httpx.HTTPError, ValueError):
         return None, None
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="start_meeting",
             description=(
@@ -104,6 +107,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["topic", "agents"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
         Tool(
             name="direct_to",
@@ -139,6 +143,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["agents"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
         Tool(
             name="end_meeting",
@@ -158,6 +163,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["meeting_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
         Tool(
             name="propose_conclude",
@@ -176,6 +182,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["meeting_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
         Tool(
             name="leave_meeting",
@@ -198,12 +205,16 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["meeting_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
-    ]
+    ])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     try:
         if name == "start_meeting":
             session_id, chat_id = await _get_current_session_info()
@@ -313,7 +324,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     except httpx.HTTPStatusError as e:
         body = e.response.text[:300]
         return [TextContent(type="text", text=f"API error {e.response.status_code}: {body}")]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
 

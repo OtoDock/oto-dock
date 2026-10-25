@@ -9,11 +9,11 @@ import asyncio
 import time
 
 import numpy as np
-
-import config
-import breath
-from config_manager import ConfigManager
 from pipeline_fakes import make_route
+
+import breath
+import config
+from config_manager import ConfigManager
 
 
 def _cfg(**overrides):
@@ -29,8 +29,11 @@ def _breath_frames(n=3):
 
 
 async def _run_tts(p):
+    # One sentence through an open context: the fake speaks a frame for it
+    # and ends the segment at the end of input, as a provider does.
     p.tts.start_streaming_context()
     task = asyncio.create_task(p._stream_tts_audio())
+    await p.tts.send_text_chunk("Hello.", is_last=True)
     await task
 
 

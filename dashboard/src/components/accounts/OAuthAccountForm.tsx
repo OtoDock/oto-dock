@@ -3,9 +3,11 @@
  * Driven by ``UserAccountsManager``.
  *
  * Two behaviors:
- *   - Flow picker — when ``oauth_meta.flows`` lists more than one flow,
- *     a radio appears so the user picks at connect time. ``client_credentials``
- *     (Server-to-Server, admin-only) is hidden — it's configured elsewhere.
+ *   - Ways to connect — one per flow in ``oauth_meta.flows``; with app kinds
+ *     (GitHub) the browser flow is one way per ``oauth_meta.connect_kinds``
+ *     entry, the default first. More than one way renders a radio.
+ *     ``client_credentials`` (Server-to-Server, admin-only) is hidden — it's
+ *     configured elsewhere.
  *   - PAT branch — when ``personal_access_token`` is selected, the
  *     "Connect" popup is replaced by a textarea + "Save token" button.
  *
@@ -16,6 +18,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { safeHref } from '../../lib/safeUrl'
+import { OAUTH_APP_KIND, isGitHubApp } from '../../lib/kinds/oauthApp'
 import { useQueryClient } from '@tanstack/react-query'
 import type {
   AccountSummary,
@@ -33,6 +36,11 @@ import {
   usePollDeviceCode,
   useStartAdminConsent,
 } from '../../api/oauth'
+import { eventCatalogKey } from '../../api/subscriptions'
+import { useDialogs } from '../ui/dialogs'
+import Button from '../ui/Button'
+import { Input } from '../ui/Field'
+import { BADGE_BASE, BADGE_TONE, FIELD, FIELD_REGULAR, FIELD_BORDER } from '../ui/classes'
 interface Props {
   integration: Integration
   account: AccountSummary | null
@@ -40,27 +48,56 @@ interface Props {
 }
 
 const FLOW_LABELS: Record<string, string> = {
-  authorization_code: 'OAuth (browser)',
-  authorization_code_pkce: 'OAuth (browser, PKCE)',
+  authorization_code: 'OAuth in the browser',
+  authorization_code_pkce: 'OAuth in the browser with PKCE',
   device_code: 'Device code',
   personal_access_token: 'Personal Access Token',
-  client_credentials: 'Service-to-Server (admin)',
+  client_credentials: 'Service-to-Server, admin only',
 }
 
+const BROWSER_SENTENCE = 'Sign in with your account in a browser window.'
+const TICK_A_SERVICE = 'Tick at least one service.'
+
 const FLOW_DESCRIPTIONS: Record<string, string> = {
-  authorization_code:
-    'Recommended for first-time users. Opens a consent popup; the token refreshes automatically.',
-  authorization_code_pkce:
-    'Same browser flow as OAuth, with PKCE for added safety on public clients.',
-  device_code:
-    'For devices without a browser. Visit a URL on another device and enter the code shown.',
-  personal_access_token:
-    'Generate a token in your provider settings and paste it here. Best for production — no mid-session expiry surprises.',
-  client_credentials:
-    'Admin-managed. No per-user grant; one token serves all calls.',
+  authorization_code: BROWSER_SENTENCE,
+  authorization_code_pkce: BROWSER_SENTENCE,
+  device_code: 'Open a page on another device and type the code shown.',
+  personal_access_token: 'Create a token in your account settings and paste it here.',
+  client_credentials: 'Set up once by an admin. Nobody signs in.',
+}
+
+// GitHub's ways to connect: the one provider whose manifest declares app
+// kinds, so its browser flow is one way per kind.
+const KIND_LABELS: Record<string, string> = {
+  [OAUTH_APP_KIND.GITHUB_APP]: 'GitHub App',
+  [OAUTH_APP_KIND.OAUTH_APP]: 'GitHub sign-in',
+}
+const GITHUB_APP_SENTENCE =
+  'Sign in with GitHub and install the app on the repositories you choose.'
+const HOSTED_GITHUB_APP_SENTENCE =
+  'Sign in with GitHub and install the OtoDock app on the repositories you choose.'
+const GITHUB_SIGN_IN_SENTENCE = 'Sign in with your personal GitHub account.'
+const GITHUB_TOKEN_SENTENCE = 'Create a personal access token on GitHub and paste it here.'
+
+interface ConnectMethod {
+  id: string
+  flow: string
+  /** The kind of app a browser way goes through; '' without app kinds. */
+  kind: string
+}
+
+/** One way per flow; with app kinds the browser flow is one way per kind,
+ * in the server's order (the default first). */
+function connectMethods(flows: string[], kinds: string[]): ConnectMethod[] {
+  return flows.flatMap((flow) =>
+    flow === 'authorization_code' && kinds.length
+      ? kinds.map((kind) => ({ id: `${flow}:${kind}`, flow, kind }))
+      : [{ id: flow, flow, kind: '' }],
+  )
 }
 
 export function OAuthAccountForm({ integration, account, onDone }: Props) {
+  const dialogs = useDialogs()
   const qc = useQueryClient()
   const startOAuth = useStartOAuth()
   const disconnect = useDisconnectOAuth()
@@ -72,22 +109,43 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
   const providerId = integration.oauth_meta?.provider_id || 'google'
   const queryKey = 'my-integrations'
   const services: OAuthService[] = integration.oauth_services || []
+  const meta = integration.oauth_meta
 
   // Per-(provider, mcp) accounts probe — used for requires_user_oauth gating.
   const accountsProbe = useOAuthAccounts(providerId, integration.mcp_name)
   const hasServiceOnly =
     accountsProbe.data?.has_service_credentials_only || false
 
-  // Flow picker — defaults to the first declared flow (typically OAuth).
-  // `client_credentials` (Server-to-Server) is admin-only and configured
-  // elsewhere, so it's never offered here.
+  // Ways to connect — the first is the default. `client_credentials`
+  // (Server-to-Server) is admin-only and configured elsewhere, so it's
+  // never offered here.
+  const metaFlows = meta?.flows
+  const metaKinds = meta?.connect_kinds
+  const kindInUse = meta?.app_kind
   const availableFlows = useMemo(() => {
-    const flows = integration.oauth_meta?.flows || ['authorization_code']
+    const flows = metaFlows || ['authorization_code']
     return flows.filter((f) => f !== 'client_credentials')
-  }, [integration.oauth_meta?.flows])
-  const [selectedFlow, setSelectedFlow] = useState<string>(
-    availableFlows[0] || 'authorization_code',
+  }, [metaFlows])
+  const connectKinds = useMemo(
+    () => metaKinds ?? (kindInUse ? [kindInUse] : []),
+    [metaKinds, kindInUse],
   )
+  const methods = useMemo(
+    () => connectMethods(availableFlows, connectKinds),
+    [availableFlows, connectKinds],
+  )
+  const [methodId, setMethodId] = useState(methods[0]?.id ?? '')
+  const method = methods.find((m) => m.id === methodId) ?? methods[0]
+  const selectedFlow = method?.flow ?? 'authorization_code'
+  // A reconnect keeps the account's own kind while it is offered, so an
+  // OAuth App account never turns into a GitHub App one by itself.
+  const accountKind = account?.kind ?? OAUTH_APP_KIND.OAUTH_APP
+  const connectKind = account
+    ? (connectKinds.includes(accountKind) ? accountKind : connectKinds[0] ?? '')
+    : method?.kind ?? ''
+  // A GitHub App: the app's permissions decide, so no services are picked;
+  // the person signs in, then installs the app where they choose.
+  const githubApp = isGitHubApp(connectKind)
   const [patValue, setPatValue] = useState('')
   const [patLabel, setPatLabel] = useState('')
   // The MCP server names its own authorization server: the install
@@ -138,6 +196,7 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
       if (event.origin !== window.location.origin) return
       if (event.data?.type === 'oauth-complete') {
         qc.invalidateQueries({ queryKey: [queryKey] })
+        qc.invalidateQueries({ queryKey: eventCatalogKey(integration.mcp_name) })
         onDone()
       } else if (event.data?.type === 'oauth-error') {
         setError(event.data.error || 'OAuth failed')
@@ -145,7 +204,7 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
     }
     window.addEventListener('message', handler)
     return () => window.removeEventListener('message', handler)
-  }, [qc, onDone, queryKey])
+  }, [qc, onDone, queryKey, integration.mcp_name])
 
   // Device-code polling loop. Runs while `deviceCode` is set; clears the
   // sessionStorage entry on success/cancel/expiry so a stale code doesn't
@@ -168,6 +227,7 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
           sessionStorage.removeItem(sessionKey)
           setDeviceCode(null)
           qc.invalidateQueries({ queryKey: [queryKey] })
+          qc.invalidateQueries({ queryKey: eventCatalogKey(integration.mcp_name) })
           onDone()
         } else {
           pollTimer.current = window.setTimeout(
@@ -196,10 +256,17 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
     onDone, pollDeviceCode,
   ])
 
+  // The account list, and the subscribe dialog's catalog: its scope line
+  // reads the account's scopes, which a connect changes.
+  const refreshAccounts = () => {
+    qc.invalidateQueries({ queryKey: [queryKey] })
+    qc.invalidateQueries({ queryKey: eventCatalogKey(integration.mcp_name) })
+  }
+
   const handleStartDeviceCode = async () => {
     setError('')
     if (selectedServices.length === 0 && services.length > 0) {
-      setError('Select at least one service')
+      setError(TICK_A_SERVICE)
       return
     }
     try {
@@ -251,8 +318,8 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
 
   const handleConnect = async () => {
     setError('')
-    if (selectedServices.length === 0 && services.length > 0) {
-      setError('Select at least one service')
+    if (!githubApp && selectedServices.length === 0 && services.length > 0) {
+      setError(TICK_A_SERVICE)
       return
     }
     try {
@@ -265,6 +332,7 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
         services: selectedServices,
         accountLabel: account?.account_label || (registeredClient ? registeredLabel.trim() : ''),
         mobile: isNative,
+        appKind: connectKind,
       })
       const { openOAuthWindow, waitForDeepLink } = await import(
         '../../lib/oauth'
@@ -287,15 +355,16 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
           setError(e instanceof Error ? e.message : 'Failed to complete the connect')
           return
         }
-        qc.invalidateQueries({ queryKey: [queryKey] })
+        refreshAccounts()
         onDone()
       } else {
-        const ok = await openOAuthWindow(url, `${providerId}-oauth`, () => {
-          qc.invalidateQueries({ queryKey: [queryKey] })
-        })
+        const ok = await openOAuthWindow(url, `${providerId}-oauth`, refreshAccounts)
         if (!ok) setError('Popup blocked. Allow popups for this site.')
       }
     } catch (e: unknown) {
+      // A refused start may come from a stale list (the admin switched the
+      // app, the relay stopped offering one): read the ways that stand now.
+      qc.invalidateQueries({ queryKey: [queryKey] })
       const message = e instanceof Error ? e.message : 'Failed to start OAuth'
       setError(message)
     }
@@ -308,7 +377,7 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
       return
     }
     if (selectedServices.length === 0 && services.length > 0) {
-      setError('Select at least one service')
+      setError(TICK_A_SERVICE)
       return
     }
     try {
@@ -321,6 +390,7 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
       })
       setPatValue('')
       setPatLabel('')
+      refreshAccounts()
       onDone()
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : 'Failed to save token'
@@ -332,11 +402,16 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
     if (!account) return
     const label = account.display_email || account.account_label
     const target = `${label} from ${integration.display_name}`
-    if (
-      !confirm(
-        `Disconnect ${target}? Agents bound to this account will fall back to the default account.`,
-      )
-    )
+    // The person's own repositories and Read only per agent live on the
+    // account's choices, which go with it.
+    const narrowed = (account.agent_reaches ?? []).some((r) => r.repositories.length > 0 || r.read_only)
+    if (!(await dialogs.confirm({
+      title: `Disconnect ${target}?`,
+      body: 'Agents bound to this account fall back to the default account.' +
+        (narrowed ? ' The repositories and Read only you chose for them with it are cleared.' : ''),
+      confirmLabel: 'Disconnect',
+      tone: 'danger',
+    })))
       return
     setError('')
     try {
@@ -362,12 +437,22 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
     }
   }
 
-  const showFlowPicker = availableFlows.length > 1
+  const showFlowPicker = methods.length > 1
   const isPatFlow = selectedFlow === 'personal_access_token'
   const isDeviceCodeFlow = selectedFlow === 'device_code'
-  const patUrl = integration.oauth_meta?.pat_instructions_url || ''
-  const patPlaceholder =
-    integration.oauth_meta?.pat_placeholder || 'Paste your token…'
+  const patUrl = meta?.pat_instructions_url || ''
+  const patPlaceholder = meta?.pat_placeholder || 'Paste your token…'
+  const describe = (m: ConnectMethod): string => {
+    if (!m.kind && m.flow === 'personal_access_token') {
+      return meta?.pat_description ||
+        (connectKinds.length ? GITHUB_TOKEN_SENTENCE : FLOW_DESCRIPTIONS[m.flow])
+    }
+    if (isGitHubApp(m.kind)) {
+      return meta?.app_hosted ? HOSTED_GITHUB_APP_SENTENCE : GITHUB_APP_SENTENCE
+    }
+    if (m.kind) return GITHUB_SIGN_IN_SENTENCE
+    return FLOW_DESCRIPTIONS[m.flow] || ''
+  }
 
   // Microsoft tenant-admin consent: only render the banner / button
   // when the provider is microsoft AND a service requiring admin
@@ -384,24 +469,23 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
   return (
     <div className="space-y-3">
       {account ? (
-        <div className="text-sm text-p-text">
+        <div className="text-sm text-primary">
           Connected as <strong>{account.display_email || account.account_label}</strong>
         </div>
       ) : null}
 
       {account && account.missing_scopes.length > 0 && (
-        <div className="px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
-          <div className="text-sm text-amber-700 dark:text-amber-300">
-            ⚠️ This account is missing some scopes for the services you
-            enabled. Click <strong>Reconnect</strong> to grant the
-            additional access without redoing the others.
+        <div className="px-3 py-2 rounded-card bg-status-warning-bg border border-status-warning-border">
+          <div className="text-sm text-status-warning-fg">
+            ⚠️ Some services you ticked need more access. Click{' '}
+            <strong>Reconnect</strong> to grant it.
           </div>
         </div>
       )}
 
       {account?.needs_reconnect && (
-        <div className="px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
-          <div className="text-sm text-amber-700 dark:text-amber-300">
+        <div className="px-3 py-2 rounded-card bg-status-warning-bg border border-status-warning-border">
+          <div className="text-sm text-status-warning-fg">
             ⚠️ Reconnect needed: {reconnectReasonText(account.reconnect_reason)}.
             Agents leave this account out until you click <strong>Reconnect</strong>.
           </div>
@@ -410,49 +494,48 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
 
       {registeredClient && !account && (
         <div className="space-y-2">
-          <p className="text-xs text-p-text-secondary">
+          <p className="text-xs text-secondary">
             Signs you in at <strong>{registeredClient.resource_host}</strong>.
-            This install registers itself as a client there the first time;
-            there is no OAuth app to create.
+            The first time, OtoDock registers itself there. There is no
+            OAuth app to create.
           </p>
-          <input
+          <Input
             type="text"
             value={registeredLabel}
             onChange={(e) => setRegisteredLabel(e.target.value)}
-            placeholder="Account label (optional)"
-            className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg focus:ring-2 focus:ring-brand focus:border-transparent"
+            placeholder="Account label, optional"
           />
         </div>
       )}
 
       {showFlowPicker && !account && (
         <div>
-          <p className="text-xs text-p-text-secondary mb-2">
+          <p className="text-xs text-secondary mb-2">
             Connection method:
           </p>
           <div className="space-y-1.5">
-            {availableFlows.map((flow) => (
+            {methods.map((m) => (
               <label
-                key={flow}
+                key={m.id}
                 className="flex items-start gap-2.5 cursor-pointer"
               >
                 <input
                   type="radio"
                   name={`flow-${integration.mcp_name}`}
-                  checked={selectedFlow === flow}
-                  onChange={() => setSelectedFlow(flow)}
-                  className="mt-0.5 text-brand focus:ring-brand"
+                  checked={method?.id === m.id}
+                  onChange={() => setMethodId(m.id)}
+                  className="mt-0.5 accent-action focus:ring-focus-ring"
                 />
                 <div>
-                  <div className="text-sm font-medium text-p-text">
-                    {FLOW_LABELS[flow] || flow}
+                  <div className="text-sm font-medium text-primary">
+                    {KIND_LABELS[m.kind] || FLOW_LABELS[m.flow] || m.flow}
+                    {isGitHubApp(m.kind) && (
+                      <span className={`${BADGE_BASE} ${BADGE_TONE.action} ml-1.5 align-middle`}>
+                        Recommended
+                      </span>
+                    )}
                   </div>
-                  <div className="text-xs text-p-text-light">
-                    {(flow === 'personal_access_token' &&
-                      integration.oauth_meta?.pat_description) ||
-                      FLOW_DESCRIPTIONS[flow] ||
-                      ''}
-                  </div>
+                  <div className="text-xs text-tertiary">{describe(m)}</div>
                 </div>
               </label>
             ))}
@@ -460,9 +543,26 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
         </div>
       )}
 
-      {services.length > 0 && (
+      {githubApp && !account && !showFlowPicker && method && (
+        <p className="text-xs text-secondary">{describe(method)}</p>
+      )}
+
+      {account && isGitHubApp(account.kind) && !githubApp && (
+        <p className="text-xs text-status-warning-fg">
+          Reconnecting uses GitHub sign-in now. The account then loses its
+          installations.
+        </p>
+      )}
+      {account && !isGitHubApp(account.kind) && githubApp && (
+        <p className="text-xs text-status-warning-fg">
+          Reconnecting uses the GitHub App now. The account then reaches only
+          the repositories you install it on.
+        </p>
+      )}
+
+      {services.length > 0 && !githubApp && (
         <div>
-          <p className="text-xs text-p-text-secondary mb-2">
+          <p className="text-xs text-secondary mb-2">
             Select which services to connect:
           </p>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -470,7 +570,7 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
               const isUserOauthGated =
                 !!svc.requires_user_oauth && hasServiceOnly
               const tooltip = isUserOauthGated
-                ? 'Requires user OAuth — admin has only Service-to-Server credentials configured. Ask your admin to add a user OAuth app.'
+                ? 'Requires user OAuth. The admin has set up only Service-to-Server credentials. Ask your admin to add a user OAuth app.'
                 : svc.description
               return (
                 <label
@@ -491,18 +591,18 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
                     onChange={() =>
                       !isUserOauthGated && toggleService(svc.key)
                     }
-                    className="mt-0.5 rounded-sm border-p-border-light text-brand focus:ring-brand disabled:cursor-not-allowed"
+                    className="mt-0.5 accent-action disabled:cursor-not-allowed"
                   />
                   <div>
-                    <div className="text-sm font-medium text-p-text">
+                    <div className="text-sm font-medium text-primary">
                       {svc.label}
                       {isUserOauthGated && (
-                        <span className="ml-1 text-xs text-amber-600 dark:text-amber-400">
-                          (requires user OAuth)
+                        <span className="ml-1 text-xs text-status-warning-fg">
+                          Requires user OAuth
                         </span>
                       )}
                     </div>
-                    <div className="text-xs text-p-text-light">
+                    <div className="text-xs text-tertiary">
                       {svc.description}
                     </div>
                   </div>
@@ -514,11 +614,11 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
       )}
 
       {capabilityWarnings.size > 0 && (
-        <div className="px-3 py-2 rounded-lg border border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-900/20">
-          <div className="text-sm font-medium text-red-700 dark:text-red-300 mb-1">
+        <div className="px-3 py-2 rounded-card border border-status-danger-border bg-status-danger-bg">
+          <div className="text-sm font-medium text-status-danger-fg mb-1">
             ⚠️ Sensitive capabilities
           </div>
-          <ul className="text-xs text-red-700 dark:text-red-300 list-disc list-inside">
+          <ul className="text-xs text-status-danger-fg list-disc list-inside">
             {Array.from(capabilityWarnings).map((cap) => (
               <li key={cap}>{cap.replace(/_/g, ' ')}</li>
             ))}
@@ -527,21 +627,20 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
       )}
 
       {needsAdminConsent && !account && (
-        <div className="px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
-          <div className="text-sm text-amber-700 dark:text-amber-300 mb-2">
+        <div className="px-3 py-2 rounded-card bg-status-warning-bg border border-status-warning-border">
+          <div className="text-sm text-status-warning-fg mb-2">
             🔒 One or more selected services require <strong>tenant-admin
             consent</strong>. A Microsoft tenant admin must grant these
-            scopes for the entire organization before users can connect.
+            scopes for the whole organization. Then users can connect.
           </div>
-          <button
+          <Button variant="secondary" size="xs"
             onClick={handleGrantAdminConsent}
             disabled={startAdminConsent.isPending}
-            className="px-3 py-1.5 text-xs bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 border border-amber-300 dark:border-amber-700 rounded-sm hover:bg-amber-200 dark:hover:bg-amber-900/60 disabled:opacity-50"
           >
             {startAdminConsent.isPending
               ? 'Opening admin consent…'
               : 'Grant for whole tenant'}
-          </button>
+          </Button>
         </div>
       )}
 
@@ -549,8 +648,8 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
         <div className="space-y-2">
           {deviceCode ? (
             <div className="space-y-2">
-              <div className="px-3 py-2 rounded-lg bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800">
-                <p className="text-xs text-blue-700 dark:text-blue-300 mb-2">
+              <div className="px-3 py-2 rounded-card bg-status-info-bg border border-status-info-border">
+                <p className="text-xs text-status-info-fg mb-2">
                   1. Visit{' '}
                   <a
                     href={safeHref(
@@ -564,57 +663,55 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
                     {deviceCode.verification_uri}
                   </a>
                 </p>
-                <p className="text-xs text-blue-700 dark:text-blue-300 mb-2">
+                <p className="text-xs text-status-info-fg mb-2">
                   2. Enter this code:
                 </p>
-                <div className="text-2xl font-mono font-bold text-blue-900 dark:text-blue-100 select-all">
+                <div className="text-2xl font-mono font-bold text-primary select-all">
                   {deviceCode.user_code}
                 </div>
-                <p className="text-xs text-blue-600 dark:text-blue-400 mt-2">
+                <p className="text-xs text-status-info-fg mt-2">
                   Waiting for you to complete the prompt in your browser…
                 </p>
               </div>
               <div className="flex gap-2">
-                <button
+                <Button variant="secondary" size="md"
                   onClick={handleCancelDeviceCode}
-                  className="px-4 py-2 border border-p-border-light rounded-lg text-sm hover:bg-p-bg-secondary"
                 >
                   Cancel
-                </button>
+                </Button>
               </div>
             </div>
           ) : (
             <div className="flex gap-2">
-              <button
+              <Button variant="primary" size="md"
                 onClick={handleStartDeviceCode}
                 disabled={
                   startDeviceCode.isPending ||
                   (selectedServices.length === 0 && services.length > 0)
                 }
-                className="px-4 py-2 bg-brand hover:bg-brand-hover text-white rounded-lg text-sm disabled:opacity-50"
               >
                 {startDeviceCode.isPending
                   ? 'Starting…'
                   : 'Get device code'}
-              </button>
+              </Button>
             </div>
           )}
         </div>
       ) : isPatFlow && !account ? (
         <div className="space-y-2">
           {patUrl && (
-            <p className="text-xs text-p-text-light">
-              Generate a token at{' '}
+            <p className="text-xs text-tertiary">
+              Create a token at{' '}
               <a
                 href={safeHref(patUrl)}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="underline text-brand hover:text-brand-hover"
+                className="underline text-link hover:text-link-hover"
               >
                 {patUrl}
               </a>
               {services.length > 0
-                ? ' with the scopes for the services you selected.'
+                ? ' with access to the services you ticked.'
                 : '.'}
             </p>
           )}
@@ -623,63 +720,59 @@ export function OAuthAccountForm({ integration, account, onDone }: Props) {
             onChange={(e) => setPatValue(e.target.value)}
             placeholder={patPlaceholder}
             rows={3}
-            className="w-full px-3 py-2 text-sm font-mono border border-p-border-light rounded-lg bg-p-bg focus:ring-2 focus:ring-brand focus:border-transparent"
+            className={`${FIELD} ${FIELD_REGULAR} ${FIELD_BORDER} font-mono`}
           />
-          <input
+          <Input
             type="text"
             value={patLabel}
             onChange={(e) => setPatLabel(e.target.value)}
-            placeholder="Account label (optional)"
-            className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg focus:ring-2 focus:ring-brand focus:border-transparent"
+            placeholder="Account label, optional"
           />
-          <p className="text-xs text-p-text-light">
-            Set a label to keep this token as its own separate account. If you
-            leave it empty, the account&apos;s own name is used, and saving
-            replaces the token of the account with that name.
+          <p className="text-xs text-tertiary">
+            Set a label to keep this token as its own account. Left empty, the
+            account&apos;s own name is used. Saving then replaces the token of
+            the account with that name.
           </p>
           <div className="flex gap-2">
-            <button
+            <Button variant="primary" size="md"
               onClick={handlePatSave}
               disabled={
                 patSave.isPending ||
                 !patValue.trim() ||
                 (selectedServices.length === 0 && services.length > 0)
               }
-              className="px-4 py-2 bg-brand hover:bg-brand-hover text-white rounded-lg text-sm disabled:opacity-50"
             >
               {patSave.isPending ? 'Saving…' : 'Save token'}
-            </button>
+            </Button>
           </div>
         </div>
       ) : (
         <div className="flex gap-2">
-          <button
+          <Button variant="primary" size="md"
             onClick={handleConnect}
             disabled={
               startOAuth.isPending ||
-              (selectedServices.length === 0 && services.length > 0)
+              (!githubApp && selectedServices.length === 0 && services.length > 0)
             }
-            className="px-4 py-2 bg-brand hover:bg-brand-hover text-white rounded-lg text-sm disabled:opacity-50"
           >
             {startOAuth.isPending
               ? 'Connecting...'
               : account
                 ? 'Reconnect'
                 : 'Connect'}
-          </button>
+          </Button>
           {account && (
-            <button
+            <Button variant="danger" size="md"
               onClick={handleDisconnect}
               disabled={disconnect.isPending}
-              className="px-4 py-2 border border-p-accent-red text-p-accent-red rounded-lg text-sm hover:bg-red-50 dark:hover:bg-red-900/20"
             >
               {disconnect.isPending ? 'Disconnecting...' : 'Disconnect'}
-            </button>
+            </Button>
           )}
         </div>
       )}
 
-      {error && <div className="text-sm text-p-accent-red">{error}</div>}
+      {error && <div className="text-sm text-status-danger-fg">{error}</div>}
     </div>
   )
 }

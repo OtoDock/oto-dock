@@ -13,7 +13,6 @@ import pytest
 from core.session import sibling_awareness as sa
 from storage import database as task_store
 
-
 AGENT = "pa"
 OWNER = "user-alice"
 

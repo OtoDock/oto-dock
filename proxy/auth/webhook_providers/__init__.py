@@ -42,8 +42,8 @@ logger = logging.getLogger("otodock.webhook-providers")
 #: and Jira have no provider yet; the cap applies the day one exists.
 LARGE_BODY_PROVIDERS = frozenset({"github", "gitlab", "jira"})
 
-_HARDCODED: dict[str, "WebhookProvider"] = {}
-_MANIFEST_CACHE: dict[str, "WebhookProvider"] = {}
+_HARDCODED: dict[str, WebhookProvider] = {}
+_MANIFEST_CACHE: dict[str, WebhookProvider] = {}
 
 
 def _register_hardcoded() -> None:
@@ -55,9 +55,9 @@ def _register_hardcoded() -> None:
     out as those credentials become testable.
     """
     from auth.webhook_providers.github import GitHubWebhookProvider
-    from auth.webhook_providers.slack import SlackWebhookProvider
     from auth.webhook_providers.linear import LinearWebhookProvider
     from auth.webhook_providers.microsoft import MicrosoftWebhookProvider
+    from auth.webhook_providers.slack import SlackWebhookProvider
     from auth.webhook_providers.zoom import ZoomWebhookProvider
     _HARDCODED["github"] = GitHubWebhookProvider()
     _HARDCODED["slack"] = SlackWebhookProvider()
@@ -78,7 +78,7 @@ def clear_manifest_cache() -> None:
     _MANIFEST_CACHE.clear()
 
 
-def get_provider(provider_id: str) -> "WebhookProvider":
+def get_provider(provider_id: str) -> WebhookProvider:
     """Resolve a provider by id.
 
     Lookup order: hardcoded singletons → manifest-derived cache → manifest
@@ -109,14 +109,14 @@ def list_provider_ids() -> list[str]:
     return sorted(set(_HARDCODED) | set(_MANIFEST_CACHE))
 
 
-def _build_from_manifest(provider_id: str) -> "WebhookProvider | None":
+def _build_from_manifest(provider_id: str) -> WebhookProvider | None:
     """Scan loaded manifests for the first one declaring this provider_id.
 
     Returns a ``GenericWebhookProvider`` bound to that manifest, or None if
     no manifest declares this provider.
     """
-    from services.mcp import mcp_registry
     from auth.webhook_providers.generic import GenericWebhookProvider
+    from services.mcp import mcp_registry
 
     for manifest in mcp_registry.get_all_manifests().values():
         webhooks = manifest.credentials.webhooks if manifest.credentials else None

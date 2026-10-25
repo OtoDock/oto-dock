@@ -77,10 +77,10 @@ def test_tarball_hash_cached_and_recomputed_on_source_change(tmp_path, monkeypat
 
 def test_set_auto_update_enabled_persists():
     """The auto_update_enabled column is read back after writing."""
-    from storage import remote_store
-
     # Build a minimal machine row in the test DB so we can update it.
     import uuid as _uuid
+
+    from storage import remote_store
     mid = str(_uuid.uuid4())
     name = f"test-machine-{mid[:8]}"
     remote_store.create_remote_machine(
@@ -106,8 +106,9 @@ def test_set_auto_update_enabled_persists():
 
 def test_set_satellite_version_persists():
     """Recording the satellite version on auth shows up in the row."""
-    from storage import remote_store
     import uuid as _uuid
+
+    from storage import remote_store
 
     mid = str(_uuid.uuid4())
     remote_store.create_remote_machine(
@@ -128,8 +129,9 @@ def test_set_satellite_version_persists():
 def test_record_update_result_success_clears_error_and_sets_version():
     """A successful update result stamps last_update_at + clears any
     prior error + updates satellite_version + clears pending_update."""
-    from storage import remote_store
     import uuid as _uuid
+
+    from storage import remote_store
 
     mid = str(_uuid.uuid4())
     remote_store.create_remote_machine(
@@ -156,8 +158,9 @@ def test_record_update_result_success_clears_error_and_sets_version():
 
 
 def test_set_pending_update_round_trip():
-    from storage import remote_store
     import uuid as _uuid
+
+    from storage import remote_store
 
     mid = str(_uuid.uuid4())
     remote_store.create_remote_machine(
@@ -204,9 +207,10 @@ async def test_broadcast_recipients_include_owner_and_admins(monkeypatch):
 async def test_push_machine_event_enqueues_to_all_user_connections(monkeypatch):
     """_push_machine_event pushes the payload into every recipient's
     notify queue via notification_manager."""
-    from ws import satellite as sat_ws
-    from services.notifications import notification_manager
     import asyncio as _asyncio
+
+    from services.notifications import notification_manager
+    from ws import satellite as sat_ws
 
     # Two queues for the same user (two tabs).
     q1 = _asyncio.Queue(maxsize=8)
@@ -242,8 +246,8 @@ def test_rewrite_stdio_paths_swaps_category_segment():
     not by the platform's source-directory category. The rewrite must
     swap the category segment when the two disagree, else the CLI on
     the satellite tries to spawn a path that doesn't exist."""
-    from core.remote.remote_execution import _rewrite_stdio_paths
     import config as app_config
+    from core.remote.remote_execution import _rewrite_stdio_paths
 
     plat = str(app_config.MCPS_DIR.resolve())
 
@@ -282,9 +286,10 @@ def test_rewrite_stdio_paths_swaps_category_segment():
 async def test_broadcast_satellite_updating_event_shape(monkeypatch):
     """The published event includes machine_id, machine_name, from/to
     versions and an ISO timestamp."""
-    from ws import satellite as sat_ws
-    from services.notifications import notification_manager
     import asyncio as _asyncio
+
+    from services.notifications import notification_manager
+    from ws import satellite as sat_ws
 
     q = _asyncio.Queue(maxsize=4)
     notification_manager._user_connections.clear()
@@ -336,8 +341,9 @@ def test_satellite_dir_anchor_resolves_to_repo_satellite():
 
 
 def _machine(prefix: str):
-    from storage import remote_store
     import uuid as _uuid
+
+    from storage import remote_store
 
     mid = str(_uuid.uuid4())
     remote_store.create_remote_machine(
@@ -450,9 +456,10 @@ def test_note_update_pushed_is_popped_by_the_reconnect_check():
 
 @pytest.mark.asyncio
 async def test_broadcast_update_failed_carries_attempts_and_pause(monkeypatch):
-    from ws import satellite as sat_ws
-    from services.notifications import notification_manager
     import asyncio as _asyncio
+
+    from services.notifications import notification_manager
+    from ws import satellite as sat_ws
 
     q = _asyncio.Queue(maxsize=4)
     notification_manager._user_connections.clear()
@@ -486,9 +493,9 @@ async def test_update_now_online_push_registers_the_target(monkeypatch):
     detection as the automatic push — before 2026-08-29 a satellite that
     rolled back after a manual push reconnected silently (no banner, no
     error, no count)."""
+    import core.remote.satellite_connection as sc
     from api.remote import remote_machines as rm
     from ws import satellite as sat_ws
-    import core.remote.satellite_connection as sc
 
     sent: list[dict] = []
 
@@ -530,9 +537,10 @@ async def test_update_now_counts_an_acknowledging_satellite_once_it_read_the_pus
     when the connection it went out on is still the machine's after the
     wait, and not at all when that connection ended first."""
     import asyncio
+
+    import core.remote.satellite_connection as sc
     from api.remote import remote_machines as rm
     from ws import satellite as sat_ws
-    import core.remote.satellite_connection as sc
 
     class _Conn:
         satellite_version = "1.0.0"
@@ -587,6 +595,7 @@ async def test_update_now_counts_an_acknowledging_satellite_once_it_read_the_pus
 
 def test_the_connection_manager_hands_the_acknowledgement_to_the_waiting_push():
     import asyncio
+
     from core.remote.satellite_connection import SatelliteConnectionManager
 
     async def _run():
@@ -601,9 +610,9 @@ def test_the_connection_manager_hands_the_acknowledgement_to_the_waiting_push():
 def _plaintext_update_now_stubs(monkeypatch, *, connected: bool, conn_caps: dict | None):
     """'Update now' against a machine on a plaintext link: what was sent,
     broadcast and queued, for the two branches of _do_trigger_update_now."""
+    import core.remote.satellite_connection as sc
     from api.remote import remote_machines as rm
     from ws import satellite as sat_ws
-    import core.remote.satellite_connection as sc
 
     seen = {"sent": [], "broadcast": [], "pending": []}
 

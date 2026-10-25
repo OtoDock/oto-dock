@@ -33,7 +33,7 @@ floor the fields imply.
 | `outputs` | no | Files the server writes into a shared folder that the platform moves into the session's workspace. |
 | `result_files` | no | Tools whose results the person should keep: `{"tools": ["maps_static_map"], "subdir": "maps"}`. Each picture (an MCP `image` block: png, jpeg, webp or gif) and each embedded `resource` blob such a tool returns is saved in the session's workspace under `subdir` and shown in the chat with the result's text as the caption (its first link opens from the picture). Exact tool names (up to 64, none that `outputs` already moves), one plain folder name; 15 MB a file, 8 files and 30 MB a result. Never a tool that returns a picture on every call for the model's own use (a browser screenshot). Set `platform_min_version: "1.8.0"`. On Claude only pictures are kept (the CLI saves other blobs itself). |
 | `costs` | no | Per-tool prices (`currency`, `provider`, ordered `rules`). |
-| `permissions` | no | Per-tool permission tiers (`open`, `standard`, `sensitive`, `critical`). |
+| `permissions` | no | Per-tool permission tiers (`open`, `standard`, `sensitive`; `critical` is kept for the platform's own tools and runs as `sensitive` in any other MCP). A tool no rule names takes its tier from its own MCP annotations. `readOnlyHint: true` makes it `open`. `destructiveHint: false` together with `openWorldHint: false` makes it `standard`. Any other annotation makes it `sensitive`. A tool that sends no annotations, or whose list the platform has not read yet, takes `default_tier`. Set the annotations truthfully on every tool, and keep `permissions` for the tools whose tier should differ. |
 | `assignment_mode` | no | `auto` (managers enable it per agent) or `explicit` (an admin must configure an instance first). |
 | `exclude_from` | no | Session kinds that never load it: `phone`, `task`, `terminal`, `meeting`, `external`. |
 | `audience` | no | The tier of the agent this whole MCP is for: `owner`, `editor` or `workspace` (empty = everyone, the default). In a session for a person below that tier the MCP is left out — of the session, its tools and its sandbox network opening; a session the agent runs as itself is always in, except a phone caller's (a caller who is not a platform user counts as a viewer). The whole-MCP version of `skills[].audience`. |
@@ -46,7 +46,7 @@ floor the fields imply.
 
 Fields a community package never sets: `requires_capability`, `hosted`,
 `server.proxy_callbacks`, `placement`, `device_capability`,
-`device_high_risk_tools`, `companion_app` (platform and device features).
+`companion_app` (platform and device features).
 
 ## `server`
 
@@ -58,6 +58,7 @@ Fields a community package never sets: `requires_capability`, `hosted`,
 | `source` | yes | `npm:<package>`, `pypi:<package>` (with extras: `pypi:<package>[<extra>,<extra>]`, platform 1.8.0 and later), `git+<url>@<commit>#subdirectory=<dir>`, `docker:<label>` or `remote:<host>`. A catalog git source pins the full 40-character commit, never a tag or a branch (they can move upstream); from 1.8.0 the weekly update builds a new commit the catalog pins. An admin's own ZIP may pin a tag. |
 | `version_constraint` | no | A PEP 440 range (`">=2,<3"`) that bounds the automatic updates of an npm or PyPI package. |
 | `source_build` | no | For a PyPI package: the distributions the installer may build from source when the machine has no wheel for them (every package installs from wheels first; a listed one is built only when that resolve fails on it). |
+| `tool_timeout_sec` | no | Seconds Codex gives one tool call before it fails the call, 1 to 3600 (Codex's own default is 60). Set it on a server whose tools run for minutes: a media generation, a document conversion, an install. Claude Code keeps its own limit, and a platform that does not read the key ignores it, so it needs no `platform_min_version`. |
 | `port`, `url_template`, `health_endpoint`, `docker_compose`, `image`, `service_name` | docker | The port, `http://${docker_mcp_host}:${port}`, an optional health path, the compose file in the folder, the prebuilt image (required for the containerised deployment), an optional service-DNS name. |
 | `url_template` | remote | The endpoint URL (`https://mcp.vendor.com/mcp`); its host is the MCP's identity. |
 

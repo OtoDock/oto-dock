@@ -22,10 +22,11 @@ from starlette.requests import Request
 
 import config
 from app import app
+from auth import tokens
 from auth.providers import _resolve_principal
 from auth.session_token import create_session_token
-from tests.conftest import live_session_token
 from storage import database as db
+from tests.conftest import live_session_token
 
 client = TestClient(app)
 AGENT = "project-alpha"
@@ -61,8 +62,7 @@ def _stamp_password_change(sub: str, when: datetime) -> None:
 
 
 def test_a_minted_token_carries_an_integer_iat():
-    payload = jwt.decode(create_session_token("s", AGENT, "user-viewer"),
-                         config.JWT_SECRET, algorithms=["HS256"])
+    payload = tokens.decode(create_session_token("s", AGENT, "user-viewer"), tokens.SESSION)
     assert isinstance(payload["iat"], int)
     assert abs(payload["iat"] - time.time()) < 5
 
@@ -113,13 +113,13 @@ def test_the_callback_bearer_carries_the_sessions_user():
     sid = str(uuid.uuid4())
     create_session_token(sid, AGENT, "user-viewer")   # the session's own token
     swapped = swap_session_jwt_bearer(SESSION_JWT_SENTINEL_BEARER, sid, AGENT)
-    payload = jwt.decode(swapped.split(" ", 1)[1], config.JWT_SECRET, algorithms=["HS256"])
+    payload = tokens.decode(swapped.split(" ", 1)[1], tokens.SESSION)
     assert payload["user_sub"] == "user-viewer" and payload["sid"] == sid
     # A session with no person keeps a no-user callback bearer.
     other = str(uuid.uuid4())
     create_session_token(other, AGENT, "")
-    payload = jwt.decode(swap_session_jwt_bearer(SESSION_JWT_SENTINEL_BEARER, other, AGENT)
-                         .split(" ", 1)[1], config.JWT_SECRET, algorithms=["HS256"])
+    payload = tokens.decode(swap_session_jwt_bearer(SESSION_JWT_SENTINEL_BEARER, other, AGENT)
+                            .split(" ", 1)[1], tokens.SESSION)
     assert payload["user_sub"] == ""
 
 
@@ -142,11 +142,10 @@ def test_every_password_change_closes_the_persons_chats(monkeypatch):
     with fresh tokens on the next message."""
     from unittest.mock import AsyncMock
 
+    from auth import token_holder
     from auth.password import hash_password
     from auth.providers import create_session_jwt
     from services.agents import offboarding_sessions
-
-    from auth import token_holder
 
     closer = AsyncMock(return_value=0)
     monkeypatch.setattr(offboarding_sessions, "close_person_sessions", closer)

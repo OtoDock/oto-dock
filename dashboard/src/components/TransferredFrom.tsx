@@ -16,11 +16,11 @@ export default function TransferredFrom({ row, className = '' }: { row: Transfer
   const when = row.transferred_at ? new Date(row.transferred_at).toLocaleString() : ''
   return (
     <span
-      className={`text-xs text-p-text-secondary ${className}`}
+      className={`text-xs text-secondary ${className}`}
       title={when ? `Moved to its current owner on ${when}` : undefined}
       data-testid="transferred-from"
     >
-      transferred from {who}
+      Transferred from {who}
     </span>
   )
 }

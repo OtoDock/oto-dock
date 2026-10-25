@@ -53,6 +53,23 @@ precedence = "override"
 SPDX-FileCopyrightText = "OpenAI"
 SPDX-License-Identifier = "MIT"
 
+# The spoken-language identifier: SpeechBrain's ECAPA-TDNN VoxLingua107
+# weights, exported to ONNX and quantized here (audio/models/README.md).
+[[annotations]]
+path = "audio/models/lang-id-ecapa-voxlingua107.onnx"
+precedence = "override"
+SPDX-FileCopyrightText = "SpeechBrain"
+SPDX-License-Identifier = "Apache-2.0"
+
+# The language identifier's test clip: a synthetic Greek sentence (ElevenLabs
+# text-to-speech, resampled to 8 kHz), written and generated for the test, no
+# person's voice (audio/providers/lid/tests/fixtures/README.md).
+[[annotations]]
+path = "audio/providers/lid/tests/fixtures/greek-8k.wav"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Dimitrios Mourtzis <legal@otodock.io>"
+SPDX-License-Identifier = "FSL-1.1-ALv2"
+
 # The wake-word engine: sherpa-onnx's WebAssembly build and its keyword
 # model, with the Emscripten runtime inside the build.
 [[annotations]]
@@ -90,3 +107,9 @@ precedence = "override"
 SPDX-FileCopyrightText = "freesound.org contributors (see SOURCES.md beside each file)"
 SPDX-License-Identifier = "CC0-1.0"
 
+# The Gradle wrapper of the Android project.
+[[annotations]]
+path = ["dashboard/android/gradlew", "dashboard/android/gradlew.bat", "dashboard/android/gradle/wrapper/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Gradle contributors"
+SPDX-License-Identifier = "Apache-2.0"

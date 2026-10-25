@@ -27,6 +27,7 @@ dashboard: the version reads "no longer available".
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import os
@@ -38,7 +39,6 @@ import uuid
 from pathlib import Path
 
 import config
-import contextlib
 from services.infra import safe_fs
 
 logger = logging.getLogger("otodock.media")

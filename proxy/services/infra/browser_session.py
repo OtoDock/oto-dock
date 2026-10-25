@@ -34,7 +34,7 @@ def _base_url() -> str | None:
         if port:
             host = deployment.docker_mcp_host(manifest)
             return f"http://{host}:{port}"
-    except Exception:
+    except ImportError:
         pass
     return None
 
@@ -51,7 +51,7 @@ async def _close(session_id: str) -> None:
             )
             if resp.status_code == 200 and resp.json().get("closed"):
                 logger.info("browser context closed for session %s", session_id[:8])
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # closing a browser context the sidecar's idle gc reclaims anyway
         logger.debug("browser close for %s best-effort failed: %s", session_id[:8], e)
 
 

@@ -39,7 +39,7 @@ def next_incarnation() -> str:
     return f"{_BOOT}-{next(_COUNTER)}"
 
 
-def other_sessions_held(sm: "SessionManager") -> list[dict]:
+def other_sessions_held(sm: SessionManager) -> list[dict]:
     out = []
     for sid, session in list(sm.sessions.items()):
         engine = ENGINES.get(getattr(session, "execution_path", ""))
@@ -67,17 +67,17 @@ def other_sessions_held(sm: "SessionManager") -> list[dict]:
     return out
 
 
-def sessions_alive_frame(sm: "SessionManager") -> dict | None:
+def sessions_alive_frame(sm: SessionManager) -> dict | None:
     """The frame, or None when the turn-replay list cannot be built (no
     frame, as an older satellite sends on that failure). A failure of the
     other list costs only that key, never the turn-replay report."""
     try:
         frame = {"type": "sessions_alive", "sessions": sm.headless_sessions_alive()}
-    except Exception:
+    except Exception:  # noqa: BLE001  # the connect report reads every live session: a fault sends no frame
         logger.warning("sessions_alive: the turn-replay list failed", exc_info=True)
         return None
     try:
         frame["other_sessions"] = other_sessions_held(sm)
-    except Exception:
+    except Exception:  # noqa: BLE001  # the other-sessions list is optional: a fault costs only that key
         logger.warning("sessions_alive: the other sessions' list failed", exc_info=True)
     return frame

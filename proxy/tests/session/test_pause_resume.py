@@ -13,11 +13,12 @@ Run: cd proxy && python -m pytest tests/session/test_pause_resume.py -v
 """
 
 import asyncio
+import logging
 import sys
 from datetime import datetime, timedelta, timezone
 
-
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -299,9 +300,10 @@ class TestOneTimeAutoCleanup:
         Matches one-time task auto-cleanup. Deliveries in
         notification_deliveries are independent and remain.
         """
+        from datetime import datetime, timezone
+
         from services.notifications import notification_manager
         from storage.automation import notification_store
-        from datetime import datetime, timezone
 
         # Seed a target user so resolve_targets has someone to deliver to
         from storage.pg import get_conn
@@ -334,9 +336,10 @@ class TestOneTimeAutoCleanup:
 
     def test_recurring_kept_after_fire(self, temp_db):
         """A recurring notification stays in the DB after firing — only fired_count bumps."""
+        from datetime import datetime, timezone
+
         from services.notifications import notification_manager
         from storage.automation import notification_store
-        from datetime import datetime, timezone
 
         # Seed a target user
         from storage.pg import get_conn
@@ -413,8 +416,9 @@ class TestEditTask:
         assert temp_db.get_dynamic_task("task-edit-sched")["schedule"] == "*/5 * * * *"
 
     def test_switch_recurring_to_one_time_clears_schedule(self, temp_db):
-        from services.scheduler import scheduler
         from datetime import datetime, timedelta, timezone
+
+        from services.scheduler import scheduler
 
         _create_recurring_task("task-mode-switch", schedule="0 9 * * *")
         future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
@@ -431,8 +435,9 @@ class TestEditTask:
         assert row["task_type"] == "one_time"
 
     def test_switch_one_time_to_recurring_clears_run_at(self, temp_db):
-        from services.scheduler import scheduler
         from datetime import datetime, timedelta, timezone
+
+        from services.scheduler import scheduler
 
         future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
         _create_one_time_task("task-mode-switch-2", run_at=future)
@@ -448,31 +453,35 @@ class TestEditTask:
         assert row["run_at"] is None
         assert row["task_type"] == "scheduled"
 
-    def test_edit_invalid_cron_returns_error(self, temp_db):
+    def test_edit_invalid_cron_returns_error(self, temp_db, caplog):
         from services.scheduler import scheduler
 
         _create_recurring_task("task-bad-cron")
-        ok, err = asyncio.run(
-            scheduler.update_dynamic_task(
-                "task-bad-cron", {"schedule": "not a cron"},
+        with caplog.at_level(logging.WARNING, logger="otodock.scheduler"):
+            ok, err = asyncio.run(
+                scheduler.update_dynamic_task(
+                    "task-bad-cron", {"schedule": "not a cron"},
+                )
             )
-        )
         assert ok is False
-        assert err is not None
-        assert "Invalid cron" in err
+        assert err == "That schedule is not a valid cron line. Example: 0 9 * * 1."
+        assert ("task-bad-cron refused, cron 'not a cron': "
+                "Wrong number of fields") in caplog.text
 
-    def test_edit_invalid_run_at_returns_error(self, temp_db):
+    def test_edit_invalid_run_at_returns_error(self, temp_db, caplog):
         from services.scheduler import scheduler
 
         _create_recurring_task("task-bad-runat")
-        ok, err = asyncio.run(
-            scheduler.update_dynamic_task(
-                "task-bad-runat", {"run_at": "not-a-date"},
+        with caplog.at_level(logging.WARNING, logger="otodock.scheduler"):
+            ok, err = asyncio.run(
+                scheduler.update_dynamic_task(
+                    "task-bad-runat", {"run_at": "not-a-date"},
+                )
             )
-        )
         assert ok is False
-        assert err is not None
-        assert "Invalid run_at" in err
+        assert err == "That time is not valid. Use a date and time like 2026-10-18T09:00."
+        assert ("task-bad-runat refused, run_at 'not-a-date': "
+                "Invalid isoformat string") in caplog.text
 
     def test_edit_missing_task_returns_false(self, temp_db):
         from services.scheduler import scheduler
@@ -484,8 +493,9 @@ class TestEditTask:
 
     def test_edit_past_run_at_no_job_registered(self, temp_db):
         """Editing run_at to a past time: row updated, no APScheduler job."""
-        from services.scheduler import scheduler
         from datetime import datetime, timedelta, timezone
+
+        from services.scheduler import scheduler
 
         _create_recurring_task("task-edit-past")
         row = temp_db.get_dynamic_task("task-edit-past")
@@ -580,9 +590,10 @@ class TestEditNotification:
         assert row["schedule"] == "0 12 * * *"
 
     def test_switch_to_one_time_clears_schedule_and_sets_type(self, temp_db):
+        from datetime import datetime, timedelta, timezone
+
         from services.notifications import notification_manager
         from storage.automation import notification_store
-        from datetime import datetime, timedelta, timezone
 
         _create_notification("notif-switch")
         future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
@@ -599,9 +610,10 @@ class TestEditNotification:
         assert row["notification_type"] == "one_time"
 
     def test_switch_to_recurring_clears_run_at_and_sets_type(self, temp_db):
+        from datetime import datetime, timedelta, timezone
+
         from services.notifications import notification_manager
         from storage.automation import notification_store
-        from datetime import datetime, timedelta, timezone
 
         future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
         _create_notification(
@@ -620,17 +632,33 @@ class TestEditNotification:
         assert row["run_at"] is None
         assert row["notification_type"] == "recurring"
 
-    def test_edit_invalid_cron_returns_error(self, temp_db):
+    def test_edit_invalid_cron_returns_error(self, temp_db, caplog):
         from services.notifications import notification_manager
         _create_notification("notif-bad-cron")
-        ok, err = asyncio.run(
-            notification_manager.update_notification(
-                "notif-bad-cron", {"schedule": "garbage"},
+        with caplog.at_level(logging.WARNING, logger="otodock.notifications"):
+            ok, err = asyncio.run(
+                notification_manager.update_notification(
+                    "notif-bad-cron", {"schedule": "garbage"},
+                )
             )
-        )
         assert ok is False
-        assert err is not None
-        assert "Invalid cron" in err
+        assert err == "That schedule is not a valid cron line. Example: 0 9 * * 1."
+        assert ("notif-bad-cron refused, cron 'garbage': "
+                "Wrong number of fields") in caplog.text
+
+    def test_edit_invalid_run_at_returns_error(self, temp_db, caplog):
+        from services.notifications import notification_manager
+        _create_notification("notif-bad-runat")
+        with caplog.at_level(logging.WARNING, logger="otodock.notifications"):
+            ok, err = asyncio.run(
+                notification_manager.update_notification(
+                    "notif-bad-runat", {"run_at": "not-a-date"},
+                )
+            )
+        assert ok is False
+        assert err == "That time is not valid. Use a date and time like 2026-10-18T09:00."
+        assert ("notif-bad-runat refused, run_at 'not-a-date': "
+                "Invalid isoformat string") in caplog.text
 
     def test_edit_missing_returns_false(self, temp_db):
         from services.notifications import notification_manager

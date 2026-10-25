@@ -10,16 +10,20 @@ import asyncio
 import base64
 import logging
 import time
+from collections import deque
 from typing import TYPE_CHECKING
-from services.notifications import notification_manager
-from core import placement
-from core.session import interactive_session
-from core.events.artifact_events import artifact_event_from_perm_item
+
 from auth import roles
-from ws import wire_events as wire
+from core import placement
 from core.background import spawn
+from core.events.artifact_events import artifact_event_from_perm_item, for_viewer
+from core.session import interactive_session
+from services.notifications import notification_manager
+from ws import wire_events as wire
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from ws.dashboard_host import DashboardHost as _Host
 else:
     _Host = object
@@ -38,58 +42,136 @@ _READ_ONLY_NOTICE_GAP_S = 2.0
 # never sees a replay.
 _PTY_OUTBOX_MAX_BYTES = 1024 * 1024
 
+_OUT_DATA = "data"
+_OUT_STATUS = "status"
+_OUT_REPLAY = "replay"
+
 
 class _PtyOutbox:
-    """One viewer's PTY output, bounded. ``push`` is synchronous (the
-    session's output path calls it per chunk) and starts the one drain task
-    when none runs; ``drain`` sends the chunks in order through ``send``,
-    and after an overflow sends ``replay()`` instead of what was dropped."""
+    """One viewer's PTY stream, bounded and in one order: output chunks, the
+    transport's statuses and screen replays share one queue and one drain
+    task, so no output lands ahead of a replay that should precede it and a
+    status never overtakes a replay queued before it.
 
-    def __init__(self, send, replay, *, limit: int = _PTY_OUTBOX_MAX_BYTES) -> None:
+    The enqueuers are synchronous: the session's output path calls ``push``
+    in the same loop step the scrollback ring recorded the chunk, so a
+    replay's snapshot, taken when the drain reaches it, holds every chunk
+    queued so far. A replay therefore drops the output queued around it
+    (it is all in the snapshot) and a chunk pushed while a replay waits is
+    not queued. A held outbox (an attach still sending its first replay)
+    queues and drains nothing until ``release``. Past the byte limit the
+    queued output is dropped and the screen replayed, then ``reconnected``
+    re-syncs the viewer's size."""
+
+    def __init__(self, send, replay, send_status, *,
+                 limit: int = _PTY_OUTBOX_MAX_BYTES, held: bool = False) -> None:
         self._send = send
         self._replay = replay
+        self._send_status = send_status
         self._limit = limit
-        self._chunks: list[bytes] = []
+        self._items: deque[tuple[str, bytes | str]] = deque()
         self._bytes = 0
-        self.overflowed = False
+        self._held = held
+        self._cancelled = False
+        # A replay is queued and not yet sent: kept as a flag, since push
+        # reads it for every chunk in the session's output path.
+        self._replay_queued = False
         self.replays = 0
         self.task: asyncio.Task | None = None
 
+    @property
+    def replay_pending(self) -> bool:
+        return self._replay_queued
+
     def push(self, data: bytes) -> None:
-        if self.overflowed or self._bytes + len(data) > self._limit:
-            self.overflowed = True
-            self._chunks.clear()
-            self._bytes = 0
-        else:
-            self._chunks.append(data)
-            self._bytes += len(data)
+        if self._cancelled or self.replay_pending:
+            return
+        if self._bytes + len(data) > self._limit:
+            self.request_replay()
+            return
+        self._items.append((_OUT_DATA, data))
+        self._bytes += len(data)
+        self._start()
+
+    def push_status(self, state: str) -> None:
+        if self._cancelled:
+            return
+        self._items.append((_OUT_STATUS, state))
+        self._start()
+
+    def request_replay(self) -> None:
+        """A reset replay of the screen, then ``reconnected``."""
+        if self._cancelled:
+            return
+        self._drop_queued_output()
+        if not self._replay_queued:
+            self._replay_queued = True
+            self._items.append((_OUT_REPLAY, b""))
+            self._items.append((_OUT_STATUS, "reconnected"))
+        self._start()
+
+    def release(self) -> None:
+        if self._cancelled:
+            return
+        self._held = False
+        self._start()
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
+        self._items.clear()
+        self._bytes = 0
+        self._replay_queued = False
+
+    def _drop_queued_output(self) -> None:
+        self._items = deque(item for item in self._items if item[0] != _OUT_DATA)
+        self._bytes = 0
+
+    def _start(self) -> None:
+        if self._held or self._cancelled or not self._items:
+            return
         if self.task is None or self.task.done():
             self.task = asyncio.get_running_loop().create_task(self._drain())
 
-    def cancel(self) -> None:
-        if self.task is not None and not self.task.done():
-            self.task.cancel()
-        self._chunks.clear()
-        self._bytes = 0
-
     async def _drain(self) -> None:
-        while self._chunks or self.overflowed:
-            if self.overflowed:
-                self.overflowed = False
-                self._chunks.clear()
-                self._bytes = 0
+        while self._items and not self._cancelled:
+            kind, payload = self._items.popleft()
+            if kind == _OUT_DATA:
+                self._bytes -= len(payload)
+                await self._send(payload)
+            elif kind == _OUT_STATUS:
+                await self._send_status(payload)
+            else:
+                self._replay_queued = False
+                self._drop_queued_output()
                 self.replays += 1
                 await self._replay()
-                continue
-            data = self._chunks.pop(0)
-            self._bytes -= len(data)
-            await self._send(data)
+
+
+def _mirror_replay(sess) -> bytes:
+    """The scrollback a viewer's reset replay carries, by the attach path's
+    rule: a local ring is raw, so the program's terminal queries come out (a
+    mirror must not answer them); every ring loses its clipboard writes (a
+    replayed copy would overwrite the viewer's clipboard)."""
+    from core.terminal_queries import strip_clipboard_writes, strip_queries
+    scrollback = sess.pty.scrollback()
+    if not sess.is_remote:
+        scrollback = strip_queries(scrollback)
+    return strip_clipboard_writes(scrollback)
 
 
 
 class PtyViewerController(_Host):
     """Interactive (PTY) viewer attach/detach: mirrors a live TUI session to
     this socket and forwards its prompts/artifacts/exit."""
+
+    # The connection state this mixin assigns, declared where it assigns it:
+    # the type checker reads an attribute a mixin assigns from the mixin
+    # first. Annotations only (strings), no class attributes.
+    _pty_listener: "Callable[[bytes], Awaitable[None] | None] | None"
+    _pty_outbox: "_PtyOutbox | None"
+    _pty_viewer_sid: "str | None"
 
     async def _send_pty_read_only(self, sess) -> None:
         """Tell this socket its input was refused: the session belongs to
@@ -133,8 +215,8 @@ class PtyViewerController(_Host):
         # PER-AGENT role is what governs (a platform member can be an editor on
         # one agent and a viewer on another), read live so a just-revoked role
         # takes effect immediately.
-        from storage.pg import run_db
         from auth.providers import acting_role_of
+        from storage.pg import run_db
         if not roles.can_write_workspace(await run_db(
             acting_role_of, self.user_sub, sess.agent_name, fallback_user=self.user,
         )):
@@ -183,27 +265,32 @@ class PtyViewerController(_Host):
             })
 
         async def _replay_screen() -> None:
-            # The reader fell a full outbox behind: the same re-render a
-            # satellite blip gets (a reset with the scrollback, then the
-            # status that re-syncs the size).
+            # A clean re-render (a reset with the scrollback): the reader
+            # fell a full outbox behind, or the remote transport came back
+            # (the inline TUI's relative-cursor repaints leave the mirror
+            # mis-aligned across a blip). The outbox sends "reconnected"
+            # after it, which re-syncs the viewer's size.
             if sess.pty is None:
                 return
-            from core.terminal_queries import strip_clipboard_writes
             await self._send({
                 "type": wire.PTY_OUTPUT, "chat_id": vcid, "session_id": vsid,
-                "data": base64.b64encode(
-                    strip_clipboard_writes(sess.pty.scrollback())
-                ).decode("ascii"),
+                "data": base64.b64encode(_mirror_replay(sess)).decode("ascii"),
                 "replay": True, "reset": True,
             })
+
+        async def _send_status(state: str) -> None:
             await self._send({
                 "type": wire.PTY_STATUS, "chat_id": vcid, "session_id": vsid,
-                "state": "reconnected",
+                "state": state,
             })
 
-        outbox = _PtyOutbox(_send_output, _replay_screen)
+        # Held until the attach's own replay is out: output arriving while
+        # "attached" and the replay are sent waits behind them.
+        outbox = _PtyOutbox(_send_output, _replay_screen, _send_status, held=True)
 
-        async def _on_pty_output(data: bytes) -> None:
+        def _on_pty_output(data: bytes) -> None:
+            # Synchronous: the chunk joins the outbox in the loop step the
+            # ring recorded it, which the outbox's replays rely on.
             outbox.push(data)
 
         async def _on_pty_perm(item: dict) -> None:
@@ -245,6 +332,9 @@ class PtyViewerController(_Host):
                 # arrival (the dashboard dedups in-place by file_id).
                 event = artifact_event_from_perm_item(item)
                 if event is not None:
+                    # A push queued before a takeover can reach the next
+                    # controller: its token goes only to its own person.
+                    event = for_viewer(event, self.user_sub)
                     # The drainer's persisted row id (final artifacts only) —
                     # the client's stable key for replay-on-open dedupe and
                     # X-dismiss memory (useArtifactWindows).
@@ -273,40 +363,33 @@ class PtyViewerController(_Host):
             # device"); "superseded_otodock" = a local `otodock` terminal took over
             # (dual-control — "opened in a local terminal"). Either way a reload
             # re-claims it (evicting the other). Clears this connection's viewer
-            # attributes.
+            # attributes, and drops what its outbox still held: a queued replay
+            # and "reconnected" would make this tab answer with its own size.
             self._pty_viewer_sid = None
             self._pty_listener = None
+            outbox.cancel()
+            if getattr(self, "_pty_outbox", None) is outbox:
+                self._pty_outbox = None
             await self._send({
                 "type": wire.PTY_EXIT, "chat_id": vcid, "session_id": vsid,
                 "reason": reason,
             })
 
-        async def _on_pty_status(state: str) -> None:
-            # the remote PTY transport is reconnecting/reconnected (a
-            # satellite WS blip). reconnecting → banner + input pause. reconnected →
-            # a clean RE-RENDER first: the inline TUI's relative-cursor repaints
-            # leave the mirror mis-aligned across the blip, so reset the xterm and
-            # replay the proxy scrollback. This rides BEFORE the buffered gap output
-            # (the satellite's control-first writer sends `pty_alive` ahead of the
-            # pty lane), so the gap output then appends live onto the fresh screen.
+        def _on_pty_status(state: str) -> None:
+            # The remote PTY transport is reconnecting/reconnected (a
+            # satellite WS blip). reconnecting → banner + input pause.
+            # reconnected → a clean re-render first (the reset replay), then
+            # the status. Both ride the outbox in order with the output: the
+            # replay's snapshot covers the gap output queued around it, and
+            # what arrives after the snapshot follows it.
             if state == "reconnected" and sess.pty is not None:
-                from core.terminal_queries import strip_clipboard_writes
-                await self._send({
-                    "type": wire.PTY_OUTPUT, "chat_id": vcid, "session_id": vsid,
-                    # Replay boundary: a buffered OSC 52 copy must not re-fire
-                    # into the viewer's clipboard on re-render.
-                    "data": base64.b64encode(
-                        strip_clipboard_writes(sess.pty.scrollback())
-                    ).decode("ascii"),
-                    "replay": True, "reset": True,
-                })
-            await self._send({
-                "type": wire.PTY_STATUS, "chat_id": vcid, "session_id": vsid,
-                "state": state,
-            })
+                outbox.request_replay()
+            else:
+                outbox.push_status(state)
 
         # Register the listener BEFORE replaying scrollback so no bytes are lost
-        # in the gap; there is no await between the two, so ordering holds.
+        # in the gap: the returned snapshot plus what the held outbox queues
+        # from then on is the whole stream, in order.
         # The CONTROLLER's socket is the viewer: its evict callback makes the
         # attach single-viewer (a new attach kicks the prior), and it takes
         # the session's prompt, close and status slots. A socket that may
@@ -324,34 +407,37 @@ class PtyViewerController(_Host):
         self._pty_viewer_sid = vsid
         self._pty_listener = _on_pty_output
         self._pty_outbox = outbox
-        # The session's baked TUI theme — the viewer renders its xterm with THIS
-        # theme (a dark-seeded TUI in a light xterm paints white-on-white).
-        await self._send({
-            "type": wire.PTY_STATUS, "chat_id": vcid, "session_id": vsid,
-            "state": "attached", "tui_theme": sess.tui_theme,
-        })
-        if not can_drive:
-            # Mirroring someone else's session: watch freely, drive nothing
-            # until an explicit take-over. Announced right after "attached" so
-            # the banner is up before the scrollback replay draws.
-            self._read_only_notice_at = 0.0
-            await self._send_pty_read_only(sess)
-        if scrollback:
+        try:
+            # The session's baked TUI theme — the viewer renders its xterm with THIS
+            # theme (a dark-seeded TUI in a light xterm paints white-on-white).
             await self._send({
-                "type": wire.PTY_OUTPUT, "chat_id": vcid, "session_id": vsid,
-                "data": base64.b64encode(scrollback).decode("ascii"),
-                "replay": True,
+                "type": wire.PTY_STATUS, "chat_id": vcid, "session_id": vsid,
+                "state": "attached", "tui_theme": sess.tui_theme,
             })
-        # If the satellite is mid-reconnect right now, tell the freshly-attached
-        # viewer so it shows the reconnecting banner — after
-        # the scrollback replay so the banner sits over the current screen.
-        if not placement.is_local(sess.target):
-            from core.remote.satellite_connection import get_connection_manager
-            if get_connection_manager().is_pty_in_grace(sess.target):
+            if not can_drive:
+                # Mirroring someone else's session: watch freely, drive nothing
+                # until an explicit take-over. Announced right after "attached" so
+                # the banner is up before the scrollback replay draws.
+                self._read_only_notice_at = 0.0
+                await self._send_pty_read_only(sess)
+            if scrollback:
                 await self._send({
-                    "type": wire.PTY_STATUS, "chat_id": vcid, "session_id": vsid,
-                    "state": "reconnecting",
+                    "type": wire.PTY_OUTPUT, "chat_id": vcid, "session_id": vsid,
+                    "data": base64.b64encode(scrollback).decode("ascii"),
+                    "replay": True,
                 })
+            # If the satellite is mid-reconnect right now, tell the freshly-attached
+            # viewer so it shows the reconnecting banner — after
+            # the scrollback replay so the banner sits over the current screen.
+            if not placement.is_local(sess.target):
+                from core.remote.satellite_connection import get_connection_manager
+                if get_connection_manager().is_pty_in_grace(sess.target):
+                    await self._send({
+                        "type": wire.PTY_STATUS, "chat_id": vcid, "session_id": vsid,
+                        "state": "reconnecting",
+                    })
+        finally:
+            outbox.release()
         # dual-control: this dashboard viewer is CLAIMING a session a local
         # `otodock` terminal currently controls → take it over. Modeled
         # as a mini-reconnect: show the "reconnecting" banner + pause input (the

@@ -29,7 +29,9 @@ import contextlib
 import logging
 import threading
 from pathlib import Path
-from .. import config as satconfig  # the module: ``maybe_start_tray`` takes the loaded SatelliteConfig as ``config``
+
+# the module: ``maybe_start_tray`` takes the loaded SatelliteConfig as ``config``
+from .. import config as satconfig
 
 logger = logging.getLogger("satellite")
 
@@ -97,7 +99,7 @@ class TrayController:
     def _run(self) -> None:
         try:
             self._icon.run()
-        except Exception:
+        except Exception:  # noqa: BLE001  # the tray thread's target: a raise would end it unlogged
             # Backend failed to start (no desktop session, etc.). Degrade to
             # headless — the daemon keeps running without a tray.
             logger.warning("tray icon backend exited", exc_info=True)
@@ -127,7 +129,7 @@ class TrayController:
             self._icon.title = f"OtoDock — {_STATUS_LABEL.get(status, status)}"
             # Re-render the menu so the Pause/Resume label + status line track.
             self._icon.update_menu()
-        except Exception:
+        except Exception:  # noqa: BLE001  # pystray's win32 backend raises from ctypes and its temp icon file
             logger.debug("tray set_status failed", exc_info=True)
 
     @property
@@ -164,7 +166,7 @@ def _load_base_image():
     """
     try:
         from PIL import Image
-    except Exception:
+    except ImportError:
         return None
     # The tarball ships the package under a `satellite/` arcname but ships
     # `bin/otodock.ico` at the tarball ROOT; the installer extracts BOTH into
@@ -186,7 +188,7 @@ def _load_base_image():
         img = Image.open(ico)
         img.load()
         return img.convert("RGBA")
-    except Exception:
+    except Exception:  # noqa: BLE001  # Pillow on the shipped icon raises anything from a decoder
         logger.debug("failed to load tray base image", exc_info=True)
         return None
 
@@ -208,7 +210,7 @@ def maybe_start_tray(loop, cmd_queue, config, status: str = STATUS_STARTING):
 
     try:
         import pystray
-    except Exception:
+    except ImportError:
         logger.info("pystray not available — running without a tray icon")
         return None
 
@@ -216,7 +218,7 @@ def maybe_start_tray(loop, cmd_queue, config, status: str = STATUS_STARTING):
         # Hop to the loop thread; the consumer task dispatches the command.
         try:
             loop.call_soon_threadsafe(cmd_queue.put_nowait, cmd)
-        except Exception:
+        except Exception:  # noqa: BLE001  # runs inside pystray menu callbacks: a raise is lost in its pump
             logger.debug("tray enqueue failed", exc_info=True)
 
     # ---- menu actions ----
@@ -225,7 +227,7 @@ def maybe_start_tray(loop, cmd_queue, config, status: str = STATUS_STARTING):
         import webbrowser
         try:
             webbrowser.open(_dashboard_url(config.platform_url))
-        except Exception:
+        except Exception:  # noqa: BLE001  # a pystray menu callback: a raise is lost in the win32 message pump
             logger.debug("open dashboard failed", exc_info=True)
 
     def _on_view_logs(icon, item):
@@ -233,7 +235,7 @@ def maybe_start_tray(loop, cmd_queue, config, status: str = STATUS_STARTING):
         log_path = otodir_log_path()
         try:
             os.startfile(str(log_path))  # type: ignore[attr-defined]
-        except Exception:
+        except Exception:  # noqa: BLE001  # a pystray menu callback: a raise is lost in the win32 message pump
             logger.debug("view logs failed", exc_info=True)
 
     def _on_pause_resume(icon, item):
@@ -276,7 +278,7 @@ def maybe_start_tray(loop, cmd_queue, config, status: str = STATUS_STARTING):
             title=f"OtoDock — {_STATUS_LABEL.get(status, status)}",
             menu=menu,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001  # pystray's backend constructor raises by the desktop session's state
         logger.info("could not construct tray icon — running headless",
                     exc_info=True)
         return None
@@ -284,7 +286,7 @@ def maybe_start_tray(loop, cmd_queue, config, status: str = STATUS_STARTING):
     controller = TrayController(icon, base_image, status)
     try:
         icon.icon = controller._compose_image(status)
-    except Exception:
+    except Exception:  # noqa: BLE001  # pystray's win32 backend raises from ctypes and its temp icon file
         logger.debug("tray initial image failed", exc_info=True)
 
     controller.start()
@@ -319,6 +321,6 @@ def _confirm_remove() -> bool:
             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
         )
         return res == IDYES
-    except Exception:
+    except Exception:  # noqa: BLE001  # a ctypes call into user32 raises by the platform's own rules
         logger.debug("confirm dialog unavailable", exc_info=True)
         return True

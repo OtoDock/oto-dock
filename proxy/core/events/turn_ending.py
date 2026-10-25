@@ -35,14 +35,20 @@ LOST = "lost"
 # of a message sent to a session whose process the proxy's own abort ended
 # (a review turn, a queued message) — that is a stop, not a lost machine.
 STOPPED = "stopped"
-REASONS = (DECLINED, LIMIT, ERROR, EXITED, SILENT, LOST, STOPPED)
+# The platform restarted while the turn ran and nothing replayed it: written
+# as the chat's closing row when the platform comes back
+# (``services/scheduler/cut_turns.py``), never carried on an ERROR event.
+RESTARTED = "restarted"
+REASONS = (DECLINED, LIMIT, ERROR, EXITED, SILENT, LOST, STOPPED, RESTARTED)
 # The endings the turn's owner ends the engine process on: a declined turn
 # goes on by itself, a limit's process would hit the wall again, a silent
 # one is the kill itself. An ``error`` keeps the process (it answered), an
 # ``exited`` one is already gone, a ``lost`` one is not here.
 KILLS_PROCESS = frozenset({DECLINED, LIMIT, SILENT})
 # The endings whose card offers to send the message again verbatim: the
-# same words would be declined again, and a limit needs its reset.
+# same words would be declined again, a limit needs its reset, and a reply
+# the restart cut has its work so far in the chat (sending the first message
+# again would start it over).
 RESEND = frozenset({ERROR, EXITED, SILENT, LOST, STOPPED})
 # A decline's detail when Codex's Guardian stopped the turn after too many
 # of its actions were denied (``codexErrorInfo: tooManyDenials``, Codex
@@ -115,6 +121,9 @@ class TurnEnding:
         if self.reason == LOST:
             return ("⚠ The connection to the machine running this chat was lost mid-turn. "
                     "Send the message again once the machine is back.")
+        if self.reason == RESTARTED:
+            return ("⚠ The reply was cut short when the platform restarted. "
+                    "Send a message to continue.")
         return "⚠ The engine was stopped before this message ran. Send it again."
 
     def summary(self) -> str:
@@ -139,6 +148,8 @@ class TurnEnding:
         if self.reason == LOST:
             return f"The machine's stream was lost mid-turn ({self.detail})." if self.detail \
                 else "The machine's stream was lost mid-turn."
+        if self.reason == RESTARTED:
+            return "Cut short when the platform restarted."
         return "Stopped by the person."
 
     def callback_note(self, worker_chat_id: str) -> str:
@@ -174,6 +185,9 @@ class TurnEnding:
         if self.reason == LOST:
             return ("The connection to the worker's machine was lost mid-turn. Continue it "
                     f"with {plain} once the machine is back.")
+        if self.reason == RESTARTED:
+            return ("The worker's turn was cut short when the platform restarted. Its work "
+                    f"so far is in its chat: continue it with {plain}.")
         return f"The worker's turn was stopped by a person. Continue it with {plain}."
 
     def abort_stamps(self) -> dict | None:
@@ -184,7 +198,12 @@ class TurnEnding:
         ``stopped`` message met a process the proxy's abort ended: the send
         consumed the Stop's own flags while it built its batch, so the next
         turn needs them again. The engine answered on an ``error``, and a
-        decline or a limit kept its history."""
+        decline or a limit kept its history. A ``restarted`` turn's process
+        ended with the platform, but its engine's own record holds the turn
+        (the CLI's or Codex's transcript, Direct LLM's chat rows, which the
+        checkpoints wrote): graceful, so the next turn repeats none of it."""
+        if self.reason == RESTARTED:
+            return {"last_turn_aborted": True, "last_abort_graceful": True}
         if self.reason in (EXITED, STOPPED):
             return {"last_turn_aborted": True, "last_abort_graceful": False}
         if self.reason in (SILENT, LOST):
@@ -192,8 +211,8 @@ class TurnEnding:
         return None
 
     def as_dict(self) -> dict:
-        out = {"reason": self.reason, "resets_at": self.resets_at, "detail": self.detail,
-               "window": self.window}
+        out: dict = {"reason": self.reason, "resets_at": self.resets_at, "detail": self.detail,
+                     "window": self.window}
         if self.exit_code is not None:
             out["exit_code"] = self.exit_code
         if self.graceful:

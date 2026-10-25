@@ -42,20 +42,23 @@ devices.
 
 ## Delegation
 
-An agent hands work to another agent on its **Delegation Targets** roster (Agent
-Settings → Configuration). A session's delegation targets are that roster: the edges its
-department wires (locked, "via <Department>") plus the targets a manager ticks by hand
-*(manager)*; the agent's prompt lists them. A worker that runs as the target agent
-(agent scope) needs the person behind the chat to be an **editor+** there; a personal
-worker runs as that person and needs only access. Workers are visible, first-class
-sessions — a chat lane the user can watch and steer, or a background task — and results
-report back to the delegating chat. Multi-lane jobs turn the delegating chat into an
-**orchestrator** with a dock of live lane cards and a board file. Agents can also pass
-real files: deliverables copy into the target's `workspace/inbox/<sender>/` (passive —
-delegate with a prompt to make the target act), and a delegated worker attaches its
+An agent hands work to another agent on its **Delegation Targets** roster (Agent Settings
+→ Configuration). A session's delegation targets are that roster: the edges its department
+wires (locked, "via <Department>") plus the targets a manager ticks by hand *(manager)*;
+the agent's prompt lists them. A worker that runs as the target agent (agent scope) needs
+the person behind the chat to be an **editor+** there; a personal worker runs as that
+person and needs only access. Workers are visible, first-class sessions — a chat lane the
+user can watch and steer, or a background task — and results report back to the delegating
+chat. A worker's report shows in the delegating chat as a collapsed card with a short
+preview and its files as chips (a click opens it whole), and the task a lane receives
+shows the same way in the worker's chat. A worker that stopped before writing its report
+gets a card that reads "ended without a report". Multi-lane jobs turn the delegating chat
+into an **orchestrator** with a dock of live lane cards and a board file. Agents can also
+pass real files: deliverables copy into the target's `workspace/inbox/<sender>/` (passive
+— delegate with a prompt to make the target act), and a delegated worker attaches its
 deliverables to its result (`attach_result_files`): they land in the delegating chat's
-`inbox/<worker>/` with no edge back and the result names them, with an Open per file
-in the chat. A worker's result arrives once its background commands and sub-agents have
+`inbox/<worker>/` with no edge back and the result names them, with an Open per file in
+the chat. A worker's result arrives once its background commands and sub-agents have
 finished. Admin caps live on the Delegation MCP row.
 
 **Visibility is not delegation.** In a user's chat, an agent can read whatever that user
@@ -69,12 +72,14 @@ that summarizes what the team's agents did overnight.
 ## Meetings
 
 Several agents in one conversation: a moderator convenes with a topic + participants,
-directs questions (parallel answers supported), and closes with a summary. Invitees
-follow the **convening user's access** (each agent joins with that user's role);
-meetings convened by no-user scheduled runs are limited to the agent's delegation
-roster. Transcripts stream live with per-agent attribution; history sits on each
-agent's **Meetings** tab and a platform-wide admin Meetings page. Meetings are personal
-(convened from your chat) or agent-scoped (convened on the agent's behalf).
+directs questions (parallel answers supported), and closes with a summary. Invitees follow
+the **convening user's access** (each agent joins with that user's role); meetings
+convened by no-user scheduled runs are limited to the agent's delegation roster.
+Transcripts stream live with per-agent attribution; history sits on each agent's
+**Meetings** section and a platform-wide admin Meetings page. Meetings are personal (convened
+from your chat) or agent-scoped (convened on the agent's behalf). An admin caps how many
+participants one person's meetings hold at once under **Admin → MCP Servers → Meeting
+Rooms** (four by default). 0 turns meetings off.
 
 ## Shared knowledge libraries
 

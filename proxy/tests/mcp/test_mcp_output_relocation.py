@@ -163,8 +163,8 @@ def test_cleanup_session_noop_without_gc_after(tmp_path: Path, temp_db, monkeypa
 def test_t2_uses_docker_cp(tmp_path: Path, temp_db, monkeypatch):
     """In T2 the source is an invisible named volume → pull via `docker cp`."""
     import config as app_config
-    from services.mcp import mcp_output_relocation
     from core.config import deployment
+    from services.mcp import mcp_output_relocation
 
     mcp_dir = tmp_path / "mcp"; mcp_dir.mkdir()
     source = mcp_dir / "screenshots"  # NOT created — proxy can't see the volume

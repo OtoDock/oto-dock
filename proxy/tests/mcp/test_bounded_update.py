@@ -10,11 +10,12 @@ Covers the pure / unit-testable pieces without real npm/PyPI/GitHub:
   never false-flags on a missing/stale hash or a docker entry).
 """
 
+import asyncio
+
 import pytest
 
 from services.community import community_catalog
 from services.mcp import mcp_updater
-
 
 # Pinned golden vector — the catalog ``scripts/generate-registry.py::_manifest_hash``
 # MUST produce this exact value for the same manifest (parity is the whole point).
@@ -386,3 +387,57 @@ class TestAheadOfCatalog:
         assert "downgrade" not in updates["camoufox"]
         assert updates["theme-factory"]["reason"] == "ahead"
         assert updates["theme-factory"]["latest"] == "1.0.0"
+
+
+# ── the registry reads: closed responses, only the shapes they expect ─────
+
+@pytest.mark.parametrize("doc, expected", [
+    ({"version": "1.2.3"}, "1.2.3"),
+    ({"version": 5}, None),
+    ({}, None),
+    (None, None),                      # an error, or a body that is no object
+])
+def test_the_npm_latest_reads_only_a_version_string(monkeypatch, doc, expected):
+    monkeypatch.setattr(mcp_updater, "_read_capped", lambda url, accept: doc)
+    assert asyncio.run(mcp_updater._check_npm_version("pkg")) == expected
+
+
+@pytest.mark.parametrize("doc, expected", [
+    ({"info": {"version": "2.0"}}, "2.0"),
+    ({"info": None}, None),
+    ({"info": ["2.0"]}, None),
+    (None, None),
+])
+def test_the_pypi_latest_reads_only_a_version_string(monkeypatch, doc, expected):
+    monkeypatch.setattr(mcp_updater, "_read_capped", lambda url, accept: doc)
+    assert asyncio.run(mcp_updater._check_pypi_version("pkg")) == expected
+
+
+def test_the_version_lists_skip_what_is_not_their_shape(monkeypatch):
+    docs = {
+        "npm": {"versions": {"1.0.0": {}, "2.0.0": {}}},
+        "npm-list": {"versions": ["1.0.0"]},
+        "pypi": {"releases": {"1.0": [{"yanked": True}], "2.0": [{}], "3.0": [], "4.0": "x",
+                              "5.0": ["not a file"]}},
+        "pypi-list": {"releases": ["2.0"]},
+    }
+    which = {"key": ""}
+    monkeypatch.setattr(mcp_updater, "_read_capped", lambda url, accept: docs[which["key"]])
+    for key, fn, expected in (
+        ("npm", mcp_updater._all_npm_versions, ["1.0.0", "2.0.0"]),
+        ("npm-list", mcp_updater._all_npm_versions, []),
+        ("pypi", mcp_updater._all_pypi_versions, ["2.0", "5.0"]),
+        ("pypi-list", mcp_updater._all_pypi_versions, []),
+    ):
+        which["key"] = key
+        assert asyncio.run(fn("pkg")) == expected, key
+
+
+def test_a_failed_registry_read_answers_nothing(monkeypatch):
+
+    def _boom(url, accept):
+        raise OSError("unreachable")
+
+    monkeypatch.setattr(mcp_updater, "_read_capped", _boom)
+    assert asyncio.run(mcp_updater._check_npm_version("pkg")) is None
+    assert asyncio.run(mcp_updater._all_pypi_versions("pkg")) == []

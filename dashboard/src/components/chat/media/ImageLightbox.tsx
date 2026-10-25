@@ -1,9 +1,13 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { safeHref } from '../../../lib/safeUrl'
 import { pushEscHandler } from '../../../lib/escStack'
+import { blockedByModal } from '../../../lib/ui/modalLayers'
+import { useReturnFocus, wrapTab } from '../../ui/focusReturn'
+import { usePortalRoot } from '../../ui/portalRoot'
 import { useSwipeGesture } from '../../../hooks/useSwipeGesture'
-import { saveNativeFile } from '../../../lib/nativeBridge'
+import { triggerDownload } from './imageDownload'
+import { ON_STAGE, STAGE, STAGE_TEXT, STAGE_TEXT_MUTED } from './stage'
 
 export interface LightboxImage {
   /** Either url (external) or imageData+mimeType (base64) must be set. */
@@ -28,69 +32,6 @@ function imageSrc(img: LightboxImage): string {
   if (img.url) return img.url
   if (img.imageData) return `data:${img.mimeType || 'image/jpeg'};base64,${img.imageData}`
   return ''
-}
-
-// Map mime → file extension. A naive `mime.split('/')[1]` mangles compound
-// subtypes (`image/svg+xml` → `svg+xml`) and gives `jpeg` instead of the
-// conventional `jpg`, so download filenames come out wrong for SVG / HEIC.
-const MIME_EXT: Record<string, string> = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/gif': 'gif',
-  'image/webp': 'webp',
-  'image/svg+xml': 'svg',
-  'image/heic': 'heic',
-  'image/heif': 'heif',
-  'image/avif': 'avif',
-  'image/bmp': 'bmp',
-  'image/tiff': 'tiff',
-}
-
-function downloadFilename(img: LightboxImage, index: number): string {
-  const cap = img.caption || img.attribution || `image-${index + 1}`
-  const mime = (img.mimeType || 'image/jpeg').toLowerCase()
-  // Fallback strips any `+suffix` (e.g. svg+xml → svg) for unmapped mimes.
-  const ext = MIME_EXT[mime] || mime.split('/')[1]?.replace(/\+.*$/, '') || 'jpg'
-  return cap.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 50) + '.' + ext
-}
-
-async function triggerDownload(img: LightboxImage, index: number) {
-  const filename = downloadFilename(img, index)
-
-  // Native Android: route base64 through the app's channel if available.
-  if (img.imageData) {
-    if (saveNativeFile(img.imageData, filename, img.mimeType || 'image/jpeg')) return
-    const byteChars = atob(img.imageData)
-    const byteArr = new Uint8Array(byteChars.length)
-    for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i)
-    const blob = new Blob([byteArr], { type: img.mimeType || 'image/jpeg' })
-    const blobUrl = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = blobUrl
-    link.download = filename
-    link.click()
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 5000)
-    return
-  }
-
-  // External URL: fetch → blob → download. Direct <a download> won't work
-  // for cross-origin URLs without CORS, but fetch-as-blob does the trick
-  // for image CDNs that allow CORS (Unsplash, Pexels, Google all do).
-  const fetchUrl = img.downloadUrl || img.url
-  if (!fetchUrl) return
-  try {
-    const resp = await fetch(fetchUrl)
-    const blob = await resp.blob()
-    const blobUrl = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = blobUrl
-    link.download = filename
-    link.click()
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 5000)
-  } catch {
-    // Fallback: open in new tab — user can right-click → save.
-    window.open(fetchUrl, '_blank', 'noopener')
-  }
 }
 
 // Zoom bounds for the pinch/wheel/double-tap gestures.
@@ -118,6 +59,11 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
   const [imgDim, setImgDim] = useState<{ w: number; h: number } | null>(null)
   const imgRef = useRef<HTMLImageElement | null>(null)
   const outerRef = useRef<HTMLDivElement | null>(null)
+  const portalRoot = usePortalRoot()
+  const closeRef = useRef<HTMLButtonElement | null>(null)
+  useReturnFocus(true)
+  // The keyboard starts inside the viewer, and Tab stays there.
+  useEffect(() => { closeRef.current?.focus({ preventScroll: true }) }, [])
   const containRef = useRef<HTMLDivElement | null>(null)
 
   // Zoom/pan state. The transform is `translate(x,y) scale(z)` around the
@@ -126,7 +72,7 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
   // `smooth` animates programmatic jumps (double-tap) but not live gestures.
   const [view, setView] = useState<View>({ z: 1, x: 0, y: 0 })
   const viewRef = useRef(view)
-  viewRef.current = view
+  useLayoutEffect(() => { viewRef.current = view })
   const [smooth, setSmooth] = useState(false)
   const [dragging, setDragging] = useState(false)
   const pointersRef = useRef(new Map<number, { x: number; y: number }>())
@@ -134,8 +80,19 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
   const panRef = useRef<{ px: number; py: number; x: number; y: number } | null>(null)
   const tapRef = useRef({ t: 0, x: 0, y: 0 })
 
-  const goPrev = useCallback(() => setIdx((i) => (i - 1 + total) % total), [total])
-  const goNext = useCallback(() => setIdx((i) => (i + 1) % total), [total])
+  /** Show another image: the gesture state and the zoom start over with it. */
+  const showIndex = useCallback((i: number) => {
+    setImgDim(null)
+    pointersRef.current.clear()
+    pinchRef.current = null
+    panRef.current = null
+    setDragging(false)
+    setSmooth(false)
+    setView({ z: 1, x: 0, y: 0 })
+    setIdx(i)
+  }, [])
+  const goPrev = useCallback(() => showIndex((idx - 1 + total) % total), [idx, total, showIndex])
+  const goNext = useCallback(() => showIndex((idx + 1) % total), [idx, total, showIndex])
 
   /** Pointer position relative to the container CENTER (the transform origin). */
   const focal = useCallback((clientX: number, clientY: number) => {
@@ -301,7 +258,7 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
   }, [])
 
   useEffect(() => {
-    const pop = pushEscHandler(() => onCloseRef.current())
+    const pop = pushEscHandler(() => onCloseRef.current(), () => outerRef.current)
     const prev = document.body.style.overflow
     document.body.style.overflow = 'hidden'
     return () => {
@@ -312,6 +269,7 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (blockedByModal(e)) return
       if (e.key === 'ArrowLeft') goPrev()
       else if (e.key === 'ArrowRight') goNext()
     }
@@ -330,16 +288,6 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
     onSwipeRight: total > 1 && view.z === 1 ? goPrev : undefined,
     mobileOnly: true,
   })
-
-  useEffect(() => {
-    setImgDim(null)
-    pointersRef.current.clear()
-    pinchRef.current = null
-    panRef.current = null
-    setDragging(false)
-    setSmooth(false)
-    setView({ z: 1, x: 0, y: 0 })
-  }, [idx])
 
   const onImgLoad = () => {
     const el = imgRef.current
@@ -360,17 +308,20 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
     // adds the iOS home-indicator strip on top of our default footer pad.
     <div
       ref={outerRef}
-      className="fixed inset-0 z-50 flex flex-col bg-black/80 backdrop-blur-xs overflow-hidden h-dvh"
+      className={`fixed inset-0 z-50 flex flex-col ${STAGE} overflow-hidden h-dvh`}
       onClick={onClose}
+      onKeyDown={(e) => { if (outerRef.current) wrapTab(e, outerRef.current) }}
       style={{
         paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))',
       }}
     >
       {/* Close button — pinned to the header row (z-10 so it sits above the image) */}
       <button
+        ref={closeRef}
         onClick={onClose}
-        className="absolute top-3 right-3 z-10 w-9 h-9 flex items-center justify-center rounded-full bg-white/10 hover:bg-white/20 text-white text-lg transition-colors"
+        className={`absolute top-3 right-3 z-10 w-9 h-9 flex items-center justify-center rounded-full ${ON_STAGE} text-lg transition-colors`}
         title="Close"
+        aria-label="Close"
       >
         &times;
       </button>
@@ -380,19 +331,19 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
         <>
           <button
             onClick={(e) => { e.stopPropagation(); goPrev() }}
-            className="absolute left-2 sm:left-4 top-1/2 -translate-y-1/2 z-10 w-10 h-10 flex items-center justify-center rounded-full bg-white/10 hover:bg-white/20 text-white text-2xl transition-colors"
+            className={`absolute left-2 sm:left-4 top-1/2 -translate-y-1/2 z-10 w-10 h-10 flex items-center justify-center rounded-full ${ON_STAGE} text-2xl transition-colors`}
             title="Previous (←)"
           >
             ‹
           </button>
           <button
             onClick={(e) => { e.stopPropagation(); goNext() }}
-            className="absolute right-2 sm:right-4 top-1/2 -translate-y-1/2 z-10 w-10 h-10 flex items-center justify-center rounded-full bg-white/10 hover:bg-white/20 text-white text-2xl transition-colors"
+            className={`absolute right-2 sm:right-4 top-1/2 -translate-y-1/2 z-10 w-10 h-10 flex items-center justify-center rounded-full ${ON_STAGE} text-2xl transition-colors`}
             title="Next (→)"
           >
             ›
           </button>
-          <div className="absolute top-3 left-3 z-10 px-3 py-1 rounded-full bg-white/10 text-white text-xs">
+          <div className={`absolute top-3 left-3 z-10 px-3 py-1 rounded-full ${ON_STAGE} text-xs`}>
             {idx + 1} / {total}
           </div>
         </>
@@ -422,7 +373,7 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
           src={imageSrc(current)}
           alt={current.caption || 'Image'}
           draggable={false}
-          className={`max-w-full max-h-full object-contain rounded-lg shadow-2xl select-none ${
+          className={`max-w-full max-h-full object-contain rounded-card shadow-elevation-4 select-none ${
             smooth ? 'transition-transform duration-200' : ''
           }`}
           style={{ transform: `translate3d(${view.x}px, ${view.y}px, 0) scale(${view.z})` }}
@@ -432,24 +383,24 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
 
       {/* Footer — shrink-0, always renders fully */}
       <div
-        className="shrink-0 flex flex-col items-center gap-0.5 text-center text-white px-4 pt-3"
+        className={`shrink-0 flex flex-col items-center gap-0.5 text-center ${STAGE_TEXT} px-4 pt-3`}
         onClick={(e) => e.stopPropagation()}
       >
         {current.caption && (
-          <p className="text-sm text-white/90 max-w-2xl max-h-24 overflow-y-auto">{current.caption}</p>
+          <p className="text-sm max-w-2xl max-h-24 overflow-y-auto">{current.caption}</p>
         )}
         {current.attribution && (
-          <p className="text-xs text-white/60 line-clamp-1 max-w-2xl">{current.attribution}</p>
+          <p className={`text-xs ${STAGE_TEXT_MUTED} line-clamp-1 max-w-2xl`}>{current.attribution}</p>
         )}
         {imgDim && (
-          <p className="text-[10px] text-white/40">
+          <p className={`text-3xs ${STAGE_TEXT_MUTED}`}>
             {imgDim.w} × {imgDim.h}{view.z > 1 ? ` · ${Math.round(view.z * 100)}%` : ''}
           </p>
         )}
         <div className="mt-2 flex flex-wrap justify-center gap-2">
           <button
             onClick={(e) => { e.stopPropagation(); triggerDownload(current, idx) }}
-            className="px-4 py-1.5 rounded-md bg-white/10 hover:bg-white/20 text-sm text-white transition-colors"
+            className={`px-4 py-1.5 rounded-control ${ON_STAGE} text-sm transition-colors`}
           >
             ⬇ Download
           </button>
@@ -459,7 +410,7 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
               target="_blank"
               rel="noopener noreferrer"
               onClick={(e) => e.stopPropagation()}
-              className="px-4 py-1.5 rounded-md bg-white/10 hover:bg-white/20 text-sm text-white transition-colors"
+              className={`px-4 py-1.5 rounded-control ${ON_STAGE} text-sm transition-colors`}
             >
               View source ↗
             </a>
@@ -467,8 +418,7 @@ export default function ImageLightbox({ images, initialIndex = 0, onClose }: Pro
         </div>
       </div>
     </div>,
-    document.body,
+    portalRoot,
   )
 }
 
-export { triggerDownload }

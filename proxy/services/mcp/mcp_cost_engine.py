@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from services.mcp.mcp_registry import CostsBlock, CostRule
+from services.mcp.mcp_registry import CostRule, CostsBlock
 
 logger = logging.getLogger(__name__)
 

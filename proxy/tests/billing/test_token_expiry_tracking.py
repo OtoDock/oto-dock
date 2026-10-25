@@ -14,8 +14,7 @@ from unittest.mock import patch
 
 from core.execution_layer import OAuthRefresh
 from core.layers.cli import oauth as claude_oauth
-from services.engines import subscription_pool as pool
-from services.engines import token_fanout
+from services.engines import subscription_pool as pool, token_fanout
 
 _REFRESH = "core.layers.cli.layer.CLIExecutionLayer.refresh_oauth"
 
@@ -391,7 +390,7 @@ class TestConcurrentBindDuringFanOut:
                     with patch.object(pool.subscription_store,
                                       "decrement_active_sessions"):
                         pool.release_subscription(sid)
-                except BaseException as e:  # noqa: BLE001
+                except BaseException as e:  # noqa: BLE001  # a worker thread's error is collected for the test to assert on
                     errors.append(e)
                     return
                 i += 1

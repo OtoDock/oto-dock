@@ -8,8 +8,10 @@ Runs independently of WebSocket connections:
 
 Execution-layer agnostic: consumes CommonEvent (not ClaudeStreamChunk).
 
-Module-level state (_active_pumps, _pending_permissions,
-_session_cumulative_cost) lives here and is imported by ws/dashboard.py.
+Module-level state (_active_pumps, _pending_permissions) lives here and is
+imported by ws/dashboard.py; _session_cumulative_cost and _GOAL_UNSET are
+defined beside the handlers in pump_event_handlers.py and re-exported here
+for the tests.
 """
 
 import asyncio
@@ -18,39 +20,57 @@ import functools
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
+from typing import Any, cast
 
+import psycopg
+
+from core.events import (
+    artifact_events,
+    chat_writer,
+    input_queue,
+    tool_roles,
+    turn_checkpoint,
+    turn_ending,
+)
+from core.events.artifact_events import artifact_event_from_perm_item
+from core.events.pump_event_handlers import (  # _GOAL_UNSET and the cost map are re-exported here for the tests
+    _GOAL_UNSET,
+    PumpEventHandlers,
+    _session_cumulative_cost,
+)
+from services.notifications import notification_manager
 from storage import database as task_store
 from storage.automation import run_status
+from storage.chat import open_turns
 from storage.pg import run_db
-from core.events import chat_writer, input_queue, tool_roles, turn_ending
-from services.notifications import notification_manager
-from core.events import artifact_events
-from core.events.artifact_events import artifact_event_from_perm_item
-from ws import chat_phase
-from ws import wire_events as wire
+from ws import chat_phase, wire_events as wire
 
 #: The platform's own delegate MCP tool: its call renders as the delegate
 #: pill from the proxy's ``delegate_spawn`` frame, never as a tool block
 #: (the dashboard's skip set carries the same name — ``lib/tools/roles.ts``).
 DELEGATE_TOOL = "mcp__delegation-mcp__delegate"
+from core.background import spawn
+from core.events.bg_command_state import get_bg_command_registry
+from core.events.common_events import (
+    ARTIFACT_TURN,
+    BG_REVIEW_TURN,
+    ERROR,
+    PRODUCER_DONE,
+    QUEUE_TURN,
+    TEXT,
+    THINKING,
+    WORKFLOW_PROGRESS,
+    CommonEvent,
+    TurnInput,
+)
+from core.permission_modes import ASK_MODE
+from core.session import session_kind
 from core.session.session_state import (
     _chat_streaming_state,
-    set_session_mode,
     get_subagent_registry,
     prompt_waits,
-)
-from core.events.bg_command_state import get_bg_command_registry
-from core.session.transcript_tool_events import result_summary, truncate_result
-from core.events.common_events import (
-    CommonEvent,
-    TEXT, THINKING, TOOL_USE, TOOL_INPUT, TOOL_RESULT,
-    PERMISSION_REQUEST, SUBAGENT_START, SUBAGENT_END, DELEGATE_SPAWN,
-    CHECK_VERDICT, BG_COMMAND_START, BG_COMMAND_END,
-    WORKFLOW_START, WORKFLOW_PROGRESS, WORKFLOW_END,
-    PLAN_MODE, SYSTEM, METADATA, DONE, ERROR, QUEUE_TURN, ARTIFACT_TURN,
-    PRODUCER_DONE, TODO_UPDATE, GOAL_UPDATE, CONTEXT_COMPACT,
-    TurnInput, goal_payload_to_state,
 )
 
 # Min seconds between workflow_progress WS forwards per workflow (the live
@@ -67,12 +87,10 @@ _WORKFLOW_PROGRESS_MIN_INTERVAL = 0.3
 # delegate spawns count too (they equally signal a long working turn), and
 # the fire is effectively prompt-only-titled (pending text flushes per
 # event; no assistant rows are persisted mid-turn) — intended cap behavior.
-from services.title_generator import (
+from services.title_generator import (  # noqa: F401  # read by the handlers' module; a test imports the tool one from here
     TITLE_CHAR_THRESHOLD as _TITLE_CHAR_THRESHOLD,
     TITLE_TOOL_THRESHOLD as _TITLE_TOOL_THRESHOLD,
 )
-from core.session import session_kind
-from core.background import spawn
 
 logger = logging.getLogger("otodock")
 
@@ -111,10 +129,10 @@ class _ViewerQueue(asyncio.Queue):
 
 def _delta_key(event_type: str, payload: dict) -> tuple | None:
     """What a delta may merge with, or None when the frame never coalesces:
-    a TEXT that is only content, a THINKING text delta (same other keys), a
-    THINKING progress ping (latest wins)."""
+    a TEXT that is only content (a note only with a note), a THINKING text
+    delta (same other keys), a THINKING progress ping (latest wins)."""
     if event_type == TEXT:
-        return (TEXT,) if payload.keys() == {"content"} else None
+        return (TEXT, bool(payload.get("note"))) if payload.keys() <= {"content", "note"} else None
     if event_type == THINKING:
         phase = payload.get("phase")
         if phase == "progress":
@@ -150,6 +168,17 @@ _active_pumps: dict[str, "ChatStreamPump"] = {}  # chat_id -> pump
 # full turn, so a shutdown flush would duplicate content + double-count cost.
 _recovery_suppress_flush: set[str] = set()  # chat_id
 
+# The platform is ending (the lifespan's shutdown began): a turn whose pump
+# ends now without its engine's result or a typed ending was cut by the
+# restart, and its open-turn record stays for the boot's closing row.
+_platform_ending = False
+
+
+def note_platform_ending() -> None:
+    """The first step of the graceful shutdown (``startup.lifespan``)."""
+    global _platform_ending
+    _platform_ending = True
+
 
 def pending_preview_snapshot(chat_id: str, file_id: str) -> str | None:
     """The snapshot of a document push the chat's pump holds for the turn's
@@ -166,29 +195,12 @@ def pending_preview_snapshot(chat_id: str, file_id: str) -> str | None:
 def suppress_recovery_flush(chat_id: str) -> None:
     """Mark a chat's in-flight turn for satellite re-adopt: its pump skips the
     durable turn-block + cost persist so the post-restart replay doesn't
-    duplicate them. The blocks a steer saved in the middle of the turn are
-    deleted now (the replay writes the whole turn again, after the steer's
-    row). Runs at shutdown, so the delete is a synchronous write."""
+    duplicate them, and leaves the turn's open-turn record. The rows a steer
+    or a checkpoint saved early stay: their ranges are in that record, and the
+    adoption deletes them before the replay writes the whole turn
+    (``run_recovery._recover_session``); a turn nothing replays keeps them,
+    with the boot's closing row."""
     _recovery_suppress_flush.add(chat_id)
-    pump = _active_pumps.get(chat_id)
-    ranges = list(getattr(pump, "_steer_saved_ranges", None) or ())
-    if not ranges:
-        return
-    try:
-        n = task_store.delete_chat_message_ranges(chat_id, ranges)
-        logger.info(f"chat={chat_id[:8]}: {n} row(s) a steer saved early left to the replay")
-    except Exception:
-        logger.exception(f"chat={chat_id[:8]}: the rows a steer saved early were not removed")
-
-# Tracks CLI's cumulative cost per session across pump instances.
-# CLI's total_cost_usd is cumulative per process — new pumps need the last
-# reported value to compute per-turn deltas correctly.
-_session_cumulative_cost: dict[str, float] = {}  # session_id -> last CLI cost
-
-# Initial _current_goal marker, distinct from None ("goal known cleared") so
-# the change-gate can't skip NULLing chats.thread_goal on a cleared event in a
-# pump that never saw the goal being set.
-_GOAL_UNSET = object()
 
 
 def _evict_latest(blocks: list[dict], kind: str) -> None:
@@ -236,15 +248,15 @@ def shelve_undelivered(chat_id: str, items: "list[TurnInput]", *,
                           event_type=wire.SYSTEM, event_data=json.dumps(block)),
         label="undelivered_input",
     )
-    logger.info(f"chat={chat_id[:8]}: {len(items)} queued message(s) nothing sent, "
-                f"kept as an undelivered-input card")
+    logger.info("chat=%s: %s queued message(s) nothing sent, "
+                "kept as an undelivered-input card", chat_id[:8], len(items))
 
 
 def turn_ended_block(ending: "turn_ending.TurnEnding") -> dict:
     """The ``system`` block of a turn's typed ending (subtype
     ``turn_ended``): the reason, the line the card shows, the engine's
     detail, a limit's reset and an exited process's code."""
-    block = {"type": wire.SYSTEM, "subtype": wire.SUBTYPE_TURN_ENDED,
+    block: dict[str, Any] = {"type": wire.SYSTEM, "subtype": wire.SUBTYPE_TURN_ENDED,
              "reason": ending.reason, "message": ending.line(),
              "detail": ending.detail, "resets_at": ending.resets_at}
     if ending.exit_code is not None:
@@ -273,7 +285,7 @@ async def _replay_stored_wakes(chat_id: str) -> None:
         if chat:
             await delivery._redeliver_chat(chat)
     except Exception:
-        logger.exception(f"chat={chat_id[:8]}: the stored wakes' replay failed")
+        logger.exception("chat=%s: the stored wakes' replay failed", chat_id[:8])
 
 
 _replays: set[asyncio.Task] = set()
@@ -330,23 +342,35 @@ def _serialize_turn_rows(blocks: list[dict]) -> list[tuple[str, str, str, str]]:
             continue
         if block["type"] == wire.LIVE_TEXT:
             meeting_agent = block.get("_meeting_agent")
-            event_data = ""
+            meta: dict = {"note": True} if block.get("note") else {}
             if meeting_agent:
                 from storage.agents import agent_store
                 ad = agent_store.get_agent(meeting_agent)
-                event_data = json.dumps({
+                meta.update({
                     "agent_slug": meeting_agent,
                     "agent_display_name": (ad or {}).get("display_name", meeting_agent),
                     "agent_color": (ad or {}).get("color", ""),
                     "badge": "meeting",
                 })
-            rows.append(("assistant", block["content"], "", event_data))
+            rows.append(("assistant", block["content"], "", json.dumps(meta) if meta else ""))
         else:
             stored = block
             if artifact is not None and any(k in block for k in artifact_events.LIVE_ONLY_KEYS):
                 stored = {k: v for k, v in block.items() if k not in artifact_events.LIVE_ONLY_KEYS}
             rows.append(("event", "", block["type"], json.dumps(stored)))
     return rows
+
+
+def _stored_binding(session_id: str) -> dict | None:
+    """The session's persisted pool binding, None when it has none or the
+    read failed (the usage then goes to ``default``, as before)."""
+    from storage.billing import subscription_store
+    try:
+        row = subscription_store.get_session_binding(session_id)
+    except psycopg.Error:
+        logger.debug("usage snapshot: subscription lookup failed", exc_info=True)
+        return None
+    return row if isinstance(row, dict) else None
 
 
 def _record_usage(chat_row: dict, snap: dict) -> None:
@@ -359,8 +383,8 @@ def _record_usage(chat_row: dict, snap: dict) -> None:
     written when their cost is positive.
     """
     try:
-        from services.billing import usage_service
         from config import get_model_provider
+        from services.billing import usage_service
 
         chat_model = chat_row.get("model", "")
         llm_provider = get_model_provider(chat_model) or "anthropic"
@@ -412,11 +436,11 @@ def _record_usage(chat_row: dict, snap: dict) -> None:
             })
 
         usage_service.record_turn_usage(rows)
-    except Exception as e:
-        logger.error(f"Failed to record usage: {e}")
+    except (ImportError, psycopg.Error) as e:
+        logger.error("Failed to record usage: %s", e)
 
 
-class ChatStreamPump:
+class ChatStreamPump(PumpEventHandlers):
     """Decoupled stream processor for chat turns.
 
     Runs independently of WebSocket connections:
@@ -484,7 +508,7 @@ class ChatStreamPump:
         # The typed ending of the turn (every way it ended short: a decline,
         # a limit, an error, an exit, a silence, a loss); the runner and the
         # delegator read it.
-        self.last_ending: "turn_ending.TurnEnding | None" = None
+        self.last_ending: turn_ending.TurnEnding | None = None
 
         # Spoken utterances and the plan's implement message (never a typed
         # message: those wait in the chat's own queue, input_queue.py), shared
@@ -494,19 +518,42 @@ class ChatStreamPump:
         self.message_queue: list[TurnInput] = []
         self._leftover_messages: list[TurnInput] = []
         # Accept jobs this pump has in flight (a steer's row, a drained
-        # batch's rows): a resume drains the chat's lane before its cut.
+        # batch's rows, a run's review rows): a resume drains the chat's lane
+        # before its cut.
         self.accepts_in_flight = 0
         # The person pressed Stop (``ws/dashboard_dispatch._on_abort``): the
         # queue was returned there, nothing is returned at the end.
         self.stopped = False
+        # The chat is being deleted (``end_for_delete``): the turn ends now,
+        # no alert fires, no title is asked, the queue goes to nobody.
+        self.deleting = False
         # The queue sequence at this pump's failure: the messages queued up
         # to it are returned at its end, later ones go out as the next turn.
         self._return_upto: int | None = None
         # A satellite turn the proxy may re-adopt after a restart: the id
-        # ranges a steer's early save wrote (the replay writes them again),
-        # since the current engine turn began.
+        # ranges a steer's early save wrote, since the current engine turn
+        # began (the turn's open-turn record holds every early save's).
         self._recovery_eligible: bool | None = None
         self._steer_saved_ranges: list[tuple[int, int]] = []
+        # The turn's open-turn record (``storage/chat/open_turns.py``): the
+        # token the start wrote (only the pump registered for the chat
+        # writes one), deleted by that token at the end.
+        self._turn_token = ""
+        # The engine's result (DONE) arrived in the current engine turn.
+        self._engine_done = False
+        # Checkpoints (``turn_checkpoint.py``): the loop time of the last
+        # save, the last checkpoint's job, the live twins, the checklist's
+        # row, the ids of the live blocks checkpoints in flight will trim
+        # (new words never go into one), the foreground subagents whose
+        # spawn is done, the plan reviews answered (when), a search row owed.
+        self._last_save_at: float | None = None
+        self._checkpoint_fut: asyncio.Future | None = None
+        self._live_twins: turn_checkpoint.Twins = {}
+        self._todo_ref: turn_checkpoint.RowRef | None = None
+        self._checkpoint_trims: set[int] = set()
+        self._spawns_done: set[str] = set()
+        self._reviews_answered: dict[str, float] = {}
+        self._search_owed = False
         # System prompt queue — delivered silently (no user bubble).
         # Used for delegate results and bg nudges during background drain.
         self.system_queue: list[str] = []
@@ -548,6 +595,7 @@ class ChatStreamPump:
         # activity; the touch is throttled in the event loop.
         self._activity_touch = time.monotonic()
         self._pending_text: list[str] = []  # text chunks since last event
+        self._pending_note = False  # the pending segment is a progress note (TEXT ``note``)
         self._turn_blocks: list[dict] = []  # ordered text segments + events
         # Highest DB message id before this pump's first row — the id-based
         # cutoff that excludes in-flight turn saves from chat_history on live
@@ -590,6 +638,10 @@ class ChatStreamPump:
         # Seed from previous pump's last CLI cost (cumulative per process)
         self._last_session_cost = _session_cumulative_cost.get(session_id, 0.0)
         self._cost_saved = False
+        # The session's stored pool binding, read by the turn-start job when
+        # the pool's memory did not know the session (``_usage_snapshot``).
+        self._stored_binding: dict | None = None
+        self._binding_read = False
         self._meeting_agent: str | None = None  # current speaker in meetings
         self._context_used = 0
         self._context_max = 0
@@ -678,7 +730,35 @@ class ChatStreamPump:
         socket's close path racing a new viewer) is inherently harmless.
         """
         with contextlib.suppress(ValueError):
-            self._ws_queues.remove(q)
+            self._ws_queues.remove(cast("_ViewerQueue", q))
+
+    async def end_for_delete(self, timeout: float = 5.0) -> None:
+        """The chat is being deleted: the turn ends now and the pump's rows
+        and turn-end job are queued on the chat's lane before the route
+        queues the row delete. Stopped and deleting (no alert, no title,
+        the queue returned to nobody: its rows go with the chat), the
+        session told (a settling run ends), the interactions and system
+        prompts dropped, the producer ended on the hard path (the session
+        is closed right after), then the pump's task awaited within
+        ``timeout``. A pump already done but still unwinding is awaited the
+        same way."""
+        self.stopped = True
+        self.deleting = True
+        self._title_armed = False
+        if self.session_id:
+            from core.session import session_events
+            session_events.note_stop(self.session_id)
+        self.cancel_all_artifacts()
+        self.message_queue.clear()
+        self.system_queue.clear()
+        if not self._done:
+            self.abort()
+        if self._task is not None and not self._task.done():
+            ended, _ = await asyncio.wait({self._task}, timeout=timeout)
+            if not ended:
+                logger.warning(
+                    "chat=%s: the pump did not end within %.0fs of the chat's delete; "
+                    "the row delete goes ahead of its last writes", self.chat_id[:8], timeout)
 
     def abort(self):
         """Kill the producer — pump will exit its loop."""
@@ -703,7 +783,10 @@ class ChatStreamPump:
     async def resolve_active_permission(self):
         """Current permission resolved. Forward next from buffer if any."""
         if self._permission_active is not None:
-            self._pinged.pop(self._permission_active.get("request_id") or "", None)
+            rid = self._permission_active.get("request_id") or ""
+            self._pinged.pop(rid, None)
+            if self._permission_active.get("event_type") == wire.ITEM_PLAN_REVIEW:
+                self._reviews_answered[rid] = time.monotonic()
         self._permission_active = None
         live = _chat_streaming_state.get(self.chat_id)
         if live:
@@ -776,6 +859,8 @@ class ChatStreamPump:
                 {"pump_type": wire.PUMP_PLAN_REVIEW, "perm_data": perm_data,
                  "filename": filename},
             )
+            # The plan waits on the person like a permission does.
+            self._ping_needs_input(perm_data, "Review the plan")
         elif evt_type == wire.ITEM_QUESTION_PROMPT:
             # Codex request_user_input: the daemon HOLDS the turn open on this
             # question, so the turn-end ping never fires for it. Do NOT touch
@@ -852,7 +937,7 @@ class ChatStreamPump:
 
         try:
             chat, in_meeting, label = await run_db(_row_meeting_label)
-        except Exception:
+        except psycopg.Error:
             logger.debug("chat=%s: the needs-input ping's chat read failed", chat_id[:8],
                          exc_info=True)
             return False
@@ -922,7 +1007,7 @@ class ChatStreamPump:
                 from services.scheduler import run_recovery
                 self._recovery_eligible = bool(await run_db(
                     run_recovery.is_recovery_eligible, self.chat_id))
-            self._save_turn_blocks(note_range=self._recovery_eligible)
+            self._save_turn_blocks(note_range=self._recovery_eligible, early=True)
             ids = await input_queue.get(self.chat_id).accept_job(
                 [qi], extra_meta=data.get("extra_meta"))
         finally:
@@ -946,6 +1031,7 @@ class ChatStreamPump:
             self._save_turn_blocks()
         # The restart replay covers the engine turn starting now only.
         self._steer_saved_ranges = []
+        self._engine_turn_begins()
         inputs = list(data.get("inputs") or [])
         if not inputs and data.get("text"):
             meta = data.get("event_data") or {}
@@ -1007,7 +1093,7 @@ class ChatStreamPump:
         """Queue an artifact interaction for the boundary drain. False when
         the queue is closed or the pending cap is hit (each delivery costs a
         real agent turn)."""
-        from ws.artifact_interactions import QUEUE_CAP
+        from core.events.artifact_events import QUEUE_CAP
         if self.queue_closed or len(self.artifact_queue) >= QUEUE_CAP:
             return False
         self.artifact_queue.append(interaction)
@@ -1052,7 +1138,14 @@ class ChatStreamPump:
         """
         text = "".join(self._pending_text)
         if text:
-            self._turn_blocks.append(self._stamp_speaker({"type": wire.TEXT, "content": text}))
+            block = self._stamp_speaker({"type": wire.TEXT, "content": text})
+            if self._pending_note:
+                block["note"] = True
+            self._turn_blocks.append(block)
+            live = _chat_streaming_state.get(self.chat_id)
+            shown = live.get("live_blocks") if live else None
+            if shown and shown[-1].get("type") == wire.LIVE_TEXT:
+                self._live_twins[id(block)] = (block, shown[-1])
             self._pending_text.clear()
 
     def _stamp_speaker(self, block: dict) -> dict:
@@ -1108,52 +1201,123 @@ class ChatStreamPump:
             await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
         self._pending_previews.clear()
 
-    def _save_turn_blocks(self, *, note_range: bool = False) -> asyncio.Future | None:
+    def _rewrite_row(self, ref: turn_checkpoint.RowRef, block: dict) -> None:
+        """The row a checkpoint saved for ``block`` rewritten as it is now."""
+        turn_checkpoint.rewrite_row(self.chat_id, ref, _serialize_turn_rows([block])[0][3])
+
+    async def _maybe_checkpoint(self) -> None:
+        """A long turn's settled blocks saved while it runs (``turn_checkpoint.due_upto``)."""
+        upto = turn_checkpoint.due_upto(self, suppressed=self.chat_id in _recovery_suppress_flush)
+        if upto:
+            self._checkpoint_fut = self._save_turn_blocks(upto=upto)
+
+    def _engine_turn_begins(self) -> None:
+        """A new engine turn inside this pump's turn (its ranges start over)."""
+        self._engine_done = False
+        turn_checkpoint.note_engine_turn(self.chat_id, self._turn_token, running=True)
+
+    def _engine_turn_ended(self) -> None:
+        """The engine's result arrived, after the DONE save: the rows are final."""
+        self._engine_done = True
+        turn_checkpoint.note_engine_turn(self.chat_id, self._turn_token, running=False)
+
+    def _save_turn_blocks(self, *, note_range: bool = False, early: bool = False,
+                          upto: int | None = None) -> asyncio.Future | None:
         """Persist the turn blocks accumulated so far, in order, off the loop.
 
         The rows are serialised HERE (the block dicts keep mutating on the
-        loop afterwards — plan_review actions, live badges), the accumulator
-        is cleared, and ONE writer job per call goes on the chat's lane:
-        inserts → snapshot GC → the last message id. When the job lands the
-        id-based cutoff advances and exactly the live blocks it persisted are
-        trimmed from live_state, so a viewer reconnecting during the write
-        still sees the turn (live_state), and afterwards from chat_history —
-        never neither, never both. Returns the job's future, or None when
-        nothing was queued. ``note_range`` records the id range the job wrote
-        (a steer's early save on a turn a restart may replay).
+        loop afterwards — plan_review actions, live badges), the saved blocks
+        leave the accumulator, and ONE writer job per call goes on the chat's
+        lane: inserts → snapshot GC → the last message id. When the job lands
+        the id-based cutoff advances and exactly the live blocks it persisted
+        are trimmed from live_state (``turn_checkpoint.trim_list``, taken now)
+        — never neither, never both for a viewer reconnecting. Returns the
+        job's future, or None when nothing was queued. ``note_range``: the
+        pump records the id range (a steer's save on a turn a restart may
+        replay); ``early`` (a steer, a checkpoint): the open-turn record gets
+        it inside the rows' transaction. ``upto`` makes it a checkpoint: the
+        first ``upto`` blocks (``settled_prefix``), the row-less ones kept in
+        front, the checklist segment going on, no search-row rebuild.
         """
         if self.chat_id in _recovery_suppress_flush:
             # This turn will be re-adopted + re-persisted from the satellite
             # after the restart — a shutdown flush here would duplicate it.
             self._turn_blocks.clear()
             return None
-        if not self._turn_blocks:
+        checkpoint = upto is not None
+        if not checkpoint:
+            # The segment ends here, saved or already checkpointed: a
+            # checklist after it is a new block.
+            self._todo_block = self._todo_ref = None
+        prefix = self._turn_blocks[:upto]
+        saved = [b for b in prefix if turn_checkpoint.rowed(b)] if checkpoint else prefix
+        if not saved:
+            if not checkpoint and self._search_owed:
+                # Nothing left to write: the checkpoints' text still owes
+                # the chat's search row.
+                self._search_owed = False
+                chat_writer.submit(self.chat_id, functools.partial(
+                    task_store.rebuild_chat_search, self.chat_id), label="search_row")
             return None
-        rows = _serialize_turn_rows(self._turn_blocks)
-        self._turn_blocks.clear()
-        self._todo_block = None
+        rows = _serialize_turn_rows(saved)
+        self._turn_blocks[:len(prefix)] = [b for b in prefix if not turn_checkpoint.rowed(b)] if checkpoint else []
+        ref = turn_checkpoint.todo_ref(saved, self._todo_block) if checkpoint else None
+        if ref is not None:
+            self._todo_ref = ref[1]
         # A tool still open is not in these rows: its live block stays, and
-        # it lands at the head of the blocks that follow (its start index
-        # pointed into the list just cleared).
-        open_tools = {id(b) for b in self._active_tools.values()}
-        for b in self._active_tools.values():
-            b["_insert_idx"] = 0
-        gc_pending, self._gc_snapshots_pending = self._gc_snapshots_pending, False
+        # it lands at its start position in the blocks that follow.
+        open_tools = list(self._active_tools.values())
+        for b in open_tools:
+            b["_insert_idx"] = b["_insert_idx"] - len(saved) if checkpoint else 0
+        # A checkpoint runs no snapshot GC (a held preview is not saved yet)
+        # and leaves the search row to the next full save.
+        gc_pending = search_owed = False
+        if checkpoint:
+            self._search_owed = True
+        else:
+            gc_pending, self._gc_snapshots_pending = self._gc_snapshots_pending, False
+            search_owed, self._search_owed = self._search_owed, False
         chat_id = self.chat_id
         live = _chat_streaming_state.get(chat_id)
         live_list = live.get("live_blocks") if live else None
-        live_len = len(live_list) if live_list is not None else 0
-
+        trim = turn_checkpoint.trim_list(live_list or [], self._turn_blocks, open_tools,
+                                         self._live_twins)
+        trim_ids = {id(b) for b in trim}
+        if checkpoint:
+            self._checkpoint_trims |= trim_ids
+            for b in saved:
+                self._live_twins.pop(id(b), None)
+        else:
+            self._live_twins.clear()
         ranges = self._steer_saved_ranges if note_range else None
+        token = self._turn_token if early or checkpoint else ""
+        self._last_save_at = asyncio.get_running_loop().time()
 
         def _job() -> int:
-            before = task_store.get_last_chat_message_id(chat_id) if ranges is not None else 0
+            before = task_store.get_last_chat_message_id(chat_id) if ranges is not None or token else 0
+            ids: list[int] = []
+
+            def _note(conn: psycopg.Connection, written: list[int]) -> None:
+                if max(written, default=0):
+                    open_turns.note_range_in(conn, chat_id, token, before or 0, max(written))
+
+            # The row ids for a row rewritten later, the range note, the
+            # search row left to the next full save: none on the plain save.
+            extra: dict[str, Any] = {"ids": ids} if ref is not None else {}
+            if token:
+                extra["in_txn"] = _note
+            if checkpoint:
+                extra["search"] = False
             # One transaction and ONE search-row rebuild for the turn's rows.
             task_store.add_chat_messages_batch(chat_id, [
                 ("assistant", content, "", event_data) if role == "assistant"
                 else ("event", "", event_type, event_data)
                 for role, content, event_type, event_data in rows
-            ])
+            ], **extra)
+            if ref is not None:
+                ref[1].id = ids[ref[0]] if ref[0] < len(ids) else 0
+            if search_owed and not any(role == "assistant" and content for role, content, _t, _d in rows):
+                task_store.rebuild_chat_search(chat_id)
             if gc_pending:
                 # The flushed preview rows are persisted now — prune this
                 # chat's unreferenced version-pinned snapshots (dismissed
@@ -1161,7 +1325,7 @@ class ChatStreamPump:
                 try:
                     from services.media import preview_snapshots
                     preview_snapshots.gc_chat(chat_id)
-                except Exception:
+                except (ImportError, OSError, psycopg.Error):
                     logger.debug("preview snapshot GC failed", exc_info=True)
             last = task_store.get_last_chat_message_id(chat_id)
             if ranges is not None:
@@ -1171,6 +1335,8 @@ class ChatStreamPump:
         fut = chat_writer.submit(chat_id, _job, label="turn_blocks")
 
         def _landed(f: asyncio.Future) -> None:
+            if checkpoint:
+                self._checkpoint_trims -= trim_ids
             if f.cancelled() or f.exception() is not None:
                 return
             # Advance the cutoff so the saved content (completed meeting
@@ -1180,11 +1346,13 @@ class ChatStreamPump:
             # Trim exactly the blocks this job persisted; blocks appended
             # since (the next speaker) stay live. A superseding pump replaces
             # the live dict — then there is nothing of ours to trim.
+            # ``trim`` keeps its dicts alive until here, so no block appended
+            # since can have taken the address of one an eviction dropped.
+            gone = {id(b) for b in trim}
             cur = _chat_streaming_state.get(chat_id)
-            if (cur is not None and live_list is not None
-                    and cur.get("live_blocks") is live_list):
-                live_list[:live_len] = [b for b in live_list[:live_len]
-                                        if id(b) in open_tools]
+            if (cur is not None and cur.get("live_blocks") is live_list
+                    and live_list is not None):
+                live_list[:] = [b for b in live_list if id(b) not in gone]
 
         fut.add_done_callback(_landed)
         return fut
@@ -1232,14 +1400,23 @@ class ChatStreamPump:
                 self._owner_sub, chat_id, chat_phase.STREAMING, agent=self._chat_agent,
             )
 
-        def _job() -> tuple[int, dict]:
+        # A session the pool's memory does not know has its stored binding
+        # read here, for the turn's usage snapshot: a close at the turn's end
+        # deletes the row on the binding writer while the cost job waits.
+        from services.engines import subscription_pool
+        session_id = self.session_id
+        read_binding = None in subscription_pool.bound_attribution(session_id)
+
+        def _job() -> tuple[int, dict, dict | None]:
             row = task_store.get_chat(chat_id) or {}
-            return task_store.get_last_chat_message_id(chat_id), row
+            return (task_store.get_last_chat_message_id(chat_id), row,
+                    _stored_binding(session_id) if read_binding else None)
 
         def _started(f: asyncio.Future) -> None:
             if f.cancelled() or f.exception() is not None:
                 return
-            cutoff, row = f.result()
+            cutoff, row, binding = f.result()
+            self._stored_binding, self._binding_read = binding, read_binding
             self._db_msg_cutoff_id = max(self._db_msg_cutoff_id or 0, cutoff or 0)
             if row.get("title_generated"):
                 self._title_armed = False
@@ -1257,6 +1434,16 @@ class ChatStreamPump:
                     )
 
         chat_writer.submit(chat_id, _job, label="turn_start").add_done_callback(_started)
+        # The turn's open-turn record, its own job (a failure never touches
+        # the cutoff above), by the pump that owns the chat only (a captured
+        # wake's pump beside it must not replace its token). A meeting
+        # pump's session is never a satellite's: none recorded.
+        if _active_pumps.get(chat_id) is self:
+            self._turn_token = uuid.uuid4().hex
+            chat_writer.submit(chat_id, functools.partial(
+                open_turns.open_turn, chat_id, self._turn_token,
+                "" if self.source_type == session_kind.MEETING.source_type else session_id),
+                label="turn_open")
         if session_kind.is_task_chat_id(chat_id) and self.source_type != session_kind.TASK.source_type:
             # Dashboard-RESUMED task conversation (the scheduler's own runs are
             # source_type == "task"): reflect the live turn in the Task History
@@ -1294,6 +1481,7 @@ class ChatStreamPump:
             chat_row = task_store.get_chat(chat_id)
             if not chat_row:
                 return
+            self._stored_attribution(snap)
             old_cost = chat_row.get("total_cost") or 0
             updates = {"total_cost": old_cost + snap["total_cost_delta"]}
             if snap["context_used"] > 0:
@@ -1330,15 +1518,39 @@ class ChatStreamPump:
             "sub_id": "default",
             "payer": None,
         }
-        try:
-            # Attribute the LLM turn to the subscription that served it, so the
-            # pool can route new chats to the least-consumed account.
-            snap["sub_id"] = subscription_pool.get_session_subscription(self.session_id) or "default"
-            if self.scope == "agent":
-                snap["payer"] = subscription_pool.get_session_payer_sub(self.session_id)
-        except Exception:
-            logger.debug("usage snapshot: subscription lookup failed", exc_info=True)
+        # Attribute the LLM turn to the subscription that served it, so the
+        # pool can route new chats to the least-consumed account. The pool's
+        # in-memory binding is read now; for a session it does not know
+        # (outside the pool, or bound before a restart) the stored binding
+        # the turn-start job read answers, or, when that job has not landed,
+        # the cost job reads it (``_stored_attribution``).
+        sub, payer = subscription_pool.bound_attribution(self.session_id)
+        if self._binding_read:
+            stored = self._stored_binding or {}
+            if sub is None:
+                sub = stored.get("subscription_id") or "default"
+            if payer is None:
+                payer = stored.get("user_sub") or ""
+        snap["sub_id"] = sub or "default"
+        snap["sub_unbound"] = sub is None
+        if self.scope == "agent":
+            snap["payer"] = payer
+            snap["payer_unbound"] = payer is None
         return snap
+
+    @staticmethod
+    def _stored_attribution(snap: dict) -> None:
+        """The cost job's half of the usage snapshot: the stored binding of a
+        session the pool's memory did not know."""
+        sub_unbound = snap.pop("sub_unbound", False)
+        payer_unbound = snap.pop("payer_unbound", False)
+        if not (sub_unbound or payer_unbound):
+            return
+        stored = _stored_binding(snap["session_id"]) or {}
+        if sub_unbound:
+            snap["sub_id"] = stored.get("subscription_id") or "default"
+        if payer_unbound:
+            snap["payer"] = stored.get("user_sub") or ""
 
     async def _cost_billed_for(self, session_id: str) -> bool:
         """``cost_billed`` for a metadata event: does this session's credential
@@ -1351,7 +1563,7 @@ class ChatStreamPump:
         from services.engines import subscription_pool
         try:
             return await run_db(subscription_pool.session_cost_billed, session_id)
-        except Exception:
+        except psycopg.Error:
             logger.debug("cost_billed lookup failed", exc_info=True)
             return True
 
@@ -1380,7 +1592,7 @@ class ChatStreamPump:
                         chat_id, run_status.CANCELLED if aborted else run_status.COMPLETED,
                         only_from=(run_status.RUNNING,),
                     )
-                except Exception as e:
+                except psycopg.Error as e:
                     logger.debug("resumed-task run status close failed: %s", e)
             chat = task_store.get_chat(chat_id)
             if not chat:
@@ -1402,8 +1614,8 @@ class ChatStreamPump:
                 break  # the lane was cancelled — nothing more will land
             waited += 10.0
             logger.warning(
-                f"ChatStreamPump chat={self.chat_id}: turn rows still landing "
-                f"after {waited:.0f}s — database slow?"
+                "ChatStreamPump chat=%s: turn rows still landing "
+                "after %.0fs — database slow?", self.chat_id, waited
             )
 
     def _deliver(self, item: dict) -> None:
@@ -1418,8 +1630,9 @@ class ChatStreamPump:
                 q.put_nowait({"pump_type": PUMP_RESYNC})
                 q.overflowed = True
                 logger.warning(
-                    f"ChatStreamPump chat={self.chat_id}: a viewer fell "
-                    f"{_VIEWER_QUEUE_MAX} frames behind; resyncing it")
+                    "ChatStreamPump chat=%s: a viewer fell "
+                    "%s frames behind; resyncing it",
+                    self.chat_id, _VIEWER_QUEUE_MAX)
                 continue
             q.put_nowait(item)
 
@@ -1530,6 +1743,7 @@ class ChatStreamPump:
             # stuck-chat failure class. The matching "ready" fires in the
             # finally when the turn genuinely ends.
             self._submit_turn_start()
+            self._last_save_at = asyncio.get_running_loop().time()
             while True:
                 # Poll permission queue (non-blocking)
                 if self.perm_queue is not None:
@@ -1546,6 +1760,7 @@ class ChatStreamPump:
                         self.event_queue.get(), timeout=timeout,
                     )
                 except asyncio.TimeoutError:
+                    await self._maybe_checkpoint()
                     continue
 
                 # Throttled sidebar-recency touch (see _activity_touch above).
@@ -1556,268 +1771,387 @@ class ChatStreamPump:
                         await run_db(task_store.touch_chat, self.chat_id)
 
                 if event.type == ERROR:
-                    err_msg = event.data.get("message", "")
-                    self.last_error = err_msg or "engine error"
-                    typed = turn_ending.from_dict(event.data.get("ending"))
-                    # Every error that ends the turn is typed: an untyped one
-                    # (a session gone, a producer's exception) is the
-                    # ``error`` ending with its own words, so the chat keeps
-                    # its card and the next message starts a new turn.
-                    ending = typed or turn_ending.TurnEnding(
-                        reason=turn_ending.ERROR, detail=err_msg or "engine error",
-                    )
-                    self.last_ending = ending
-                    # Failover: a turn that died on a provider limit or overload
-                    # rests this session's subscription so the next chat or turn
-                    # picks another: a typed limit ending until the window it
-                    # names resets (account-wide, or for that model family only),
-                    # else the usual cooldown; a transient overload (529) only a
-                    # brief nudge, so an immediate retry isn't blocked
-                    # (subscription_pool.rest_after_limit).
-                    try:
-                        from services.engines import subscription_pool as _subpool
-                        _subpool.rest_after_limit(self.session_id, typed, err_msg)
-                    except Exception:
-                        pass
-                    # Closed before the viewer sees the error: the session
-                    # may be dead, and a message sent from here on waits in
-                    # the chat's queue for the next turn.
-                    self.close_queue()
-                    frame = {"pump_type": wire.PUMP_ERROR,
-                             "message": err_msg if typed else ending.line(),
-                             "reason": ending.reason, "resets_at": ending.resets_at}
-                    await self._forward(frame)
-                    # The ending is the chat's ``turn_ended`` row, after the
-                    # turn's text so far: a reload shows the card where the
-                    # live frame showed it. This loop BREAKS on ERROR (the
-                    # trailing DONE never flows through the pump), and the
-                    # `finally` saves the blocks in order. The flags a lost
-                    # partial turn needs ride the same lane, before the row's
-                    # save.
-                    self._flush_pending_text()
-                    self._turn_blocks.append(self._stamp_speaker(turn_ended_block(ending)))
-                    stamps = ending.abort_stamps()
-                    if stamps:
-                        self._submit_chat_update("abort_flags", **stamps)
-                    # What was queued until now goes back to its authors at
-                    # the pump's end; a message sent after it is the next turn.
-                    self._return_upto = input_queue.get(self.chat_id).seq
+                    await self._on_error_event(event)
                     break
 
                 if event.type == PRODUCER_DONE:
-                    # Final perm queue drain
-                    if self.perm_queue is not None:
-                        while True:
-                            try:
-                                perm_data = self.perm_queue.get_nowait()
-                                await self._handle_perm_event(perm_data)
-                            except asyncio.QueueEmpty:
-                                break
-                    # Save remaining text/events in order
-                    self._flush_pending_text()
-                    await self._flush_pending_previews()
-                    for tool_evt in self._active_tools.values():
-                        self._turn_blocks.append(tool_evt)
-                    self._active_tools.clear()
-                    save_fut = self._save_turn_blocks()
-                    self._submit_cost_job()
-                    # LLM chat-title: a short first response never crossed the
-                    # streaming threshold — fire once the turn-end save has
-                    # landed (the service reads the first prompt + response
-                    # from the DB). The atomic claim dedupes against the
-                    # threshold fire. One pump == one turn.
-                    if self._title_armed:
-                        self._title_armed = False
-                        from services import title_generator
-                        _title_cid = self.chat_id
-
-                        def _fire_title(_f=None) -> None:
-                            spawn(title_generator.request_chat_title(_title_cid),
-                                  name="request_chat_title", owner="stream_pump")
-
-                        if save_fut is not None:
-                            save_fut.add_done_callback(_fire_title)
-                        else:
-                            _fire_title()
-                    # all_done goes out from the finally, after this turn's rows
-                    # have landed: "done" means "persisted" to the queue drain
-                    # and the resume re-send.
-                    self._completed = True
+                    await self._on_producer_done()
                     break
 
                 if event.type in (QUEUE_TURN, STEER_ACCEPTED):
-                    # An accept that fails (a lane or DB error) ends the turn
-                    # typed, with its row and its card, like any error.
-                    try:
-                        await (self._accept_queue_turn if event.type == QUEUE_TURN
-                               else self._accept_steer)(event.data)
-                    except Exception as e:
-                        logger.exception(f"chat={self.chat_id[:8]}: an accept failed")
-                        await self.event_queue.put(CommonEvent(type=ERROR, data={
-                            "message": f"the message could not be saved: {e}"}))
+                    await self._on_accept_event(event)
                     continue
 
                 if event.type == ARTIFACT_TURN:
-                    # Drained backchannel interactions (artifact sends AND
-                    # app send_prompt actions, kind-tagged): one distinct
-                    # event row per entry (NEVER a "user" row — the row type +
-                    # the framed prompt carry the provenance), forwarded live
-                    # so the sender's transcript shows the chip at delivery.
-                    from ws import artifact_interactions as _ai
-                    _art_rows = [
-                        (_ai.event_type(it), _ai.event_row_json(it))
-                        for it in event.data.get("interactions", [])
-                    ]
-                    _art_cid = self.chat_id
+                    await self._on_artifact_turn(event)
+                    continue
 
-                    def _art_job(_rows=_art_rows) -> None:
-                        for _etype, _edata in _rows:
-                            task_store.add_chat_message(
-                                _art_cid, "event", "", event_type=_etype, event_data=_edata,
-                            )
-
-                    if _art_rows:
-                        chat_writer.submit(_art_cid, _art_job, label="artifact_turn")
-                    for it in event.data.get("interactions", []):
-                        frame = _ai.ws_frame(it, self.chat_id)
-                        frame["pump_type"] = frame.pop("type")
-                        await self._forward(frame)
+                if event.type == BG_REVIEW_TURN:
+                    await self._on_review_turn(event)
                     continue
 
                 # Process event (text, thinking, tools, metadata, etc.)
+                if self._engine_done and turn_checkpoint.opens_engine_turn(event):
+                    # A prompt the engine took after its result (a system
+                    # prompt is sent with no pump event): a new engine turn.
+                    self._engine_turn_begins()
                 await self._process_event(event)
+                await self._maybe_checkpoint()
 
         except Exception as e:
-            logger.error(
-                f"ChatStreamPump error: chat={self.chat_id}, error={e}",
-                exc_info=True,
+            logger.exception(
+                "ChatStreamPump error: chat=%s, error=%s", self.chat_id, e,
             )
         finally:
-            self._done = True
-            # Whatever ended the pump (a cancelled producer, an exception),
-            # nothing drains the queues any more.
-            self.close_queue()
-            self.producer.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self.producer
+            await self._persist_tail()
+            await self._end_turn()
 
-            # Save any unflushed text/events (error recovery)
-            self._flush_pending_text()
-            await self._flush_pending_previews()
-            # Persist in-progress thinking text too — if the producer died
-            # mid-stream (e.g. asyncio.LimitOverrunError on a large MCP
-            # tool-result line), thinking events between phase=start and
-            # phase=end would otherwise never reach _turn_blocks and the
-            # block would silently vanish on chat refresh.
-            if self._thinking_text:
-                self._turn_blocks.append(self._stamp_speaker({
-                    "type": wire.THINKING, "content": self._thinking_text,
-                }))
-                self._thinking_text = ""
-            for tool_evt in self._active_tools.values():
-                self._turn_blocks.append(tool_evt)
-            self._save_turn_blocks()
-            self._submit_cost_job()
-            # A steer the engine accepted after the loop's last read: its row
-            # lands after the final save, and its frame still reaches the
-            # attached viewers before their done.
-            while not self.event_queue.empty():
-                late = self.event_queue.get_nowait()
-                if late.type == STEER_ACCEPTED:
-                    with contextlib.suppress(Exception):
-                        await self._accept_steer(late.data)
-            if self._leftover_messages:
-                # Spoken utterances nothing sent stay in the chat as a card.
-                shelve_undelivered(self.chat_id, self._leftover_messages)
-                self._leftover_messages = []
+    async def _on_error_event(self, event: CommonEvent) -> None:
+        """An ERROR event ends the turn: the typed ending, the account
+        rested, the queue closed, the error frame, the ``turn_ended`` row."""
+        err_msg = event.data.get("message", "")
+        self.last_error = err_msg or "engine error"
+        typed = turn_ending.from_dict(event.data.get("ending"))
+        # Every error that ends the turn is typed: an untyped one
+        # (a session gone, a producer's exception) is the
+        # ``error`` ending with its own words, so the chat keeps
+        # its card and the next message starts a new turn.
+        ending = typed or turn_ending.TurnEnding(
+            reason=turn_ending.ERROR, detail=err_msg or "engine error",
+        )
+        if _platform_ending and ending.reason in (turn_ending.EXITED, turn_ending.LOST):
+            # The shutdown closing the session is what ended the engine.
+            ending = turn_ending.TurnEnding(reason=turn_ending.RESTARTED, detail=ending.detail)
+            typed = None
+        self.last_ending = ending
+        # Failover: a turn that died on a provider limit or overload
+        # rests this session's subscription so the next chat or turn
+        # picks another: a typed limit ending until the window it
+        # names resets (account-wide, or for that model family only),
+        # else the usual cooldown; a transient overload (529) only a
+        # brief nudge, so an immediate retry isn't blocked
+        # (subscription_pool.rest_after_limit).
+        try:
+            from services.engines import subscription_pool as _subpool
+            _subpool.rest_after_limit(self.session_id, typed, err_msg)
+        except Exception:  # noqa: BLE001  # resting the account spans the pool and layers: the error frame goes on
+            pass
+        # Closed before the viewer sees the error: the session
+        # may be dead, and a message sent from here on waits in
+        # the chat's queue for the next turn.
+        self.close_queue()
+        frame = {"pump_type": wire.PUMP_ERROR,
+                 "message": err_msg if typed else ending.line(),
+                 "reason": ending.reason, "resets_at": ending.resets_at}
+        await self._forward(frame)
+        # The ending is the chat's ``turn_ended`` row, after the
+        # turn's text so far: a reload shows the card where the
+        # live frame showed it. This loop BREAKS on ERROR (the
+        # trailing DONE never flows through the pump), and the
+        # `finally` saves the blocks in order. The flags a lost
+        # partial turn needs ride the same lane, before the row's
+        # save.
+        self._flush_pending_text()
+        self._turn_blocks.append(self._stamp_speaker(turn_ended_block(ending)))
+        stamps = ending.abort_stamps()
+        if stamps:
+            self._submit_chat_update("abort_flags", **stamps)
+        # What was queued until now goes back to its authors at
+        # the pump's end; a message sent after it is the next turn.
+        self._return_upto = input_queue.get(self.chat_id).seq
 
-            if self.implementing_plan:
-                chat_writer.submit(
-                    self.chat_id,
-                    functools.partial(
-                        task_store.update_chat_plan_status,
-                        self.chat_id, self.implementing_plan, "implemented",
-                    ),
-                    label="plan_status",
+    async def _on_producer_done(self) -> None:
+        """The producer's end: the permission queue drained, the turn's
+        rest saved in order, the cost job, the title fire once."""
+        # Final perm queue drain
+        if self.perm_queue is not None:
+            while True:
+                try:
+                    perm_data = self.perm_queue.get_nowait()
+                    await self._handle_perm_event(perm_data)
+                except asyncio.QueueEmpty:
+                    break
+        # Save remaining text/events in order
+        self._flush_pending_text()
+        await self._flush_pending_previews()
+        for tool_evt in self._active_tools.values():
+            self._turn_blocks.append(tool_evt)
+        self._active_tools.clear()
+        save_fut = self._save_turn_blocks()
+        if save_fut is None and self._checkpoint_fut is not None and not self._checkpoint_fut.done():
+            save_fut = self._checkpoint_fut
+        self._submit_cost_job()
+        # LLM chat-title: a short first response never crossed the
+        # streaming threshold — fire once the turn-end save has
+        # landed (the service reads the first prompt + response
+        # from the DB). The atomic claim dedupes against the
+        # threshold fire. One pump == one turn.
+        if self._title_armed:
+            self._title_armed = False
+            from services import title_generator
+            _title_cid = self.chat_id
+
+            def _fire_title(_f=None, *, _cid=_title_cid) -> None:
+                spawn(title_generator.request_chat_title(_cid),
+                      name="request_chat_title", owner="stream_pump")
+
+            if save_fut is not None:
+                save_fut.add_done_callback(_fire_title)
+            else:
+                _fire_title()
+        # all_done goes out from the finally, after this turn's rows
+        # have landed: "done" means "persisted" to the queue drain
+        # and the resume re-send.
+        self._completed = True
+
+    async def _on_accept_event(self, event: CommonEvent) -> None:
+        """A queued turn or a steer the engine accepted: its row and its
+        frame, or the typed error that ends the turn."""
+        # An accept that fails (a lane or DB error) ends the turn
+        # typed, with its row and its card, like any error.
+        try:
+            await (self._accept_queue_turn if event.type == QUEUE_TURN
+                   else self._accept_steer)(event.data)
+        except Exception as e:
+            logger.exception("chat=%s: an accept failed", self.chat_id[:8])
+            await self.event_queue.put(CommonEvent(type=ERROR, data={
+                "message": f"the message could not be saved: {e}"}))
+
+    async def _on_artifact_turn(self, event: CommonEvent) -> None:
+        """Drained backchannel interactions: one event row each, forwarded
+        live."""
+        # Drained backchannel interactions (artifact sends AND
+        # app send_prompt actions, kind-tagged): one distinct
+        # event row per entry (NEVER a "user" row — the row type +
+        # the framed prompt carry the provenance), forwarded live
+        # so the sender's transcript shows the chip at delivery.
+        from core.events import artifact_events as _ai
+        self._engine_turn_begins()
+        _art_rows = [
+            (_ai.event_type(it), _ai.event_row_json(it))
+            for it in event.data.get("interactions", [])
+        ]
+        _art_cid = self.chat_id
+
+        def _art_job(_rows=_art_rows, *, _cid=_art_cid) -> None:
+            for _etype, _edata in _rows:
+                task_store.add_chat_message(
+                    _cid, "event", "", event_type=_etype, event_data=_edata,
                 )
 
-            # Supersession guard: a NEWER pump may already own this chat — an
-            # abort + fast resend starts the next turn's pump while this one is
-            # still unwinding. Only the still-current pump may stamp the turn
-            # end, tear down shared per-chat state or declare the chat ready
-            # below; a late pop / "ready" broadcast from the aborted pump would
-            # wipe the new turn's live state and flip the live UI idle mid-turn
-            # (the session_id check alone doesn't cover Codex, where abort
-            # keeps the daemon and the next turn reuses the same session_id).
-            was_active_pump = _active_pumps.get(self.chat_id) is self
-            end_fut = self._submit_turn_end_job() if was_active_pump else None
-            end_row: dict | None = None
-            end_meeting = False
-            end_label = ""
-            still_active = was_active_pump
-            try:
-                # Every row of this turn is committed before the pump leaves
-                # _active_pumps, forwards all_done and declares the chat ready
-                # — "done" means "persisted" to the post-turn queue drain and
-                # the resume re-send. The loop stays free meanwhile.
-                await self._drain_writes()
-                if end_fut is not None and not end_fut.cancelled() and end_fut.exception() is None:
-                    end_row, end_meeting, end_label = end_fut.result()
-                if self._completed:
-                    await self._forward({"pump_type": wire.PUMP_ALL_DONE})
-            finally:
-                # Shared-state teardown runs whatever happened above (a
-                # cancellation inside the drain must not leave the pump
-                # registered as live). Re-check ownership: a newer pump may
-                # have registered during the drain.
-                # Clear live state + deregister (only if we're still the
-                # current pump). EXCEPTION: while background subagents are
-                # still running, keep a reduced live-state residual — the
-                # running-agent badges only — so a reconnect between this
-                # turn's end and the nudge turn still renders them. The
-                # turn's text/widgets are in the DB now (drained above), so
-                # live_blocks are dropped to avoid double-rendering against
-                # chat history; the status bar's active_agents is the only
-                # thing the DB can't reconstruct mid-flight. Each agent's
-                # badge clears via mark_subagent_done as it finishes; the
-                # nudge turn's pump pops the state fully when has_pending is
-                # finally False.
-                still_active = _active_pumps.get(self.chat_id) is self
-                live = _chat_streaming_state.get(self.chat_id)
-                if still_active and live and live.get("session_id") == self.session_id:
-                    if (get_subagent_registry(self.session_id).has_pending
-                            or get_bg_command_registry(self.session_id).has_pending):
-                        live["streaming"] = False
-                        live["live_blocks"] = []
-                        live["active_tools"] = []
-                        live["pending_permission"] = None
-                        live["thinking_active"] = False
-                        live["thinking_text"] = ""
-                        live["thinking_tokens"] = 0
-                        live["todos"] = []
-                        live["active_agents"] = [
-                            a for a in live.get("active_agents", []) if a.get("active")
-                        ]
-                        live["active_delegates"] = [
-                            d for d in live.get("active_delegates", []) if d.get("active")
-                        ]
-                        live["active_commands"] = [
-                            c for c in live.get("active_commands", []) if c.get("active")
-                        ]
-                    else:
-                        _chat_streaming_state.pop(self.chat_id, None)
-                if still_active:
-                    del _active_pumps[self.chat_id]
-                    # What the chat's queue still holds: what was queued
-                    # before a failure goes back to its authors, the rest
-                    # goes out as the next turn (an attached viewer drains its
-                    # own on its loop's way out first). A pump that ended
-                    # without its result and without a Stop failed too. A
-                    # superseded pump leaves it to the pump that owns the
-                    # chat now.
-                    if (self._return_upto is None and not self._completed
-                            and not self.stopped):
-                        self._return_upto = input_queue.get(self.chat_id).seq
+        if _art_rows:
+            chat_writer.submit(_art_cid, _art_job, label="artifact_turn")
+        for it in event.data.get("interactions", []):
+            frame = _ai.ws_frame(it, self.chat_id)
+            frame["pump_type"] = frame.pop("type")
+            await self._forward(frame)
+
+    async def _on_review_turn(self, event: CommonEvent) -> None:
+        """A run's review of its finished background work (the task
+        producer's): the blocks so far saved, then one nudge row per kind on
+        the lane after them, then the badges of the jobs it names cleared
+        (a completion read during the settle reaches no viewer when the
+        registry has no chat bound) and each kind's frame flagged ``review``
+        so the viewer ends the bubble there, as the rows draw it. Never a
+        person's row: nobody wrote the nudge."""
+        self._flush_pending_text()
+        if self._turn_blocks:
+            self._save_turn_blocks()
+        # The restart replay covers the engine turn starting now only.
+        self._steer_saved_ranges = []
+        self._engine_turn_begins()
+        nudges = [n for n in event.data.get("nudges") or () if n.get("event_type")]
+        if not nudges:
+            return
+        rows = [(n["event_type"], json.dumps({"count": n.get("count", 0),
+                                               "labels": list(n.get("labels") or ())}))
+                for n in nudges]
+        chat_id = self.chat_id
+
+        def _job() -> int:
+            # One transaction for both kinds: never one line without the other.
+            return task_store.add_chat_messages_batch(
+                chat_id, [("event", "", etype, edata) for etype, edata in rows])
+
+        def _landed(f: asyncio.Future) -> None:
+            # The rows are final and no live block holds them: a reconnect
+            # mid-review reads them from the history (only a person's row is
+            # exempt from the in-flight cut).
+            if f.cancelled() or f.exception() is not None:
+                return
+            self._db_msg_cutoff_id = max(self._db_msg_cutoff_id or 0, f.result() or 0)
+
+        # The rows land before the frames, as a queued turn's do, and are
+        # counted in flight the same way: a resume at the boundary drains
+        # the lane before its cut, so it reads them from the history. A
+        # failed write is logged by the lane; the frames still go out.
+        self.accepts_in_flight += 1
+        try:
+            fut = chat_writer.submit(chat_id, _job, label="review_turn")
+            fut.add_done_callback(_landed)
+            with contextlib.suppress(Exception):
+                await fut
+        finally:
+            self.accepts_in_flight -= 1
+        live = _chat_streaming_state.get(chat_id)
+        for n in nudges:
+            agents = n["event_type"] == wire.PERSISTED_BG_NUDGE
+            for tuid in n.get("tool_use_ids") or ():
+                if not tuid:
+                    continue
+                if agents:
+                    await self._on_subagent_end({"tool_use_id": tuid}, live)
+                else:
+                    # The producer knows the job ended, not how.
+                    await self._on_bg_command_end({"tool_use_id": tuid}, live)
+            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": {
+                "type": wire.BG_AGENTS_COMPLETE if agents else wire.BG_COMMANDS_COMPLETE,
+                "count": n.get("count", 0), "review": True}})
+
+    async def _persist_tail(self) -> None:
+        """The loop's end, first half: nothing drains the queues any more,
+        the producer is ended and awaited, what the turn left unflushed is
+        saved (the thinking rest, the active tools, a late steer, the spoken
+        leftovers) and the plan's status lands."""
+        self._done = True
+        # Whatever ended the pump (a cancelled producer, an exception),
+        # nothing drains the queues any more.
+        self.close_queue()
+        self.producer.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self.producer
+
+        # Save any unflushed text/events (error recovery)
+        self._flush_pending_text()
+        await self._flush_pending_previews()
+        # Persist in-progress thinking text too — if the producer died
+        # mid-stream (e.g. asyncio.LimitOverrunError on a large MCP
+        # tool-result line), thinking events between phase=start and
+        # phase=end would otherwise never reach _turn_blocks and the
+        # block would silently vanish on chat refresh.
+        if self._thinking_text:
+            self._turn_blocks.append(self._stamp_speaker({
+                "type": wire.THINKING, "content": self._thinking_text,
+            }))
+            self._thinking_text = ""
+        for tool_evt in self._active_tools.values():
+            self._turn_blocks.append(tool_evt)
+        self._save_turn_blocks()
+        self._submit_cost_job()
+        # A steer the engine accepted after the loop's last read: its row
+        # lands after the final save, and its frame still reaches the
+        # attached viewers before their done.
+        while not self.event_queue.empty():
+            late = self.event_queue.get_nowait()
+            if late.type == STEER_ACCEPTED:
+                with contextlib.suppress(Exception):
+                    await self._accept_steer(late.data)
+        if self._leftover_messages:
+            # Spoken utterances nothing sent stay in the chat as a card.
+            shelve_undelivered(self.chat_id, self._leftover_messages)
+            self._leftover_messages = []
+
+        if self.implementing_plan:
+            chat_writer.submit(
+                self.chat_id,
+                functools.partial(
+                    task_store.update_chat_plan_status,
+                    self.chat_id, self.implementing_plan, "implemented",
+                ),
+                label="plan_status",
+            )
+
+
+    async def _end_turn(self) -> None:
+        """The loop's end, second half: the turn-end job (this pump's only
+        when it still owns the chat), the rows drained before all_done, the
+        live state left or trimmed to the running badges, the registry, the
+        queue's hand-off and the stored wakes' replay (not for a chat being
+        deleted), pump_ended, the sidebar dot and the alert, the library
+        reconcile."""
+        # Supersession guard: a NEWER pump may already own this chat — an
+        # abort + fast resend starts the next turn's pump while this one is
+        # still unwinding. Only the still-current pump may stamp the turn
+        # end, tear down shared per-chat state or declare the chat ready
+        # below; a late pop / "ready" broadcast from the aborted pump would
+        # wipe the new turn's live state and flip the live UI idle mid-turn
+        # (the session_id check alone doesn't cover Codex, where abort
+        # keeps the daemon and the next turn reuses the same session_id).
+        was_active_pump = _active_pumps.get(self.chat_id) is self
+        end_fut = self._submit_turn_end_job() if was_active_pump else None
+        if self._turn_token and not self._keeps_open_turn():
+            chat_writer.submit(self.chat_id, functools.partial(
+                open_turns.end_turn, self.chat_id, self._turn_token), label="turn_close")
+        end_row: dict | None = None
+        end_meeting = False
+        end_label = ""
+        still_active = was_active_pump
+        try:
+            # Every row of this turn is committed before the pump leaves
+            # _active_pumps, forwards all_done and declares the chat ready
+            # — "done" means "persisted" to the post-turn queue drain and
+            # the resume re-send. The loop stays free meanwhile.
+            await self._drain_writes()
+            if end_fut is not None and not end_fut.cancelled() and end_fut.exception() is None:
+                end_row, end_meeting, end_label = end_fut.result()
+            if self._completed:
+                await self._forward({"pump_type": wire.PUMP_ALL_DONE})
+        finally:
+            # Shared-state teardown runs whatever happened above (a
+            # cancellation inside the drain must not leave the pump
+            # registered as live). Re-check ownership: a newer pump may
+            # have registered during the drain.
+            # Clear live state + deregister (only if we're still the
+            # current pump). EXCEPTION: while background subagents are
+            # still running, keep a reduced live-state residual — the
+            # running-agent badges only — so a reconnect between this
+            # turn's end and the nudge turn still renders them. The
+            # turn's text/widgets are in the DB now (drained above), so
+            # live_blocks are dropped to avoid double-rendering against
+            # chat history; the status bar's active_agents is the only
+            # thing the DB can't reconstruct mid-flight. Each agent's
+            # badge clears via mark_subagent_done as it finishes; the
+            # nudge turn's pump pops the state fully when has_pending is
+            # finally False.
+            still_active = _active_pumps.get(self.chat_id) is self
+            live = _chat_streaming_state.get(self.chat_id)
+            if still_active and live and live.get("session_id") == self.session_id:
+                if (get_subagent_registry(self.session_id).has_pending
+                        or get_bg_command_registry(self.session_id).has_pending):
+                    live["streaming"] = False
+                    live["live_blocks"] = []
+                    live["active_tools"] = []
+                    live["pending_permission"] = None
+                    live["thinking_active"] = False
+                    live["thinking_text"] = ""
+                    live["thinking_tokens"] = 0
+                    live["todos"] = []
+                    live["active_agents"] = [
+                        a for a in live.get("active_agents", []) if a.get("active")
+                    ]
+                    live["active_delegates"] = [
+                        d for d in live.get("active_delegates", []) if d.get("active")
+                    ]
+                    live["active_commands"] = [
+                        c for c in live.get("active_commands", []) if c.get("active")
+                    ]
+                else:
+                    _chat_streaming_state.pop(self.chat_id, None)
+            if still_active:
+                del _active_pumps[self.chat_id]
+                # What the chat's queue still holds: what was queued
+                # before a failure goes back to its authors, the rest
+                # goes out as the next turn (an attached viewer drains its
+                # own on its loop's way out first). A pump that ended
+                # without its result and without a Stop failed too. A
+                # superseded pump leaves it to the pump that owns the
+                # chat now.
+                if (self._return_upto is None and not self._completed
+                        and not self.stopped):
+                    self._return_upto = input_queue.get(self.chat_id).seq
+                # A deleted chat's queue goes with the chat: nothing is
+                # returned or delivered, no wake is replayed.
+                if not self.deleting:
                     input_queue.on_pump_end(
                         self.chat_id, return_upto=self._return_upto,
                         viewers=self.has_viewers,
@@ -1826,57 +2160,70 @@ class ChatStreamPump:
                         _stored_wake_chats.discard(self.chat_id)
                         _spawn_replay(self.chat_id)
 
-                # Signal any remaining subscribers (a later attach gets it too)
-                self._flush_deltas()
-                self._ended = True
-                self._deliver({"pump_type": wire.PUMP_ENDED})
+            # Signal any remaining subscribers (a later attach gets it too)
+            self._flush_deltas()
+            self._ended = True
+            self._deliver({"pump_type": wire.PUMP_ENDED})
 
-            # Fire the ephemeral turn-complete signal — but NOT while background
-            # subagents are still running. When the LLM spawns bg agents and ends
-            # its turn ("launched, I'll review when done"), the work is not
-            # actually finished; the genuine completion is the nudge turn that
-            # fires once every SubagentStop has landed. Notifying here would alert
-            # "finished" prematurely (and, for the in-app ping, twice). The nudge
-            # turn's pump end has no pending agents, so it fires the real one.
-            # notification_manager decides foreground (in-app onDone ping) vs
-            # backgrounded (FCM vibration) — we just gate on "genuinely done".
-            try:
-                if not still_active:
-                    # Superseded by a newer pump for this chat: it broadcast
-                    # "streaming" at its _run entry, so OUR "ready" would land
-                    # after it and clear the live dot/stop button mid-turn.
-                    # The new pump owns the ready broadcast + notification.
-                    logger.debug(
-                        f"chat={self.chat_id}: superseded pump — skipping ready "
-                        f"broadcast + end-of-turn notification"
-                    )
-                elif get_subagent_registry(self.session_id).has_pending:
-                    logger.debug(
-                        f"chat={self.chat_id}: end-of-turn notification deferred — "
-                        f"background subagents still running (nudge turn will fire it)"
-                    )
-                else:
-                    self._fire_end_of_turn(end_row, end_meeting, end_label)
-            except Exception:
-                pass  # Don't break pump cleanup for notification failure
+        # Fire the ephemeral turn-complete signal — but NOT while background
+        # subagents are still running. When the LLM spawns bg agents and ends
+        # its turn ("launched, I'll review when done"), the work is not
+        # actually finished; the genuine completion is the nudge turn that
+        # fires once every SubagentStop has landed. Notifying here would alert
+        # "finished" prematurely (and, for the in-app ping, twice). The nudge
+        # turn's pump end has no pending agents, so it fires the real one.
+        # notification_manager decides foreground (in-app onDone ping) vs
+        # backgrounded (FCM vibration) — we just gate on "genuinely done".
+        try:
+            if not still_active:
+                # Superseded by a newer pump for this chat: it broadcast
+                # "streaming" at its _run entry, so OUR "ready" would land
+                # after it and clear the live dot/stop button mid-turn.
+                # The new pump owns the ready broadcast + notification.
+                logger.debug(
+                    "chat=%s: superseded pump — skipping ready "
+                    "broadcast + end-of-turn notification", self.chat_id
+                )
+            elif get_subagent_registry(self.session_id).has_pending:
+                logger.debug(
+                    "chat=%s: end-of-turn notification deferred — "
+                    "background subagents still running (nudge turn will fire it)",
+                    self.chat_id
+                )
+            else:
+                self._fire_end_of_turn(end_row, end_meeting, end_label)
+        except Exception:  # noqa: BLE001  # the end-of-turn fan-out must not break the pump's teardown
+            pass  # Don't break pump cleanup for notification failure
 
-            # Shared-library turn-end reconcile: a sandbox delete/write inside
-            # a library (mirror or source) passes no proxy chokepoint — kick
-            # the projector now so the agent's own change lands before it
-            # reports, instead of waiting for the 5-minute sweep. No-op for
-            # agents without library rows (one indexed SELECT). Uses the row
-            # the turn-end job returned — no loop-side read.
-            try:
-                if end_row and end_row.get("agent"):
-                    from services.knowledge import library_projector
-                    library_projector.schedule_reconcile_for_agent(end_row["agent"])
-            except Exception:
-                pass
+        # Shared-library turn-end reconcile: a sandbox delete/write inside
+        # a library (mirror or source) passes no proxy chokepoint — kick
+        # the projector now so the agent's own change lands before it
+        # reports, instead of waiting for the 5-minute sweep. No-op for
+        # agents without library rows (one indexed SELECT). Uses the row
+        # the turn-end job returned — no loop-side read.
+        try:
+            if end_row and end_row.get("agent"):
+                from services.knowledge import library_projector
+                library_projector.schedule_reconcile_for_agent(end_row["agent"])
+        except ImportError:
+            pass
 
-            logger.info(
-                f"ChatStreamPump ended: chat={self.chat_id}, "
-                f"blocks={len(self._turn_blocks)}, plan={self.implementing_plan or 'none'}"
-            )
+        logger.info(
+            "ChatStreamPump ended: chat=%s, "
+            "blocks=%s, plan=%s",
+            self.chat_id, len(self._turn_blocks), self.implementing_plan or 'none'
+        )
+
+
+    def _keeps_open_turn(self) -> bool:
+        """The turn's open-turn record outlives the pump: the replay writes
+        this turn (it takes the record), or the platform is ending and the
+        turn got neither its engine's result nor a typed ending, and nobody
+        stopped or deleted it (the boot writes its closing row)."""
+        if self.chat_id in _recovery_suppress_flush:
+            return True
+        return (_platform_ending and not self._engine_done and self.last_ending is None
+                and not self.stopped and not self.deleting)
 
     def _fire_end_of_turn(self, chat: dict | None, in_meeting: bool,
                           agent_label: str) -> None:
@@ -1898,7 +2245,9 @@ class ChatStreamPump:
             chat["user_sub"], self.chat_id, chat_phase.READY,
             agent=chat.get("agent") or "",
         )
-        if self.source_type == session_kind.TASK.source_type:
+        # A deleted chat's turn ended because the chat is going: the dot
+        # clears everywhere, nothing "finished".
+        if self.source_type == session_kind.TASK.source_type or self.deleting:
             return
         if not in_meeting:
             spawn(notification_manager.fire_ephemeral(
@@ -1908,14 +2257,17 @@ class ChatStreamPump:
                 chat_id=self.chat_id,
             ), name="fire_ephemeral", owner="stream_pump")
 
-    @staticmethod
-    def _live_append_text(live: dict, text: str):
-        """Append text to the last text block in live_blocks, or create a new one."""
+    def _live_append_text(self, live: dict, text: str, note: bool | None = None):
+        """Append text to the last text block in live_blocks when it is of the
+        same kind (a progress note or not; ``None``: either), or create a new
+        one (also instead of one a checkpoint in flight will trim)."""
         blocks = live["live_blocks"]
-        if blocks and blocks[-1].get("type") == wire.LIVE_TEXT:
-            blocks[-1]["content"] += text
+        last = blocks[-1] if blocks else None
+        if (last is not None and last.get("type") == wire.LIVE_TEXT and id(last) not in self._checkpoint_trims
+                and (note is None or bool(last.get("note")) == note)):
+            last["content"] += text
         else:
-            blocks.append({"type": wire.TEXT, "content": text})
+            blocks.append({"type": wire.TEXT, "content": text, **({"note": True} if note else {})})
 
     async def _clear_orphan_thinking(self, live: dict | None):
         """Real output started while a progress-only thinking was still live.
@@ -1930,679 +2282,48 @@ class ChatStreamPump:
             live["thinking_tokens"] = 0
             await self._forward_event(THINKING, {"phase": "end", "text": ""})
 
-    async def _process_event(self, event: CommonEvent):
-        """Process a single CommonEvent — update live state, save events, forward.
-
-        Text is accumulated in _pending_text. Before any non-text event,
-        pending text is flushed to _turn_blocks. This preserves interleaving
-        so widgets appear in correct position after page refresh.
-        live_blocks mirrors this interleaving for reconnect rendering.
-
-        Execution-layer agnostic: operates on CommonEvent, not ClaudeStreamChunk.
-        """
-        live = _chat_streaming_state.get(self.chat_id)
-        ed = event.data
-
-        if event.type == TEXT:
-            content = ed.get("content", "")
-            if content:
-                await self._clear_orphan_thinking(live)
-                await self._forward_delta(TEXT, {"content": content})
-                self._pending_text.append(content)
-                if live:
-                    self._live_append_text(live, content)
-                # LLM chat-title: once the first response crosses the length
-                # threshold on the first turn, fire the title upgrade early (feels
-                # instant) from the response so far. Disarmed immediately; the
-                # PRODUCER_DONE fallback covers shorter turns; the atomic claim
-                # guarantees exactly-once.
-                if self._title_armed and sum(
-                    len(t) for t in self._pending_text
-                ) >= _TITLE_CHAR_THRESHOLD:
-                    self._title_armed = False
-                    from services import title_generator
-                    spawn(title_generator.request_chat_title(
-                        self.chat_id, assistant_excerpt="".join(self._pending_text),
-                    ), name="request_chat_title", owner="stream_pump")
-
-        elif event.type == THINKING:
-            await self._forward_delta(THINKING, ed)
-            live = _chat_streaming_state.get(self.chat_id)
-            if ed.get("phase") == "start":
-                self._thinking_text = ""
-                if live:
-                    live["thinking_active"] = True
-                    live["thinking_text"] = ""
-                    live["thinking_tokens"] = 0
-            elif ed.get("phase") == "progress":
-                # Live-only token-estimate gauge (adaptive-effort models hide
-                # the thinking CONTENT — the CLI sends `thinking_tokens` pings
-                # instead; see the translator). Never accumulated, never
-                # persisted — only the live dict + the forward above.
-                if live:
-                    live["thinking_active"] = True
-                    live["thinking_tokens"] = ed.get("estimated_tokens", 0)
-            elif ed.get("text"):
-                self._thinking_text += ed["text"]
-                if live:
-                    live["thinking_text"] = self._thinking_text
-            elif ed.get("phase") == "end":
-                if self._thinking_text:
-                    self._flush_pending_text()
-                    thinking_block = self._stamp_speaker(
-                        {"type": wire.THINKING, "content": self._thinking_text})
-                    self._turn_blocks.append(thinking_block)
-                    if live:
-                        live["live_blocks"].append(thinking_block)
-                self._thinking_text = ""
-                if live:
-                    live["thinking_active"] = False
-                    live["thinking_text"] = ""
-                    live["thinking_tokens"] = 0
-
-        elif event.type == TOOL_USE:
-            await self._clear_orphan_thinking(live)
-            await self._forward_event(TOOL_USE, ed)
-            tool_name = ed.get("name", "")
-            # LLM chat-title: tool-count early trigger. Counted at branch top —
-            # before _skips_tool_persist — so subagent/delegate spawns count.
-            self._tool_seen += 1
-            if self._title_armed and self._tool_seen >= _TITLE_TOOL_THRESHOLD:
-                self._title_armed = False
-                from services import title_generator
-                spawn(title_generator.request_chat_title(
-                    self.chat_id, assistant_excerpt="".join(self._pending_text),
-                ), name="request_chat_title", owner="stream_pump")
-            # A memory tool call resets this session's capture-nudge counter
-            # (services/memory_nudge). Name shapes: mcp__memory-mcp__memory
-            # (CLI/Codex) or bare "memory" (Direct LLM).
-            if tool_name == "memory" or tool_name.startswith("mcp__memory-mcp__"):
-                try:
-                    from services.memory import memory_nudge
-                    memory_nudge.record_memory_call(self.session_id)
-                except Exception:
-                    pass
-            # Record tool-start time for any MCP with `outputs` declared so
-            # mcp_output_relocation can diff source dir by mtime on
-            # TOOL_RESULT and move just the newly-written files.
-            if tool_name.startswith("mcp__"):
-                try:
-                    # mcp__{server_name}__{tool} → resolve server_name to MCP name
-                    parts = tool_name.split("__", 2)
-                    if len(parts) >= 2:
-                        from services.mcp import mcp_output_relocation, mcp_registry
-                        server_name = parts[1]
-                        for n, m in mcp_registry.get_all_manifests().items():
-                            if (m.server_name or m.name) == server_name and m.outputs:
-                                mcp_output_relocation.record_tool_start(
-                                    self.session_id, n,
-                                )
-                                break
-                except Exception:
-                    logger.debug("record_tool_start failed", exc_info=True)
-            # Skip tool tracking for Agent/Task/PlanMode (they have dedicated events)
-            if not self._skips_tool_persist(tool_name):
-                tool_id = ed.get("tool_id") or tool_name
-                self._flush_pending_text()
-                tool_block = self._stamp_speaker({
-                    "type": wire.PERSISTED_TOOL, "name": tool_name,
-                    "tool_id": tool_id, "summary": "", "active": True,
-                    "tool_input": None,
-                    "_insert_idx": len(self._turn_blocks),  # track position for correct DB ordering
-                })
-                self._active_tools[tool_id] = tool_block
-                if live:
-                    live["active_tools"] = list(self._active_tools.values())
-                    live["live_blocks"].append(tool_block)
-
-        elif event.type == TOOL_INPUT:
-            await self._forward_event(TOOL_INPUT, ed)
-            name = ed.get("name", "")
-            summary = ed.get("summary", "")
-            tool_input = ed.get("tool_input")
-            for t in self._active_tools.values():
-                if t["name"] == name:
-                    t["summary"] = summary
-                    t["tool_input"] = tool_input
-                    break
-            # Capture plan filename from file-writing tools. Normalize
-            # separators first: a Windows-satellite session reports the
-            # host-absolute path with backslashes (C:\Users\...\.claude\plans\x.md).
-            if tool_roles.role_of(name) == tool_roles.WRITE:
-                fp = (ed.get("file_path", "") or "").replace("\\", "/")
-                if ("/.claude/plans/" in fp or "/.codex/plans/" in fp) and fp.endswith(".md"):
-                    self._plan_filename = fp.rsplit("/", 1)[-1]
-            # Note: TodoWrite todo updates are now handled by the TODO_UPDATE
-            # CommonEvent emitted by the translator (cross-layer abstraction).
-
-        elif event.type == TOOL_RESULT:
-            tool_id = ed.get("tool_id") or ed.get("name", "")
-            tool_name = ed.get("name", "")
-            # Codex-style completions carry the output inline (the CLI path
-            # gets it via the PostToolUse hook instead): attach it to the
-            # still-active block + emit the hook path's `tool_result` frame
-            # BEFORE tool_end, and keep the body out of the tool_end frame.
-            result_content = ed.pop("result_content", None)
-            result_is_error = bool(ed.pop("is_error", False))
-            # A Codex MCP result's pictures and blobs: kept and shown for a
-            # tool its MCP opts in (``result_files``), never forwarded or
-            # recorded with the tool block.
-            result_blocks = ed.pop("result_blocks", None)
-            result_owner = ed.pop("result_session_id", None) or self.session_id
-            if result_blocks:
-                from services.mcp import result_files
-                await result_files.keep_blocks(result_owner, tool_name, result_blocks,
-                                               result_content or "", is_error=result_is_error)
-            if result_content:
-                result_content = truncate_result(result_content)
-                summary = result_summary(tool_name, result_content)
-                target = self._active_tools.get(tool_id)
-                if target is None:
-                    for t in self._active_tools.values():
-                        if t["name"] == tool_name:
-                            target = t
-                            break
-                if target is not None:
-                    target["tool_result"] = result_content
-                    target["result_summary"] = summary
-                    target["is_error"] = result_is_error
-                await self._forward({"pump_type": wire.PUMP_WS_EVENT,
-                    "event": {"type": wire.TOOL_RESULT,
-                               "tool_name": tool_name,
-                               "tool_use_id": tool_id,
-                               "summary": summary,
-                               "result_content": result_content}})
-            await self._forward_event(TOOL_RESULT, ed)
-            tool_evt = self._active_tools.pop(tool_id, None)
-            if tool_evt:
-                tool_evt["active"] = False  # Also updates live_blocks (same dict ref)
-                self._flush_pending_text()
-                # Insert at the position where the tool STARTED (not at end).
-                # This ensures hook-pushed events (images, previews) that arrived
-                # during tool execution appear AFTER the tool block in DB order.
-                insert_idx = tool_evt.pop("_insert_idx", len(self._turn_blocks))
-                insert_idx = min(insert_idx, len(self._turn_blocks))
-                self._turn_blocks.insert(insert_idx, tool_evt)
-            if live:
-                live["active_tools"] = list(self._active_tools.values())
-
-            # Relocate any files an MCP with `outputs` just produced into
-            # the session-scoped workspace subdir. Camoufox screenshots
-            # flow through here (privacy + cleanup). For remote sessions
-            # the relocated files are also pushed to the satellite so the
-            # agent CLI on the satellite can read them at the same path.
-            if tool_name.startswith("mcp__"):
-                try:
-                    parts = tool_name.split("__", 2)
-                    if len(parts) >= 2:
-                        from services.mcp import mcp_output_relocation, mcp_registry
-                        server_name = parts[1]
-                        tool_only = parts[2] if len(parts) >= 3 else ""
-                        for n, m in mcp_registry.get_all_manifests().items():
-                            if (m.server_name or m.name) == server_name and m.outputs:
-                                # tool_evt carries the tool's result text (set by
-                                # the PostToolUse hook) → precise move-by-filename;
-                                # None on the Codex/interactive paths → mtime scan.
-                                await mcp_output_relocation.relocate_and_push_for_tool(
-                                    self.session_id, n, tool_only,
-                                    result_text=(tool_evt or {}).get("tool_result"),
-                                )
-                                break
-                except Exception:
-                    logger.debug("output relocation failed", exc_info=True)
-
-            # Generic per-tool cost evaluation. Looks up the manifest's
-            # `costs` block (if any) and applies the first matching rule
-            # against the args we stashed when we saw the TOOL_INPUT event.
-            # See services/mcp/mcp_cost_engine.py.
-            #
-            # Caveats:
-            #   - Failed tool calls are NOT charged: the PostToolUse hook
-            #     reports `is_error` (the structured MCP flag, or an "Error…"
-            #     result for MCPs that return failures as plain text), which we
-            #     stashed on the tool block above. The direct/codex paths have
-            #     no such hook, so a failed tool there can still be charged
-            #     (secondary follow-up).
-            #   - Aborts between TOOL_USE and TOOL_RESULT are NOT charged
-            #     (TOOL_RESULT never fires).
-            if (
-                tool_evt is not None
-                and not tool_evt.get("is_error")
-                and tool_name.startswith("mcp__")
-            ):
-                try:
-                    from services.mcp import mcp_cost_engine
-                    found = mcp_cost_engine.find_costs_block_for_tool(tool_name)
-                    if found is not None:
-                        mcp_name, plain_tool, costs_block = found
-                        hit = mcp_cost_engine.evaluate(
-                            mcp_name, plain_tool, tool_evt.get("tool_input"), costs_block,
-                        )
-                        if hit is not None and hit.amount > 0:
-                            self._total_cost_delta += hit.amount
-                            key = (hit.provider, hit.model)
-                            self._mcp_cost_by_key[key] = round(
-                                self._mcp_cost_by_key.get(key, 0.0) + hit.amount, 6,
-                            )
-                            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": {
-                                "type": wire.MCP_COST,
-                                "cost_usd": hit.amount,
-                                # A tool fee is money whatever credential the
-                                # LLM runs on — the gauge shows it even on a
-                                # subscription / local-model chat.
-                                "cost_billed": True,
-                                "provider": hit.provider,
-                                "model": hit.model,
-                                "tool": plain_tool,
-                                "mcp": mcp_name,
-                            }})
-                except Exception:
-                    logger.exception("mcp cost evaluation failed for %s", tool_name)
-
-        elif event.type == SUBAGENT_START:
-            await self._forward_event(SUBAGENT_START, ed)
-            self._flush_pending_text()
-            self._turn_blocks.append({"type": wire.TASK_SPAWN, **ed})
-            is_bg = ed.get("run_in_background", False)
-            if live:
-                agent_block = {
-                    "type": wire.LIVE_AGENT,
-                    "description": ed.get("description", ""),
-                    "subagent_type": ed.get("subagent_type", ""),
-                    "background": is_bg,
-                    "tool_use_id": ed.get("tool_use_id", ""),  # completion key (SUBAGENT_END)
-                    "active": True,
-                    # Full Agent tool input — reconnect renders the same
-                    # expandable detail as the live pill.
-                    "tool_input": ed.get("tool_input"),
-                }
-                live["active_agents"].append(agent_block)
-                live["live_blocks"].append(agent_block)  # Same dict ref — updates propagate
-
-        elif event.type == SUBAGENT_END:
-            # Deterministic per-agent completion (stdout task_notification
-            # backup path; the SubagentStop hook delivers the same WS event
-            # out-of-band via push_pump_event). Clears the widget by id —
-            # order-independent, no FIFO.
-            tuid = ed.get("tool_use_id", "")
-            await self._forward_event(SUBAGENT_END, {"tool_use_id": tuid})
-            if live and tuid:
-                for a in live["active_agents"]:
-                    if a.get("tool_use_id") == tuid:
-                        a["active"] = False
-                        break
-
-        elif event.type == BG_COMMAND_START:
-            # Backgrounded bash command — mirror SUBAGENT_START: a live badge +
-            # inline block keyed by the Bash tool_use_id. The dashboard FOLDS
-            # the command's normal tool card into this block by that id
-            # (pairBgCommandBlocks) — one expandable pill per command.
-            # Completion (BG_COMMAND_END) clears it by id, order-independent
-            # (multiple bg commands run concurrently).
-            await self._forward_event(BG_COMMAND_START, ed)
-            self._flush_pending_text()
-            self._turn_blocks.append({"type": wire.BG_COMMAND_SPAWN, **ed})
-            if live:
-                command_block = {
-                    "type": wire.LIVE_COMMAND,
-                    "command": ed.get("command", ""),
-                    "description": ed.get("description", ""),
-                    "tool_use_id": ed.get("tool_use_id", ""),  # completion key (BG_COMMAND_END)
-                    "active": True,
-                }
-                live["active_commands"].append(command_block)
-                live["live_blocks"].append(command_block)  # same dict ref — updates propagate
-
-        elif event.type == BG_COMMAND_END:
-            # Deterministic per-command completion — driven by the CLI
-            # task_updated frame (no completion hook exists for bg bash). Clears
-            # the widget by tool_use_id, order-independent (no FIFO guessing).
-            tuid = ed.get("tool_use_id", "")
-            await self._forward_event(BG_COMMAND_END, {"tool_use_id": tuid,
-                                                       "status": ed.get("status", "")})
-            if live and tuid:
-                for c in live["active_commands"]:
-                    if c.get("tool_use_id") == tuid:
-                        c["active"] = False
-                        break
-
-        elif event.type == WORKFLOW_START:
-            # Dynamic workflow (Opus 4.8 Workflow tool) — one orchestration
-            # spawning many agents, surfaced as a live phase/agent tree in the
-            # floating WorkflowPanel. Like the TodoPanel checklist, this is
-            # live-state only (not persisted as a turn block) — the agents'
-            # actual output streams as normal text/tool blocks.
-            tuid = ed.get("tool_use_id", "")
-            await self._forward_event(WORKFLOW_START, {
-                "tool_use_id": tuid, "workflow_name": ed.get("workflow_name", ""),
+    # The two handlers kept beside the globals they read while the rest
+    # live in pump_event_handlers.py: this one's coalescing window and clock
+    # share a home with _forward_delta's (the clock the characterization
+    # trace replaces is this module's `time`).
+    async def _on_workflow_progress(self, ed: dict, live: dict | None) -> None:
+        tuid = ed.get("tool_use_id", "")
+        progress = ed.get("workflow_progress", [])
+        # Live state always holds the latest snapshot (reconnect accuracy).
+        if live and tuid in live.get("workflows", {}):
+            live["workflows"][tuid]["progress"] = progress
+        # Coalesce WS forwards so a fast workflow can't flood the satellite.
+        now = time.monotonic()
+        if now - self._wf_last_forward.get(tuid, 0.0) >= _WORKFLOW_PROGRESS_MIN_INTERVAL:
+            self._wf_last_forward[tuid] = now
+            await self._forward_event(WORKFLOW_PROGRESS, {
+                "tool_use_id": tuid, "workflow_progress": progress,
             })
-            if live:
-                live["workflows"][tuid] = {
-                    "tool_use_id": tuid,
-                    "workflow_name": ed.get("workflow_name", ""),
-                    "progress": [], "active": True,
-                }
 
-        elif event.type == WORKFLOW_PROGRESS:
-            tuid = ed.get("tool_use_id", "")
-            progress = ed.get("workflow_progress", [])
-            # Live state always holds the latest snapshot (reconnect accuracy).
-            if live and tuid in live.get("workflows", {}):
-                live["workflows"][tuid]["progress"] = progress
-            # Coalesce WS forwards so a fast workflow can't flood the satellite.
-            now = time.monotonic()
-            if now - self._wf_last_forward.get(tuid, 0.0) >= _WORKFLOW_PROGRESS_MIN_INTERVAL:
-                self._wf_last_forward[tuid] = now
-                await self._forward_event(WORKFLOW_PROGRESS, {
-                    "tool_use_id": tuid, "workflow_progress": progress,
-                })
-
-        elif event.type == WORKFLOW_END:
-            tuid = ed.get("tool_use_id", "")
-            self._wf_last_forward.pop(tuid, None)
-            await self._forward_event(WORKFLOW_END, {"tool_use_id": tuid})
-            if live and tuid in live.get("workflows", {}):
-                live["workflows"][tuid]["active"] = False
-
-        elif event.type == DELEGATE_SPAWN:
-            evt = {"type": wire.DELEGATE_SPAWN, **ed}
-            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
-            self._flush_pending_text()
-            self._turn_blocks.append(evt)
-            if live:
-                delegate_block = {
-                    "type": wire.LIVE_DELEGATE,
-                    "task_id": ed.get("task_id", ""),
-                    "task_name": ed.get("task_name", ""),
-                    "agent": ed.get("agent", ""),
-                    # Full prompt for the expandable pill (reconnect parity).
-                    "prompt": ed.get("prompt", ""),
-                    "active": True,
-                    "status": run_status.RUNNING,  # a DELEGATE_RESULTS word on terminal
-                }
-                live["active_delegates"].append(delegate_block)
-                live["live_blocks"].append(delegate_block)
-
-        elif event.type == CHECK_VERDICT:
-            # A check's verdict (CHECKS.md "Rendering"): the card rides the
-            # turn in order — forwarded live, kept in the live state for a
-            # reconnect, persisted as an event row with the turn's blocks.
-            evt = {**ed, "type": wire.CHECK_VERDICT}
-            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
+    # Kept here: tests/core/test_status_surface.py pins the `completed`
+    # compare below to this file's path.
+    async def _on_context_compact(self, ed: dict, live: dict | None) -> None:
+        # Context compression event (CLI auto-compact, Codex compaction, etc.)
+        phase = ed.get("phase", "")
+        evt = {"type": wire.CONTEXT_COMPACT, **ed}
+        await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
+        if phase == "completed":
             self._flush_pending_text()
             self._turn_blocks.append(evt)
             if live:
                 live["live_blocks"].append(evt)
-
-        elif event.type == PERMISSION_REQUEST:
-            # The engine's own request (Claude's stdio channel): a prompt
-            # waiting on a person, answered through the raising session's
-            # layer (core/session/engine_prompts).
-            from core.session import engine_prompts
-            if engine_prompts.withdrawn_before_registered(str(ed.get("request_id") or "")):
-                return   # the engine withdrew it before the card could show
-            engine_prompts.watch(ed.get("session_id") or self.session_id, ed,
-                                 chat_id=self.chat_id)
-            self._flush_pending_text()
-            self._turn_blocks.append({"type": wire.PERMISSION_PROMPT, **ed})
-            # Gate: use the same queue as perm_queue permissions
-            perm_data = {**ed, "event_type": wire.ITEM_PERMISSION_PROMPT}
-            await self._queue_or_show_permission(perm_data)
-
-        elif event.type == PLAN_MODE:
-            evt = {"type": wire.PLAN_MODE, **ed}
-            await self._forward(
-                {"pump_type": wire.PUMP_WS_EVENT, "event": evt},
-            )
-            self._flush_pending_text()
-            self._turn_blocks.append(evt)
-            if live:
-                live["live_blocks"].append(evt)
-            # Update hook mode + DB so plan mode is enforced even without WS
-            action = ed.get("action", "")
-            if action == "enter":
-                set_session_mode(self.session_id, "plan")
+        elif phase == "usage":
+            # Post-compaction gauge state (no chip, not a turn block): a
+            # compaction at/after turn end has no follow-up METADATA frame,
+            # so the compacted size is persisted here — a reopened chat
+            # must not show the pre-compaction gauge.
+            post = int(ed.get("post_tokens", 0) or 0)
+            if post > 0:
+                self._context_used = post
+                if ed.get("context_max"):
+                    self._context_max = int(ed["context_max"])
                 if self.chat_id:
-                    self._submit_chat_update("plan_mode", permission_mode="plan")
-            # exit is handled by plan_review_response (implement sets acceptEdits/default)
-
-        elif event.type == TODO_UPDATE:
-            # Cross-layer todo/checklist update (TodoWrite for CLI, update_plan for Codex)
-            todos = ed.get("todos", [])
-            self._current_todos = todos
-            await self._forward_event(TODO_UPDATE, {"todos": todos})
-            if live:
-                live["todos"] = todos
-            # Some checklist sources have no tool-path block the panel can rehydrate
-            # from on reload — Codex's update_plan (no block at all) and the CLI
-            # TaskCreate/TaskUpdate family (its own inline cards, but no TodoWrite
-            # snapshot). Persist a TodoWrite-shaped block so the checklist survives
-            # turn end + refresh — one block per turn-segment, updated in place (the
-            # frontend + get_last_todo_snapshot restore the panel from the last one).
-            # panel_only marks the Task-tool case so the frontend suppresses it inline
-            # (the TaskCreate/TaskUpdate cards already render); codex omits it (the
-            # synthesized block IS its only inline representation).
-            if ed.get("persist_block"):
-                if self._todo_block is None:
-                    self._flush_pending_text()
-                    self._todo_block = self._stamp_speaker({
-                        "type": wire.PERSISTED_TOOL, "name": tool_roles.TODO_SNAPSHOT,
-                        "tool_input": {"todos": todos},
-                    })
-                    if ed.get("panel_only"):
-                        self._todo_block["panel_only"] = True
-                    self._turn_blocks.append(self._todo_block)
-                else:
-                    self._todo_block["tool_input"]["todos"] = todos
-
-        elif event.type == GOAL_UPDATE:
-            # Codex thread goal — chat-durable panel state, NOT a turn block
-            # (like workflows). Reloads restore it from chats.thread_goal via
-            # restore.goal; live.goal only covers a mid-turn reconnect. The DB
-            # write is change-gated: goal notifications can repeat every turn
-            # and each update_chat bumps updated_at.
-            goal = goal_payload_to_state(ed)
-            changed = goal != self._current_goal
-            self._current_goal = goal
-            await self._forward_event(GOAL_UPDATE, {"goal": goal})
-            if live:
-                live["goal"] = goal
-            if changed and self.chat_id:
-                self._submit_chat_update(
-                    "thread_goal", thread_goal=json.dumps(goal) if goal else None)
-
-        elif event.type == CONTEXT_COMPACT:
-            # Context compression event (CLI auto-compact, Codex compaction, etc.)
-            phase = ed.get("phase", "")
-            evt = {"type": wire.CONTEXT_COMPACT, **ed}
-            await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
-            if phase == "completed":
-                self._flush_pending_text()
-                self._turn_blocks.append(evt)
-                if live:
-                    live["live_blocks"].append(evt)
-            elif phase == "usage":
-                # Post-compaction gauge state (no chip, not a turn block): a
-                # compaction at/after turn end has no follow-up METADATA frame,
-                # so the compacted size is persisted here — a reopened chat
-                # must not show the pre-compaction gauge.
-                post = int(ed.get("post_tokens", 0) or 0)
-                if post > 0:
-                    self._context_used = post
-                    if ed.get("context_max"):
-                        self._context_max = int(ed["context_max"])
-                    if self.chat_id:
-                        self._submit_chat_update("context_used", context_used=post)
-
-        elif event.type == SYSTEM:
-            subtype = ed.get("subtype", "")
-            # Subagent completion (fg + bg) is a first-class SUBAGENT_END
-            # event keyed by tool_use_id (the SubagentStop hook + the
-            # task_notification backup) — no FIFO matching. No layer mints
-            # a `fg_agents_complete` subtype; that frame's one minter is the
-            # liveness clear (ws/dashboard_server_events).
-            if subtype == wire.SUBTYPE_MEETING_STARTED:
-                evt = {"type": wire.SYSTEM, **ed}
-                await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
-                self._flush_pending_text()
-                self._turn_blocks.append(evt)
-                # Save immediately so it appears before any QUEUE_TURN user messages
-                self._save_turn_blocks()
-                if live:
-                    live["meeting_participants"] = ed.get("participants", [])
-                    # Don't re-add to live_blocks — it's now in DB and will come
-                    # via chat_history on reconnect.  Re-adding caused duplicates.
-            elif subtype == wire.SUBTYPE_MEETING_TURN_START:
-                self._meeting_agent = ed.get("agent", "")
-                evt = {"type": wire.SYSTEM, **ed}
-                await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
-                self._flush_pending_text()
-                self._turn_blocks.append(evt)
-                if live:
-                    live["meeting_agent"] = self._meeting_agent
-                    live["live_blocks"].append(evt)
-            elif subtype == wire.SUBTYPE_MEETING_FAILED:
-                # Pre-turn meeting failure (admission denial, spawn failure…)
-                # surfaced by the orchestrator: persist immediately so the
-                # attach-time chat_history re-send carries the banner, and
-                # clear live meeting state so the pill goes away. Not re-added
-                # to live_blocks after the save (meeting_started precedent —
-                # it would duplicate on reconnect).
-                self._meeting_agent = None
-                evt = {"type": wire.SYSTEM, **ed}
-                await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
-                self._flush_pending_text()
-                self._turn_blocks.append(evt)
-                self._save_turn_blocks()
-                if live:
-                    live["meeting_agent"] = None
-                    live["meeting_participants"] = []
-            elif subtype in (wire.SUBTYPE_MEETING_TURN_END, wire.SUBTYPE_MEETING_CONCLUDED, wire.SUBTYPE_MEETING_AGENT_FAILED):
-                if subtype in (wire.SUBTYPE_MEETING_TURN_END, wire.SUBTYPE_MEETING_CONCLUDED):
-                    self._meeting_agent = None
-                evt = {"type": wire.SYSTEM, **ed}
-                await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": evt})
-                self._flush_pending_text()
-                self._turn_blocks.append(evt)
-                # Meeting costs now arrive as separate METADATA events with
-                # _meeting_cost=True (emitted by meeting_produce after computing
-                # per-turn delta). No cost extraction from turn_end/concluded.
-                # Save each meeting turn's blocks immediately so DB order
-                # matches chronological order (user QUEUE_TURN messages also
-                # save immediately, and would otherwise appear before all
-                # meeting content which is deferred to PRODUCER_DONE).
-                self._save_turn_blocks()
-                if live:
-                    if subtype in (wire.SUBTYPE_MEETING_TURN_END, wire.SUBTYPE_MEETING_CONCLUDED):
-                        live["meeting_agent"] = None
-                    if subtype == wire.SUBTYPE_MEETING_CONCLUDED:
-                        live["meeting_participants"] = []
-                    live["live_blocks"].append(evt)
-            elif subtype not in wire.SYSTEM_SUBTYPES_TRANSIENT:
-                evt = {"type": wire.SYSTEM, **ed}
-                await self._forward(
-                    {"pump_type": wire.PUMP_WS_EVENT, "event": evt},
-                )
-                self._flush_pending_text()
-                self._turn_blocks.append(evt)
-                if live:
-                    live["live_blocks"].append(evt)
-
-        elif event.type == METADATA:
-            # Persist Codex thread_id for resume after proxy restart
-            codex_tid = ed.get("codex_thread_id")
-            if codex_tid and self.chat_id:
-                self._submit_chat_update("codex_thread_id", codex_thread_id=codex_tid)
-                return  # internal metadata — don't forward to WS or save as turn block
-
-            # Display-only flag: the chat hides the cost line + gauge for a
-            # subscription / local-model turn. Stamped here, the one place
-            # every emitter (CLI, Codex, direct, satellite, meetings) passes
-            # through, so it rides the WS frame AND the persisted row. A
-            # meeting turn names the speaker's session (each participant
-            # runs on its own account); accounting below is untouched.
-            cost_billed = await self._cost_billed_for(ed.get("session_id") or self.session_id)
-            is_delta = ed.get("cost_is_delta") or ed.get("_meeting_cost")
-            if is_delta:
-                # Cost is already a per-turn delta (Direct LLM, Codex, meetings).
-                # Use directly — don't touch cumulative tracking.
-                turn_cost = ed.get("cost_usd", 0)
-                meta_event = {"type": wire.METADATA, "cost_usd": turn_cost,
-                              "cost_billed": cost_billed}
-                # Preserve context/cache/duration fields if present
-                for k in ("context_used", "context_max", "cache_read",
-                          "cache_write", "input_tokens", "output_tokens",
-                          "duration_ms"):
-                    if k in ed:
-                        meta_event[k] = ed[k]
-                await self._forward({"pump_type": wire.PUMP_WS_EVENT, "event": meta_event})
-                self._flush_pending_text()
-                self._turn_blocks.append(meta_event)
-                self._total_cost_delta += turn_cost
-                self._llm_cost_delta += turn_cost
-            else:
-                # Cost is CUMULATIVE session total (CLI). Compute per-turn delta.
-                session_cost = ed.get("cost_usd", 0)
-                if session_cost < self._last_session_cost:
-                    # CLI process restarted — cost counter reset
-                    self._last_session_cost = 0.0
-                turn_cost = max(0, session_cost - self._last_session_cost)
-                self._last_session_cost = session_cost
-                _session_cumulative_cost[self.session_id] = session_cost
-                # The baseline made durable for a resume after a proxy restart
-                # (the turn-start callback seeds from it: _seed_cost_baseline).
-                if self.chat_id:
-                    self._submit_chat_update(
-                        "engine_cost", engine_cost_total=session_cost,
-                        engine_cost_session_id=self.session_id,
-                    )
-                # Forward per-turn cost (not cumulative)
-                meta_event = {**ed, "cost_usd": turn_cost, "cost_billed": cost_billed}
-                await self._forward_event(METADATA, meta_event)
-                self._flush_pending_text()
-                self._turn_blocks.append({"type": wire.METADATA, **meta_event})
-                self._total_cost_delta += turn_cost
-                self._llm_cost_delta += turn_cost
-            # Track context + cache stats for persistence
-            ctx_used = ed.get("context_used", 0)
-            ctx_max = ed.get("context_max", 0)
-            if ctx_used > 0 and ctx_max > 0:
-                self._context_used = ctx_used
-                self._context_max = ctx_max
-            it = ed.get("input_tokens", 0)
-            cr = ed.get("cache_read", 0)
-            cw = ed.get("cache_write", 0)
-            ot = ed.get("output_tokens", 0)
-            if it > 0:
-                self._input_tokens = it
-            if ot > 0:
-                self._output_tokens = ot
-            if cr > 0 or cw > 0:
-                self._cache_read = cr
-                self._cache_write = cw
-
-        elif event.type == ERROR:
-            # NOTE: the main `_run` loop intercepts ERROR (forward + break) before
-            # this dispatcher is reached, so a grace-expiry's durable marker is
-            # persisted there (see the ERROR branch in `_run`). This path remains
-            # for any future caller that routes an ERROR through `_process_event`.
-            await self._forward_event(ERROR, {"message": ed.get("message", "")})
-
-        elif event.type == DONE:
-            # Turn boundary — flush all pending data to DB in order
-            self._flush_pending_text()
-            await self._flush_pending_previews()
-            for tool_evt in self._active_tools.values():
-                self._turn_blocks.append(tool_evt)
-            self._active_tools.clear()
-            self._save_turn_blocks()
-            self._pending_text.clear()
-            if live:
-                # Don't reset live_blocks — keep accumulating for live_state
-                # reconnect (DB messages are truncated at _db_msg_cutoff_id)
-                self._live_append_text(live, "\n\n")  # paragraph break between turns
-                live["active_tools"] = []
-            await self._forward({"pump_type": wire.PUMP_IS_DONE})
+                    self._submit_chat_update("context_used", context_used=post)
 
     async def _handle_perm_event(self, perm_data: dict):
         """Handle a permission queue event — forward to WS or store for re-presentation."""
@@ -2621,7 +2342,8 @@ class ChatStreamPump:
             # A deferred kind (the document preview) replaces the push of
             # the same file in place and waits for the turn's flush
             # (``_flush_pending_previews``) instead of being forwarded now.
-            evt = artifact_event_from_perm_item(perm_data)
+            # Every artifact kind maps to a frame (artifact_events.KINDS).
+            evt = cast("dict", artifact_event_from_perm_item(perm_data))
             if artifact.block:
                 evt = self._stamp_speaker(evt)
                 self._flush_pending_text()
@@ -2630,7 +2352,7 @@ class ChatStreamPump:
                 if live:
                     _evict_latest(live["live_blocks"], artifact.evicts)
             if artifact.deferred:
-                self._buffer_preview(evt, artifact.identity, live)
+                self._buffer_preview(evt, cast("str", artifact.identity), live)
                 return
             if artifact.block:
                 self._turn_blocks.append(evt)
@@ -2740,7 +2462,7 @@ class ChatStreamPump:
             await self._retire_prompt(perm_data.get("request_id", ""),
                                       caller_gone=bool(perm_data.get("caller_gone")))
         elif evt_type == wire.ITEM_MODE_RESTORED:
-            mode = perm_data.get("mode", "default")
+            mode = perm_data.get("mode") or ASK_MODE
             self._submit_chat_update("mode_restored", permission_mode=mode)
             await self._forward({"pump_type": wire.PUMP_MODE_RESTORED, "mode": mode})
 
@@ -2748,8 +2470,8 @@ class ChatStreamPump:
 # The background-work monitors live in pump_bg_monitors.py; re-exported here
 # so `from core.events.stream_pump import bg_monitor_running` (ws/dashboard) works.
 from core.events.pump_bg_monitors import (  # noqa: F401
-    bg_monitor_running,
     _bg_agent_monitor,
-    bg_command_monitor_running,
     _bg_command_monitor,
+    bg_command_monitor_running,
+    bg_monitor_running,
 )

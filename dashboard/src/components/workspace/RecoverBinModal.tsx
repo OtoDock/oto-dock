@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useState } from 'react'
-import { createPortal } from 'react-dom'
-import { pushEscHandler } from '../../lib/escStack'
+import { useMemo, useState } from 'react'
+import Dialog from '../ui/Dialog'
 import {
   useRestoreFiles,
   useDiscardFiles,
   type RecoverBinEntry,
   type RestoreResult,
 } from '../../api/agents'
+import Button from '../ui/Button'
+import { DIALOG_PANEL } from '../ui/classes'
+import { toastError } from '../../lib/http/apiJson'
 
 interface Props {
   agent: string
@@ -22,7 +24,7 @@ const REASON_LABEL: Record<RecoverBinEntry['reason'], string> = {
 
 function parentFolder(relPath: string): string {
   const i = relPath.lastIndexOf('/')
-  return i === -1 ? '(root)' : relPath.slice(0, i)
+  return i === -1 ? 'Top folder' : relPath.slice(0, i)
 }
 
 function formatSize(bytes: number): string {
@@ -37,17 +39,16 @@ function formatSize(bytes: number): string {
  * path the recovered copy is saved alongside as "name (recovered).ext" so
  * existing content is never overwritten. */
 export default function RecoverBinModal({ agent, entries, onClose }: Props) {
-  useEffect(() => pushEscHandler(onClose), [onClose])
 
   const restore = useRestoreFiles()
   const discard = useDiscardFiles()
   const [result, setResult] = useState<RestoreResult | null>(null)
-  const [armDiscard, setArmDiscard] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(
     () => new Set(entries.map((e) => e.entry_id)),
   )
-  // Re-arm the destructive Discard whenever the selection changes.
-  useEffect(() => setArmDiscard(false), [selected])
+  // The destructive Discard is armed for one selection: a change disarms it.
+  const [armedFor, setArmedFor] = useState<Set<string> | null>(null)
+  const armDiscard = armedFor === selected
 
   // Group by parent folder; folders sorted, files sorted within each.
   const groups = useMemo(() => {
@@ -94,53 +95,55 @@ export default function RecoverBinModal({ agent, entries, onClose }: Props) {
 
   const onRestore = async () => {
     if (selected.size === 0) return
-    const res = await restore.mutateAsync({ agent, entryIds: [...selected] })
-    setResult(res)
+    try {
+      setResult(await restore.mutateAsync({ agent, entryIds: [...selected] }))
+    } catch (e) {
+      toastError('The items were not restored')(e)
+    }
   }
 
   const onDiscard = async () => {
     if (selected.size === 0) return
     if (!armDiscard) {
-      setArmDiscard(true)  // first click arms; second click confirms
+      setArmedFor(selected)  // first click arms; second click confirms
       return
     }
     await discard.mutateAsync({ agent, entryIds: [...selected] })
-    onClose()
+      .then(() => onClose())
+      .catch(toastError('The items were not discarded'))
   }
 
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs p-3"
-      onClick={onClose}
+  return (
+    <Dialog
+      onClose={onClose}
+      busy={restore.isPending || discard.isPending}
+      aria-labelledby="recover-bin-title"
+      panelClassName={`${DIALOG_PANEL} max-w-[min(560px,92vw)] max-h-[80vh] flex flex-col`}
     >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="w-[min(560px,92vw)] max-h-[80vh] flex flex-col rounded-xl bg-white dark:bg-p-surface border border-p-border-light shadow-xl"
-      >
         {/* Header */}
-        <div className="p-4 border-b border-p-border-light">
-          <h3 className="text-sm font-semibold text-p-text">Recover files</h3>
-          <p className="text-xs text-p-text-secondary mt-1">
+        <div className="p-4 border-b border-subtle">
+          <h3 id="recover-bin-title" className="text-sm font-semibold text-primary">Recover files</h3>
+          <p className="text-xs text-secondary mt-1">
             {result
               ? 'All done.'
-              : "These files were removed or replaced by a newer version. Choose which to restore — each goes back to its original location. If a file is already there, the recovered copy is saved alongside it (nothing is overwritten)."}
+              : "These files were removed or replaced by a newer version. Choose which to restore. Each goes back to where it was. If a file is already there, the recovered copy is saved next to it. Nothing is overwritten."}
           </p>
         </div>
 
         {/* Body */}
         {result ? (
           <div className="flex-1 overflow-y-auto p-4 min-h-0">
-            <p className="text-sm text-p-text mb-2">
+            <p className="text-sm text-primary mb-2">
               Restored {result.restored.length} file
               {result.restored.length === 1 ? '' : 's'}.
             </p>
             {result.renamed.length > 0 && (
               <div className="mb-2">
-                <p className="text-xs text-p-text-secondary mb-1">
+                <p className="text-xs text-secondary mb-1">
                   Some files already existed, so the recovered copies were saved
                   alongside them:
                 </p>
-                <ul className="text-[11px] text-p-text-light space-y-0.5">
+                <ul className="text-2xs text-tertiary space-y-0.5">
                   {result.renamed.map((r) => (
                     <li key={r.entry_id} className="truncate">
                       {r.restored_as}
@@ -150,7 +153,7 @@ export default function RecoverBinModal({ agent, entries, onClose }: Props) {
               </div>
             )}
             {result.denied.length > 0 && (
-              <p className="text-xs text-amber-600">
+              <p className="text-xs text-status-warning-fg">
                 {result.denied.length} file
                 {result.denied.length === 1 ? '' : 's'} could not be restored.
               </p>
@@ -159,13 +162,13 @@ export default function RecoverBinModal({ agent, entries, onClose }: Props) {
         ) : (
           <>
             {/* Select-all bar */}
-            <div className="flex items-center justify-between px-4 py-2 border-b border-p-border-light shrink-0">
-              <span className="text-xs text-p-text-light">
+            <div className="flex items-center justify-between px-4 py-2 border-b border-subtle shrink-0">
+              <span className="text-xs text-tertiary">
                 {selected.size} of {allIds.length} selected
               </span>
               <button
                 onClick={() => setSelected(allSelected ? new Set() : new Set(allIds))}
-                className="text-xs text-brand hover:underline"
+                className="text-xs text-link hover:text-link-hover hover:underline"
               >
                 {allSelected ? 'Deselect all' : 'Select all'}
               </button>
@@ -178,12 +181,12 @@ export default function RecoverBinModal({ agent, entries, onClose }: Props) {
                 return (
                   <div key={folder} className="mb-3">
                     <div className="flex items-center justify-between px-2 mb-1">
-                      <span className="text-[11px] font-medium text-p-text-secondary truncate min-w-0">
+                      <span className="text-2xs font-medium text-secondary truncate min-w-0">
                         {folder}
                       </span>
                       <button
                         onClick={() => setGroup(items, !groupAllOn)}
-                        className="text-[11px] text-brand hover:underline shrink-0 ml-2"
+                        className="text-2xs text-link hover:text-link-hover hover:underline shrink-0 ml-2"
                       >
                         {groupAllOn ? 'none' : 'all'}
                       </button>
@@ -191,17 +194,17 @@ export default function RecoverBinModal({ agent, entries, onClose }: Props) {
                     <ul className="space-y-0.5">
                       {items.map((e) => (
                         <li key={e.entry_id}>
-                          <label className="flex items-center gap-2 px-2 py-1 rounded-sm hover:bg-p-surface-hover cursor-pointer">
+                          <label className="flex items-center gap-2 px-2 py-1 rounded-sm hover:bg-surface-hover cursor-pointer">
                             <input
                               type="checkbox"
                               checked={selected.has(e.entry_id)}
                               onChange={() => toggle(e.entry_id)}
                               className="shrink-0"
                             />
-                            <span className="text-xs text-p-text truncate min-w-0 flex-1">
+                            <span className="text-xs text-primary truncate min-w-0 flex-1">
                               {e.original_name}
                             </span>
-                            <span className="text-[10px] text-p-text-light shrink-0">
+                            <span className="text-3xs text-secondary shrink-0">
                               {REASON_LABEL[e.reason]} · {formatSize(e.size)}
                             </span>
                           </label>
@@ -216,55 +219,44 @@ export default function RecoverBinModal({ agent, entries, onClose }: Props) {
         )}
 
         {/* Footer */}
-        <div className="flex items-center justify-between gap-2 p-4 border-t border-p-border-light shrink-0">
+        <div className="flex items-center justify-between gap-2 p-4 border-t border-subtle shrink-0">
           {result ? (
-            <button
-              onClick={onClose}
-              className="ml-auto px-3 py-1.5 text-xs rounded-lg bg-brand text-white hover:opacity-90"
-            >
+            <Button variant="primary" size="xs" className="ml-auto" onClick={onClose}>
               Done
-            </button>
+            </Button>
           ) : (
             <>
-              <button
+              <Button
+                variant={armDiscard ? 'danger' : 'secondary'}
+                size="xs"
                 onClick={onDiscard}
                 disabled={discard.isPending || selected.size === 0}
                 title="Permanently remove the selected backups without restoring them"
-                className={
-                  armDiscard
-                    ? 'px-3 py-1.5 text-xs rounded-lg bg-red-500 text-white hover:bg-red-600 disabled:opacity-60'
-                    : 'px-3 py-1.5 text-xs rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-60'
-                }
               >
                 {discard.isPending
                   ? 'Discarding…'
                   : armDiscard
                     ? `Discard ${selected.size} permanently?`
                     : 'Discard'}
-              </button>
+              </Button>
               <div className="flex items-center gap-2">
-                <button
-                  onClick={onClose}
-                  disabled={restore.isPending || discard.isPending}
-                  className="px-3 py-1.5 text-xs rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-p-text hover:bg-p-surface-hover"
-                >
+                <Button size="xs" onClick={onClose} disabled={restore.isPending || discard.isPending}>
                   Cancel
-                </button>
-                <button
+                </Button>
+                <Button
+                  variant="primary"
+                  size="xs"
                   onClick={onRestore}
                   disabled={restore.isPending || selected.size === 0}
-                  className="px-3 py-1.5 text-xs rounded-lg bg-brand text-white hover:opacity-90 disabled:opacity-60"
                 >
                   {restore.isPending
                     ? 'Restoring…'
                     : `Restore ${selected.size} selected`}
-                </button>
+                </Button>
               </div>
             </>
           )}
         </div>
-      </div>
-    </div>,
-    document.body,
+    </Dialog>
   )
 }

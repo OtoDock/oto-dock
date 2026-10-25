@@ -14,11 +14,11 @@ from types import SimpleNamespace
 import pytest
 
 import config
+from core import placement
 from core.config import phone_config_builder as pcb
 from core.execution_layer import AgentConfig
 from core.session import external_identity
 from services.phone.phone_identity import RouteIdentity
-from core import placement
 
 SID = "11111111-2222-4333-8444-555555555555"
 
@@ -36,8 +36,9 @@ def agent(temp_db):
 
 @pytest.fixture
 def stubs(monkeypatch):
-    from services.mcp import dynamic_context, mcp_registry
     from services.engines import subscription_pool
+    from services.mcp import dynamic_context, mcp_registry
+    from services.remote import remote_status
     from storage import remote_store
     seen: dict = {}
     monkeypatch.setattr(config, "get_cli_model", lambda name: "model-x")
@@ -57,7 +58,7 @@ def stubs(monkeypatch):
     monkeypatch.setattr(dynamic_context, "get_dynamic_contexts", _dyn)
     monkeypatch.setattr(subscription_pool, "resolve_subscription_env",
                         lambda *a, **k: ("sub-1", {"_PROVIDER": "anthropic"}))
-    monkeypatch.setattr(remote_store, "resolve_execution_target",
+    monkeypatch.setattr(remote_status, "resolve_execution_target",
                         lambda agent, sub, role: (seen.setdefault("target", "local"), None))
     monkeypatch.setattr(remote_store, "placement_of",
                         lambda value, sub, agent: (
@@ -73,6 +74,32 @@ def _identity(agent, *, mode="caller", role="viewer", phone="+302101234567", **k
         shared=(mode == "shared"), **kw,
     )
     return RouteIdentity(mode=mode, role=role, external=ident)
+
+
+@pytest.mark.asyncio
+async def test_the_prompt_is_built_off_the_loop(agent, stubs, monkeypatch):
+    """``build_agent_prompt`` (the files, the caller's memory and context,
+    the tree walk) runs in a worker thread: the loop thread never builds it."""
+    import asyncio
+    import threading
+    seen: dict = {}
+
+    def recorder(*a, **k):
+        seen["thread"] = threading.get_ident()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            seen["loop"] = None
+        else:
+            seen["loop"] = "running"
+        return "PROMPT"
+
+    monkeypatch.setattr(config, "build_agent_prompt", recorder)
+    cfg = await pcb.build_phone_agent_config(
+        agent, route_identity=_identity(agent), session_id=SID,
+    )
+    assert cfg.system_prompt.startswith("PROMPT")
+    assert seen["thread"] != threading.get_ident() and seen["loop"] is None
 
 
 @pytest.mark.asyncio
@@ -202,9 +229,9 @@ async def test_user_mode_delegates_to_the_dashboard_builder(agent, stubs, monkey
 
 
 def test_execution_target_resolver_passes_role_and_user(monkeypatch):
-    from storage import remote_store
+    from services.remote import remote_status
     seen = {}
-    monkeypatch.setattr(remote_store, "resolve_execution_target",
+    monkeypatch.setattr(remote_status, "resolve_execution_target",
                         lambda agent, sub, role: (seen.update(sub=sub, role=role) or "local", None))
     assert pcb.resolve_phone_execution_target("a", role="manager", user_sub="u1") == "local"
     assert seen == {"sub": "u1", "role": "manager"}

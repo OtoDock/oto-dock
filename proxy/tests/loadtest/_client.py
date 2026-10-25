@@ -147,7 +147,7 @@ def _health(host, port) -> dict:
     try:
         r = _request(host, port, raw, timeout=5.0)
         return {"status": r["status"], "ms": _ms(r["elapsed"])}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  # the harness records any failure as the probe's result
         return {"status": type(exc).__name__, "ms": None}
 
 
@@ -198,7 +198,7 @@ async def _stream(spec: dict) -> None:
     lag.restart()
     chats = [c["chat"] for c in spec["conns"]]
     try:
-        await asyncio.wait_for(asyncio.gather(*(view(ws, cid) for ws, cid in zip(socks, chats))),
+        await asyncio.wait_for(asyncio.gather(*(view(ws, cid) for ws, cid in zip(socks, chats, strict=True))),
                                spec["timeout"])
     finally:
         for ws in socks:
@@ -261,7 +261,7 @@ async def _pages(spec: dict) -> None:
                         while json.loads(await ws.recv()).get("type") != "server_info":
                             pass
                 return "socket", 101, time.perf_counter() - t0
-            except Exception:
+            except Exception:  # noqa: BLE001  # the harness records any failure as the probe's result
                 return "socket", 0, time.perf_counter() - t0
 
         async def wave():
@@ -405,7 +405,7 @@ def _idle(spec: dict) -> None:
     _wait_word()
     _out(phase="health", health=[_health(host, port) for _ in range(3)])
     _wait_word()
-    open_socks = {s.fileno(): (s, t) for s, t in zip(socks, opened_at)}
+    open_socks = {s.fileno(): (s, t) for s, t in zip(socks, opened_at, strict=True)}
     for s in socks:
         s.setblocking(False)
     closed_after: list[float] = []
@@ -460,7 +460,7 @@ async def _photo(spec: dict) -> None:
 
     frames = []
     for path in spec["frame_files"]:
-        with open(path, encoding="ascii") as fh:
+        with open(path, encoding="ascii") as fh:  # noqa: ASYNC230  # the harness's own frame files, read before the timed phase
             frames.append(fh.read())
     _out(phase="ready")
     for frame in frames:

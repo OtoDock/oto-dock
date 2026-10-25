@@ -20,11 +20,14 @@ from unittest.mock import patch
 import pytest
 
 from core.events.common_events import (
-    CommonEvent, TEXT, TOOL_USE, TOOL_INPUT, TOOL_RESULT,
+    TEXT,
+    TOOL_INPUT,
+    TOOL_RESULT,
+    TOOL_USE,
+    CommonEvent,
 )
 from services.meetings import meeting_orchestrator as MO
 from services.meetings.meeting_context import build_turn_prompt
-
 
 # ---------------------------------------------------------------------------
 # Scripted-layer harness for the live turn runner
@@ -318,7 +321,7 @@ def test_build_turn_prompt_restate_footer():
 # after a routing call (api/hooks); the runner clears that state around the
 # turn and keeps a summary written after the MODERATOR's end_meeting.
 
-from core.session.session_state import (  # noqa: E402
+from core.session.session_state import (
     cleanup_meeting_session_info,
     get_meeting_session_info,
     mark_meeting_turn_routed,

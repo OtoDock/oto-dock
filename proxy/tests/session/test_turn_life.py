@@ -5,7 +5,6 @@ background work or a recent hook keep a silent turn alive."""
 import time
 import uuid
 
-
 import config
 from core.events import turn_life
 from core.session import session_state

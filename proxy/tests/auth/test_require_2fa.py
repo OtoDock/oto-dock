@@ -294,6 +294,7 @@ async def test_turning_the_requirement_on_counts_a_passkey_only_while_passkeys_a
     """The 409 that keeps an admin off the enrolment screen follows the same
     rule as the gate: a passkey the login never offers is no second factor."""
     from fastapi import HTTPException
+
     from api.auth import platform as platform_api
     from storage.identity import webauthn_store
     sub = _mk_user()

@@ -273,3 +273,160 @@ async def test_a_request_withdrawn_before_it_registered_is_never_shown(layer, te
     engine_prompts.watch("s-ew", _request("r-ew"))
     assert not engine_prompts.owns("r-ew")
     engine_prompts._withdrawn_early.clear()
+
+
+def _review_limit(rid: str) -> dict:
+    return {"type": "control_request", "request_id": rid, "request": {
+        "subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "rm -rf build"},
+        "decision_reason_type": "classifier"}}
+
+
+@pytest.mark.asyncio
+async def test_the_reviewers_decline_limit_is_refused_and_auto_re_entered_twice(layer):
+    """Claude Code's ask after its reviewer declined several actions in a
+    row is never a card: refused with a message the model reads, then auto
+    re-entered (Ask and back clears the CLI's pause), twice per session; the
+    third time Auto answers with the platform's cards."""
+    sid = "sess-review-limit"
+    changes: list[str] = []
+    messages: dict[str, str] = {}
+
+    async def _reenter(session_id):
+        changes.append(session_id)
+        return True
+
+    async def _answer(session_id, request_id, approved, tool_input):
+        frame = engine_prompts.answer_frame(request_id, approved, tool_input)
+        messages[request_id] = frame["response"]["response"]["message"]
+        layer.answers.append((session_id, request_id, approved, tool_input))
+
+    layer.reenter_review = _reenter
+    layer.answer_engine_prompt = _answer
+    session_state.set_session_mode(sid, "autoReview")
+    try:
+        for n, rid in enumerate(("r0", "r1", "r2"), start=1):
+            engine_prompts.note_frame(sid, _review_limit(rid), in_turn=True)
+            assert engine_prompts.withdrawn_before_registered(rid)   # the pump shows no card
+            for _ in range(200):
+                if len(layer.answers) == n and (n == 3 or len(changes) == n):
+                    break
+                await asyncio.sleep(0.01)
+        assert [(r, ok) for _s, r, ok, _i in layer.answers] == [("r0", False), ("r1", False), ("r2", False)]
+        assert set(messages.values()) == {engine_prompts._REVIEW_LIMIT_MESSAGE}
+        assert changes == [sid, sid]
+        assert session_state.get_session_mode(sid) == "autoReview"   # never written by the re-entry
+        assert session_state.review_paused(sid)
+        # A mode change lifts the pause.
+        session_state.set_session_mode(sid, "ask")
+        assert not session_state.review_paused(sid)
+    finally:
+        session_state.cleanup_session_permission_state(sid)
+        session_state._session_modes.pop(sid, None)
+        session_state._review_reentries.pop(sid, None)
+
+
+@pytest.mark.asyncio
+async def test_a_decline_limit_outside_auto_is_refused_and_nothing_re_enters(layer):
+    sid = "sess-review-limit-ask"
+    changes: list[str] = []
+
+    async def _reenter(session_id):
+        changes.append(session_id)
+        return True
+
+    layer.reenter_review = _reenter
+    session_state.set_session_mode(sid, "ask")
+    try:
+        engine_prompts.note_frame(sid, _review_limit("r9"), in_turn=False)
+        for _ in range(200):
+            if layer.answers:
+                break
+            await asyncio.sleep(0.01)
+        assert [(r, ok) for _s, r, ok, _i in layer.answers] == [("r9", False)]
+        await asyncio.sleep(0.05)
+        assert changes == [] and not session_state.review_paused(sid)
+    finally:
+        session_state._session_modes.pop(sid, None)
+
+
+@pytest.mark.asyncio
+async def test_a_mode_picked_during_the_turn_survives_the_re_entry(layer, monkeypatch):
+    """The decline limit lands mid-turn; the person picks Ask before the
+    turn ends. The CLI layer re-enters only under the session's lock (after
+    the turn), reads the mode again there and leaves it: no control frame,
+    the session stays in Ask. With the mode still Auto it sends Ask then
+    Auto to the CLI, in the CLI's words, and writes no platform mode."""
+    from core.layers.cli import layer as cli_layer
+    sid = "sess-review-race"
+    sent: list = []
+
+    class _Session:
+        def __init__(self):
+            self.lock = asyncio.Lock()
+
+        async def send_control_request(self, subtype, **kw):
+            sent.append((subtype, kw))
+
+        async def send_control_response(self, request_id, approved, tool_input=None):
+            pass
+
+    session = _Session()
+
+    async def _get(session_id):
+        return session
+    monkeypatch.setattr(cli_layer, "get_persistent_session", _get)
+    cli = cli_layer.CLIExecutionLayer.__new__(cli_layer.CLIExecutionLayer)
+    from core.session import session_manager
+    monkeypatch.setattr(session_manager, "find_layer_for_session", lambda s: cli)
+    session_state.set_session_mode(sid, "autoReview")
+    try:
+        await session.lock.acquire()          # the turn holds the session
+        engine_prompts.note_frame(sid, _review_limit("rr0"), in_turn=True)
+        await asyncio.sleep(0.05)
+        session_state.set_session_mode(sid, "ask")   # the person's pick
+        session.lock.release()
+        await asyncio.sleep(0.05)
+        assert sent == []
+        assert session_state.get_session_mode(sid) == "ask"
+        # Still in Auto when the lock frees: the CLI leaves auto and comes back.
+        session_state.set_session_mode(sid, "autoReview")
+        assert await cli.reenter_review(sid) is True
+        assert sent == [("set_permission_mode", {"mode": "default"}),
+                        ("set_permission_mode", {"mode": "auto"})]
+        assert session_state.get_session_mode(sid) == "autoReview"
+    finally:
+        if session.lock.locked():
+            session.lock.release()
+        session_state.cleanup_session_permission_state(sid)
+        session_state._session_modes.pop(sid, None)
+        session_state._review_reentries.pop(sid, None)
+
+
+@pytest.mark.asyncio
+async def test_a_remote_re_entry_reads_the_mode_and_writes_none(monkeypatch):
+    """The remote placement sends the two control frames through the
+    engine's adapter only while the session is in Auto, and leaves the
+    session record and the platform's mode alone."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from core.layers.cli.remote import ClaudeRemoteAdapter
+    from core.remote.remote_execution import RemoteExecutionLayer
+    sid = "sess-review-remote"
+    lay = RemoteExecutionLayer(MagicMock())
+    lay._cm.send_fire_and_forget = AsyncMock()
+    info = MagicMock(session_id=sid, machine_id="m1", mode="autoReview")
+    lay._sessions[sid] = info
+    monkeypatch.setattr(lay, "_adapter", lambda i: ClaudeRemoteAdapter(MagicMock()))
+    try:
+        session_state.set_session_mode(sid, "ask")
+        assert await lay.reenter_review(sid) is False
+        lay._cm.send_fire_and_forget.assert_not_called()
+        session_state.set_session_mode(sid, "autoReview")
+        assert await lay.reenter_review(sid) is True
+        frames = [c.args[1] for c in lay._cm.send_fire_and_forget.call_args_list]
+        assert [(f["subtype"], f["kwargs"]) for f in frames] == [
+            ("set_permission_mode", {"mode": "default"}), ("set_permission_mode", {"mode": "auto"})]
+        assert info.mode == "autoReview" and session_state.get_session_mode(sid) == "autoReview"
+    finally:
+        lay._sessions.pop(sid, None)
+        session_state._session_modes.pop(sid, None)

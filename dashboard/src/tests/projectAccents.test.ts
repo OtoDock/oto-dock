@@ -3,45 +3,50 @@ import { describe, it, expect } from 'vitest'
 import { rowAccentClass } from '@/components/chat/projectAccents'
 import type { Chat } from '@/api/chats'
 
-const NOW = Date.parse('2026-07-08T12:00:00Z')
-
 function chat(over: Partial<Chat>): Chat {
   return {
     id: 'c1', user_sub: 'u', agent: 'a', title: '', session_id: null,
     permission_mode: 'default', execution_path: '',
-    created_at: '2026-07-08T10:00:00Z', updated_at: '2026-07-08T11:00:00Z',
+    created_at: '2026-07-08T10:00:00Z', updated_at: '2026-07-06T11:00:00Z',
     ...over,
   } as Chat
 }
 
 describe('projectAccents', () => {
-  it('no accent for a plain chat', () => {
-    expect(rowAccentClass(chat({}), { now: NOW })).toBe('')
-    expect(rowAccentClass(chat({ project_id: 'p1' }), { now: NOW })).toBe('')
+  it('a plain chat gets the transparent edge', () => {
+    expect(rowAccentClass(chat({}))).toBe('border-l-2 border-l-transparent')
+    expect(rowAccentClass(chat({ project_id: 'p1' }))).toBe('border-l-2 border-l-transparent')
   })
 
-  it('every delegated worker gets the violet accent — no project-count gating', () => {
-    expect(rowAccentClass(chat({ origin: 'delegated' }), { now: NOW }))
-      .toContain('violet')
-    expect(rowAccentClass(chat({ delegate_role: 'worker' }), { now: NOW }))
-      .toContain('violet')
+  it('every delegated worker gets the agent accent at half strength', () => {
+    for (const c of [chat({ origin: 'delegated' }), chat({ delegate_role: 'worker' })]) {
+      expect(rowAccentClass(c)).toBe('border-l-2 border-l-accent-agent-solid/50')
+    }
   })
 
-  it('orchestrators get the amber accent', () => {
-    const cls = rowAccentClass(chat({ delegate_role: 'orchestrator' }), { now: NOW })
-    expect(cls).toContain('amber')
-    expect(cls).not.toContain('violet')
+  it('an orchestrator gets the full accent on a wider edge, and never a row background', () => {
+    const c = chat({ delegate_role: 'orchestrator' })
+    const cls = rowAccentClass(c)
+    expect(cls).toBe('border-l-[3px] border-l-accent-agent-solid')
+    expect(cls).not.toContain('bg-')
   })
 
-  it('the active chat shows no accent — the selection bar is the only left stripe', () => {
-    expect(rowAccentClass(chat({ origin: 'delegated' }), { now: NOW, active: true }))
-      .toBe('')
+  it('the orchestrator reads stronger than its workers in the same family', () => {
+    const orchestrator = rowAccentClass(chat({ delegate_role: 'orchestrator' }))
+    const worker = rowAccentClass(chat({ origin: 'delegated' }))
+    expect(orchestrator).toContain('accent-agent')
+    expect(worker).toContain('accent-agent')
+    expect(worker).toContain('/50')
+    expect(orchestrator).not.toContain('/')
   })
 
-  it('accents fade once the chat has been quiet for a day', () => {
-    const stale = chat({ origin: 'delegated', updated_at: '2026-07-06T11:00:00Z' })
-    expect(rowAccentClass(stale, { now: NOW })).toContain('/40')
-    const fresh = chat({ origin: 'delegated' })
-    expect(rowAccentClass(fresh, { now: NOW })).not.toContain('/40')
+  it('a quiet chat keeps its accent: the row time says the age', () => {
+    expect(rowAccentClass(chat({ origin: 'delegated', updated_at: '2026-01-01T00:00:00Z' })))
+      .toBe('border-l-2 border-l-accent-agent-solid/50')
+  })
+
+  it('the active chat shows no accent: the selection bar is the only stripe', () => {
+    const c = chat({ delegate_role: 'orchestrator' })
+    expect(rowAccentClass(c, { active: true })).toBe('border-l-2 border-l-transparent')
   })
 })

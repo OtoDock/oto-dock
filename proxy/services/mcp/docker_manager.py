@@ -5,12 +5,22 @@ defined via docker-compose.yml in their manifest.
 """
 
 import contextlib
+import dataclasses
+import hashlib
+import json
 import logging
 import os
 import re
+import selectors
+import shlex
+import signal
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+
+import psycopg
+import yaml
 
 import config
 from core.config import deployment
@@ -76,8 +86,98 @@ def _log_docker_perm_denied(context: str) -> None:
     logger.error("%s: %s", context, _DOCKER_PERM_HINT)
 
 
+class ComposeStalled(subprocess.TimeoutExpired):
+    """A build that printed nothing for its stall bound (the buildkit session
+    that died with compose still waiting on it)."""
+
+
+class ComposeEnded(subprocess.TimeoutExpired):
+    """A run the proxy's shutdown ended, or one it refused to start."""
+
+
+@dataclasses.dataclass
+class _LiveRun:
+    proc: subprocess.Popen
+    #: compose reached the containers (a recreate stops the old one, creates
+    #: the new one under a temporary name, renames it): cut there, a
+    #: container is left under that name.
+    containers: bool = False
+
+
+# A compose run is its own process group (compose and its buildx child); the
+# live ones are ended at shutdown, so a stop never waits on a build. Once
+# the shutdown set ``_stopping`` (under the lock, so a run either registered
+# before it or sees it) no run starts and no stalled build is retried.
+_live_groups: dict[int, _LiveRun] = {}
+_live_lock = threading.Lock()
+_stopping = threading.Event()
+# How long a group gets between SIGTERM and SIGKILL, and the reader's poll.
+_TERM_GRACE_S = 5.0
+_READ_POLL_S = 1.0
+# How long the shutdown lets a run that reached the containers finish.
+_RECREATE_GRACE_S = 30.0
+# Compose's line for a step on a container ("Container <name>  Recreate",
+# a mark in front of it on a terminal).
+_CONTAINER_STEP_RE = re.compile(
+    rb"^[^A-Za-z]*Container\s+\S+\s+(Recreat|Creat|Start|Stop|Remov|Renam)", re.IGNORECASE)
+# A container a cut recreate left under compose's temporary name.
+_TEMP_NAME_RE = re.compile(r"^[0-9a-f]{12}_(.+)$")
+
+
+def _exited(proc: subprocess.Popen) -> bool:
+    """Whether the leader exited, WITHOUT reaping it: while its zombie holds
+    the pid, the group id cannot be reused by another process."""
+    if proc.returncode is not None:
+        return True
+    try:
+        return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        return True
+
+
+def _end_group(proc: subprocess.Popen) -> None:
+    """SIGTERM to the compose run's process group, SIGKILL after the grace
+    (to the rest of the group too: a buildx child that outlived compose),
+    then the leader reaped."""
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    deadline = time.monotonic() + _TERM_GRACE_S
+    while time.monotonic() < deadline and not _exited(proc):
+        time.sleep(0.1)
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=_TERM_GRACE_S)
+
+
+def _end_at_stop(run: _LiveRun) -> None:
+    """A run that reached the containers gets ``_RECREATE_GRACE_S`` to finish
+    (a recreate cut there leaves a container under a temporary name); a
+    build is ended at once."""
+    if run.containers:
+        deadline = time.monotonic() + _RECREATE_GRACE_S
+        while time.monotonic() < deadline and not _exited(run.proc):
+            time.sleep(0.2)
+    _end_group(run.proc)
+
+
+def end_running_compose() -> int:
+    """Start no compose run any more and end every one still going (the
+    proxy's shutdown): a project the boot has not reached returns at once, a
+    stalled build is not started again, a run recreating containers gets a
+    short grace. Returns how many were ended."""
+    with _live_lock:
+        _stopping.set()
+        runs = list(_live_groups.values())
+    if runs:
+        with ThreadPoolExecutor(max_workers=len(runs)) as pool:
+            list(pool.map(_end_at_stop, runs))
+    return len(runs)
+
+
 def _run_compose_streaming(
     manifest, cmd: list[str], *, timeout: int, cwd: str | None = None,
+    stall: float | None = None,
 ) -> tuple[int, str]:
     """Run a compose command, streaming progress lines into the log.
 
@@ -85,43 +185,77 @@ def _run_compose_streaming(
     that swallowed pull/build progress entirely, so a fresh install read as a
     hang. stderr (compose writes progress AND errors there) is buffered in
     full for the callers' overlap/permission checks; progress-shaped lines log
-    at INFO throttled to ~one per 5s. A watchdog kills the process at
-    ``timeout`` and ``subprocess.TimeoutExpired`` is raised, matching the old
-    ``subprocess.run`` contract. stdout is discarded — no caller of the long
-    ops reads it.
+    at INFO throttled to ~one per 5s. stdout is discarded — no caller of the
+    long ops reads it.
+
+    The run is its own process group, read through a poll on the descriptor
+    (a child that keeps the pipe open never blocks the reader). At
+    ``timeout``, or after ``stall`` seconds without a byte of output, the
+    group is ended and ``subprocess.TimeoutExpired`` (``ComposeStalled`` for
+    a stall) is raised, matching the old ``subprocess.run`` contract; a run
+    the shutdown ended, or would have started after it, raises
+    ``ComposeEnded``. The exception's ``recreating`` says whether compose had
+    reached the containers.
     """
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        text=True, cwd=cwd, env=_compose_env(),
-    )
-    timed_out = threading.Event()
-
-    def _kill() -> None:
-        timed_out.set()
-        with contextlib.suppress(OSError):
-            proc.kill()
-
-    watchdog = threading.Timer(timeout, _kill)
-    watchdog.daemon = True
-    watchdog.start()
-    lines: list[str] = []
+    with _live_lock:
+        if _stopping.is_set():
+            raise ComposeEnded(cmd, 0)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            cwd=cwd, env=_compose_env(), start_new_session=True,
+        )
+        run = _LiveRun(proc)
+        _live_groups[proc.pid] = run
+    assert proc.stderr is not None
+    fd = proc.stderr.fileno()
+    sel = selectors.DefaultSelector()
+    sel.register(fd, selectors.EVENT_READ)
+    buf = bytearray()
+    pending = b""
+    started = last_byte = time.monotonic()
     last_log = 0.0
+    ended: type[subprocess.TimeoutExpired] | None = None
     try:
-        assert proc.stderr is not None
-        for line in proc.stderr:
-            lines.append(line)
-            stripped = line.strip()
-            if stripped and _PROGRESS_RE.search(stripped):
-                now = time.monotonic()
-                if now - last_log >= 5.0:
+        while True:
+            now = time.monotonic()
+            if now - started >= timeout:
+                ended = subprocess.TimeoutExpired
+            elif stall is not None and now - last_byte >= stall:
+                ended = ComposeStalled
+            if ended is not None:
+                _end_group(proc)
+                break
+            if not sel.select(_READ_POLL_S):
+                if proc.poll() is not None and not sel.select(0):
+                    break
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            buf += chunk
+            last_byte = time.monotonic()
+            *done, pending = (pending + chunk).replace(b"\r", b"\n").split(b"\n")
+            for raw in done:
+                if not run.containers and _CONTAINER_STEP_RE.search(raw):
+                    run.containers = True
+                stripped = raw.decode("utf-8", "replace").strip()
+                if stripped and _PROGRESS_RE.search(stripped) and last_byte - last_log >= 5.0:
                     logger.info("%s: %s", manifest.name, stripped[:200])
-                    last_log = now
-        proc.wait()
+                    last_log = last_byte
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_TERM_GRACE_S)
     finally:
-        watchdog.cancel()
-    if timed_out.is_set():
-        raise subprocess.TimeoutExpired(cmd, timeout)
-    return proc.returncode, "".join(lines)
+        sel.close()
+        proc.stderr.close()
+        with _live_lock:
+            _live_groups.pop(proc.pid, None)
+    if ended is None and _stopping.is_set() and proc.returncode != 0:
+        ended = ComposeEnded
+    if ended is not None:
+        exc = ended(cmd, stall if ended is ComposeStalled and stall is not None else timeout)
+        exc.recreating = run.containers  # type: ignore[attr-defined]  # read by _compose_up
+        raise exc
+    return proc.returncode if proc.returncode is not None else -1, buf.decode("utf-8", "replace")
 
 
 def _project_name(manifest) -> str:
@@ -205,8 +339,13 @@ def image_stale(manifest, running_images: list[str]) -> bool:
 
 
 def container_state(manifest) -> tuple[str, list[str]]:
-    """``get_container_status``'s answer and the images of the project's
-    running containers (one ``compose ps`` call)."""
+    """``get_container_status``'s answer and the images of the MCP's running
+    containers (one ``compose ps`` call). The MCP's own service decides
+    (``_target_service``): a sidecar's health check never does (Collabora's
+    start period would read as the file tools starting), but a sidecar that is
+    down and did not finish cleanly reads the project as stopped, so the
+    boot's ``up -d`` brings it back. A project whose own service cannot be
+    named is judged by its first container."""
     try:
         result = subprocess.run(
             _compose_cmd(manifest, "ps", "--format", "json", "-a"),
@@ -227,34 +366,132 @@ def container_state(manifest) -> tuple[str, list[str]]:
         # docker compose ps --format json outputs one JSON object per line
         # (the State / Health words are Docker's, not ours).
         import json
-        status = None
-        images: list[str] = []
+        rows = []
         for line in output.splitlines():
             if not line.strip():
                 continue
             try:
-                container = json.loads(line)
+                rows.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-            state = container.get("State", "").lower()
-            if state == "running":
-                if container.get("Image"):
-                    images.append(str(container["Image"]))
-                if status is None:
-                    # `Health` is "" when the image declares no healthcheck.
-                    health = (container.get("Health") or "").lower()
-                    status = (UNHEALTHY if health == "unhealthy"
-                              else STARTING if health == "starting" else RUNNING)
-            elif state in ("exited", "dead", "created") and status is None:
-                status = STOPPED
 
+        target = _target_service(manifest)
+        if target is None or not all("Service" in c for c in rows):
+            status, images = _judge_rows(rows)
+            return status or NOT_FOUND, images
+        status, images = _judge_rows([c for c in rows if c.get("Service") == target])
+        if status in (RUNNING, STARTING, UNHEALTHY) and any(
+                _sidecar_down(c) for c in rows if c.get("Service") != target):
+            status = STOPPED
         return status or NOT_FOUND, images
     except subprocess.TimeoutExpired:
         logger.warning("Timeout checking Docker status for %s", manifest.name)
         return ERROR, []
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         logger.warning("Error checking Docker status for %s: %s", manifest.name, e)
         return ERROR, []
+
+
+def _judge_rows(rows: list) -> tuple[str | None, list[str]]:
+    """The first running container's state (its health word when the image
+    declares a check), or stopped when one before it is down; and the images
+    of the running ones. ``None`` when no row says either."""
+    status = None
+    images: list[str] = []
+    for container in rows:
+        state = container.get("State", "").lower()
+        if state == "running":
+            if container.get("Image"):
+                images.append(str(container["Image"]))
+            if status is None:
+                # `Health` is "" when the image declares no healthcheck.
+                health = (container.get("Health") or "").lower()
+                status = (UNHEALTHY if health == "unhealthy"
+                          else STARTING if health == "starting" else RUNNING)
+        elif state in ("exited", "dead", "created") and status is None:
+            status = STOPPED
+    return status, images
+
+
+def _sidecar_down(container: dict) -> bool:
+    """A container of another service of the project that is not running and
+    did not end cleanly: a one-shot that exited 0 has done its work."""
+    if _judge_rows([container])[0] != STOPPED:
+        return False
+    return bool(container.get("ExitCode")) or container.get("State", "").lower() != "exited"
+
+
+def _target_service(manifest) -> str | None:
+    """The compose service the MCP itself runs as, the one the platform's
+    compose handling picks: on bare metal the base compose's target (the
+    T1 override's pick), under Docker-Compose the pull form's. ``None`` when
+    the compose cannot be read or names no single one."""
+    from services.mcp import compose_rewrite
+    try:
+        data = yaml.safe_load((manifest.mcp_dir / manifest.server.docker_compose).read_text()) or {}
+        services = data.get("services")
+        if not isinstance(services, dict) or not services:
+            return None
+        if deployment.in_docker_compose():
+            return compose_rewrite._pick_pull_target(services, deployment.mcp_service_name(manifest))
+        return compose_rewrite._pick_target_service(
+            services, manifest.server.service_name or manifest.name)
+    except (OSError, ValueError, TypeError, AttributeError, yaml.YAMLError):
+        return None
+
+
+# A volume ``subpath`` mount (one file of a volume) needs Docker Engine 26,
+# API 1.45: an older engine mounts the whole volume, and the service misses
+# the file it expects (the file tools' Collabora runs without its WOPI key).
+_SUBPATH_MIN_API = (1, 45)
+
+
+def _compose_mounts_subpath(manifest) -> bool:
+    """Whether the MCP's compose mounts one file of a volume."""
+    try:
+        data = yaml.safe_load((manifest.mcp_dir / manifest.server.docker_compose).read_text()) or {}
+    except (OSError, ValueError, AttributeError, yaml.YAMLError):
+        return False
+    services = data.get("services") if isinstance(data, dict) else None
+    for svc in (services.values() if isinstance(services, dict) else ()):
+        for vol in ((svc.get("volumes") or []) if isinstance(svc, dict) else ()):
+            spec = vol.get("volume") if isinstance(vol, dict) else None
+            if isinstance(spec, dict) and spec.get("subpath"):
+                return True
+    return False
+
+
+def _engine_api_version() -> tuple[int, ...] | None:
+    """The Docker Engine's API version, ``None`` when it cannot be read."""
+    try:
+        result = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.APIVersion}}"],
+            capture_output=True, text=True, timeout=15, env=_compose_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return tuple(int(part) for part in result.stdout.strip().split("."))
+    except ValueError:
+        return None
+
+
+def _check_engine_for_subpath(manifest, engine_api: list) -> None:
+    """Log the cause when the MCP's compose mounts a volume subpath and the
+    engine is older than Docker Engine 26. The engine is asked once per boot
+    (``engine_api`` holds its answer) and only for such a compose."""
+    if not _compose_mounts_subpath(manifest):
+        return
+    if not engine_api:
+        engine_api.append(_engine_api_version())
+    api = engine_api[0]
+    if api is not None and api < _SUBPATH_MIN_API:
+        logger.warning(
+            "Docker MCP %s: its compose mounts one file of a volume, which needs "
+            "Docker Engine 26 or later (API 1.45); this engine speaks API %s and "
+            "mounts the whole volume instead. Update Docker, then restart OtoDock.",
+            manifest.name, ".".join(str(part) for part in api),
+        )
 
 
 def _odd_backslash_run_before_quote(value: str) -> bool:
@@ -357,7 +594,7 @@ def _inject_mcp_env(manifest) -> bool:
     if manifest.credentials.type == "infra":
         try:
             infra_creds = credential_store.get_infra_credentials(manifest.name) or {}
-        except Exception as e:
+        except psycopg.Error as e:
             logger.warning(
                 "Failed to load infra credentials for %s: %s",
                 manifest.name, e,
@@ -453,8 +690,6 @@ def _compose_config_hash(manifest) -> str | None:
     compose is missing/unreadable — callers degrade to the plain skip,
     never raise.
     """
-    import hashlib
-
     try:
         base = manifest.mcp_dir / manifest.server.docker_compose
         if not base.is_file():
@@ -467,16 +702,39 @@ def _compose_config_hash(manifest) -> str | None:
                 h.update(p.read_bytes())
                 h.update(b"\0")
         return h.hexdigest()
-    except Exception as e:
+    except OSError as e:
         logger.debug("Compose hash for %s unavailable: %s", manifest.name, e)
         return None
 
 
-def _read_recorded_compose_hash(manifest) -> str | None:
+def _read_hash_file(manifest) -> tuple[str | None, dict | None]:
+    """The hash file's two lines: the compose hash, and the build record
+    (JSON) a successful ``up --build`` wrote. A file from before the build
+    record has one line."""
     try:
-        return (manifest.mcp_dir / _COMPOSE_HASH_NAME).read_text().strip() or None
+        lines = (manifest.mcp_dir / _COMPOSE_HASH_NAME).read_text().splitlines()
     except OSError:
-        return None
+        return None, None
+    compose = lines[0].strip() if lines else ""
+    record = None
+    if len(lines) > 1:
+        with contextlib.suppress(ValueError):
+            parsed = json.loads(lines[1])
+            record = parsed if isinstance(parsed, dict) else None
+    return compose or None, record
+
+
+def _write_hash_file(manifest, *, compose: str | None = None, record: dict | None = None) -> None:
+    """Rewrite the hash file, keeping the line the call does not set."""
+    old_compose, old_record = _read_hash_file(manifest)
+    compose = compose or old_compose or ""
+    record = record if record is not None else old_record
+    text = compose + "\n" + (json.dumps(record, sort_keys=True) + "\n" if record else "")
+    (manifest.mcp_dir / _COMPOSE_HASH_NAME).write_text(text)
+
+
+def _read_recorded_compose_hash(manifest) -> str | None:
+    return _read_hash_file(manifest)[0]
 
 
 def _record_compose_hash(manifest) -> None:
@@ -493,9 +751,135 @@ def _record_compose_hash(manifest) -> None:
     try:
         digest = _compose_config_hash(manifest)
         if digest:
-            (manifest.mcp_dir / _COMPOSE_HASH_NAME).write_text(digest + "\n")
-    except Exception as e:
+            _write_hash_file(manifest, compose=digest)
+    except OSError as e:
         logger.warning("Could not record compose hash for %s: %s", manifest.name, e)
+
+
+# What a build context's hash leaves out: folders the platform or a tool
+# makes there, and the files the platform writes beside the compose.
+_BUILD_SKIP_DIRS = frozenset({"venv", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".git"})
+_BUILD_SKIP_FILES = frozenset({".env", _COMPOSE_HASH_NAME, "docker-compose.override.yml"})
+# A context larger than this is not hashed: its builds always run.
+_BUILD_HASH_MAX_BYTES = 256 * 1024 * 1024
+# A build up that prints nothing this long has stalled (the file tools'
+# quietest step, a 176 MB model download, takes minutes on a slow link).
+_BUILD_STALL_S = 600.0
+
+
+def _hash_tree(h, root: str, budget: list[int]) -> bool:
+    """Feed every regular file under ``root`` (sorted, the skipped names
+    left out, links by their target text) into ``h``. False once the bytes
+    read pass ``budget``."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _BUILD_SKIP_DIRS)
+        for name in sorted(filenames):
+            if name in _BUILD_SKIP_FILES:
+                continue
+            path = os.path.join(dirpath, name)
+            h.update(os.path.relpath(path, root).encode("utf-8", "surrogateescape") + b"\0")
+            if os.path.islink(path):
+                h.update(b"link:" + os.readlink(path).encode("utf-8", "surrogateescape") + b"\0")
+                continue
+            size = os.path.getsize(path)
+            if size > budget[0]:
+                return False
+            budget[0] -= size
+            with open(path, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+            h.update(b"\0")
+    return True
+
+
+def _build_state(manifest) -> tuple[str, list[str]] | None:
+    """The hash of what the MCP's builds are made from and the images they
+    make: every ``build:`` service of the resolved compose (``docker compose
+    config``, so the context, the dockerfile and the args are what compose
+    uses), its context's files and its dockerfile. None when a build cannot
+    be judged from local files (a git context, ``additional_contexts``, an
+    inline dockerfile, a context past the size cap) or compose cannot say."""
+    try:
+        result = subprocess.run(
+            _compose_cmd(manifest, "config", "--format", "json"),
+            capture_output=True, text=True, timeout=30,
+            cwd=str(manifest.mcp_dir), env=_compose_env(),
+        )
+        if result.returncode != 0:
+            return None
+        services = (json.loads(result.stdout) or {}).get("services") or {}
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+        return None
+    if not isinstance(services, dict):
+        return None
+    h = hashlib.sha256()
+    images: list[str] = []
+    budget = [_BUILD_HASH_MAX_BYTES]
+    for name in sorted(services):
+        svc = services[name]
+        build = svc.get("build") if isinstance(svc, dict) else None
+        if not isinstance(build, dict):
+            continue
+        context = str(build.get("context") or "")
+        if (not context or not os.path.isdir(context) or build.get("additional_contexts")
+                or build.get("dockerfile_inline")):
+            return None
+        h.update(name.encode() + b"\0" + json.dumps(build, sort_keys=True).encode() + b"\0")
+        try:
+            if not _hash_tree(h, context, budget):
+                return None
+            dockerfile = os.path.join(context, str(build.get("dockerfile") or "Dockerfile"))
+            if not os.path.realpath(dockerfile).startswith(os.path.realpath(context) + os.sep):
+                with open(dockerfile, "rb") as f:
+                    h.update(b"dockerfile\0" + f.read() + b"\0")
+        except OSError:
+            return None
+        images.append(str(svc.get("image") or f"{_project_name(manifest)}-{name}"))
+    if not images:
+        return None
+    return h.hexdigest(), images
+
+
+def _image_id(image: str) -> str | None:
+    """The local image's ID, None when the daemon has no such image."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+            capture_output=True, text=True, timeout=30, env=_compose_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None if result.returncode == 0 else None
+
+
+def _build_is_current(manifest, state: tuple[str, list[str]] | None) -> bool:
+    """Whether the images the last ``up --build`` recorded were built from
+    what the build would read today and are still the images on this host
+    (an image rebuilt or retagged by hand has another ID)."""
+    if state is None:
+        return False
+    record = _read_hash_file(manifest)[1]
+    if not record or record.get("hash") != state[0]:
+        return False
+    recorded = record.get("images")
+    if not isinstance(recorded, dict) or sorted(recorded) != sorted(state[1]):
+        return False
+    return all(_image_id(image) == recorded[image] for image in state[1])
+
+
+def _record_build(manifest, state: tuple[str, list[str]] | None) -> None:
+    """After a successful ``up --build``: the hash computed BEFORE the build
+    (a file changed during it reads as changed next time) and the images'
+    IDs. T1-only, never raises."""
+    if state is None or deployment.current_mode() != deployment.MANAGED_LOCAL:
+        return
+    ids = {image: _image_id(image) for image in state[1]}
+    if not all(ids.values()):
+        return
+    try:
+        _write_hash_file(manifest, record={"hash": state[0], "images": ids})
+    except OSError as e:
+        logger.warning("Could not record the build of %s: %s", manifest.name, e)
 
 
 def start_container(manifest, *, force_recreate: bool = False) -> bool:
@@ -561,9 +945,8 @@ def start_container(manifest, *, force_recreate: bool = False) -> bool:
         build_local = config.OTODOCK_MCP_BUILD_LOCAL or not srv_image
         if build_local:
             # No published image (or the dev build-local flag) → build from the
-            # Dockerfile. A build can take minutes — widen the timeout.
-            args.append("--build")
-            return _compose_up(manifest, args, timeout=900, t1_retry=True)
+            # Dockerfile when its sources changed.
+            return _build_up(manifest, args)
 
         # Pull the canonical image; if it isn't present afterwards (unpublished
         # or a failed pull), self-heal by building locally (the base keeps
@@ -582,13 +965,94 @@ def start_container(manifest, *, force_recreate: bool = False) -> bool:
             logger.info(
                 "%s: image %s absent after pull — building locally", manifest.name, srv_image,
             )
-            args.append("--build")
-        return _compose_up(
-            manifest, args, timeout=900 if "--build" in args else 120, t1_retry=True,
-        )
-    except Exception as e:
+            return _build_up(manifest, args)
+        return _compose_up(manifest, args, timeout=120, t1_retry=True)
+    except ComposeEnded:
+        logger.info("Docker MCP %s: not started, the proxy is stopping", manifest.name)
+        return False
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError, psycopg.Error) as e:
         logger.error("Error starting Docker MCP %s: %s", manifest.name, e)
         return False
+
+
+def _build_up(manifest, args: list[str]) -> bool:
+    """An up for an MCP whose image compose builds here: with ``--no-build``
+    when the last build is still current (the hash of its sources and the
+    image's ID decide, so a boot never builds for nothing), else
+    ``--build``, recorded once it succeeded."""
+    state = _build_state(manifest)
+    if _build_is_current(manifest, state):
+        logger.info("%s: its image is current, no build", manifest.name)
+        return _compose_up(manifest, [*args, "--no-build"], timeout=120, t1_retry=True)
+    ok = _compose_up(manifest, [*args, "--build"], timeout=900, t1_retry=True)
+    if ok:
+        _record_build(manifest, state)
+    return ok
+
+
+def _run_up(manifest, args: list[str], timeout: int) -> tuple[int, str]:
+    """One ``compose up``. A build that stalls (``_BUILD_STALL_S`` without
+    output) or runs past ``timeout`` is ended with its process group and
+    started once more, in a new build session: by hand that worked every
+    time the boot's build hung. A second one raises."""
+    cmd = _compose_cmd(manifest, *args)
+    building = "--build" in args
+    stall = _BUILD_STALL_S if building else None
+    first = ""
+    for attempt in (1, 2):
+        try:
+            return _run_compose_streaming(
+                manifest, cmd, timeout=timeout, cwd=str(manifest.mcp_dir), stall=stall)
+        except subprocess.TimeoutExpired as e:
+            if attempt == 2:
+                e.prior = first  # type: ignore[attr-defined]  # read by _compose_up
+            if (not building or attempt == 2 or isinstance(e, ComposeEnded) or _stopping.is_set()
+                    or getattr(e, "recreating", False)):
+                raise
+            first = _ended(e)
+            logger.warning("%s: the build %s; starting it once more", manifest.name, first)
+    raise AssertionError("unreachable")
+
+
+def _ended(e: subprocess.TimeoutExpired) -> str:
+    if isinstance(e, ComposeStalled):
+        return f"printed nothing for {e.timeout:.0f} s"
+    return f"ran past {e.timeout:.0f} s"
+
+
+def _settle_interrupted_recreate(manifest) -> str:
+    """A recreate cut short leaves the new container under compose's
+    temporary name ``<id>_<name>``: renamed back when the old one is gone,
+    else the way out named (the old container still holds the name).
+    Returns the sentence for the log."""
+    project = _project_name(manifest)
+    try:
+        listed = subprocess.run(
+            ["docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={project}",
+             "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=15, env=_compose_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "its containers could not be listed"
+    names = set(listed.stdout.split()) if listed.returncode == 0 else set()
+    notes: list[str] = []
+    for name in sorted(names):
+        m = _TEMP_NAME_RE.match(name)
+        if not m:
+            continue
+        real = m.group(1)
+        if real not in names:
+            try:
+                renamed = subprocess.run(["docker", "rename", name, real], capture_output=True,
+                                         text=True, timeout=15, env=_compose_env()).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                renamed = False
+            if renamed:
+                notes.append(f"{name} renamed back to {real}")
+                continue
+        notes.append(f"{name} is left beside {real}: docker stop {real}; docker rm {real}; "
+                     f"docker rename {name} {real}")
+    return "; ".join(notes) or "no container is left under a temporary name"
 
 
 def _compose_up(manifest, args: list[str], *, timeout: int, t1_retry: bool = False) -> bool:
@@ -598,16 +1062,47 @@ def _compose_up(manifest, args: list[str], *, timeout: int, t1_retry: bool = Fal
     because another stack grabbed our pinned /24 between pick-time and
     create-time (stderr mentions "overlap"), reallocate a fresh free /24 into the
     override and retry once. Still failing → return False (the admin sees it).
+    A run ended before compose reached the containers (a hung build) leaves
+    the running ones as they were; one cut while it recreated them gets its
+    temporary-named container renamed back, or the way out logged
+    (``_settle_interrupted_recreate``).
     """
+    try:
+        return _compose_up_attempts(manifest, args, timeout=timeout, t1_retry=t1_retry)
+    except ComposeEnded as e:
+        if getattr(e, "recreating", False):
+            logger.warning("Docker MCP %s: the proxy stopped while compose recreated its "
+                           "containers: %s", manifest.name, _settle_interrupted_recreate(manifest))
+        else:
+            logger.info("Docker MCP %s: not started, the proxy is stopping", manifest.name)
+        return False
+    except subprocess.TimeoutExpired as e:
+        by_hand = " ".join(shlex.quote(part) for part in _compose_cmd(manifest, *args))
+        prior = getattr(e, "prior", "")
+        if getattr(e, "recreating", False):
+            what = (f"compose up {_ended(e)} while it recreated the containers "
+                    f"({_settle_interrupted_recreate(manifest)})")
+        elif "--build" in args:
+            causes = f"{prior}, then {_ended(e)}" if prior and prior != _ended(e) else (
+                f"{_ended(e)} twice" if prior else _ended(e))
+            what = f"its build {causes}; its running containers are unchanged"
+        else:
+            what = f"compose up {_ended(e)}"
+        logger.error(
+            "Failed to start Docker MCP %s: %s, and the next start tries again. "
+            "By hand: cd %s && %s",
+            manifest.name, what, shlex.quote(str(manifest.mcp_dir)), by_hand,
+        )
+        return False
+
+
+def _compose_up_attempts(manifest, args: list[str], *, timeout: int, t1_retry: bool) -> bool:
     logger.info(
         "%s: compose up%s (first boot may pull/build images — can take minutes "
         "on slow links; progress is logged)",
         manifest.name, " --build" if "--build" in args else "",
     )
-    rc, stderr = _run_compose_streaming(
-        manifest, _compose_cmd(manifest, *args),
-        timeout=timeout, cwd=str(manifest.mcp_dir),
-    )
+    rc, stderr = _run_up(manifest, args, timeout)
     if rc == 0:
         logger.info(
             "Started Docker MCP: %s%s",
@@ -623,10 +1118,7 @@ def _compose_up(manifest, args: list[str], *, timeout: int, t1_retry: bool = Fal
         )
         from services.mcp import compose_rewrite
         compose_rewrite.ensure_t1_override(manifest, force_realloc=True)
-        rc, retry_err = _run_compose_streaming(
-            manifest, _compose_cmd(manifest, *args),
-            timeout=timeout, cwd=str(manifest.mcp_dir),
-        )
+        rc, retry_err = _run_up(manifest, args, timeout)
         if rc == 0:
             logger.info("Started Docker MCP %s after subnet reallocation", manifest.name)
             _record_compose_hash(manifest)
@@ -652,14 +1144,11 @@ def _compose_up(manifest, args: list[str], *, timeout: int, t1_retry: bool = Fal
                 capture_output=True, text=True, timeout=60,
                 env=deployment.docker_subprocess_env(),
             )
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
             rm = None
             logger.warning("%s: stale-container removal failed: %s", manifest.name, e)
         if rm is not None and rm.returncode == 0:
-            rc, retry_err = _run_compose_streaming(
-                manifest, _compose_cmd(manifest, *args),
-                timeout=timeout, cwd=str(manifest.mcp_dir),
-            )
+            rc, retry_err = _run_up(manifest, args, timeout)
             if rc == 0:
                 logger.info(
                     "Started Docker MCP %s after removing the previous "
@@ -715,7 +1204,7 @@ def _warn_foreign_mcp_leftovers() -> None:
                 "docker rm -f %s",
                 len(stale), ", ".join(stale), " ".join(stale),
             )
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         logger.debug("foreign-MCP-leftover scan skipped: %s", e)
 
 
@@ -735,7 +1224,7 @@ def stop_container(manifest) -> bool:
             "Failed to stop Docker MCP %s: %s", manifest.name, result.stderr[:500]
         )
         return False
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         logger.error("Error stopping Docker MCP %s: %s", manifest.name, e)
         return False
 
@@ -762,7 +1251,7 @@ def remove_image(image: str) -> bool:
             image, r.stderr.strip()[:200],
         )
         return False
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         logger.info("Best-effort rmi of %s skipped: %s", image, e)
         return False
 
@@ -806,7 +1295,7 @@ def remove_container(manifest, *, prune_image: bool = True) -> bool:
             image = getattr(getattr(manifest, "server", None), "image", "") or ""
             remove_image(image)
         return ok
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         logger.error("Error removing Docker MCP %s: %s", manifest.name, e)
         return False
 
@@ -847,7 +1336,7 @@ def restart_container(manifest, *, start_exited: bool = False) -> bool:
             ["up", "-d", "--force-recreate", "--no-build", "--pull", "never"],
             timeout=120, t1_retry=True,
         )
-    except Exception as e:
+    except (OSError, ValueError, subprocess.SubprocessError, psycopg.Error) as e:
         logger.error("Error restarting Docker MCP %s: %s", manifest.name, e)
         return False
 
@@ -856,7 +1345,7 @@ def startup_docker_mcps() -> None:
     """Called on proxy startup. Start all enabled Docker MCPs that aren't running.
 
     Always re-injects the platform `.env` (PROXY_URL, HOST_AGENTS_DIR,
-    WOPI_BASE_URL, COLLABORA_FRAME_ANCESTORS, COLLABORA_SERVICE_ROOT) so
+    WOPI_BASE_URL, COLLABORA_SERVICE_ROOT) so
     containers see the current platform config. Note: NO master key — Docker
     MCPs that call back authenticate with a per-session JWT (Authorization
     header injected per session via server.proxy_callbacks), not PROXY_API_KEY.
@@ -899,68 +1388,87 @@ def startup_docker_mcps() -> None:
 
     states = mcp_store.get_all_mcp_states()
     manifests = mcp_registry.get_all_manifests()
+    engine_api: list = []
+    enabled = [(name, manifest) for name, manifest in manifests.items()
+               if _mt.is_container(manifest.server) and states.get(name, False)]
+    for _name, manifest in enabled:
+        _check_engine_for_subpath(manifest, engine_api)
 
-    for name, manifest in manifests.items():
-        if not _mt.is_container(manifest.server):
-            continue
-        if not states.get(name, False):
-            continue  # not enabled
+    # One worker per project, a few at once: a build that runs long (or
+    # stalls until its bound) never holds the next project's start.
+    with ThreadPoolExecutor(max_workers=_BRINGUP_WORKERS, thread_name_prefix="docker-mcp") as pool:
+        futures = {pool.submit(_bring_up, name, manifest): name for name, manifest in enabled}
+        for future, name in futures.items():
+            exc = future.exception()
+            if exc is not None:
+                logger.error("Docker MCP %s: bring-up failed: %r", name, exc, exc_info=exc)
 
-        env_changed = False
-        try:
-            env_changed = _inject_mcp_env(manifest)
-        except Exception as e:
-            logger.warning("Failed to refresh .env for %s: %s", name, e)
 
-        status = get_container_status(manifest)
-        if status == RUNNING:
-            # Compose-config drift check: the skip path historically ran
-            # NOTHING, so base-compose/override changes (a new mem_limit
-            # default, an image retag) never reached a running container
-            # until something else happened to recreate it. Hash the on-disk
-            # config BEFORE refreshing the override (the pre-refresh text is
-            # a faithful baseline for what the running container was created
-            # from — only start_container ever writes the override), refresh
-            # it, re-hash, and recreate on drift. Any failure degrades to
-            # the plain skip this branch always was.
-            compose_changed = False
-            try:
-                from services.mcp import compose_rewrite
+# How many Docker MCP projects the boot brings up at once.
+_BRINGUP_WORKERS = 4
 
-                pre = _compose_config_hash(manifest)
-                compose_rewrite.ensure_t1_override(manifest)
-                post = _compose_config_hash(manifest)
-                recorded = _read_recorded_compose_hash(manifest)
-                if post is not None:
-                    if recorded is not None:
-                        compose_changed = post != recorded
-                    else:
-                        # First boot with this feature: recreate only on
-                        # REAL pending drift (the refresh changed the
-                        # effective config); otherwise seed quietly so
-                        # unchanged installs see no recreate storm.
-                        compose_changed = pre is not None and post != pre
-                        if not compose_changed:
-                            _record_compose_hash(manifest)
-            except Exception as e:
-                logger.warning(
-                    "Compose drift check for %s failed (skipping): %s", name, e,
-                )
 
-            if env_changed:
-                logger.info(
-                    "Docker MCP %s: .env changed, force-recreating to pick up new values",
-                    name,
-                )
-                start_container(manifest, force_recreate=True)
-            elif compose_changed:
-                logger.info(
-                    "Docker MCP %s: compose config changed, force-recreating to pick it up",
-                    name,
-                )
-                start_container(manifest, force_recreate=True)
+def _bring_up(name: str, manifest) -> None:
+    """One enabled Docker MCP at boot: its ``.env`` refreshed, then started,
+    or recreated when its ``.env`` or its compose config changed. Nothing
+    once the proxy is stopping (the pool's queued projects)."""
+    if _stopping.is_set():
+        return
+    env_changed = False
+    try:
+        env_changed = _inject_mcp_env(manifest)
+    except (OSError, ValueError, psycopg.Error) as e:
+        logger.warning("Failed to refresh .env for %s: %s", name, e)
+
+    status = get_container_status(manifest)
+    if status != RUNNING:
+        logger.info("Docker MCP %s: status=%s, starting...", name, status)
+        start_container(manifest)
+        return
+    # Compose-config drift check: the skip path historically ran
+    # NOTHING, so base-compose/override changes (a new mem_limit
+    # default, an image retag) never reached a running container
+    # until something else happened to recreate it. Hash the on-disk
+    # config BEFORE refreshing the override (the pre-refresh text is
+    # a faithful baseline for what the running container was created
+    # from — only start_container ever writes the override), refresh
+    # it, re-hash, and recreate on drift. Any failure degrades to
+    # the plain skip this branch always was.
+    compose_changed = False
+    try:
+        from services.mcp import compose_rewrite
+
+        pre = _compose_config_hash(manifest)
+        compose_rewrite.ensure_t1_override(manifest)
+        post = _compose_config_hash(manifest)
+        recorded = _read_recorded_compose_hash(manifest)
+        if post is not None:
+            if recorded is not None:
+                compose_changed = post != recorded
             else:
-                logger.info("Docker MCP %s: already running", name)
-        else:
-            logger.info("Docker MCP %s: status=%s, starting...", name, status)
-            start_container(manifest)
+                # First boot with this feature: recreate only on
+                # REAL pending drift (the refresh changed the
+                # effective config); otherwise seed quietly so
+                # unchanged installs see no recreate storm.
+                compose_changed = pre is not None and post != pre
+                if not compose_changed:
+                    _record_compose_hash(manifest)
+    except (OSError, ValueError) as e:
+        logger.warning(
+            "Compose drift check for %s failed (skipping): %s", name, e,
+        )
+
+    if env_changed:
+        logger.info(
+            "Docker MCP %s: .env changed, force-recreating to pick up new values",
+            name,
+        )
+        start_container(manifest, force_recreate=True)
+    elif compose_changed:
+        logger.info(
+            "Docker MCP %s: compose config changed, force-recreating to pick it up",
+            name,
+        )
+        start_container(manifest, force_recreate=True)
+    else:
+        logger.info("Docker MCP %s: already running", name)

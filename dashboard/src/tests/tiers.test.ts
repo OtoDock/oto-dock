@@ -21,8 +21,8 @@ describe('tiers', () => {
   })
 
   it('writes the tooltip with the word, the rank and the good-at line', () => {
-    expect(tierTitle(2, 'strong', 'complex coding')).toBe('Strong (tier 2 of 4): complex coding')
-    expect(tierTitle(4)).toBe('Fast (tier 4 of 4)')
+    expect(tierTitle(2, 'strong', 'complex coding')).toBe('Strong, tier 2 of 4: complex coding')
+    expect(tierTitle(4)).toBe('Fast, tier 4 of 4')
     expect(tierTitle(null, undefined, 'local')).toBe('Untiered: no capability rating yet')
   })
 

@@ -765,10 +765,11 @@ function toolErrorText(line) {
 
 // Upstream never recreates its browser after an out-of-band disconnect (the
 // user hit Disconnect on the extension page, closed every group tab, the
-// service worker restarted): every later tool fails with one of these until
-// the inner MCP restarts.
+// service worker restarted, the daemon exited with its last tab): every later
+// tool fails with one of these until the inner MCP restarts. A refused
+// connect means the daemon is gone; the respawned child relaunches it.
 const CLOSED_BROWSER_RE =
-  /Target page, context or browser has been closed|browser has been closed|Browser closed|Target closed|Extension not connected|Extension disconnected|WebSocket closed/i;
+  /Target page, context or browser has been closed|browser has been closed|Browser closed|Target closed|Extension not connected|Extension disconnected|WebSocket closed|connect ECONNREFUSED/i;
 function isClosedBrowserError(text) {
   return CLOSED_BROWSER_RE.test(String(text || ""));
 }

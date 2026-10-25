@@ -1,0 +1,7521 @@
+{
+ "chat": {
+  "cache_read": 0,
+  "cache_write": 0,
+  "codex_thread_id": null,
+  "context_max": 0,
+  "context_used": 0,
+  "engine_cost_session_id": "",
+  "engine_cost_total": 0.0,
+  "last_abort_graceful": false,
+  "last_response_at": false,
+  "last_turn_aborted": false,
+  "output_tokens": 0,
+  "permission_mode": "ask",
+  "thread_goal": null,
+  "title_generated": false,
+  "total_cost": 0.0
+ },
+ "events": [
+  [
+   "text",
+   {
+    "content": "Reading the file. "
+   }
+  ],
+  [
+   "tool_use",
+   {
+    "name": "Read",
+    "tool_id": "toolu_hk_read"
+   }
+  ],
+  [
+   "tool_input",
+   {
+    "name": "Read",
+    "summary": "notes.txt",
+    "tool_input": {
+     "file_path": "/users/dev-admin/workspace/notes.txt"
+    }
+   }
+  ],
+  [
+   "tool_result",
+   {
+    "name": "Read",
+    "tool_id": "toolu_hk_read"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "Done."
+   }
+  ],
+  [
+   "done",
+   {}
+  ]
+ ],
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "Reading the file. ",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "active": false,
+    "is_error": false,
+    "name": "Read",
+    "result_summary": "3 lines",
+    "summary": "notes.txt",
+    "tool_id": "toolu_hk_read",
+    "tool_input": {
+     "file_path": "/users/dev-admin/workspace/notes.txt"
+    },
+    "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "tool_input": {
+     "questions": [
+      {
+       "header": "Folder",
+       "options": [
+        {
+         "label": "workspace"
+        },
+        {
+         "label": "knowledge"
+        }
+       ],
+       "question": "Which folder?"
+      }
+     ]
+    },
+    "tool_name": "AskUserQuestion",
+    "type": "question"
+   },
+   "event_type": "question",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "filename": "write-hello.md",
+    "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+    "request_id": "req-plan-0001",
+    "tool_input": {
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+    },
+    "type": "plan_review"
+   },
+   "event_type": "plan_review",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "filename": "write-hello.md",
+    "plan": "# Plan v2\n\n1. Create hello.txt",
+    "request_id": "req-plan-0002",
+    "tool_input": {
+     "plan": "# Plan v2"
+    },
+    "type": "plan_review"
+   },
+   "event_type": "plan_review",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "images": [
+     {
+      "attribution": "",
+      "caption": "A chart",
+      "image_data": "iVBORw0KGgo=",
+      "link_url": "",
+      "url": ""
+     }
+    ],
+    "type": "images"
+   },
+   "event_type": "images",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "images": [
+     {
+      "attribution": "",
+      "caption": "A chart",
+      "image_data": "iVBORw0KGgo=",
+      "link_url": "",
+      "url": ""
+     }
+    ],
+    "type": "images"
+   },
+   "event_type": "images",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "description": "",
+    "title": "Example",
+    "type": "url",
+    "url": "https://example.com"
+   },
+   "event_type": "url",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "description": "The report",
+    "download_url": "/v1/media/tok-file-1?download=1",
+    "filename": "report.pdf",
+    "type": "file"
+   },
+   "event_type": "file",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "caption": "A clip",
+    "media_url": "",
+    "mime": "",
+    "poster": "",
+    "src_kind": "url",
+    "title": "Clip",
+    "token": "",
+    "type": "video",
+    "url": "https://example.com/clip.mp4"
+   },
+   "event_type": "video",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "caption": "A take",
+    "media_url": "/v1/media/tok-audio-1",
+    "mime": "audio/wav",
+    "poster": "",
+    "src_kind": "token",
+    "title": "Take",
+    "token": "tok-audio-1",
+    "type": "audio",
+    "url": ""
+   },
+   "event_type": "audio",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "download_url": "/v1/media/tok-doc-2?download=1",
+    "file_id": "f1",
+    "filename": "notes.docx",
+    "generation": 4,
+    "snapshot_id": "snap-2",
+    "type": "document_preview",
+    "version": 3,
+    "wopi_url": "/v1/wopi/files/f1"
+   },
+   "event_type": "document_preview",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "height": 420,
+    "path": "workspace/ui/calc.html",
+    "title": "A calculator",
+    "token": "tok-ui-1",
+    "type": "ui",
+    "ui_url": "/v1/ui/tok-ui-1"
+   },
+   "event_type": "ui",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "Done.",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  }
+ ],
+ "seams": {
+  "ephemeral": [
+   [
+    [
+     "user-admin"
+    ],
+    {
+     "body": "Allow Bash?",
+     "chat_id": "chat-pc-hooks",
+     "mid_turn": true,
+     "title": "a1 needs your input"
+    }
+   ],
+   [
+    [
+     "user-admin"
+    ],
+    {
+     "body": "Delete the keypair file?",
+     "chat_id": "chat-pc-hooks",
+     "mid_turn": true,
+     "title": "a1 needs your input"
+    }
+   ]
+  ],
+  "kept": [],
+  "reconciles": [],
+  "relocated": [],
+  "replays": [],
+  "rests": [],
+  "status": [],
+  "titles": [],
+  "tool_starts": []
+ },
+ "trace": [
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Reading the file. "
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Read",
+      "tool_id": "toolu_hk_read",
+      "type": "tool_start"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "Read",
+      "summary": "",
+      "tool_id": "toolu_hk_read",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "Read",
+      "summary": "",
+      "tool_id": "toolu_hk_read",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_hk_read"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_use/Read"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Read",
+      "summary": "notes.txt",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "type": "tool_info"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "Read",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "name": "Read",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_hk_read"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_input/Read"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "result_content": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "summary": "3 lines",
+      "tool_name": "Read",
+      "tool_use_id": "toolu_hk_read",
+      "type": "tool_result"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "_insert_idx": 1,
+      "active": true,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_hk_read"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:tool_result"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "Read",
+      "tool_id": "toolu_hk_read",
+      "type": "tool_end"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_result/Read"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:question"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    }
+   ],
+   "frames": [
+    {
+     "perm_data": {
+      "event_type": "permission_prompt",
+      "request_id": "req-perm-0001",
+      "tool_input": {
+       "command": "rm -r build"
+      },
+      "tool_name": "Bash"
+     },
+     "pump_type": "perm_permission_prompt"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "permission_prompt",
+     "request_id": "req-perm-0001",
+     "tool_input": {
+      "command": "rm -r build"
+     },
+     "tool_name": "Bash"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-perm-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-perm-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "req-perm-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:permission_prompt"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    }
+   ],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "permission_prompt",
+     "request_id": "req-perm-0001",
+     "tool_input": {
+      "command": "rm -r build"
+     },
+     "tool_name": "Bash"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-perm-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-perm-0001",
+    "permission_buffer": [
+     "req-perm-0002"
+    ],
+    "pinged": [
+     "req-perm-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:permission_prompt"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "request_id": "req-perm-0001",
+      "type": "prompt_retired"
+     },
+     "pump_type": "ws_event"
+    },
+    {
+     "meeting_agent": "ceo",
+     "perm_data": {
+      "event_type": "permission_prompt",
+      "meeting_agent": "ceo",
+      "request_id": "req-perm-0002",
+      "tool_input": {
+       "file_path": "/workspace/x.md"
+      },
+      "tool_name": "Write"
+     },
+     "pump_type": "perm_permission_prompt"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "permission_prompt",
+     "meeting_agent": "ceo",
+     "request_id": "req-perm-0002",
+     "tool_input": {
+      "file_path": "/workspace/x.md"
+     },
+     "tool_name": "Write"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-perm-0002",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-perm-0002",
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:prompt_retired"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "request_id": "req-perm-0002",
+      "type": "prompt_retired"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:prompt_retired"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    }
+   ],
+   "frames": [
+    {
+     "mode": "default",
+     "pump_type": "perm_mode_restored"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:mode_restored"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    }
+   ],
+   "frames": [
+    {
+     "perm_data": {
+      "event_type": "question_prompt",
+      "request_id": "req-question-0001",
+      "tool_input": {
+       "questions": [
+        {
+         "question": "Delete the keypair file?"
+        }
+       ]
+      },
+      "tool_name": "request_user_input"
+     },
+     "pump_type": "perm_question_prompt"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:question_prompt"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    }
+   ],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:plan_review"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    }
+   ],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:plan_review"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:images"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "model": "nano-banana",
+     "prompt_preview": "a red bicycle",
+     "type": "image_generating"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "model": "nano-banana",
+      "prompt_preview": "a red bicycle",
+      "type": "image_generating"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "model": "nano-banana",
+      "prompt_preview": "a red bicycle",
+      "type": "image_generating"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:image_generating"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:images"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "model": "nano-banana",
+     "prompt_preview": "a red bicycle",
+     "type": "image_generating"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "model": "nano-banana",
+      "prompt_preview": "a red bicycle",
+      "type": "image_generating"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "model": "nano-banana",
+      "prompt_preview": "a red bicycle",
+      "type": "image_generating"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:image_generating"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "type": "image_gen_failed"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:image_gen_failed"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "description": "",
+     "title": "Example",
+     "type": "url",
+     "url": "https://example.com"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:url"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "description": "",
+     "title": "Example",
+     "type": "url",
+     "url": "https://example.com"
+    },
+    {
+     "description": "The report",
+     "download_url": "/v1/media/tok-file-1?download=1",
+     "filename": "report.pdf",
+     "type": "file"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:file"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "description": "",
+     "title": "Example",
+     "type": "url",
+     "url": "https://example.com"
+    },
+    {
+     "description": "The report",
+     "download_url": "/v1/media/tok-file-1?download=1",
+     "filename": "report.pdf",
+     "type": "file"
+    },
+    {
+     "caption": "A clip",
+     "media_kind": "video",
+     "type": "media_processing"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "caption": "A clip",
+      "media_kind": "video",
+      "type": "media_processing"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     },
+     {
+      "caption": "A clip",
+      "media_kind": "video",
+      "type": "media_processing"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:media_processing"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "description": "",
+     "title": "Example",
+     "type": "url",
+     "url": "https://example.com"
+    },
+    {
+     "description": "The report",
+     "download_url": "/v1/media/tok-file-1?download=1",
+     "filename": "report.pdf",
+     "type": "file"
+    },
+    {
+     "caption": "A clip",
+     "media_url": "",
+     "mime": "",
+     "poster": "",
+     "src_kind": "url",
+     "title": "Clip",
+     "token": "",
+     "type": "video",
+     "url": "https://example.com/clip.mp4"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "caption": "A clip",
+      "media_url": "",
+      "mime": "",
+      "poster": "",
+      "src_kind": "url",
+      "title": "Clip",
+      "token": "",
+      "type": "video",
+      "url": "https://example.com/clip.mp4"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     },
+     {
+      "caption": "A clip",
+      "media_url": "",
+      "mime": "",
+      "poster": "",
+      "src_kind": "url",
+      "title": "Clip",
+      "token": "",
+      "type": "video",
+      "url": "https://example.com/clip.mp4"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:video"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "description": "",
+     "title": "Example",
+     "type": "url",
+     "url": "https://example.com"
+    },
+    {
+     "description": "The report",
+     "download_url": "/v1/media/tok-file-1?download=1",
+     "filename": "report.pdf",
+     "type": "file"
+    },
+    {
+     "caption": "A clip",
+     "media_url": "",
+     "mime": "",
+     "poster": "",
+     "src_kind": "url",
+     "title": "Clip",
+     "token": "",
+     "type": "video",
+     "url": "https://example.com/clip.mp4"
+    },
+    {
+     "caption": "A clip",
+     "media_kind": "video",
+     "type": "media_processing"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "caption": "A clip",
+      "media_kind": "video",
+      "type": "media_processing"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     },
+     {
+      "caption": "A clip",
+      "media_url": "",
+      "mime": "",
+      "poster": "",
+      "src_kind": "url",
+      "title": "Clip",
+      "token": "",
+      "type": "video",
+      "url": "https://example.com/clip.mp4"
+     },
+     {
+      "caption": "A clip",
+      "media_kind": "video",
+      "type": "media_processing"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:media_processing"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "description": "",
+     "title": "Example",
+     "type": "url",
+     "url": "https://example.com"
+    },
+    {
+     "description": "The report",
+     "download_url": "/v1/media/tok-file-1?download=1",
+     "filename": "report.pdf",
+     "type": "file"
+    },
+    {
+     "caption": "A clip",
+     "media_url": "",
+     "mime": "",
+     "poster": "",
+     "src_kind": "url",
+     "title": "Clip",
+     "token": "",
+     "type": "video",
+     "url": "https://example.com/clip.mp4"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "error": "ffmpeg failed",
+      "type": "media_failed"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     },
+     {
+      "caption": "A clip",
+      "media_url": "",
+      "mime": "",
+      "poster": "",
+      "src_kind": "url",
+      "title": "Clip",
+      "token": "",
+      "type": "video",
+      "url": "https://example.com/clip.mp4"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:media_failed"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "description": "",
+     "title": "Example",
+     "type": "url",
+     "url": "https://example.com"
+    },
+    {
+     "description": "The report",
+     "download_url": "/v1/media/tok-file-1?download=1",
+     "filename": "report.pdf",
+     "type": "file"
+    },
+    {
+     "caption": "A clip",
+     "media_url": "",
+     "mime": "",
+     "poster": "",
+     "src_kind": "url",
+     "title": "Clip",
+     "token": "",
+     "type": "video",
+     "url": "https://example.com/clip.mp4"
+    },
+    {
+     "caption": "A take",
+     "media_url": "/v1/media/tok-audio-1",
+     "mime": "audio/wav",
+     "poster": "",
+     "src_kind": "token",
+     "title": "Take",
+     "token": "tok-audio-1",
+     "type": "audio",
+     "url": ""
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "caption": "A take",
+      "media_url": "/v1/media/tok-audio-1",
+      "mime": "audio/wav",
+      "poster": "",
+      "src_kind": "token",
+      "title": "Take",
+      "token": "tok-audio-1",
+      "type": "audio",
+      "url": ""
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     },
+     {
+      "caption": "A clip",
+      "media_url": "",
+      "mime": "",
+      "poster": "",
+      "src_kind": "url",
+      "title": "Clip",
+      "token": "",
+      "type": "video",
+      "url": "https://example.com/clip.mp4"
+     },
+     {
+      "caption": "A take",
+      "media_url": "/v1/media/tok-audio-1",
+      "mime": "audio/wav",
+      "poster": "",
+      "src_kind": "token",
+      "title": "Take",
+      "token": "tok-audio-1",
+      "type": "audio",
+      "url": ""
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:audio"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "description": "",
+     "title": "Example",
+     "type": "url",
+     "url": "https://example.com"
+    },
+    {
+     "description": "The report",
+     "download_url": "/v1/media/tok-file-1?download=1",
+     "filename": "report.pdf",
+     "type": "file"
+    },
+    {
+     "caption": "A clip",
+     "media_url": "",
+     "mime": "",
+     "poster": "",
+     "src_kind": "url",
+     "title": "Clip",
+     "token": "",
+     "type": "video",
+     "url": "https://example.com/clip.mp4"
+    },
+    {
+     "caption": "A take",
+     "media_url": "/v1/media/tok-audio-1",
+     "mime": "audio/wav",
+     "poster": "",
+     "src_kind": "token",
+     "title": "Take",
+     "token": "tok-audio-1",
+     "type": "audio",
+     "url": ""
+    },
+    {
+     "access_token": "wopi-secret-live-only",
+     "access_token_ttl": 3600,
+     "download_url": "/v1/media/tok-doc-1?download=1",
+     "file_id": "f1",
+     "filename": "notes.docx",
+     "generation": 3,
+     "snapshot_id": "snap-1",
+     "token_person": "",
+     "type": "document_preview",
+     "version": 2,
+     "wopi_url": "/v1/wopi/files/f1"
+    }
+   ],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     },
+     {
+      "caption": "A clip",
+      "media_url": "",
+      "mime": "",
+      "poster": "",
+      "src_kind": "url",
+      "title": "Clip",
+      "token": "",
+      "type": "video",
+      "url": "https://example.com/clip.mp4"
+     },
+     {
+      "caption": "A take",
+      "media_url": "/v1/media/tok-audio-1",
+      "mime": "audio/wav",
+      "poster": "",
+      "src_kind": "token",
+      "title": "Take",
+      "token": "tok-audio-1",
+      "type": "audio",
+      "url": ""
+     },
+     {
+      "access_token": "wopi-secret-live-only",
+      "access_token_ttl": 3600,
+      "download_url": "/v1/media/tok-doc-1?download=1",
+      "file_id": "f1",
+      "filename": "notes.docx",
+      "generation": 3,
+      "snapshot_id": "snap-1",
+      "token_person": "",
+      "type": "document_preview",
+      "version": 2,
+      "wopi_url": "/v1/wopi/files/f1"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [
+     "f1"
+    ],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:document_preview"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "description": "",
+     "title": "Example",
+     "type": "url",
+     "url": "https://example.com"
+    },
+    {
+     "description": "The report",
+     "download_url": "/v1/media/tok-file-1?download=1",
+     "filename": "report.pdf",
+     "type": "file"
+    },
+    {
+     "caption": "A clip",
+     "media_url": "",
+     "mime": "",
+     "poster": "",
+     "src_kind": "url",
+     "title": "Clip",
+     "token": "",
+     "type": "video",
+     "url": "https://example.com/clip.mp4"
+    },
+    {
+     "caption": "A take",
+     "media_url": "/v1/media/tok-audio-1",
+     "mime": "audio/wav",
+     "poster": "",
+     "src_kind": "token",
+     "title": "Take",
+     "token": "tok-audio-1",
+     "type": "audio",
+     "url": ""
+    },
+    {
+     "access_token": "wopi-secret-live-only-2",
+     "access_token_ttl": 3600,
+     "download_url": "/v1/media/tok-doc-2?download=1",
+     "file_id": "f1",
+     "filename": "notes.docx",
+     "generation": 4,
+     "snapshot_id": "snap-2",
+     "token_person": "",
+     "type": "document_preview",
+     "version": 3,
+     "wopi_url": "/v1/wopi/files/f1"
+    }
+   ],
+   "frames": [],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     },
+     {
+      "caption": "A clip",
+      "media_url": "",
+      "mime": "",
+      "poster": "",
+      "src_kind": "url",
+      "title": "Clip",
+      "token": "",
+      "type": "video",
+      "url": "https://example.com/clip.mp4"
+     },
+     {
+      "caption": "A take",
+      "media_url": "/v1/media/tok-audio-1",
+      "mime": "audio/wav",
+      "poster": "",
+      "src_kind": "token",
+      "title": "Take",
+      "token": "tok-audio-1",
+      "type": "audio",
+      "url": ""
+     },
+     {
+      "access_token": "wopi-secret-live-only-2",
+      "access_token_ttl": 3600,
+      "download_url": "/v1/media/tok-doc-2?download=1",
+      "file_id": "f1",
+      "filename": "notes.docx",
+      "generation": 4,
+      "snapshot_id": "snap-2",
+      "token_person": "",
+      "type": "document_preview",
+      "version": 3,
+      "wopi_url": "/v1/wopi/files/f1"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [
+     "f1"
+    ],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:document_preview"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "description": "",
+     "title": "Example",
+     "type": "url",
+     "url": "https://example.com"
+    },
+    {
+     "description": "The report",
+     "download_url": "/v1/media/tok-file-1?download=1",
+     "filename": "report.pdf",
+     "type": "file"
+    },
+    {
+     "caption": "A clip",
+     "media_url": "",
+     "mime": "",
+     "poster": "",
+     "src_kind": "url",
+     "title": "Clip",
+     "token": "",
+     "type": "video",
+     "url": "https://example.com/clip.mp4"
+    },
+    {
+     "caption": "A take",
+     "media_url": "/v1/media/tok-audio-1",
+     "mime": "audio/wav",
+     "poster": "",
+     "src_kind": "token",
+     "title": "Take",
+     "token": "tok-audio-1",
+     "type": "audio",
+     "url": ""
+    },
+    {
+     "access_token": "wopi-secret-live-only-2",
+     "access_token_ttl": 3600,
+     "download_url": "/v1/media/tok-doc-2?download=1",
+     "file_id": "f1",
+     "filename": "notes.docx",
+     "generation": 4,
+     "snapshot_id": "snap-2",
+     "token_person": "",
+     "type": "document_preview",
+     "version": 3,
+     "wopi_url": "/v1/wopi/files/f1"
+    },
+    {
+     "height": 420,
+     "path": "workspace/ui/calc.html",
+     "title": "A calculator",
+     "token": "tok-ui-1",
+     "type": "ui",
+     "ui_url": "/v1/ui/tok-ui-1"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "height": 420,
+      "path": "workspace/ui/calc.html",
+      "title": "A calculator",
+      "token": "tok-ui-1",
+      "type": "ui",
+      "ui_url": "/v1/ui/tok-ui-1"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     },
+     {
+      "caption": "A clip",
+      "media_url": "",
+      "mime": "",
+      "poster": "",
+      "src_kind": "url",
+      "title": "Clip",
+      "token": "",
+      "type": "video",
+      "url": "https://example.com/clip.mp4"
+     },
+     {
+      "caption": "A take",
+      "media_url": "/v1/media/tok-audio-1",
+      "mime": "audio/wav",
+      "poster": "",
+      "src_kind": "token",
+      "title": "Take",
+      "token": "tok-audio-1",
+      "type": "audio",
+      "url": ""
+     },
+     {
+      "access_token": "wopi-secret-live-only-2",
+      "access_token_ttl": 3600,
+      "download_url": "/v1/media/tok-doc-2?download=1",
+      "file_id": "f1",
+      "filename": "notes.docx",
+      "generation": 4,
+      "snapshot_id": "snap-2",
+      "token_person": "",
+      "type": "document_preview",
+      "version": 3,
+      "wopi_url": "/v1/wopi/files/f1"
+     },
+     {
+      "height": 420,
+      "path": "workspace/ui/calc.html",
+      "title": "A calculator",
+      "token": "tok-ui-1",
+      "type": "ui",
+      "ui_url": "/v1/ui/tok-ui-1"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [
+     "f1"
+    ],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:ui"
+  },
+  {
+   "blocks": [
+    {
+     "content": "Reading the file. ",
+     "type": "text"
+    },
+    {
+     "active": false,
+     "is_error": false,
+     "name": "Read",
+     "result_summary": "3 lines",
+     "summary": "notes.txt",
+     "tool_id": "toolu_hk_read",
+     "tool_input": {
+      "file_path": "/users/dev-admin/workspace/notes.txt"
+     },
+     "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+     "type": "tool"
+    },
+    {
+     "tool_input": {
+      "questions": [
+       {
+        "header": "Folder",
+        "options": [
+         {
+          "label": "workspace"
+         },
+         {
+          "label": "knowledge"
+         }
+        ],
+        "question": "Which folder?"
+       }
+      ]
+     },
+     "tool_name": "AskUserQuestion",
+     "type": "question"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+     "request_id": "req-plan-0001",
+     "tool_input": {
+      "plan": "# Plan\n\n1. Create hello.txt\n2. Write hello",
+      "planFilePath": "/users/dev-admin/.claude/plans/write-hello.md"
+     },
+     "type": "plan_review"
+    },
+    {
+     "filename": "write-hello.md",
+     "plan": "# Plan v2\n\n1. Create hello.txt",
+     "request_id": "req-plan-0002",
+     "tool_input": {
+      "plan": "# Plan v2"
+     },
+     "type": "plan_review"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "images": [
+      {
+       "attribution": "",
+       "caption": "A chart",
+       "image_data": "iVBORw0KGgo=",
+       "link_url": "",
+       "url": ""
+      }
+     ],
+     "type": "images"
+    },
+    {
+     "description": "",
+     "title": "Example",
+     "type": "url",
+     "url": "https://example.com"
+    },
+    {
+     "description": "The report",
+     "download_url": "/v1/media/tok-file-1?download=1",
+     "filename": "report.pdf",
+     "type": "file"
+    },
+    {
+     "caption": "A clip",
+     "media_url": "",
+     "mime": "",
+     "poster": "",
+     "src_kind": "url",
+     "title": "Clip",
+     "token": "",
+     "type": "video",
+     "url": "https://example.com/clip.mp4"
+    },
+    {
+     "caption": "A take",
+     "media_url": "/v1/media/tok-audio-1",
+     "mime": "audio/wav",
+     "poster": "",
+     "src_kind": "token",
+     "title": "Take",
+     "token": "tok-audio-1",
+     "type": "audio",
+     "url": ""
+    },
+    {
+     "access_token": "wopi-secret-live-only-2",
+     "access_token_ttl": 3600,
+     "download_url": "/v1/media/tok-doc-2?download=1",
+     "file_id": "f1",
+     "filename": "notes.docx",
+     "generation": 4,
+     "snapshot_id": "snap-2",
+     "token_person": "",
+     "type": "document_preview",
+     "version": 3,
+     "wopi_url": "/v1/wopi/files/f1"
+    },
+    {
+     "height": 420,
+     "path": "workspace/ui/calc.html",
+     "title": "A calculator",
+     "token": "tok-ui-1",
+     "type": "ui",
+     "ui_url": "/v1/ui/tok-ui-1"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "Done.",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     },
+     {
+      "caption": "A clip",
+      "media_url": "",
+      "mime": "",
+      "poster": "",
+      "src_kind": "url",
+      "title": "Clip",
+      "token": "",
+      "type": "video",
+      "url": "https://example.com/clip.mp4"
+     },
+     {
+      "caption": "A take",
+      "media_url": "/v1/media/tok-audio-1",
+      "mime": "audio/wav",
+      "poster": "",
+      "src_kind": "token",
+      "title": "Take",
+      "token": "tok-audio-1",
+      "type": "audio",
+      "url": ""
+     },
+     {
+      "access_token": "wopi-secret-live-only-2",
+      "access_token_ttl": 3600,
+      "download_url": "/v1/media/tok-doc-2?download=1",
+      "file_id": "f1",
+      "filename": "notes.docx",
+      "generation": 4,
+      "snapshot_id": "snap-2",
+      "token_person": "",
+      "type": "document_preview",
+      "version": 3,
+      "wopi_url": "/v1/wopi/files/f1"
+     },
+     {
+      "height": 420,
+      "path": "workspace/ui/calc.html",
+      "title": "A calculator",
+      "token": "tok-ui-1",
+      "type": "ui",
+      "ui_url": "/v1/ui/tok-ui-1"
+     },
+     {
+      "content": "Done.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [
+     "f1"
+    ],
+    "pending_text": [
+     "Done."
+    ],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "access_token": "wopi-secret-live-only-2",
+      "access_token_ttl": 3600,
+      "download_url": "/v1/media/tok-doc-2?download=1",
+      "file_id": "f1",
+      "filename": "notes.docx",
+      "generation": 4,
+      "snapshot_id": "snap-2",
+      "token_person": "",
+      "type": "document_preview",
+      "version": 3,
+      "wopi_url": "/v1/wopi/files/f1"
+     },
+     "pump_type": "ws_event"
+    },
+    {
+     "pump_type": "is_done"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "content": "Reading the file. ",
+      "type": "text"
+     },
+     {
+      "active": false,
+      "is_error": false,
+      "name": "Read",
+      "result_summary": "3 lines",
+      "summary": "notes.txt",
+      "tool_id": "toolu_hk_read",
+      "tool_input": {
+       "file_path": "/users/dev-admin/workspace/notes.txt"
+      },
+      "tool_result": "total 5064\ndrwxrwxr-x 9 person person    4096 Oct 16 22:09 .\ndrwxrwxr-x 8 person person    4096 Jul 26 04:07 ..\n-rw-r--r-- 1 person person      28 Oct 16 22:09 c9p1-note.txt\n",
+      "type": "tool"
+     },
+     {
+      "tool_input": {
+       "questions": [
+        {
+         "header": "Folder",
+         "options": [
+          {
+           "label": "workspace"
+          },
+          {
+           "label": "knowledge"
+          }
+         ],
+         "question": "Which folder?"
+        }
+       ]
+      },
+      "tool_name": "AskUserQuestion",
+      "type": "question"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "images": [
+       {
+        "attribution": "",
+        "caption": "A chart",
+        "image_data": "iVBORw0KGgo=",
+        "link_url": "",
+        "url": ""
+       }
+      ],
+      "type": "images"
+     },
+     {
+      "description": "",
+      "title": "Example",
+      "type": "url",
+      "url": "https://example.com"
+     },
+     {
+      "description": "The report",
+      "download_url": "/v1/media/tok-file-1?download=1",
+      "filename": "report.pdf",
+      "type": "file"
+     },
+     {
+      "caption": "A clip",
+      "media_url": "",
+      "mime": "",
+      "poster": "",
+      "src_kind": "url",
+      "title": "Clip",
+      "token": "",
+      "type": "video",
+      "url": "https://example.com/clip.mp4"
+     },
+     {
+      "caption": "A take",
+      "media_url": "/v1/media/tok-audio-1",
+      "mime": "audio/wav",
+      "poster": "",
+      "src_kind": "token",
+      "title": "Take",
+      "token": "tok-audio-1",
+      "type": "audio",
+      "url": ""
+     },
+     {
+      "access_token": "wopi-secret-live-only-2",
+      "access_token_ttl": 3600,
+      "download_url": "/v1/media/tok-doc-2?download=1",
+      "file_id": "f1",
+      "filename": "notes.docx",
+      "generation": 4,
+      "snapshot_id": "snap-2",
+      "token_person": "",
+      "type": "document_preview",
+      "version": 3,
+      "wopi_url": "/v1/wopi/files/f1"
+     },
+     {
+      "height": 420,
+      "path": "workspace/ui/calc.html",
+      "title": "A calculator",
+      "token": "tok-ui-1",
+      "type": "ui",
+      "ui_url": "/v1/ui/tok-ui-1"
+     },
+     {
+      "content": "Done.\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": {
+     "event_type": "question_prompt",
+     "request_id": "req-question-0001",
+     "tool_input": {
+      "questions": [
+       {
+        "question": "Delete the keypair file?"
+       }
+      ]
+     },
+     "tool_name": "request_user_input"
+    },
+    "session_id": "sid-pc-hooks",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": "req-question-0001",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-question-0001",
+    "permission_buffer": [
+     "req-plan-0001",
+     "req-plan-0002"
+    ],
+    "pinged": [
+     "req-question-0001"
+    ],
+    "plan_filename": "write-hello.md",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": true,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:done"
+  }
+ ]
+}

@@ -115,7 +115,8 @@ def test_purge_removes_everything_and_needs_the_slug_from_a_human(agent_tree):
     folder = agent_tree / row["rel_path"]
     assert folder.is_dir() and releases.app_release_dir(row).is_dir()
     # The confirmation, the authority and the human at the keyboard.
-    assert client.post(f"/v1/apps/{row['id']}/purge", json={"confirm": "nope"}).status_code == 400
+    wrong = client.post(f"/v1/apps/{row['id']}/purge", json={"confirm": "nope"})
+    assert (wrong.status_code, wrong.json()["detail"]) == (400, "Type the app's ID to confirm.")
     _as(_user(is_api_key=True))
     assert client.post(f"/v1/apps/{row['id']}/purge", json={"confirm": "board"}).status_code == 403
     _as(_user("bob-sub", {AGENT: "viewer"}))
@@ -223,6 +224,7 @@ def test_the_purge_deletes_each_walked_file_by_the_path_it_was_walked_at(agent_t
     FIFO in the folder is neither counted nor followed."""
     import os
     from unittest.mock import AsyncMock
+
     from services.infra import file_bookkeeping
     linked_root = tmp_path / "agents-link"
     linked_root.symlink_to(config.AGENTS_DIR, target_is_directory=True)
@@ -259,6 +261,7 @@ def test_a_purge_that_leaves_a_linked_folder_in_place_announces_no_delete(agent_
     """A folder that is a link is neither walked (the walk would follow it
     into another folder's files) nor announced to the satellites as gone."""
     from unittest.mock import AsyncMock
+
     from services.infra import file_bookkeeping
     other = agent_tree / "workspace" / "elsewhere"
     other.mkdir()
@@ -286,3 +289,22 @@ def test_a_user_delete_removes_the_viewer_documents_of_their_personal_apps(agent
     assert viewer_data.viewers_dir(row).is_dir()
     asyncio.run(app_lifecycle.remove_user_app_dirs("alice-sub"))
     assert not viewer_data.viewers_dir(row).exists()
+
+
+def test_neither_the_unpin_nor_the_purge_removes_a_folder_the_app_made(agent_tree):
+    folder = agent_tree / "users/alice/workspace/apps/board"
+    (folder / "client").mkdir(parents=True)
+    (folder / "client" / "index.html").write_text("<p>v1</p>")
+    (folder / "app.json").write_text(json.dumps({"title": "Timeline", "files": {
+        "read": ["workspace/videos"], "create": ["workspace/videos/projects"]}}))
+    body = _hook("deploy", {"slug": "board"}).json()
+    assert client.post(f"/v1/apps/{body['app_id']}/deploy/approve").status_code == 200
+    made = agent_tree / "users/alice/workspace/videos/projects"
+    (made / "cut.vproj.json").write_text("{}")
+    assert _hook("unpin", {"slug": "board"}).status_code == 200
+    assert (made / "cut.vproj.json").is_file()
+    body = _hook("deploy", {"slug": "board"}).json()
+    assert client.post(f"/v1/apps/{body['app_id']}/deploy/approve").status_code == 200
+    with patch("services.infra.file_bookkeeping.push_file_delete"):
+        assert _hook("purge", {"slug": "board", "confirm": "board"}).status_code == 200
+    assert not folder.exists() and (made / "cut.vproj.json").is_file()

@@ -32,8 +32,9 @@ The kind's ``name`` is also the word the MCP manifests' ``exclude_from``
 lists (``task`` / ``phone`` / ``meeting``; ``terminal`` and ``external``
 are not kinds — a placement and a principal). ``chats.origin``
 (``dashboard`` / ``otodock`` / ``delegated``) is a chat-list badge, not a
-kind. The owner sentinels (``task::<agent>``, ``agent::<agent>``,
-``phone``) live with the owners in ``core/session/visibility.py``.
+kind. The owner prefixes (``task::<agent>``, ``agent::<agent>``) are spelled
+here and the ``phone`` sentinel with the owners in
+``core/session/visibility.py``, which mints and asks of all three.
 
 Stdlib only — a leaf every side imports at module level.
 """
@@ -41,6 +42,7 @@ Stdlib only — a leaf every side imports at module level.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 
 @dataclass(frozen=True)
@@ -72,6 +74,12 @@ _BY_ROW_SOURCE_TYPE = {k.source_type: k for k in KINDS if k.mints_chat}
 
 #: The chat ids the scheduler mints: ``task-{run_id}`` (``runner._execute_task``).
 TASK_CHAT_ID_PREFIX = "task-"
+
+#: The synthetic chat-row owners' prefixes: a Shared-only agent's shared
+#: history (``agent::<slug>``) and an agent-scope task run's chat
+#: (``task::<slug>``); ``core/session/visibility.py`` mints and asks of them.
+SHARED_CHAT_OWNER_PREFIX = "agent::"
+TASK_CHAT_OWNER_PREFIX = "task::"
 
 #: The pump ``source_type`` spellings of the kinds an out-of-band driver owns
 #: — the dashboard never attaches to their pumps, and the agent Conversations
@@ -126,14 +134,14 @@ def is_task_chat_id(chat_id: str | None) -> bool:
     carry ``chat`` in ``source_type`` and nothing else says task. A site
     that needs the RUN keeps asking the store for it — the shape alone
     grants nothing."""
-    return bool(chat_id) and chat_id.startswith(TASK_CHAT_ID_PREFIX)
+    return bool(chat_id) and cast("str", chat_id).startswith(TASK_CHAT_ID_PREFIX)
 
 
 def run_id_of_chat(chat_id: str | None) -> str:
     """The run id a task chat id carries, ``""`` for any other id."""
     if not is_task_chat_id(chat_id):
         return ""
-    return chat_id[len(TASK_CHAT_ID_PREFIX):]
+    return cast("str", chat_id)[len(TASK_CHAT_ID_PREFIX):]
 
 
 def of_chat(row: dict | None) -> SessionKind:

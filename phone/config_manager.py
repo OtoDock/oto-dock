@@ -10,8 +10,11 @@ instead of importing config.py settings.
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
+
+from audio.streaming.lang import language_candidates
 
 logger = logging.getLogger("config_manager")
 
@@ -221,7 +224,7 @@ class ConfigManager:
         self._servers = config_data.get("servers", {}) or {}
         self._rebuild_route_index()
         version = config_data.get("version", "?")
-        logger.info(f"Config loaded (version={version}, {len(self._routes_by_uuid)} inbound, {len(self._routes_outbound)} outbound)")
+        logger.info("Config loaded (version=%s, %s inbound, %s outbound)", version, len(self._routes_by_uuid), len(self._routes_outbound))
 
     def _rebuild_route_index(self) -> None:
         """Rebuild route lookup dicts from config data."""
@@ -497,6 +500,29 @@ class ConfigManager:
     @property
     def smart_turn_audio_window_s(self) -> float:
         return float(self._s("smart_turn_audio_window_s", "8.0"))
+
+    # The caller's language (pipeline/language.py): the local identifier on
+    # or off, its threads, and the languages it may pick (the install's
+    # list, a subset of the platform's; a wrong-language move needs two
+    # candidates that confuse each other, so an install lists what it
+    # speaks).
+    @property
+    def language_identify_enabled(self) -> bool:
+        return self._s("language_identify_enabled", "true").lower() in ("true", "1", "yes")
+
+    @property
+    def language_identify_threads(self) -> int:
+        """One identifier run's threads, 1 to the CPU count (a value that is
+        not a number counts as 1: the pre-warm must never raise on it)."""
+        try:
+            threads = int(self._s("language_identify_threads", "1"))
+        except (TypeError, ValueError):
+            threads = 1
+        return max(1, min(threads, os.cpu_count() or 1))
+
+    @property
+    def language_candidates(self) -> list[str]:
+        return language_candidates(self._s("language_candidates", ""))
 
     # Fillers (enable/disable is per-route — see resolve_route_settings)
     @property

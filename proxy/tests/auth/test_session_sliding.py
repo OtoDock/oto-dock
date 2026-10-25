@@ -108,10 +108,10 @@ def test_logout_not_resurrected():
 # cookie, reads off the loop otherwise, and never costs the route its
 # answer: any error there skips the re-mint.
 
-import pytest  # noqa: E402
+import pytest
 
-import middleware  # noqa: E402
-from storage import pg  # noqa: E402
+import middleware
+from storage import pg
 
 
 @pytest.fixture
@@ -165,7 +165,9 @@ async def test_a_remint_is_dated_to_the_routes_check_so_a_later_epoch_refuses_it
     without a second read, dated to the route's check, so the new cookie
     predates the epoch and is refused like the old one."""
     from datetime import datetime, timezone
+
     from starlette.datastructures import MutableHeaders
+
     from auth.providers import session_cookie_current
     from storage import database as task_store
     from storage.pg import get_conn

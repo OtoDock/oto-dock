@@ -10,6 +10,8 @@
  * every engine maps its own into them on the proxy.
  */
 
+import { isRecord } from '../json/guards'
+
 export const TOOL_ROLES: Record<string, string> = {
   'Bash': 'shell',
   'Monitor': 'shell',
@@ -46,6 +48,15 @@ export const TOOL_ROLES: Record<string, string> = {
   'request_user_input': 'question',
   'CodexEscalation': 'escalation',
   'CodexTerminalInput': 'escalation',
+  'view_image': 'read',
+  'spawn_agent': 'subagent',
+  'send_input': 'subagent',
+  'resume_agent': 'subagent',
+  'wait_agent': 'subagent',
+  'close_agent': 'subagent',
+  'list_mcp_resources': 'discovery',
+  'list_mcp_resource_templates': 'discovery',
+  'read_mcp_resource': 'discovery',
 }
 
 export const TOOL_PAYLOADS: Record<string, string> = {
@@ -84,6 +95,15 @@ export const TOOL_PAYLOADS: Record<string, string> = {
   'request_user_input': '',
   'CodexEscalation': '',
   'CodexTerminalInput': '',
+  'view_image': 'path',
+  'spawn_agent': '',
+  'send_input': '',
+  'resume_agent': '',
+  'wait_agent': '',
+  'close_agent': '',
+  'list_mcp_resources': '',
+  'list_mcp_resource_templates': '',
+  'read_mcp_resource': '',
 }
 
 /** The input keys a payload kind is read from, in order (the first present
@@ -135,8 +155,8 @@ export function toolPayload(name: string | undefined | null): string {
 
 /** The tool's payload — the value under the first present key of its
  *  kind — or undefined. */
-export function payloadValue(name: string, input: any): unknown {
-  if (!input || typeof input !== 'object') return undefined
+export function payloadValue(name: string, input: unknown): unknown {
+  if (!isRecord(input)) return undefined
   for (const key of PAYLOAD_KEYS[toolPayload(name)] || []) {
     const v = input[key]
     if (v !== undefined && v !== null && v !== '') return v
@@ -145,7 +165,7 @@ export function payloadValue(name: string, input: any): unknown {
 }
 
 /** The payload as text ('' when absent or not a string). */
-export function payloadText(name: string, input: any): string {
+export function payloadText(name: string, input: unknown): string {
   const v = payloadValue(name, input)
   return typeof v === 'string' ? v : ''
 }

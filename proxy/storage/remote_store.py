@@ -10,14 +10,15 @@ import json
 import logging
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
-from storage.pg import get_conn
+from cryptography.fernet import InvalidToken
 
-from auth import roles
 # The placement vocabulary (the stored target value, the resolved kind, the
 # pairing scope) and the descriptor this store builds from a machine row.
 from core import placement
+from storage.pg import get_conn
+from ws import wire_events as wire
 
 logger = logging.getLogger("otodock.remote-store")
 
@@ -153,20 +154,26 @@ def placement_of(
 
     The local placement for an empty, ``local`` or sentinel target (a
     sentinel's session never starts — every consumer refuses before the
-    registration; see ``core.placement``); the user-paired kind when
-    ``user_remote_targets`` for this (user, agent) pair names the machine,
+    registration; see ``core.placement``); the user-paired kind for a
+    person's own machine, and for an admin machine the person's
+    ``user_remote_targets`` row names for this agent (the dual-scope flow),
     else the agent-level default (admin-paired); the machine row read once
     and its facts parsed by ``placement.from_machine`` (a missing row: the
     kind with every fact empty — the path gate fail-closes).
     """
     if placement.is_local(target) or placement.is_offline_sentinel(target):
         return placement.LOCAL_PLACEMENT
+    machine = get_remote_machine(target)
     kind = placement.KIND_ADMIN_REMOTE
-    if user_sub:
+    if machine and not placement.machine_is_admin_paired(machine):
+        # A person's own machine is user-remote whatever pinned the chat
+        # there (their default, or a move to it).
+        kind = placement.KIND_USER_REMOTE
+    elif user_sub:
         ut = get_user_remote_target(user_sub, agent_slug)
         if ut and ut.get("machine_id") == target:
             kind = placement.KIND_USER_REMOTE
-    return placement.from_machine(kind, get_remote_machine(target))
+    return placement.from_machine(kind, machine)
 
 
 def get_all_remote_machines() -> list[dict]:
@@ -429,7 +436,7 @@ def get_target_browser_settings(target: placement.PlacementCapabilities) -> Brow
         from storage.identity import credential_store
         try:
             token = credential_store.decrypt_secret(enc)
-        except Exception:
+        except (InvalidToken, UnicodeDecodeError):
             logger.warning(
                 "Failed to decrypt the browser extension token of machine %s "
                 "(key mismatch? see the CREDENTIAL KEY MISMATCH boot check)",
@@ -669,6 +676,50 @@ def delete_remote_machine(machine_id: str) -> bool:
             "SELECT name FROM remote_machines WHERE id = %s", (machine_id,)
         ).fetchone()
         machine_name = (machine_row or {}).get("name") or machine_id[:8]
+        # A chat moved TO this machine whose source still holds its session
+        # files (the move waits for proof) goes back there with its ids; the
+        # move rows naming the machine settle; a task's machine goes.
+        from storage import move_schema as _mv
+        _now_s = _now()
+        for r in conn.execute(
+            """SELECT DISTINCT ON (m.chat_id) m.id, m.chat_id, m.source, m.target,
+                      m.state, m.memory, m.created_at
+                 FROM chat_moves m JOIN chats c ON c.id = m.chat_id
+                WHERE c.execution_target = %s
+                ORDER BY m.chat_id, m.created_at DESC""",
+            (machine_id,),
+        ).fetchall():
+            if (r["state"] == _mv.AWAITING_RESUME and r["memory"] == _mv.MEMORY_FILES
+                    and r["target"] == machine_id and r["source"] != machine_id):
+                # The source's copy misses any turn the chat ran on this
+                # machine since the move: those come back as a digest of
+                # just those turns on the next one (``returned:<move id>``).
+                conn.execute(
+                    """UPDATE chats SET execution_target = %s,
+                              pending_history_seed = CASE WHEN EXISTS (
+                                  SELECT 1 FROM chat_messages cm
+                                   WHERE cm.chat_id = chats.id
+                                     AND cm.role IN ('user', 'assistant')
+                                     AND cm.created_at > %s)
+                                THEN %s ELSE pending_history_seed END
+                        WHERE id = %s AND execution_target = %s""",
+                    (r["source"], r["created_at"], f"returned:{r['id']}", r["chat_id"],
+                     machine_id),
+                )
+                conn.execute(
+                    "UPDATE chat_moves SET state = %s, settled_at = %s WHERE id = %s",
+                    (_mv.RETURNED, _now_s, r["id"]),
+                )
+        for col, state in (("source", _mv.SOURCE_GONE), ("target", _mv.TARGET_GONE)):
+            conn.execute(
+                f"UPDATE chat_moves SET state = %s, settled_at = %s "
+                f"WHERE {col} = %s AND state = ANY(%s)",
+                (state, _now_s, machine_id, [_mv.MOVING, _mv.AWAITING_RESUME]),
+            )
+        conn.execute(
+            "UPDATE dynamic_tasks SET target_machine = '' WHERE target_machine = %s",
+            (machine_id,),
+        )
         # Transition pinned chats to auto-continue. last_turn_aborted is
         # cleared too: the history digest already contains the aborted turn,
         # so the cancelled-context injection must not fire on top of it.
@@ -712,29 +763,228 @@ def delete_remote_machine(machine_id: str) -> bool:
     return deleted
 
 
-def rebind_chat_to_current_target(chat_id: str, from_label: str) -> bool:
-    """Transition ONE chat to auto-continue on the agent's current target —
-    the user-facing "Move this chat" escape hatch.
-
-    The exact ``delete_remote_machine`` per-chat shape scoped to one row: the
-    pin is cleared to ``''`` (an explicit pin would be masked-then-restamped
-    by the next warmup — dashboard_warmup's ``w_pinned`` requires a live
-    session_id), session ids are dropped so the next turn fresh-spawns, and
-    ``pending_history_seed='moved:<from_label>'`` marks the chat for the
-    DB-history digest injection. The old session is abandoned where it lives
-    (idle reaper / satellite retention owns it)."""
+def _rebind(chat_id: str, sets: str, set_args: tuple, *, expect_target: str,
+            expect_session_id: str | None, expect_thread: str | None) -> bool:
+    """One chat's place changed by a move, as a compare-and-set on the place
+    and the ids the move read: a second move, or a spawn that re-bound the
+    row in between, makes it a no-op (False)."""
     with get_conn() as conn:
         cur = conn.execute(
-            """UPDATE chats
-                  SET execution_target = '', session_id = NULL,
-                      codex_thread_id = NULL, last_turn_aborted = FALSE,
-                      last_abort_graceful = FALSE, context_used = 0,
-                      pending_history_seed = %s
-                WHERE id = %s""",
-            (f"moved:{from_label}", chat_id),
+            f"""UPDATE chats SET {sets}
+                 WHERE id = %s AND COALESCE(execution_target, '') = %s
+                   AND session_id IS NOT DISTINCT FROM %s
+                   AND codex_thread_id IS NOT DISTINCT FROM %s""",
+            (*set_args, chat_id, expect_target or "", expect_session_id or None,
+             expect_thread or None),
         )
         conn.commit()
         return cur.rowcount > 0
+
+
+def rebind_chat_with_files(chat_id: str, target: str, *, expect_target: str,
+                           expect_session_id: str | None, expect_thread: str | None) -> bool:
+    """The move WITH the session files: the chat's place becomes ``target``
+    and it keeps its ids and its context fill (the engine's files are there
+    now, so the next turn resumes the same session); any pending seed goes."""
+    return _rebind(chat_id, "execution_target = %s, pending_history_seed = ''", (target,),
+                   expect_target=expect_target, expect_session_id=expect_session_id,
+                   expect_thread=expect_thread)
+
+
+def rebind_chat_to_target(chat_id: str, target: str, move_id: str, *, expect_target: str,
+                          expect_session_id: str | None, expect_thread: str | None) -> bool:
+    """The move WITHOUT the files (the source offline, the transfer failed):
+    the ``delete_remote_machine`` per-chat shape scoped to one row, pinned to
+    the CHOSEN ``target``: the session ids are dropped so the next turn
+    spawns fresh there, and ``pending_history_seed='moved:<move id>'`` marks
+    the chat for the DB-history digest (the move row names both places and
+    why). The old session stays where it lived."""
+    return _rebind(
+        chat_id,
+        """execution_target = %s, session_id = NULL, codex_thread_id = NULL,
+           last_turn_aborted = FALSE, last_abort_graceful = FALSE,
+           context_used = 0, pending_history_seed = %s""",
+        (target, f"moved:{move_id}"),
+        expect_target=expect_target, expect_session_id=expect_session_id,
+        expect_thread=expect_thread,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chat moves (storage/move_schema.py)
+# ---------------------------------------------------------------------------
+
+_MOVE_COLUMNS = (
+    "id", "chat_id", "agent", "engine", "session_id", "resume_handle", "home_user",
+    "source", "target", "from_label", "to_label", "memory", "why", "state",
+    "files", "bytes", "main_rel", "main_size", "actor", "origin", "created_at", "settled_at",
+)
+
+
+def create_chat_move(row: dict) -> None:
+    """Write a move's row (its ``state`` and ids set by the caller)."""
+    cols = [c for c in _MOVE_COLUMNS if c in row]
+    with get_conn() as conn:
+        conn.execute(
+            f"INSERT INTO chat_moves ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))})",
+            tuple(row[c] for c in cols),
+        )
+        conn.commit()
+
+
+def update_chat_move(move_id: str, **fields) -> None:
+    """Update a move's row; a settling state stamps ``settled_at``."""
+    from storage import move_schema
+    fields = {k: v for k, v in fields.items() if k in _MOVE_COLUMNS and k != "id"}
+    if fields.get("state") and fields["state"] not in (move_schema.MOVING,
+                                                       move_schema.AWAITING_RESUME):
+        fields.setdefault("settled_at", _now())
+    if not fields:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE chat_moves SET {', '.join(f'{k} = %s' for k in fields)} WHERE id = %s",
+            (*fields.values(), move_id),
+        )
+        conn.commit()
+
+
+def get_chat_move(move_id: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM chat_moves WHERE id = %s", (move_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def latest_chat_move(chat_id: str) -> dict | None:
+    """The chat's newest move row, or None."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM chat_moves WHERE chat_id = %s ORDER BY created_at DESC, id LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def tool_moves_since_person(chat_id: str) -> int:
+    """The agent's own moves of the chat (``origin`` tool, any that did not
+    fail) since the chat's last message from a person (a ``user`` row with an
+    author: the platform's own prompts carry none)."""
+    from storage import move_schema
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT count(*) AS n FROM chat_moves
+                WHERE chat_id = %s AND origin = %s AND state <> %s
+                  AND created_at > COALESCE(
+                      (SELECT max(created_at) FROM chat_messages
+                        WHERE chat_id = %s AND role = 'user'
+                          AND COALESCE(author_sub, '') <> ''), '')""",
+            (chat_id, move_schema.ORIGIN_TOOL, move_schema.FAILED, chat_id),
+        ).fetchone()
+        return int((row or {}).get("n") or 0)
+
+
+def add_switch_leftover(row: dict) -> None:
+    """Record the session files an engine switch left (``row``: the
+    ``engine_switch_leftovers`` columns)."""
+    cols = ("id", "chat_id", "agent", "engine", "session_id", "resume_handle",
+            "home_user", "place", "created_at")
+    with get_conn() as conn:
+        conn.execute(
+            f"INSERT INTO engine_switch_leftovers ({', '.join(cols)}) "
+            f"VALUES ({', '.join(['%s'] * len(cols))})",
+            tuple(row[c] for c in cols),
+        )
+        conn.commit()
+
+
+def switch_leftovers() -> list[dict]:
+    """Every engine switch's leftover, oldest first."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM engine_switch_leftovers ORDER BY created_at, id").fetchall()
+        return [dict(r) for r in rows]
+
+
+def drop_switch_leftover(leftover_id: str) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM engine_switch_leftovers WHERE id = %s", (leftover_id,))
+        conn.commit()
+
+
+def last_answer_since(chat_id: str, since: str) -> tuple[int, list[str]] | None:
+    """The chat's last answer of its agent written after ``since`` (an ISO
+    stamp, as the rows store theirs), as ``(row id, the event_data of every
+    system event row after it)``; None when the agent wrote none."""
+    with get_conn() as conn:
+        last = conn.execute(
+            "SELECT max(id) AS id FROM chat_messages WHERE chat_id = %s AND role = 'assistant' "
+            "AND created_at > %s",
+            (chat_id, since),
+        ).fetchone()
+        if not last or last["id"] is None:
+            return None
+        rows = conn.execute(
+            "SELECT event_data FROM chat_messages WHERE chat_id = %s AND id > %s "
+            "AND role = 'event' AND event_type = %s ORDER BY id",
+            (chat_id, last["id"], wire.SYSTEM),
+        ).fetchall()
+        return int(last["id"]), [str(r["event_data"] or "") for r in rows]
+
+
+def chat_moves_in(states: tuple[str, ...]) -> list[dict]:
+    """Every move row in one of ``states``, oldest first."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM chat_moves WHERE state = ANY(%s) ORDER BY created_at",
+            (list(states),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def session_refs_shared(chat_id: str, refs: list[str]) -> bool:
+    """Whether anything besides the chat ``chat_id`` still names one of
+    ``refs``: another chat row's session or thread id, or a task that
+    continues the session (a delegation's ``continue_session``). Such a
+    session stays where it is: its next round resumes it there."""
+    refs = [r for r in refs if r]
+    if not refs:
+        return False
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT 1 WHERE EXISTS (
+                   SELECT 1 FROM chats
+                    WHERE id != %s AND (session_id = ANY(%s) OR codex_thread_id = ANY(%s)))
+                OR EXISTS (
+                   SELECT 1 FROM dynamic_tasks WHERE continue_session = ANY(%s))""",
+            (chat_id, refs, refs, refs),
+        ).fetchone()
+        return row is not None
+
+
+def chat_continued_by_task(chat: dict) -> bool:
+    """Whether a task continues the chat's session (a delegation's
+    ``continue_session`` names its session or thread id)."""
+    refs = [r for r in (chat.get("session_id"), chat.get("codex_thread_id")) if r]
+    if not refs:
+        return False
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM dynamic_tasks WHERE continue_session = ANY(%s) LIMIT 1", (refs,),
+        ).fetchone()
+        return row is not None
+
+
+def fail_running_moves() -> int:
+    """A move a proxy restart cut short: its job is gone, so it failed (the
+    chat's place is whatever its compare-and-set left). At startup."""
+    from storage import move_schema
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE chat_moves SET state = %s, settled_at = %s WHERE state = %s",
+            (move_schema.FAILED, _now(), move_schema.MOVING),
+        )
+        conn.commit()
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
 
 # ---------------------------------------------------------------------------
@@ -944,120 +1194,3 @@ def clear_user_remote_targets_for_agent(agent_slug: str) -> int:
         )
         conn.commit()
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-
-
-# ---------------------------------------------------------------------------
-# Unified target resolution
-# ---------------------------------------------------------------------------
-
-def resolve_execution_target(
-    agent_slug: str,
-    user_sub: str | None = None,
-    role: str = roles.MANAGER,
-) -> tuple[str, str | None]:
-    """Resolve effective execution target: user override > agent default > local.
-
-    Returns (target, fallback_reason) where:
-    - target is a machine_id, ``placement.LOCAL``, or the offline sentinel
-      (``placement.offline_sentinel``) when the intended remote target is
-      unreachable and fallback is disabled.
-    - fallback_reason is a short slug describing *why* the target differs from
-      the user-configured/admin-configured intent. Values:
-        * None — target matches intent (user override or agent default)
-        * "user-override-offline" — user override exists but machine is offline
-          and fallback-to-agent-default is enabled
-        * "agent-default-offline" — agent-default machine offline and fallback
-          to local is enabled
-        * "viewer-on-admin-remote" — non-owner per-agent role (viewer/editor)
-          forced to local because remote has no bwrap isolation; non-owners
-          may still set own user-level overrides (registered_by themselves)
-          since they own the hardware. Slug name is historical — covers
-          both viewer and editor
-
-    The 'role' parameter is the caller's effective per-agent role for this
-    agent (admin/manager/editor/viewer). Non-owner sessions (anything other
-    than manager/admin) never run on admin-configured remote targets
-    (security regression — remote has no bwrap sandbox). Non-owner
-    user-level overrides (their own paired machine) are still honored.
-    """
-    from services.remote.remote_status import is_reachable
-    from storage.agents import agent_store
-    from storage import database as _db
-
-    # The Direct LLM engine runs in-process on the server, never on a
-    # satellite (session_manager.get_layer routes it local unconditionally
-    # and remote_session_start refuses it), so a direct-llm agent's target is
-    # local whatever its pin or the user's override says. Deciding it HERE
-    # covers every builder (chat, task, meeting, phone), the dashboard's
-    # pin/mismatch logic and the scheduler in one place — before the fix each
-    # of them believed the pin and shaped a remote placement prompt + device
-    # MCP set for a session that then ran on the server (2026-09-07).
-    agent = agent_store.get_agent(agent_slug)
-    from core.session.session_manager import get_layer_capabilities
-    _ec = get_layer_capabilities((agent or {}).get("execution_path") or "")
-    if _ec is not None and not _ec.runtime.supports_remote_execution:
-        if not placement.is_local((agent or {}).get("execution_target")):
-            logger.info(
-                "resolve_execution_target: %s runs on the Direct LLM engine — "
-                "its remote target is ignored (always local)", agent_slug,
-            )
-        return (placement.LOCAL, None)
-
-    fallback_user = _db.get_platform_setting("remote_fallback_user_override")
-    fallback_agent = _db.get_platform_setting("remote_fallback_agent_default")
-    allow_fallback_user = fallback_user != "0"    # default true
-    allow_fallback_agent = fallback_agent == "1"  # default false
-
-    # 1. Check user-level override. Works for all roles (viewer included) —
-    #    user paired their own hardware.
-    if user_sub:
-        user_target = get_user_remote_target(user_sub, agent_slug)
-        if user_target:
-            machine_id = user_target["machine_id"]
-            if is_reachable(machine_id):
-                return (machine_id, None)
-            # User's machine is offline. Fall through to agent-default if
-            # allowed, else hard-fail with sentinel.
-            logger.warning(
-                "User %s remote target %s is offline, fallback_user=%s",
-                user_sub[:16], machine_id[:8], allow_fallback_user,
-            )
-            if not allow_fallback_user:
-                return (placement.offline_sentinel(machine_id), "user-override-offline-hard-fail")
-            # Soft fall-through to agent default — continues below with reason.
-            _user_override_fallback = True
-        else:
-            _user_override_fallback = False
-    else:
-        _user_override_fallback = False
-
-    # 2. Agent-level default (the row was loaded above)
-    agent_target = (agent or {}).get("execution_target") or placement.LOCAL
-
-    if placement.is_local(agent_target):
-        if _user_override_fallback:
-            return (placement.LOCAL, "user-override-offline")
-        return (placement.LOCAL, None)
-
-    # 3. Agent-set remote target. Only OWNERS (manager/admin) can run on
-    #    admin-paired remotes — satellite has no bwrap kernel isolation,
-    #    so role-based filesystem restrictions enforced via the path_policy
-    #    hook for non-owner roles (viewer, editor) are bypassable on satellite
-    #    via Codex's hook-bypass surface. Force-to-local for non-owners
-    #    preserves the role isolation guarantee. Users who paired their own
-    #    machine via User Settings still hit it via user_remote_targets in
-    #    step 1 (above) — that's their own hardware, machine-trust model.
-    if not roles.can_manage(role):
-        reason = "viewer-on-admin-remote"  # historical name; extended to editor+viewer
-        return (placement.LOCAL, reason)
-
-    # 4. Owner (manager/admin) with agent remote target — honor if reachable.
-    if is_reachable(agent_target):
-        if _user_override_fallback:
-            return (agent_target, "user-override-offline")
-        return (agent_target, None)
-
-    # Agent target offline.
-    if allow_fallback_agent:
-        return (placement.LOCAL, "agent-default-offline")
-    return (placement.offline_sentinel(agent_target), "agent-default-offline-hard-fail")

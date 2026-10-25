@@ -15,11 +15,10 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from core import placement
+from core import layout, placement
 from core.events import tool_roles
 from core.placement import PlacementCapabilities
 from services.checks import classify, patterns
-from core import layout
 
 logger = logging.getLogger("checks")
 
@@ -80,7 +79,7 @@ def _relative_of(raw: str, security) -> str:
         from services import path_policy_v2 as ppv2
         ctx = ppv2.context_from_security(security)
         res = ppv2.resolve_path_for_session(ctx, raw)
-    except Exception:
+    except ImportError:
         return ""
     rel = (res.sandbox_relative or "").strip("/")
     if rel and rel.split("/")[0] not in _TREE_HEADS:
@@ -145,7 +144,7 @@ async def _remote_git_root(machine_id: str, native_path: str, agent: str, cache:
             cur = cur.rsplit("/", 1)[0] or "/"
             if cur == "/" or re.match(r"^[A-Za-z]:/?$", cur):
                 return ""
-    except Exception:
+    except Exception:  # noqa: BLE001  # a remote git probe is optional, the check runs without the root
         logger.debug("checks: remote git probe failed", exc_info=True)
     return ""
 

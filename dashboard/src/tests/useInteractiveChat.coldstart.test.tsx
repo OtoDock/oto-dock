@@ -22,7 +22,7 @@ const CTX = {
   chatId: 'chat-1',
   sessionId: null,
   warmingUp: false,
-  warmupParams: { agentName: 'dev', chatId: 'chat-1', mode: 'default', model: 'm', layer: 'claude-code-cli' },
+  warmupParams: { agentName: 'dev', chatId: 'chat-1', mode: 'ask', model: 'm', layer: 'claude-code-cli' },
 }
 
 describe('useInteractiveChat cold start', () => {

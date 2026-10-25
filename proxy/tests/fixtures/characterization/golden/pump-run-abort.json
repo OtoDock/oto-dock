@@ -1,0 +1,187 @@
+{
+ "chat": {
+  "cache_read": 0,
+  "cache_write": 0,
+  "codex_thread_id": null,
+  "context_max": 0,
+  "context_used": 0,
+  "engine_cost_session_id": "",
+  "engine_cost_total": 0.0,
+  "last_abort_graceful": false,
+  "last_response_at": true,
+  "last_turn_aborted": false,
+  "output_tokens": 0,
+  "permission_mode": "ask",
+  "thread_goal": null,
+  "title_generated": false,
+  "total_cost": 0.0
+ },
+ "frames": [
+  {
+   "event": {
+    "content": "cut ",
+    "type": "text"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "event": {
+    "agent": "personal-assistant-lite",
+    "chat_id": "task-run-c9p1-0001",
+    "prompt": "Count the files in the workspace folder and report the number.",
+    "prompt_preview": "Count the files in the workspace folder and report the number.",
+    "surface": "task",
+    "task_id": "dyn-c9p1-0001",
+    "task_name": "count-files",
+    "type": "delegate_spawn"
+   },
+   "pump_type": "ws_event"
+  },
+  {
+   "pump_type": "all_done"
+  },
+  {
+   "pump_type": "pump_ended"
+  }
+ ],
+ "live_after": null,
+ "queue_seq": 0,
+ "registered_after": false,
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "cut ",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "agent": "personal-assistant-lite",
+    "chat_id": "task-run-c9p1-0001",
+    "prompt": "Count the files in the workspace folder and report the number.",
+    "prompt_preview": "Count the files in the workspace folder and report the number.",
+    "surface": "task",
+    "task_id": "dyn-c9p1-0001",
+    "task_name": "count-files",
+    "type": "delegate_spawn"
+   },
+   "event_type": "delegate_spawn",
+   "role": "event"
+  }
+ ],
+ "seams": {
+  "ephemeral": [
+   [
+    [
+     "user-admin"
+    ],
+    {
+     "body": "Response ready",
+     "chat_id": "chat-pr-abort",
+     "title": "a1 finished"
+    }
+   ]
+  ],
+  "kept": [],
+  "reconciles": [
+   "a1"
+  ],
+  "relocated": [],
+  "replays": [],
+  "rests": [],
+  "status": [
+   [
+    [
+     "user-admin",
+     "chat-pr-abort",
+     "streaming"
+    ],
+    {
+     "agent": "a1"
+    }
+   ],
+   [
+    [
+     "user-admin",
+     "chat-pr-abort",
+     "ready"
+    ],
+    {
+     "agent": "a1"
+    }
+   ]
+  ],
+  "titles": [
+   [
+    "chat-pr-abort",
+    ""
+   ]
+  ],
+  "tool_starts": []
+ },
+ "state": {
+  "abort_requested": true,
+  "accepts_in_flight": 0,
+  "active_tools": [],
+  "cache": [
+   0,
+   0
+  ],
+  "completed": true,
+  "context": [
+   0,
+   0
+  ],
+  "cost_delta": 0.0,
+  "cumulative_cost": null,
+  "done": true,
+  "engine_prompts": [],
+  "gc_snapshots_pending": false,
+  "goal": null,
+  "has_pending_prompt": false,
+  "last_ending": null,
+  "last_error": "",
+  "last_session_cost": 0.0,
+  "leftover": [],
+  "llm_cost_delta": 0.0,
+  "mcp_cost_by_key": {},
+  "meeting_agent": null,
+  "pending_permission": null,
+  "pending_previews": [],
+  "pending_text": [],
+  "permission_active": null,
+  "permission_buffer": [],
+  "pinged": [],
+  "plan_filename": "",
+  "queue_closed": true,
+  "recovery_eligible": null,
+  "registry": {
+   "completed": [],
+   "has_pending": false,
+   "spawned": []
+  },
+  "retried": [],
+  "session_mode": "auto",
+  "steer_saved_ranges": [],
+  "thinking_text": "",
+  "title_armed": false,
+  "todos": [],
+  "tokens": [
+   0,
+   0
+  ],
+  "tool_seen": 0,
+  "viewers": [
+   [
+    true,
+    false,
+    4
+   ]
+  ],
+  "workflows_forwarded": []
+ },
+ "usage": []
+}

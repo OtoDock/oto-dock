@@ -4,12 +4,13 @@
 // workspace overlay's handler below it on the escape stack stays put).
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { createPortal } from 'react-dom'
 
 import WorkspaceToolbar from '@/components/workspace/WorkspaceToolbar'
 import { usePortalMenu } from '@/hooks/usePortalMenu'
 import { pushEscHandler } from '@/lib/escStack'
+import Dialog from '@/components/ui/Dialog'
 
 function Harness() {
   const m = usePortalMenu()
@@ -23,7 +24,7 @@ function Harness() {
           <button role="menuitem">Two</button>
           <button role="menuitem">Three</button>
         </div>,
-        document.body,
+        m.portalRoot,
       )}
     </>
   )
@@ -134,6 +135,21 @@ describe('the workspace toolbar menus by keyboard', () => {
     expect(screen.queryByRole('menu')).toBeNull()
   })
 
+  it('a click opens either menu with no row painted by its focus: only a keyboard focus paints', async () => {
+    media(true)
+    toolbar()
+    for (const [button, name] of [['Upload', 'Upload'], ['File', 'New file']] as const) {
+      fireEvent.click(screen.getByRole('button', { name: button }))
+      const menu = screen.getByRole('menu', { name })
+      for (const row of within(menu).getAllByRole('menuitem')) {
+        expect(row.className).not.toMatch(/(^|\s)focus:bg-/)
+        expect(row.className).toContain('focus-visible:bg-surface-hover')
+      }
+      fireEvent.keyDown(document, { key: 'Escape' })
+      await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    }
+  })
+
   it('opens the file picker straight away where there is no folder picker', () => {
     media(false)
     const { container } = toolbar()
@@ -161,5 +177,31 @@ describe('the workspace toolbar menus by keyboard', () => {
     fireEvent.click(document.activeElement!)
     expect(onNewFile).toHaveBeenCalledWith('.txt')
     expect(screen.queryByRole('menu')).toBeNull()
+  })
+})
+
+describe('usePortalMenu inside a dialog', () => {
+  it('mounts its panel in the dialog, takes Escape before it, and a backdrop press closes only the menu', async () => {
+    const onClose = vi.fn()
+    render(<Dialog aria-label="Edit" onClose={onClose}><Harness /></Dialog>)
+    const dialog = screen.getByRole('dialog', { name: 'Edit' })
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+    const menu = screen.getByRole('menu')
+    expect(dialog.contains(menu)).toBe(true)
+    await waitFor(() => expect(focused()).toBe('One'))
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' })
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(onClose).not.toHaveBeenCalled()
+    expect(closeWorkspace).not.toHaveBeenCalled()
+    // Open again; a press on the backdrop closes the menu, not the dialog.
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+    fireEvent.pointerDown(dialog)
+    fireEvent.mouseDown(dialog)
+    fireEvent.click(dialog, { detail: 1 })
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(closeWorkspace).not.toHaveBeenCalled()
   })
 })

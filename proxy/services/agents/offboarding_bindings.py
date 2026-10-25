@@ -30,7 +30,7 @@ from services.agents import offboarding
 from services.webhooks import subscription_manager
 from storage import database as task_store
 from storage.automation import webhook_subscription_store
-from storage.identity import credential_store
+from storage.identity import credential_store, oauth_app_kinds
 from storage.pg import run_db
 
 logger = logging.getLogger("otodock")
@@ -83,14 +83,25 @@ async def clear_binding(row: dict, owner_sub: str) -> None:
 
 async def _sweep_orphans() -> int:
     """Every service-scope subscription whose binding no longer stands, or
-    now names another account, goes; the vendor delete is best-effort."""
+    now names another account, goes; an installation row the standing
+    binding no longer covers goes alone. The vendor delete is best-effort."""
     rows = await run_db(webhook_subscription_store.list_subscriptions, scope="service")
     gone = 0
     for row in rows:
         agent = row.get("agent") or ""
         binding = await run_db(credential_store.get_service_agent_binding,
                                row["mcp_name"], agent)
-        if binding and binding[0] == row["account_label"]:
+        if binding and binding.account_label == row["account_label"]:
+            if row.get("target_kind") != oauth_app_kinds.INSTALLATION_TARGET_KIND:
+                continue
+            if await _covers(binding, row):
+                continue
+            try:
+                deleted, _ = await subscription_manager.delete_subscription(subscription_id=row["id"])
+                gone += int(deleted)
+            except Exception:
+                logger.exception("offboarding: the orphaned subscription %s was not cleaned",
+                                 row.get("id"))
             continue
         try:
             gone += await subscription_manager.cleanup_account_subscriptions(
@@ -101,6 +112,14 @@ async def _sweep_orphans() -> int:
             logger.exception("offboarding: the orphaned subscription %s was not cleaned",
                              row.get("id"))
     return gone
+
+
+async def _covers(binding: credential_store.ServiceBinding, row: dict) -> bool:
+    """Whether ``binding`` still covers the installation ``row`` targets."""
+    meta = {} if binding.installation_id else await run_db(
+        credential_store.get_account_meta, binding.account_owner_sub, row["mcp_name"],
+        row["account_label"])
+    return oauth_app_kinds.binding_covers(binding.installation_id, meta, row.get("vendor_target") or "")
 
 
 async def clear_unmanaged_bindings(sub: str) -> int:

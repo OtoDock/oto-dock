@@ -1,0 +1,53 @@
+<p class="muted">A section only some roles see. Mark it with the lowest role that may use it. The page hides it from everyone below, with one line that says so. Use it for an owner's settings on a public page, or a manager's view inside a team app. Hiding is a courtesy to the reader. The platform still refuses a call the role may not make. The app's own code checks the role on every change too. A link visitor is always a viewer, so the page asks nothing there.</p>
+
+<div class="card">
+  <h3>Bookings</h3>
+  <p>Everyone who opens the app sees this.</p>
+</div>
+<div class="card" style="margin-top: 16px" data-min-role="contributor">
+  <h3>Add a booking</h3>
+  <p>A contributor and above can add one.</p>
+  <button type="button" class="btn primary">Add a booking</button>
+</div>
+<div class="card" style="margin-top: 16px" data-min-role="editor">
+  <h3>Opening hours</h3>
+  <p>An editor and above can change them.</p>
+</div>
+<div class="card" style="margin-top: 16px" data-min-role="manager">
+  <h3>People</h3>
+  <p>A manager and above can invite people.</p>
+</div>
+<p class="muted role-gate-note" id="role-note" hidden></p>
+
+<style>
+.role-gate-note { margin-top: 16px; font-size: var(--p-font-size-xs); }
+</style>
+
+<script>
+(function () {
+  var RANK = ['viewer', 'contributor', 'editor', 'manager', 'admin']
+  var WORDS = { contributor: 'a contributor', editor: 'an editor', manager: 'a manager', admin: 'an admin' }
+  function apply(role) {
+    var mine = RANK.indexOf(role)
+    if (mine < 0) mine = 0
+    var lowest = null
+    document.querySelectorAll('[data-min-role]').forEach(function (el) {
+      var need = RANK.indexOf(el.dataset.minRole)
+      var hidden = need > mine
+      el.hidden = hidden
+      if (hidden && (lowest === null || need < lowest)) lowest = need
+    })
+    var note = document.getElementById('role-note')
+    note.hidden = lowest === null
+    if (lowest !== null) note.textContent = 'More appears here for ' + WORDS[RANK[lowest]] + ' of this agent.'
+  }
+  // The viewer's role comes from the platform when the page is opened as an
+  // app. A link visitor and a page outside an app count as a viewer, and
+  // a link page never asks the platform.
+  if (window.otodock && typeof otodock.platform === 'function' && !otodock.sharedLink) {
+    otodock.platform('viewer.me').then(function (me) { apply(me && me.role ? String(me.role) : 'viewer') }, function () { apply('viewer') })
+  } else {
+    apply('viewer')
+  }
+})()
+</script>

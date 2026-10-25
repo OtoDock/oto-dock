@@ -1,9 +1,10 @@
 import { PAYLOAD, payloadText, toolPayload } from '../../lib/tools/roles'
+import Button from '../ui/Button'
 
 interface Props {
   requestId: string
   toolName: string
-  toolInput: any
+  toolInput: unknown
   description?: string
   resolved?: boolean
   approved?: boolean
@@ -37,7 +38,7 @@ export default function PermissionDialog({
 
     // Denied: show compact denial notice
     return (
-      <div className="my-2 p-2 rounded-lg border border-p-accent-red/20 bg-p-accent-red/5 text-sm text-p-accent-red">
+      <div className="my-2 p-2 rounded-card border border-status-danger-border bg-status-danger-bg text-sm text-status-danger-fg">
         <div className="flex items-center gap-2">
           <span>{'\u2717'}</span>
           <span className="font-medium">{toolName}</span>
@@ -48,34 +49,34 @@ export default function PermissionDialog({
   }
 
   return (
-    <div className="my-2 p-3 rounded-lg border border-[#f4b206]/30 bg-[#f4b206]/5">
+    <div className="my-2 p-3 rounded-card border border-status-warning-border bg-status-warning-bg">
       {meetingAgent && (
-        <div className="flex items-center gap-1.5 mb-1.5 text-xs text-p-text-secondary">
-          <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: meetingAgent.color || '#6B7280' }} />
+        <div className="flex items-center gap-1.5 mb-1.5 text-xs text-secondary">
+          <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: meetingAgent.color || 'var(--color-accent-agent-fill)' }} />
           <span className="font-medium">{meetingAgent.displayName || meetingAgent.slug}</span>
         </div>
       )}
       <div className="flex items-center gap-2 mb-2">
-        <span className="text-[#b8860b]">&#128274;</span>
-        <span className="font-medium text-sm text-p-text">{toolName}</span>
-        {description && <span className="text-xs text-p-text-secondary">{description}</span>}
+        <span className="text-status-warning-fg">&#128274;</span>
+        <span className="font-medium text-sm text-primary">{toolName}</span>
+        {description && <span className="text-xs text-secondary">{description}</span>}
       </div>
-      <pre className="p-2 rounded-sm bg-white dark:bg-p-surface border border-p-border-light text-xs text-p-text mb-3 max-h-40 overflow-auto whitespace-pre-wrap">
+      <pre className="p-2 rounded-sm bg-surface-card border border-subtle text-xs text-primary mb-3 max-h-40 overflow-auto whitespace-pre-wrap">
         {displayInput}
       </pre>
       <div className="flex gap-2">
-        <button
+        <Button
+          size="sm" variant="primary"
           onClick={() => onRespond(requestId, true)}
-          className="px-3 py-1 rounded-lg text-sm font-medium text-white bg-green-600 hover:bg-green-700"
         >
           Allow
-        </button>
-        <button
+        </Button>
+        <Button
+          size="sm" variant="danger"
           onClick={() => onRespond(requestId, false)}
-          className="px-3 py-1 rounded-lg text-sm font-medium text-white bg-red-600 hover:bg-red-700"
         >
           Deny
-        </button>
+        </Button>
       </div>
     </div>
   )

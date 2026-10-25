@@ -24,7 +24,16 @@ from services.oauth import oauth_engine
 from storage.identity import credential_store
 from tests.auth.test_mcp_authorization_discovery import ISSUER
 from tests.auth.test_oauth_mcp_authorization_flow import (  # noqa: F401 (fixtures)
-    DASH, MCP, PROVIDER, TOKEN, _app_shape, _manifest_data, _params, _start, person, rig,
+    DASH,
+    MCP,
+    PROVIDER,
+    TOKEN,
+    _app_shape,
+    _manifest_data,
+    _params,
+    _start,
+    person,
+    rig,
 )
 
 COOKIE = "oto_oauth_connect"
@@ -157,7 +166,7 @@ def test_a_vendor_error_response_leaves_the_state_unspent(rig):  # noqa: F811
     _, q = _consent(rig)
     resp = rig.client.get(f"/v1/oauth/{PROVIDER}/callback",
                           params={"error": "access_denied", "state": q["state"], "iss": ISSUER})
-    assert "Provider returned: access_denied" in resp.text
+    assert "The sign-in was cancelled. Connect again to retry." in resp.text
     assert oauth_engine.peek_state_identity(q["state"]) is not None
     assert "Account Connected" in _callback(rig.client, q["state"]).text
 

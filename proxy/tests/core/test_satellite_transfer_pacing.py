@@ -53,7 +53,10 @@ async def _app(scope, receive, send):
                 return
     if scope["type"] != "websocket":
         return
-    from core.remote.satellite_connection import SatelliteConnection, SatelliteConnectionManager
+    from core.remote.satellite_connection import (
+        SatelliteConnection,
+        SatelliteConnectionManager,
+    )
     from services.path_policy_v2 import PathRef
 
     await receive()

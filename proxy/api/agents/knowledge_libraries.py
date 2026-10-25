@@ -30,6 +30,7 @@ from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 
 import config
+from api.agents._router import router
 from auth.providers import (
     UserContext,
     get_current_user,
@@ -37,13 +38,15 @@ from auth.providers import (
     require_creator_interactive,
     session_bound_to,
 )
-from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path, resolve_under
-from storage.agents import agent_store
-from storage.knowledge import db_knowledge_libraries
-
-from api.agents._router import router
 from core import layout
 from core.background import spawn
+from services.infra.path_confinement import (
+    PathOutsideRoot,
+    normalize_rel_path,
+    resolve_under,
+)
+from storage.agents import agent_store
+from storage.knowledge import db_knowledge_libraries
 
 logger = logging.getLogger("otodock.knowledge-libraries")
 
@@ -129,9 +132,9 @@ def normalize_subdir(subdir: str) -> str:
         raise _bad("Library folder may not contain control characters.")
     try:
         sub = normalize_rel_path(sub)
-    except PathOutsideRoot:
+    except PathOutsideRoot as exc:
         raise _bad("Library folder must be a clean relative path "
-                   "(no empty, '.' or '..' segments).")
+                   "(no empty, '.' or '..' segments).") from exc
     segs = sub.split("/")
     for seg in segs:
         if seg.startswith("."):
@@ -439,7 +442,7 @@ async def attach_knowledge_library(
                 writable=req.writable, created_by=u.acting_sub or "",
                 subdir=subdir))
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if not created:
         await asyncio.to_thread(
             db_knowledge_libraries.set_writable, source, name, req.writable,

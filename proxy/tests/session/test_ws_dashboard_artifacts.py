@@ -12,7 +12,9 @@ import asyncio
 import json
 import secrets
 
-from core.events.common_events import CommonEvent, TEXT, DONE
+import pytest
+
+from core.events.common_events import DONE, TEXT, CommonEvent
 from storage import database as task_store
 from tests.fixtures.ws_dashboard_harness import (
     ANY,
@@ -26,8 +28,6 @@ from tests.fixtures.ws_dashboard_harness import (
     stub_dashboard_seams,
     warm_new_chat,
 )
-
-import pytest
 
 
 @pytest.fixture(autouse=True)

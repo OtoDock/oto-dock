@@ -26,10 +26,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import logging
 import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+from storage.identity import oauth_app_kinds
+
+logger = logging.getLogger("otodock.oauth")
 
 # OAuth state TTL — 5 minutes. Matches Authentik's default state TTL; the
 # browser-binding cookie the start route sets lives as long.
@@ -59,6 +64,14 @@ class OAuthState:
     # endpoints the start resolved. The state binds the person, the MCP, the
     # provider and this registration; the callback uses exactly these.
     mcp_authorization: dict[str, Any] | None = None
+    # The admin credential kind the connect goes through
+    # (storage/identity/oauth_app_kinds.py; "" = the provider's only kind):
+    # the exchange uses that kind's client, whatever the bundle says by then,
+    # and the account's meta records it.
+    app_kind: str = ""
+    # An "Install the app on GitHub" round trip rather than a sign-in: the
+    # setup URL consumes it and re-lists the account's installations.
+    install: bool = False
     # monotonic timestamp at which this state expires
     expiry: float = 0.0
 
@@ -100,6 +113,8 @@ def create_state(
     redirect_uri: str = "",
     extra: dict[str, str] | None = None,
     mcp_authorization: dict[str, Any] | None = None,
+    app_kind: str = "",
+    install: bool = False,
 ) -> str:
     """Mint and store a new OAuth state token. Returns the opaque token.
 
@@ -138,6 +153,8 @@ def create_state(
         extra=extra_merged,
         code_verifier=code_verifier,
         mcp_authorization=dict(mcp_authorization) if mcp_authorization else None,
+        app_kind=app_kind,
+        install=install,
         expiry=time.monotonic() + _STATE_TTL_SECONDS,
     )
     _purge_expired()
@@ -169,6 +186,13 @@ def peek_state_identity(token: str) -> tuple[str, bool] | None:
     if state is None or time.monotonic() > state.expiry:
         return None
     return state.user_sub, state.mobile
+
+
+def peek_state_install(token: str) -> bool:
+    """Non-consuming: whether a live state is an install page's (GitHub's
+    return with it is re-listed by the setup page, never exchanged)."""
+    state = _states.get(token)
+    return state is not None and time.monotonic() <= state.expiry and state.install
 
 
 def discard_state(token: str) -> None:
@@ -303,20 +327,24 @@ def active_state_count() -> int:
 # --- app credential resolution (manifest-driven) ------------------------
 
 def _resolve_app_credentials(
-    oauth: dict[str, Any], creds: dict[str, str],
+    oauth: dict[str, Any], creds: dict[str, str], kind: str = "",
 ) -> tuple[str, str]:
     """Extract (client_id, client_secret) from infra credentials.
 
-    Walks the manifest's ``app_credential_fields`` and picks the field
-    whose key contains ``CLIENT_ID`` / ``CLIENT_SECRET`` (case-insensitive)
-    as the substring. New providers just declare their admin-form field
-    keys with those substrings present (e.g. ``GOOGLE_OAUTH_CLIENT_ID``,
-    ``SLACK_CLIENT_ID``, ``LINEAR_CLIENT_ID``); this resolver finds the
-    right two automatically.
+    Walks the admin fields of ``kind`` (the bundle's active kind when not
+    given: ``storage/identity/oauth_app_kinds.active_kind``; the manifest's
+    ``app_credential_fields`` for a provider that declares no kinds) and
+    picks the field whose key contains ``CLIENT_ID`` / ``CLIENT_SECRET``
+    (case-insensitive) as the substring. New providers just declare their
+    admin-form field keys with those substrings present (e.g.
+    ``GOOGLE_OAUTH_CLIENT_ID``, ``SLACK_CLIENT_ID``); this resolver finds the
+    right two automatically, and the kinds' keys never shadow each other.
     """
+    from storage.identity import oauth_app_kinds
     client_id = ""
     client_secret = ""
-    for field_def in oauth.get("app_credential_fields", []) or []:
+    kind = kind or oauth_app_kinds.active_kind(oauth, creds)
+    for field_def in oauth_app_kinds.kind_fields(oauth, kind):
         key = field_def.get("key", "")
         key_u = key.upper()
         val = creds.get(key, "")
@@ -338,6 +366,9 @@ class ExchangeResult:
     name: str
     account_label: str
     state: OAuthState
+    # A GitHub-App connect: how many installations the listing with the
+    # fresh token found (``None``: another kind, or the listing failed).
+    installations_listed: int | None = None
 
 
 async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> ExchangeResult:
@@ -357,12 +388,17 @@ async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> Ex
     state = validate_state(state_token)
     if state is None:
         raise RuntimeError("Invalid or expired OAuth state")
+    if state.install:
+        # An install page's return carries the person GitHub has signed in
+        # at that moment: exchanging it could put another GitHub user's token
+        # under the account's label. The setup page re-lists instead.
+        raise RuntimeError("An install page's return is not a sign-in")
 
     # Provider + app credentials
     from auth.oauth_providers import get_provider
-    from storage.identity import credential_store
     from services.billing import relay_client
     from services.mcp import mcp_registry
+    from storage.identity import credential_store
 
     provider = get_provider(state.provider_id)
 
@@ -400,14 +436,19 @@ async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> Ex
         client_id = ""
         client_secret = ""
         token_url = ""
+        # The relay says which kind of app issued the token; an answer
+        # without the word is the OAuth App.
+        app_kind = str(token_set.raw.get("app_kind") or state.app_kind or "")
     else:
         # SELF-MANAGED: app credentials live in infra_credentials keyed by the
-        # manifest's `credentials.oauth.app_credential` slug. Walk the declared
-        # `app_credential_fields` to find the CLIENT_ID / CLIENT_SECRET keys.
+        # manifest's `credentials.oauth.app_credential` slug, read through the
+        # kind the START chose (an admin switching kinds mid-flow does not
+        # change a running exchange), else the bundle's active kind.
         app_cred_name = manifest.credentials.oauth.get("app_credential", "")
         creds = credential_store.get_infra_credentials(app_cred_name) if app_cred_name else {}
+        app_kind = state.app_kind or oauth_app_kinds.active_kind(manifest.credentials.oauth, creds)
         client_id, client_secret = _resolve_app_credentials(
-            manifest.credentials.oauth, creds,
+            manifest.credentials.oauth, creds, app_kind,
         )
         if not client_id or not client_secret:
             raise RuntimeError(
@@ -421,6 +462,8 @@ async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> Ex
             code_verifier=state.code_verifier or None,
         )
         token_url = provider.token_url
+    if app_kind:
+        token_set.raw["app_kind"] = app_kind
 
     # Identity probe uses the user's own access token — no OtoDock secret
     # needed, so it works the same for hosted and self-managed.
@@ -447,6 +490,7 @@ async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> Ex
     # the account lock the refresh worker holds across its own rewrite.
     from core.credentials import credential_locks
     from services.oauth import oauth_account_store
+    listed: int | None = None
     async with credential_locks.get_lock(state.user_sub, state.provider_id, account_label):
         await asyncio.to_thread(
             oauth_account_store.persist_oauth_account,
@@ -461,13 +505,52 @@ async def do_oauth_exchange(*, code: str, state_token: str, iss: str = "") -> Ex
             client_secret=client_secret,
             token_url=token_url,
         )
+        if app_kind == oauth_app_kinds.KIND_GITHUB_APP:
+            # The installations the person can reach, with the new token.
+            from services.oauth import github_apps
+            listed = await asyncio.to_thread(
+                github_apps.record_installations_after_connect,
+                state.user_sub, state.mcp_name, account_label,
+            )
+    if app_kind == oauth_app_kinds.KIND_GITHUB_APP and token_set.raw.get("via_relay"):
+        await _register_hosted_app_events(state)
 
     return ExchangeResult(
         email=userinfo.email,
         name=userinfo.name,
         account_label=account_label,
         state=state,
+        installations_listed=listed,
     )
+
+
+async def _register_hosted_app_events(state: OAuthState) -> None:
+    """A hosted GitHub-App account: the relay forwards its installations'
+    changes (a repository added, the app removed) only to an install whose
+    events endpoint is registered, so register it now (idempotent: the
+    forward secret rotates only when none is held). Best-effort: the
+    account stands either way, and its card's Refresh still reads GitHub."""
+    import httpx
+
+    from services.billing import relay_client
+    from services.mcp import mcp_registry
+    from services.webhooks import subscription_manager
+    manifest = mcp_registry.get_manifest(state.mcp_name)
+    webhooks = (manifest.credentials.webhooks or {}) if manifest and manifest.credentials else {}
+    if not webhooks.get("app_webhook"):
+        return
+    try:
+        await subscription_manager._relay_register_events(provider_id=state.provider_id)
+    except relay_client.RelayError as exc:
+        # The relay keeps the first address an install registers, for every
+        # provider: a refused address is the admin's to fix, not a blip.
+        level = logging.WARNING if exc.code in ("events_host_changed", "bad_events_url") else logging.INFO
+        logger.log(level, "hosted GitHub App: the events endpoint was not registered (%s): %s",
+                   exc.code, relay_client.relay_error_message(exc.code))
+    except subscription_manager.SubscriptionError as exc:
+        logger.warning("hosted GitHub App: the events endpoint was not registered: %s", exc)
+    except (relay_client.RelayNotConfigured, httpx.HTTPError, OSError) as exc:
+        logger.info("hosted GitHub App: the events endpoint was not registered (%s)", exc)
 
 
 async def _exchange_registered_client(

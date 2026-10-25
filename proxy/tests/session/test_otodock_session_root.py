@@ -15,12 +15,12 @@ import sys
 # Redundant under pytest (conftest handles it); kept for `python <file>` runs.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from services.path_policy_v2 import (  # noqa: E402
-    PathPolicyContext,
-    resolve_path_for_session,
-    context_from_security,
-)
 from core import placement
+from services.path_policy_v2 import (
+    PathPolicyContext,
+    context_from_security,
+    resolve_path_for_session,
+)
 
 HOME = "/home/alice"
 AGENTS = "/home/alice/.oto-dock/agents"

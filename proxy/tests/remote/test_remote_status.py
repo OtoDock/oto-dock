@@ -4,7 +4,6 @@ import time
 from unittest.mock import MagicMock, patch
 
 
-
 def _fake_conn(last_heartbeat_age_s: float):
     """Build a fake SatelliteConnection with the given heartbeat age."""
     conn = MagicMock()

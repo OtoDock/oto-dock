@@ -6,26 +6,22 @@ Covers:
 - Tool result formatting and the underlying HTTP shape (mocked AsyncClient).
 - Cache invalidation on mutating calls.
 
-The MCP lives outside ``proxy/``'s import path. We load it via
-``importlib.util`` from the canonical filesystem location and reset env vars
-around each test (the permission matrix is resolved at module load).
+The MCP lives outside ``proxy/``'s import path. We load it through
+``tests._paths.load_mcp_server`` (its folder on ``sys.path`` while it loads,
+so its sibling ``_tool_args`` imports) and reset env vars around each test
+(the permission matrix is resolved at module load).
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
-import importlib.util
 import os
-import sys
 
 import httpx
 
-
-from tests._paths import CUSTOM_MCPS
+from tests._paths import CUSTOM_MCPS, load_mcp_server
 
 MCP_DIR = CUSTOM_MCPS / "mcps-mcp"
-MCP_FILE = MCP_DIR / "server.py"
 
 
 def _load_server(env: dict[str, str]):
@@ -40,14 +36,7 @@ def _load_server(env: dict[str, str]):
         if key.startswith("OTO_") or key in {"PROXY_URL", "PROXY_API_KEY", "MCPS_MCP_PROXY_URL"}:
             os.environ.pop(key, None)
     os.environ.update(env)
-
-    # Force a clean module slot every time.
-    sys.modules.pop("mcps_mcp_server", None)
-    spec = importlib.util.spec_from_file_location("mcps_mcp_server", MCP_FILE)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return load_mcp_server(MCP_DIR)
 
 
 # ───────────────────────────────────────────────────────────────────────────

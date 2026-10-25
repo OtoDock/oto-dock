@@ -110,7 +110,7 @@ def test_a_128_mb_satellite_pull_holds_the_loop(tmp_path):
             "m1", PathRef("agent_tree", "workspace/pulled.bin"), dest, agent_slug="lt-pull",
             stall_s=120))
         async with asyncio.timeout(10):
-            while not sat.sent:
+            while not sat.sent:  # noqa: ASYNC110  # a fake satellite's sent list: the fake has no event
                 await asyncio.sleep(0.005)
         rid = sat.sent[0]["request_id"]
         frames = [json.dumps({
@@ -138,7 +138,7 @@ def test_a_128_mb_satellite_pull_holds_the_loop(tmp_path):
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 ok, first, window = await one_pull(dest)
                 size = dest.stat().st_size if dest.exists() else 0
-                sha = await asyncio.to_thread(lambda: "sha256:" + hashlib.sha256(dest.read_bytes()).hexdigest()) \
+                sha = await asyncio.to_thread(lambda dest=dest: "sha256:" + hashlib.sha256(dest.read_bytes()).hexdigest()) \
                     if size else ""
                 runs.append({"ok": ok, "bytes": size, "hash_ok": sha == whole_hash,
                              "first_chunk_ms": h.ms(first), **window.summary()})
@@ -178,8 +178,8 @@ def test_a_12_mp_pasted_photo_holds_the_loop(tmp_path):
     from PIL import Image
 
     import ws.dashboard  # noqa: F401  (assembles the support mixin first)
-    from ws import dashboard_chat_support as support
     from tests.loadtest import _harness as h
+    from ws import dashboard as dash, dashboard_chat_support as support
 
     # The dashboard sends a photo of 2 MB or less as it is and scales a
     # larger one down to 1568 px, so 2 MB is the largest it pastes.
@@ -200,7 +200,7 @@ def test_a_12_mp_pasted_photo_holds_the_loop(tmp_path):
     async def photo_route(websocket):
         await websocket.accept()
         msg = json.loads(await websocket.receive_text())
-        saved = await support._save_photo_off_loop(support._save_base64_image, msg["images"][0],
+        saved = await support._save_photo_off_loop(dash._save_base64_image, msg["images"][0],
                                                    save_dir=save_dir)
         await websocket.send_json({"path": (saved or {}).get("path", "")})
         await websocket.close()

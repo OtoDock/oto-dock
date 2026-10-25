@@ -14,7 +14,6 @@ Docs (``*.md``) are excluded — only code identifiers are guarded here.
 
 from __future__ import annotations
 
-
 import pytest
 
 from tests._paths import REPO_ROOT
@@ -101,7 +100,7 @@ def test_no_stale_voice_identifier(pattern):
     for path in _iter_code_files():
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
+        except OSError:
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
             if pattern in line:
@@ -118,7 +117,7 @@ def test_no_stale_voice_phrase(phrase):
     for path in _iter_code_files():
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
+        except OSError:
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
             if phrase in line.lower():

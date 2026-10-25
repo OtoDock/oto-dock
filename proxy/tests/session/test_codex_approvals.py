@@ -20,19 +20,19 @@ import sys
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from core.layers.codex.codex_approvals import (  # noqa: E402
-    approval_to_tool,
+from core.layers.codex.codex_approvals import (
+    APPROVAL_METHODS,
     approval_for_sandbox,
+    approval_to_tool,
     build_response,
     build_sandbox_policy,
     make_server_request_handler,
-    APPROVAL_METHODS,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────
 # approval_to_tool
@@ -46,7 +46,8 @@ def test_exec_v2_carries_command_and_cwd():
         {"command": "printf probe > /home/u/x.txt", "cwd": "/work", "itemId": "c1"},
     )
     assert tn == "Bash"
-    assert ti == {"command": "printf probe > /home/u/x.txt", "cwd": "/work"}
+    assert ti == {"command": "printf probe > /home/u/x.txt", "cwd": "/work",
+                  "_codex_command": "printf probe > /home/u/x.txt"}
 
 
 def test_exec_v2_write_stdin_is_terminal_input_not_a_command():
@@ -270,7 +271,7 @@ async def test_handler_allows_via_decide():
         {"command": "ls", "cwd": "/work"},
     )
     assert resp == {"decision": "accept"}
-    assert calls == [("Bash", {"command": "ls", "cwd": "/work"})]
+    assert calls == [("Bash", {"command": "ls", "cwd": "/work", "_codex_command": "ls"})]
 
 
 @pytest.mark.asyncio
@@ -332,58 +333,33 @@ def test_approval_for_sandbox():
     assert approval_for_sandbox("read-only") == "on-request"
 
 
-def test_attended_chats_ask_for_every_command_and_patch():
-    """An attended app-server chat (a person answers the bridge) sends the
-    ``untrusted`` policy in every prompting mode, so an in-workspace ``rm``
-    reaches decide_tool_permission like Claude's hook; dontAsk/auto stay
-    ``never`` (nothing asks), and the fallback trigger recognises a daemon
-    that retired the wire value."""
+def test_auto_runs_on_codexs_reviewer_every_other_mode_on_the_bridge():
+    """Auto runs ``on-request`` with Codex's own reviewer: its sandbox
+    crossings go to the reviewer, never to a card. Every other mode keeps
+    the sandbox's policy and the bridge (a person through the platform);
+    the PreToolUse hook judges every call in every mode, so no mode needs
+    the retired ``untrusted`` policy (HOOKS.md "Codex chats")."""
     from core.layers.codex.codex_approvals import (
-        UNTRUSTED_FALLBACK, UNTRUSTED_POLICY, approval_policy, is_untrusted_policy_rejection,
+        approval_policy,
+        approvals_reviewer,
+        tui_reviewer_flags,
     )
-    assert approval_policy("default", "workspace-write", attended=True) == UNTRUSTED_POLICY
-    assert approval_policy("acceptEdits", "workspace-write", attended=True) == UNTRUSTED_POLICY
-    assert approval_policy("plan", "read-only", attended=True) == UNTRUSTED_POLICY
-    assert approval_policy("dontAsk", "danger-full-access", attended=True) == "never"
-    assert approval_policy("auto", "danger-full-access", attended=True) == "never"
-    assert UNTRUSTED_FALLBACK == "on-request"
-    assert is_untrusted_policy_rejection("invalid params: unknown variant `untrusted`")
-    assert is_untrusted_policy_rejection(RuntimeError("approvalPolicy: UnlessTrusted is not supported"))
-    assert not is_untrusted_policy_rejection("thread not found")
+    assert approval_policy("autoReview", "workspace-write") == "on-request"
+    for mode, sandbox, policy in [
+        ("ask", "workspace-write", "on-request"), ("ask", "danger-full-access", "never"),
+        ("plan", "read-only", "on-request"), ("dontAsk", "danger-full-access", "never"),
+        ("auto", "danger-full-access", "never"), ("judge", "read-only", "on-request"),
+    ]:
+        assert approval_policy(mode, sandbox) == policy, mode
+    assert approvals_reviewer("autoReview") == "auto_review"
+    assert {approvals_reviewer(m) for m in ("ask", "plan", "dontAsk", "auto", "judge", "")} == {"user"}
+    assert tui_reviewer_flags("autoReview") == ["-c", 'approvals_reviewer="auto_review"']
+    assert tui_reviewer_flags("ask") == []
 
 
-def test_the_mode_not_the_sandbox_picks_an_attended_chats_policy():
-    """A machine paired with full access runs default and acceptEdits under
-    danger-full-access: the chat still asks through the bridge there, and
-    only dontAsk / auto run under never, where the hook judges (HOOKS.md
-    "Attended Codex chats"). Unattended sessions and a proxy that ships no
-    mode keep the sandbox rule."""
-    from core.layers.codex.codex_approvals import (
-        NO_PROMPT_MODES, UNTRUSTED_POLICY, approval_policy,
-    )
-    assert NO_PROMPT_MODES == {"dontAsk", "auto"}
-    for mode in ("default", "acceptEdits"):
-        assert approval_policy(mode, "danger-full-access", attended=True) == UNTRUSTED_POLICY
-    assert approval_policy("dontAsk", "workspace-write", attended=True) == "never"
-    # Unattended: the sandbox decides, whatever the mode (a judge included).
-    assert approval_policy("default", "danger-full-access", attended=False) == "never"
-    assert approval_policy("default", "workspace-write", attended=False) == "on-request"
-    assert approval_policy("judge", "read-only", attended=False) == "on-request"
-    assert approval_policy("auto", "danger-full-access", attended=False) == "never"
-    # No mode shipped (an older proxy on a 0.5.143 satellite): as before.
-    assert approval_policy("", "danger-full-access", attended=True) == "never"
-    assert approval_policy("", "workspace-write", attended=True) == UNTRUSTED_POLICY
-
-
-def test_the_untrusted_fallback_never_leaves_a_full_access_chat_unjudged():
-    """A daemon that refuses ``untrusted``: on-request where a sandbox
-    escape still reaches the bridge; never under danger-full-access, where
-    on-request would run every command with no judge and never hands the
-    call to the hook."""
-    from core.layers.codex.codex_approvals import UNTRUSTED_FALLBACK, untrusted_fallback
-    assert untrusted_fallback("workspace-write") == UNTRUSTED_FALLBACK
-    assert untrusted_fallback("read-only") == UNTRUSTED_FALLBACK
-    assert untrusted_fallback("danger-full-access") == "never"
+def test_the_untrusted_policy_is_gone():
+    import core.layers.codex.codex_approvals as approvals
+    assert not [name for name in dir(approvals) if "untrusted" in name.lower()]
 
 
 def test_sandbox_policy_danger_full_access():
@@ -557,6 +533,7 @@ async def test_the_router_records_a_patchs_paths_before_its_approval_runs():
     decision sees a pathless Write (auto-allowed in acceptEdits)."""
     import asyncio
     from types import SimpleNamespace
+
     from core.layers.codex.session import CodexAppServerSession
     s = CodexAppServerSession.__new__(CodexAppServerSession)
     s._client = SimpleNamespace(notif_queue=asyncio.Queue())

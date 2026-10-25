@@ -35,7 +35,7 @@ FRAME_PAGE = """<!doctype html><html><body>
 
 
 class _Handler(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         if self.path.startswith("/apps/"):
             body = HOST_PAGE.encode()
             self.send_response(200)
@@ -57,7 +57,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *a):  # noqa: D102
+    def log_message(self, *a):
         return
 
 

@@ -25,10 +25,11 @@ _FULL = placement.PlacementCapabilities(
 
 
 def _stub(monkeypatch, captured: dict):
-    from services.meetings import meeting_context as mc
-    from core.config import task_config_builder as tcb
-    import core.session.visibility as v
     import core.sandbox.oto_env as oe
+    import core.session.visibility as v
+    from core.config import task_config_builder as tcb
+    from services.meetings import meeting_context as mc
+    from services.remote import remote_status
     from storage import remote_store
     monkeypatch.setattr(tcb, "resolve_task_identity", lambda *a, **k: tcb.TaskIdentity(
         username="alice", role="manager", scope="user", creds_user_sub="alice-sub"))
@@ -39,7 +40,7 @@ def _stub(monkeypatch, captured: dict):
     async def _to_thread(fn, *a, **k):
         return fn(*a, **k)
     monkeypatch.setattr(mc.asyncio, "to_thread", _to_thread)
-    monkeypatch.setattr(remote_store, "resolve_execution_target", lambda *a, **k: ("m-1", None))
+    monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("m-1", None))
     monkeypatch.setattr(remote_store, "placement_of", lambda *a, **k: _FULL)
     monkeypatch.setattr(remote_store, "get_target_browser_settings", lambda *a, **k: None)
 
@@ -92,3 +93,35 @@ def test_the_participant_keeps_the_kind_and_the_label_only(monkeypatch):
     assert p.admin_paired and p.is_remote
     assert p.machine_id == "" and p.home_dir == "" and p.agents_dir == ""
     assert p.allow_full_fs is False and p.device_grants == set() and p.site == placement.SITE_LOCAL
+
+
+_REAL_TO_THREAD = asyncio.to_thread
+
+
+def test_the_prompt_is_built_off_the_loop(monkeypatch):
+    """``build_agent_prompt`` runs in a worker thread (the stub above runs
+    ``to_thread`` inline; this test puts the real one back): the loop thread
+    never builds a participant's prompt."""
+    import threading
+
+    from services.meetings import meeting_context as mc
+    captured: dict = {}
+    _stub(monkeypatch, captured)
+    monkeypatch.setattr(mc.asyncio, "to_thread", _REAL_TO_THREAD)
+    seen: dict = {}
+
+    def recorder(*a, **k):
+        seen["thread"] = threading.get_ident()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            seen["loop"] = None
+        else:
+            seen["loop"] = "running"
+        return "PROMPT"
+
+    monkeypatch.setattr(mc.config, "build_agent_prompt", recorder)
+    cfg = asyncio.run(mc.build_meeting_agent_config(
+        "pa", {"scope": "user", "created_by": "alice-sub", "id": "mt-2"}, "sess-2"))
+    assert "PROMPT" in cfg.system_prompt
+    assert seen["thread"] != threading.get_ident() and seen["loop"] is None

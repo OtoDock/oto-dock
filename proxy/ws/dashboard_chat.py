@@ -21,15 +21,15 @@ names below are re-exported for their existing importers.
 """
 
 import config  # noqa: F401  (tests patch ``dashboard_chat.config.get_model_provider``)
+from ws.dashboard_chat_resume import ChatResumeMixin
+from ws.dashboard_chat_send import ChatSendMixin
+from ws.dashboard_chat_stream import ChatStreamMixin
+from ws.dashboard_chat_support import ChatSupportMixin
 from ws.dashboard_chat_text import (  # noqa: F401
     _STOP_AND_SEND_NOTE,
     _provider_switch_blocker,
     _queued_outgoing,
 )
-from ws.dashboard_chat_send import ChatSendMixin
-from ws.dashboard_chat_resume import ChatResumeMixin
-from ws.dashboard_chat_stream import ChatStreamMixin
-from ws.dashboard_chat_support import ChatSupportMixin
 
 
 class ChatController(ChatSendMixin, ChatResumeMixin, ChatStreamMixin, ChatSupportMixin):

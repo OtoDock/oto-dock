@@ -5,7 +5,7 @@
 // frame's messages through `host.ts`. Nothing here reads a dashboard
 // cookie; the only requests are the link's own routes, same-origin.
 
-import { batchUrl, classify, frameSrc, linkQuery, openAllowed, readConfig, resultMessage, sessionUrl, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, stateUrl, unlockUrl, viewerTokenUrl, webUrl, type ActionCall, type ShareConfig, type SnapshotMessage } from './host'
+import { batchUrl, classify, frameSrc, linkQuery, openAllowed, pickTheme, readConfig, resultMessage, sessionUrl, settleBatch, snapshotMediaUrl, snapshotUiUrl, snapshotUrl, stateUrl, unlockUrl, viewerTokenUrl, webUrl, type ActionCall, type ShareConfig, type SnapshotMessage } from './host'
 import { WIRE } from '../api/wireEvents'
 import { fitViewportToDevice } from '../lib/device/viewport'
 
@@ -42,27 +42,33 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, attrs: Record<string,
   return node
 }
 
-const theme = (): 'light' | 'dark' =>
-  window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+// The UI kit's sheet themes by a class on <html>; until this runs the
+// shell's own rule follows the device.
+function theme(): 'light' | 'dark' {
+  let stored: string | null = null
+  try { stored = localStorage.getItem('theme') } catch { /* storage refused */ }
+  return pickTheme(stored, !!window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+}
+document.documentElement.classList.add(theme())
 
 function renderUnavailable(message: string): void {
   if (!root) return
   root.replaceChildren()
-  const p = el('p', { style: 'margin:auto;max-width:28rem;text-align:center;padding:0 1.5rem;opacity:.8' }, message)
+  const p = el('p', { style: 'margin:auto;max-width:28rem;text-align:center;padding:0 1.5rem;color:var(--p-text-secondary)' }, message)
   root.appendChild(p)
 }
 
 function renderPasswordForm(c: ShareConfig): void {
   if (!root) return
   root.replaceChildren()
-  const wrap = el('div', { style: 'margin:auto;width:min(92vw,22rem);padding:1.5rem;border-radius:1rem;border:1px solid rgba(128,128,128,.25)' })
+  const wrap = el('div', { style: 'margin:auto;width:min(92vw,22rem);padding:1.5rem;border-radius:var(--p-radius-lg);background:var(--p-card);box-shadow:var(--p-elevation-2)' })
   wrap.appendChild(el('h1', { style: 'font-size:1rem;margin:0 0 .25rem' }, c.title))
-  wrap.appendChild(el('p', { style: 'font-size:.8rem;opacity:.7;margin:0 0 1rem' }, 'This page is protected. Enter the password you were given.'))
+  wrap.appendChild(el('p', { style: 'font-size:.8rem;color:var(--p-text-secondary);margin:0 0 1rem' }, 'This page is protected. Enter the password you were given.'))
   const form = el('form')
   const input = el('input', { type: 'password', autocomplete: 'current-password', 'aria-label': 'Password', required: 'true',
-    style: 'width:100%;box-sizing:border-box;padding:.6rem .7rem;border-radius:.5rem;border:1px solid rgba(128,128,128,.4);background:transparent;color:inherit;font:inherit' })
-  const err = el('p', { style: 'font-size:.8rem;color:#c33;min-height:1.2em;margin:.5rem 0 0', role: 'alert' })
-  const btn = el('button', { type: 'submit', style: 'margin-top:.75rem;width:100%;padding:.6rem;border-radius:.5rem;border:0;background:#2f6feb;color:#fff;font:inherit;cursor:pointer' }, 'Open')
+    style: 'width:100%;box-sizing:border-box;padding:.6rem .7rem;border-radius:var(--p-radius-sm);border:1px solid var(--p-border-strong);background:var(--p-card);color:inherit;font:inherit' })
+  const err = el('p', { style: 'font-size:.8rem;color:var(--p-status-danger-fg);min-height:1.2em;margin:.5rem 0 0', role: 'alert' })
+  const btn = el('button', { type: 'submit', style: 'margin-top:.75rem;width:100%;padding:.6rem;border-radius:var(--p-radius-sm);border:0;background:var(--p-action);color:var(--p-action-fg);font:inherit;font-weight:500;cursor:pointer' }, 'Open')
   form.append(input, err, btn)
   let turnstileToken = ''
   if (c.turnstile_site_key) {
@@ -141,7 +147,7 @@ function renderApp(c: ShareConfig): void {
     const wait = Math.max(0, 1000 - (now - lastBatchAt))
     lastBatchAt = now + wait
     if (wait) await new Promise((r) => setTimeout(r, wait))
-    let lines: string[] = []
+    let lines: string[]
     try {
       const res = await fetch(batchUrl(c), {
         method: 'POST', credentials: 'same-origin',
@@ -226,11 +232,11 @@ function renderApp(c: ShareConfig): void {
     if (!ts) return answer(null, 'unavailable')
     const overlay = el('div', { role: 'dialog', 'aria-label': 'Verification',
       style: 'position:fixed;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45)' })
-    const box = el('div', { style: 'width:min(92vw,22rem);padding:1.25rem;border-radius:1rem;background:#f6f7f9;color:#223' })
+    const box = el('div', { style: 'width:min(92vw,22rem);padding:1.25rem;border-radius:var(--p-radius-lg);background:var(--p-surface-overlay);color:var(--p-text);box-shadow:var(--p-elevation-4)' })
     box.appendChild(el('p', { style: 'font-size:.85rem;margin:0 0 .75rem' }, 'A quick check that you are a person.'))
     const holder = el('div')
     box.appendChild(holder)
-    const cancel = el('button', { type: 'button', style: 'margin-top:.75rem;width:100%;padding:.5rem;border-radius:.5rem;border:1px solid rgba(128,128,128,.4);background:transparent;color:inherit;font:inherit;cursor:pointer' }, 'Cancel')
+    const cancel = el('button', { type: 'button', style: 'margin-top:.75rem;width:100%;padding:.5rem;border-radius:var(--p-radius-sm);border:1px solid var(--p-border);background:transparent;color:inherit;font:inherit;cursor:pointer' }, 'Cancel')
     box.appendChild(cancel)
     overlay.appendChild(box)
     root.appendChild(overlay)
@@ -292,27 +298,27 @@ function block(m: SnapshotMessage, c: ShareConfig): HTMLElement | null {
     const row = el('div', { style: `display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'}` })
     const bubble = el('div', {
       style: `max-width:85%;padding:.5rem .75rem;border-radius:1rem;font-size:.9rem;white-space:pre-wrap;overflow-wrap:anywhere;${
-        mine ? 'background:#2f6feb;color:#fff' : 'background:rgba(128,128,128,.12)'}`,
+        mine ? 'background:var(--p-action);color:var(--p-action-fg)' : 'background:var(--p-card);box-shadow:var(--p-elevation-1)'}`,
     }, m.content || '')
     row.appendChild(bubble)
     return row
   }
-  const d = (m.data ?? {}) as Record<string, any>
-  const card = el('div', { style: 'border:1px solid rgba(128,128,128,.25);border-radius:.75rem;overflow:hidden' })
+  const d: Record<string, unknown> = m.data ?? {}
+  const card = el('div', { style: 'background:var(--p-card);box-shadow:var(--p-elevation-1);border-radius:var(--p-radius);overflow:hidden' })
   switch (m.event_type) {
     case WIRE.UI: {
-      if (d.title) card.appendChild(el('p', { style: 'margin:0;padding:.4rem .75rem;font-size:.8rem;font-weight:600;border-bottom:1px solid rgba(128,128,128,.2)' }, String(d.title)))
+      if (d.title) card.appendChild(el('p', { style: 'margin:0;padding:.4rem .75rem;font-size:.8rem;font-weight:600;border-bottom:1px solid var(--p-border-light)' }, String(d.title)))
       const h = Math.min(Math.max(Number(d.height) || 320, 120), 900)
       card.appendChild(el('iframe', { sandbox: 'allow-scripts', referrerpolicy: 'no-referrer', title: String(d.title || 'Artifact'),
-        src: snapshotUiUrl(c, String(d.token || '')), style: `display:block;width:100%;height:${h}px;border:0;background:transparent` }))
+        src: snapshotUiUrl(c, String(d.token || ''), theme()), style: `display:block;width:100%;height:${h}px;border:0;background:transparent` }))
       return card
     }
     case WIRE.IMAGES: {
       const wrap = el('div', { style: 'display:flex;flex-wrap:wrap;gap:.5rem' })
       for (const img of (d.images as Array<Record<string, string>> | undefined) ?? []) {
-        const fig = el('figure', { style: 'margin:0;max-width:20rem;border:1px solid rgba(128,128,128,.25);border-radius:.75rem;overflow:hidden' })
+        const fig = el('figure', { style: 'margin:0;max-width:20rem;background:var(--p-card);box-shadow:var(--p-elevation-1);border-radius:var(--p-radius);overflow:hidden' })
         fig.appendChild(el('img', { src: img.token ? snapshotMediaUrl(c, img.token) : webUrl(img.url), alt: img.caption || '', style: 'display:block;max-height:18rem;width:100%;object-fit:contain' }))
-        if (img.caption) fig.appendChild(el('figcaption', { style: 'padding:.25rem .5rem;font-size:.7rem;opacity:.7' }, img.caption))
+        if (img.caption) fig.appendChild(el('figcaption', { style: 'padding:.25rem .5rem;font-size:.7rem;color:var(--p-text-light)' }, img.caption))
         wrap.appendChild(fig)
       }
       return wrap
@@ -322,21 +328,21 @@ function block(m: SnapshotMessage, c: ShareConfig): HTMLElement | null {
       const src = d.token ? snapshotMediaUrl(c, String(d.token)) : webUrl(d.url)
       const media = el(m.event_type, { controls: 'true', src, style: m.event_type === WIRE.VIDEO ? 'display:block;width:100%;max-height:24rem' : 'display:block;width:100%' })
       card.appendChild(media)
-      if (d.caption || d.title) card.appendChild(el('p', { style: 'margin:0;padding:.3rem .75rem;font-size:.7rem;opacity:.7' }, String(d.caption || d.title)))
+      if (d.caption || d.title) card.appendChild(el('p', { style: 'margin:0;padding:.3rem .75rem;font-size:.7rem;color:var(--p-text-light)' }, String(d.caption || d.title)))
       return card
     }
     case WIRE.FILE: {
-      const a = el('a', { href: snapshotMediaUrl(c, String(d.token || '')), download: String(d.filename || ''), style: 'display:inline-block;padding:.5rem .75rem;border:1px solid rgba(128,128,128,.25);border-radius:.75rem;font-size:.85rem;color:inherit;text-decoration:none' }, String(d.filename || 'file'))
+      const a = el('a', { href: snapshotMediaUrl(c, String(d.token || '')), download: String(d.filename || ''), style: 'display:inline-block;padding:.5rem .75rem;background:var(--p-card);box-shadow:var(--p-elevation-1);border-radius:var(--p-radius);font-size:.85rem;color:inherit;text-decoration:none' }, String(d.filename || 'file'))
       return a
     }
     case WIRE.URL: {
       const href = webUrl(d.url)
       if (!href) return el('p', { style: 'margin:0;font-size:.85rem' }, String(d.title || d.url || ''))
-      const a = el('a', { href, target: '_blank', rel: 'noreferrer noopener', style: 'display:block;padding:.5rem .75rem;border:1px solid rgba(128,128,128,.25);border-radius:.75rem;font-size:.85rem;color:#2f6feb;text-decoration:none' }, String(d.title || d.url || ''))
+      const a = el('a', { href, target: '_blank', rel: 'noreferrer noopener', style: 'display:block;padding:.5rem .75rem;background:var(--p-card);box-shadow:var(--p-elevation-1);border-radius:var(--p-radius);font-size:.85rem;color:var(--p-link);text-decoration:none' }, String(d.title || d.url || ''))
       return a
     }
     default: {
-      const details = el('details', { style: 'font-size:.7rem;opacity:.7;padding:.3rem .75rem;border:1px dashed rgba(128,128,128,.3);border-radius:.5rem' })
+      const details = el('details', { style: 'font-size:.7rem;color:var(--p-text-light);padding:.3rem .75rem;border:1px dashed var(--p-border);border-radius:var(--p-radius)' })
       details.appendChild(el('summary', {}, m.event_type || 'event'))
       details.appendChild(el('pre', { style: 'white-space:pre-wrap;overflow-wrap:anywhere;max-height:12rem;overflow:auto;font-size:.65rem' }, m.event_data || ''))
       return details
@@ -347,9 +353,9 @@ function block(m: SnapshotMessage, c: ShareConfig): HTMLElement | null {
 async function renderChat(c: ShareConfig): Promise<void> {
   if (!root) return
   root.replaceChildren()
-  const header = el('header', { style: 'display:flex;align-items:center;gap:.5rem;padding:.5rem .75rem;border-bottom:1px solid rgba(128,128,128,.2);font-size:.85rem' })
+  const header = el('header', { style: 'display:flex;align-items:center;gap:.5rem;padding:.5rem .75rem;background:var(--p-card);border-bottom:1px solid var(--p-border-light);font-size:.85rem' })
   header.appendChild(el('span', { style: 'font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, c.title))
-  const sub = el('span', { style: 'margin-left:auto;font-size:.7rem;opacity:.6;white-space:nowrap' }, 'Shared with you · read-only')
+  const sub = el('span', { style: 'margin-left:auto;font-size:.7rem;color:var(--p-text-light);white-space:nowrap' }, 'Shared with you · read-only')
   header.appendChild(sub)
   const main = el('main', { style: 'flex:1;overflow-y:auto;padding:1rem .75rem' })
   const list = el('div', { style: 'max-width:48rem;margin:0 auto;display:flex;flex-direction:column;gap:.75rem' })
@@ -367,7 +373,7 @@ async function renderChat(c: ShareConfig): Promise<void> {
       const node = block(m, c)
       if (node) list.appendChild(node)
     }
-    if (!list.childElementCount) list.appendChild(el('p', { style: 'text-align:center;opacity:.6;font-size:.8rem' }, 'Nothing to show.'))
+    if (!list.childElementCount) list.appendChild(el('p', { style: 'text-align:center;color:var(--p-text-light);font-size:.8rem' }, 'Nothing to show.'))
   } catch {
     renderUnavailable('Could not reach the server.')
   }

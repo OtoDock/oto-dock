@@ -1,6 +1,6 @@
 # oto-audio
 
-Provider-agnostic **STT / TTS / VAD / turn-classifier** package for OtoDock.
+Provider-agnostic **STT / TTS / VAD / turn-classifier / language-identifier** package for OtoDock.
 
 It is imported by the **proxy** for the chat audio surface (`/v1/audio/tts`,
 `/ws/audio/stt`, `/v1/audio/transcribe`), and by the **phone service** for
@@ -17,7 +17,9 @@ provider implementations behind small ABCs.
    instantiates. This keeps the package testable with trivial mocks and free
    of process-specific bootstrap.
 2. **One provider per file**, one category per folder (`stt/`, `tts/`, `vad/`,
-   `turn/`), each with a `base.py` ABC that is the contributor contract.
+   `turn/`), each with a `base.py` ABC that is the contributor contract. `lid/`
+   holds the language identifier's ABC beside the rule and the tracker that
+   drive it.
 3. **No `import config`.** Audio-format constants live in
    [`constants.py`](constants.py); the transcript-logging gate lives in
    [`log_policy.py`](log_policy.py).
@@ -40,8 +42,10 @@ audio/
     tts/  { base, cartesia, elevenlabs }
     vad/  { base, silero (state machine), silero_model (the ONNX session) }
     turn/ { base, smart_turn, groq, dispatcher }
-  streaming/          lang.py (language registry/detect), text_chunks.py (sentence chunking), tts_stream.py (streaming-TTS orchestration)
-  models/             smart-turn-v3.2-cpu.onnx, silero_vad.onnx + vendored whisper feature-extractor config (README.md: origin + licences)
+    lid/  { base, ecapa (the ONNX identifier), rule (the language rule), tracker (the driver), evidence (two streams' words compared over the audio both covered) }
+    stt/streams.py    LanguageStreams: one STT provider over the default, the active and at most one more stream
+  streaming/          lang.py (language registry, the candidate list, the TTS detector), text_chunks.py (sentence chunking), tts_stream.py (streaming-TTS orchestration)
+  models/             smart-turn-v3.2-cpu.onnx, silero_vad.onnx, lang-id-ecapa-voxlingua107.onnx + vendored whisper feature-extractor config (README.md: origin + licences)
 ```
 
 ## Local development

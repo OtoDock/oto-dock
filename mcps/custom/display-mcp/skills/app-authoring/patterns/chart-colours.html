@@ -1,0 +1,35 @@
+<p class="muted">Chart colours. A chart draws its own colours. It reads them from the kit at render time and draws again when the theme changes. The series is the information colour, never the action blue. Axis text is the light text and grid lines the light border. The tooltip sits on the overlay surface in the kit's font. Use this for every chart, with ECharts from the kit.</p>
+
+<div class="card">
+  <h3>Bookings per day</h3>
+  <div id="chart" style="height: 260px"></div>
+</div>
+
+<script src="/ui-kit/echarts.min.js"></script>
+<script>
+(function () {
+  var el = document.getElementById('chart')
+  var chart = echarts.init(el, null, { renderer: 'canvas' })
+  function v(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim() }
+  function draw() {
+    chart.setOption({
+      textStyle: { color: v('--p-text'), fontFamily: v('--p-font') },
+      grid: { left: 40, right: 16, top: 16, bottom: 32 },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: v('--p-surface-overlay'),
+        borderColor: v('--p-border-light'),
+        textStyle: { color: v('--p-text'), fontFamily: v('--p-font') },
+        axisPointer: { lineStyle: { color: v('--p-border') } },
+      },
+      xAxis: { type: 'category', data: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],
+        axisLabel: { color: v('--p-text-light') }, axisLine: { lineStyle: { color: v('--p-border-light') } } },
+      yAxis: { type: 'value', axisLabel: { color: v('--p-text-light') }, splitLine: { lineStyle: { color: v('--p-border-light') } } },
+      series: [{ type: 'bar', data: [12, 18, 9, 21, 15], itemStyle: { color: v('--p-status-info-solid'), borderRadius: [4, 4, 0, 0] } }],
+    }, true)
+  }
+  draw()
+  addEventListener('otodock:theme', draw)
+  new ResizeObserver(function () { chart.resize() }).observe(el)
+})()
+</script>

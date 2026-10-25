@@ -85,13 +85,13 @@ def test_the_proxys_refusal_is_shown_as_its_sentence(monkeypatch):
         request = httpx.Request("POST", "http://proxy" + path)
         response = httpx.Response(
             400, request=request,
-            content=json.dumps({"detail": "Invalid user_tz: 'No time zone found with key Mars/Olympus'"}),
+            content=json.dumps({"detail": "That time zone is not known. Use a name like Europe/Athens."}),
         )
         raise httpx.HTTPStatusError("400", request=request, response=response)
 
     monkeypatch.setattr(mod, "_post", _post)
     text = _call(mod, "edit_task", {"task_id": "dyn-1", "timezone": "Mars/Olympus"})
-    assert text == "API error 400: Invalid user_tz: 'No time zone found with key Mars/Olympus'"
+    assert text == "API error 400: That time zone is not known. Use a name like Europe/Athens."
 
 
 def test_get_task_names_the_zone_a_task_fires_in(monkeypatch):
@@ -117,3 +117,43 @@ def test_get_task_names_the_zone_a_task_fires_in(monkeypatch):
     assert "Fires: 2026-09-20T05:00:00+03:00 (timezone Asia/Tokyo)" in _call(mod, "get_task", {"task_id": "dyn-1"})
     assert "Fires: 2026-09-20T05:00:00+03:00 (platform timezone Europe/Athens)" in _call(mod, "get_task", {"task_id": "dyn-1"})
     assert "Fires: on trigger (none wired yet)\n" in _call(mod, "get_task", {"task_id": "dyn-1"})
+
+
+# ── the task's machine: the same argument on the three write tools ──────────
+
+
+def test_the_write_tools_advertise_one_machine_argument():
+    mod = _mod()
+    tools = {t.name: t for t in asyncio.run(mod.list_tools())}
+    for name in ("create_scheduled_task", "create_one_time_task", "edit_task"):
+        prop = tools[name].inputSchema["properties"]["machine"]
+        assert prop is mod._MACHINE_ARG_SCHEMA and prop["type"] == "string"
+        assert "'default'" in prop["description"] and "offline" in prop["description"]
+        assert "machine" not in tools[name].inputSchema["required"]
+
+
+def test_create_forwards_the_machine_only_when_given(monkeypatch):
+    mod = _mod()
+    posted = _capture_post(mod, monkeypatch)
+    text = _call(mod, "create_scheduled_task", {
+        "name": "Digest", "prompt": "do", "schedule": "0 7 * * *",
+        "notification_mode": "none", "machine": "laptop",
+    })
+    assert posted[-1][1]["machine"] == "laptop"
+    assert "Machine: laptop" in text
+    text = _call(mod, "create_one_time_task", {
+        "name": "Once", "prompt": "do", "delay_seconds": 60, "notification_mode": "none",
+    })
+    assert "machine" not in posted[-1][1] and "Machine:" not in text
+
+
+def test_edit_keeps_default_and_empty_as_the_explicit_clear(monkeypatch):
+    mod = _mod()
+    posted = _capture_post(mod, monkeypatch, reply={})
+    text = _call(mod, "edit_task", {"task_id": "dyn-1", "machine": "default"})
+    assert posted[-1] == ("/v1/tasks/dyn-1/edit", {"machine": "default"})
+    assert "Machine: agent default (cleared)" in text
+    _call(mod, "edit_task", {"task_id": "dyn-1", "machine": ""})
+    assert posted[-1] == ("/v1/tasks/dyn-1/edit", {"machine": ""})
+    text = _call(mod, "edit_task", {"task_id": "dyn-1", "machine": "rack-1"})
+    assert posted[-1][1] == {"machine": "rack-1"} and "Machine: rack-1" in text

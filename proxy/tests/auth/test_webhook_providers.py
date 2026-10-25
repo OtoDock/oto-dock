@@ -18,6 +18,7 @@ import time
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -749,6 +750,7 @@ def test_zoom_endpoint_validation_handshake_returns_encrypted_token():
 def test_microsoft_client_state_verify_positive():
     """All items in value[] must carry the same clientState as the row's secret."""
     import json as _json
+
     from auth.webhook_providers.microsoft import MicrosoftWebhookProvider
     p = MicrosoftWebhookProvider()
     secret = "row-clientstate-secret"
@@ -770,6 +772,7 @@ def test_microsoft_client_state_verify_positive():
 def test_microsoft_client_state_verify_negative_one_mismatch_fails_all():
     """A single item with a wrong clientState fails the entire request."""
     import json as _json
+
     from auth.webhook_providers.microsoft import MicrosoftWebhookProvider
     p = MicrosoftWebhookProvider()
     secret = "row-clientstate-secret"
@@ -792,6 +795,7 @@ def test_microsoft_client_state_verify_negative_one_mismatch_fails_all():
 def test_microsoft_client_state_verify_negative_empty_value_array():
     """Empty value[] is rejected — there's nothing to verify."""
     import json as _json
+
     from auth.webhook_providers.microsoft import MicrosoftWebhookProvider
     p = MicrosoftWebhookProvider()
     body = _json.dumps({"value": []}).encode()
@@ -809,6 +813,7 @@ def test_microsoft_client_state_verify_negative_missing_secret():
     """Empty signing_secret must be rejected — an attacker forging empty
     clientState would otherwise pass."""
     import json as _json
+
     from auth.webhook_providers.microsoft import MicrosoftWebhookProvider
     p = MicrosoftWebhookProvider()
     body = _json.dumps({
@@ -1066,6 +1071,7 @@ def test_platform_signing_secret_reads_app_credential_slug(monkeypatch):
     manifest's `app_credential` slug (slack-oauth-app) — the dispatcher
     must read THAT bundle (mcp-name fallback for oauth-less manifests)."""
     from types import SimpleNamespace
+
     from services.mcp import mcp_registry
     from services.webhooks import webhook_dispatcher
     from storage.identity import credential_store
@@ -1098,6 +1104,7 @@ def test_platform_signing_secret_falls_back_to_mcp_name(monkeypatch):
     """Manifests without an oauth block (or with the secret stored under
     the legacy mcp-name bundle) still resolve."""
     from types import SimpleNamespace
+
     from services.mcp import mcp_registry
     from services.webhooks import webhook_dispatcher
     from storage.identity import credential_store

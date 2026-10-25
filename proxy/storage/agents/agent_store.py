@@ -8,14 +8,14 @@ import json
 import logging
 import re
 import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
-from pathlib import Path
 
 import config
-from core.execution_layer import DEFAULT_EXECUTION_PATH  # the leaf: no cycle
-from storage.pg import get_conn
 from auth import roles
 from core import layout
+from storage.agents.schema import DEFAULT_EXECUTION_PATH
+from storage.pg import get_conn
 
 # ``agents.default_for_new_users_role``: off (""), or the per-agent role a new user is attached with.
 _DEFAULT_ROLE_CHOICES = (roles.NO_ACCESS, *roles.AGENT_ROLES)
@@ -29,6 +29,36 @@ _cache_lock = threading.Lock()
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# The steps above storage an agent takes after its row is written or deleted
+# (its config repo and shared quota scope; the quota released):
+# ``services/agents/agent_provisioning.py`` installs them at startup and they
+# run where those steps always ran, bare (what a step lets through
+# propagates).
+_created_hooks: list[Callable[[str], None]] = []
+_deleted_hooks: list[Callable[[str], None]] = []
+
+
+def on_agent_created(hook: Callable[[str], None]) -> None:
+    """Install ``hook(slug)``, run after ``create_agent`` wrote the row and
+    the folders; idempotent."""
+    if hook not in _created_hooks:
+        _created_hooks.append(hook)
+
+
+def on_agent_deleted(hook: Callable[[str], None]) -> None:
+    """Install ``hook(slug)``, run after ``delete_agent`` removed a row;
+    idempotent."""
+    if hook not in _deleted_hooks:
+        _deleted_hooks.append(hook)
+
+
+def _run_hooks(hooks: list[Callable[[str], None]], event: str, slug: str) -> None:
+    if not hooks:
+        logger.error("Agent %s %s with no provisioning hook installed", slug, event)
+    for hook in hooks:
+        hook(slug)
 
 
 def _invalidate_cache():
@@ -297,16 +327,13 @@ def create_agent(
         row = conn.execute("SELECT * FROM agents WHERE slug = %s", (slug,)).fetchone()
         result = _row_to_dict(row)
     _invalidate_cache()
-    # Initialize git repo for the agent's config dir so agent.md /
-    # context files have an audit trail from day one.
-    # Also create the knowledge/ dir up front — bwrap mounts fail if the
-    # source path doesn't exist, and the SandboxBuilder defensively mkdirs
-    # it too, but creating here at agent-creation time keeps a clean
-    # filesystem audit (knowledge/ visible immediately in the workspace
-    # tree, even before any session has run).
-    # Best-effort: failures are logged but don't block agent creation.
+    # Create the knowledge/ dir up front: bwrap mounts fail if the source
+    # path doesn't exist, and the SandboxBuilder defensively mkdirs it too,
+    # but creating here at agent-creation time keeps a clean filesystem
+    # audit (knowledge/ visible immediately in the workspace tree, even
+    # before any session has run). Best-effort: failures don't block agent
+    # creation.
     try:
-        from services.infra import git_writer
         agent_dir = config.AGENTS_DIR / slug
         (agent_dir / layout.CONFIG / layout.CONTEXT).mkdir(parents=True, exist_ok=True)
         (agent_dir / layout.KNOWLEDGE).mkdir(parents=True, exist_ok=True)
@@ -314,18 +341,11 @@ def create_agent(
         # first session (core/sandbox/sandbox.py), which is too late to stamp the XFS
         # project-inherit flag BEFORE the agent's first write — see ensure_scope.
         (agent_dir / layout.WORKSPACE).mkdir(parents=True, exist_ok=True)
-        git_writer.init_if_missing(agent_dir / "config")
-    except Exception:
+    except OSError:
         pass
-    # Bind the shared bucket (workspace + knowledge + config) to its XFS project
-    # ID and apply the current limit now, so lazily-created children (.claude/ …)
-    # inherit it. No-op unless the kernel quota tier is enabled. Every agent's
-    # shared workspace is metered the same, regardless of visibility mode.
-    try:
-        from services.infra import storage_quota
-        storage_quota.ensure_scope(slug, "shared")
-    except Exception:
-        pass  # best-effort; the quota monitor sweep re-asserts assignment
+    # The config repo and the shared quota scope
+    # (services/agents/agent_provisioning.py).
+    _run_hooks(_created_hooks, "created", slug)
     return result
 
 
@@ -546,6 +566,10 @@ def delete_agent(slug: str) -> bool:
         # cascade off the chats delete via their chat_id FK; chat_search has no FK.
         conn.execute("DELETE FROM chat_search WHERE agent = %s", (slug,))
         conn.execute("DELETE FROM chats WHERE agent = %s", (slug,))
+        # The moves of the agent's chats (their files went with the chats),
+        # and the sessions an engine switch left.
+        conn.execute("DELETE FROM chat_moves WHERE agent = %s", (slug,))
+        conn.execute("DELETE FROM engine_switch_leftovers WHERE agent = %s", (slug,))
         # Chatless capability tokens stamped with this agent (workspace mints,
         # task-session artifacts) — their files live under the agent folder
         # being removed, so the rows would only ever serve 404s.
@@ -602,82 +626,10 @@ def delete_agent(slug: str) -> bool:
         conn.commit()
         deleted = cursor.rowcount > 0
     _invalidate_cache()
-    # Release the agent's storage-quota enforcement + alert state (the project
-    # rows are kept as tombstones so IDs are never reused). Best-effort; no-op
-    # unless the kernel quota tier is enabled.
+    # The quota release (services/agents/agent_provisioning.py).
     if deleted:
-        try:
-            from services.infra import storage_quota
-            storage_quota.reclaim_agent(slug)
-        except Exception:
-            pass
+        _run_hooks(_deleted_hooks, "deleted", slug)
     return deleted
-
-
-# ---------------------------------------------------------------------------
-# Persona filename migration (prompt.md → agent.md, pre-1.4 installs)
-# ---------------------------------------------------------------------------
-
-def migrate_persona_filenames() -> int:
-    """One-shot startup sweep: converge every agent on ``config/agent.md``.
-
-    ``prompt.md`` is the pre-1.4 persona filename. Per agent: only
-    ``prompt.md`` → git-committed rename to ``agent.md``; both present and
-    byte-identical → drop the duplicate ``prompt.md``; both and divergent →
-    keep both (readers prefer ``agent.md``) and warn. Every removal records
-    a sync tombstone so an idle satellite APPLIES the delete at next merge
-    instead of resurrecting the old file, and the change is committed to the
-    config audit repo so revert-from-history keeps a coherent trail.
-
-    Runs in the lifespan before the app serves traffic (single process, no
-    readers racing). Best-effort per agent — a failure leaves that agent on
-    ``prompt.md``, which every reader still accepts. Returns the number of
-    agents changed.
-    """
-    import time as _time
-
-    from services.infra import git_writer
-    from storage.files import file_author_store
-    from storage.files import file_tombstones_store
-
-    migrated = 0
-    for slug in get_agent_slugs():
-        config_dir = config.AGENTS_DIR / slug / "config"
-        old = config_dir / "prompt.md"
-        new = config_dir / "agent.md"
-        try:
-            if not old.is_file():
-                continue
-            if new.is_file():
-                if new.read_bytes() != old.read_bytes():
-                    logger.warning(
-                        "Agent %s has both agent.md and prompt.md with "
-                        "different content — keeping both; agent.md wins at "
-                        "read time", slug,
-                    )
-                    continue
-                old.unlink()
-                action = "removed duplicate config/prompt.md"
-            else:
-                old.rename(new)
-                action = "renamed config/prompt.md to agent.md"
-            file_tombstones_store.record(
-                slug, "config/prompt.md", _time.time(),
-                origin="persona-migration",
-            )
-            file_author_store.clear(slug, "config/prompt.md")
-            file_tombstones_store.drop(slug, "config/agent.md")
-            commit_targets: list[Path | str] = [new]
-            if git_writer.is_tracked(config_dir, "prompt.md"):
-                commit_targets.append(old)
-            git_writer.commit_paths(
-                config_dir, commit_targets, "Rename persona file to agent.md",
-            )
-            logger.info("Agent %s: %s", slug, action)
-            migrated += 1
-        except OSError as exc:
-            logger.warning("Persona migration skipped for %s: %s", slug, exc)
-    return migrated
 
 
 # ---------------------------------------------------------------------------
@@ -690,3 +642,39 @@ def sanitize_slug(name: str) -> str:
     slug = re.sub(r"[^a-z0-9\-]", "-", slug)
     slug = re.sub(r"-+", "-", slug).strip("-")
     return slug[:40]
+
+
+# Slugs an agent may not take: the words the platform's paths and names use
+# for itself, and the two a meeting transcript gives the people's entries and
+# the platform's own lines (an agent named so would be read as one of them).
+# A new agent only, created or installed from a template: an agent that holds
+# one from an earlier release keeps it.
+RESERVED_AGENT_SLUGS = frozenset(
+    {"admin", "internal", "api", "auth", "me", "system", "proxy", "setup", "user"})
+
+
+def reserved_slug_refusal(slug: str) -> str | None:
+    """The sentence refusing ``slug`` to a new agent, or None when it may
+    take it."""
+    if slug in RESERVED_AGENT_SLUGS:
+        return f"'{slug}' is reserved by OtoDock. Pick another ID."
+    return None
+
+
+def _get_execution_paths(agent_data: dict | None) -> list[str]:
+    """Compute the full list of execution paths for an agent."""
+    primary = ((agent_data or {}).get("execution_path")
+               or DEFAULT_EXECUTION_PATH)
+    extra_json = (agent_data or {}).get("execution_paths", "")
+    extra = []
+    if extra_json:
+        try:
+            extra = json.loads(extra_json)
+        except (json.JSONDecodeError, TypeError):
+            extra = []
+    # Primary first, then extras (deduped)
+    paths = [primary]
+    for p in extra:
+        if p not in paths:
+            paths.append(p)
+    return paths

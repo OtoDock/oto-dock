@@ -26,7 +26,8 @@ import pytest
 
 from satellite._vendored.app_server_client import AppServerError
 from satellite.sessions.codex_session import (
-    CodexSession, _validate_config_toml,
+    CodexSession,
+    _validate_config_toml,
 )
 from satellite.sessions.session_manager import SessionManager
 

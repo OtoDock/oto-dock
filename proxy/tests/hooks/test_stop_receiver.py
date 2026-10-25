@@ -109,6 +109,7 @@ def test_the_stop_script_prints_the_block_shape_only_on_a_block(monkeypatch, tmp
     import io
     import json
     import pathlib
+
     import config as app_config
 
     path = pathlib.Path(app_config.BASE_DIR) / "hooks" / "stop_tracker.py"
@@ -172,6 +173,7 @@ def test_the_stop_script_waits_for_a_verdict_only_on_a_terminal(monkeypatch):
     import io
     import json
     import pathlib
+
     import config as app_config
 
     path = pathlib.Path(app_config.BASE_DIR) / "hooks" / "stop_tracker.py"

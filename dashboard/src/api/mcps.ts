@@ -1,7 +1,9 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './auth'
-import { raiseApiError } from '../lib/http/apiJson'
+import { ApiError, apiJson, apiOk, withMessage } from '../lib/http/apiJson'
+import { isRecord } from '../lib/json/guards'
+import { placePhrase } from './remoteMachines'
 import type { McpRuntime } from '../lib/kinds/mcpRuntime'
+import { TARGET_LOCAL } from '../lib/placement'
 import type { DockerStatus, EnableDockerResult } from '../lib/status/docker'
 
 export interface ConfigField {
@@ -57,6 +59,13 @@ export interface McpInstancesResponse {
   max_instances: number
 }
 
+export interface McpAppKind {
+  kind: string
+  label: string
+  mcp_token?: string
+  fields: { key: string; label: string; input_type: string; help?: string }[]
+}
+
 export interface McpServer {
   name: string
   label: string
@@ -107,6 +116,10 @@ export interface McpServer {
   app_credential_fields?: { key: string; label: string; input_type: string; help?: string }[]
   app_credential_configured?: boolean
   app_credential_configured_keys?: string[]
+  /** The kinds of vendor application an admin may register (lib/kinds/oauthApp.ts)
+   * and the one the bundle is in. */
+  app_kinds?: { key: string; kinds: McpAppKind[] }
+  app_credential_kind?: string
   // OAuth provider id (e.g. "google", "linear", "notion") — drives the
   // callback URL `/v1/oauth/{provider_id}/callback` and per-provider
   // help text in the app-credentials form.
@@ -141,9 +154,7 @@ export function useAdminMcps() {
   return useQuery({
     queryKey: ['admin-mcps'],
     queryFn: async (): Promise<McpServer[]> => {
-      const res = await apiFetch('/v1/admin/mcps')
-      if (!res.ok) throw new Error('Failed to fetch MCPs')
-      const data = await res.json()
+      const data = await apiJson<{ mcps: McpServer[] }>('/v1/admin/mcps').catch(withMessage('Failed to fetch MCPs'))
       return data.mcps
     },
   })
@@ -160,9 +171,8 @@ export function useEnableMcp() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (name: string): Promise<EnableMcpResult> => {
-      const res = await apiFetch(`/v1/admin/mcps/${name}/enable`, { method: 'PATCH' })
-      if (!res.ok) throw new Error('Failed to enable MCP')
-      return res.json()
+      return apiJson<EnableMcpResult>(`/v1/admin/mcps/${name}/enable`, { method: 'PATCH' })
+        .catch(withMessage('Failed to enable MCP'))
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
   })
@@ -172,11 +182,7 @@ export function useDisableMcp() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (name: string) => {
-      const res = await apiFetch(`/v1/admin/mcps/${name}/disable`, { method: 'PATCH' })
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
-        throw new Error(data.detail || 'Failed to disable MCP')
-      }
+      await apiOk(`/v1/admin/mcps/${name}/disable`, { method: 'PATCH' }, 'Failed to disable MCP')
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
   })
@@ -186,12 +192,11 @@ export function useSetMcpConfig() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ name, values }: { name: string; values: Record<string, string> }) => {
-      const res = await apiFetch(`/v1/admin/mcps/${name}/config`, {
+      await apiOk(`/v1/admin/mcps/${name}/config`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ values }),
-      })
-      if (!res.ok) throw new Error('Failed to save config')
+      }).catch(withMessage('Could not save the settings'))
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
   })
@@ -217,16 +222,11 @@ export function useSetMcpToolFilter() {
       tool_filter_regex: string
       docker_restarted: boolean
     }> => {
-      const res = await apiFetch(`/v1/admin/mcps/${name}/tool-filter`, {
+      return apiJson(`/v1/admin/mcps/${name}/tool-filter`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ regex }),
-      })
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
-        throw new Error(data.detail || 'Failed to save tool filter')
-      }
-      return res.json()
+      }, 'Failed to save tool filter')
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
   })
@@ -236,12 +236,11 @@ export function useSetHostedServiceMode() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ name, mode }: { name: string; mode: 'self_managed' | 'hosted' }) => {
-      const res = await apiFetch(`/v1/admin/mcps/${name}/hosted-service-mode`, {
+      await apiOk(`/v1/admin/mcps/${name}/hosted-service-mode`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode }),
-      })
-      if (!res.ok) throw new Error('Failed to save hosted service mode')
+      }).catch(withMessage('Failed to save hosted service mode'))
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
   })
@@ -251,12 +250,11 @@ export function useSetNetworkAccess() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ name, enabled }: { name: string; enabled: boolean }) => {
-      const res = await apiFetch(`/v1/admin/mcps/${name}/network-access`, {
+      await apiOk(`/v1/admin/mcps/${name}/network-access`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled }),
-      })
-      if (!res.ok) throw new Error('Failed to save network access')
+      }).catch(withMessage('Failed to save network access'))
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
   })
@@ -266,9 +264,8 @@ export function useDockerAction() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ name, action }: { name: string; action: 'start' | 'stop' | 'restart' }) => {
-      const res = await apiFetch(`/v1/admin/mcps/${name}/docker/${action}`, { method: 'POST' })
       // The server's sentence (a missing image says to run Update again).
-      if (!res.ok) await raiseApiError(res, `Failed to ${action} container`)
+      await apiOk(`/v1/admin/mcps/${name}/docker/${action}`, { method: 'POST' }, `Failed to ${action} container`)
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
   })
@@ -278,12 +275,7 @@ export function useDeleteMcp() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (name: string) => {
-      const res = await apiFetch(`/v1/admin/mcps/${name}`, { method: 'DELETE' })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: 'Delete failed' }))
-        throw new Error(err.detail || `Delete failed (${res.status})`)
-      }
-      return res.json()
+      return apiJson(`/v1/admin/mcps/${name}`, { method: 'DELETE' }, 'Delete failed')
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
   })
@@ -384,11 +376,11 @@ export interface McpUpdateState {
 export function automaticUpdateNote(info: McpUpdateInfo, autoUpdateEnabled: boolean): string | null {
   if (info.registry === 'git') {
     if (info.pinned_commit === false) {
-      return 'Its catalog source names a tag or a branch, not a commit: it can be installed once the catalog pins a commit.'
+      return 'Its source in the community list names a tag or a branch, not a commit. It can be installed once the list pins a commit.'
     }
     if (info.held) return 'Held: automatic updates skip it.'
     if (!autoUpdateEnabled) return 'Automatic updates are off.'
-    return 'The next automatic run builds the commit the catalog pins on this server, and paired machines rebuild it at their next sync.'
+    return `On ${placePhrase(TARGET_LOCAL, '')}, the next automatic run builds the commit the community list pins. Paired machines rebuild it at their next sync.`
   }
   if (info.settled === undefined || info.reason === 'manifest') return null
   if (info.held) return 'Held: automatic updates skip it.'
@@ -417,9 +409,7 @@ export function useMcpUpdateState() {
   return useQuery({
     queryKey: ['mcp-update-state'],
     queryFn: async (): Promise<McpUpdateState> => {
-      const res = await apiFetch('/v1/admin/mcps/update-state')
-      if (!res.ok) throw new Error('Failed to load the update state')
-      return res.json()
+      return apiJson<McpUpdateState>('/v1/admin/mcps/update-state').catch(withMessage('Failed to load the update state'))
     },
     staleTime: 60_000,
   })
@@ -429,9 +419,7 @@ export function useCheckMcpUpdates() {
   return useQuery({
     queryKey: ['mcp-updates'],
     queryFn: async (): Promise<McpUpdateState> => {
-      const res = await apiFetch('/v1/admin/mcps/check-updates')
-      if (!res.ok) throw new Error('Failed to check updates')
-      return res.json()
+      return apiJson<McpUpdateState>('/v1/admin/mcps/check-updates').catch(withMessage('Failed to check updates'))
     },
     staleTime: 300_000, // 5 min cache
     enabled: false, // only fetch on demand
@@ -448,16 +436,16 @@ function dropFromUpdates(qc: ReturnType<typeof useQueryClient>, name: string) {
   }
 }
 
+/** An update's answer; the row shows its install log. */
+export interface McpUpdateResult {
+  install_log?: string
+}
+
 export function useUpdateMcp() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: async (name: string) => {
-      const res = await apiFetch(`/v1/admin/mcps/${name}/update`, { method: 'POST' })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: 'Update failed' }))
-        throw new Error(err.detail || `Update failed (${res.status})`)
-      }
-      return res.json()
+    mutationFn: async (name: string): Promise<McpUpdateResult> => {
+      return apiJson<McpUpdateResult>(`/v1/admin/mcps/${name}/update`, { method: 'POST' }, 'Update failed')
     },
     onSuccess: (_data, name) => {
       qc.invalidateQueries({ queryKey: ['admin-mcps'] })
@@ -482,16 +470,11 @@ export function useAcceptMcpSource() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ name, from, to, manifest_hash }: { name: string; from: string; to: string; manifest_hash: string }): Promise<AcceptSourceResult> => {
-      const res = await apiFetch(`/v1/admin/mcps/${name}/accept-source`, {
+      return apiJson<AcceptSourceResult>(`/v1/admin/mcps/${name}/accept-source`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ from, to, manifest_hash }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: 'Switch failed' }))
-        throw new Error(err.detail || `Switch failed (${res.status})`)
-      }
-      return res.json()
+      }, 'Switch failed')
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['admin-mcps'] })
@@ -505,12 +488,7 @@ export function useDismissMcpSourceChange() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (name: string) => {
-      const res = await apiFetch(`/v1/admin/mcps/${name}/source-change`, { method: 'DELETE' })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: 'Dismiss failed' }))
-        throw new Error(err.detail || `Dismiss failed (${res.status})`)
-      }
-      return res.json()
+      return apiJson(`/v1/admin/mcps/${name}/source-change`, { method: 'DELETE' }, 'Dismiss failed')
     },
     onSuccess: (_data, name) => {
       dropFromUpdates(qc, name)
@@ -536,9 +514,8 @@ export function useMcpAutoUpdateLog() {
   return useQuery({
     queryKey: ['mcp-auto-update-log'],
     queryFn: async (): Promise<{ runs: McpAutoUpdateRow[]; last_run_at: string }> => {
-      const res = await apiFetch('/v1/admin/mcps/auto-update-log')
-      if (!res.ok) throw new Error('Failed to fetch auto-update log')
-      return res.json()
+      return apiJson<{ runs: McpAutoUpdateRow[]; last_run_at: string }>('/v1/admin/mcps/auto-update-log')
+        .catch(withMessage('Failed to fetch auto-update log'))
     },
   })
 }
@@ -558,15 +535,10 @@ export function useInstallMcp() {
     mutationFn: async (file: File): Promise<InstallResult> => {
       const form = new FormData()
       form.append('file', file)
-      const res = await apiFetch('/v1/admin/mcps/install', {
+      return apiJson<InstallResult>('/v1/admin/mcps/install', {
         method: 'POST',
         body: form,
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: 'Install failed' }))
-        throw new Error(err.detail || `Install failed (${res.status})`)
-      }
-      return res.json()
+      }, 'Install failed')
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-mcps'] }),
   })
@@ -590,15 +562,10 @@ export function useInstallSkillZip() {
     mutationFn: async (file: File): Promise<SkillInstallResult> => {
       const form = new FormData()
       form.append('file', file)
-      const res = await apiFetch('/v1/admin/skills/install', {
+      return apiJson<SkillInstallResult>('/v1/admin/skills/install', {
         method: 'POST',
         body: form,
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: 'Install failed' }))
-        throw new Error(err.detail || `Install failed (${res.status})`)
-      }
-      return res.json()
+      }, 'Install failed')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['admin-mcps'] })
@@ -612,9 +579,7 @@ export function useMcpInstances(mcpName: string) {
   return useQuery({
     queryKey: ['mcp-instances', mcpName],
     queryFn: async (): Promise<McpInstancesResponse> => {
-      const res = await apiFetch(`/v1/admin/mcps/${mcpName}/instances`)
-      if (!res.ok) throw new Error('Failed to fetch instances')
-      return res.json()
+      return apiJson<McpInstancesResponse>(`/v1/admin/mcps/${mcpName}/instances`).catch(withMessage('Failed to fetch instances'))
     },
     enabled: !!mcpName,
   })
@@ -624,13 +589,11 @@ export function useCreateMcpInstance() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ mcpName, data }: { mcpName: string; data: { instance_name: string; field_values: Record<string, string>; agents: string[]; assigned_to_all?: boolean; hosted_mode?: 'self_managed' | 'hosted' } }) => {
-      const res = await apiFetch(`/v1/admin/mcps/${mcpName}/instances`, {
+      return apiJson(`/v1/admin/mcps/${mcpName}/instances`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error('Failed to create instance')
-      return res.json()
+      }).catch(withMessage('Failed to create instance'))
     },
     onSuccess: (_, { mcpName }) => {
       qc.invalidateQueries({ queryKey: ['mcp-instances', mcpName] })
@@ -649,13 +612,11 @@ export function useUpdateMcpInstance() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ mcpName, instanceId, data }: { mcpName: string; instanceId: number; data: { instance_name: string; field_values: Record<string, string>; agents: string[]; assigned_to_all?: boolean; hosted_mode?: 'self_managed' | 'hosted' } }) => {
-      const res = await apiFetch(`/v1/admin/mcps/${mcpName}/instances/${instanceId}`, {
+      return apiJson(`/v1/admin/mcps/${mcpName}/instances/${instanceId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error('Failed to update instance')
-      return res.json()
+      }).catch(withMessage('Failed to update instance'))
     },
     onSuccess: (_, { mcpName }) => {
       qc.invalidateQueries({ queryKey: ['mcp-instances', mcpName] })
@@ -671,8 +632,8 @@ export function useDeleteMcpInstance() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ mcpName, instanceId }: { mcpName: string; instanceId: number }) => {
-      const res = await apiFetch(`/v1/admin/mcps/${mcpName}/instances/${instanceId}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error('Failed to delete instance')
+      await apiOk(`/v1/admin/mcps/${mcpName}/instances/${instanceId}`, { method: 'DELETE' })
+        .catch(withMessage('Failed to delete instance'))
     },
     onSuccess: (_, { mcpName }) => {
       qc.invalidateQueries({ queryKey: ['mcp-instances', mcpName] })
@@ -691,9 +652,7 @@ export function useSshKeys() {
   return useQuery({
     queryKey: ['ssh-keys'],
     queryFn: async (): Promise<SshKey[]> => {
-      const res = await apiFetch('/v1/admin/ssh/keys')
-      if (!res.ok) throw new Error('Failed to fetch SSH keys')
-      return (await res.json()).keys
+      return (await apiJson<{ keys: SshKey[] }>('/v1/admin/ssh/keys').catch(withMessage('Failed to fetch SSH keys'))).keys
     },
   })
 }
@@ -704,8 +663,7 @@ export function useUploadSshKey() {
     mutationFn: async (file: File) => {
       const form = new FormData()
       form.append('file', file)
-      const res = await apiFetch('/v1/admin/ssh/keys', { method: 'POST', body: form })
-      if (!res.ok) throw new Error('Failed to upload key')
+      await apiOk('/v1/admin/ssh/keys', { method: 'POST', body: form }).catch(withMessage('Failed to upload key'))
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['ssh-keys'] }),
   })
@@ -715,8 +673,8 @@ export function useDeleteSshKey() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (name: string) => {
-      const res = await apiFetch(`/v1/admin/ssh/keys/${encodeURIComponent(name)}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error('Failed to delete key')
+      await apiOk(`/v1/admin/ssh/keys/${encodeURIComponent(name)}`, { method: 'DELETE' })
+        .catch(withMessage('Failed to delete key'))
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['ssh-keys'] }),
   })
@@ -766,9 +724,7 @@ export function useAgentMcps(agent: string, enabled = true) {
   return useQuery({
     queryKey: ['agent-mcps', agent],
     queryFn: async (): Promise<AgentMcpData> => {
-      const res = await apiFetch(`/v1/agents/${agent}/mcps`)
-      if (!res.ok) throw new Error('Failed to fetch agent MCPs')
-      return res.json()
+      return apiJson<AgentMcpData>(`/v1/agents/${agent}/mcps`).catch(withMessage('Failed to fetch agent MCPs'))
     },
     enabled: !!agent && enabled,
   })
@@ -778,23 +734,24 @@ export function useSetAgentMcps() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ agent, mcps }: { agent: string; mcps: string[] }) => {
-      const res = await apiFetch(`/v1/agents/${agent}/mcps`, {
+      await apiOk(`/v1/agents/${agent}/mcps`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mcps }),
-      })
-      if (res.status === 400) {
-        const body = await res.json().catch(() => ({}))
-        const detail = body?.detail
-        if (detail && Array.isArray(detail.not_visible)) {
-          throw new AgentMcpsNotVisibleError(detail.not_visible)
+      }).catch((e: unknown) => {
+        // A 400 names the MCPs the agent cannot see, or says why it refused.
+        if (e instanceof ApiError && e.status === 400) {
+          const detail = e.detail
+          if (isRecord(detail) && Array.isArray(detail.not_visible)) {
+            throw new AgentMcpsNotVisibleError(detail.not_visible)
+          }
+          throw new Error(String((isRecord(detail) && detail.error) || 'Failed to save agent MCPs'))
         }
-        throw new Error(detail?.error || 'Failed to save agent MCPs')
-      }
-      if (!res.ok) throw new Error('Failed to save agent MCPs')
+        return withMessage('Failed to save agent MCPs')(e)
+      })
     },
+    // Resolves with the agent's own list, the one the saving page shows.
     onSuccess: (_, { agent }) => {
-      qc.invalidateQueries({ queryKey: ['agent-mcps', agent] })
       qc.invalidateQueries({ queryKey: ['admin-mcps'] })
       qc.invalidateQueries({ queryKey: ['agent-info', agent] })
       // Skills depend on the manager-enabled set; refetch so the skills tab updates
@@ -802,6 +759,7 @@ export function useSetAgentMcps() {
       // Per-user integrations depend on the visibility set per agent; if a manager
       // enables a per-user-creds MCP, the integrations panel should refresh.
       qc.invalidateQueries({ queryKey: ['my-integrations'] })
+      return qc.invalidateQueries({ queryKey: ['agent-mcps', agent] })
     },
   })
 }
@@ -831,9 +789,7 @@ export function useAgentSkills(agent: string, enabled = true) {
   return useQuery({
     queryKey: ['agent-skills', agent],
     queryFn: async (): Promise<AgentSkill[]> => {
-      const res = await apiFetch(`/v1/agents/${agent}/skills`)
-      if (!res.ok) throw new Error('Failed to fetch agent skills')
-      const data = await res.json()
+      const data = await apiJson<{ skills: AgentSkill[] }>(`/v1/agents/${agent}/skills`).catch(withMessage('Failed to fetch agent skills'))
       return data.skills
     },
     enabled: !!agent && enabled,
@@ -855,25 +811,19 @@ export function useSetAgentSkill() {
       enabled: boolean
       exclude_from: string[]
     }) => {
-      const res = await apiFetch(
+      return apiJson(
         `/v1/agents/${agent}/skills/${encodeURIComponent(skillId)}`,
         {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ enabled, exclude_from }),
         },
+        'Failed to save skill',
       )
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
-        throw new Error(
-          typeof data.detail === 'string' ? data.detail : 'Failed to save skill',
-        )
-      }
-      return res.json()
     },
     onSuccess: (_, { agent }) => {
-      qc.invalidateQueries({ queryKey: ['agent-skills', agent] })
       qc.invalidateQueries({ queryKey: ['community-skills'] })
+      return qc.invalidateQueries({ queryKey: ['agent-skills', agent] })
     },
   })
 }

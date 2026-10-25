@@ -32,9 +32,9 @@ def test_persists_drained_and_watchdog_stopped_before_pool_close(monkeypatch):
             order.append("drain")
             return True
 
-    from core.remote import satellite_connection as sc
     from core import loop_watchdog
     from core.layers.direct import mcp as direct_mcp
+    from core.remote import satellite_connection as sc
 
     monkeypatch.setattr(startup, "_flush_active_pumps", _fake_flush)
     monkeypatch.setattr(startup.task_store, "list_orphaned_runs", lambda: [])
@@ -62,8 +62,8 @@ def test_slow_drain_is_bounded_and_never_blocks_close(monkeypatch, caplog):
             await asyncio.sleep(min(timeout, 0.05))
             return False  # still pending (stalled DB)
 
-    from core.remote import satellite_connection as sc
     from core.layers.direct import mcp as direct_mcp
+    from core.remote import satellite_connection as sc
     closed = []
 
     async def _fake_flush(logger):

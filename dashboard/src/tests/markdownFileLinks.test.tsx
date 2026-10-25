@@ -6,10 +6,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 
-import MarkdownContent, { isFileSystemPathHref } from '@/components/chat/MarkdownContent'
+import MarkdownContent from '@/components/chat/MarkdownContent'
 import { ChatFileProvider } from '@/components/chat/ChatFileContext'
 import { SearchProvider } from '@/contexts/SearchContext'
 import * as authApi from '@/api/auth'
+import { isFileSystemPathHref } from '@/lib/chat/markdownLinks'
 
 // The preview surface is exercised in chatFilePreview.test.tsx — here it only
 // marks "the preview opened".
@@ -70,7 +71,7 @@ describe('MarkdownContent — file-path links', () => {
     // decoded path
     renderMd('[Άνοιγμα αρχείου](C:\\Users\\amour\\OtoDock\\αρχείο.xlsx)')
     expect(screen.queryByRole('link')).toBeNull()
-    const chip = screen.getByTitle('Local file path — ask for a preview or download link')
+    const chip = screen.getByTitle('A local file path. Ask the agent for a preview or a download link.')
     expect(chip.tagName).toBe('SPAN')
     expect(chip).not.toHaveAttribute('href')
     expect(chip.textContent).toContain('C:\\Users\\amour\\OtoDock\\αρχείο.xlsx')
@@ -157,7 +158,7 @@ describe('MarkdownContent — clickable file chips (chat context)', () => {
     renderChatMd('[open](/workspace/missing.xlsx)', 'chat-d')
     await act(async () => { fireEvent.click(screen.getByTitle('Open file preview')) })
     const chip = screen.getByTitle("File not found in the agent's workspace")
-    expect(chip.textContent).toContain('not found')
+    expect(chip.textContent).toContain('Not found')
     expect(screen.queryByTestId('file-preview-body')).toBeNull()
     // …and reverts after a moment (no toast, no sticky error)
     act(() => { vi.advanceTimersByTime(3000) })

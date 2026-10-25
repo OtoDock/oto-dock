@@ -33,16 +33,15 @@ import contextlib
 import logging
 import shutil
 import time
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
 
 import config
 from core.session import external_identity
 from services.infra.agent_dirs import agent_dirs
 from storage import database as task_store
-from storage.files import file_author_store
-from storage.files import file_tombstones_store
+from storage.files import file_author_store, file_tombstones_store
 from storage.phone import phone_call_log_store
 
 logger = logging.getLogger("otodock")
@@ -186,7 +185,7 @@ def remove_home(agent: str, home: Path, stats: dict, dry_run: bool) -> bool:
     rel = _rel_prefix(agent, home)
     if not rel.startswith(external_identity.EXTERNALS_DIRNAME + "/"):
         stats["errors"] += 1
-        logger.error(f"caller-data: refusing to remove {home} (not under externals/)")
+        logger.error("caller-data: refusing to remove %s (not under externals/)", home)
         return False
     size = _tree_bytes(home)
     if dry_run:
@@ -196,7 +195,7 @@ def remove_home(agent: str, home: Path, stats: dict, dry_run: bool) -> bool:
         shutil.rmtree(home)
     except OSError as e:
         stats["errors"] += 1
-        logger.warning(f"caller-data: failed to remove {home}: {e}")
+        logger.warning("caller-data: failed to remove %s: %s", home, e)
         return False
     with contextlib.suppress(Exception):
         file_tombstones_store.purge_prefix(agent, rel)
@@ -320,11 +319,14 @@ def forget_all(busy_homes: set, live_session_ids: set, live_pump_chat_ids: set) 
         _delete_phone_chat(chat, stats, dry_run=False)
     stats["call_log_rows_deleted"] += phone_call_log_store.delete_all()
     logger.info(
-        f"caller-data: forget-all removed {stats['callers_forgotten']} caller trees "
-        f"({stats['caller_bytes_freed']} bytes), {stats['phone_chats_deleted']} phone chats, "
-        f"{stats['call_log_rows_deleted']} call-log rows; "
-        f"skipped {stats['callers_busy_skipped']} busy trees, "
-        f"{stats['phone_chats_busy_skipped']} live conversations"
+        "caller-data: forget-all removed %s caller trees "
+        "(%s bytes), %s phone chats, "
+        "%s call-log rows; "
+        "skipped %s busy trees, "
+        "%s live conversations",
+        stats['callers_forgotten'], stats['caller_bytes_freed'], stats['phone_chats_deleted'],
+        stats['call_log_rows_deleted'], stats['callers_busy_skipped'],
+        stats['phone_chats_busy_skipped']
     )
     return stats
 

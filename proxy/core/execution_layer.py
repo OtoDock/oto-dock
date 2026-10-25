@@ -8,36 +8,70 @@ execution layers exclusively through this contract.
 import asyncio
 import contextlib
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import AsyncIterator, Iterator
 
-from core.events.common_events import CommonEvent
 from core import placement
-
-#: The engine an agent runs on when nothing says otherwise — a missing
-#: ``agents.execution_path``, a chat row from before the column existed, a
-#: caller with no opinion. ONE constant: it used to be typed inline at a dozen
-#: sites, so "the platform's default engine" could be neither read nor changed
-#: in one place. Lives here, with the contract, because this module is a leaf
-#: (the registry imports it, not the other way round) so every config builder
-#: can read it without an import cycle.
-DEFAULT_EXECUTION_PATH = "claude-code-cli"
-
-#: The permission modes a person can pick for a chat — what a descriptor's
-#: ``permission_modes`` may declare (the dashboard's menu is the declared
-#: subset). ``auto`` (a task's silent mode) and ``judge`` (a check's
-#: read-only profile) are stored on a chat too but never offered. Values
-#: are ``chats.permission_mode`` vocabulary — frozen.
-PERMISSION_MODES: tuple[str, ...] = ("default", "acceptEdits", "plan", "dontAsk")
-PLAN_MODE = "plan"
+from core.events.common_events import CommonEvent
+from core.permission_modes import (
+    ASK_MODE as ASK_MODE,
+    AUTO_REVIEW_MODE as AUTO_REVIEW_MODE,
+    DONT_ASK_MODE as DONT_ASK_MODE,
+    JUDGE_MODE as JUDGE_MODE,
+    LEGACY_MODES as LEGACY_MODES,
+    PERMISSION_MODES as PERMISSION_MODES,
+    PLAN_MODE as PLAN_MODE,
+    STORED_ONLY_MODES as STORED_ONLY_MODES,
+    UNATTENDED_MODE as UNATTENDED_MODE,
+    chat_row as chat_row,
+    cli_mode as cli_mode,
+    current_mode as current_mode,
+    entry_mode as entry_mode,
+    offered_mode as offered_mode,
+    terminal_mode as terminal_mode,
+)
 
 #: The platform's effort levels, lowest first — what ``agents.default_effort``
 #: may hold and the order every engine's ``effort_levels`` and every
 #: provider's ``effort_scale`` follow (each is a sub-sequence of it).
 EFFORT_LADDER: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max", "ultra")
+
+
+class ResumeVerdict(Enum):
+    """What ``can_resume_session`` knows about a dead session's conversation.
+
+    ``RESUMABLE``: the engine's files hold it, ``start_session(resume=True)``
+    continues it. ``FRESH``: they definitely do not (missing, empty, a name
+    nothing can load), the chat takes a fresh session and the history digest.
+    ``UNKNOWN``: the question could not be answered now (a machine away or
+    not answering, a read the host could not finish): the caller waits or
+    refuses the turn, and nothing of the chat changes. The fresh branch is
+    irreversible, so this is never a bool: a caller that reads it as one
+    fails at its first run instead of resuming fresh on a slow machine.
+    """
+
+    RESUMABLE = "resumable"
+    FRESH = "fresh"
+    UNKNOWN = "unknown"
+
+    def __bool__(self) -> bool:
+        raise TypeError("a ResumeVerdict is compared to its members, never read as a bool")
+
+
+class MachineReach(Enum):
+    """Where a session's machine stands when its resume probe went
+    unanswered: the platform itself (``LOCAL``), connected but silent
+    (``CONNECTED``), dropped within its reconnect grace (``AWAY_RECENT``, worth
+    a wait), or away past it or paused (``AWAY``, refused at once)."""
+
+    LOCAL = "local"
+    CONNECTED = "connected"
+    AWAY_RECENT = "away_recent"
+    AWAY = "away"
 
 
 def fold_effort(level: str, scale: list[str] | tuple[str, ...]) -> str:
@@ -81,14 +115,16 @@ class AgentConfig:
     # instead of being baked into config files. Direct-LLM ignores this field
     # (it provisions from its own build_session_mcp_config call).
     mcp_secret_bundles: dict = field(default_factory=dict)
-    permission_mode: str = "default"   # auto | default | plan | acceptEdits
+    permission_mode: str = ASK_MODE    # a PERMISSION_MODES word, or the unattended / judge word
     client_type: str = ""              # the session kind's name (core/session/session_kind.py); "" = unrecorded
     model: str = ""                    # override model (empty = agent default)
     effort: str = ""                   # low | medium | high | max
     resume: bool = False               # CLI: --resume existing session
     use_native_permissions: bool = False  # CLI: use native perm mode vs hook
     extra_env: dict = field(default_factory=dict)
-    security_context: object = None    # SecurityContext for path-based access control
+    # SecurityContext for path-based access control (typed object here; a
+    # layer casts its reads, None when the session has none).
+    security_context: object = None
     subscription_id: str = ""          # tracks pool subscription for cleanup on session close
     # The ACQUISITION-scope user sub subscription_id was resolved with — the
     # exact user_sub the config builder passed to the pool ("" = agent-scope /
@@ -371,8 +407,8 @@ class ModelPolicy:
     best tier the engine serves with tier 1 offered but never defaulted, so
     a frontier model is always a deliberate choice. The resolver honours it
     when its row is enabled and the platform pool can serve its provider;
-    otherwise it falls DOWN the tiers from it, never up (config.py
-    ``resolve_agent_model``). ``model_filter_policy`` is how the engine's
+    otherwise it falls DOWN the tiers from it, never up
+    (``configuration/models.py`` ``resolve_agent_model``). ``model_filter_policy`` is how the engine's
     model list is trimmed to the providers with an active subscription:
     ``all`` (every provider filtered), ``local_providers`` (only local
     endpoints are hidden without a row — a personal vendor account must keep
@@ -684,6 +720,11 @@ class RemoteEngineAdapter(ABC):
     reads it. ``cm`` is the satellite connection manager.
     """
 
+    async def reenter_review(self, info, cm) -> bool:
+        """Re-enter the engine's own review after its decline limit (see
+        ``ExecutionLayer.reenter_review``); False for an engine with none."""
+        return False
+
     #: Env keys that are this engine's PRIVATE carriers (credential blobs, a
     #: local endpoint, the model rows) and must never ride the satellite env.
     #: The shared builder strips the UNION over every registered adapter after
@@ -782,6 +823,7 @@ class RemoteEngineAdapter(ABC):
         """That frame went out for the live turn: an engine whose turn then
         ends in an error result marks the result as the interrupt's.
         Default: nothing."""
+        return
 
     def turn_settled(self, info) -> bool:
         """The engine's turn is over (its result was read) and only the wait
@@ -809,13 +851,26 @@ class RemoteEngineAdapter(ABC):
 
     # --- resume --------------------------------------------------------------
 
+    def probe_future(self, cm, *, machine_id: str, session_id: str) -> "asyncio.Future | None":
+        """The outstanding resume probe's answer for ``session_id`` on
+        ``machine_id`` (``can_resume`` left it out), None when none is out.
+        Default: an engine that probes nothing has none."""
+        return None
+
+    def forget_probe(self, cm, *, machine_id: str, session_id: str) -> None:
+        """Drop the outstanding resume probe for ``session_id`` on
+        ``machine_id`` (a late answer is dropped with it). Default: nothing."""
+        return
+
     @abstractmethod
     async def can_resume(
         self, cm, *, machine_id: str, session_id: str, agent_name: str,
-        username: str, resume_handle: str,
-    ) -> bool:
+        username: str, resume_handle: str, external_home: str = "",
+    ) -> ResumeVerdict:
         """Whether a dead or lost remote session of this engine can be resumed
-        on ``machine_id`` — by asking the satellite, or from the handle."""
+        on ``machine_id`` — by asking the satellite, or from the handle. An
+        engine that asks answers ``UNKNOWN`` while the machine is away or
+        silent (``core/session/resume_probe.py`` waits on it)."""
 
 
 @dataclass
@@ -982,6 +1037,36 @@ class ExecutionLayer(ABC):
         declared); the remote placement delegates to the engine behind the
         session. Never raises: an unknown native name comes back as is."""
         return native
+
+    def engine_reviews(self, session_id: str, live_mode: str) -> bool:
+        """Whether this engine's own reviewer judges the call the hook is
+        deciding now (Auto's review set), from the mode the engine reported
+        with the call (``live_mode``, empty for a call no hook raised). False
+        by default: an engine with no reviewer gets the platform's own
+        answer. Never raises."""
+        return False
+
+    async def reenter_review(self, session_id: str) -> bool:
+        """Re-enter the engine's own review after its decline limit paused
+        it, leaving the platform's mode alone: only while the session is
+        still in Auto when the engine can take the change (a person's change
+        made meanwhile wins). False when nothing was sent (the default: an
+        engine with no such pause)."""
+        return False
+
+    def hook_can_ask(self) -> bool:
+        """Whether this engine's PreToolUse hook can make its terminal ask
+        the person (an ``ask`` decision feeds the CLI's own prompt). False
+        by default: Codex's hook only denies (``OTO_HOOK_DENY_ONLY``)."""
+        return False
+
+    def terminal_reports_mode(self) -> bool:
+        """Whether this engine's interactive terminal reports its own mode
+        word with each hook call (Claude Code's Shift+Tab), which the
+        person's chat follows. False by default: Codex reports only its
+        approval policy (``default`` / ``bypassPermissions``), which is not
+        a mode the person picked."""
+        return False
 
     def chat_session_files(self, home: Path, session_id: str, resume_handle: str) -> list[Path]:
         """The on-disk session files of ONE chat under a scope home
@@ -1192,7 +1277,7 @@ class ExecutionLayer(ABC):
             yield ev
 
     @abstractmethod
-    async def _send_turn(
+    def _send_turn(
         self, session_id: str, message: str, **kwargs,
     ) -> AsyncIterator[CommonEvent]:
         """Run ONE turn: send the message, yield its events, return at the
@@ -1273,6 +1358,7 @@ class ExecutionLayer(ABC):
         """Answer a permission request the engine raised on its own stdio
         channel (``core/session/engine_prompts``). Only the Claude CLI raises
         them; every other layer has nothing to write."""
+        return
 
     @abstractmethod
     async def change_model(
@@ -1482,12 +1568,41 @@ class ExecutionLayer(ABC):
     @abstractmethod
     async def can_resume_session(
         self, session_id: str, *, agent_name: str = "", username: str = "",
-    ) -> bool:
-        """Check if a dead session has conversation data and can be resumed.
+        external_home: str = "",
+    ) -> ResumeVerdict:
+        """Whether a dead session has conversation data and can be resumed.
 
         CLI: checks session .jsonl file for user messages.  After proxy
         restart the in-memory session→claude-dir mapping is lost, so
-        *agent_name* and *username* are used to derive the .claude/ path.
-        Direct LLM: always False (in-memory history lost on death;
-        recovery handled via chat_id in AgentConfig instead).
+        *agent_name* and *username* (or an external caller's
+        *external_home*) are used to derive the .claude/ path.
+        Direct LLM: always ``FRESH`` (in-memory history lost on death;
+        recovery handled via chat_id in AgentConfig instead). The callers go
+        through ``core/session/resume_probe.settle_resume``, which waits on
+        an ``UNKNOWN`` answer within a budget and never reads it as fresh.
         """
+
+    def resume_probe_future(
+        self, session_id: str, *, agent_name: str = "", username: str = "",
+    ) -> "asyncio.Future | None":
+        """The answer of the resume probe still outstanding for a session
+        whose machine has not answered (``settle_resume`` kept it): a future
+        a deferred turn's watcher waits on, None when none is out. A local
+        session has no probe out."""
+        return None
+
+    def forget_resume_probe(
+        self, session_id: str, *, agent_name: str = "", username: str = "",
+    ) -> None:
+        """Stop waiting for the session's outstanding resume probe (a late
+        answer is dropped). Nothing for a local session."""
+        return
+
+    def resume_machine_reach(
+        self, session_id: str, *, agent_name: str = "", username: str = "",
+    ) -> MachineReach:
+        """Where the session's machine stands, for a resume probe that went
+        unanswered (``resume_probe.settle_resume`` decides whether to wait).
+        A layer that runs on the platform answers ``LOCAL``; the remote layer
+        answers from its connection manager."""
+        return MachineReach.LOCAL

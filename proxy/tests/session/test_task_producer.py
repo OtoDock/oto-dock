@@ -18,14 +18,20 @@ from contextlib import asynccontextmanager
 
 import pytest
 
-from core.events.common_events import (
-    CommonEvent, SUBAGENT_START, BG_COMMAND_START, QUEUE_TURN,
-)
 from core.events.bg_command_state import (
-    _bg_command_registries, get_bg_command_registry,
+    _bg_command_registries,
+    get_bg_command_registry,
+)
+from core.events.common_events import (
+    BG_COMMAND_START,
+    BG_REVIEW_TURN,
+    QUEUE_TURN,
+    SUBAGENT_START,
+    CommonEvent,
 )
 from core.events.pump_bg_monitors import (
-    bg_monitor_running, bg_command_monitor_running,
+    bg_command_monitor_running,
+    bg_monitor_running,
 )
 from core.events.task_producer import task_produce
 from core.session.session_state import get_subagent_registry
@@ -111,7 +117,7 @@ async def _run(layer, session_id, **kw):
 
 
 def _nudges(events):
-    return [e for e in events if e.type == QUEUE_TURN]
+    return [e for e in events if e.type == BG_REVIEW_TURN]
 
 
 @pytest.fixture
@@ -469,7 +475,7 @@ async def test_the_producer_never_sends_the_streams_done(clean_registries):
     """The stream's ``done`` is the runner's, sent after the row is stamped:
     the producer forwards the turn's frames and nothing else — on a clean
     run, on a failure and on a cancel."""
-    from core.events.common_events import TEXT, ERROR
+    from core.events.common_events import ERROR, TEXT
 
     sent: list[dict] = []
 
@@ -541,6 +547,56 @@ async def test_nudge_names_finished_agents(clean_registries):
     await _run(layer, sid)
 
     assert '1 background agent(s) ("probe auth" [sub-a])' in layer.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_the_review_is_nudge_rows_never_a_persons_message(clean_registries):
+    """The run's review puts its boundary as the nudge rows the chat
+    monitors store, one per kind with the prompt's counts and the jobs'
+    labels, agents first; never a queued person's turn (a review stored as
+    the person's own blue bubble, and handed to the delegating agent as
+    "[User interjected]", 2026-10-22)."""
+    sid = "tp-review-rows"
+    clean_registries.append(sid)
+    reg = get_subagent_registry(sid)
+    reg.register_spawn("sub-a", "t1", label='"probe auth" [sub-a]')
+    reg.mark_done("sub-a")
+    bgreg = get_bg_command_registry(sid)
+    bgreg.register_spawn("cmd-a", "t2", label="cmd-a — make test")
+    bgreg.mark_done("cmd-a", surfaced=False)
+
+    layer = _FakeLayer(turns=[[_bg_sub_start(), _bg_cmd_start()], []])
+    events = await _run(layer, sid)
+
+    assert not [e for e in events if e.type == QUEUE_TURN]
+    [review] = _nudges(events)
+    assert review.data == {"nudges": [
+        {"event_type": "bg_nudge", "count": 1, "labels": ['"probe auth" [sub-a]'],
+         "tool_use_ids": ["t1"]},
+        {"event_type": "bg_command_nudge", "count": 1, "labels": ["cmd-a — make test"],
+         "tool_use_ids": ["t2"]},
+    ]}
+    # The engine gets the task and ONE review prompt, naming both: the
+    # boundary event sends the engine nothing.
+    assert len(layer.prompts) == 2
+    assert layer.prompts[1].startswith(
+        'Your 1 background agent(s) ("probe auth" [sub-a]) and 1 background '
+        "command(s) (cmd-a — make test) have completed their work.")
+
+
+@pytest.mark.asyncio
+async def test_a_review_names_the_prompts_agent_count(clean_registries):
+    """An agent whose spawn the turn counted but the registry never named
+    (no ``task_started`` read): the row says what the prompt says."""
+    sid = "tp-review-tally"
+    clean_registries.append(sid)
+    layer = _FakeLayer(turns=[[_bg_sub_start()], []])
+    events = await _run(layer, sid)
+    [review] = _nudges(events)
+    assert review.data["nudges"] == [{"event_type": "bg_nudge", "count": 1, "labels": [],
+                                      "tool_use_ids": []}]
+    assert len(layer.prompts) == 2
+    assert layer.prompts[1].startswith("Your 1 background agent(s) have completed")
 
 
 @pytest.mark.asyncio
@@ -694,6 +750,7 @@ async def test_the_wait_counts_from_the_settle_read_start(clean_registries):
     """The settle read and the producer's wait share one deadline: work the
     settle already waited on is not given a second full ceiling."""
     import time
+
     from core.layers.cli import settle as cli_settle
     sid = "tp-one-deadline"
     clean_registries.append(sid)

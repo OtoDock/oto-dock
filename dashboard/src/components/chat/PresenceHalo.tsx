@@ -37,8 +37,9 @@
 // (sparks, orbiting arc, breathing oscillation) but keeps the live,
 // audio-reactive glow and its state colors.
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useLayoutEffect } from 'react'
 import type { DuplexPhase } from '../../hooks/useDuplexVoice'
+import { debugLog, debugWarn } from '../../lib/debug/log'
 
 export interface PresenceHaloProps {
   phase: DuplexPhase
@@ -93,8 +94,10 @@ export function PresenceHalo({ phase, getLevels }: PresenceHaloProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const phaseRef = useRef(phase)
   const levelsRef = useRef(getLevels)
-  phaseRef.current = phase
-  levelsRef.current = getLevels
+  useLayoutEffect(() => {
+    phaseRef.current = phase
+    levelsRef.current = getLevels
+  })
 
   const active = phase !== 'off' && phase !== 'error'
 
@@ -107,7 +110,7 @@ export function PresenceHalo({ phase, getLevels }: PresenceHaloProps) {
     const reduced = !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
     // Breadcrumbs are deliberate: this surface has device-specific failure
     // modes we can only debug from a remote console.
-    console.info(
+    debugLog(
       `[presence] active phase=${phaseRef.current} reduced=${reduced} `
       + `dpr=${window.devicePixelRatio || 1}`)
 
@@ -129,7 +132,7 @@ export function PresenceHalo({ phase, getLevels }: PresenceHaloProps) {
         // clear it before it can ever composite.
         ctx.setTransform(1, 0, 0, 1, 0, 0)
         ctx.clearRect(0, 0, w, h)
-        console.info(`[presence] canvas ${w}x${h}`)
+        debugLog(`[presence] canvas ${w}x${h}`)
       }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
       const cr = canvas.getBoundingClientRect()
@@ -260,7 +263,7 @@ export function PresenceHalo({ phase, getLevels }: PresenceHaloProps) {
           // A point on one of the four edges + its outward normal.
           const side = (Math.random() * 4) | 0
           const u = Math.random()
-          let px = 0, py = 0, nx = 0, ny = 0
+          let px: number, py: number, nx = 0, ny = 0
           if (side === 0) { px = rx + u * rw; py = ry; ny = -1 }
           else if (side === 1) { px = rx + u * rw; py = ry + rh; ny = 1 }
           else if (side === 2) { px = rx; py = ry + u * rh; nx = -1 }
@@ -301,11 +304,11 @@ export function PresenceHalo({ phase, getLevels }: PresenceHaloProps) {
       if (broken) return false
       try {
         paint(now)
-        if (!painted) { painted = true; console.info('[presence] first frame painted') }
+        if (!painted) { painted = true; debugLog('[presence] first frame painted') }
         return true
       } catch (e) {
         broken = true
-        console.warn('[presence] paint failed — halo disabled for this session', e)
+        debugWarn('[presence] paint failed — halo disabled for this session', e)
         return false
       }
     }

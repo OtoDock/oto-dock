@@ -27,12 +27,22 @@ import socket
 import struct
 from pathlib import Path
 
-from .otodock_proto import (
-    read_frame, encode, encode_json,
-    T_OPEN, T_INPUT, T_RESIZE, T_DETACH, T_LIST,
-    T_OPENED, T_ERROR, T_OUTPUT, T_EXIT, T_LISTED,
-)
 from .. import config
+from .otodock_proto import (
+    T_DETACH,
+    T_ERROR,
+    T_EXIT,
+    T_INPUT,
+    T_LIST,
+    T_LISTED,
+    T_OPEN,
+    T_OPENED,
+    T_OUTPUT,
+    T_RESIZE,
+    encode,
+    encode_json,
+    read_frame,
+)
 
 logger = logging.getLogger("satellite")
 
@@ -65,6 +75,7 @@ def named_pipe_path() -> str:
     ``otodock_dir()`` string (not ``.resolve()``) to avoid drive-letter/8.3
     casing nondeterminism between a service and an interactive shell."""
     import hashlib
+
     from ..config import otodock_dir
     h = hashlib.sha256(str(otodock_dir()).lower().encode("utf-8")).hexdigest()[:16]
     return rf"\\.\pipe\otodock-{h}"
@@ -103,11 +114,11 @@ def set_pipe_byte_mode(endpoint) -> None:
         ]
         kernel32.SetNamedPipeHandleState.restype = ctypes.wintypes.BOOL
         kernel32.SetNamedPipeHandleState(handle, ctypes.byref(mode), None, None)
-    except Exception:
+    except Exception:  # noqa: BLE001  # a ctypes call into kernel32 raises by the platform's own rules
         logger.debug("otodock pipe byte-mode switch skipped", exc_info=True)
 
 
-def _pipe_peer_sid_verdict(handle, *, server_pid: bool) -> "bool | None":
+def _pipe_peer_sid_verdict(handle, *, server_pid: bool) -> bool | None:
     """Compare the pipe PEER's token-user SID with ours.
 
     ``server_pid=False`` resolves the CLIENT's pid (the daemon vetting a
@@ -206,12 +217,12 @@ def _pipe_peer_sid_verdict(handle, *, server_pid: bool) -> "bool | None":
         our_sid, _our_buf = ours
 
         return bool(advapi32.EqualSid(peer_sid, our_sid))
-    except Exception:
+    except Exception:  # noqa: BLE001  # ctypes calls into kernel32 and advapi32 raise by the platform's rules
         logger.debug("otodock pipe peer check inconclusive", exc_info=True)
         return None
 
 
-def _check_peer_windows(writer: "asyncio.StreamWriter") -> bool:
+def _check_peer_windows(writer: asyncio.StreamWriter) -> bool:
     """SO_PEERCRED analog for the daemon side: the CONNECTING process's
     token-user SID must equal ours. Fail-open on an inconclusive check — the
     default pipe DACL already excludes other standard users, so this is
@@ -233,7 +244,7 @@ def verify_pipe_server_identity(transport) -> bool:
         if pipe is None:
             return False
         return _pipe_peer_sid_verdict(pipe.fileno(), server_pid=True) is True
-    except Exception:
+    except ValueError:
         logger.debug("otodock pipe server-identity check failed", exc_info=True)
         return False
 
@@ -242,14 +253,14 @@ class _LocalConn:
     """One connected `otodock` terminal: an output queue fed by the PTY tee, drained
     to the socket by a writer task; input/resize forwarded to the PTY session."""
 
-    def __init__(self, session_id: str, writer: "asyncio.StreamWriter"):
+    def __init__(self, session_id: str, writer: asyncio.StreamWriter):
         self.session_id = session_id
         self._writer = writer
         self._out_q: asyncio.Queue = asyncio.Queue(maxsize=_OUT_QUEUE_MAX)
         self._session = None
         self._exited = False
         self._closed = False
-        self._writer_task: "asyncio.Task | None" = None
+        self._writer_task: asyncio.Task | None = None
 
     # --- wired by session_manager._wire_local_conn ---
     def bind_session(self, session) -> None:
@@ -263,7 +274,7 @@ class _LocalConn:
                 # — THIS path only (proxy pty_input writes aren't local typing).
                 s.note_local_input(data)
                 s.write(data)
-            except Exception:
+            except OSError:
                 logger.debug("otodock input write failed", exc_info=True)
 
     def resize(self, rows: int, cols: int) -> None:
@@ -271,7 +282,7 @@ class _LocalConn:
         if s is not None:
             try:
                 s.resize(rows, cols)
-            except Exception:
+            except OSError:
                 logger.debug("otodock resize failed", exc_info=True)
 
     # --- PTY tee (called from BasePtySession._on_output / _on_exit, same loop) ---
@@ -319,7 +330,7 @@ class _LocalConn:
                     return
         except (ConnectionError, asyncio.CancelledError, BrokenPipeError):
             return
-        except Exception:
+        except Exception:  # noqa: BLE001  # a local terminal's writer task: nobody awaits it
             logger.debug("otodock conn drain error", exc_info=True)
 
     async def close(self) -> None:
@@ -336,10 +347,10 @@ class LocalControlServer:
     def __init__(self, ws_client, session_manager):
         self.ws = ws_client
         self.sm = session_manager
-        self._server: "asyncio.AbstractServer | None" = None
-        self._path: "Path | None" = None
+        self._server: asyncio.AbstractServer | None = None
+        self._path: Path | None = None
         # Windows: the list of PipeServers from start_serving_pipe (Unix: stays None).
-        self._pipe_servers: "list | None" = None
+        self._pipe_servers: list | None = None
 
     async def start(self) -> None:
         if not config.HOST.posix:
@@ -452,7 +463,7 @@ class LocalControlServer:
         except (ConnectionRefusedError, FileNotFoundError, OSError):
             return False
 
-    def _check_peer(self, writer: "asyncio.StreamWriter") -> bool:
+    def _check_peer(self, writer: asyncio.StreamWriter) -> bool:
         """Defense-in-depth on top of the 0600/0700 file perms: on Linux verify the
         connecting process's uid == ours via SO_PEERCRED, on Windows the peer's
         token-user SID == ours via the named-pipe client PID. Best-effort elsewhere."""
@@ -467,14 +478,14 @@ class LocalControlServer:
             )
             _pid, uid, _gid = struct.unpack("3i", creds)
             return uid == os.getuid()
-        except Exception:
+        except (OSError, struct.error):
             return True
 
     async def _handle_conn(
-        self, reader: "asyncio.StreamReader", writer: "asyncio.StreamWriter"
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         session_id = ""
-        conn: "_LocalConn | None" = None
+        conn: _LocalConn | None = None
         try:
             if not config.HOST.posix:
                 # Match the AF_UNIX byte stream: stdlib pipes are message-mode,
@@ -492,7 +503,7 @@ class LocalControlServer:
                 return
             try:
                 args = json.loads(payload or b"{}")
-            except Exception:
+            except ValueError:
                 await self._reply_error(writer, "malformed request payload")
                 return
 
@@ -543,10 +554,7 @@ class LocalControlServer:
                 await self._reply_error(writer, "the platform returned no session")
                 return
             if attach and session_id not in self.sm.pty_sessions:
-                try:
-                    await self.ws.send_local_detached(session_id)
-                except Exception as e:
-                    logger.debug("send_local_detached (attach-miss): %s", e)
+                await self.ws.send_local_detached(session_id)
                 await self._reply_error(
                     writer, "that session is no longer running — run `otodock --resume` again"
                 )
@@ -572,12 +580,12 @@ class LocalControlServer:
                     try:
                         obj = json.loads(payload or b"{}")
                         conn.resize(int(obj.get("rows", 24)), int(obj.get("cols", 80)))
-                    except Exception:
+                    except (ValueError, TypeError, AttributeError):
                         pass
                 elif ftype == T_DETACH:
                     break
                 # unknown frame types ignored (forward-compat)
-        except Exception:
+        except Exception:  # noqa: BLE001  # a local terminal connection's task: nobody awaits it
             logger.debug("otodock local conn error", exc_info=True)
         finally:
             if conn is not None:
@@ -591,17 +599,14 @@ class LocalControlServer:
                 # (which would clear the new controller's otodock_attached). Only the
                 # conn that is still the live one tears down + notifies the proxy.
                 if self.sm.detach_local_conn(session_id, conn):
-                    try:
-                        await self.ws.send_local_detached(session_id)
-                    except Exception as e:
-                        logger.debug("send_local_detached (conn teardown): %s", e)
+                    await self.ws.send_local_detached(session_id)
             with contextlib.suppress(Exception):
                 writer.close()
 
     @staticmethod
-    async def _reply_error(writer: "asyncio.StreamWriter", reason: str) -> None:
+    async def _reply_error(writer: asyncio.StreamWriter, reason: str) -> None:
         try:
             writer.write(encode_json(T_ERROR, {"reason": reason}))
             await writer.drain()
-        except Exception:
+        except OSError:
             pass

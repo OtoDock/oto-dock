@@ -27,7 +27,7 @@ from fastapi.testclient import TestClient
 # Every router these modules own needs a principal on every route.
 GUARDED = (
     "api.admin.admin_storage", "api.admin.execution_layers", "api.admin.title_generation",
-    "api.agents.chats", "api.apps.app_secrets", "api.audio.audio",
+    "api.agents.chats", "api.agents.reply_reports", "api.apps.app_secrets", "api.audio.audio",
     "api.auth.agent_api_keys", "api.auth.claude_oauth", "api.auth.openai_oauth",
     "api.auth.user_api_keys", "api.billing.billing", "api.billing.usage",
     "api.checks.checks", "api.departments.departments", "api.duplex.duplex",
@@ -102,7 +102,7 @@ def _field_value(field):
     try:
         schema = TypeAdapter(Annotated[field.field_info.annotation, field.field_info]).json_schema(
             ref_template="#/$defs/{model}")
-    except Exception:
+    except Exception:  # noqa: BLE001  # pydantic refuses some annotations with errors of its own
         return "x"
     return _value(schema, schema.get("$defs") or {})
 
@@ -156,6 +156,8 @@ OPEN_ROUTES = {
     "/v1/webhooks/{provider_id}/{subscription_id}": "vendor deliveries, signed per subscription",
     "/v1/account/connect/callback": "the commercial account connect's return page",
     "/v1/oauth/{provider}/callback": "an OAuth provider's redirect back (the state binds it)",
+    "/v1/oauth/{provider}/app/setup": "GitHub's redirect back after an app install (the state binds it; a plain page otherwise)",
+    "/v1/webhooks/{provider_id}/app": "a GitHub App's deliveries, signed with the app secret",
     "/v1/oauth/microsoft/admin-consent/callback": "Microsoft's admin-consent redirect back",
     "/v1/images/temp/{token}": "a temporary image by its unguessable token",
     "/v1/twilio/inbound/{server_id}": "Twilio's signed call webhook",

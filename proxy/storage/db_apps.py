@@ -97,7 +97,7 @@ def actions_sig(actions_json: str) -> str:
     return hashlib.sha256(actions_json.encode("utf-8")).hexdigest()
 
 
-def canonical_actions_json(actions: list) -> str:
+def canonical_actions_json(actions: list | dict) -> str:
     return json.dumps(actions, sort_keys=True, separators=(",", ":"))
 
 

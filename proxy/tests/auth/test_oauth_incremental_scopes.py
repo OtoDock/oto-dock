@@ -22,12 +22,10 @@ from __future__ import annotations
 
 import json
 
-
 from auth.oauth_providers.base import OAuthProvider, TokenSet, UserInfo
-from auth.oauth_providers.google import GoogleOAuthProvider
 from auth.oauth_providers.generic import GenericOAuthProvider
+from auth.oauth_providers.google import GoogleOAuthProvider
 from services.oauth import oauth_account_store
-
 
 # ---------------------------------------------------------------------------
 # Provider attribute contract
@@ -70,8 +68,8 @@ def _persist(monkeypatch, tmp_path, *, provider_id: str, mcp_name: str,
     """Run persist_oauth_account with everything except the token file stubbed."""
     import config as _config
     from services.mcp import mcp_registry
-    from storage.identity import credential_store
     from storage import database as task_store
+    from storage.identity import credential_store
 
     monkeypatch.setattr(_config, "SESSIONS_DIR", tmp_path, raising=False)
     monkeypatch.setattr(task_store, "get_username_by_sub", lambda sub: "alice")

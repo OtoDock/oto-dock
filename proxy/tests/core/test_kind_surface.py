@@ -67,7 +67,8 @@ MACHINES: tuple[Machine, ...] = (
             ("proxy/core/events/", "proxy/ws/dashboard_pty.py", "proxy/services/sharing/chat_snapshot.py",
              "proxy/core/session/interactive_session.py"),
             (_TS + "lib/kinds/artifact.ts",),
-            (_TS + "hooks/useChatStream.ts", _TS + "hooks/useArtifactWindows.ts", _TS + "hooks/useChatMessages.ts",
+            (_TS + "hooks/useChatStream.ts", _TS + "hooks/chatStream/", _TS + "hooks/useArtifactWindows.ts",
+             _TS + "hooks/useChatMessages.ts",
              _TS + "hooks/useDashboardWs.ts", _TS + "lib/displayReplay.ts", _TS + "lib/messageBlocks.ts",
              _TS + "api/wireEvents.ts", _TS + "components/chat/artifacts/ArtifactWindows.tsx")),
     Machine("task",
@@ -77,7 +78,7 @@ MACHINES: tuple[Machine, ...] = (
             ("proxy/services/scheduler/", "proxy/api/tasks/", "proxy/storage/automation/",
              "proxy/storage/billing/db_usage.py", "proxy/storage/checks/db_checks.py",
              "proxy/services/checks/evaluator.py", "proxy/core/config/task_config_builder.py",
-             "proxy/api/apps/manifest.py", "proxy/services/apps/app_handlers.py"),
+             "proxy/services/apps/manifest.py", "proxy/services/apps/app_handlers.py"),
             (_TS + "lib/kinds/task.ts",),
             (_TS + "lib/runs.ts", _TS + "lib/format.ts", _TS + "pages/History.tsx",
              _TS + "components/GroupedRunsTable.tsx", _TS + "components/chat/TaskMetadata.tsx",
@@ -154,7 +155,7 @@ KNOWN_TS_SITES: dict[str, tuple[str, dict[str, int]]] = {
         "and identity rules ask the mirror",
         {"artifact:images": 1, "artifact:image_generating": 1, "artifact:media_processing": 1,
          "artifact:video": 1, "artifact:audio": 2, "artifact:url": 1, "artifact:file": 1, "artifact:ui": 1}),
-    "dashboard/src/hooks/useChatStream.ts": (
+    "dashboard/src/hooks/chatStream/useStreamBlocks.ts": (
         "a transcode skeleton's media kind (audio | video), not an artifact kind", {"artifact:audio": 1}),
     "dashboard/src/lib/messageBlocks.ts": (
         "ONE kind each: a preview's last push per file in a message, a ui page's supersede-to-chip by "
@@ -307,7 +308,7 @@ def _ts_counts(text: str) -> dict[str, int]:
 def _ts_files() -> list[Path]:
     src = REPO_ROOT / "dashboard" / "src"
     return [p for p in sorted(list(src.rglob("*.ts")) + list(src.rglob("*.tsx")))
-            if "/tests/" not in p.relative_to(REPO_ROOT).as_posix()]
+            if "/tests/" not in p.relative_to(REPO_ROOT).as_posix() and ".test." not in p.name]
 
 
 def _scan_ts() -> dict[str, dict[str, int]]:

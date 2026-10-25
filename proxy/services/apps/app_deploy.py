@@ -30,16 +30,26 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
+
+import psycopg
 
 import config
-from api.apps import manifest as _mf
+from auth import roles
 from auth.request_path import has_traversal
-from services.apps import app_sandbox, app_supervisor, releases
+from core import layout
+from services.apps import (
+    app_folders,
+    app_sandbox,
+    app_supervisor,
+    manifest as _mf,
+    releases,
+)
+from services.apps.releases import _deploy_lock
+from services.apps.slugs import APP_SLUG_RE
 from services.infra import path_confinement, safe_fs
 from storage import database as task_store
 from storage.pg import run_db
-from auth import roles
-from core import layout
 
 logger = logging.getLogger("otodock.apps")
 
@@ -93,7 +103,7 @@ MAX_INBOUND = 8
 # so are the loader and interpreter hooks: the env reaches the host-side
 # launcher (python3, pasta, bwrap) before the sandbox exists.
 SECRET_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
-SECRET_RESERVED_NAMES = frozenset({"PATH", "HOME", "TMPDIR", "LANG", "PORT",
+SECRET_RESERVED_NAMES = frozenset({"PATH", "HOME", "TMPDIR", "LANG", "PORT", "NODE_ENV",
                                    "BASH_ENV", "ENV", "GCONV_PATH"})
 SECRET_RESERVED_PREFIXES = ("OTODOCK_", "OTO_", "BUN_", "LD_", "DYLD_", "PYTHON")
 SECRET_HEADER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
@@ -119,7 +129,6 @@ STEP_TIMEOUT_DEFAULT_S = 60
 STEP_TIMEOUT_MAX_S = 7200          # the session ceiling (config.CLAUDE_TIMEOUT)
 STEP_SCRIPT_MAX_BYTES = 256 * 1024
 AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
-APP_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 MAX_HANDLERS = 16
 MAX_EXPORTS_PER_KIND = 16
 MAX_BINDINGS = 16
@@ -189,18 +198,18 @@ def read_app_json(source_dir: Path) -> dict:
     points at)."""
     try:
         raw = releases.read_tree_file(source_dir, "app.json", max_size=APP_JSON_MAX_BYTES)
-    except safe_fs.FileTooLarge:
-        raise DeployError("app.json is larger than 32 KB")
-    except safe_fs.SymlinkRefused:
-        raise DeployError("symlink not allowed in an app: app.json")
-    except safe_fs.NotRegularFile:
-        raise DeployError("app.json is not a regular file")
-    except OSError:
-        raise DeployError("no app.json in the folder — a folder app needs one (APPS.md)")
+    except safe_fs.FileTooLarge as exc:
+        raise DeployError("app.json is larger than 32 KB") from exc
+    except safe_fs.SymlinkRefused as exc:
+        raise DeployError("symlink not allowed in an app: app.json") from exc
+    except safe_fs.NotRegularFile as exc:
+        raise DeployError("app.json is not a regular file") from exc
+    except OSError as exc:
+        raise DeployError("no app.json in the folder — a folder app needs one (APPS.md)") from exc
     try:
         doc = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as e:
-        raise DeployError(f"app.json is not valid JSON: {e}")
+        raise DeployError(f"app.json is not valid JSON: {e}") from e
     if not isinstance(doc, dict):
         raise DeployError("app.json must be a JSON object")
     return doc
@@ -212,10 +221,10 @@ def require_entry_page(source_dir: Path) -> None:
     try:
         root, base = releases.tree_root(source_dir)
         st = safe_fs.lstat_beneath(root, f"{base}/client/index.html" if base else "client/index.html")
-    except (safe_fs.SymlinkRefused, safe_fs.EscapeRefused):
-        raise DeployError("symlink not allowed in an app: client/index.html")
-    except OSError:
-        raise DeployError("client/index.html is missing (the page every viewer opens)")
+    except (safe_fs.SymlinkRefused, safe_fs.EscapeRefused) as exc:
+        raise DeployError("symlink not allowed in an app: client/index.html") from exc
+    except OSError as exc:
+        raise DeployError("client/index.html is missing (the page every viewer opens)") from exc
     if stat.S_ISLNK(st.st_mode):
         raise DeployError("symlink not allowed in an app: client/index.html")
     if not stat.S_ISREG(st.st_mode):
@@ -292,52 +301,6 @@ def validate_external(block) -> dict:
     return out
 
 
-def validate_files(block, shared: bool) -> dict[str, list[str]]:
-    """The declared prefixes, agent-dir-relative (``workspace/…`` or
-    ``knowledge/…``; a personal app's are stored under ``users/{owner}/``
-    and resolved from the owner at call time). Knowledge is never writable;
-    the never-declarable segments are refused literally and by the
-    credential-path rule."""
-    if block is None:
-        return {"read": [], "write": []}
-    if not isinstance(block, dict) or any(k not in ("read", "write") for k in block):
-        raise DeployError("files must be an object with read and/or write lists")
-    from services import path_roles
-    out: dict[str, list[str]] = {"read": [], "write": []}
-    total = 0
-    for mode in ("read", "write"):
-        prefixes = block.get(mode) or []
-        if not isinstance(prefixes, list):
-            raise DeployError(f"files.{mode} must be a list")
-        for p in prefixes:
-            if not isinstance(p, str):
-                raise DeployError("file prefixes must be strings")
-            rel = p.strip().strip("/")
-            parts = rel.split("/") if rel else []
-            if not parts or parts[0] not in (layout.WORKSPACE, layout.KNOWLEDGE):
-                raise DeployError(f"file prefix {p!r}: must start with workspace/ or knowledge/")
-            try:
-                rel = path_confinement.normalize_rel_path(rel)
-            except path_confinement.PathOutsideRoot:
-                raise DeployError(f"file prefix {p!r}: no empty or dot segments")
-            if any(seg in NEVER_SEGMENTS for seg in parts) or (
-                    len(parts) >= 3 and parts[1] == "apps" and "data" in parts):
-                raise DeployError(f"file prefix {p!r}: that path is never declarable")
-            if path_roles.is_protected_credentials_path(rel):
-                raise DeployError(f"file prefix {p!r}: that path holds credentials")
-            if mode == "write" and parts[0] == layout.KNOWLEDGE:
-                raise DeployError(f"file prefix {p!r}: knowledge is read-only for apps")
-            stored = rel if shared else f"{layout.USERS}/{{owner}}/{rel}"
-            if not shared and parts[0] == layout.KNOWLEDGE:
-                raise DeployError(f"file prefix {p!r}: a personal app names the owner's tree only")
-            if stored not in out[mode]:
-                out[mode].append(stored)
-                total += 1
-            if total > MAX_FILE_PREFIXES:
-                raise DeployError(f"at most {MAX_FILE_PREFIXES} file prefixes")
-    return out
-
-
 def _str_list(value, what: str, cap: int, pattern: re.Pattern | None = None,
               max_chars: int = 64) -> list[str]:
     if value is None:
@@ -372,7 +335,7 @@ def validate_bindings(block) -> list[dict]:
         name, agent, app = (str(b.get(k) or "").strip() for k in ("name", "agent", "app"))
         if not HANDLER_NAME_RE.match(name):
             raise DeployError(f"binding {name!r}: not a valid name")
-        if not AGENT_NAME_RE.match(agent) or not APP_SLUG_RE.match(app):
+        if not AGENT_NAME_RE.fullmatch(agent) or not APP_SLUG_RE.fullmatch(app):
             raise DeployError(f"binding {name!r}: agent and app must be slugs")
         if name in seen:
             raise DeployError(f"binding {name!r} is declared twice")
@@ -411,9 +374,13 @@ def validate_exports(block) -> dict:
             if floor is not None:
                 if kind == "events":
                     raise DeployError(f"exports.events.{name}: events carry no min_role")
-                if floor not in (roles.EDITOR, roles.MANAGER):
-                    raise DeployError(f"exports.{kind}.{name}: min_role must be editor or manager")
-                entry["min_role"] = floor
+                if floor not in _mf.ACTION_ROLES:
+                    raise DeployError(f"exports.{kind}.{name}: min_role is viewer, contributor, "
+                                      "editor or manager")
+                # The default floor is every caller and is never stored, as
+                # an action's.
+                if floor != roles.VIEWER:
+                    entry["min_role"] = floor
             canon[name] = entry
         if canon:
             out[kind] = canon
@@ -449,6 +416,7 @@ def validate_handlers(block, shared: bool, binding_names: set[str]) -> dict:
         if not isinstance(sched, dict):
             raise DeployError("handlers.on_schedule must be an object of name → {cron}")
         from zoneinfo import ZoneInfo
+
         from services.scheduler import scheduler_triggers
         canon: dict = {}
         for n, spec in sched.items():
@@ -458,8 +426,8 @@ def validate_handlers(block, shared: bool, binding_names: set[str]) -> dict:
                 raise DeployError(f"handlers.on_schedule.{name}: an object with a cron string")
             try:
                 scheduler_triggers.build_cron_trigger(cron.strip(), ZoneInfo("UTC"))
-            except Exception as e:
-                raise DeployError(f"handlers.on_schedule.{name}: not a valid cron ({e})")
+            except Exception as exc:
+                raise DeployError(f"handlers.on_schedule.{name}: not a valid cron ({exc})") from exc
             canon[name] = {"cron": cron.strip()}
         if canon:
             out["on_schedule"] = canon
@@ -550,7 +518,7 @@ def validate_steps(block, handler_names: set[str], source_dir: Path | None) -> d
         try:
             run = validate_step_run(spec.get("run"))
         except DeployError as e:
-            raise DeployError(f"steps.{name}: {e}")
+            raise DeployError(f"steps.{name}: {e}") from e
         timeout = spec.get("timeout", STEP_TIMEOUT_DEFAULT_S)
         if isinstance(timeout, bool) or not isinstance(timeout, int) \
                 or not 1 <= timeout <= STEP_TIMEOUT_MAX_S:
@@ -559,10 +527,10 @@ def validate_steps(block, handler_names: set[str], source_dir: Path | None) -> d
         if source_dir is not None:
             try:
                 data = releases.read_tree_file(source_dir, run, max_size=STEP_SCRIPT_MAX_BYTES)
-            except safe_fs.FileTooLarge:
-                raise DeployError(f"steps.{name}: {run} is larger than 256 KB")
-            except OSError:
-                raise DeployError(f"steps.{name}: {run} is not a file in the app folder")
+            except safe_fs.FileTooLarge as exc:
+                raise DeployError(f"steps.{name}: {run} is larger than 256 KB") from exc
+            except OSError as exc:
+                raise DeployError(f"steps.{name}: {run} is not a file in the app folder") from exc
             problem = step_script_problem(data)
             if problem:
                 raise DeployError(f"steps.{name}: {run} does not parse — {problem}")
@@ -787,13 +755,13 @@ def validate_app_json(doc: dict, agent: str, shared: bool,
         raise DeployError(f"app.json: {err}")
     # A folder app's server owns its data directory, where the per-viewer
     # documents would sit: it keeps per-viewer data in its own database.
-    from api.apps.catalog import VIEWER_DATA_METHODS
+    from services.apps.catalog import VIEWER_DATA_METHODS
     per_viewer = sorted({a.get("method") for a in json.loads(actions_json)
                          if a.get("type") == "platform" and a.get("method") in VIEWER_DATA_METHODS})
     if per_viewer:
         raise DeployError(f"app.json: {', '.join(per_viewer)} are for single-file apps; "
                           "a folder app keeps per-viewer data in its own database")
-    files = validate_files(doc.get("files"), shared)
+    files = app_folders.validate_files(doc.get("files"), shared)
     egress = validate_egress(doc.get("egress"))
     try:
         bindings = validate_bindings(doc.get("bindings"))
@@ -817,7 +785,7 @@ def validate_app_json(doc: dict, agent: str, shared: bool,
         inbound = validate_inbound(doc.get("inbound"), names, {s["name"] for s in secrets})
         external = validate_external(doc.get("external"))
     except DeployError as e:
-        raise DeployError(f"app.json: {e}")
+        raise DeployError(f"app.json: {e}") from e
     ra = doc.get("deploy_requires_approval")
     if ra is not None and not isinstance(ra, bool):
         raise DeployError("app.json: deploy_requires_approval must be true or false")
@@ -920,8 +888,8 @@ async def pull_folder(session_id: str, rel_dir: str) -> int:
     if agent_dir is not None and remote_file_flow.absence_is_reliable(session_id):
         try:
             root = path_confinement.join_under(agent_dir, rel_dir)
-        except path_confinement.PathOutsideRoot:
-            raise DeployError("the folder is outside your workspace")
+        except path_confinement.PathOutsideRoot as exc:
+            raise DeployError("the folder is outside your workspace") from exc
         keep = {inner for _rel, inner in wanted} | unread
 
         def _absent() -> list[str]:
@@ -940,7 +908,7 @@ async def pull_folder(session_id: str, rel_dir: str) -> int:
         try:
             absent = await asyncio.to_thread(_absent)
         except releases.ReleaseInvalid as e:
-            raise DeployError(str(e))
+            raise DeployError(str(e)) from e
         # A removal is a write-back of the machine's absence: the same gate.
         removable = [p for p in absent if await remote_file_flow.write_back_allowed(
             session_id, info.agent_name if info else "", f"{rel_dir}/{p}")]
@@ -989,7 +957,7 @@ def snapshot_db(src: Path, dst: Path) -> bool:
     except sqlite3.Error as e:
         tmp.unlink(missing_ok=True)
         raise DeployError(f"the app's database could not be copied ({e}) — the deploy "
-                          "stops here so nothing is lost")
+                          "stops here so nothing is lost") from e
     tmp.replace(dst)
     return True
 
@@ -1061,11 +1029,6 @@ def _prune_rollback_snapshots(row: dict) -> None:
 # ── the pipeline ────────────────────────────────────────────────────────────
 
 
-def _deploy_lock(app_id: str) -> asyncio.Lock:
-    from api.apps.apps import _deploy_lock
-    return _deploy_lock(app_id)
-
-
 async def _notify_pending(row: dict, n: int, waiting: str = "", *, lowers: bool = False) -> None:
     from services.notifications.notification_manager import fire_notification
     from storage.identity import db_users
@@ -1104,6 +1067,10 @@ async def go_live(row: dict, n: int, *, start: bool = True) -> dict:
     waiting = await asyncio.to_thread(app_secrets.waiting_reason, row)
     if waiting:
         raise DeployError(f"{waiting} — set it in the app's settings first")
+    # The folders the manifest declares, before the server that lists them
+    # starts.
+    folders = (await asyncio.to_thread(app_folders.ensure_created_dirs, row)
+               if app_folders.declares_folders(row) else None)
     db = releases.app_data_dir(row) / "app.db"
     await asyncio.to_thread(snapshot_db, db, releases.db_before_path(row, n))
     if start and app_sandbox.server_entry(new_dir) and task_store.app_actions_approved(row):
@@ -1114,7 +1081,7 @@ async def go_live(row: dict, n: int, *, start: bool = True) -> dict:
             await run_db(task_store.set_deploy_state, row["id"], deploy_state=task_store.DEPLOY_IDLE,
                          pending_release=0)
             raise DeployError(f"the new release did not start, the previous one keeps "
-                              f"serving: {e}")
+                              f"serving: {e}") from e
     rel, sha = await asyncio.to_thread(releases.point_to, row, n)
     fresh = await run_db(task_store.set_app_release, row["id"], rel, sha) or row
     fresh = await run_db(task_store.set_deploy_state, fresh["id"], deploy_state=task_store.DEPLOY_IDLE,
@@ -1126,10 +1093,11 @@ async def go_live(row: dict, n: int, *, start: bool = True) -> dict:
         await app_handlers.sync_rows(fresh)
     except Exception:
         logger.exception("App %s: handler rows out of step after go-live", row.get("slug"))
-    from api.apps.apps import announce_deploy
+    from services.apps.audience import announce_deploy
     screens = await announce_deploy(fresh, n, file_updated=False)
     logger.info("App deployed: app=%s release=%d screens=%d", row.get("slug"), n, screens)
-    return {"status": RESULT_OK, "app_id": row["id"], "release": n, "screens": screens}
+    return {"status": RESULT_OK, "app_id": row["id"], "release": n, "screens": screens,
+            **({"folders": folders} if folders is not None else {})}
 
 
 async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: str,
@@ -1152,23 +1120,23 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
         if remote_file_flow.is_remote_session(session_id):
             pulled = await pull_folder(session_id, rel_dir)
             logger.info("App deploy: pulled %d file(s) of %s from the satellite", pulled, rel_dir)
-    if not source_dir.is_dir():
+    if not await asyncio.to_thread(source_dir.is_dir):
         raise DeployError(f"no folder at apps/{slug} in your scope")
     # The tree first (no link anywhere in it), then its manifest and page,
     # each read without following a link.
     try:
         release_bytes = await asyncio.to_thread(releases.tree_bytes, source_dir)
     except releases.ReleaseInvalid as e:
-        raise DeployError(str(e))
+        raise DeployError(str(e)) from e
     doc = await asyncio.to_thread(read_app_json, source_dir)
     await asyncio.to_thread(require_entry_page, source_dir)
     existing = await run_db(task_store.get_app_by_slug, agent, username, slug)
     # A deploy while a release waits for approval REPLACES the waiting copy:
     # nothing of it went live, the card re-renders on the new state, and the
     # agent that saw a problem in the pictures ships the fix at once instead
-    # of asking the user to approve a release it already wants to replace
-    # (found on the internal install, 2026-09-14). The replacement takes a
-    # new number, so a card still showing the old copy cannot approve it.
+    # of asking the user to approve a release it already wants to replace.
+    # The replacement takes a new number, so a card still showing the old
+    # copy cannot approve it.
     superseded = 0
     if existing is not None:
         if not task_store.app_kind_of(existing).serves_tree and (existing.get("release_path") or
@@ -1188,7 +1156,7 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
     try:
         files = await asyncio.to_thread(releases.walk_tree, source_dir)
     except releases.ReleaseInvalid as e:
-        raise DeployError(str(e))
+        raise DeployError(str(e)) from e
     findings = await asyncio.to_thread(app_lint.lint_tree, source_dir, files,
                                        app_lint.declared_from_manifest(m))
     lint = app_lint.summary(findings)
@@ -1207,8 +1175,8 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
         row = await run_db(task_store.set_deploy_state, row["id"], requires_approval=True) or row
     consent_refused = ""
     if approve_as and not task_store.app_actions_approved(row):
-        from api.apps.apps import _manifest_target_error
         from auth.providers import user_context_for_sub
+        from services.apps.manifest import _manifest_target_error
         approver = await asyncio.to_thread(user_context_for_sub, approve_as)
         consent_refused = (await asyncio.to_thread(_manifest_target_error, row, approver)
                            if approver else "the person who consented is gone")
@@ -1240,7 +1208,7 @@ async def deploy_folder(agent: str, username: str, owner_sub: str | None, slug: 
                                                   after=superseded)
         except releases.ReleaseInvalid as e:
             await _restore_live_manifest(row)
-            raise DeployError(str(e))
+            raise DeployError(str(e)) from e
         approved = task_store.app_actions_approved(row)
         if not cold:
             # The rendered check of the copy that ships (APPS.md "Deploy
@@ -1402,14 +1370,21 @@ async def rollback_folder(row: dict) -> dict:
         restored = True
     rel, sha = await asyncio.to_thread(releases.point_to, row, prev)
     fresh = await run_db(task_store.set_app_release, row["id"], rel, sha) or row
+    folders: dict | None = None
     # The manifest the previous release carries is the served one again;
     # the handler schedules follow it (a departed handler's cron stops).
     try:
         live_dir = await asyncio.to_thread(releases.live_release_dir, fresh)
-        m = await asyncio.to_thread(_manifest_of, live_dir, fresh)
+        # point_to refused a release without its manifest file, so the live
+        # directory resolves (the deploy lock keeps it in place).
+        m = await asyncio.to_thread(_manifest_of, cast("Path", live_dir), fresh)
         fresh = await run_db(task_store.upsert_app, fresh["agent"], fresh.get("username") or "",
                              fresh.get("owner_sub"), fresh["slug"], actions_json=m.actions_json,
                              blocks=m.blocks()) or fresh
+        # An approved restored manifest makes its folders; one that waits
+        # makes them at its approval.
+        if app_folders.declares_folders(fresh):
+            folders = await asyncio.to_thread(app_folders.ensure_created_dirs, fresh)
     except (DeployError, releases.ReleaseDamaged):
         logger.exception("App %s: the previous release's manifest did not read back", row.get("slug"))
     from services.apps import app_handlers
@@ -1417,12 +1392,13 @@ async def rollback_folder(row: dict) -> dict:
         await app_handlers.sync_rows(fresh)
     except Exception:
         logger.exception("App %s: handler rows out of step after rollback", row.get("slug"))
-    from api.apps.apps import announce_deploy
+    from services.apps.audience import announce_deploy
     screens = await announce_deploy(fresh, prev, file_updated=False)
     logger.info("App rolled back: app=%s release=%d db_restored=%s snapshot=%s",
                 row.get("slug"), prev, restored, snapshotted)
     return {"release": prev, "screens": screens, "db_restored": restored,
-            "snapshot": f"rollback-{stamp}.sqlite" if snapshotted else ""}
+            "snapshot": f"rollback-{stamp}.sqlite" if snapshotted else "",
+            **({"folders": folders} if folders is not None else {})}
 
 
 async def cut_preview(row: dict, source_dir: Path) -> str:
@@ -1446,7 +1422,7 @@ async def cut_preview(row: dict, source_dir: Path) -> str:
     try:
         return await asyncio.to_thread(_copy)
     except releases.ReleaseInvalid as e:
-        raise DeployError(str(e))
+        raise DeployError(str(e)) from e
 
 
 def status(row: dict) -> dict:
@@ -1466,7 +1442,7 @@ def status(row: dict) -> dict:
     from services.apps import app_handlers
     try:
         out["wakes"] = app_handlers.wakes(row)
-    except Exception:
+    except psycopg.Error:
         out["wakes"] = []
     # APPS.md "Secrets": each declared name with whether it is set (never a
     # value), and why the release waits when a required one is not.
@@ -1479,6 +1455,8 @@ def status(row: dict) -> dict:
     except Exception:
         logger.exception("App %s: the secrets status failed", row.get("slug"))
         out["secrets"], out["waiting"] = [], ""
+    if app_folders.declares_folders(row):
+        out["folders"] = app_folders.folder_states(row)
     if pending:
         try:
             live = releases.live_release_dir(row)

@@ -143,7 +143,12 @@ def credential_state(request: Request, cookies: dict, path: str) -> str:
     session cookie, the master key or a session token as the bearer, and on
     WOPI and Collabora paths a WOPI token (the bearer, else ``access_token``:
     Collabora sends both, and the header alone for an editor frame posted
-    with ``access_header``)."""
+    with ``access_header``). A WOPI call (``/wopi/``) lifts the cap only
+    when it carries Collabora's three proof headers (their presence: the
+    route verifies them) or the install accepts unsigned calls
+    (``WOPI_ACCEPT_UNSIGNED``): a token copied from a log, sent alone, never
+    reaches past the unauthenticated tier. The editor relay (``/collabora/``)
+    is the browser's: it carries no proof headers."""
     from auth.external_endpoints import session_token_claims
     from auth.service_endpoints import extract_master_key
     presented = request.headers.get("authorization", "") != ""
@@ -161,7 +166,10 @@ def credential_state(request: Request, cookies: dict, path: str) -> str:
         if token:
             presented = True
             from api.media.wopi import validate_wopi_token
-            if validate_wopi_token(token) is not None:
+            from api.media.wopi_proof import _PROOF_HEADERS
+            signed = not path.startswith("/wopi/") or config.WOPI_ACCEPT_UNSIGNED is True or all(
+                request.headers.get(h) for h in _PROOF_HEADERS)
+            if signed and validate_wopi_token(token) is not None:
                 return "valid"
     return "invalid" if presented else "none"
 
@@ -173,8 +181,8 @@ def routed_path(request: Request) -> str:
     """The path the router matches (``scope["path"]``) with a decoded ``?``
     or ``#`` put back in its encoded form. ``request.url.path`` re-parses
     the decoded path and cuts it at either, so an allowlist judging it saw
-    a shorter path than the one routed (``/v1/sessions/warmup%3F/abort``
-    read as the allowed ``/v1/sessions/warmup``)."""
+    a shorter path than the one routed (``/v1/phone/calls/report%3F/answer``
+    read as the allowed ``/v1/phone/calls/report``)."""
     return scope_routed_path(request.scope)
 
 
@@ -430,7 +438,9 @@ async def _refresh_session_cookie(scope, headers: MutableHeaders, cookie: str) -
     if any(v.startswith("session=") for v in headers.getlist("set-cookie")):
         return
     from auth.providers import (
-        apply_session_cookie, create_session_jwt, session_cookie_current,
+        apply_session_cookie,
+        create_session_jwt,
+        session_cookie_current,
         validate_session_jwt,
     )
     from auth.session_revocation import session_cookie_id
@@ -528,7 +538,7 @@ class _Exchange:
             if self.cookie and not own:
                 try:
                     await _refresh_session_cookie(self.scope, headers, self.cookie)
-                except Exception:
+                except Exception:  # noqa: BLE001  # the route's answer goes out whatever the cookie refresh met
                     # The route's answer goes out as it is (a database
                     # outage, a timeout, shutdown).
                     logger.debug("session refresh skipped", exc_info=True)
@@ -655,9 +665,9 @@ class PlatformHttpMiddleware:
             if not logged or x.started or db_unavailable(exc):
                 raise
             client = scope.get("client")
-            logger.error("DASH %s %s → 500 EXCEPTION (%.3fs) from %s: %s",
-                         scope.get("method"), path, time.monotonic() - started_at,
-                         client[0] if client else "?", exc, exc_info=True)
+            logger.exception("DASH %s %s → 500 EXCEPTION (%.3fs) from %s: %s",
+                             scope.get("method"), path, time.monotonic() - started_at,
+                             client[0] if client else "?", exc)
             await x.answer(500, _SERVER_ERROR)
             return
         if logged and logger.isEnabledFor(logging.DEBUG):
@@ -681,7 +691,7 @@ class PlatformHttpMiddleware:
         if routed.startswith("/v1/webhooks/"):
             from api.events import webhook_body
             ceiling = min(_backstop(), max(full, webhook_body.ceiling()))
-            lift = lambda: min(ceiling, scope.get(webhook_body.SCOPE_KEY) or 0)  # noqa: E731
+            lift = lambda: min(ceiling, scope.get(webhook_body.SCOPE_KEY) or 0)
         cap = _BodyCap(
             min(unauth, full) if narrowable and unauth > 0 else full, full,
             lambda: credential_state(request, cookies, routed),

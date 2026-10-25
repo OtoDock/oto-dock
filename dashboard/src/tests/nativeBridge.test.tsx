@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import ts from 'typescript'
+
+import { cssColor, model } from '../../design/build.mjs'
 import { act, render } from '@testing-library/react'
 import {
   APP_PRIVACY_POLICY_URL, askNative, callNative, hasNativeBridge, saveNativeFile,
@@ -82,7 +84,7 @@ describe('the call sites', () => {
 
   it('post on the channel and never read window.Android', async () => {
     const ch = installFakeNativeChannel({ getInstallations: [] })
-    const { triggerDownload } = await import('@/components/chat/media/ImageLightbox')
+    const { triggerDownload } = await import('@/components/chat/media/imageDownload')
     await triggerDownload({ imageData: 'QUJD', mimeType: 'image/png', caption: 'plan' } as never, 0)
     const { saveWakeDiag, setWakeDiag, wakeDiagFrames } = await import('@/audio/wakeDiag')
     setWakeDiag(true)
@@ -92,6 +94,8 @@ describe('the call sites', () => {
     window.matchMedia = vi.fn(() => ({
       matches: false, addEventListener: () => {}, removeEventListener: () => {},
     })) as unknown as typeof window.matchMedia
+    // The theme reads the page colour from the stylesheet, absent here.
+    document.documentElement.style.setProperty('--ot-surface-page', '#faf9f9')
     const { ThemeProvider } = await import('@/contexts/ThemeContext')
     const { default: AppSettingsModal } = await import('@/components/chat/AppSettingsModal')
     await act(async () => {
@@ -150,14 +154,33 @@ describe('the setup page', () => {
     expect(fonts.length).toBeGreaterThan(0)
     expect(page).not.toMatch(/url\((?!setup-fonts\/)/)
     const config = readFileSync(join(ROOT, 'vite.config.ts'), 'utf8')
-    const glob = config.match(/src: 'node_modules\/@fontsource\/comfortaa\/files\/comfortaa-\{([\w,]+)\}-\{([\d,]+)\}-normal\.woff2',\s*dest: 'setup-fonts'/)
-    expect(glob).not.toBeNull()
-    const [subsets, weights] = [glob![1].split(','), glob![2].split(',')]
-    for (const font of fonts) {
-      const [, subset, weight] = font.match(/^comfortaa-(\w+)-(\d+)-normal\.woff2$/)!
-      expect(subsets, font).toContain(subset)
-      expect(weights, font).toContain(weight)
+    // One copy entry per family; a one-member brace is literal in the glob,
+    // so a weight may be written plain.
+    const copied = new Set<string>()
+    const entries = config.matchAll(/src: 'node_modules\/@fontsource\/(\w+)\/files\/\1-\{([\w,]+)\}-(\{[\d,]+\}|\d+)-normal\.woff2',\s*dest: 'setup-fonts'/g)
+    for (const [, family, subsets, weights] of entries) {
+      for (const subset of subsets.split(',')) {
+        for (const weight of weights.replace(/[{}]/g, '').split(',')) copied.add(`${family}-${subset}-${weight}-normal.woff2`)
+      }
     }
+    expect(copied.size).toBeGreaterThan(0)
+    for (const font of fonts) expect(copied, font).toContain(font)
+  })
+
+  it('paints the tokens in both themes', () => {
+    const m = model()
+    const values = new Set<string>()
+    for (const name of ['surface.page', 'surface.card', 'text.primary', 'text.secondary', 'text.tertiary',
+      'border.default', 'border.strong', 'action.default', 'action.hover', 'action.fg', 'focus.ring', 'brand.mark', 'status.danger.bg',
+      'status.danger.fg', 'status.danger.border', 'status.success.fg', 'status.warning.solid']) {
+      for (const mode of ['light', 'dark'] as const) values.add(cssColor(m.resolve(name, mode) as string))
+    }
+    const hexes = [...page.matchAll(/#[0-9a-f]{6}\b/gi)].map((h) => h[0].toLowerCase())
+    expect(hexes.length).toBeGreaterThan(10)
+    for (const hex of hexes) expect(values, hex).toContain(hex)
+    expect(page).toContain('@media (prefers-color-scheme: dark)')
+    expect(page).toMatch(/<meta name="color-scheme" content="light dark">/)
+    expect(page).not.toContain('logo.png')
   })
 
   it('shows the privacy link only when the app offers to open it', () => {

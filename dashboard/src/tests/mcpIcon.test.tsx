@@ -20,14 +20,20 @@ describe('McpIcon', () => {
   })
 
   it("draws OtoDock's own community mark without the white frame", () => {
-    const { container } = render(<McpIcon name="camoufox" label="Browser (Camoufox)" category="community" author="OtoDock" />)
+    const { container } = render(<McpIcon name="camoufox" label="Browser (Camoufox)" category="community" author="OtoDock" hasIcon />)
     const img = container.querySelector('img')!
     expect(img.getAttribute('src')).toBe('/v1/mcps/camoufox/icon.png')
     expect(img.parentElement!.className).not.toContain('bg-white')
   })
 
-  it('always tries the image for a community MCP and falls back on error', () => {
-    const { container, getByText } = render(<McpIcon name="github-mcp" label="GitHub" category="community" author="GitHub" />)
+  it('requests nothing for a community MCP the route has no icon for', () => {
+    const { container, getByText } = render(<McpIcon name="reddit-mcp" label="Reddit" category="community" author="someone" />)
+    expect(container.querySelector('img')).toBeNull()
+    expect(getByText('R')).toBeTruthy()
+  })
+
+  it('loads a community icon the row names and falls back on error', () => {
+    const { container, getByText } = render(<McpIcon name="github-mcp" label="GitHub" category="community" author="GitHub" hasIcon />)
     const img = container.querySelector('img')!
     expect(img.getAttribute('src')).toBe('/v1/mcps/github-mcp/icon.png')
     // Community marks sit on a white tile so a black mark stays visible on the dark theme.

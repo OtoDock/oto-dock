@@ -708,6 +708,7 @@ async def test_a_failed_voice_turn_sends_nothing_more_into_its_session(temp_db, 
     sent" card."""
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
+
     from core.events import stream_pump
     from core.events.common_events import ERROR, CommonEvent, TurnInput
     from core.events.stream_pump import _active_pumps
@@ -755,6 +756,7 @@ async def test_a_voice_turn_left_wake_is_stored_for_the_bridge_person(temp_db, m
     the person the bridge runs as."""
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
+
     from core.events import chat_writer
     from core.events.common_events import ERROR, CommonEvent
     from core.events.stream_pump import _active_pumps
@@ -791,3 +793,27 @@ async def test_a_voice_turn_left_wake_is_stored_for_the_bridge_person(temp_db, m
             {"prompt": "a delegated result", "person": "user-admin", "role": "admin", "by": ""}]
     finally:
         _active_pumps.pop("chat-w", None)
+
+
+@pytest.mark.asyncio
+async def test_a_voice_never_drives_a_chat_locked_on_a_colleagues_computer(temp_db, monkeypatch):
+    """The placement lock holds on the voice door as on the typed one: an
+    utterance into a chat whose live session sits on another person's
+    computer is answered with the lock's sentence, and no turn starts."""
+    from services.remote import chat_move
+    from storage import database as task_store
+    task_store.create_chat("chat-l", "agent::agent-a", "agent-a", "auto")
+    sentence = "This chat is running on Ann's computer."
+    monkeypatch.setattr(chat_move, "lock_sentence",
+                        lambda chat, sub: sentence if sub != "user-ann" else "")
+
+    async def _never(_bridge):
+        raise AssertionError("a locked chat must not resolve a session")
+
+    monkeypatch.setattr(duplex_attach, "_resolve", _never)
+    bridge = _bridge(chat_id="chat-l", sub="user-bob")
+    bridge.engine_ws = FakeWebSocket()
+    await duplex_attach.run_utterance(bridge, {"turn": 4, "text": "run the report"})
+    assert any(f.get("type") == "error" and f.get("turn") == 4
+               and f.get("data", {}).get("message") == sentence
+               for f in bridge.engine_ws.sent if isinstance(f, dict))

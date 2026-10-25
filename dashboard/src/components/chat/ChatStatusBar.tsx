@@ -1,6 +1,11 @@
-import { useState, useEffect, useRef, type JSX } from 'react'
-import { modeOffered } from '../../lib/engines/modes'
-import IconDropdown, { type IconDropdownOption, type IconDropdownGroup } from '../ui/IconDropdown'
+import { useState, useEffect, useLayoutEffect, useRef, type JSX } from 'react'
+import {
+  ASK_MODE, AUTO_REVIEW_MODE, DONT_ASK_CHIP, DONT_ASK_MODE, PLAN_MODE, currentMode, modeOffered,
+} from '../../lib/engines/modes'
+import IconDropdown, { type IconDropdownGroup } from '../ui/IconDropdown'
+import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT, POPOVER } from '../ui/classes'
+import { useDialogs } from '../ui/dialogs'
+import { emitAppToast } from '../../lib/appToasts'
 
 export interface ActiveAgent {
   id: string
@@ -30,10 +35,11 @@ interface Props {
   model: string
   modelValue?: string  // compound value for dropdown matching (layer::model_id)
   costUsd: number
-  /** false = the chat's newest turn ran on a subscription or a local model —
-   * the total is an activity estimate, not money, so the badge is hidden.
-   * Undefined keeps it shown (back-compat / unknown credential). */
+  /** false = the chat's newest turn ran on a subscription or a local model:
+   * the cost popup adds its subscription note. Undefined is the same as true. */
   costBilled?: boolean
+  /** The tool fees' share of costUsd (money whatever the model runs on). */
+  toolCostUsd?: number
   contextUsed: number
   contextMax: number
   cacheStats?: CacheStats
@@ -93,6 +99,10 @@ interface Props {
    * Used by the interactive terminal control-key bar —
    * it scrolls horizontally within this slot, ~20px before the model control. */
   leftSlot?: JSX.Element
+  /** Optional icon pill rendered before the view toggle on a live terminal
+   * (then the model button) and before the mode icon headless: the chat's
+   * "Runs on" control, built by the page. */
+  targetSlot?: JSX.Element
   onModeChange: (mode: string) => void
   onModelChange: (model: string) => void
   onCompactContext?: () => void
@@ -104,26 +114,27 @@ interface Props {
 }
 
 // --- Permission mode config ---
+// Keyed in menu order (Ask, Auto, Don't Ask, Plan): the dropdown lists them so.
 const MODE_CONFIG: Record<string, { label: string; bg: string; text: string; border: string; icon: JSX.Element }> = {
-  default: {
-    label: 'Default',
-    bg: 'bg-p-surface', text: 'text-p-text-secondary', border: 'border-p-border-light/60 dark:border-gray-700',
+  [ASK_MODE]: {
+    label: 'Ask',
+    bg: 'bg-surface-muted', text: 'text-secondary', border: 'border-subtle',
     icon: <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>,
   },
-  acceptEdits: {
-    label: 'Accept Edits',
-    bg: 'bg-brand-50', text: 'text-brand', border: 'border-brand/30',
-    icon: <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>,
+  [AUTO_REVIEW_MODE]: {
+    label: 'Auto',
+    bg: 'bg-action-subtle', text: 'text-link', border: 'border-action-subtle-hover',
+    icon: <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456z" /></svg>,
   },
-  plan: {
-    label: 'Plan',
-    bg: 'bg-[#673a97]/10', text: 'text-p-accent-purple', border: 'border-[#673a97]/30',
-    icon: <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>,
-  },
-  dontAsk: {
+  [DONT_ASK_MODE]: {
     label: "Don't Ask",
-    bg: 'bg-[#f4b206]/10', text: 'text-[#b8860b]', border: 'border-[#f4b206]/30',
+    ...DONT_ASK_CHIP,
     icon: <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>,
+  },
+  [PLAN_MODE]: {
+    label: 'Plan',
+    bg: 'bg-accent-agent-bg', text: 'text-accent-agent-fg', border: 'border-accent-agent-border',
+    icon: <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>,
   },
 }
 
@@ -146,7 +157,6 @@ const DEFAULT_MODEL_OPTIONS = [
 ]
 
 // The mode and model pickers share the icon dropdown in components/ui.
-type ModelOption = IconDropdownOption
 type ModelGroup = IconDropdownGroup
 
 // Interactive-terminal on/off switch — rendered at the top of the Model popup.
@@ -168,18 +178,18 @@ function InteractiveToggle({ on, disabled, disabledReason, onToggle }: {
       title={disabled
         ? disabledReason || 'Switching…'
         : on
-          ? 'Interactive terminal is ON — toggle off to switch back to normal mode'
-          : 'Run this chat as the interactive CLI (terminal)'}
-      className={`w-full flex items-center justify-between gap-2 px-3 py-2 border-b border-p-border-light text-left transition-colors ${
-        disabled ? 'opacity-50 cursor-not-allowed' : 'hover:bg-p-surface-hover'
+          ? 'Interactive terminal is on. Turn it off to go back to normal mode.'
+          : 'Run this chat in an interactive terminal'}
+      className={`w-full flex items-center justify-between gap-2 px-3 py-2 border-b border-subtle text-left transition-colors ${
+        disabled ? 'opacity-50 cursor-not-allowed' : 'hover:bg-surface-hover'
       }`}
     >
       <span className="flex flex-col min-w-0">
-        <span className="text-xs font-medium text-p-text">Interactive terminal</span>
-        <span className="text-[10px] text-p-text-light leading-tight truncate">The native CLI runs as a live TUI</span>
+        <span className="text-xs font-medium text-primary">Interactive terminal</span>
+        <span className="text-3xs text-tertiary leading-tight truncate">The agent runs live in a terminal</span>
       </span>
-      <span className={`relative inline-block w-9 h-5 rounded-full shrink-0 transition-colors ${on ? 'bg-brand' : 'bg-p-border'}`}>
-        <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${on ? 'translate-x-4' : ''}`} />
+      <span className={`relative inline-block w-9 h-5 rounded-full shrink-0 transition-colors ${on ? 'bg-action' : 'bg-control-track'}`}>
+        <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-action-fg shadow-elevation-1 transition-transform ${on ? 'translate-x-4' : ''}`} />
       </span>
     </button>
   )
@@ -196,6 +206,7 @@ export default function ChatStatusBar({
   model,
   costUsd,
   costBilled,
+  toolCostUsd,
   contextUsed,
   contextMax,
   cacheStats,
@@ -217,38 +228,46 @@ export default function ChatStatusBar({
   modeLocked,
   lockReason,
   leftSlot,
+  targetSlot,
   onModeChange,
   onModelChange,
   onCompactContext,
   onModelMenuOpen,
 }: Props) {
+  const dialogs = useDialogs()
+  const liveRef = useRef({ streaming, meetingActive })
+  useLayoutEffect(() => { liveRef.current = { streaming, meetingActive } })
   const resolvedModelOptions = modelOptionsProp && modelOptionsProp.length > 0
     ? modelOptionsProp.filter(m => m.value !== '')  // exclude "System Default" from runtime dropdown
     : DEFAULT_MODEL_OPTIONS
-  const [elapsed, setElapsed] = useState(0)
+  // The timer's tick, keyed by the turn it counts: a new turn reads 0 until
+  // its own first tick, an ended turn reads 0 at once.
+  const [tick, setTick] = useState<{ start: number | null; s: number }>({ start: null, s: 0 })
+  const elapsed = streaming && startTime && tick.start === startTime ? tick.s : 0
   const [contextPopupOpen, setContextPopupOpen] = useState(false)
   const contextRef = useRef<HTMLDivElement>(null)
+  const [costPopupOpen, setCostPopupOpen] = useState(false)
+  const costRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    if (!streaming || !startTime) {
-      setElapsed(0)
-      return
-    }
+    if (!streaming || !startTime) return
     const interval = setInterval(() => {
-      setElapsed((Date.now() - startTime) / 1000)
+      setTick({ start: startTime, s: (Date.now() - startTime) / 1000 })
     }, 100)
     return () => clearInterval(interval)
   }, [streaming, startTime])
 
-  // Close context popup on outside click
+  // Close the context and cost popups on an outside click
   useEffect(() => {
-    if (!contextPopupOpen) return
+    if (!contextPopupOpen && !costPopupOpen) return
     const handler = (e: MouseEvent) => {
-      if (contextRef.current && !contextRef.current.contains(e.target as Node)) setContextPopupOpen(false)
+      const t = e.target as Node
+      if (contextRef.current && !contextRef.current.contains(t)) setContextPopupOpen(false)
+      if (costRef.current && !costRef.current.contains(t)) setCostPopupOpen(false)
     }
     document.addEventListener('mousedown', handler)
     return () => document.removeEventListener('mousedown', handler)
-  }, [contextPopupOpen])
+  }, [contextPopupOpen, costPopupOpen])
 
   const fgAgents = activeAgents.filter(a => !a.background && a.type !== 'delegate' && a.type !== 'bgcommand')
   const bgAgents = activeAgents.filter(a => a.background && a.type !== 'bgcommand')
@@ -261,13 +280,13 @@ export default function ChatStatusBar({
       {/* Agent + meeting badges — own row on mobile, inline on desktop */}
       {(hasActiveAgents || meetingActive) && (
         <div className="flex items-center gap-2 mb-1.5 justify-end md:hidden">
-          <AgentBadge agents={fgAgents} label="Foreground" bgClass="bg-brand-50 border-brand/20" textClass="text-brand" spinnerClass="border-brand" />
-          <AgentBadge agents={bgAgents} label="Background" bgClass="bg-[#f4b206]/10 border-[#f4b206]/20" textClass="text-[#b8860b]" spinnerClass="border-[#f4b206]" />
-          <AgentBadge agents={bgCommands} label="Commands" bgClass="bg-[#10b981]/10 border-[#10b981]/25" textClass="text-[#059669]" spinnerClass="border-[#10b981]" />
-          <AgentBadge agents={delegatedAgents} label="Delegated" bgClass="bg-[#0d9488]/10 border-[#0d9488]/20" textClass="text-p-accent-teal" spinnerClass="border-p-accent-teal" />
+          <AgentBadge agents={fgAgents} label="Foreground" {...AGENT_WORK} />
+          <AgentBadge agents={bgAgents} label="Background" {...AGENT_WORK} />
+          <AgentBadge agents={bgCommands} label="Commands" {...COMMANDS} />
+          <AgentBadge agents={delegatedAgents} label="Delegated" {...AGENT_WORK} />
           {meetingActive && (
-            <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-[#0891b2]/10 border border-[#0891b2]/25 text-[#0891b2]">
-              <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#0891b2] animate-pulse" />
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-accent-agent-bg border border-accent-agent-border text-accent-agent-fg whitespace-nowrap shrink-0">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent-agent-solid animate-pulse" />
               Meeting
             </span>
           )}
@@ -279,8 +298,8 @@ export default function ChatStatusBar({
         {/* Timer badge — hidden during warmup (the "Getting ready…" badge shows
             instead) and in interactive mode (no -p turn → no meaningful timer). */}
         {streaming && startTime && !warming && !interactiveActive && (
-          <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-p-surface border border-p-border-light/60 dark:border-gray-700 text-p-text-secondary tabular-nums font-mono">
-            <svg className="w-3 h-3 text-p-text-light" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-surface-muted text-secondary tabular-nums font-mono whitespace-nowrap shrink-0">
+            <svg className="w-3 h-3 text-tertiary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
             {elapsed < 60 ? `${elapsed.toFixed(0)}s` : `${Math.floor(elapsed / 60)}m ${Math.floor(elapsed % 60)}s`}
@@ -290,18 +309,18 @@ export default function ChatStatusBar({
         {/* Context gauge / Thinking / Compressing — swap on mobile to save space.
             Priority: compressing > thinking > context gauge. */}
         {warming ? (
-          <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-p-surface border border-p-border-light/60 dark:border-gray-700 text-p-text-secondary">
-            <span className="inline-block w-2 h-2 border-[1.5px] border-p-text-light border-t-transparent rounded-full animate-spin" />
+          <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-surface-muted text-secondary whitespace-nowrap shrink-0">
+            <span className="inline-block w-2 h-2 border-[1.5px] border-status-info-solid border-t-transparent rounded-full animate-spin" />
             Getting ready…
           </span>
         ) : compressingActive ? (
-          <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-[#b8860b]/10 border border-[#b8860b]/20 text-[#b8860b]">
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#b8860b] animate-pulse" />
+          <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-status-info-bg border border-status-info-border text-status-info-fg whitespace-nowrap shrink-0">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-status-info-solid animate-pulse" />
             Compressing
           </span>
         ) : thinkingActive ? (
-          <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-[#673a97]/10 border border-[#673a97]/20 text-p-accent-purple">
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-p-accent-purple animate-pulse" />
+          <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-accent-agent-bg border border-accent-agent-border text-accent-agent-fg whitespace-nowrap shrink-0">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent-agent-solid animate-pulse" />
             Thinking
           </span>
         ) : contextMax > 0 && !interactiveActive && (() => {
@@ -309,17 +328,17 @@ export default function ChatStatusBar({
           const fmtK = (n: number) => n >= 1000000 ? `${(n / 1000000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(0)}K` : String(n)
           const usedK = fmtK(contextUsed)
           const maxK = fmtK(contextMax)
-          const bgColor = pct >= 90 ? 'bg-p-accent-red/10 border border-p-accent-red/30'
-            : pct >= 80 ? 'bg-[#f4b206]/10 border border-[#f4b206]/30'
-            : 'bg-p-surface border border-p-border-light/60 dark:border-gray-700'
-          const textColor = pct >= 90 ? 'text-p-accent-red'
-            : pct >= 80 ? 'text-[#b8860b]'
-            : 'text-p-text-secondary'
+          const bgColor = pct >= 90 ? 'bg-status-danger-bg border border-status-danger-border'
+            : pct >= 80 ? 'bg-status-warning-bg border border-status-warning-border'
+            : 'bg-surface-muted border border-transparent'
+          const textColor = pct >= 90 ? 'text-status-danger-fg'
+            : pct >= 80 ? 'text-status-warning-fg'
+            : 'text-secondary'
           return (
-            <div className="relative" ref={contextRef}>
+            <div className="relative shrink-0" ref={contextRef}>
               <button
                 onClick={() => setContextPopupOpen(!contextPopupOpen)}
-                className={`flex items-center gap-1 px-2 py-0.5 rounded-lg ${bgColor} ${textColor} tabular-nums font-mono cursor-pointer`}
+                className={`flex items-center gap-1 px-2 py-0.5 rounded-full ${bgColor} ${textColor} tabular-nums font-mono whitespace-nowrap cursor-pointer`}
               >
                 <svg className="w-3 h-3" viewBox="0 0 16 16">
                   <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.2" />
@@ -333,25 +352,25 @@ export default function ChatStatusBar({
                 {pct}%
               </button>
               {contextPopupOpen && (
-                <div className="absolute bottom-full mb-1 left-0 md:left-1/2 md:-translate-x-1/2 w-52 bg-white dark:bg-p-surface rounded-xl shadow-lg border border-p-border-light py-2 px-3 z-50">
-                  <p className="text-[10px] font-semibold text-p-text-light uppercase tracking-wider mb-1.5">Context Usage</p>
+                <div className={`absolute bottom-full mb-1 left-0 md:left-1/2 md:-translate-x-1/2 w-52 ${POPOVER} py-2 px-3 z-50`}>
+                  <p className="text-3xs font-semibold text-tertiary uppercase tracking-wider mb-1.5">Context Usage</p>
                   {/* Progress bar */}
-                  <div className="w-full h-1.5 rounded-full bg-p-surface mb-2">
+                  <div className="w-full h-1.5 rounded-full bg-surface-muted mb-2">
                     <div
-                      className={`h-full rounded-full transition-all ${pct >= 90 ? 'bg-p-accent-red' : pct >= 80 ? 'bg-[#f4b206]' : 'bg-brand'}`}
+                      className={`h-full rounded-full transition-all ${pct >= 90 ? 'bg-status-danger-solid' : pct >= 80 ? 'bg-status-warning-solid' : 'bg-status-info-solid'}`}
                       style={{ width: `${Math.min(pct, 100)}%` }}
                     />
                   </div>
-                  <div className="flex justify-between text-[11px] text-p-text-secondary mb-2">
+                  <div className="flex justify-between text-2xs text-secondary mb-2">
                     <span className="font-mono">{usedK} / {maxK}</span>
                     <span className={`font-semibold ${textColor}`}>{pct}%</span>
                   </div>
                   {cacheStats && (cacheStats.cacheRead > 0 || cacheStats.cacheWrite > 0 || cacheStats.outputTokens > 0) && (
                     <>
-                      <div className="border-t border-p-border-light pt-1.5 mt-1">
-                        <p className="text-[10px] font-semibold text-p-text-light uppercase tracking-wider mb-1">Last Turn</p>
+                      <div className="border-t border-subtle pt-1.5 mt-1">
+                        <p className="text-3xs font-semibold text-tertiary uppercase tracking-wider mb-1">Last Turn</p>
                       </div>
-                      <div className="space-y-0.5 text-[11px] text-p-text-secondary">
+                      <div className="space-y-0.5 text-2xs text-secondary">
                         {cacheStats.cacheRead > 0 && (
                           <div className="flex justify-between">
                             <span>Cache Read</span>
@@ -374,16 +393,24 @@ export default function ChatStatusBar({
                     </>
                   )}
                   {onCompactContext && pct > 0 && !meetingActive && (
-                    <div className="border-t border-p-border-light pt-1.5 mt-1.5">
+                    <div className="border-t border-subtle pt-1.5 mt-1.5">
                       <button
-                        onClick={() => {
-                          if (window.confirm('Compress context? This will summarize the conversation to free up context window.')) {
-                            onCompactContext()
-                            setContextPopupOpen(false)
+                        onClick={async () => {
+                          if (!(await dialogs.confirm({
+                            title: 'Compress the context?',
+                            body: 'This summarizes the conversation to free up the context window.',
+                            confirmLabel: 'Compress',
+                          }))) return
+                          setContextPopupOpen(false)
+                          // A reply or a meeting may have started while the dialog was open.
+                          if (liveRef.current.streaming || liveRef.current.meetingActive) {
+                            emitAppToast({ severity: 'info', title: 'The context was not compressed', body: 'A reply is running. Try again when it ends.' })
+                            return
                           }
+                          onCompactContext()
                         }}
                         disabled={streaming}
-                        className="w-full text-[11px] font-medium text-[#b8860b] hover:bg-[#b8860b]/10 rounded-lg py-1 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        className={`${BUTTON_BASE} ${BUTTON_VARIANT.secondary} ${BUTTON_SIZE.xs} w-full`}
                       >
                         Compress Context
                       </button>
@@ -397,18 +424,18 @@ export default function ChatStatusBar({
 
         {/* Meeting badge — desktop only (mobile shows in row above) */}
         {meetingActive && (
-          <span className="hidden md:flex items-center gap-1 px-2 py-0.5 rounded-lg bg-[#0891b2]/10 border border-[#0891b2]/25 text-[#0891b2]">
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#0891b2] animate-pulse" />
+          <span className="hidden md:flex items-center gap-1 px-2 py-0.5 rounded-full bg-accent-agent-bg border border-accent-agent-border text-accent-agent-fg whitespace-nowrap shrink-0">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent-agent-solid animate-pulse" />
             Meeting
           </span>
         )}
 
         {/* Agent badges — inline on desktop, hidden on mobile (shown in row above) */}
         <div className="hidden md:contents">
-          <AgentBadge agents={fgAgents} label="Foreground" bgClass="bg-brand-50 border-brand/20" textClass="text-brand" spinnerClass="border-brand" />
-          <AgentBadge agents={bgAgents} label="Background" bgClass="bg-[#f4b206]/10 border-[#f4b206]/20" textClass="text-[#b8860b]" spinnerClass="border-[#f4b206]" />
-          <AgentBadge agents={bgCommands} label="Commands" bgClass="bg-[#10b981]/10 border-[#10b981]/25" textClass="text-[#059669]" spinnerClass="border-[#10b981]" />
-          <AgentBadge agents={delegatedAgents} label="Delegated" bgClass="bg-[#0d9488]/10 border-[#0d9488]/20" textClass="text-p-accent-teal" spinnerClass="border-p-accent-teal" />
+          <AgentBadge agents={fgAgents} label="Foreground" {...AGENT_WORK} />
+          <AgentBadge agents={bgAgents} label="Background" {...AGENT_WORK} />
+          <AgentBadge agents={bgCommands} label="Commands" {...COMMANDS} />
+          <AgentBadge agents={delegatedAgents} label="Delegated" {...AGENT_WORK} />
         </div>
 
         {/* Left slot (interactive control-key bar) fills the spacer so the model
@@ -417,18 +444,54 @@ export default function ChatStatusBar({
           ? <div className="flex-1 min-w-0 mr-3">{leftSlot}</div>
           : <div className="flex-1" />}
 
-        {/* Cost badge — hidden in interactive mode (cost accrues inside the TUI,
-            not via the -p pump; a leftover value would be stale) and when the
-            newest turn ran on a subscription / local model (costBilled false:
-            the number is activity, not money — still counted in Usage). */}
-        {costUsd > 0 && costBilled !== false && !interactiveActive && (
-          <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-p-surface border border-p-border-light/60 dark:border-gray-700 text-p-text-secondary tabular-nums font-mono">
-            <svg className="w-3 h-3 text-p-text-light" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-            ${costUsd.toFixed(2)}
-          </span>
-        )}
+        {/* Cost: the money this chat has cost, an API key's or the relay's
+            turns and every tool fee, never a subscription's or a local
+            model's activity estimate (costUsd is already that sum). A round
+            icon that opens the amount, so a long figure never crowds the
+            row. Hidden in interactive mode (cost accrues inside the TUI, not
+            via the -p pump; a leftover value would be stale). */}
+        {costUsd > 0 && !interactiveActive && (() => {
+          const tools = toolCostUsd ?? 0
+          const modelCost = Math.max(0, costUsd - tools)
+          const label = `$${costUsd.toFixed(2)}`
+          return (
+            <div className="relative shrink-0" ref={costRef}>
+              <button
+                type="button"
+                onClick={() => setCostPopupOpen(!costPopupOpen)}
+                aria-expanded={costPopupOpen}
+                aria-label={`Cost ${label}`}
+                title={`Cost ${label}`}
+                className="flex items-center justify-center w-7 h-7 rounded-full bg-surface-muted text-secondary bg-linear-to-b from-transparent to-transparent hover:from-surface-hover hover:to-surface-hover transition-colors cursor-pointer"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </button>
+              {costPopupOpen && (
+                <div className={`absolute bottom-full mb-1 right-0 md:right-auto md:left-1/2 md:-translate-x-1/2 w-48 ${POPOVER} py-2 px-3 z-50`}>
+                  <p className="text-3xs font-semibold text-tertiary uppercase tracking-wider mb-1">Cost</p>
+                  <p className="text-base font-semibold text-primary tabular-nums font-mono">{label}</p>
+                  {tools > 0 && (
+                    <div className="mt-1.5 space-y-0.5 text-2xs text-secondary">
+                      {modelCost > 0 && (
+                        <div className="flex justify-between"><span>Model</span><span className="font-mono">${modelCost.toFixed(2)}</span></div>
+                      )}
+                      <div className="flex justify-between"><span>Tools</span><span className="font-mono">${tools.toFixed(2)}</span></div>
+                    </div>
+                  )}
+                  {costBilled === false && (
+                    <p className="mt-1.5 text-2xs text-tertiary">The model runs on a subscription. Only tool fees are billed.</p>
+                  )}
+                </div>
+              )}
+            </div>
+          )
+        })()}
+
+        {/* The chat's "Runs on" control, when the page provides one: before
+            the view toggle on a live terminal, before the mode icon headless. */}
+        {targetSlot}
 
         {/* View toggle — flip the live terminal ⇄ the DB
             rich conversation history WITHOUT killing the session. Shown only
@@ -440,10 +503,10 @@ export default function ChatStatusBar({
             onClick={() => onToggleRichView?.()}
             aria-pressed={!!richViewActive}
             title={richViewActive ? 'Back to the live terminal' : 'Show the conversation history'}
-            className={`flex items-center justify-center w-7 h-7 rounded-lg border transition-colors cursor-pointer ${
+            className={`flex items-center justify-center w-7 h-7 rounded-control border transition-colors cursor-pointer ${
               richViewActive
-                ? 'bg-brand-50 border-brand/30 text-brand'
-                : 'bg-p-surface border-p-border-light/60 dark:border-gray-700 text-p-text-secondary hover:bg-white dark:hover:bg-p-surface-hover hover:border-p-border'
+                ? 'bg-action-subtle border-action-subtle-hover text-link'
+                : 'bg-surface-muted border-subtle text-secondary hover:text-primary'
             }`}
           >
             {richViewActive ? (
@@ -466,7 +529,7 @@ export default function ChatStatusBar({
         {/* Mode icon dropdown — hidden in interactive mode (the TUI owns its
             permission mode; our baseline + path enforcement still apply). */}
         {!hidePermissions && (() => {
-          const mc = MODE_CONFIG[mode] || MODE_CONFIG.default
+          const mc = MODE_CONFIG[currentMode(mode)] || MODE_CONFIG[ASK_MODE]
           const offered = permissionModesProp ?? Object.keys(MODE_CONFIG)
           const modeOptions = modeLocked
             ? [{ value: mode, label: mc.label }]
@@ -479,7 +542,7 @@ export default function ChatStatusBar({
               onChange={modeLocked ? () => {} : onModeChange}
               trigger={
                 <span
-                  className={`flex items-center justify-center w-7 h-7 rounded-lg border ${mc.bg} ${mc.border} ${mc.text} hover:brightness-95 transition-colors cursor-pointer`}
+                  className={`flex items-center justify-center w-7 h-7 rounded-control border ${mc.bg} ${mc.border} ${mc.text} hover:brightness-95 transition-colors cursor-pointer`}
                   title={`Mode: ${mc.label}${lockReason ? ` · ${lockReason}` : ''}`}
                 >
                   {mc.icon}
@@ -518,7 +581,7 @@ export default function ChatStatusBar({
                 : undefined}
               trigger={
                 <span
-                  className="flex items-center justify-center w-7 h-7 rounded-lg border bg-p-surface border-p-border-light/60 dark:border-gray-700 text-p-text-secondary hover:bg-white dark:hover:bg-p-surface-hover hover:border-p-border transition-colors cursor-pointer text-xs font-semibold"
+                  className="flex items-center justify-center w-7 h-7 rounded-control border bg-surface-muted border-subtle text-secondary hover:text-primary transition-colors cursor-pointer text-xs font-semibold"
                   title={`Model: ${modelLabel}${modelTier ? ` · ${modelTier}` : ''}${lockReason ? ` · ${lockReason}` : ''}`}
                 >
                   {modelLetter}
@@ -531,6 +594,11 @@ export default function ChatStatusBar({
     </div>
   )
 }
+
+// The running-work badges: subagents, background agents and delegated work
+// are agent work; a background shell command is information.
+const AGENT_WORK = { bgClass: 'bg-accent-agent-bg border-accent-agent-border', textClass: 'text-accent-agent-fg', spinnerClass: 'border-accent-agent-solid' }
+const COMMANDS = { bgClass: 'bg-status-info-bg border-status-info-border', textClass: 'text-status-info-fg', spinnerClass: 'border-status-info-solid' }
 
 function AgentBadge({
   agents,
@@ -548,7 +616,7 @@ function AgentBadge({
   if (agents.length === 0) return null
   return (
     <span
-      className={`flex items-center gap-1 px-2 py-0.5 rounded-lg border ${bgClass} ${textClass}`}
+      className={`flex items-center gap-1 px-2 py-0.5 rounded-full border ${bgClass} ${textClass}`}
       title={agents.map(a => a.description).join('\n')}
     >
       <span className={`inline-block w-2 h-2 border-[1.5px] ${spinnerClass} border-t-transparent rounded-full animate-spin`} />

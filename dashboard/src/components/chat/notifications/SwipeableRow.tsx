@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useRef, useState, useCallback } from 'react'
 
 /** A row that swipes left to dismiss (touch): the notifications panel's
  * deliveries and the "Shared with you" section's received items. A
@@ -17,11 +17,15 @@ export default function SwipeableRow({ onSwipeDismiss, resetKey, children }: {
   const startY = useRef(0)
   const locked = useRef(false)  // true = horizontal swipe confirmed
 
-  useEffect(() => {
-    if (!resetKey) return
-    setDismissed(false)
-    setOffsetX(0)
-  }, [resetKey])
+  // A new reset key puts the row back, in render.
+  const [seenKey, setSeenKey] = useState(resetKey)
+  if (seenKey !== resetKey) {
+    setSeenKey(resetKey)
+    if (resetKey) {
+      setDismissed(false)
+      setOffsetX(0)
+    }
+  }
 
   const handleTouchStart = useCallback((e: React.TouchEvent) => {
     startX.current = e.touches[0].clientX
@@ -74,14 +78,14 @@ export default function SwipeableRow({ onSwipeDismiss, resetKey, children }: {
   return (
     <div ref={rowRef} className="relative overflow-hidden" style={{ maxHeight: dismissed ? 0 : undefined, transition: dismissed ? 'max-height 200ms ease-out' : undefined }}>
       {/* Red background revealed on swipe */}
-      <div className="absolute inset-0 bg-p-accent-red flex items-center justify-end pr-4">
-        <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <div className="absolute inset-0 bg-status-danger-fill flex items-center justify-end pr-4">
+        <svg className="w-4 h-4 text-on-solid" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
         </svg>
       </div>
       {/* Foreground content */}
       <div
-        className="relative bg-white dark:bg-p-surface"
+        className="relative bg-surface-overlay"
         style={{
           transform: dismissed ? 'translateX(-100%)' : `translateX(${offsetX}px)`,
           transition: swiping ? 'none' : 'transform 200ms ease-out',

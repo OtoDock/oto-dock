@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { apiFetch } from './auth'
+import { apiJson, withMessage } from '../lib/http/apiJson'
 
 /** One version of a document in a chat: a push's pinned copy. */
 export interface DocumentVersion {
@@ -27,9 +27,9 @@ export interface ChatDocument {
 export const chatDocumentsKey = (chatId: string) => ['chat-documents', chatId] as const
 
 export async function fetchChatDocuments(chatId: string): Promise<ChatDocument[]> {
-  const res = await apiFetch(`/v1/documents/chat-documents?chat_id=${encodeURIComponent(chatId)}`)
-  if (!res.ok) throw new Error(`chat documents: ${res.status}`)
-  const body = await res.json()
+  const body = await apiJson<{ documents?: unknown } | null>(
+    `/v1/documents/chat-documents?chat_id=${encodeURIComponent(chatId)}`,
+  ).catch(withMessage((status) => `chat documents: ${status}`))
   return Array.isArray(body?.documents) ? body.documents : []
 }
 

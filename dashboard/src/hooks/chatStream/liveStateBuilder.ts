@@ -1,6 +1,6 @@
 import { liveBlockToMessageBlock } from '../../lib/messageBlocks'
 import type { DisplayMessage, MessageBlock } from '../../components/chat/types'
-import { LIVE_BLOCK, SYSTEM_SUBTYPE, WIRE } from '../../api/wireEvents'
+import { LIVE_BLOCK, SYSTEM_SUBTYPE, WIRE, type LiveBlock } from '../../api/wireEvents'
 
 /**
  * Pure reconstruction of the live-state message list from ordered live_blocks.
@@ -11,7 +11,7 @@ import { LIVE_BLOCK, SYSTEM_SUBTYPE, WIRE } from '../../api/wireEvents'
  * currentMsgRef / meetingSpeakerRef / setMessages and the meeting-banner merge.
  */
 export function buildLiveStateMessages(
-  liveBlocks: any[],
+  liveBlocks: LiveBlock[],
   thinking: { active?: boolean; text?: string; tokens?: number },
 ): DisplayMessage[] {
   const newMsgs: DisplayMessage[] = []
@@ -46,7 +46,9 @@ export function buildLiveStateMessages(
     }
     switch (lb.type) {
       case LIVE_BLOCK.TEXT:
-        pushBlock({ type: 'text', content: lb.content || '' })
+        pushBlock(lb.note
+          ? { type: 'text', content: lb.content || '', note: true }
+          : { type: 'text', content: lb.content || '' })
         break
       case LIVE_BLOCK.TOOL:
         pushBlock({
@@ -106,7 +108,7 @@ export function buildLiveStateMessages(
     msg.blocks.push({
       type: 'thinking',
       content: thinking.text || '',
-      collapsed: true,
+      collapsed: false,  // still streaming: open, as the live stream draws it
       tokens: thinking.tokens || 0,
     })
   }

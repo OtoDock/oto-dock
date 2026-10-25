@@ -68,19 +68,20 @@ MACHINES: tuple[Machine, ...] = (
              "proxy/ws/", "proxy/core/events/stream_pump.py", "proxy/core/events/task_producer.py",
              "proxy/core/session/session_state.py", "proxy/services/checks/kinds/judge_kind.py",
              "proxy/services/apps/app_handlers.py", "proxy/services/apps/app_steps.py",
-             "proxy/api/apps/catalog.py", "proxy/services/delegation/"),
+             "proxy/services/apps/catalog.py", "proxy/services/delegation/"),
             ("dashboard/src/lib/status/run.ts",),
             ("dashboard/src/api/runs.ts", "dashboard/src/lib/runs.ts", "dashboard/src/components/StatusBadge.tsx",
              "dashboard/src/components/chat/TaskMetadata.tsx", "dashboard/src/components/chat/DelegateTaskInfo.tsx",
              "dashboard/src/components/chat/ChatHistory.tsx", "dashboard/src/pages/History.tsx",
              "dashboard/src/lib/messageBlocks.ts", "dashboard/src/hooks/useChatStream.ts",
+             "dashboard/src/hooks/chatStream/",
              "dashboard/src/components/GroupedRunsTable.tsx")),
     Machine("chat_phase",
             frozenset({"streaming", "warming", "finished", "generating", "awaiting_user"}),
             frozenset({"ready", "idle"}),
             ("proxy/ws/chat_phase.py", "proxy/services/delegation/lane_status.py"),
             ("proxy/ws/", "proxy/core/events/stream_pump.py", "proxy/core/session/interactive_session.py",
-             "proxy/api/agents/chats.py", "proxy/services/notifications/", "proxy/api/apps/catalog.py",
+             "proxy/api/agents/chats.py", "proxy/services/notifications/", "proxy/services/apps/catalog.py",
              "proxy/core/session/sibling_awareness.py"),
             ("dashboard/src/lib/status/chat.ts",),
             ("dashboard/src/store/chatStore.ts", "dashboard/src/hooks/useActiveChats.ts",
@@ -212,9 +213,12 @@ KNOWN_TS_SITES: dict[str, tuple[str, dict[str, int]]] = {
     "dashboard/src/components/ui/IconDropdown.tsx": (
         "a placement direction (up | down), not a server state", {"app_server:up": 1}),
     "dashboard/src/hooks/useChatStream.ts": (
-        "the compaction phase (completed | failed), the plan status (pending) and the tool block's status "
-        "(running) — three dashboard-side vocabularies sharing the run's words",
-        {"run:completed": 1, "run:failed": 1, "run:pending": 2, "run:running": 2}),
+        "the plan status (pending) and the tool block's status (running), two dashboard-side "
+        "vocabularies sharing the run's words",
+        {"run:pending": 2, "run:running": 2}),
+    "dashboard/src/hooks/chatStream/useStreamBlocks.ts": (
+        "the compaction phase (completed | failed), not a run's status",
+        {"run:completed": 1, "run:failed": 1}),
     "dashboard/src/store/installStore.ts": (
         "the dashboard's install job, not a request", {"mcp_request:installing": 2}),
 }
@@ -357,7 +361,7 @@ def _scan_ts() -> dict[str, dict[str, int]]:
     sites: dict[str, dict[str, int]] = {}
     for p in sorted(list(src.rglob("*.ts")) + list(src.rglob("*.tsx"))):
         rel = p.relative_to(REPO_ROOT).as_posix()
-        if "/tests/" in rel:
+        if "/tests/" in rel or ".test." in p.name:
             continue
         counts = _ts_counts(p.read_text(encoding="utf-8", errors="surrogateescape"))
         if not counts:

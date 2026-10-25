@@ -8,6 +8,7 @@ the /v1/tasks/runs user-view). Chat mode excludes task-% chats outright
 reaches agent users for the scheduler's synthetic task:: chat owner.
 """
 
+import json
 import uuid
 
 import pytest
@@ -77,10 +78,9 @@ def test_the_mint_writes_the_kind_and_both_lists_agree(temp_db, _as, monkeypatch
     by either half; a row minted BEFORE the write (the default 'chat' with a
     task- id) sorts the same way; a chat-surface delegate worker (a uuid id,
     the default column) stays a chat."""
-    import config
     from core.session import session_kind
     from services.scheduler import runner, shared
-    monkeypatch.setattr(config, "get_cli_model", lambda *a, **k: "m")
+    monkeypatch.setattr("configuration.models.get_cli_model", lambda *a, **k: "m")
     _as(_user())
     pre = _mk_task_chat(scope="user", created_by="user-alice")
     assert task_store.get_chat(pre)["source_type"] == "chat"
@@ -286,7 +286,7 @@ async def test_ephemeral_push_task_chat_deep_link(temp_db, monkeypatch):
     from storage.automation import notification_store as ns
     captured = {}
 
-    async def fake_send_fcm(token, payload):
+    async def fake_send_fcm(token, payload, platform="android"):
         captured["payload"] = payload
     monkeypatch.setattr(ps, "send_fcm", fake_send_fcm)
     monkeypatch.setattr(ns, "get_push_subscriptions",
@@ -311,8 +311,9 @@ def test_task_mode_listing_and_search_run_off_the_loop(temp_db, loop_db_guard):
     store on the event loop thread. The handler coroutines are awaited
     directly on this thread with the guard armed; rows and flags are the
     ones the on-loop listing produced."""
-    from api.agents import chats as api
     import asyncio
+
+    from api.agents import chats as api
     task_store.create_dynamic_task(
         "dyn-off", AGENT, "Nightly report", "p", "cli", "scheduled",
         "0 9 * * *", None, None, 3600, "user-alice", scope="agent")
@@ -325,7 +326,7 @@ def test_task_mode_listing_and_search_run_off_the_loop(temp_db, loop_db_guard):
             listed = await api.list_chats(agent=AGENT, kind="tasks", limit=50, user=u)
             found = await api.search_chats(q="elephant", agent=AGENT, kind="tasks",
                                            limit=20, user=u)
-        return listed["chats"], found["chats"]
+        return json.loads(listed.body)["chats"], json.loads(found.body)["chats"]
 
     listed, found = asyncio.run(scenario())
     assert [r["id"] for r in listed] == [cid]
@@ -335,9 +336,11 @@ def test_task_mode_listing_and_search_run_off_the_loop(temp_db, loop_db_guard):
 
 
 def test_task_mode_listing_answers_400_and_403_from_the_job(temp_db):
-    from fastapi import HTTPException
-    from api.agents import chats as api
     import asyncio
+
+    from fastapi import HTTPException
+
+    from api.agents import chats as api
 
     async def scenario():
         with pytest.raises(HTTPException) as no_agent:

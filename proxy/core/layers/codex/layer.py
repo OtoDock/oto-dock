@@ -14,36 +14,59 @@ import contextlib
 import json
 import logging
 import re
-import tomllib
+import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, cast
 
-import time
+import tomllib
 
 import config as app_config
-from core import placement
-from core.events.common_events import CommonEvent, ERROR, METADATA, DONE, PLAN_MODE
+from core import layout, placement
+from core.events.common_events import DONE, ERROR, METADATA, CommonEvent
 from core.execution_layer import (
-    AgentConfig, AuthProfile, BehaviourProfile,
-    CredentialFileSpec, EngineIdentity, ExecutionLayer, LayerCapabilities,
-    ModelPolicy, OAuthRefresh, RuntimeProfile, SubscriptionHandle, UsageProfile,
-    WindowSpec, Windows,
+    AUTO_REVIEW_MODE,
+    PERMISSION_MODES,
+    AgentConfig,
+    AuthProfile,
+    BehaviourProfile,
+    CredentialFileSpec,
+    EngineIdentity,
+    ExecutionLayer,
+    LayerCapabilities,
+    ModelPolicy,
+    OAuthRefresh,
+    ResumeVerdict,
+    RuntimeProfile,
+    SubscriptionHandle,
+    UsageProfile,
+    Windows,
+    WindowSpec,
 )
-from core.layers.codex import oauth as codex_oauth
-from core.layers.codex import usage as codex_usage
-from core import layout
+from core.layers.codex import oauth as codex_oauth, usage as codex_usage
 from core.layers.codex.session import (
-    create_codex_session, get_codex_session, close_codex_session,
+    close_codex_session,
+    create_codex_session,
+    get_codex_session,
 )
 from core.session.session_state import (
-    _record_session_use, set_session_security, set_session_mode,
-    cleanup_session_permission_state, register_session_state,
-    set_session_codex_dir,
+    START_MARK_TTL_S,
+    _record_session_use,
+    cleanup_session_permission_state,
+    clear_starting,
+    mark_starting,
+    register_session_state,
     resolve_permission,
     resolve_session_permissions,
-    mark_starting, clear_starting, session_is_held, START_MARK_TTL_S,
+    session_is_held,
+    set_session_codex_dir,
+    set_session_mode,
+    set_session_security,
 )
+
+if TYPE_CHECKING:
+    from auth.path_policy import SecurityContext
 
 logger = logging.getLogger("codex-layer")
 
@@ -52,8 +75,7 @@ logger = logging.getLogger("codex-layer")
 # The event translator now lives in translator.py; re-exported here so
 # `from core.layers.codex.layer import CodexEventTranslator` keeps working
 # (remote_session_info, remote_session_start + the codex tests import it from this module).
-from core.layers.codex.translator import CodexEventTranslator  # noqa: F401
-
+from core.layers.codex.translator import CodexEventTranslator
 
 # ---------------------------------------------------------------------------
 # Capabilities
@@ -73,7 +95,7 @@ _CODEX_CAPABILITIES = LayerCapabilities(
     supports_context_compression=False,
     supports_control_commands=True,   # app-server: model/mode via per-turn override
     supports_mcps=True,
-    permission_modes=["default", "acceptEdits", "plan", "dontAsk"],
+    permission_modes=list(PERMISSION_MODES),
     control_commands=["set_model", "set_permission_mode"],
     models=app_config.get_layer_models("codex-cli", offers_ultra=True),
     # "max" is real wire vocabulary from the GPT-5.6 family on (GPT-6 too);
@@ -106,7 +128,7 @@ _CODEX_CAPABILITIES = LayerCapabilities(
              "kind": "local", "relay_path": "", "api_path": "/v1",
              "effort_scale": ["low", "medium", "high", "xhigh"],
              "effort_per_model": []},
-            {"id": "openai_compatible", "label": "OpenAI-compatible endpoint", "requires_key": False,
+            {"id": "openai_compatible", "label": "OpenAI-compatible server", "requires_key": False,
              "kind": "local", "relay_path": "", "api_path": "",
              "effort_scale": ["low", "medium", "high", "xhigh"],
              "effort_per_model": []},
@@ -213,8 +235,135 @@ from core.session import session_kind
 # config.toml [tools] table every session gets — see _write_config_toml.
 _CODEX_TOOLS_TABLE = "[tools]\nupdate_plan = { enabled = true }"
 
+#: The mode word Codex's PreToolUse hook reports for a turn under an asking
+#: approval policy (on-request; ``never`` reports ``bypassPermissions``).
+CODEX_ON_REQUEST_WORD = "default"
 _TOML_MCP_SECTION_RE = re.compile(r"^\[mcp_servers\.([a-zA-Z0-9_-]+)\]")
+# The writer puts each inline ``env`` table on one line, and a value may
+# carry braces (a JSON list of objects, a credential blob): the table ends at
+# the line's LAST brace, never the first.
 _TOML_ENV_LINE_RE = re.compile(r'^(\s*env\s*=\s*\{)(.*)\}(\s*)$')
+_TOML_ENV_LINES_RE = re.compile(r'^([ \t]*env[ \t]*=[ \t]*\{)(.*)\}([ \t]*)$', re.MULTILINE)
+
+
+def _tui_env(session_id: str, agent_name: str, username: str, user_role: str,
+             codex_bin: str, extra_env: dict[str, str]) -> dict[str, str]:
+    """The bare Codex TUI's env: the daemon's (mirror of ``_build_env``) with
+    TERM and ``OTO_INTERACTIVE`` (the PostToolUse forwarder no-ops;
+    ``decide_tool_permission`` answers "ask" for the ask tier, the deny-only
+    gate stays silent on it, so Codex's own ``-a on-request`` prompts), and,
+    last, the shell's command-line token over the final session token."""
+    import os
+
+    from auth.session_token import attach_cli_token
+    from core.sandbox.env_builder import build_session_env
+    proc_env = build_session_env(session_id, agent_name, username=username, user_role=user_role)
+    codex_dir = os.path.dirname(os.path.realpath(codex_bin))
+    if codex_dir and codex_dir not in proc_env.get("PATH", ""):
+        proc_env["PATH"] = codex_dir + ":" + proc_env.get("PATH", "/usr/bin:/bin")
+    proc_env.update(extra_env)  # CODEX_HOME + subscription + credential + proxy vars
+    proc_env["TERM"] = proc_env.get("TERM") or "xterm-256color"
+    # xterm.js renders 24-bit; without the hint the TUI downgrades to
+    # 256-color SGR (see the Claude twin in cli/session.py).
+    proc_env.setdefault("COLORTERM", "truecolor")
+    proc_env["OTO_INTERACTIVE"] = "1"
+    # Codex's PreToolUse hook rejects permissionDecision:"allow" — tell
+    # permission_gate.py to emit JSON only to DENY (allow/defer → silent
+    # exit 0 → Codex proceeds). The hard-deny FLOOR still enforces.
+    proc_env["OTO_HOOK_DENY_ONLY"] = "1"
+    attach_cli_token(proc_env)
+    return proc_env
+
+
+def with_tool_approvals(mcp_toml: str) -> str:
+    """An app-server session's MCP sections with Codex's approvals where its
+    own rule and the platform's tier disagree: a server whose glob-ruled
+    sensitive tools are not known by name yet gets ``default_tools_approval_mode
+    = "prompt"`` (``mcp_permissions.codex_server_default``), and each tool the
+    two disagree on a ``[mcp_servers.<k>.tools."<t>"]`` table
+    (``codex_tool_approvals``): the critical tools approved (the person's card
+    is their one judge), a tool the platform allows that Codex would ask about
+    approved, a sensitive one Codex would run asked. A terminal gets none: its
+    own prompt is its gate."""
+    from services.mcp.mcp_permissions import codex_server_default, codex_tool_approvals
+    out: list[str] = []
+    tables: list[str] = []
+    for line in mcp_toml.splitlines():
+        out.append(line)
+        m = _TOML_MCP_SECTION_RE.match(line.strip())
+        if not m:
+            continue
+        default = codex_server_default(m.group(1))
+        if default:
+            out.append(f'default_tools_approval_mode = "{default}"')
+        for tool, mode in codex_tool_approvals(m.group(1)).items():
+            esc = tool.replace("\\", "\\\\").replace('"', '\\"')
+            tables.append(f'[mcp_servers.{m.group(1)}.tools."{esc}"]')
+            tables.append(f'approval_mode = "{mode}"')
+    text = "\n".join(out).rstrip()
+    return text + ("\n\n" + "\n".join(tables) if tables else "") + "\n"
+
+
+#: The app-server's item type for a plan-mode turn's proposed plan.
+PLAN_ITEM = "plan"
+#: The plan review's mark that nothing waits on its card: the dashboard keeps
+#: it answerable while the plan row is pending (a Claude review whose turn
+#: ended unanswered reads as cancelled).
+PLAN_BETWEEN_TURNS = "between_turns"
+
+
+async def queue_plan_review(session_id: str, plan: str, plans_dir: Path | None) -> None:
+    """A Codex plan turn's plan as a plan review: written to the chat's plan
+    file (``plan-<chat8>.md``, the same file across revisions; under
+    ``plans_dir`` for a local session, none on a satellite, whose plans the
+    reviewed rows hold) and put on the session's permission queue as
+    Claude's ExitPlanMode puts it, so the pump writes the plan row (pending)
+    and the review card shows. Nothing waits on the card: the turn ends and
+    the answer comes between turns (ws/dashboard_prompts)."""
+    import uuid
+
+    from core.session.session_state import get_permission_queue
+    from storage import database as task_store
+    from storage.pg import run_db
+    from ws import wire_events as wire
+    chat = await run_db(task_store.get_chat_by_session, session_id)
+    chat_id = (chat or {}).get("id") or session_id
+    filename = f"plan-{chat_id[:8]}.md"
+    if plans_dir is not None:
+        def _write() -> None:
+            plans_dir.mkdir(parents=True, exist_ok=True)
+            (plans_dir / filename).write_text(plan, encoding="utf-8")
+        try:
+            await asyncio.to_thread(_write)
+        except OSError:
+            logger.warning("Codex [%s] plan file not written", session_id[:8], exc_info=True)
+    get_permission_queue(session_id).put_nowait({
+        "event_type": wire.ITEM_PLAN_REVIEW,
+        "request_id": str(uuid.uuid4()),
+        "plan": plan,
+        "tool_input": {"plan": plan, "planFilePath": filename, PLAN_BETWEEN_TURNS: True},
+    })
+
+
+def _inject_proxy_vars_toml(toml_content: str, proxy_vars: dict[str, str]) -> str:
+    """Append each of ``proxy_vars`` to every ``env = { ... }`` inline table
+    that does not declare the key yet. ``config_builder.inject_credential_env_into_toml``
+    already injects ``PROXY_API_KEY`` (with the user_sub), so re-appending it
+    produced a DUPLICATE TOML key, invalid TOML: the Codex app-server's
+    parser tolerated it (last wins) but the strict interactive ``codex`` TUI
+    parser rejects it ("duplicate key", exit 1, a blank terminal).
+    Idempotent both ways: inject if absent, skip if present."""
+    for key, val in proxy_vars.items():
+        escaped_key = key.replace('"', '\\"')
+        escaped_val = val.replace('\\', '\\\\').replace('"', '\\"')
+        needle = f'"{key}"'
+
+        def _inject(m, _needle=needle, _ek=escaped_key, _ev=escaped_val):
+            if _needle in m.group(2):
+                return m.group(0)
+            return f'{m.group(1)}{m.group(2)}, "{_ek}" = "{_ev}" }}{m.group(3)}'
+        toml_content = _TOML_ENV_LINES_RE.sub(_inject, toml_content)
+    return toml_content
 
 
 def _inject_fetch_tokens_toml(
@@ -242,7 +391,7 @@ def _inject_fetch_tokens_toml(
         em = _TOML_ENV_LINE_RE.match(body)
         if em and slug in bundle_keys:
             head, inner, trail = em.group(1), em.group(2), em.group(3)
-            tok = mcp_broker.mint_token(session_id, slug)
+            tok = mcp_broker.mint_token(session_id, cast("str", slug))
             esc = tok.replace("\\", "\\\\").replace('"', '\\"')
             sep = "" if inner.strip() == "" else ", "
             out_lines.append(
@@ -267,7 +416,8 @@ def _inject_session_jwt_toml(
     are untouched.
     """
     from auth.session_token import (
-        SESSION_JWT_SENTINEL_BEARER, swap_session_jwt_bearer,
+        SESSION_JWT_SENTINEL_BEARER,
+        swap_session_jwt_bearer,
     )
     if SESSION_JWT_SENTINEL_BEARER not in toml_content:
         return toml_content
@@ -290,7 +440,7 @@ def _inject_session_id_toml(toml_content: str, session_id: str) -> str:
     carries a query string (a bare ``?`` append would corrupt e.g.
     ``...?api_key=x`` into a double-``?`` URL).
     """
-    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
     def _sub(m: re.Match) -> str:
         parsed = urlparse(m.group(2))
@@ -329,6 +479,27 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             from core.layers.codex.remote import CodexRemoteAdapter
             self._remote_adapter = CodexRemoteAdapter(self)
         return self._remote_adapter
+
+    def engine_reviews(self, session_id: str, live_mode: str) -> bool:
+        """Codex's reviewer judges what the hook leaves undecided when Codex
+        reports its on-request policy with the call (``default``; a turn under
+        ``never`` reports ``bypassPermissions``) and the turn running now was
+        started with ``auto_review``: a local session records that per turn;
+        a remote one runs it when its mode is Auto and its satellite speaks
+        the 1.9 modes."""
+        if live_mode != CODEX_ON_REQUEST_WORD:
+            return False
+        from core.layers.codex.session import _codex_sessions
+        session = _codex_sessions.get(session_id)
+        if session is not None:
+            return bool(session.review_turn)
+        from core.remote.remote_start_payload import speaks_review_modes
+        from core.remote.satellite_connection import get_connection_manager
+        from core.session.session_manager import _get_remote_layer
+        remote = _get_remote_layer()
+        info = remote._sessions.get(session_id) if remote is not None else None
+        return bool(info is not None and info.mode == AUTO_REVIEW_MODE
+                    and speaks_review_modes(get_connection_manager(), info.machine_id))
 
     def canonical_tool_name(self, session_id: str, native: str) -> str:
         """Codex's native names → the canonical set (``tool_names.py``), and
@@ -454,7 +625,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # agent-scope even with a human present, so it works in /workspace, not
         # /users/{u}. ``mount_username`` is "" for any agent-scope mount.
         agent_dir = app_config.get_agent_dir(config.agent_name)
-        _ctx = config.security_context
+        _ctx = cast("SecurityContext | None", config.security_context)
         username = _ctx.mount_username if _ctx else ""
         from core.session.external_identity import external_home_of, is_external_ctx
         _ext_home = external_home_of(_ctx)
@@ -466,16 +637,19 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             work_dir = str(agent_dir / layout.WORKSPACE)
 
         # Sandbox setup
-        from core.sandbox.sandbox import resolve_sandbox_config, SandboxBuilder
+
+        from core.sandbox.sandbox import (
+            SandboxBuilder,
+            mcp_sandbox_mounts,
+            resolve_sandbox_config,
+        )
         from services.mcp import mcp_registry
-        import os as _os
 
         # is_remote=False (fail-closed default, explicit here): LOCAL bwrap mount
         # path — satellite_only device MCPs run native on the satellite and must
         # never be mounted locally.
-        mcp_mounts = []
-        for manifest in (mcp_registry.get_agent_mcps(config.agent_name, placement=placement.LOCAL_PLACEMENT) or []):
-            mcp_mounts.extend(manifest.sandbox_mounts)
+        mcp_mounts = mcp_sandbox_mounts(
+            mcp_registry.get_agent_mcps(config.agent_name, placement=placement.LOCAL_PLACEMENT) or [])
 
         # Mount the Codex CLI installation directory inside the sandbox
         # (it lives in ~/.npm-global/ which isn't in the default system mounts).
@@ -485,10 +659,10 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         codex_extra_mounts = cli_install_ro_binds(codex_bin)
 
         sandbox_cfg = resolve_sandbox_config(
-            role=config.security_context.role if config.security_context else "viewer",
+            role=cast("SecurityContext", config.security_context).role if config.security_context else "viewer",
             username=username,   # already the MOUNT username (see work_dir above)
             agent_name=config.agent_name,
-            is_admin_agent=config.security_context.is_admin_agent if config.security_context else False,
+            is_admin_agent=cast("SecurityContext", config.security_context).is_admin_agent if config.security_context else False,
             host_claude_dir=Path(config.sandbox_host_claude_dir),
             user_sub=config.user_sub,
             mcp_sandbox_mounts=mcp_mounts,
@@ -517,10 +691,10 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         from core.sandbox.sandbox import nested_sandbox_ok
         if nested_sandbox_ok() is False:
             logger.warning(
-                f"codex[{config.agent_name}]: this host denies nested bwrap "
+                "codex[%s]: this host denies nested bwrap "
                 "(boot probe) — the Codex inner sandbox will fail to start and "
                 "commands fall back to permission prompts. Run "
-                "scripts/sandbox-doctor.sh to pinpoint the denial."
+                "scripts/sandbox-doctor.sh to pinpoint the denial.", config.agent_name
             )
         env_overrides = sandbox_builder.get_env_overrides(
             config_dir_name=self.capabilities.runtime.config_dir_name,
@@ -574,32 +748,17 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # - TOML env: for MCPs (display, location, notifications, etc.)
         # Note: OTO_* (incl. OTO_SESSION_ID) are baked into the env block by
         # config_builder via inject_credential_env_into_toml — don't re-inject
-        # here or TOML parse fails with "duplicate key".
+        # here or TOML parse fails with "duplicate key". The chat and task
+        # builders bake PROXY_API_KEY in too, naming the session's person; the
+        # token below, which names nobody, reaches only a config that carries
+        # none (the meeting and external phone builders mint no token).
         if mcp_toml_content:
             from auth.session_token import create_session_token
             proxy_vars = {
                 "PROXY_URL": f"http://localhost:{app_config.PORT}",
                 "PROXY_API_KEY": create_session_token(session_id, config.agent_name),
             }
-            for key, val in proxy_vars.items():
-                escaped_key = key.replace('"', '\\"')
-                escaped_val = val.replace('\\', '\\\\').replace('"', '\\"')
-                needle = f'"{key}"'
-                # Append to each env = { ... } block, but SKIP a block that already
-                # declares this key. ``config_builder.inject_credential_env_into_toml``
-                # already injects PROXY_API_KEY (with the user_sub), so re-appending
-                # it produced a DUPLICATE TOML key — invalid TOML. The Codex
-                # app-server's parser tolerated it (last-wins) but the strict
-                # interactive ``codex`` TUI parser rejects it ("duplicate key" →
-                # exit 1 → blank terminal). Idempotent both ways: inject if absent,
-                # skip if present.
-                def _inject(m, _needle=needle, _ek=escaped_key, _ev=escaped_val):
-                    if _needle in m.group(2):
-                        return m.group(0)
-                    return f'{m.group(1)}{m.group(2)}, "{_ek}" = "{_ev}" }}'
-                mcp_toml_content = re.sub(
-                    r'(env\s*=\s*\{)([^}]*)\}', _inject, mcp_toml_content,
-                )
+            mcp_toml_content = _inject_proxy_vars_toml(mcp_toml_content, proxy_vars)
 
             # Credential broker: inject the per-(session, mcp) cap-token
             # into each stdio MCP that has a secret bundle, then wrap its command
@@ -660,7 +819,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             from services.engines.token_fanout import write_credential_file
             write_credential_file(
                 Path(config.sandbox_host_claude_dir),
-                self.capabilities.auth.credential_file.filename, auth_json,
+                cast("CredentialFileSpec", self.capabilities.auth.credential_file).filename, cast("dict", auth_json),
             )
         else:
             self._drop_stale_auth_json(Path(config.sandbox_host_claude_dir))
@@ -668,7 +827,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # Create session (thread_id from DB enables resume after proxy restart)
         codex_effort = _map_effort_to_codex(config.effort, config.model)
         _user_role = (
-            config.security_context.role if config.security_context else ""
+            cast("SecurityContext", config.security_context).role if config.security_context else ""
         )
 
         # Credential broker: populate the per-session secret store so
@@ -682,30 +841,13 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # prelude above (sandbox prefix, .codex config.toml + auth.json, MCP TOML,
         # credential broker) is shared; only the spawned process differs.
         if config.interactive:
-            from core.session import interactive_session
-            from core.sandbox.env_builder import build_session_env
-            from core.layers.codex.codex_approvals import approval_for_sandbox
-            # Daemon-equivalent env for the bare TUI (mirror _build_env) + TERM +
-            # OTO_INTERACTIVE (the PostToolUse forwarder no-ops; decide_tool_permission
-            # returns "ask" for the ask-tier — the deny-only gate stays silent on it,
-            # so Codex's own -a on-request prompts).
-            proc_env = build_session_env(
-                session_id, config.agent_name,
-                username=username, user_role=_user_role,
+            from core.layers.codex.codex_approvals import (
+                approval_for_sandbox,
+                tui_reviewer_flags,
             )
-            _codex_dir_path = _os.path.dirname(_os.path.realpath(codex_bin))
-            if _codex_dir_path and _codex_dir_path not in proc_env.get("PATH", ""):
-                proc_env["PATH"] = _codex_dir_path + ":" + proc_env.get("PATH", "/usr/bin:/bin")
-            proc_env.update(extra_env)  # CODEX_HOME + subscription + credential + proxy vars
-            proc_env["TERM"] = proc_env.get("TERM") or "xterm-256color"
-            # xterm.js renders 24-bit; without the hint the TUI downgrades to
-            # 256-color SGR (see the Claude twin in cli/session.py).
-            proc_env.setdefault("COLORTERM", "truecolor")
-            proc_env["OTO_INTERACTIVE"] = "1"
-            # Codex's PreToolUse hook rejects permissionDecision:"allow" — tell
-            # permission_gate.py to emit JSON only to DENY (allow/defer → silent
-            # exit 0 → Codex proceeds). The hard-deny FLOOR still enforces.
-            proc_env["OTO_HOOK_DENY_ONLY"] = "1"
+            from core.session import interactive_session
+            proc_env = _tui_env(session_id, config.agent_name, username, _user_role,
+                                codex_bin, extra_env)
             sandbox_cwd = sandbox_builder.get_cwd()
             approval = approval_for_sandbox(sandbox_mode)
             # Flags precede the optional PROMPT (codex [opts] [PROMPT]).
@@ -729,6 +871,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             ]
             if config.model:
                 flags += ["-m", config.model]
+            flags += tui_reviewer_flags(config.permission_mode)
             if codex_effort:
                 flags += ["-c", f'model_reasoning_effort="{codex_effort}"']
             _prompt_in_argv = False
@@ -784,7 +927,8 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             # InteractiveSession.close().
             if config.subscription_id:
                 from services.engines.subscription_pool import (
-                    bind_session, credential_scope_key,
+                    bind_session,
+                    credential_scope_key,
                 )
                 await asyncio.wrap_future(bind_session(
                     session_id, config.subscription_id,
@@ -819,7 +963,18 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             # platform mode, not the sandbox: a judge (CHECKS.md) is
             # read-only without planning.
             permission_mode=config.permission_mode,
+            # The thread's folder inside the sandbox (bwrap's --chdir): a
+            # thread carried here from a machine resumes there, not in the
+            # machine's folder its rollout recorded.
+            thread_cwd=sandbox_builder.get_cwd(),
         )
+        session = await get_codex_session(session_id)
+        if session is not None and session.resume_refused and config.chat_id:
+            # The thread the chat names would not open: its first turn here
+            # restores the history instead of starting with no memory.
+            from core.session.history_seed import mark_resume_refused
+            from storage.pg import run_db
+            await run_db(mark_resume_refused, config.chat_id)
 
         # Session metadata (permission mode + security context were
         # registered before the spawn)
@@ -828,7 +983,8 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # Bind subscription for cleanup on close
         if config.subscription_id:
             from services.engines.subscription_pool import (
-                bind_session, credential_scope_key,
+                bind_session,
+                credential_scope_key,
             )
             await asyncio.wrap_future(bind_session(
                 session_id, config.subscription_id,
@@ -937,7 +1093,8 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             # never touches the store on the loop. The one adapter call that
             # reads storage.
             from core.layers.codex.local_model_catalog import (
-                LOCAL_MODEL_ROWS_ENV, local_model_rows_json,
+                LOCAL_MODEL_ROWS_ENV,
+                local_model_rows_json,
             )
             env[LOCAL_MODEL_ROWS_ENV] = local_model_rows_json(handle.provider or "")
         return env
@@ -1015,16 +1172,17 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         inject_time = kwargs.get("inject_time", False)
         turn_start = _time.monotonic()
 
-        # Plan mode: codex delivers the plan as the turn's final agentMessage (no
-        # ExitPlanMode / structured Plan item on the -p path — probe-verified), so
-        # we SYNTHESIZE the implement card. Capture the last agentMessage + whether
-        # the turn was interrupted; emit a `plan_mode exit` (the SAME event the
-        # Claude ExitPlanMode path uses → same pump persistence + PlanView card)
-        # right before DONE, but only for a normally-completed plan turn with a
-        # non-empty plan. A held request_user_input can't leave a question pending
-        # at turn-end (codex resumes the turn only after it's answered).
+        # Plan mode: the turn's completed `plan` item is the plan (Codex's plan
+        # collaboration mode emits it; the last agent message stands in for a
+        # turn that produced none). A normally completed plan turn with a
+        # plan becomes a plan review right before DONE: the file in the
+        # session's plans folder, the review card and the plan row through the
+        # pump's own path (queue_plan_review). A held request_user_input can't
+        # leave a question pending at turn-end (codex resumes the turn only
+        # after it's answered).
         in_plan = bool(getattr(session, "plan_mode", False))
-        final_plan_msg = ""
+        plan_text = ""
+        final_msg = ""
         turn_interrupted = False
 
         # Emit codex_thread_id once → pump persists to chats.codex_thread_id so
@@ -1038,8 +1196,10 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         ):
             if in_plan and codex_event.type == "item/completed":
                 _item = (codex_event.data or {}).get("item") or {}
-                if _item.get("type") == "agentMessage" and _item.get("text"):
-                    final_plan_msg = _item["text"]          # last one wins = the plan
+                if _item.get("type") == PLAN_ITEM and _item.get("text"):
+                    plan_text = _item["text"]
+                elif _item.get("type") == "agentMessage" and _item.get("text"):
+                    final_msg = _item["text"]          # last one wins
             elif in_plan and codex_event.type == "turn/completed":
                 if ((codex_event.data or {}).get("turn") or {}).get("status") == "interrupted":
                     turn_interrupted = True
@@ -1050,15 +1210,10 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                     duration_ms = int((_time.monotonic() - turn_start) * 1000)
                     common_event.data["duration_ms"] = duration_ms
                 if (common_event.type == DONE and in_plan and not turn_interrupted
-                        and final_plan_msg.strip()):
-                    # `synthetic` distinguishes this from Claude's ExitPlanMode
-                    # plan_mode-exit (a no-op in the FE, since Claude's actionable
-                    # card is the held plan_review) → the FE renders the implement
-                    # card ONLY for the codex synthetic exit.
-                    yield CommonEvent(type=PLAN_MODE, data={
-                        "action": "exit", "synthetic": True,
-                        "tool_input": {"plan": final_plan_msg},
-                    })
+                        and (plan_text or final_msg).strip()):
+                    await queue_plan_review(session_id, (plan_text or final_msg).strip(),
+                                            Path(session.config_dir) / "plans"
+                                            if session.config_dir else None)
                 yield common_event
 
     async def close_session(self, session_id: str) -> None:
@@ -1192,7 +1347,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
     async def can_resume_session(
         self, session_id: str, *, agent_name: str = "", username: str = "",
         external_home: str = "",
-    ) -> bool:
+    ) -> ResumeVerdict:
         """Codex resumability is THREAD-backed, not pool-backed.
 
         The thread + its rollout persist on disk independently of the
@@ -1206,13 +1361,13 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         """
         session = await get_codex_session(session_id)
         if session is not None and session.thread_id is not None:
-            return True
+            return ResumeVerdict.RESUMABLE
 
         from storage.database import get_chat_by_session
         chat = get_chat_by_session(session_id)
         thread_id = (chat or {}).get("codex_thread_id") or ""
         if not thread_id:
-            return False
+            return ResumeVerdict.FRESH
 
         from core.session import codex_rollout_tailer
         from core.session.session_state import get_session_codex_dir
@@ -1228,8 +1383,9 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                 candidate = agent_dir / layout.WORKSPACE / ".codex"
             if candidate.is_dir():
                 codex_dir = str(candidate)
-        return bool(codex_dir) and codex_rollout_tailer.rollout_exists(
-            codex_dir, thread_id)
+        if codex_dir and codex_rollout_tailer.rollout_exists(codex_dir, thread_id):
+            return ResumeVerdict.RESUMABLE
+        return ResumeVerdict.FRESH
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1420,7 +1576,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
 
         # MCP server sections (already formatted as TOML by mcp_registry)
         if mcp_toml:
-            parts.append(mcp_toml.strip())
+            parts.append((mcp_toml if interactive else with_tool_approvals(mcp_toml)).strip())
 
         config_text = "\n\n".join(parts) + "\n"
         # Validation gate: never hand Codex invalid TOML. The strict TUI
@@ -1448,7 +1604,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             )
             raise RuntimeError(
                 f"generated codex config.toml failed TOML validation: {e}"
-            )
+            ) from e
         config_path.write_text(config_text)
         # config.toml can carry an inline MCP bearer (see the module header) —
         # lock it owner-only, same as auth.json in this dir.
@@ -1481,6 +1637,6 @@ class CodexCLIExecutionLayer(ExecutionLayer):
 # Permission mode → Codex sandbox mode and effort mappings live in helpers.py
 # so both the local layer and RemoteExecutionLayer use the exact same logic.
 from core.layers.codex.helpers import (
-    permission_to_sandbox as _permission_to_sandbox,
     map_effort_to_codex as _map_effort_to_codex,
+    permission_to_sandbox as _permission_to_sandbox,
 )

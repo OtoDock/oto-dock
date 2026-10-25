@@ -75,9 +75,9 @@ describe('lib/permissions', () => {
   })
 
   it('wears one badge palette and one label per role', () => {
-    expect(roleBadge('admin')).toContain('red')
-    expect(roleBadge('editor')).toContain('amber')
-    expect(roleBadge('contributor')).toContain('teal')
+    expect(roleBadge('admin')).toContain('status-danger')
+    expect(roleBadge('editor')).toContain('status-warning')
+    expect(roleBadge('contributor')).toContain('accent-media')
     expect(roleBadge('nobody')).toBe(roleBadge('viewer'))
     expect(roleLabel('manager')).toBe('Manager')
     expect(roleLabel('contributor')).toBe('Contributor')

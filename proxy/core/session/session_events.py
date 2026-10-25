@@ -45,10 +45,11 @@ import asyncio
 import collections
 import contextlib
 import logging
-from core.events import tool_roles
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Awaitable, Callable
+
+from core.events import tool_roles
 
 logger = logging.getLogger("session-events")
 
@@ -211,17 +212,44 @@ def stopped_since(session_id: str, since: float) -> bool:
 # pre_tool
 # ---------------------------------------------------------------------------
 
+# The permission authority (``api/hooks/permission.py``) installs its two
+# doors when it is imported, which the app does before any session starts:
+# core does not import the hook surface. With none installed a tool call is
+# denied and a question answered with nothing.
+_permission_authority: tuple[Callable[..., Awaitable[dict]],
+                             Callable[..., Awaitable[dict]]] | None = None
+
+
+def register_permission_authority(decide: Callable[..., Awaitable[dict]],
+                                  ask: Callable[..., Awaitable[dict]]) -> None:
+    """Install ``decide(session_id, tool_name, tool_input, *,
+    live_permission_mode)`` and ``ask(session_id, questions, *, tool_name)``."""
+    global _permission_authority
+    _permission_authority = (decide, ask)
+
+
 async def pre_tool(
     session_id: str, tool_name: str, tool_input: dict | None = None,
     *, live_permission_mode: str = "",
 ) -> dict:
     """The named door to the permission authority. Returns the authority's
     ``{"decision": allow|deny|ask|defer, "reason"?, "updated_input"?}``."""
-    from api.hooks.permission import decide_tool_permission
-    return await decide_tool_permission(
+    if _permission_authority is None:
+        return {"decision": "deny", "reason": "no permission authority is installed"}
+    decide, _ask = _permission_authority
+    return await decide(
         session_id, tool_name, tool_input or {},
         live_permission_mode=live_permission_mode,
     )
+
+
+async def ask_question(session_id: str, questions: list, *, tool_name: str = "") -> dict:
+    """The named door to the question authority: the answers map, ``{}``
+    when nobody answers."""
+    if _permission_authority is None:
+        return {}
+    _decide, ask = _permission_authority
+    return await ask(session_id, questions, tool_name=tool_name)
 
 
 # ---------------------------------------------------------------------------

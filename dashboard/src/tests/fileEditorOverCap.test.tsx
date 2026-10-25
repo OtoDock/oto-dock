@@ -8,6 +8,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import * as authApi from '@/api/auth'
 import FileEditor from '@/components/FileEditor'
+import Dialog from '@/components/ui/Dialog'
 
 const fetchSpy = vi.spyOn(authApi, 'apiFetch')
 
@@ -57,5 +58,28 @@ describe('FileEditor on a refused read', () => {
       expect(screen.getByText(/Forbidden/)).toBeTruthy()
     })
     expect(screen.queryByRole('textbox')).toBeNull()
+  })
+})
+
+describe('FileEditor with a dialog open over it', () => {
+  it('Ctrl+S neither saves nor opens the browser\'s Save page', async () => {
+    const puts: string[] = []
+    fetchSpy.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method === 'PUT') puts.push(path)
+      return { ok: true, status: 200, json: async () => ({ content: 'hello' }) } as Response
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <FileEditor agent="dev" path="workspace/notes.md" />
+        <Dialog aria-label="Confirm" onClose={() => {}}><button>Inside</button></Dialog>
+      </QueryClientProvider>,
+    )
+    await waitFor(() => expect(screen.getByDisplayValue('hello')).toBeTruthy())
+    const behind = screen.getByDisplayValue('hello')
+    const key = new KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true, cancelable: true })
+    behind.dispatchEvent(key)
+    expect(key.defaultPrevented).toBe(true)
+    expect(puts).toEqual([])
   })
 })

@@ -10,6 +10,11 @@ import { useMyAudioPrefs, useUpdateMyAudioPrefs, type AudioMode } from '../../ap
 import { useAudioPrefsStore } from '../../store/audioPrefsStore'
 import { loadVoices, type VoiceOption } from '../../audio/backends/nativeTts'
 import { AUTO_LANGUAGE, LANGUAGES } from '../../audio/lang'
+import { useSaveState, type SaveStatus } from '../../hooks/useSaveState'
+import { Select } from '../ui/Field'
+import { BUTTON_BASE, BUTTON_SIZE, CARD, SEGMENT } from '../ui/classes'
+import { SaveState, SettingRow } from '../ui/SettingsControls'
+import { PAGE_TITLE } from '../ui/classes'
 
 const MODES: AudioMode[] = ['auto', 'native', 'platform']
 
@@ -17,28 +22,27 @@ const MODES: AudioMode[] = ['auto', 'native', 'platform']
 // native recognizer accepts; normalized to provider codes server-side).
 const STT_LANGS = LANGUAGES
 
-// Friendly language name for a 2-letter code ("de" → "German — de"), via the
+// Friendly language name for a 2-letter code ("de" → "German (de)"), via the
 // platform's own Intl data so we don't ship a language table.
 function langLabel(code: string): string {
   try {
     const name = new Intl.DisplayNames([navigator.language || 'en'], { type: 'language' }).of(code)
-    return name && name.toLowerCase() !== code ? `${name} — ${code}` : code.toUpperCase()
+    return name && name.toLowerCase() !== code ? `${name} (${code})` : code.toUpperCase()
   } catch { return code.toUpperCase() }
 }
 
-function ModeRow({ label, value, onChange }: { label: string; value: AudioMode; onChange: (m: AudioMode) => void }) {
+function ModeRow({ label, value, save, onChange }: { label: string; value: AudioMode; save: SaveStatus; onChange: (m: AudioMode) => void }) {
   return (
     <div className="flex items-center justify-between gap-4 py-1.5">
-      <span className="text-sm text-p-text">{label}</span>
-      <div className="flex gap-1">
+      <span className="text-sm text-primary">{label}<SaveState state={save} /></span>
+      <div role="group" aria-label={label} className="flex gap-1">
         {MODES.map(m => (
           <button
             key={m}
+            type="button"
             onClick={() => onChange(m)}
-            className={`px-2.5 py-1 text-xs rounded-lg border transition-colors capitalize ${
-              value === m ? 'border-brand bg-brand/10 text-brand font-medium'
-                : 'border-p-border-light text-p-text-secondary hover:border-gray-300'
-            }`}
+            aria-pressed={value === m}
+            className={`${BUTTON_BASE} ${BUTTON_SIZE.xs} capitalize ${value === m ? SEGMENT.on : SEGMENT.off}`}
           >{m}</button>
         ))}
       </div>
@@ -50,6 +54,7 @@ export function AudioPrefsSection() {
   const { data: cap, isLoading: capLoading } = useChatAudioCapability()
   const { data: prefs } = useMyAudioPrefs()
   const update = useUpdateMyAudioPrefs()
+  const { stateOf, run } = useSaveState()
   const nativeVoiceURI = useAudioPrefsStore(s => s.nativeVoiceURI)
   const setNativeVoice = useAudioPrefsStore(s => s.setNativeVoice)
   const [voices, setVoices] = useState<VoiceOption[]>([])
@@ -83,81 +88,86 @@ export function AudioPrefsSection() {
 
   return (
     <div className="mb-8">
-      <h2 className="text-lg font-medium text-p-text mb-3">Audio</h2>
+      <h2 className={`${PAGE_TITLE} mb-3`}>Audio</h2>
       {capLoading ? (
-        <p className="text-sm text-p-text-secondary">Checking audio availability…</p>
+        <p className="text-sm text-secondary">Checking audio availability…</p>
       ) : !cap ? (
-        <p className="text-sm text-p-text-secondary">Couldn't check chat audio availability — reload the page to retry.</p>
+        <p className="text-sm text-secondary">Couldn't check if chat audio is available. Reload the page to try again.</p>
       ) : !cap.icons_enabled ? (
-        <p className="text-sm text-p-text-secondary">Chat audio (sound &amp; mic icons) is currently turned off by the administrator.</p>
+        <p className="text-sm text-secondary">Chat audio, the sound and mic icons, is turned off by the administrator.</p>
       ) : (
         <div className="space-y-3">
-          <p className="text-sm text-p-text-secondary">Sound &amp; mic icons in chat. {cap.reason}</p>
+          <p className="text-sm text-secondary">Sound and mic icons in chat. {cap.reason}</p>
 
           {(cap.tts === 'either' || cap.stt === 'either') ? (
-            <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4 space-y-1">
+            <div className={`${CARD} p-4 space-y-1`}>
               {cap.tts === 'either' && (
-                <ModeRow label="Play voice (TTS)" value={prefs?.tts_mode ?? 'auto'}
-                  onChange={m => update.mutate({ tts_mode: m })} />
+                <ModeRow label="Voice playback" value={prefs?.tts_mode ?? 'auto'} save={stateOf('tts_mode')}
+                  onChange={m => { void run('tts_mode', () => update.mutateAsync({ tts_mode: m }), { failTitle: 'The voice setting was not saved' }) }} />
               )}
               {cap.stt === 'either' && (
-                <ModeRow label="Dictation (STT)" value={prefs?.stt_mode ?? 'auto'}
-                  onChange={m => update.mutate({ stt_mode: m })} />
+                <ModeRow label="Dictation" value={prefs?.stt_mode ?? 'auto'} save={stateOf('stt_mode')}
+                  onChange={m => { void run('stt_mode', () => update.mutateAsync({ stt_mode: m }), { failTitle: 'The dictation setting was not saved' }) }} />
               )}
             </div>
           ) : (
-            <p className="text-xs text-p-text-light">Voice engine is set by the platform policy.</p>
+            <p className="text-xs text-tertiary">Voice engine is set by the platform policy.</p>
           )}
 
           {/* Dictation (STT) language — the language the mic recognizes */}
           {cap.stt !== 'unavailable' && (
-            <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <span className="text-sm text-p-text">Dictation language</span>
-                  <p className="text-xs text-p-text-light">The language the mic recognizes (set this to dictate non-English). Automatic lets the platform engine identify it from your first words, which then arrive a moment later. The device recognizer keeps your browser language.</p>
-                </div>
-                <select
+            <div className={`${CARD} p-4`}>
+              <SettingRow
+                label="Dictation language"
+                htmlFor="dictation-language"
+                save={stateOf('stt_language')}
+                info="The language the mic recognizes. Set it to dictate in a language other than English. Automatic starts in your browser language. Within a second or two, it moves to the language you speak. The device recognizer keeps your browser language."
+              >
+                <Select
+                  id="dictation-language"
+                  className="w-max shrink-0"
                   value={prefs?.stt_language || 'en-US'}
-                  onChange={e => update.mutate({ stt_language: e.target.value })}
-                  className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text"
+                  onChange={e => {
+                    const language = e.target.value
+                    void run('stt_language', () => update.mutateAsync({ stt_language: language }), { failTitle: 'The dictation language was not saved' })
+                  }}
                 >
                   <option value={AUTO_LANGUAGE}>Automatic</option>
                   {STT_LANGS.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
-                </select>
-              </div>
+                </Select>
+              </SettingRow>
             </div>
           )}
 
           {/* Native voice — one language at a time (device-local). A full
               per-language list was cluttered on devices with many voices. */}
           {voiceLangs.length > 0 && (
-            <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4 space-y-3">
-              <p className="text-xs text-p-text-light">Preferred device voice for native playback on this device. Set one language at a time.</p>
+            <div className={`${CARD} p-4 space-y-3`}>
+              <p className="text-xs text-tertiary">Preferred device voice for native playback on this device. Set one language at a time.</p>
               <div className="flex items-center justify-between gap-3">
-                <span className="text-sm text-p-text">Language</span>
-                <select
+                <span className="text-sm text-primary">Language</span>
+                <Select
                   value={effectiveLang}
                   onChange={e => setEditLang(e.target.value)}
-                  className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text max-w-[16rem]"
+                  className="max-w-[16rem]"
                 >
                   {voiceLangs.map(l => <option key={l} value={l}>{langLabel(l)}</option>)}
-                </select>
+                </Select>
               </div>
               <div className="flex items-center justify-between gap-3">
-                <span className="text-sm text-p-text">Voice</span>
-                <select
+                <span className="text-sm text-primary">Voice</span>
+                <Select
                   value={nativeVoiceURI[effectiveLang] || ''}
                   onChange={e => setNativeVoice(effectiveLang, e.target.value)}
-                  className="px-2 py-1 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text max-w-[16rem]"
+                  className="max-w-[16rem]"
                 >
-                  <option value="">(device default)</option>
+                  <option value="">Device default</option>
                   {voices.filter(v => v.lang.toLowerCase().startsWith(effectiveLang))
                     .map(v => <option key={v.voiceURI} value={v.voiceURI}>{v.name}</option>)}
-                </select>
+                </Select>
               </div>
               {customizedLangs.length > 0 && (
-                <p className="text-xs text-p-text-light">Customized: {customizedLangs.map(l => l.toUpperCase()).join(', ')}</p>
+                <p className="text-xs text-tertiary">Customized: {customizedLangs.map(l => l.toUpperCase()).join(', ')}</p>
               )}
             </div>
           )}

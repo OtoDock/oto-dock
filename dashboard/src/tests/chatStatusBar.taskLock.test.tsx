@@ -19,7 +19,7 @@ function renderBar(over: Partial<Parameters<typeof ChatStatusBar>[0]> = {}) {
       thinkingActive={false}
       compressingActive={false}
       activeAgents={[]}
-      mode="default"
+      mode="ask"
       model="claude-sonnet-5"
       costUsd={0}
       contextUsed={0}
@@ -39,7 +39,7 @@ describe('ChatStatusBar task-run locks', () => {
     fireEvent.click(screen.getByTitle("Mode: Don't Ask"))
     const options = screen.getAllByRole('button').filter(b => b.textContent === "Don't Ask")
     expect(options).toHaveLength(1)
-    expect(screen.queryByText('Accept Edits')).toBeNull()
+    expect(screen.queryByText('Auto')).toBeNull()
 
     fireEvent.click(options[0])
     expect(onModeChange).not.toHaveBeenCalled()
@@ -67,10 +67,11 @@ describe('ChatStatusBar task-run locks', () => {
   })
 
   it('unlocked mode dropdown still offers the full option set', () => {
-    renderBar({ mode: 'default' })
-    fireEvent.click(screen.getByTitle('Mode: Default'))
-    expect(screen.getByText('Accept Edits')).toBeTruthy()
+    renderBar({ mode: 'ask' })
+    fireEvent.click(screen.getByTitle('Mode: Ask'))
+    expect(screen.getByText('Auto')).toBeTruthy()
     expect(screen.getByText("Don't Ask")).toBeTruthy()
+    expect(screen.getByText('Plan')).toBeTruthy()
   })
 })
 
@@ -82,7 +83,7 @@ describe('ChatStatusBar on a chat that runs as the agent, below the editor tier'
     const onModelChange = vi.fn()
     const onInteractiveToggle = vi.fn()
     renderBar({
-      mode: 'default', modeLocked: true, modelLocked: true,
+      mode: 'ask', modeLocked: true, modelLocked: true,
       interactiveAvailable: true, interactiveOn: false, interactiveDisabled: true,
       lockReason: reason, onModeChange, onModelChange, onInteractiveToggle,
       modelOptions: [
@@ -91,9 +92,9 @@ describe('ChatStatusBar on a chat that runs as the agent, below the editor tier'
       ],
     })
     // The triggers keep their "Mode:" / "Model:" prefix and carry the reason.
-    const modeTrigger = screen.getByTitle(`Mode: Default · ${reason}`)
+    const modeTrigger = screen.getByTitle(`Mode: Ask · ${reason}`)
     fireEvent.click(modeTrigger)
-    expect(screen.queryByText('Accept Edits')).toBeNull()
+    expect(screen.queryByText('Auto')).toBeNull()
 
     fireEvent.click(screen.getByTitle(`Model: Sonnet 5 · ${reason}`))
     expect(screen.queryByText('Fable 5')).toBeNull()

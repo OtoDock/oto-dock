@@ -30,6 +30,7 @@ replay it; the fetch happens exactly once, before the CLI spawns.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -38,10 +39,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from .._vendored import layout
 from ..config import otodock_dir
 from ..host import auth_paths, path_translator
-from .._vendored import layout
-import contextlib
 
 logger = logging.getLogger("satellite.session_files")
 

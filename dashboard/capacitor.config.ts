@@ -27,22 +27,36 @@ const config: CapacitorConfig = {
     accessOrigins: [],
   },
 
+  // MainActivity.load() reads this block from the synced capacitor.config.json
+  // for a server boot (Capacitor reads it itself for the setup page), so the
+  // plugins see the same values on both.
   plugins: {
+    // The app's own insets listener (MainActivity) pads the WebView for the
+    // system bars and the keyboard. Capacitor's SystemBars plugin must not pad
+    // the window a second time: 8.5.2 moved its listener from the WebView's
+    // parent, where the app's replaced it, to the window's decor, where both
+    // ran and a band the keyboard's height sat above the keyboard.
     SplashScreen: {
-      // Capacitor's splash plugin opts out — MainActivity shows a custom
-      // full-bleed splash overlay so the OtoDock wordmark is visible (the
-      // Android 12+ system splash clips drawables to a 192dp icon circle).
+      // Capacitor's splash plugin opts out (a zero duration installs no
+      // splash of its own): MainActivity installs the system splash itself
+      // and holds it until the dashboard's first real screen.
       launchAutoHide: true,
       launchShowDuration: 0,
-      backgroundColor: '#0C5CA1',
-      androidSplashResourceName: 'splash',
       showSpinner: false,
       splashFullScreen: false,
       splashImmersive: false,
     },
+    // The bars over the boot field until the dashboard's theme arrives: light
+    // icons, and the status bar on the field's colour (colors.xml's
+    // bootField; a test holds the two equal). MainActivity owns the bars from
+    // the page's colour after that.
+    SystemBars: {
+      insetsHandling: 'disable',
+      style: 'DARK',
+    },
     StatusBar: {
-      style: 'LIGHT',
-      backgroundColor: '#FAF9F9',
+      style: 'DARK',
+      backgroundColor: '#1d4f80',
     },
   },
 }

@@ -11,9 +11,8 @@ import re
 import subprocess
 import sys
 
-from tests._paths import PROXY_DIR, REPO_ROOT
-
 from core.events import common_events as ce
+from tests._paths import PROXY_DIR, REPO_ROOT
 from ws import wire_events as wire
 
 MIRROR = REPO_ROOT / "dashboard" / "src" / "api" / "wireEvents.ts"
@@ -31,8 +30,9 @@ def _constants(module, prefix: str = "") -> dict[str, str]:
 # The constants that alias a frame name for another vocabulary (the pump
 # item, hook item, notify, phone, inbound and live-block spellings).
 _ALIAS_PREFIXES = ("PUMP_", "ITEM_", "NOTIFY_", "PHONE_", "IN_", "PERSISTED_", "SUBTYPE_")
-# UNDELIVERED_QUEUED: a card's ``reason`` value that shares the word "queued".
-_ALIASES = {"LIVE_TEXT", "LIVE_THINKING", "LIVE_TOOL", "UNDELIVERED_QUEUED"}
+# UNDELIVERED_QUEUED: a card's ``reason`` value that shares the word "queued";
+# CAUSE_DELEGATE_RESULT: a server turn's ``cause``, the result frame's word.
+_ALIASES = {"LIVE_TEXT", "LIVE_THINKING", "LIVE_TOOL", "UNDELIVERED_QUEUED", "CAUSE_DELEGATE_RESULT"}
 
 
 def _frame_constants() -> dict[str, str]:
@@ -45,7 +45,7 @@ def test_every_frame_is_a_constant_and_every_constant_a_frame():
     # Every FRAMES key is the value of an upper-case module constant.
     values = set(_constants(wire).values())
     assert names <= values, sorted(names - values)
-    assert len(names) == 116
+    assert len(names) == 118
     # No frame name is spelled twice.
     assert len(_frame_constants()) == len(names)
 
@@ -66,7 +66,7 @@ def test_per_chat_is_derived_from_the_table():
     assert wire.STEERED in wire.PER_CHAT_FRAMES
     # A retired prompt's card belongs to the viewed chat's stream.
     assert wire.FRAMES[wire.PROMPT_RETIRED] == wire.Frame(True, None)
-    assert len(wire.PER_CHAT_FRAMES) == 58
+    assert len(wire.PER_CHAT_FRAMES) == 59
 
 
 def test_the_persisted_spellings():
@@ -76,11 +76,12 @@ def test_the_persisted_spellings():
     assert wire.persisted_of(wire.TEXT) is None          # an assistant row
     assert wire.persisted_of(wire.MEDIA_PROCESSING) is None
     assert wire.persisted_of(wire.TASK_SPAWN) == "task_spawn"
+    assert wire.persisted_of(wire.MCP_COST) == "mcp_cost"   # the fee's own row
     assert wire.persisted_of("no-such-frame") is None
     assert {f.persisted for f in wire.FRAMES.values() if f.persisted} <= wire.PERSISTED_EVENT_TYPES
     assert {"tool", "bg_nudge", "bg_command_nudge", "schedule_wake", "thinking", "system",
-            "metadata", "context_compact", "check_verdict", "ui"} <= wire.PERSISTED_EVENT_TYPES
-    assert len(wire.PERSISTED_EVENT_TYPES) == 27
+            "metadata", "mcp_cost", "context_compact", "check_verdict", "ui"} <= wire.PERSISTED_EVENT_TYPES
+    assert len(wire.PERSISTED_EVENT_TYPES) == 28
 
 
 def test_the_rename_table_covers_every_forwarded_common_event():
@@ -99,6 +100,7 @@ def test_the_rename_table_covers_every_forwarded_common_event():
     # `delegate_result`).
     assert ce.DONE not in wire.WIRE_OF_EVENT
     assert ce.ARTIFACT_TURN not in wire.WIRE_OF_EVENT
+    assert ce.BG_REVIEW_TURN not in wire.WIRE_OF_EVENT
     assert ce.QUESTION not in wire.WIRE_OF_EVENT
     assert ce.DELEGATE_RESULT not in wire.WIRE_OF_EVENT
     # The renames the finding named.
@@ -128,7 +130,8 @@ def test_the_other_vocabularies_beside_the_wire():
 
 def test_the_three_error_shapes_share_one_string():
     assert wire.ERROR == wire.PHONE_ERROR == "error"
-    assert set(wire.ErrorFrame.__annotations__) == {"chat_id", "message", "reason", "resets_at"}
+    assert set(wire.ErrorFrame.__annotations__) == {"chat_id", "message", "reason", "resets_at",
+                                                    "queue_id"}
     assert set(wire.PhoneErrorFrame.__annotations__) == {"turn", "data"}
     assert set(wire.DuplexErrorFrame.__annotations__) == {"reason"}
 
@@ -166,9 +169,10 @@ def test_the_inbound_table_names_every_message_the_two_chains_handled():
 
 
 def test_every_handler_in_the_table_is_a_connection_method():
+    import inspect
+
     import ws.dashboard  # noqa: F401  (the mixins assemble at its end)
     from ws.dashboard import DashboardConnection
-    import inspect
     for name, spec in wire.INBOUND.items():
         fn = getattr(DashboardConnection, spec.handler, None)
         assert fn is not None, f"{name}: {spec.handler} is not a DashboardConnection method"
@@ -230,14 +234,22 @@ def test_the_dashboard_mirror_equals_the_authority():
     assert set(ts_sub.values()) >= wire.SYSTEM_SUBTYPES
     synthesised = set(ts_sub.values()) - wire.SYSTEM_SUBTYPES
     assert synthesised == {"no_subscription", "pool_cap", "target_unavailable", "session_error",
-                           "below_editor", "bg_agents_completed", "bg_commands_completed"}
+                           "below_editor", "bg_agents_completed", "bg_commands_completed",
+                           "queue_refused"}
     ts_reasons = _ts_const_object(text, "WARMUP_FAILED_REASON")
     assert set(ts_reasons.values()) == wire.WARMUP_FAILED_REASONS
     assert _ts_const_object(text, "UNDELIVERED_REASON") == {
         "QUEUED": wire.UNDELIVERED_QUEUED, "TURN_FAILED": wire.UNDELIVERED_TURN_FAILED,
         "STOPPED": wire.UNDELIVERED_STOPPED}
+    assert _ts_const_object(text, "CHAT_MOVED_REASON") == {
+        "FAILED": wire.MOVED_FAILED, "RESUME_STOPPED": wire.MOVED_RESUME_STOPPED,
+        "RESUME_SKIPPED": wire.MOVED_RESUME_SKIPPED}
+    assert tuple(_ts_const_object(text, "MOVE_PHASE").values()) == wire.MOVE_PHASES
+    assert _ts_const_object(text, "WAKE_SOURCE") == {"MOVE": wire.WAKE_SOURCE_MOVE}
+    assert set(_ts_const_object(text, "SERVER_TURN_CAUSE").values()) == wire.SERVER_TURN_CAUSES
     from core.events import input_queue
     assert _ts_const_object(text, "QUEUE_WAITING") == {"RECONNECT": input_queue.WAITING_RECONNECT,
+                                                       "MACHINE": input_queue.WAITING_MACHINE,
                                                        "TERMINAL": input_queue.WAITING_TERMINAL}
     # The artifact kinds' replayable set derives from the facts table in
     # lib/kinds/artifact.ts — bound by tests/core/test_kinds.py (phase 9).
@@ -294,7 +306,8 @@ _KEY_BOUND_FRAMES = ("DocumentPreviewFrame", "PromptRetiredFrame", "QueueCleared
                      "SystemFrame", "QueuedFrame", "QueueRemovedFrame", "QueueSentFrame",
                      "SteeredFrame", "QueueSnapshotFrame", "LiveStateFrame", "ErrorFrame",
                      "PermissionPromptFrame", "PlanReviewFrame", "QuestionFrame",
-                     "DelegateResultFrame", "ShareInboxFrame")
+                     "DelegateResultFrame", "ShareInboxFrame", "PermissionResolvedFrame",
+                     "TextFrame", "ThinkingFrame", "ServerTurnStartFrame")
 
 
 def test_the_mirror_declares_the_same_keys_per_frame():
@@ -303,6 +316,11 @@ def test_the_mirror_declares_the_same_keys_per_frame():
         cls = getattr(wire, name)
         py_keys = set(cls.__required_keys__) | set(cls.__optional_keys__)
         assert py_keys == _ts_keys(name, table), name
+    # The two background-completion frames share one payload (``CountFrame``).
+    count_keys = set(wire.CountFrame.__required_keys__) | set(wire.CountFrame.__optional_keys__)
+    assert count_keys == {"chat_id", "count", "review"}
+    for name in ("BgAgentsCompleteFrame", "BgCommandsCompleteFrame"):
+        assert _ts_keys(name, table) == count_keys, name
     # The parser reads what the frames carry (a guard against a vacuous pass).
     assert {"access_token", "access_token_ttl", "wopi_url", "chat_id"} <= _ts_keys(
         "DocumentPreviewFrame", table)

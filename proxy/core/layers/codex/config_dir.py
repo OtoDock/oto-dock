@@ -94,7 +94,8 @@ def ensure_persistent_codex_dir(
     os.chmod(codex_dir, 0o700)
 
     logger.debug(
-        f"Prepared .codex/ dir: {codex_dir} "
-        f"(agent={agent_name}, user={username or '(none)'})"
+        "Prepared .codex/ dir: %s "
+        "(agent=%s, user=%s)",
+        codex_dir, agent_name, username or '(none)'
     )
     return codex_dir

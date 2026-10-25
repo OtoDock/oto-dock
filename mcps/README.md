@@ -19,6 +19,13 @@ next to the MCP. The bundled ones share one family, a blue tile with a
 [Lucide](https://lucide.dev) glyph (ISC licence); a community entry's icon
 is the upstream project's own mark.
 
+Three JSON schemas live here beside the folders, one per catalog kind:
+`manifest.schema.json` (an MCP package's `manifest.json`),
+`agent-template.schema.json` (an agent template's folder, read as one
+document) and `skill.schema.json` (a skill's `SKILL.md` front matter). The
+platform checks what it installs against them, and each community catalog's
+CI checks its entries against the copy of the release it pins.
+
 Developer docs — manifest format, sandboxing, credential brokering — live at
 [docs.otodock.io](https://docs.otodock.io). An agent can author a package
 too: the `mcp-authoring` skill bundled with `custom/mcps-mcp` (its check tool

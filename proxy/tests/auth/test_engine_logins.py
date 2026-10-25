@@ -22,8 +22,7 @@ from unittest.mock import DEFAULT, MagicMock
 import pytest
 from fastapi import HTTPException
 
-from api.auth import claude_oauth as claude_api
-from api.auth import openai_oauth as openai_api
+from api.auth import claude_oauth as claude_api, openai_oauth as openai_api
 from api.auth.openai_oauth import OAuthFinishRequest, OAuthStartRequest
 from auth import rate_limiter
 
@@ -97,7 +96,7 @@ class FakeCodex:
         self.send_signal(9)
 
     async def wait(self) -> int:
-        while self.returncode is None:
+        while self.returncode is None:  # noqa: ASYNC110  # a fake process's return code: the fake has no event
             await asyncio.sleep(0.001)
         return self.returncode
 
@@ -236,7 +235,7 @@ def test_finish_refuses_a_blob_without_identity(rig):
         assert "did not identify" in exc.value.detail
         rig.store.add_subscription.assert_not_called()
         rig.store.update_credential_data.assert_not_called()
-        assert not Path(pa.env["CODEX_HOME"]).exists()
+        assert not Path(pa.env["CODEX_HOME"]).exists()  # noqa: ASYNC240  # a test's own temporary files
 
     asyncio.run(scenario())
 
@@ -258,10 +257,10 @@ def test_finish_removes_the_login_home(rig):
     async def scenario():
         ra, pa = await _connected(rig, A)
         home = Path(pa.env["CODEX_HOME"])
-        assert home.is_dir()
+        assert home.is_dir()  # noqa: ASYNC240  # a test's own temporary files
         pa.complete(_blob("A"))
         await _finish(ra["login_id"], A)
-        assert not home.exists()
+        assert not home.exists()  # noqa: ASYNC240  # a test's own temporary files
         assert ra["login_id"] not in openai_api._active_logins
 
     asyncio.run(scenario())
@@ -345,7 +344,7 @@ def test_start_poll_and_finish_do_their_file_work_off_the_loop(rig, monkeypatch)
         assert (await _status(ra["login_id"], A))["status"] == "completed"
         await _finish(ra["login_id"], A)           # the read, the removal
         guard.armed = False
-        assert not Path(pa.env["CODEX_HOME"]).exists()
+        assert not Path(pa.env["CODEX_HOME"]).exists()  # noqa: ASYNC240  # a test's own temporary files
         rig.store.add_subscription.assert_called_once()
 
     asyncio.run(scenario())
@@ -360,7 +359,7 @@ def test_an_ended_login_and_the_sweep_remove_homes_off_the_loop(rig, monkeypatch
         guard.armed = True
         assert (await _status(ra["login_id"], A))["status"] == "failed"
         guard.armed = False
-        assert not Path(pa.env["CODEX_HOME"]).exists()
+        assert not Path(pa.env["CODEX_HOME"]).exists()  # noqa: ASYNC240  # a test's own temporary files
 
         rb, pb = await _connected(rig, B)
         openai_api._active_logins[rb["login_id"]]["started_at"] -= 1201
@@ -372,7 +371,7 @@ def test_an_ended_login_and_the_sweep_remove_homes_off_the_loop(rig, monkeypatch
         await _connected(rig, A)                   # the sweep ends B's, removes the orphan
         guard.armed = False
         assert rb["login_id"] not in openai_api._active_logins
-        assert not old.exists() and not Path(pb.env["CODEX_HOME"]).exists()
+        assert not old.exists() and not Path(pb.env["CODEX_HOME"]).exists()  # noqa: ASYNC240  # a test's own temporary files
 
     asyncio.run(scenario())
 
@@ -421,7 +420,7 @@ def test_a_cli_that_exits_during_the_poll_read_is_not_failed(rig, monkeypatch):
         loop_thread = threading.get_ident()
         _poll_read_hook(monkeypatch, write_and_exit)
         assert (await _status(ra["login_id"], A))["status"] in ("pending", "completed")
-        assert Path(pa.env["CODEX_HOME"]).is_dir()
+        assert Path(pa.env["CODEX_HOME"]).is_dir()  # noqa: ASYNC240  # a test's own temporary files
         assert ra["login_id"] in openai_api._active_logins
 
     asyncio.run(scenario())
@@ -468,7 +467,7 @@ def test_a_failed_login_is_ended_when_reported(rig):
         pa.exit(1)
         assert (await _status(ra["login_id"], A))["status"] == "failed"
         assert ra["login_id"] not in openai_api._active_logins
-        assert not home.exists()
+        assert not home.exists()  # noqa: ASYNC240  # a test's own temporary files
 
     asyncio.run(scenario())
 
@@ -521,7 +520,7 @@ def test_a_start_replaced_by_a_newer_one_answers_409(rig):
         pa2.release()
         ra2 = await ta2
         assert list(openai_api._active_logins) == [ra2["login_id"]]
-        assert not Path(pa.env["CODEX_HOME"]).exists()
+        assert not Path(pa.env["CODEX_HOME"]).exists()  # noqa: ASYNC240  # a test's own temporary files
 
     asyncio.run(scenario())
 
@@ -539,7 +538,7 @@ def test_the_sweep_removes_stale_logins_and_orphan_homes(rig):
         await _connected(rig, B)
         assert ra["login_id"] not in openai_api._active_logins
         assert 15 in pa.signals
-        assert not Path(pa.env["CODEX_HOME"]).exists()
+        assert not Path(pa.env["CODEX_HOME"]).exists()  # noqa: ASYNC240  # a test's own temporary files
         assert not old.exists()
         assert young.is_dir()
 

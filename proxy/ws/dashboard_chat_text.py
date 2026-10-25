@@ -16,7 +16,8 @@ import config
 # end in spaces instead of a line break).
 _TIME_PRELUDE_RE = re.compile(
     r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
-    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\.)\]"
+    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\."
+    r'|Meeting "[^\n]{0,4000}? you have only this note\.)\]'
     r"(?:[ \t]*(?:\r?\n+|$)|[ \t]+)"
 )
 
@@ -33,17 +34,6 @@ def interactive_prelude(text: str, *, user_tz: str | None, focus_line: str = "")
     the browser's own stamp (``withInteractiveTime``), the same shape."""
     focus = f"{focus_line}\n\n" if focus_line else ""
     return f"[Current time: {config.format_current_time(user_tz)}]\n\n{focus}{text}"
-
-
-
-def task_prelude(text: str, *, user_tz: str | None, parallel_line: str = "") -> str:
-    """A task run's first prompt into a terminal: the time stamp and the
-    parallel-activity line ahead of the text on the SAME line (the matchers
-    above end a prelude at spaces too). The Claude TUI journals a multi-line
-    prompt, which reaches it as a bracketed paste, wrapped as pasted
-    content; a single-line task prompt stays a typed line."""
-    head = f"[Current time: {config.format_current_time(user_tz)}]"
-    return " ".join(part for part in (head, parallel_line, text) if part)
 
 
 async def live_model(model: str) -> str:
@@ -143,13 +133,55 @@ LIVE_TERMINAL_REFUSED = "refused"
 # written) while its chat's machine reconnects.
 RECONNECTING_NOT_SENT = ("Not sent: the machine running this chat is reconnecting. "
                          "Send it again once it is back.")
+# The card a warmup ends with when the chat's machine did not answer the
+# resume probe within its budget: the chat keeps its session and its history,
+# the message above it was not delivered.
+MACHINE_BUSY_NOT_SENT = ("The machine running this chat is not answering. Your message "
+                         "above was not delivered; send it again in a moment.")
+# The same, for a chat whose session files are on this server and could not
+# be read (a disk fault): nothing of the chat changes.
+SESSION_FILES_UNREAD_NOT_SENT = ("The files of this chat could not be read. Your message "
+                                 "above was not delivered; send it again in a moment.")
+# The line for a turn whose row is written (a server kick, an interaction)
+# when the chat's machine is connected but did not answer the resume probe.
+MACHINE_NOT_ANSWERING_NOT_SENT = ("Not sent: the machine running this chat is not answering. "
+                                  "Send it again in a moment.")
 
 
 class TurnDeferred(Exception):
-    """A turn's session is still held in its machine's reconnect grace once
-    the wait is over: the start is put off and nothing of the session is
-    touched. Every caller of ``_start_new_stream`` catches it, except
-    ``_run_server_turn``, which lets it reach its own callers."""
+    """A turn's start is put off and nothing of the session is touched: its
+    session is still held in its machine's reconnect grace once the wait is
+    over (the reconnect pass arms what waited), or the machine is connected
+    but did not answer the resume probe within the inline budget
+    (``unanswered``: ``ws/resume_wait`` arms what waited when the probe
+    answers, or after a bounded wait). Every caller of ``_start_new_stream``
+    catches it, except ``_run_server_turn``, which lets it reach its own
+    callers. ``waiting``, ``why``, ``not_sent_text`` and ``subtype`` are the
+    words each case puts on the chip, in the log and on the line."""
+
+    def __init__(self, session_id: str = "", *, unanswered: bool = False) -> None:
+        super().__init__(session_id)
+        self.session_id = session_id
+        self.unanswered = unanswered
+
+    @property
+    def waiting(self) -> str:
+        from core.events import input_queue
+        return input_queue.WAITING_MACHINE if self.unanswered else input_queue.WAITING_RECONNECT
+
+    @property
+    def why(self) -> str:
+        return "the machine is not answering" if self.unanswered else "the machine is reconnecting"
+
+    @property
+    def not_sent_text(self) -> str:
+        return MACHINE_NOT_ANSWERING_NOT_SENT if self.unanswered else RECONNECTING_NOT_SENT
+
+    @property
+    def subtype(self) -> str:
+        from ws import wire_events as wire
+        return (wire.SUBTYPE_MACHINE_NOT_ANSWERING if self.unanswered
+                else wire.SUBTYPE_MACHINE_RECONNECTING)
 
 
 def grace_layer(session_id: str, fallback):

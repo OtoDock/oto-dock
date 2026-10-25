@@ -41,7 +41,7 @@ import asyncio
 import base64
 import logging
 from collections import deque
-from typing import Iterable, Optional
+from collections.abc import Iterable
 
 from core.sandbox.pty_relay import DEFAULT_SCROLLBACK_BYTES, ExitCb, OutputCb
 
@@ -60,13 +60,15 @@ logger = logging.getLogger("otodock.remote_pty")
 # ``core.terminal_queries`` (shared with the input-side strip and mirrored to
 # the satellite's replay sanitizer).
 from core.background import spawn
-from core.terminal_queries import PasteModeTracker
-from core.terminal_queries import strip_queries as _strip_terminal_queries
+from core.terminal_queries import (
+    PasteModeTracker,
+    strip_queries as _strip_terminal_queries,
+)
 
 # (machine_id, session_id) -> RemotePtyProcess. The single routing table for
 # inbound pty_output / pty_exit frames. An entry is added on construction and
 # removed when the handle's exit fires (satellite-reported or local close).
-_remote_ptys: dict[tuple[str, str], "RemotePtyProcess"] = {}
+_remote_ptys: dict[tuple[str, str], RemotePtyProcess] = {}
 
 
 def feed_output(machine_id: str, session_id: str, data: bytes) -> None:
@@ -76,7 +78,7 @@ def feed_output(machine_id: str, session_id: str, data: bytes) -> None:
         rp._feed_output(data)
 
 
-def feed_exit(machine_id: str, session_id: str, code: Optional[int]) -> None:
+def feed_exit(machine_id: str, session_id: str, code: int | None) -> None:
     """Route a satellite ``pty_exit`` frame to its RemotePtyProcess."""
     rp = _remote_ptys.get((machine_id, session_id))
     if rp is not None:
@@ -92,7 +94,7 @@ def cancel_machine_ptys(machine_id: str) -> None:
     than hanging on a stream that will never resume. (A future grace-window
     re-adopt is a planned enhancement.)
     """
-    for (mid, sid), rp in list(_remote_ptys.items()):
+    for (mid, _sid), rp in list(_remote_ptys.items()):
         if mid == machine_id:
             rp._feed_exit(None)
 
@@ -163,20 +165,20 @@ class RemotePtyProcess:
         rows: int,
         cols: int,
         on_output: OutputCb,
-        on_exit: Optional[ExitCb],
+        on_exit: ExitCb | None,
         scrollback_limit: int,
     ) -> None:
         self.machine_id = machine_id
         self.session_id = session_id
         # Satellite-reported pid (filled from the pty_open ack) — for log parity
         # with PtyProcess.pid; the proxy never signals it directly.
-        self.pid: Optional[int] = None
+        self.pid: int | None = None
         self.rows = rows
         self.cols = cols
         self._on_output = on_output
         self._on_exit = on_exit
         self._scrollback_limit = scrollback_limit
-        self._scrollback: "deque[bytes]" = deque()
+        self._scrollback: deque[bytes] = deque()
         self._scrollback_len = 0
         self._paste_mode = PasteModeTracker()
         self._loop = asyncio.get_running_loop()
@@ -202,7 +204,7 @@ class RemotePtyProcess:
         except Exception:
             logger.exception("remote pty %s: on_output failed", self.session_id[:8])
 
-    def _feed_exit(self, code: Optional[int]) -> None:
+    def _feed_exit(self, code: int | None) -> None:
         # The satellite reports the PTY process ended (or the machine dropped).
         self._fire_exit(code)
 
@@ -268,7 +270,7 @@ class RemotePtyProcess:
         # still arrives) is deduped by the _exit_fired guard in _fire_exit.
         self._fire_exit(None)
 
-    def _fire_exit(self, code: Optional[int]) -> None:
+    def _fire_exit(self, code: int | None) -> None:
         _remote_ptys.pop((self.machine_id, self.session_id), None)
         self._closed = True
         if self._exit_fired:
@@ -306,7 +308,7 @@ async def spawn_remote_pty(
     rows: int,
     cols: int,
     on_output: OutputCb,
-    on_exit: Optional[ExitCb] = None,
+    on_exit: ExitCb | None = None,
     scrollback_limit: int = DEFAULT_SCROLLBACK_BYTES,
     timeout: float = 60.0,
 ) -> RemotePtyProcess:

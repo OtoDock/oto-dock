@@ -35,11 +35,11 @@ import time
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, Request
+import psycopg
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
-from api.apps import manifest as _mf
 from api.apps.app_proxy import (
     _CORS,
     _DROP_RESPONSE,
@@ -51,15 +51,14 @@ from api.apps.app_proxy import (
     _unavailable,
     check_app_path,
     check_rate,
-    forward,
     resolve_caller,
 )
-from services.apps import app_supervisor, app_tokens, releases
-from storage import database as task_store
-from storage import db_app_deliveries as deliveries
-from storage.pg import run_db
-from auth.providers import effective_role_of
 from auth import roles
+from auth.providers import effective_role_of
+from services.apps import app_supervisor, app_tokens, manifest as _mf, releases
+from services.apps.app_supervisor import forward
+from storage import database as task_store, db_app_deliveries as deliveries
+from storage.pg import run_db
 
 logger = logging.getLogger("otodock.apps")
 router = APIRouter()
@@ -136,8 +135,8 @@ def role_on(sub: str, agent: str) -> str:
 
 
 def floor_ok(entry: dict, role: str) -> bool:
-    """The default floor is reachable on the edge alone; ``editor`` and
-    ``manager`` need membership on the target."""
+    """The default floor is reachable on the edge alone; ``contributor``,
+    ``editor`` and ``manager`` need that rank on the target."""
     return _mf.meets_floor({"min_role": entry.get("min_role")}, role)
 
 
@@ -238,7 +237,7 @@ def _read_regular(base: Path, name: str) -> tuple[bytes, os.stat_result]:
             os.close(efd)
     except OSError as e:
         if e.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise _refuse(502, "the snapshot is not a regular file")
+            raise _refuse(502, "the snapshot is not a regular file") from e
         raise
     finally:
         os.close(dfd)
@@ -275,9 +274,9 @@ def _read_snapshot(target: dict, name: str) -> tuple[bytes, str] | None:
         except FileNotFoundError:
             if attempt:
                 return None
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError) as exc:
             if attempt:
-                raise _refuse(502, "the snapshot is not valid JSON")
+                raise _refuse(502, "the snapshot is not valid JSON") from exc
         time.sleep(0.05)
     return None
 
@@ -372,7 +371,7 @@ async def broker(app_id: str, name: str, path: str, request: Request):
         _release()
         logger.warning("Binding %s→%s: upstream error on %s: %s", row.get("slug"),
                        target.get("slug"), path, e)
-        raise _refuse(502, "that app did not answer")
+        raise _refuse(502, "that app did not answer") from e
     except BaseException:
         _release()
         raise
@@ -437,8 +436,8 @@ async def emit_event(app_id: str, request: Request):
         raise _refuse(413, "event larger than 32 KB")
     try:
         doc = json.loads(body or b"{}")
-    except ValueError:
-        raise _refuse(400, "a JSON body is required")
+    except ValueError as exc:
+        raise _refuse(400, "a JSON body is required") from exc
     name = str((doc or {}).get("name") or "") if isinstance(doc, dict) else ""
     payload = (doc or {}).get("payload") if isinstance(doc, dict) else None
     events = _mf.parse_exports(row).get("events") or {}
@@ -459,8 +458,8 @@ async def emit_event(app_id: str, request: Request):
         if not sub_row or sub_row.get("hidden"):
             continue
         try:
-            await run_db(lambda: gate(sub_row, row))
-        except Exception:
+            await run_db(lambda sub_row=sub_row: gate(sub_row, row))
+        except (HTTPException, psycopg.Error, ValueError):
             continue
         d = await app_handlers.enqueue(
             sub_row, handler, f"app:{bname}:{name}",

@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 
 from tests._paths import PROXY_DIR
+
 _FWD = PROXY_DIR / "hooks" / "tool_result_forwarder.py"
 _spec = importlib.util.spec_from_file_location("tool_result_forwarder", _FWD)
 forwarder = importlib.util.module_from_spec(_spec)

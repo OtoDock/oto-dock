@@ -403,6 +403,191 @@ def test_compose_hint_creates_config_env_private(tmp_path, fakebin):
     assert (work / "config.env").read_text().startswith("POSTGRES_PASSWORD=")
 
 
+# ── install-baseline-tools.sh: where pasta comes from ──────────────────
+
+_BASELINE = (SCRIPTS / "install-baseline-tools.sh").read_text()
+_PASST_PIN = re.search(r'local passt_ver="\$\{PASST_VERSION:-([^}]+)\}"', _BASELINE).group(1)
+_PASST_COMMIT = re.search(r'local passt_commit="([0-9a-f]{40})"', _BASELINE).group(1)
+_DEBIAN_12 = "0.0~git20230309.7c7625d-1"
+
+# sudo logs and runs nothing: an apt-get of passt leaves a distro pasta (or
+# fails with FAKE_APT_FAIL), the install of passt.new leaves the built one,
+# tee swallows its input. The host's /usr/local/bin is never touched.
+_PASST_FAKES = {
+    "sudo": r'''#!/bin/sh
+echo "sudo $*" >> "$FAKE_CALLS"
+for a; do last="$a"; done
+case "$1" in
+  apt-get) if [ "$last" = passt ]; then
+             [ -n "${FAKE_APT_FAIL:-}" ] && exit 100
+             printf '#!/bin/sh\necho "pasta unknown version"\n' > "$FAKEBIN/pasta"; chmod +x "$FAKEBIN/pasta"
+           fi ;;
+  install) if [ "$last" = /usr/local/bin/passt.new ]; then
+             printf '#!/bin/sh\necho "pasta %s"\n' "$FAKE_BUILT" > "$FAKEBIN/pasta"; chmod +x "$FAKEBIN/pasta"
+           fi ;;
+  tee) cat > /dev/null ;;
+esac
+exit 0
+''',
+    "apt-cache": '#!/bin/sh\necho "  Candidate: ${FAKE_CANDIDATE:-(none)}"\n',
+    "git": r'''#!/bin/sh
+echo "git $*" >> "$FAKE_CALLS"
+case " $* " in
+  *" clone "*) [ -n "${FAKE_CLONE_FAIL:-}" ] && exit 128
+               for a; do dir="$a"; done
+               mkdir -p "$dir/LICENSES" && touch "$dir/LICENSES/GPL-2.0-or-later.txt" ;;
+  *" rev-parse "*) echo "$FAKE_HEAD" ;;
+  *" archive "*) prev=""; for a; do [ "$prev" = -o ] && touch "$a"; prev="$a"; done ;;
+esac
+''',
+    "make": r'''#!/bin/sh
+echo "make $*" >> "$FAKE_CALLS"
+[ -n "${FAKE_MAKE_FAIL:-}" ] && exit 2
+prev=""; for a; do [ "$prev" = -C ] && touch "$a/passt"; prev="$a"; done
+''',
+    "curl": '#!/bin/sh\necho "curl $*" >> "$FAKE_CALLS"\nexit 7\n',
+    "uname": "#!/bin/sh\necho x86_64\n",
+}
+
+
+def _baseline_function(name: str) -> str:
+    """A function of the installer as text: one line, or up to its closing brace."""
+    m = (re.search(rf"^{name}\(\) \{{[^\n]*\}}\n", _BASELINE, re.M)
+         or re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", _BASELINE, re.S | re.M))
+    assert m, name
+    return m.group(0)
+
+
+def _netns(tmp_path, mode, *, pasta=None, candidate=_DEBIAN_12, head=_PASST_COMMIT, **fail):
+    """install_netns_tools from the real installer, with fakes for every tool
+    it runs and a PATH holding nothing else: the host's own pasta, apt and git
+    are never reached. ``pasta`` is the version an existing pasta prints;
+    ``fail`` sets FAKE_CLONE_FAIL / FAKE_MAKE_FAIL / FAKE_APT_FAIL. Returns the
+    run and the calls logged."""
+    fakes, tools = tmp_path / "netnsbin", tmp_path / "netnstools"
+    for d in (fakes, tools):
+        d.mkdir()
+    bodies = dict(_PASST_FAKES)
+    if pasta:
+        bodies["pasta"] = f'#!/bin/sh\necho "pasta {pasta}"\n'
+    for name, body in bodies.items():
+        (fakes / name).write_text(body)
+        (fakes / name).chmod(0o755)
+    for name in ("bash", "cat", "chmod", "head", "mkdir", "mktemp", "rm", "sed", "sort", "touch"):
+        (tools / name).symlink_to(shutil.which(name))
+    calls = tmp_path / "netns.log"
+    calls.touch()
+    script = ('set -euo pipefail\n'
+              'info() { echo "[INFO] $*"; }; ok() { echo "[OK] $*"; }\n'
+              'warn() { echo "[WARN] $*"; }; err() { echo "[ERROR] $*" >&2; }\n'
+              f'SUDO=sudo\nOTODOCK_PASST_BUILD={mode}\n'
+              + "".join(_baseline_function(n) for n in
+                        ("_older", "_passt_date", "_install_passt", "_build_pinned_passt", "install_netns_tools"))
+              + "install_netns_tools\n")
+    env = {"PATH": f"{fakes}:{tools}", "FAKE_CALLS": str(calls), "FAKEBIN": str(fakes),
+           "FAKE_CANDIDATE": candidate, "FAKE_HEAD": head, "FAKE_BUILT": _PASST_PIN,
+           "TMPDIR": str(tmp_path)}
+    env.update({f"FAKE_{k.upper()}_FAIL": "1" for k, v in fail.items() if v})
+    r = subprocess.run([str(tools / "bash"), "-c", script], env=env, cwd=tmp_path,
+                       capture_output=True, text=True, timeout=60)
+    return r, calls.read_text().splitlines()
+
+
+_APT_PASST = "sudo apt-get install -y --no-install-recommends passt"
+
+
+def test_passt_dates_read_every_version_form(tmp_path):
+    script = _baseline_function("_passt_date") + "".join(
+        f'echo "[$(_passt_date "{v}")]"\n' for v in (
+            "pasta 2026_10_02.cba3570", "pasta 2026_06_11.a9c61ff-31-gbf21038",
+            _DEBIAN_12, "pasta unknown version", ""))
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+    assert r.stdout.split() == ["[2026_10_02]", "[2026_06_11]", "[2023_03_09]", "[]", "[]"], r.stderr
+
+
+def test_passt_builds_the_pin_and_keeps_its_source(tmp_path):
+    r, calls = _netns(tmp_path, "required")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"[OK] pasta installed — pasta {_PASST_PIN}" in r.stdout
+    clone = next(c for c in calls if " clone " in c)
+    assert f"--branch {_PASST_PIN} https://passt.top/passt" in clone
+    order = [c.split()[0] + " " + c.split()[1] for c in calls if not c.startswith("sudo apt-get")]
+    assert order[:4] == ["git -c", "git -C", "make -s", "sudo install"], calls
+    assert any(" archive " in c and f"passt-{_PASST_PIN}.tar.gz" in c for c in calls)
+    assert any(c.startswith("sudo install -m 0644") and f"passt-{_PASST_PIN}.tar.gz" in c
+               and c.endswith("/usr/local/share/doc/passt/") for c in calls), calls
+    # Copied beside first, then the old layout replaced, then the link.
+    swap = [c for c in calls if "/usr/local/bin/" in c]
+    assert [c.split()[1] for c in swap] == ["install", "rm", "mv", "ln"], swap
+    assert _APT_PASST not in calls
+
+
+@pytest.mark.parametrize("head", [
+    _PASST_COMMIT[:7] + "0" * 33,        # the tag's short sha, another commit
+    "0123456789" * 4,                    # nothing of the tag's
+])
+def test_passt_refuses_a_clone_that_is_not_the_pinned_commit(tmp_path, head):
+    r, calls = _netns(tmp_path, "required", head=head)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"resolves to commit {head}, not the pinned one" in r.stderr
+    assert not [c for c in calls if c.startswith(("make", "sudo install", "sudo mv"))], calls
+
+
+def test_passt_required_fails_on_a_failed_clone_and_takes_no_other(tmp_path):
+    r, calls = _netns(tmp_path, "required", clone=True)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "did not build, and this install takes no other" in r.stderr
+    assert _APT_PASST not in calls and not [c for c in calls if c.startswith("curl")]
+
+
+def test_passt_auto_falls_back_to_the_distro_on_a_failed_build(tmp_path):
+    r, calls = _netns(tmp_path, "auto", make=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert calls.index(_APT_PASST) > next(i for i, c in enumerate(calls) if c.startswith("make"))
+    assert "[WARN] passt installed from the distro" in r.stdout
+
+
+def test_passt_auto_keeps_a_pasta_below_the_floor_when_the_build_fails(tmp_path):
+    r, calls = _netns(tmp_path, "auto", pasta="0.0~git20230309.7c7625d-1", make=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "stays, below the floor" in r.stdout and _APT_PASST not in calls
+
+
+def test_passt_distro_mode_never_clones(tmp_path):
+    r, calls = _netns(tmp_path, "distro")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [c for c in calls if c.startswith(("git", "make"))], calls
+    assert _APT_PASST in calls
+
+
+def test_passt_distro_mode_without_a_distro_passt_warns_and_goes_on(tmp_path):
+    """A paired machine on a release with no passt package (Ubuntu 22.04):
+    no build, no upstream download, no failure of the pairing."""
+    r, calls = _netns(tmp_path, "distro", candidate="(none)", apt=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [c for c in calls if c.startswith(("git", "make", "curl"))], calls
+    assert "[WARN] no pasta on this host (OTODOCK_PASST_BUILD=distro)" in r.stdout
+
+
+@pytest.mark.parametrize("mode, pasta, candidate, apt", [
+    ("auto", "2026_06_11.a9c61ff-31-gbf21038", _DEBIAN_12, False),   # at or above the floor: stays
+    ("required", "2026_10_02.cba3570", _DEBIAN_12, False),
+    ("auto", None, "0.0~git20240220.1e6f92b-1", True),               # Ubuntu 24.04's candidate
+])
+def test_passt_takes_nothing_new_when_the_host_or_distro_reaches_the_floor(tmp_path, mode, pasta, candidate, apt):
+    r, calls = _netns(tmp_path, mode, pasta=pasta, candidate=candidate)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [c for c in calls if c.startswith(("git", "make"))], calls
+    assert (_APT_PASST in calls) is apt
+
+
+def test_passt_required_never_takes_the_distro_candidate(tmp_path):
+    # The image builds the pin even where the distro offers one above the floor.
+    r, calls = _netns(tmp_path, "required", candidate="0.0~git20240220.1e6f92b-1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _APT_PASST not in calls and any(" clone " in c for c in calls)
+
+
 # ── dev-setup.sh stops while the platform's units run ──────────────────
 
 # A stand-in for systemctl: `is-active --quiet <unit>` answers 0 for a unit
@@ -416,13 +601,17 @@ exit 3
 '''
 
 
-def _dev_setup(tmp_path, *flags, active="", systemctl=True):
+def _dev_setup(tmp_path, *flags, active="", systemctl=True, node_major=None,
+               node_at="/usr/bin/node"):
     """Run a copy of dev-setup.sh from a scratch platform root whose
     installer is a stub that logs and exits 7, so a run past the guard stops
-    at its second step. PATH holds only logging fakes of node (answering the
-    pinned major), uv and docker, systemctl unless ``systemctl`` is False,
-    and the system tools the script runs before that step. Returns the run
-    and the calls logged, systemctl's apart."""
+    at its second step. PATH holds only logging fakes of node (answering
+    ``node_major``, the pinned major by default), uv, docker, curl and sudo
+    (which runs nothing), readlink (resolving every path to ``node_at``), id
+    (a non-root user, so the script always goes through the fake sudo),
+    systemctl unless ``systemctl`` is False, and the system tools the script
+    runs before that step. Returns the run and the calls logged, systemctl's
+    apart."""
     root = tmp_path / "root"
     (root / "scripts").mkdir(parents=True)
     for name in ("dev-setup.sh", "versions.sh"):
@@ -432,8 +621,16 @@ def _dev_setup(tmp_path, *flags, active="", systemctl=True):
         'echo installer >> "$FAKE_CALLS"\nexit 7\n')
     node = re.search(r"^NODE_VERSION=(\S+)", (REPO / "VERSIONS.md").read_text(), re.M)
     assert node, "VERSIONS.md has no NODE_VERSION"
-    bodies = {name: f'#!/bin/sh\necho "{name} $*" >> "$FAKE_CALLS"\n' for name in ("uv", "docker")}
-    bodies["node"] = f'#!/bin/sh\necho "node $*" >> "$FAKE_CALLS"\necho v{node.group(1)}\n'
+    major = node_major or node.group(1).split(".")[0]
+    bodies = {name: f'#!/bin/sh\necho "{name} $*" >> "$FAKE_CALLS"\n' for name in ("uv", "docker", "curl")}
+    bodies["node"] = f'#!/bin/sh\necho "node $*" >> "$FAKE_CALLS"\necho v{major}.0.0\n'
+    # `curl ... | sudo -E bash -`: the fake drains the pipe BEFORE it records,
+    # so its line follows curl's (curl has exited once the pipe closes). With
+    # the shell's own `read`: the PATH below has no `cat`.
+    bodies["sudo"] = ('#!/bin/sh\nif [ "$1" = -E ]; then while IFS= read -r _; do :; done; fi\n'
+                      'echo "sudo $*" >> "$FAKE_CALLS"\nexit 0\n')
+    bodies["readlink"] = f'#!/bin/sh\necho "{node_at}"\n'
+    bodies["id"] = '#!/bin/sh\necho 1000\n'
     if systemctl:
         bodies["systemctl"] = FAKE_SYSTEMCTL
     fakes, tools, home = tmp_path / "devbin", tmp_path / "tools", tmp_path / "home"
@@ -485,6 +682,33 @@ def test_dev_setup_goes_on_past_the_guard(tmp_path, active, systemctl):
     assert asked == (["systemctl is-active --quiet otodock-proxy"] if systemctl else [])
     # The Node step ran, then the stub installer ended the run.
     assert calls[-1] == "installer" and calls[:-1] and set(calls[:-1]) == {"node -v"}
+
+
+@pytest.mark.parametrize("major", ["24", None])
+def test_dev_setup_stops_on_a_node_outside_usr_before_any_change(tmp_path, major):
+    # A version manager's node first on PATH hides the one NodeSource would
+    # install, whatever its major: the run stops before sudo, curl or apt.
+    nvm = "/home/tester/.nvm/versions/node/v26.12.0/bin/node"
+    r, _, calls = _dev_setup(tmp_path, node_major=major, node_at=nvm)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"node at {nvm} is not under /usr" in r.stderr
+    assert not [c for c in calls if c.startswith(("sudo", "curl", "installer"))], calls
+
+
+def test_dev_setup_moves_node_through_one_nodesource_source(tmp_path):
+    # A host the baseline installer set up first carries nodesource.list for
+    # its major: it goes before NodeSource's own setup writes the new source.
+    r, _, calls = _dev_setup(tmp_path, node_major="24")
+    assert r.returncode == 7, r.stdout + r.stderr
+    pin = re.search(r"^NODE_VERSION=(\d+)\.", (REPO / "VERSIONS.md").read_text(), re.M).group(1)
+    steps = [c for c in calls if c.startswith(("sudo", "curl"))]
+    assert steps == [
+        "sudo rm -f /etc/apt/sources.list.d/nodesource.list",
+        f"curl -fsSL https://deb.nodesource.com/setup_{pin}.x",
+        "sudo -E bash -",
+        "sudo apt-get install -y nodejs",
+    ], steps
+    assert calls[-1] == "installer"
 
 
 # ── install.sh: free disk where Docker keeps its images ────────────────
@@ -574,8 +798,8 @@ def test_disk_preflight_floor_must_be_a_whole_number(tmp_path):
 
 # ── restore.sh on a run directory ───────────────────────────────────────────
 
-import gzip  # noqa: E402
-import io  # noqa: E402
+import gzip
+import io
 
 KEY_A = "a" * 32
 KEY_B = "b" * 32
@@ -824,6 +1048,68 @@ def test_a_skipped_tree_restores_the_database_and_says_why(tmp_path, fakebin):
     assert "backup skipped the trees" in r.stderr and (vol / "stale.txt").exists()
 
 
+def _snapshot_dir(tmp_path, *, version="1.8.0", shape="1.9", folder="upgrade-20261030-120000") -> Path:
+    """An upgrade.sh snapshot: the dump under its timestamped name, the env
+    and compose copies, and the manifest a 1.9.0 (``trees=none``) or a 1.8.x
+    (``agents=skipped``) upgrade.sh wrote."""
+    d = tmp_path / folder
+    d.mkdir()
+    dump = "otodock-otodock-20261030-120000.sql.gz"
+    with gzip.open(d / dump, "wb") as fh:
+        fh.write(b"SELECT 1;\n")
+    for name in (".env", "docker-compose.yml"):
+        (d / name).write_text("# the copy upgrade.sh made\n")
+    trees = ["trees=none"] if shape == "1.9" else ["agents=skipped", "ssh_keys=skipped"]
+    lines = [f"otodock_version={version}", "created_at=2026-10-30T12:00:00Z", "topology=docker",
+             "project=otodock", "database=otodock", f"db={dump}", "env=1", *trees,
+             "credential_keys=" + json.dumps({KEY_A: "JWT_SECRET"}), "errors=0", "complete=1"]
+    (d / "manifest").write_text("\n".join(lines) + "\n")
+    return d
+
+
+@pytest.mark.parametrize("shape, folder", [
+    ("1.9", "upgrade-20261030-120000"),
+    ("1.8", "renamed-by-hand"),          # the 1.8.x manifest's own shape
+    ("1.8", "upgrade-20261030-120000-2"),
+], ids=["trees-none", "1.8-shape", "1.8-folder-name"])
+def test_an_upgrade_snapshot_restores_the_database_and_says_it_holds_no_trees(
+        tmp_path, fakebin, shape, folder):
+    containers, vol = _stack(tmp_path)
+    d = _snapshot_dir(tmp_path, shape=shape, folder=folder)
+    r = _restore(tmp_path, fakebin, containers, d)
+    assert r.returncode == 0, r.stderr
+    assert "the snapshot upgrade.sh takes before it changes anything" in r.stderr
+    assert "copy .env\n  and the compose files from" in r.stderr
+    assert "not readable" not in r.stderr and "skipped the trees" not in r.stderr
+    assert _fed(tmp_path) and (vol / "stale.txt").exists()
+
+
+def test_a_1_8_shaped_manifest_with_a_host_line_is_a_backup_run(tmp_path, fakebin):
+    """backup.sh always records the host: its skipped trees keep their reason."""
+    containers, _ = _stack(tmp_path)
+    d = _snapshot_dir(tmp_path, shape="1.8", folder="renamed-by-hand")
+    (d / "manifest").write_text((d / "manifest").read_text() + "host=box\n")
+    r = _restore(tmp_path, fakebin, containers, d)
+    assert r.returncode == 0, r.stderr
+    assert "backup skipped the trees" in r.stderr and "upgrade.sh takes" not in r.stderr
+
+
+def test_an_older_upgrade_snapshot_says_the_running_release_migrates_it_again(tmp_path, fakebin):
+    containers, _ = _stack(tmp_path)
+    d = _snapshot_dir(tmp_path, version="1.7.1")
+    r = _restore(tmp_path, fakebin, containers, d)
+    assert r.returncode == 0, r.stderr
+    assert "taken on OtoDock 1.7.1 and this install runs 1.8.0" in r.stderr
+    assert "migrates the restored database to 1.8.0 again" in r.stderr
+    # A backup.sh run as old says nothing of the kind.
+    (tmp_path / "two").mkdir()
+    containers2, _ = _stack(tmp_path / "two")
+    r = _restore(tmp_path / "two", fakebin, containers2,
+                 _run_dir(tmp_path / "two", version="1.7.1", keys={KEY_A: "JWT_SECRET"}))
+    assert r.returncode == 0, r.stderr
+    assert "migrates the restored database" not in r.stderr
+
+
 def test_a_set_agents_dir_restores_onto_this_host_beside_a_stack(tmp_path, fakebin):
     """As for backup.sh, OTODOCK_AGENTS_DIR names this host: the trees land
     in that directory and no one-off container runs on the proxy's image,
@@ -979,3 +1265,121 @@ def test_an_incomplete_tree_is_named_before_the_confirmation(tmp_path, fakebin):
     assert r.returncode == 0, r.stderr
     assert "errors=2" in r.stderr and "incomplete" in r.stderr
     assert r.stderr.index("incomplete") < len(r.stderr) and "Type 'yes'" in r.stdout
+
+
+# ── compose.sh: Collabora's scheme and the Docker Engine floor ─────────
+
+# A stand-in docker for compose.sh: `version` answers FAKE_API; every other
+# call is logged with the COLLABORA_SSL_TERMINATION it saw.
+FAKE_COMPOSE_DOCKER = r'''#!/bin/sh
+if [ "$1" = version ]; then echo "${FAKE_API-1.51}"; exit 0; fi
+if [ "$1" = compose ] && [ "$2" = version ]; then echo "${FAKE_COMPOSE-2.35.1}"; exit 0; fi
+echo "$* term=${COLLABORA_SSL_TERMINATION:-unset}" >> "$FAKE_LOG"
+exit 0
+'''
+
+
+@pytest.mark.parametrize("config_env, shell, api, args, rc, term", [
+    ("DASHBOARD_PUBLIC_URL=https://otodock.example.com\n", {}, "1.51", ["up", "-d"], 0, "true"),
+    ('DASHBOARD_PUBLIC_URL="HTTPS://otodock.example.com"\n', {}, "1.51", ["up", "-d"], 0, "true"),
+    ("DASHBOARD_PUBLIC_URL=http://192.168.1.5:8400\nCOLLABORA_SSL_TERMINATION=true\n", {}, "1.51",
+     ["up", "-d"], 0, "false"),
+    ("", {}, "1.45", ["up", "-d"], 0, "false"),
+    ("DASHBOARD_PUBLIC_URL=http://h:8400\n", {"COLLABORA_SSL_TERMINATION": "true"}, "1.51", ["up"], 0, "true"),
+    ("", {}, "1.44", ["up", "-d"], 1, None),
+    ("", {}, "1.44", ["logs", "-f"], 0, "false"),
+    ("", {}, "1.44", ["down"], 0, "false"),
+    ("export DASHBOARD_PUBLIC_URL=https://x.example  # the public address\n", {}, "1.51", ["up"], 0, "true"),
+    ("DASHBOARD_PUBLIC_URL = 'https://x.example'\n", {}, "1.51", ["up"], 0, "true"),
+])
+def test_compose_sh_derives_collaboras_scheme_and_needs_engine_26(tmp_path, config_env, shell, api, args, rc, term):
+    root = tmp_path / "root"
+    (root / "scripts").mkdir(parents=True)
+    for name in ("compose.sh", "versions.sh"):
+        shutil.copy2(SCRIPTS / name, root / "scripts" / name)
+    (root / "config.env").write_text("POSTGRES_PASSWORD=x\n" + config_env)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "docker").write_text(FAKE_COMPOSE_DOCKER)
+    (bindir / "docker").chmod(0o755)
+    log = tmp_path / "docker.log"
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("COLLABORA_", "OTODOCK_"))}
+    env.update({"PATH": f"{bindir}:{env['PATH']}", "FAKE_LOG": str(log), "FAKE_API": api, **shell})
+    r = subprocess.run(["bash", str(root / "scripts" / "compose.sh"), *args], cwd=root, env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == rc, r.stderr
+    calls = log.read_text().splitlines() if log.exists() else []
+    compose_calls = [c for c in calls if c.startswith("compose ") and " version" not in c]
+    if rc:
+        assert "Docker Engine 26 or later" in r.stderr and not compose_calls
+    else:
+        assert compose_calls and compose_calls[-1].endswith(f"term={term}")
+
+
+
+def test_compose_sh_needs_compose_2_26(tmp_path):
+    root = tmp_path / "root"
+    (root / "scripts").mkdir(parents=True)
+    for name in ("compose.sh", "versions.sh"):
+        shutil.copy2(SCRIPTS / name, root / "scripts" / name)
+    (root / "config.env").write_text("POSTGRES_PASSWORD=x\n")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "docker").write_text(FAKE_COMPOSE_DOCKER)
+    (bindir / "docker").chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("COLLABORA_", "OTODOCK_"))}
+    env.update({"PATH": f"{bindir}:{env['PATH']}", "FAKE_LOG": str(tmp_path / "log"),
+                "FAKE_COMPOSE": "2.25.0"})
+    r = subprocess.run(["bash", str(root / "scripts" / "compose.sh"), "up", "-d"], cwd=root, env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1 and "Docker Compose 2.26 or later" in r.stderr
+
+
+# ── install.sh: the Docker floor and the editor's scheme line ──────────
+
+def _install_steps(tmp_path, env_text, api="1.51", compose="2.35.1", script="docker_floor; collabora_scheme_line"):
+    (tmp_path / ".env").write_text(env_text)
+    (tmp_path / ".env").chmod(0o600)
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "docker").write_text(FAKE_COMPOSE_DOCKER)
+    (bindir / "docker").chmod(0o755)
+    body = ('say() { echo "$*"; }\nfail() { echo "$*" >&2; exit 1; }\n'
+            + "".join(_install_function(n) for n in
+                      ("env_value", "at_least", "docker_floor", "collabora_scheme_line"))
+            + script + "\n")
+    env = {"PATH": f"{bindir}:{os.environ['PATH']}", "FAKE_LOG": str(tmp_path / "log"),
+           "FAKE_API": api, "FAKE_COMPOSE": compose}
+    return subprocess.run(["bash", "-euo", "pipefail", "-c", body], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, timeout=30)
+
+
+@pytest.mark.parametrize("api, compose, message", [
+    ("1.44", "2.35.1", "Docker Engine 26 or later"),
+    ("1.51", "2.25.0", "Docker Compose 2.26 or later"),
+    ("", "2.35.1", "Docker Engine 26 or later"),
+])
+def test_install_refuses_an_old_docker_before_writing_anything(tmp_path, api, compose, message):
+    r = _install_steps(tmp_path, "", api=api, compose=compose, script="docker_floor")
+    assert r.returncode == 1 and message in r.stderr
+
+
+@pytest.mark.parametrize("env_text, want", [
+    ("DASHBOARD_PUBLIC_URL=https://x.example\n", ["COLLABORA_SSL_TERMINATION=true"]),
+    ("DASHBOARD_PUBLIC_URL=http://x:8400\n", []),
+    ("#DASHBOARD_PUBLIC_URL=https://x\n", []),
+    ("DASHBOARD_PUBLIC_URL=https://x.example\nexport COLLABORA_SSL_TERMINATION=false\n",
+     ["COLLABORA_SSL_TERMINATION=true"]),
+    ("DASHBOARD_PUBLIC_URL=https://x.example\n#COLLABORA_SSL_TERMINATION=false\n",
+     ["#COLLABORA_SSL_TERMINATION=false", "COLLABORA_SSL_TERMINATION=true"]),
+    ("DASHBOARD_PUBLIC_URL=http://x:8400\nCOLLABORA_SSL_TERMINATION=true\n",
+     ["COLLABORA_SSL_TERMINATION=false"]),
+])
+def test_install_writes_the_editors_scheme_line(tmp_path, env_text, want):
+    r = _install_steps(tmp_path, env_text)
+    assert r.returncode == 0, r.stderr
+    env = tmp_path / ".env"
+    assert [x for x in env.read_text().splitlines() if "COLLABORA_SSL_TERMINATION" in x] == want
+    assert stat.S_IMODE(env.stat().st_mode) == 0o600 and not (tmp_path / ".env.scheme").exists()
+    r = _install_steps(tmp_path, env.read_text())
+    assert r.returncode == 0 and "setting COLLABORA_SSL_TERMINATION" not in r.stdout

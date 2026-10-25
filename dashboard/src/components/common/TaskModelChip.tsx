@@ -12,26 +12,6 @@ export interface ModelRef {
   tier_label?: string
 }
 
-/** A trigger row's linked-task fields, mapped onto the chip's names. */
-export function linkedTaskModel(t: {
-  task_effective_model?: string
-  task_override_model?: string
-  task_effective_execution_path?: string
-  task_effective_model_source?: string
-  task_effective_model_tier?: number | null
-  task_tier_label?: string
-}): ModelRef {
-  return {
-    effective_model: t.task_effective_model || '',
-    override_model: t.task_override_model || null,
-    override_execution_path: null,
-    effective_model_source: t.task_effective_model_source,
-    effective_model_tier: t.task_effective_model_tier,
-    tier_label: t.task_tier_label,
-  }
-}
-
-export { TIER_LABELS, tierText } from '../../lib/tiers'
 
 /**
  * The model (and engine) a scheduled task will actually run on.
@@ -63,18 +43,18 @@ export function TaskModelChip({ task }: { task: ModelRef }) {
     <span
       title={
         pinned
-          ? `Pinned to ${task.effective_model}${layer ? ` on ${layer}` : ''} — this task only (${tier})`
-          : `${source === 'layer default' ? 'Engine default' : 'Agent default'}: ${task.effective_model} (${tier})`
+          ? `Pinned to ${task.effective_model}${layer ? ` on ${layer}` : ''} for this task only, ${tier}`
+          : `${source === 'layer default' ? 'Engine default' : 'Agent default'}: ${task.effective_model}, ${tier}`
       }
-      className={`inline-flex items-center max-w-full overflow-hidden px-1.5 py-0.5 rounded-sm text-[10px] font-medium font-mono ${
+      className={`inline-flex items-center max-w-full overflow-hidden px-1.5 py-0.5 rounded-sm text-3xs font-medium font-mono ${
         pinned
-          ? 'bg-brand/10 text-brand'
-          : 'bg-p-bg text-p-text-light border border-p-border-light'
+          ? 'bg-action-subtle text-link'
+          : 'bg-surface-muted text-tertiary'
       }`}
     >
       <span className="truncate min-w-0">{task.effective_model}</span>
       <TierMark tier={task.effective_model_tier} label={task.tier_label} size="xs" className="ml-1.5 opacity-80" />
-      {layer && <span className="opacity-70 shrink-0">&nbsp;· {layer}</span>}
+      {layer && <span className="shrink-0">&nbsp;· {layer}</span>}
     </span>
   )
 }

@@ -51,3 +51,26 @@ describe('PlanReviewCard feedback keys', () => {
     expect(onSendMessage).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('PlanReviewCard answers', () => {
+  it('implements in Auto or in Ask', () => {
+    const onRespond = vi.fn()
+    render(<PlanReviewCard requestId="r1" plan="# Plan" toolInput={{}} onRespond={onRespond} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Implement in Auto' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Implement in Ask' }))
+    expect(onRespond.mock.calls).toEqual([['r1', 'implement_auto'], ['r1', 'implement_ask']])
+  })
+
+  it('names an answered card, a stored answer from before 1.9 read as the current one', () => {
+    for (const [action, label] of [
+      ['implement_auto', 'Implementing in Auto'], ['implement_accept_edits', 'Implementing in Auto'],
+      ['implement_ask', 'Implementing in Ask'], ['implement_default', 'Implementing in Ask'],
+      ['implemented', 'Plan implemented'], ['revised', 'Plan revised'], ['reject', 'Plan cancelled'],
+    ] as const) {
+      const { unmount } = render(
+        <PlanReviewCard requestId="r1" plan="# Plan" toolInput={{}} resolved action={action} />)
+      expect(screen.getByText(label)).toBeTruthy()
+      unmount()
+    }
+  })
+})

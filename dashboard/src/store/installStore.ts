@@ -41,6 +41,7 @@ export interface InstallSlice {
   doneAt: number | null                                // set on install_done, drives done-grace UI window
   error: string | null
   warmupFailures: string[]                             // MCPs that installed but failed the boot check (advisory)
+  stillInstalling: string[]                            // set on install_done: the session started before these ended
 }
 
 interface InstallStoreState {
@@ -71,7 +72,7 @@ interface InstallStoreState {
   touchHeartbeat: (data: { machine_id: string; agent: string }) => void
   verifying: (data: { machine_id: string; agent: string }) => void
   finish: (
-    data: { machine_id: string; agent: string; warmup_failures?: string[] },
+    data: { machine_id: string; agent: string; warmup_failures?: string[]; still_installing?: string[] },
   ) => void
   fail: (data: { machine_id: string; agent: string; error: string }) => void
   clear: (machineId: string, agent: string) => void
@@ -100,6 +101,7 @@ const _empty = (machineId: string, agent: string): InstallSlice => ({
   doneAt: null,
   error: null,
   warmupFailures: [],
+  stillInstalling: [],
 })
 
 export const useInstallStore = create<InstallStoreState>((set) => ({
@@ -228,6 +230,7 @@ export const useInstallStore = create<InstallStoreState>((set) => ({
             doneAt: Date.now(),
             lastEventAt: Date.now(),
             warmupFailures: data.warmup_failures ?? prev.warmupFailures,
+            stillInstalling: data.still_installing ?? [],
           },
         },
       }

@@ -44,11 +44,11 @@ Run with `python -m satellite`. The subpackages each own one concern.
 
 | Path | Responsibility |
 |---|---|
-| `__main__.py`, `config.py`, `engines.py` | `__main__.py` is the entry point and boot guard. `config.py` holds the host OS table (`config.HOST`), `SATELLITE_VERSION` and the vendored hashes. `engines.py` holds the `ENGINES` table. |
+| `__main__.py`, `config.py`, `engines.py`, `background.py` | `__main__.py` is the entry point and boot guard. `config.py` holds the host OS table (`config.HOST`), `SATELLITE_VERSION` and the vendored hashes. `engines.py` holds the `ENGINES` table. `background.py` holds `spawn(coro, name=, owner=)`, the one way to start a task nobody keeps: held until it ends, a death handed to the loop's exception handler under `owner:name`. |
 | `transport/` | the wire: `ws_client`, `lifecycle_update` (auto-update), `http_tunnel`, `mcp_gateway`, `file_sync` |
-| `sessions/` | engine sessions: `session_manager`, `cli_session`, `codex_session`, `alive_report`, `session_files`, `step_runner` (app steps), `mcp_install_support`, `mcp_interceptor` |
+| `sessions/` | engine sessions: `session_manager`, `cli_session`, `codex_session`, `alive_report`, `session_files`, `session_move` (a chat's session files moved on and off this machine, the `session_move` frame), `step_runner` (app steps), `mcp_install_support`, `mcp_interceptor` |
 | `terminal/` | interactive PTYs and the local `otodock` command: `local_socket`, `otodock_cli`, `otodock_proto`, `pty_session_base`, `pty_session`, `codex_pty_session`, `pty_relay`, `winpty_relay` |
-| `host/` | the machine: `host_probe`, `satellite_policy`, `auth_paths`, `safe_fs` (file opens beneath the agents root with no link followed), `env_hygiene`, `path_translator`, `cli_versions`, `tray`, `service_unit` |
+| `host/` | the machine: `host_probe`, `satellite_policy`, `auth_paths`, `safe_fs` (file opens beneath the agents root with no link followed), `env_hygiene`, `path_translator`, `cli_versions`, `session_retention` (the retention sweep's keep list applied to the transcripts here), `tray`, `service_unit` |
 | `_vendored/` | byte-for-byte copies of proxy modules. Never edit them (see "Development"). |
 
 `__main__` imports only `config` at module top, so the boot guard can roll a
@@ -161,7 +161,12 @@ which can take it over:
 otodock claude <agent>                  # an interactive Claude session as <agent>, here
 otodock codex  <agent> --folder /path   # Codex, in another folder
 otodock claude <agent> --resume         # pick a chat to resume first
+otodock claude <agent> --mode ask       # start in Ask (ask|auto|dontAsk|plan, default auto)
 ```
+
+`--mode` picks the session's permission mode: `ask`, `auto`, `dontAsk` or
+`plan`, `auto` when it is left out. The older words `default` and
+`acceptEdits` are still taken, as Ask and Auto.
 
 ## Configuration
 
@@ -193,12 +198,13 @@ The hint keys are the `conf_section` / `conf_key` of each engine's row in
 │   └── {agent-slug}/
 │       ├── config/           # agent config (the platform's, pushed)
 │       ├── workspace/        # the agent's shared workspace (both ways)
+│       ├── .session-move/    # a chat move's staged session files, never synced
 │       └── users/
 │           └── {username}/
 │               ├── workspace/    # the person's workspace (both ways)
 │               ├── context/      # the person's context documents (pushed)
-│               ├── .claude/      # Claude Code session data
-│               └── .codex/       # Codex session data
+│               ├── .claude/      # Claude Code session data (moves with a chat)
+│               └── .codex/       # Codex session data (moves with a chat)
 └── mcps/                     # installed stdio MCP servers
     ├── custom/{mcp-name}/    #   manifest.json and venv/ or node_modules/
     └── community/{mcp-name}/

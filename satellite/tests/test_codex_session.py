@@ -219,7 +219,35 @@ class TestCodexSessionThread:
         assert resume_params.get("threadId") == "thread-existing"
         # The history stays in the rollout: Codex deprecates hydrating it.
         assert resume_params.get("excludeTurns") is True
+        # This machine's folder, never the cwd the rollout recorded (a thread
+        # moved here from the platform recorded the sandbox's /users/<name>,
+        # and every stdio MCP failed at spawn there).
+        assert resume_params.get("cwd") == str(tmp_agent_dir / "users" / "alice")
         assert session.thread_id == "thread-existing"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_resume_starts_a_new_thread_and_says_so(self, tmp_agent_dir, sat_config):
+        from satellite._vendored.app_server_client import AppServerError
+        config = {
+            "cwd_relative": "users/alice", "codex_dir_relative": "users/alice/.codex",
+            "system_prompt": "test", "agents_md_content": "test", "mcp_config_toml": "",
+            "model": "gpt-5.4", "env": {}, "thread_id": "thread-moved",
+        }
+        session = CodexSession("sess-rf", tmp_agent_dir, config, sat_config)
+        mock_client = AsyncMock()
+        mock_client.proc = None
+
+        async def fake_request(method, params=None):
+            if method == "thread/resume":
+                raise AppServerError(-32600, "no rollout found for thread id")
+            return {"thread": {"id": "thread-fresh"}}
+
+        mock_client.request = fake_request
+        c1, c2, c3 = _patch_daemon(session, mock_client)
+        with c1, c2, c3:
+            await session.start()
+            await session.close()
+        assert session.thread_id == "thread-fresh" and session.resume_refused is True
 
     @pytest.mark.asyncio
     async def test_start_opens_new_thread_when_none(self, tmp_agent_dir, codex_config, sat_config):
@@ -243,6 +271,8 @@ class TestCodexSessionThread:
         methods = [m for m, _ in calls]
         assert "thread/start" in methods
         assert "thread/resume" not in methods
+        start_params = next(p for m, p in calls if m == "thread/start")
+        assert start_params.get("cwd") == str(tmp_agent_dir / "users" / "alice")
         assert session.thread_id == "thread-fresh"
 
 
@@ -275,6 +305,82 @@ class TestCodexSessionControlRequest:
         judge = CodexSession("sess-2", tmp_agent_dir, {**codex_config, "permission_mode": "judge",
                                                        "sandbox_mode": "read-only"}, sat_config)
         assert judge._plan_mode("read-only") is False
+
+
+class TestTurnParams:
+    @pytest.mark.asyncio
+    async def test_every_turn_asks_for_the_reasoning_summary_and_keeps_the_effort(
+            self, tmp_agent_dir, codex_config, sat_config):
+        """Twin of the proxy's turn params: Codex's catalog defaults every
+        hosted model to no summary, so the turn asks for one."""
+        session = CodexSession("sess-sum", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "t1"
+        sent: list = []
+
+        async def fake_request(method, params=None):
+            sent.append((method, params))
+            session._main_turn_done.set()
+            return {"turn": {"id": "u1"}}
+
+        session._client = AsyncMock()
+        session._client.request = fake_request
+        await asyncio.wait_for(session._run_turn_locked("hello"), 5)
+        (method, params), = sent
+        assert method == "turn/start"
+        assert params["summary"] == "auto"
+        assert params["effort"] == "high"
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_first", [True, False])
+    async def test_a_refused_summary_runs_the_turn_again_without_it_and_never_reaches_the_platform(
+            self, tmp_agent_dir, codex_config, sat_config, error_first):
+        """An unverified OpenAI organization refuses reasoning summaries (a
+        400): the forwarder drops the refused turn, the turn runs once more
+        without the summary, and no later turn asks."""
+        refusal = {"message": "unexpected status 400 Bad Request: Your organization must be "
+                              "verified to generate reasoning summaries.", "codexErrorInfo": "badRequest"}
+        session = CodexSession("sess-ref", tmp_agent_dir, codex_config, sat_config)
+        session.thread_id = "t1"
+        forwarded: list = []
+
+        async def forward(event):
+            forwarded.append(event)
+
+        session._forward_event = forward
+        sent: list = []
+
+        class Client:
+            is_alive = True
+
+            def __init__(self):
+                self.notif_queue: asyncio.Queue = asyncio.Queue()
+
+            async def request(self, method, params=None):
+                sent.append((method, dict(params or {})))
+                if len([m for m, _ in sent if m == "turn/start"]) == 1:
+                    if error_first:
+                        self.notif_queue.put_nowait(("error", {"threadId": "t1", "error": refusal,
+                                                               "willRetry": False}))
+                    self.notif_queue.put_nowait(("turn/completed", {"threadId": "t1", "turn": {
+                        "status": "failed", "error": refusal}}))
+                else:
+                    self.notif_queue.put_nowait(("turn/completed", {"threadId": "t1",
+                                                                    "turn": {"status": "completed"}}))
+                return {"turn": {"id": "u1"}}
+
+        session._client = Client()
+        forwarder = asyncio.create_task(session._run_forwarder())
+        try:
+            await asyncio.wait_for(session._run_turn_locked("hello"), 5)
+            await asyncio.wait_for(session._run_turn_locked("again"), 5)
+        finally:
+            forwarder.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await forwarder
+        assert [("summary" in p) for _m, p in sent] == [True, False, False]
+        assert [e["method"] for e in forwarded] == ["turn/completed", "turn/completed"]
+        assert all(e["params"]["turn"]["status"] == "completed" for e in forwarded)
 
 
 class TestRequestStopTurn:
@@ -392,7 +498,8 @@ class TestConnectReportAndRevive:
         with patch.object(session, "start", side_effect=_start):
             with pytest.raises(_TurnStarted):
                 await session._run_turn_locked("go on")
-        assert forwarded == ([{"type": "_resume_handle", "handle": "thread-new"}] if told else [])
+        assert forwarded == ([{"type": "_resume_handle", "handle": "thread-new", "resumed": False}]
+                             if told else [])
 
 
 class TestAskQuestionRemote:
@@ -472,8 +579,8 @@ class TestAskQuestionRemote:
 # ---------------------------------------------------------------------------
 
 def test_pty_config_toml_header_keys():
-    from satellite.tests._toml import toml_loads
     from satellite.terminal.codex_pty_session import _build_codex_config_toml
+    from satellite.tests._toml import toml_loads
     cfg = toml_loads(_build_codex_config_toml("/home/u/work", ""))
     # Root keys must parse at root (not swallowed by a [table] header): the
     # update check would break the version pin, the suppress key pairs with
@@ -498,8 +605,9 @@ def test_pty_config_toml_puts_codex_worktrees_beside_the_codex_dir():
     # default to $CODEX_HOME/worktrees, the protected .codex dir; the root is
     # the hidden sibling at the scope root, satellite-absolute as Codex needs.
     from pathlib import Path
-    from satellite.tests._toml import toml_loads
+
     from satellite.terminal.codex_pty_session import _build_codex_config_toml
+    from satellite.tests._toml import toml_loads
     text = _build_codex_config_toml(
         "/home/u/work", "", codex_dir=Path("/home/u/.oto-dock/agents/pa/users/u/.codex"),
     )
@@ -544,8 +652,8 @@ def test_local_provider_toml_shapes():
 
 
 def test_local_provider_toml_catalog_and_idle_timeout(tmp_path):
-    from satellite.tests._toml import toml_loads
     from satellite.sessions.codex_session import local_provider_toml
+    from satellite.tests._toml import toml_loads
     codex_dir = tmp_path / "users" / "alice" / ".codex"
     root, table = local_provider_toml(_LOCAL_FULL, codex_dir)
     cfg = toml_loads(root + "\n" + table + "\n")
@@ -581,8 +689,8 @@ def test_write_or_drop_model_catalog(tmp_path):
 
 
 def test_pty_config_toml_local_provider_block(tmp_path):
-    from satellite.tests._toml import toml_loads
     from satellite.terminal.codex_pty_session import _build_codex_config_toml
+    from satellite.tests._toml import toml_loads
     text = _build_codex_config_toml(
         "/home/u/work", '[mcp_servers.task-mcp]\ncommand = "python3"',
         local_provider=_LOCAL,
@@ -623,7 +731,8 @@ class TestCodexSessionLocalProvider:
             "agents_md_content": "# Test Agent",
             "mcp_config_toml": '[mcp_servers.task-mcp]\ncommand = "python3"',
             "model": "qwen3.6-35b-a3b",
-            "env": {"PROXY_URL": "http://100.1.2.3:8400", "PROXY_API_KEY": "test-key"},
+            "env": {"PROXY_URL": "http://100.1.2.3:8400", "PROXY_API_KEY": "test-key",
+                    "OTO_CLI_TOKEN": "cli-test-token"},
         }
         base.update(overrides)
         return base
@@ -738,6 +847,33 @@ class TestCodexSessionLocalProvider:
         assert cfg["model_providers"]["oto_local"]["base_url"] == _LOCAL["base_url"]
 
     @pytest.mark.asyncio
+    async def test_a_tool_timeout_line_reaches_the_written_config(
+        self, tmp_agent_dir, sat_config,
+    ):
+        # The proxy's ``tool_timeout_sec`` line (a manifest's per-call limit)
+        # is not one the satellite's transforms know: the env path
+        # translation, the display env and the interceptor wrapper (this
+        # server carries the path marker, so it IS wrapped) keep it in the
+        # server's own table.
+        from satellite.tests._toml import toml_loads
+        path = await self._start(
+            tmp_agent_dir, sat_config, self._config(
+                mcp_config_toml=(
+                    "[mcp_servers.video-gen-mcp]\nstartup_timeout_sec = 60\n"
+                    'tool_timeout_sec = 600\ncommand = "python3"\nargs = ["server.py"]\n'
+                    'env = { "OTO_TOOL_ARG_PATHS" = "[]" }\n\n'
+                    '[mcp_servers.task-mcp]\ncommand = "python3"\n'
+                ),
+            ),
+        )
+        cfg = toml_loads(path.read_text())
+        video = cfg["mcp_servers"]["video-gen-mcp"]
+        assert video["tool_timeout_sec"] == 600
+        assert video["startup_timeout_sec"] == 60
+        assert video["args"][-2:] == ["python3", "server.py"]  # wrapped
+        assert "tool_timeout_sec" not in cfg["mcp_servers"]["task-mcp"]
+
+    @pytest.mark.asyncio
     async def test_hosted_session_overwrites_a_stale_provider(
         self, tmp_agent_dir, sat_config,
     ):
@@ -814,7 +950,8 @@ class TestHooksFloor:
             "agents_md_content": "# Test Agent",
             "mcp_config_toml": '[mcp_servers.task-mcp]\ncommand = "python3"',
             "model": "gpt-5.6-sol",
-            "env": {"PROXY_URL": "http://100.1.2.3:8400", "PROXY_API_KEY": "test-key"},
+            "env": {"PROXY_URL": "http://100.1.2.3:8400", "PROXY_API_KEY": "test-key",
+                    "OTO_CLI_TOKEN": "cli-test-token"},
         }
         base.update(overrides)
         return base
@@ -863,11 +1000,13 @@ class TestHooksFloor:
         assert env["OTO_HOOK_DENY_ONLY"] == "1"
         assert env["OTO_HOOK_NO_FORWARD"] == "1"
         assert env["OTO_SESSION_ID"] == "sess-hf"
+        assert env["OTO_CLI_TOKEN"] == "cli-test-token"   # passed on as the platform minted it
 
     @pytest.mark.asyncio
-    async def test_an_attended_chat_runs_the_bridged_floor(self, tmp_agent_dir, sat_config):
-        """0.5.143: ``codex_attended_floor`` trusts the hook on the thread with
-        the bridged env; under Don't Ask the policy is never (the hook judges)."""
+    async def test_an_attended_chat_runs_the_floor_and_the_hook_judges(self, tmp_agent_dir, sat_config):
+        """0.5.143: ``codex_attended_floor`` trusts the hook on the thread;
+        from 1.9 the hook judges every call (no session is marked bridged),
+        so under Don't Ask the policy is never."""
         from satellite.tests._toml import toml_loads
         text, calls, env = await self._start(tmp_agent_dir, sat_config, self._config(
             codex_attended_floor=True, permission_mode="dontAsk",
@@ -875,17 +1014,28 @@ class TestHooksFloor:
         assert toml_loads(text)["features"] == {"plugins": False, "hooks": True}
         start = next(p for m, p in calls if m == "thread/start")
         assert start["config"] == {"bypass_hook_trust": True}
-        assert start["approvalPolicy"] == "never"
+        assert start["approvalPolicy"] == "never" and start["approvalsReviewer"] == "user"
         assert env["OTO_HOOK_DENY_ONLY"] == "1" and env["OTO_HOOK_NO_FORWARD"] == "1"
-        assert env["OTO_HOOK_BRIDGED"] == "1"
+        assert "OTO_HOOK_BRIDGED" not in env
 
     @pytest.mark.asyncio
-    async def test_a_full_access_default_chat_asks_through_the_bridge(self, tmp_agent_dir, sat_config):
+    @pytest.mark.parametrize("mode,sandbox,policy,reviewer", [
+        ("ask", "danger-full-access", "never", "user"),
+        ("default", "danger-full-access", "never", "user"),
+        ("ask", "workspace-write", "on-request", "user"),
+        ("autoReview", "workspace-write", "on-request", "auto_review"),
+        ("acceptEdits", "workspace-write", "on-request", "auto_review"),
+    ])
+    async def test_the_mode_picks_the_policy_and_the_reviewer(
+            self, tmp_agent_dir, sat_config, mode, sandbox, policy, reviewer):
+        """Ask takes its sandbox's policy (the hook judges every call); Auto
+        runs on-request with Codex's own reviewer. A word from before 1.9
+        reads as its current one."""
         _, calls, _ = await self._start(tmp_agent_dir, sat_config, self._config(
-            codex_attended_floor=True, permission_mode="default",
-            sandbox_mode="danger-full-access"))
+            codex_attended_floor=True, permission_mode=mode, sandbox_mode=sandbox))
         start = next(p for m, p in calls if m == "thread/start")
-        assert start["approvalPolicy"] == "untrusted" and start["sandbox"] == "danger-full-access"
+        assert (start["approvalPolicy"], start["approvalsReviewer"]) == (policy, reviewer)
+        assert start["sandbox"] == sandbox
 
     @pytest.mark.asyncio
     async def test_a_floored_session_never_runs_bridged(self, tmp_agent_dir, sat_config, monkeypatch):
@@ -897,30 +1047,24 @@ class TestHooksFloor:
     @pytest.mark.asyncio
     async def test_a_mode_change_moves_the_policy_and_plan(self, tmp_agent_dir, codex_config, sat_config):
         session = CodexSession("sess-m", tmp_agent_dir, {
-            **codex_config, "codex_attended_floor": True, "permission_mode": "default",
+            **codex_config, "codex_attended_floor": True, "permission_mode": "ask",
             "sandbox_mode": "danger-full-access"}, sat_config)
-        assert session._approval_policy() == "untrusted"
+        assert session._approval_policy() == "never"
+        await session.send_control_request(
+            "set_permission_mode", sandbox_mode="workspace-write", permission_mode="autoReview")
+        assert (session._approval_policy(), session._reviewer()) == ("on-request", "auto_review")
         await session.send_control_request(
             "set_permission_mode", sandbox_mode="danger-full-access", permission_mode="dontAsk")
-        assert session._approval_policy() == "never"
+        assert (session._approval_policy(), session._reviewer()) == ("never", "user")
         await session.send_control_request(
             "set_permission_mode", sandbox_mode="read-only", permission_mode="plan")
-        assert session._approval_policy() == "untrusted" and session._plan_mode("read-only")
-        # A daemon that refuses untrusted: on-request in a workspace sandbox,
-        # never under danger-full-access (the hook judges every call there).
-        session._untrusted_rejected = True
-        await session.send_control_request(
-            "set_permission_mode", sandbox_mode="danger-full-access", permission_mode="default")
-        assert session._approval_policy() == "never"
-        await session.send_control_request(
-            "set_permission_mode", sandbox_mode="workspace-write", permission_mode="default")
-        assert session._approval_policy() == "on-request"
+        assert session._approval_policy() == "on-request" and session._plan_mode("read-only")
         # An older proxy ships no mode: the sandbox decides, as before.
         old = CodexSession("sess-o", tmp_agent_dir, {
             **codex_config, "permission_mode": "", "sandbox_mode": "danger-full-access"}, sat_config)
         assert old._approval_policy() == "never"
         await old.send_control_request("set_permission_mode", sandbox_mode="workspace-write")
-        assert old._approval_policy() == "untrusted"
+        assert old._approval_policy() == "on-request"
 
     @pytest.mark.asyncio
     async def test_attended_session_gets_none_of_it(self, tmp_agent_dir, sat_config):

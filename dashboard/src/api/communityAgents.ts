@@ -10,6 +10,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
 import type { PinnedApp } from './apps'
 import { useAuth } from '../contexts/AuthContext'
+import { apiJson, apiResponse, raiseApiError } from '../lib/http/apiJson'
 
 export interface CommunityAgentRegistryEntry {
   slug: string
@@ -78,6 +79,20 @@ export interface TemplateUpdateReport {
   mcps?: { ready?: string[]; requested?: string[]; new?: string[] }
   ignored_fields?: string[]
   notes?: string[]
+  /** The tasks whose model choice this agent cannot run, each a sentence
+   * (they run on the agent's default model and engine). */
+  task_pins_dropped?: string[]
+}
+
+/** The heading over the tasks whose model choice the agent cannot run. */
+export const TASK_PINS_HEADING = 'Model choices left out'
+
+/** An install's or an update's dropped task pins as sentences to show; an
+ * older proxy sends none. */
+export function taskPinNotes(from: { task_pins_dropped?: string[] } | null | undefined): string[] {
+  return (from?.task_pins_dropped ?? [])
+    .filter(n => typeof n === 'string' && n !== '')
+    .map(n => n.charAt(0).toUpperCase() + n.slice(1))
 }
 
 export interface TemplateUpdatePlan extends TemplateUpdateReport {
@@ -199,26 +214,13 @@ export function useInstallPreview(
   })
 }
 
-async function jsonOrThrow(r: Response) {
-  if (!r.ok) {
-    const text = await r.text()
-    let msg = text
-    try {
-      const j = JSON.parse(text)
-      msg = typeof j.detail === 'string' ? j.detail : j.detail?.message || text
-    } catch { /* not JSON */ }
-    throw new Error(msg || `HTTP ${r.status}`)
-  }
-  return r.json()
-}
-
 /** What updating an installed agent to the catalog's version would do:
  * reads only, computed on request (a POST that writes nothing). */
 export function useTemplateUpdatePlan(agentSlug: string | null) {
   return useQuery<TemplateUpdatePlan>({
     queryKey: ['template-update-plan', agentSlug],
-    queryFn: () =>
-      apiFetch(`/v1/agents/${agentSlug}/update-template/plan`, { method: 'POST' }).then(jsonOrThrow),
+    queryFn: () => apiJson<TemplateUpdatePlan>(`/v1/agents/${agentSlug}/update-template/plan`,
+      { method: 'POST' }, 'Could not read the update plan'),
     enabled: !!agentSlug,
     staleTime: 0,
     retry: false,
@@ -232,11 +234,10 @@ export function useApplyTemplateUpdate() {
     { agent_slug: string; from_version: string; approve_apps?: Record<string, string>; approve_checks?: Record<string, string> }
   >({
     mutationFn: ({ agent_slug, ...body }) =>
-      apiFetch(`/v1/agents/${agent_slug}/update-template`, {
+      apiJson<{ job_id: string; to_version: string }>(`/v1/agents/${agent_slug}/update-template`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      }).then(jsonOrThrow),
+        json: body,
+      }, 'Could not start the update'),
   })
 }
 
@@ -244,7 +245,8 @@ export function useApplyTemplateUpdate() {
 export function useTemplateUpdateStatus(agentSlug: string | null, enabled: boolean) {
   return useQuery<TemplateUpdateStatus>({
     queryKey: ['template-update-status', agentSlug],
-    queryFn: () => apiFetch(`/v1/agents/${agentSlug}/update-template/status`).then(jsonOrThrow),
+    queryFn: () => apiJson<TemplateUpdateStatus>(`/v1/agents/${agentSlug}/update-template/status`, {},
+      'Could not read the update'),
     enabled: enabled && !!agentSlug,
     refetchInterval: q => (q.state.data?.running ? 2000 : false),
   })
@@ -254,11 +256,10 @@ export function useTakeNewVersion() {
   const qc = useQueryClient()
   return useMutation<{ status: string; path: string }, Error, { agent_slug: string; new_path: string }>({
     mutationFn: ({ agent_slug, new_path }) =>
-      apiFetch(`/v1/agents/${agent_slug}/update-template/take`, {
+      apiJson<{ status: string; path: string }>(`/v1/agents/${agent_slug}/update-template/take`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ new_path }),
-      }).then(jsonOrThrow),
+        json: { new_path },
+      }, 'Could not take the new version'),
     onSuccess: (_r, v) => {
       qc.invalidateQueries({ queryKey: ['agent-files', v.agent_slug] })
     },
@@ -282,6 +283,7 @@ export interface InstallFromCommunityResult {
   copied_context: number
   setup_md_copied: boolean
   agent: Record<string, unknown>
+  task_pins_dropped?: string[]
 }
 
 /**
@@ -309,27 +311,14 @@ export function useInstallCommunityAgent() {
     }
   >({
     mutationFn: body =>
-      apiFetch('/v1/agents/install-from-community', {
+      apiResponse('/v1/agents/install-from-community', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-      }).then(async r => {
-        if (!r.ok) {
-          // Read the body once, then try to parse it as JSON (a Response
-          // body can only be consumed once — calling .json() then .text()
-          // on the same response throws "body already read").
-          const raw = await r.text()
-          let detail: any = raw
-          try {
-            detail = JSON.parse(raw)
-          } catch {
-            /* non-JSON body — keep the raw text */
-          }
-          const err = new Error(typeof detail === 'string' ? detail : (detail?.detail?.message || detail?.message || `HTTP ${r.status}`))
-          ;(err as any).status = r.status
-          ;(err as any).body = detail
-          throw err
-        }
+      }, 'Could not install the agent').then(async r => {
+        // The ApiError keeps the status and the parsed body: AgentInstallModal
+        // reads a 409's suggested slug from them.
+        if (!r.ok) await raiseApiError(r, 'Could not install the agent')
         return r.json()
       }),
     onSuccess: () => {

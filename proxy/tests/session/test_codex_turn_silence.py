@@ -11,7 +11,7 @@ import config
 from core.events import turn_ending
 from core.events.common_events import DONE, ERROR
 from core.layers.codex import session as codex_session_mod
-from core.layers.codex.session import CodexAppServerSession, TURN_ENDING_EVENT
+from core.layers.codex.session import TURN_ENDING_EVENT, CodexAppServerSession
 from core.layers.codex.translator import CodexEventTranslator
 
 
@@ -123,6 +123,7 @@ def test_the_translator_maps_the_session_endings_and_plain_failures():
 
 def test_the_codex_layer_reads_the_daemons_last_activity():
     import time
+
     from core.layers.codex.layer import CodexCLIExecutionLayer
     from core.layers.codex.session import _codex_sessions
     layer = CodexCLIExecutionLayer.__new__(CodexCLIExecutionLayer)

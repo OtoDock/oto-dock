@@ -15,8 +15,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-import isolation  # noqa: E402
-import isolation_targets as targets  # noqa: E402
+import isolation_targets as targets
+
+import isolation
 
 
 @pytest.fixture(autouse=True)

@@ -376,12 +376,35 @@ def test_self_heal_waits_for_the_entry_to_go_idle(fake_mcp):
 
         loop = asyncio.get_running_loop()
         t0 = loop.time()
-        loop.create_task(release())
+        releaser = loop.create_task(release())
         r = await hx.execute_app_tool(_shared_row(), ACTION, {"text": "again"})
+        await releaser
         assert r["status"] == "done"
         assert loop.time() - t0 >= 0.3
         assert hx._pool[(AGENT, "", "test-mcp")].manager is not entry.manager
         await hx.close_all()
+
+    asyncio.run(main())
+
+
+def test_the_idle_wait_reads_the_count_again_after_a_wake():
+    """A call that starts between the last one's end and the waiter's wake
+    keeps the entry busy: the self-heal waits for that call too."""
+    class _Manager:
+        tool_timeout = 5
+
+    async def main():
+        entry = hx._Entry(_Manager(), "sid", "", frozenset())
+        assert entry.idle.is_set()
+        entry.busy += 1
+        waiter = asyncio.create_task(hx._wait_idle(entry))
+        await asyncio.sleep(0)
+        entry.busy -= 1          # the event is set ...
+        entry.busy += 1          # ... and a sibling starts before the waiter runs
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        entry.busy -= 1
+        await asyncio.wait_for(waiter, 1)
 
     asyncio.run(main())
 
@@ -504,6 +527,7 @@ def test_the_app_identity_token_files_ride_the_bundles_of_the_started_mcps(monke
     """The app-button builder delivers the identity's OAuth token files in
     the bundles, for the MCPs this manager starts only."""
     from types import SimpleNamespace
+
     from core.credentials import credential_files as cf
     seen: list = []
     monkeypatch.setattr(cf, "token_file_env",

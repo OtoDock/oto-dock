@@ -11,12 +11,12 @@ server tools; a same-provider switch touches nothing.
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
 
 from core.layers.direct.layer import _text_only_history
-from concurrent.futures import Future
 
 
 def test_text_only_history_keeps_the_visible_text_of_every_stored_shape():
@@ -97,8 +97,7 @@ _OPENAI_HISTORY = [
 def switch_env(monkeypatch):
     """A registered Direct session on the openai provider plus a subscription
     pool that hands out a handle for whatever provider is asked."""
-    from core.layers.direct import layer as layer_mod
-    from core.layers.direct import session as session_mod
+    from core.layers.direct import layer as layer_mod, session as session_mod
     from services.engines import subscription_pool
 
     monkeypatch.setattr("core.layers.direct.session.config.get_agent_model", lambda agent: "")

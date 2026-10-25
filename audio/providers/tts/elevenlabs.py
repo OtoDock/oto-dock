@@ -40,7 +40,11 @@ from audio.constants import SAMPLE_RATE
 from audio.log_policy import log_transcript
 from audio.providers.credential_resolver import CredentialResolver
 from audio.providers.model_succession import DEFAULT_MODELS
-from audio.providers.tts.base import TTSProvider, UnsupportedProviderOperation, VoiceInfo
+from audio.providers.tts.base import (
+    TTSProvider,
+    UnsupportedProviderOperation,
+    VoiceInfo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +73,10 @@ _INACTIVITY_TIMEOUT_S = 180
 # guard instead of a hung turn.
 _POST_FLUSH_STALL_S = 10.0
 
-# Observed live (2026-07): the multi-context server streams the flushed audio
-# but sends NO isFinal — the context stays open for more text — so every
-# utterance ended via the 10 s guard above (a phone farewell then sits ~10 s
-# before the hang-up). Once audio HAS flowed for a flushed context, a short
+# The multi-context server may keep a flushed context open without a final
+# frame (the context stays open for more text), so every utterance would end
+# via the 10 s guard above (a phone farewell then sits ~10 s before the
+# hang-up). Once audio HAS flowed for a flushed context, a short
 # silent gap is conclusive: post-flush generation streams continuously, and
 # the receive loop only waits on the socket between frames (local playback
 # pacing suspends it), so 2 s of true recv-silence means the utterance is
@@ -140,7 +144,7 @@ class _Context:
     __slots__ = ("id", "language", "sample_rate", "init_gen", "input_done",
                  "buffer", "http_done", "sent", "retried",
                  "ws_gen_at_start", "t_first_send", "close_sent", "empty",
-                 "audio_started")
+                 "audio_started", "unflushed", "flushed_open")
 
     def __init__(self, *, language: str | None, sample_rate: int):
         self.id = uuid.uuid4().hex[:12]
@@ -169,6 +173,14 @@ class _Context:
         # End of input reached with NOTHING ever sent (a marker-only reply):
         # no init, no flush, and receive_audio returns at once.
         self.empty = False
+        # Characters sent since the last flush frame: a mid-utterance flush
+        # (``flush()``) goes out only when the server holds something.
+        self.unflushed = 0
+        # A mid-utterance flush went out and no text followed yet: the next
+        # text starts a new generation, whose close must wait for its first
+        # audio frame as a fresh context's does (``audio_started`` is reset
+        # when that text is sent).
+        self.flushed_open = False
 
 
 class ElevenLabsTTS(TTSProvider):
@@ -180,8 +192,8 @@ class ElevenLabsTTS(TTSProvider):
     # 404 on other accounts), each checked by a live synthesis in its language:
     # Matilda, Sarah, Laura, Charlotte, Alice, Lily. The vendor ships no
     # native non-English premade voice: these speak the language with an
-    # English accent, and the entries exist so the language lock can move a
-    # call on this provider; a native accent is a library voice an admin adds
+    # English accent, and the entries exist so language detection can move
+    # a call on this provider; a native accent is a library voice an admin adds
     # to the workspace and sets on the row. An admin's voice for a language
     # wins over the shipped one.
     shipped_voices_native = False
@@ -228,7 +240,7 @@ class ElevenLabsTTS(TTSProvider):
     # ── Factory / metadata ─────────────────────────────────────────
 
     @classmethod
-    def from_row(cls, row: dict, resolver: CredentialResolver) -> "ElevenLabsTTS":
+    def from_row(cls, row: dict, resolver: CredentialResolver) -> ElevenLabsTTS:
         return cls(
             api_key=resolver(row.get("credential_key", "")),
             voices=row.get("voices") or {},
@@ -286,7 +298,7 @@ class ElevenLabsTTS(TTSProvider):
             return "ElevenLabs rejected the API key — check the provider credential in the Audio tab"
         try:
             return json.dumps(resp.json().get("detail", ""))[:300]
-        except Exception:
+        except (ValueError, AttributeError):
             return resp.text[:300]
 
     # ── Connection lifecycle ───────────────────────────────────────
@@ -378,7 +390,7 @@ class ElevenLabsTTS(TTSProvider):
         if resp.status_code != 200:
             raise RuntimeError(f"ElevenLabs TTS error {resp.status_code}: {self._http_error_detail(resp)}")
         log_transcript(logger, "TTS synthesize", text)
-        logger.info(f"TTS synthesized {len(resp.content)} bytes")
+        logger.info("TTS synthesized %s bytes", len(resp.content))
         return resp.content
 
     # ── Streaming context (LLM → TTS bridge) ───────────────────────
@@ -406,8 +418,8 @@ class ElevenLabsTTS(TTSProvider):
     async def _prewarm(self, ctx: _Context) -> None:
         try:
             await self._ensure_ws(ctx)
-        except Exception as e:
-            logger.debug(f"TTS prewarm failed (first chunk will retry): {e}")
+        except Exception as e:  # noqa: BLE001  # a failed prewarm is retried by the first chunk
+            logger.debug("TTS prewarm failed (first chunk will retry): %s", e)
 
     def _init_frame(self, ctx: _Context) -> dict:
         frame: dict = {
@@ -421,7 +433,10 @@ class ElevenLabsTTS(TTSProvider):
 
     async def send_text_chunk(self, text: str, is_last: bool = False) -> None:
         ctx = self._ctx
-        if ctx is None or self._cancelled:
+        if ctx is None or self._cancelled or ctx.input_done:
+            # After the end of input a second ``is_last`` (a turn cut at a
+            # call tool's acceptance after its boundary already closed the
+            # context) or a late chunk changes nothing.
             return
         if not _is_ws_model(self._model_id):
             # HTTP fallback (eleven_v3): accumulate; generation runs at flush.
@@ -456,21 +471,50 @@ class ElevenLabsTTS(TTSProvider):
                     # Record what the server actually got — the zero-audio
                     # resynthesis path in receive_audio replays exactly this.
                     ctx.sent.append(payload)
+                    ctx.unflushed += len(payload)
+                    if ctx.flushed_open:
+                        ctx.flushed_open = False
+                        ctx.audio_started = False
                     if not ctx.t_first_send:
                         ctx.t_first_send = time.monotonic()
                 if is_last:
                     await ws.send(json.dumps({"context_id": ctx.id, "flush": True}))
+                    ctx.unflushed = 0
                     await self._send_close_at_flush(ws, ctx)
                 return
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # the socket raises by its state and transport, the send reconnects once
                 if self._cancelled:
                     return
                 if attempt == 0:
                     # One transparent reconnect (the 180 s inactivity timeout is
                     # the common cause); the context re-inits on the new socket.
-                    logger.warning(f"TTS send failed, reconnecting: {e}")
+                    logger.warning("TTS send failed, reconnecting: %s", e)
                     continue
-                logger.error(f"TTS send error: {e}")
+                logger.error("TTS send error: %s", e)
+
+    async def flush(self) -> None:
+        """A flush frame without a close: the server speaks the text it holds
+        under the first-generation threshold and keeps the context open for
+        more. Skipped on the HTTP models (one request at the end of input),
+        on a context never initialised server-side, after a cancel, after the
+        end of input (its own flush went out) and when nothing was sent since
+        the last flush. A send failure is left to the next text frame, which
+        reconnects and re-inits the context."""
+        ctx = self._ctx
+        if (ctx is None or self._cancelled or not _is_ws_model(self._model_id)
+                or ctx.init_gen < 0 or ctx.input_done or ctx.unflushed <= 0):
+            return
+        ws = self._ws
+        if ws is None or ctx.init_gen != self._ws_gen:
+            return
+        try:
+            await ws.send(json.dumps({"context_id": ctx.id, "flush": True}))
+        except Exception as e:  # noqa: BLE001  # a flush lost to a closing socket ends this utterance only
+            logger.warning("TTS flush failed: %s", e)
+            return
+        ctx.unflushed = 0
+        ctx.flushed_open = True
+        logger.debug("ElevenLabs TTS: flushed mid-utterance")
 
     async def _resynthesize(self, ctx: _Context):
         """Zero-audio recovery: reconnect and replay the context's sent text.
@@ -496,8 +540,8 @@ class ElevenLabsTTS(TTSProvider):
                 await ws.send(json.dumps({"context_id": ctx.id, "flush": True}))
                 await self._send_close_at_flush(ws, ctx)
             return ws
-        except Exception as e:
-            logger.error(f"TTS resynthesis reconnect failed: {e}")
+        except Exception as e:  # noqa: BLE001  # a failed resynthesis ends this utterance only
+            logger.error("TTS resynthesis reconnect failed: %s", e)
             return None
 
     async def _send_close_at_flush(self, ws, ctx: _Context) -> None:
@@ -505,8 +549,9 @@ class ElevenLabsTTS(TTSProvider):
         final frame then ends ``receive_audio`` the moment the last audio
         arrived (the tail stall guard stays as the fallback). Sent right
         behind the flush only once the server has already streamed audio for
-        this context; on a fresh context (the whole utterance flushed in one
-        go — an outbound opening) the close waits for the first audio frame
+        the current generation; on a fresh context, or the text after a
+        mid-utterance flush (a new generation, ``audio_started`` reset), the
+        close waits for that generation's first audio frame
         (``receive_audio`` sends it), because a close racing the flush made
         the server restart the utterance mid-word. Skipped when
         ``advanced.close_at_flush`` is off."""
@@ -527,9 +572,9 @@ class ElevenLabsTTS(TTSProvider):
             return
         try:
             ws = await self._ensure_ws(ctx)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # a TTS provider raises whatever its SDK and socket do
             if not self._cancelled:
-                logger.error(f"TTS receive connect error: {e}")
+                logger.error("TTS receive connect error: %s", e)
                 # A send-path _ensure_ws retry may have initialised the
                 # context on another socket — retire it best-effort.
                 self._fire_close_context(ctx)
@@ -610,7 +655,7 @@ class ElevenLabsTTS(TTSProvider):
             if audio_b64:
                 try:
                     chunk = base64.b64decode(audio_b64)
-                except Exception:
+                except ValueError:
                     continue
                 if chunk:
                     if yielded == 0 and ctx.t_first_send:
@@ -636,6 +681,14 @@ class ElevenLabsTTS(TTSProvider):
                                 await self._send_close_at_flush(ws, ctx)
                     yield chunk
             if msg.get("isFinal") or msg.get("is_final"):
+                if not ctx.input_done:
+                    # A final answered to a mid-utterance flush: the input
+                    # goes on, so the receiver stays for the rest.
+                    logger.info(
+                        "ElevenLabs TTS: final frame before the end of input "
+                        "— ignored (%d chunks so far)", yielded,
+                    )
+                    continue
                 logger.info(
                     "ElevenLabs TTS: final frame received — utterance complete "
                     "(%d chunks)", yielded,
@@ -672,7 +725,7 @@ class ElevenLabsTTS(TTSProvider):
                         ws = new_ws
                         stalled_s = 0.0
                         continue
-                logger.error(f"ElevenLabs TTS error frame: {str(msg)[:200]}")
+                logger.error("ElevenLabs TTS error frame: %s", str(msg)[:200])
                 break
         # Every exit except a server isFinal (or an explicit cancel(), which
         # sends its own close) leaves the context registered server-side —
@@ -706,7 +759,8 @@ class ElevenLabsTTS(TTSProvider):
                     if resp.status_code != 200:
                         await resp.aread()
                         logger.error(
-                            f"ElevenLabs TTS error {resp.status_code}: {self._http_error_detail(resp)}"
+                            "ElevenLabs TTS error %s: %s",
+                            resp.status_code, self._http_error_detail(resp)
                         )
                         return
                     async for chunk in resp.aiter_bytes():
@@ -724,7 +778,7 @@ class ElevenLabsTTS(TTSProvider):
                             yield chunk
         except httpx.HTTPError as e:
             if not self._cancelled:
-                logger.error(f"TTS receive error: {e}")
+                logger.error("TTS receive error: %s", e)
 
     def _fire_close_context(self, ctx: _Context | None) -> None:
         """Best-effort ``close_context`` for a context the server never

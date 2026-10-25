@@ -119,7 +119,7 @@ describe('collectDropped', () => {
     expect(paths(r)).toEqual(['repo/src/a.ts', 'repo/.env', 'repo/.gitignore'])
     expect(r.leftOut).toBe(5)
     expect(r.leftOutNames).toEqual(['.git', 'node_modules', '__pycache__'])
-    expect(leftOutNote(r)).toBe('5 folders left out (.git, node_modules, __pycache__)')
+    expect(leftOutNote(r)).toBe('5 folders left out: .git, node_modules, __pycache__')
   })
 
   it('keeps what the sync carries: .claude, .codex, and a folder merely named venv', async () => {
@@ -141,7 +141,7 @@ describe('collectDropped', () => {
       dirEntry('node_modules', [fileEntry('b.js')]),
     ])
     expect(paths(r)).toEqual(['.config/a.md'])
-    expect(leftOutNote(r)).toBe('1 folder left out (node_modules)')
+    expect(leftOutNote(r)).toBe('1 folder left out: node_modules')
   })
 
   it('reports a folder whose later batch fails as unreadable, none of its files', async () => {
@@ -163,7 +163,7 @@ describe('collectDropped', () => {
     expect(empty.emptyDirs).toEqual(['t/e'])
     expect(folderRefusal(empty, 100)).toBe('An empty folder: nothing to attach')
     const hiddenOnly = await collectDropped([dirEntry('t', [dirEntry('.git', [fileEntry('x')])])])
-    expect(folderRefusal(hiddenOnly, 100)).toBe('Nothing to attach: 1 folder left out (.git)')
+    expect(folderRefusal(hiddenOnly, 100)).toBe('Nothing to attach. 1 folder left out: .git')
   })
 
   it('names the first file over the cap, and notes what a good folder lost', async () => {
@@ -176,7 +176,7 @@ describe('collectDropped', () => {
       dirEntry('t', [fileEntry('a'), fileEntry('gone', { unreadable: true }), dirEntry('.git', [fileEntry('x')])]),
     ])
     expect(folderRefusal(ok, 100)).toBe('')
-    expect(folderNote(ok)).toBe("1 item can't be read · 1 folder left out (.git)")
+    expect(folderNote(ok)).toBe("1 item can't be read · 1 folder left out: .git")
   })
 })
 

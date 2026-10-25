@@ -29,13 +29,13 @@ import pytest
 from fastapi import HTTPException
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from auth.providers import UserContext  # noqa: E402
-from api.tasks import tasks  # noqa: E402
-
+from api.tasks import tasks
+from auth.providers import UserContext
 
 # ───────────────────────────────────────────────────────────────────────────
 # Caller factories
@@ -307,6 +307,7 @@ X, Y = "holes-x", "holes-y"
 @pytest.fixture
 def routes(temp_db, monkeypatch):
     from fastapi.testclient import TestClient
+
     from app import app
     from services.scheduler import scheduler
     from storage.agents import agent_store

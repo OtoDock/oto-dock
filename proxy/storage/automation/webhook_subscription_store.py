@@ -194,6 +194,7 @@ def list_subscriptions(
     account_label: str | None = None,
     vendor_target: str | None = None,
     delivery_mode: str | None = None,
+    target_kind: str | None = None,
 ) -> list[dict]:
     conditions: list[str] = []
     params: list[Any] = []
@@ -224,6 +225,9 @@ def list_subscriptions(
     if delivery_mode is not None:
         conditions.append("delivery_mode=%s")
         params.append(delivery_mode)
+    if target_kind is not None:
+        conditions.append("target_kind=%s")
+        params.append(target_kind)
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     with get_conn() as conn:
         rows = conn.execute(

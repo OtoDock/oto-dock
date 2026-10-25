@@ -203,6 +203,9 @@ async def test_sweeper_removes_completed_entries():
     assert warmup_registry.get("c1") is None
     assert warmup_registry.get("c2") is None
     assert warmup_registry.get("c3") is not None
+    # A waiter parked on the swept entry's event wakes instead of sleeping
+    # out its deadline.
+    assert rec2.completed.is_set()
 
 
 @pytest.mark.asyncio

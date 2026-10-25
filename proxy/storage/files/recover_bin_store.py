@@ -38,9 +38,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
-from storage.pg import get_conn
 from auth import roles
 from core import layout
+from storage.pg import get_conn
 
 logger = logging.getLogger("otodock.recover-bin")
 

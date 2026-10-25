@@ -6,6 +6,7 @@ stdlib leaves (the wire catalogue, the run vocabulary) and the stdlib.
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -14,10 +15,17 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
+
+import psycopg
 
 import config
+from core.permission_modes import ASK_MODE, PLAN_MODE, current_mode, terminal_mode
 from storage.automation import run_status
 from ws import wire_events as wire
+
+if TYPE_CHECKING:
+    from core.sandbox.pty_relay import PipedProcess
 
 logger = logging.getLogger("otodock")
 
@@ -50,12 +58,23 @@ _TASK_SESSION_REAP_TTL_SECONDS = 6 * 3600  # 6h
 _session_locks: dict[str, asyncio.Lock] = {}
 
 # Active running processes by session_id (for abort support)
-_active_processes: dict[str, asyncio.subprocess.Process] = {}
+_active_processes: "dict[str, PipedProcess]" = {}
 # Sessions explicitly aborted via abort endpoint (don't save pending results)
 _aborted_sessions: set[str] = set()
 
 # Permission gate state (for hook-based permission system)
-_session_modes: dict[str, str] = {}  # session_id -> permission_mode (auto|default|plan)
+_session_modes: dict[str, str] = {}  # session_id -> permission_mode (core/permission_modes)
+# session_id -> the mode a session left when it entered Plan (a reject
+# goes back to it).
+_pre_plan_modes: dict[str, str] = {}
+# Sessions whose engine's own review is paused after its decline limit:
+# Auto answers with the platform's cards until the next mode change.
+_review_paused: set[str] = set()
+# session_id -> how often the engine re-entered its review after that limit.
+_review_reentries: dict[str, int] = {}
+# session_id -> the last mode word an interactive terminal reported in a
+# hook call (the terminal follows Shift+Tab on a change of it).
+_live_words: dict[str, str] = {}
 # session_id -> MCP tool names the user already clicked Allow for this session.
 # One Allow per tool per session: without this, default mode re-prompts on
 # EVERY call (N cards for N calls of the same tool). MCP tools only — Bash
@@ -122,8 +141,10 @@ _session_codex_dirs: dict[str, dict] = {}
 # The location bridge (wait_for_location / resolve_location + its event/result
 # maps) lives in location_bridge.py; re-exported so `from core.session.session_state
 # import wait_for_location` (api/hooks) and `resolve_location` (ws/dashboard) work.
-from core.session.location_bridge import wait_for_location, resolve_location  # noqa: F401
-import contextlib
+from core.session.location_bridge import (  # noqa: F401
+    resolve_location,
+    wait_for_location,
+)
 
 # Hook activity tracking: updated every time a permission hook fires for a session.
 # Used by settle mode to detect that internal background agents are still working
@@ -620,8 +641,8 @@ def clear_session_liveness(session_id: str, *, reason: str = "") -> None:
         return
 
     logger.info(
-        f"clear_session_liveness: session={session_id[:8]} reason={reason or '-'} "
-        f"chats={sorted(chats)}"
+        "clear_session_liveness: session=%s reason=%s "
+        "chats=%s", session_id[:8], reason or '-', sorted(chats)
     )
     seen_queues: set[int] = set()
     for queue in list(_dashboard_notify_queues.values()):
@@ -749,7 +770,7 @@ async def reap_idle_task_sessions(interval_seconds: int = 300) -> None:
         try:
             n = reap_task_sessions()
             if n:
-                logger.info(f"Session index: reaped {n} stale task session(s)")
+                logger.info("Session index: reaped %s stale task session(s)", n)
         except Exception:
             logger.exception("reap_idle_task_sessions sweep failed")
         await asyncio.sleep(interval_seconds)
@@ -766,7 +787,7 @@ def _load_sessions() -> None:
             return
         removed = prune_dead_sessions()
         if removed:
-            logger.info(f"Session index: pruned {removed} entries inactive >{_SESSION_INDEX_TTL_DAYS}d")
+            logger.info("Session index: pruned %s entries inactive >%sd", removed, _SESSION_INDEX_TTL_DAYS)
             _save_sessions()
 
 
@@ -784,7 +805,7 @@ def _atomic_write(path, blob: str, *, fsync: bool) -> bool:
         os.replace(tmp, path)
         return True
     except OSError as e:
-        logger.error(f"Failed to save {path.name}: {e}")
+        logger.error("Failed to save %s: %s", path.name, e)
         with contextlib.suppress(OSError):
             tmp.unlink()
         return False
@@ -989,7 +1010,7 @@ async def cached_idle_timeout() -> int:
     try:
         value = await run_db(
             _read_idle_timeout_strict if getter is _STOCK_GET_IDLE_TIMEOUT else getter)
-    except Exception:
+    except psycopg.Error:
         logger.warning("idle timeout read failed; using the last known value", exc_info=True)
         if hit is not None and hit[0] is getter:
             return hit[1]
@@ -1057,9 +1078,9 @@ def _save_pending_result(
     }
     try:
         pending_path.write_text(json.dumps(data, indent=2))
-        logger.info(f"Saved pending result for session {session_id} ({len(text)} chars)")
+        logger.info("Saved pending result for session %s (%s chars)", session_id, len(text))
     except OSError as e:
-        logger.error(f"Failed to save pending result for {session_id}: {e}")
+        logger.error("Failed to save pending result for %s: %s", session_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -1067,14 +1088,55 @@ def _save_pending_result(
 # ---------------------------------------------------------------------------
 
 
-def get_session_mode(session_id: str) -> str:
-    """Get the permission mode for a session. A reloaded session its machine
-    reported, in the moment before its re-adoption restores it, already
-    answers in the mode the security index kept for it."""
+def recorded_session_mode(session_id: str) -> str:
+    """The permission mode recorded for a session, "" when none is: a
+    reloaded session its machine reported, in the moment before its
+    re-adoption restores it, already answers in the mode the security index
+    kept for it. A meeting participant reads its host chat's session here,
+    where "" means the host is gone (never ``auto``)."""
     mode = _session_modes.get(session_id)
     if mode is None:
         mode = _reloaded_state.get(session_id, ("", 0))[0]
-    return mode or "auto"
+    return mode or ""
+
+
+def get_session_mode(session_id: str) -> str:
+    """Get the permission mode for a session: its recorded mode, else
+    ``auto`` (a task or phone session never records one)."""
+    return recorded_session_mode(session_id) or "auto"
+
+
+def pre_plan_mode(session_id: str) -> str:
+    """The mode the session left when it entered Plan, Ask when unknown."""
+    return _pre_plan_modes.get(session_id) or ASK_MODE
+
+
+def pause_review(session_id: str) -> None:
+    """The engine's own review paused (its decline limit came back twice):
+    Auto answers with the platform's cards until the mode changes."""
+    _review_paused.add(session_id)
+
+
+def review_paused(session_id: str) -> bool:
+    return session_id in _review_paused
+
+
+def note_review_reentry(session_id: str) -> int:
+    """Count one re-entry of the engine's review; the count before it."""
+    done = _review_reentries.get(session_id, 0)
+    _review_reentries[session_id] = done + 1
+    return done
+
+
+def note_live_word(session_id: str, word: str) -> bool:
+    """Record the mode word an interactive terminal reported with a hook
+    call; True when it differs from the last one (the word the session was
+    spawned with, recorded at its registration, before the first). With no
+    word recorded (a session re-adopted after a restart) the first report is
+    recorded and is not a change."""
+    prev = _live_words.get(session_id)
+    _live_words[session_id] = word
+    return prev is not None and word != prev
 
 
 def set_session_mode(session_id: str, mode: str) -> None:
@@ -1086,14 +1148,19 @@ def set_session_mode(session_id: str, mode: str) -> None:
     its satellite keeps across a restart comes back in its own mode.
     """
     prev = _session_modes.get(session_id)
+    mode = current_mode(mode)
     _session_modes[session_id] = mode
+    if prev != mode:
+        _review_paused.discard(session_id)
+        if mode == PLAN_MODE and prev and prev != PLAN_MODE:
+            _pre_plan_modes[session_id] = prev
     if prev is not None and prev != mode and session_id in _session_security:
         _save_session_security()
 
 
 def remember_session_tool_allow(session_id: str, tool_name: str) -> None:
     """Record a user-approved MCP tool so the same tool doesn't re-prompt for
-    the rest of this session. Never called for high-risk device tools — those
+    the rest of this session. Never called for a critical-tier tool — those
     re-prompt per call by design."""
     _session_tool_allows.setdefault(session_id, set()).add(tool_name)
 
@@ -1144,6 +1211,7 @@ def _deserialize_security_ctx(d: dict):
     """Rebuild a SecurityContext from a persisted dict, tolerant of field drift
     (unknown keys dropped, missing keys default)."""
     import dataclasses
+
     from auth.path_policy import SecurityContext
     from core.placement import PlacementCapabilities
     fields = {f.name for f in dataclasses.fields(SecurityContext)}
@@ -1184,20 +1252,23 @@ def _save_session_security() -> None:
     Best-effort: a write failure must never break a warmup/close, so it
     only logs."""
     now = time.time()
-    data = {}
+    entries = []
     for sid, ctx in _session_security.items():
         # A reloaded session not re-adopted yet keeps what the index held.
         kept_mode, kept_floor = _reloaded_state.get(sid, ("", 0))
         try:
-            data[sid] = {
+            entry = json.dumps({
                 **_serialize_security_ctx(ctx),
                 "_saved_at": _session_security_ts.get(sid, now),
                 "_mode": _session_modes.get(sid, kept_mode),
                 "_floor": _session_token_floor.get(sid, kept_floor),
-            }
-        except Exception:
-            continue  # a non-serializable entry must not block the rest
-    _atomic_write(_SECURITY_INDEX, json.dumps(data, separators=(",", ":")), fsync=False)
+            }, separators=(",", ":"))
+        except (TypeError, ValueError) as e:
+            # One entry that cannot be written must not lose the others.
+            logger.warning("Session security index: skipped session %s (%s)", sid[:8], e)
+            continue
+        entries.append(f"{json.dumps(sid)}:{entry}")
+    _atomic_write(_SECURITY_INDEX, "{" + ",".join(entries) + "}", fsync=False)
 
 
 def load_session_security() -> None:
@@ -1209,7 +1280,7 @@ def load_session_security() -> None:
     try:
         raw = json.loads(_SECURITY_INDEX.read_text())
     except (json.JSONDecodeError, OSError) as e:
-        logger.error(f"Failed to load session security index: {e}")
+        logger.error("Failed to load session security index: %s", e)
         return
     now = time.time()
     loaded = 0
@@ -1224,9 +1295,9 @@ def load_session_security() -> None:
                 continue
             _session_security[sid] = _deserialize_security_ctx(d)
             _session_security_ts[sid] = saved_at or now
-            _reloaded_state[sid] = (str(d.get("_mode") or ""), int(d.get("_floor") or 0))
+            _reloaded_state[sid] = (current_mode(str(d.get("_mode") or "")), int(d.get("_floor") or 0))
             loaded += 1
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             logger.warning("Skipping unreadable security index entry %s", sid[:8])
     if loaded:
         logger.info("Reloaded %d session security context(s) from disk", loaded)
@@ -1282,11 +1353,14 @@ def register_session_state(session_id: str, permission_mode: str, security_conte
     """
     if not session_is_held(session_id):
         _session_token_floor[session_id] = int(token_minted_at or time.time())
+        # The word a terminal of this life starts in (a re-warm of a live
+        # session keeps the running terminal's).
+        _live_words[session_id] = terminal_mode(permission_mode)
         # A new life of the id: a replay mark of an earlier one is void.
         entry = _sessions.get(session_id)
         if entry is not None and entry.pop("recover_pending", False):
             _save_sessions()
-    _session_modes[session_id] = permission_mode
+    _session_modes[session_id] = current_mode(permission_mode)
     _reloaded_state.pop(session_id, None)
     if security_context is not None:
         set_session_security(session_id, security_context)  # persists mode + floor
@@ -1343,7 +1417,7 @@ def restore_session_state(session_id: str, permission_mode: str, token_floor: in
     the floor to "now", which would refuse the running process's own token.
     The context is the reloaded one; its load-time stamp is kept, so a
     restart never extends the index's prune window."""
-    _session_modes[session_id] = permission_mode
+    _session_modes[session_id] = current_mode(permission_mode)
     if token_floor:
         _session_token_floor[session_id] = int(token_floor)
     else:
@@ -1685,13 +1759,23 @@ def _note_no_answer(request_id: str) -> None:
 
 
 def resolve_permission(request_id: str, approved: bool) -> bool:
-    """Resolve a pending permission request. Returns True if the request existed."""
+    """Resolve a pending permission request. True when this answer took it:
+    a request that is unknown, or already answered (the waiter leaves a
+    loop tick after the first answer, and a second socket's answer can
+    land in that tick), is refused so one answer wins."""
     event = _permission_events.get(request_id)
-    if event is None:
+    if event is None or event.is_set():
         return False
     _permission_decisions[request_id] = approved
     event.set()
     return True
+
+
+def prompt_answered(request_id: str) -> bool:
+    """Whether the prompt's wait was answered and its waiter has not left
+    yet (an answer in that tick must change nothing more)."""
+    event = _permission_events.get(request_id) or _question_events.get(request_id)
+    return event is not None and event.is_set()
 
 
 def get_permission_request_session(request_id: str) -> str | None:
@@ -1746,7 +1830,7 @@ def resolve_question(request_id: str, answers: dict) -> bool:
     reaped / released), so the answer must be re-routed rather than dropped.
     """
     event = _question_events.get(request_id)
-    if event is None:
+    if event is None or event.is_set():
         return False
     _question_answers[request_id] = answers if isinstance(answers, dict) else {}
     event.set()
@@ -1789,8 +1873,9 @@ def resolve_session_permissions(session_id: str, approved: bool = False) -> int:
     _session_permission_requests.pop(session_id, None)
     if released:
         logger.info(
-            f"resolve_session_permissions: released {released} pending "
-            f"permission(s) for session={session_id[:8]} (approved={approved})"
+            "resolve_session_permissions: released %s pending "
+            "permission(s) for session=%s (approved=%s)",
+            released, session_id[:8], approved
         )
     return released
 
@@ -1824,6 +1909,12 @@ def set_meeting_session_info(
         "routed_tool": "",
         "turn_text_chars": 0,
     }
+
+
+def is_meeting_session(session_id: str) -> bool:
+    """Whether the session was started for a meeting (the orchestrator marks
+    its record). Still true once its meeting mapping is gone."""
+    return bool(_sessions.get(session_id, {}).get("is_meeting"))
 
 
 def get_meeting_session_info(agent_session_id: str) -> dict | None:
@@ -1874,6 +1965,10 @@ def cleanup_session_permission_state(session_id: str) -> None:
     # left behind (also pops both registries, incl. the bg-command one).
     clear_session_liveness(session_id, reason="session_closed")
     _session_modes.pop(session_id, None)
+    _pre_plan_modes.pop(session_id, None)
+    _review_paused.discard(session_id)
+    _review_reentries.pop(session_id, None)
+    _live_words.pop(session_id, None)
     _session_tool_allows.pop(session_id, None)
     _permission_emitters.pop(session_id, None)
     _had_security = _session_security.pop(session_id, None) is not None
@@ -1920,8 +2015,8 @@ def get_pending_result(session_id: str) -> dict | None:
     try:
         data = json.loads(pending_path.read_text())
         pending_path.unlink()
-        logger.info(f"Retrieved pending result for session {session_id}")
+        logger.info("Retrieved pending result for session %s", session_id)
         return data
     except (json.JSONDecodeError, OSError) as e:
-        logger.error(f"Failed to read pending result for {session_id}: {e}")
+        logger.error("Failed to read pending result for %s: %s", session_id, e)
         return None

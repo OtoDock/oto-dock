@@ -1,0 +1,28 @@
+<p class="muted">The empty state. When a list has nothing in it yet, say what the list is for. Then offer the one action that fills it. Use it instead of an empty table or a blank card. The platform's first picture of a new app is this screen, so it must read well on its own. The words change with the role. A person who cannot add anything is told who can.</p>
+
+<div class="card empty" id="empty">
+  <div class="empty-mark" aria-hidden="true">+</div>
+  <p class="empty-title">No bookings yet</p>
+  <p class="empty-help" data-role-can>Add the first booking, or share the link so customers can book.</p>
+  <p class="empty-help" data-role-cannot hidden>An editor of this agent adds the first booking.</p>
+  <button type="button" class="btn primary" data-role-can>Add a booking</button>
+</div>
+
+<style>
+.empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 32px 16px; }
+.empty-mark { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; margin-bottom: 8px; border-radius: var(--p-radius-sm); background: var(--p-surface); color: var(--p-text-light); font-size: var(--p-font-size-lg); }
+.empty-title { margin: 0 0 4px; font-size: var(--p-font-size-sm); font-weight: 500; color: var(--p-text); }
+.empty-help { margin: 0 0 12px; font-size: var(--p-font-size-xs); color: var(--p-text-light); max-width: 32em; }
+</style>
+
+<script>
+(function () {
+  // Swap the words by role: true when the viewer may add (see role-gate.html
+  // for reading the role).
+  function canAdd(yes) {
+    document.querySelectorAll('[data-role-can]').forEach(function (el) { el.hidden = !yes })
+    document.querySelectorAll('[data-role-cannot]').forEach(function (el) { el.hidden = yes })
+  }
+  canAdd(true)
+})()
+</script>

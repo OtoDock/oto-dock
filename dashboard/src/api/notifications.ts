@@ -1,5 +1,6 @@
 import { apiFetch } from './auth'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { apiJson } from '../lib/http/apiJson'
 
 export interface NotificationDefinition {
   /** Set on a row the offboarding transfer moved: the first creator's sub,
@@ -13,6 +14,8 @@ export interface NotificationDefinition {
   severity: 'info' | 'success' | 'warning' | 'danger'
   scope: string
   target: string | null
+  /** A user-scope row's recipient name (the admin audit view). */
+  target_name?: string
   source: string
   source_id: string | null
   notification_type: string
@@ -52,9 +55,8 @@ export const useFireNotification = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (notificationId: string) => {
-      const res = await apiFetch(`/v1/notifications/${notificationId}/fire`, { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+      return apiJson(`/v1/notifications/${notificationId}/fire`, { method: 'POST' },
+        'Could not send the notification')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['notification-definitions'] })
@@ -66,9 +68,8 @@ export const useDeleteNotification = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (notificationId: string) => {
-      const res = await apiFetch(`/v1/notifications/${notificationId}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+      return apiJson(`/v1/notifications/${notificationId}`, { method: 'DELETE' },
+        'Could not delete the notification')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['notification-definitions'] })
@@ -80,9 +81,8 @@ export const usePauseNotification = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (notificationId: string) => {
-      const res = await apiFetch(`/v1/notifications/${notificationId}/pause`, { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+      return apiJson(`/v1/notifications/${notificationId}/pause`, { method: 'POST' },
+        'Could not pause the notification')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['notification-definitions'] })
@@ -94,9 +94,8 @@ export const useResumeNotification = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (notificationId: string) => {
-      const res = await apiFetch(`/v1/notifications/${notificationId}/resume`, { method: 'POST' })
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
+      return apiJson(`/v1/notifications/${notificationId}/resume`, { method: 'POST' },
+        'Could not resume the notification')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['notification-definitions'] })

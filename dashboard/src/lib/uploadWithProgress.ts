@@ -1,3 +1,5 @@
+import { errorName } from './http/apiJson'
+import { isRecord } from './json/guards'
 // XHR-based upload with byte progress. fetch() has no upload-progress events
 // (short of experimental duplex streams), so the workspace/chat upload paths
 // use XMLHttpRequest when they want a progress bar. Auth is the same-origin
@@ -76,7 +78,8 @@ function uploadSingle(
       if (xhr.status >= 200 && xhr.status < 300 && xhr.response) {
         resolve(xhr.response as UploadResponse)
       } else {
-        const detail = (xhr.response && (xhr.response as any).detail) || `HTTP ${xhr.status}`
+        const body: unknown = xhr.response
+        const detail = (isRecord(body) && body.detail) || (xhr.status === 413 ? 'The file is too large for the server.' : 'The upload failed. Try again in a minute.')
         reject(new Error(String(detail)))
       }
     }
@@ -99,12 +102,12 @@ function uploadSingle(
 
 // --- chunked path -----------------------------------------------------------
 
-async function jsonRequest(
+async function jsonRequest<T>(
   method: string,
   url: string,
   body: unknown | undefined,
   signal?: AbortSignal,
-): Promise<any> {
+): Promise<T> {
   const resp = await fetch(url, {
     method,
     credentials: 'same-origin',
@@ -118,11 +121,11 @@ async function jsonRequest(
     throw new Error('Unauthorized')
   }
   if (!resp.ok) {
-    let detail = `HTTP ${resp.status}`
+    let detail = 'The server did not accept the request. Try again in a minute.'
     try {
       const data = await resp.json()
       if (data?.detail) detail = String(data.detail)
-    } catch { /* non-JSON error body (edge/gateway) — keep the status */ }
+    } catch { /* non-JSON error body (edge/gateway) — keep the fallback sentence */ }
     throw new Error(detail)
   }
   return resp.json()
@@ -161,7 +164,8 @@ function putChunk(
         resolve()
         return
       }
-      const detail = (xhr.response && (xhr.response as any).detail) || `HTTP ${xhr.status}`
+      const body: unknown = xhr.response
+      const detail = (isRecord(body) && body.detail) || (xhr.status === 413 ? 'The file is too large for the server.' : 'The upload failed. Try again in a minute.')
       const err = new Error(String(detail)) as Error & { status?: number }
       err.status = xhr.status
       reject(err)
@@ -213,10 +217,11 @@ async function putChunkWithRetry(
     try {
       await putChunk(uploadId, index, blob, onProgress, signal)
       return
-    } catch (e: any) {
-      if (e?.name === 'AbortError') throw e
-      const retriable = e?.transient === true ||
-        (typeof e?.status === 'number' && e.status >= 500)
+    } catch (e) {
+      if (errorName(e) === 'AbortError') throw e
+      const failure = isRecord(e) ? e : {}
+      const retriable = failure.transient === true ||
+        (typeof failure.status === 'number' && failure.status >= 500)
       if (!retriable) throw e
       lastErr = e
     }
@@ -231,7 +236,7 @@ async function uploadChunked(
   onProgress: (sent: number, total: number) => void,
   signal?: AbortSignal,
 ): Promise<UploadResponse> {
-  const init = await jsonRequest('POST', '/v1/upload/chunked/init', {
+  const init = await jsonRequest<{ upload_id: unknown; chunk_size: unknown }>('POST', '/v1/upload/chunked/init', {
     agent,
     target_dir: targetDir,
     filename: file.name,
@@ -253,12 +258,12 @@ async function uploadChunked(
       )
       onProgress(Math.min(base + blob.size, file.size), file.size)
     }
-    const done = await jsonRequest(
+    const done = await jsonRequest<UploadResponse>(
       'POST', `/v1/upload/chunked/${uploadId}/complete`, {}, signal,
     )
     onProgress(file.size, file.size)
-    return done as UploadResponse
-  } catch (e: any) {
+    return done
+  } catch (e) {
     // Every error reaching here is terminal for this upload (an abort, a
     // refused chunk or complete, exhausted retries): release the staging
     // now rather than holding a slot of the caller's cap until the sweep.
@@ -285,5 +290,5 @@ export async function reserveUploadFolder(
   signal?: AbortSignal,
   targetDir = '',
 ): Promise<{ path: string; name: string }> {
-  return jsonRequest('POST', '/v1/upload/folder', { agent, name, target_dir: targetDir }, signal)
+  return jsonRequest<{ path: string; name: string }>('POST', '/v1/upload/folder', { agent, name, target_dir: targetDir }, signal)
 }

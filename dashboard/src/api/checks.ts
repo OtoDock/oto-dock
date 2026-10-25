@@ -1,5 +1,6 @@
 import { apiFetch } from './auth'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { withMessage, apiJson } from '../lib/http/apiJson'
 
 // Checks (proxy CHECKS.md): named units that judge an agent's work at the
 // end of a turn. The agent's checks live in its config (managers write
@@ -113,9 +114,8 @@ export function useChecks(agent: string) {
     // `tool_enabled`: whether the checks MCP is on for the agent (a core MCP
     // reaches only agents created after its release; older ones turn it on).
     queryFn: async (): Promise<{ checks: CheckItem[]; can_manage: boolean; username: string; tool_enabled?: boolean }> => {
-      const res = await apiFetch(`/v1/agents/${agent}/checks`)
-      if (!res.ok) throw new Error('Failed to fetch checks')
-      return res.json()
+      return apiJson<{ checks: CheckItem[]; can_manage: boolean; username: string; tool_enabled?: boolean }>(`/v1/agents/${agent}/checks`)
+        .catch(withMessage('Failed to fetch checks'))
     },
     enabled: !!agent,
   })
@@ -165,9 +165,8 @@ export function useCheckVerdicts(agent: string, opts: { chat_id?: string; check?
   return useQuery({
     queryKey: ['check-verdicts', agent, qs],
     queryFn: async (): Promise<CheckVerdict[]> => {
-      const res = await apiFetch(`/v1/agents/${agent}/check-verdicts${qs ? `?${qs}` : ''}`)
-      if (!res.ok) throw new Error('Failed to fetch verdicts')
-      const data = await res.json()
+      const data = await apiJson<{ verdicts?: CheckVerdict[] }>(`/v1/agents/${agent}/check-verdicts${qs ? `?${qs}` : ''}`)
+        .catch(withMessage('Failed to fetch verdicts'))
       return data.verdicts ?? []
     },
     enabled: !!agent,
@@ -178,9 +177,8 @@ export function useCheckSettings(agent: string) {
   return useQuery({
     queryKey: ['check-settings', agent],
     queryFn: async (): Promise<CheckSettings> => {
-      const res = await apiFetch(`/v1/agents/${agent}/check-settings`)
-      if (!res.ok) throw new Error('Failed to fetch the check settings')
-      return res.json()
+      return apiJson<CheckSettings>(`/v1/agents/${agent}/check-settings`)
+        .catch(withMessage('Failed to fetch the check settings'))
     },
     enabled: !!agent,
   })

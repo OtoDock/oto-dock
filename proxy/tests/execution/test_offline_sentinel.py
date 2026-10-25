@@ -18,18 +18,20 @@ from unittest.mock import patch
 import pytest
 
 from core import placement
+from core.execution_layer import ResumeVerdict
+from services.remote import remote_status
 from storage import remote_store
 
 
 def test_the_resolver_mints_the_sentinel_and_the_builder_places_it_local(monkeypatch):
-    from storage.agents import agent_store
     from storage import database as _db
+    from storage.agents import agent_store
     monkeypatch.setattr(agent_store, "get_agent",
                         lambda slug: {"slug": slug, "execution_path": "claude-code-cli",
                                       "execution_target": "m-dead"})
     monkeypatch.setattr(_db, "get_platform_setting", lambda key: "0")  # no fallback either way
     with patch("services.remote.remote_status.is_reachable", return_value=False):
-        target, reason = remote_store.resolve_execution_target("pa", None, "manager")
+        target, reason = remote_status.resolve_execution_target("pa", None, "manager")
     assert placement.is_offline_sentinel(target) and placement.offline_machine_of(target) == "m-dead"
     assert reason == "agent-default-offline-hard-fail"
     assert remote_store.placement_of(target, None, "pa") is placement.LOCAL_PLACEMENT
@@ -45,8 +47,8 @@ async def test_the_headless_heal_refuses_before_any_registration(monkeypatch):
     """``resume_dead_session_headless``: a pinned machine that is offline
     raises the tailored error right after the build — before the slot, the
     layer and ``set_session_security``."""
-    from ws import headless_resume as hr
     from core.session import session_state
+    from ws import headless_resume as hr
 
     cfg = SimpleNamespace(execution_target=placement.offline_sentinel("m-dead"),
                           execution_path="claude-code-cli", interactive=False,
@@ -61,7 +63,7 @@ async def test_the_headless_heal_refuses_before_any_registration(monkeypatch):
 
     class _Layer:
         async def can_resume_session(self, *a, **k):
-            return True
+            return ResumeVerdict.RESUMABLE
 
         async def prepare_resume(self, *a, **k):
             return None

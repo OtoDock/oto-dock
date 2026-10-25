@@ -38,6 +38,7 @@ import pytest
 from fastapi import HTTPException
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -204,7 +205,7 @@ class TestRequestInstalledMcp:
         """The catalog must not even be consulted for an installed MCP —
         a zip install is requestable during a catalog outage."""
         _seed_agent()
-        from api.mcp.community import create_mcp_request, CreateRequestBody
+        from api.mcp.community import CreateRequestBody, create_mcp_request
         from services.community import community_catalog
 
         with patch(
@@ -231,7 +232,7 @@ class TestRequestInstalledMcp:
 
     def test_unknown_everywhere_404s(self, temp_db):
         _seed_agent()
-        from api.mcp.community import create_mcp_request, CreateRequestBody
+        from api.mcp.community import CreateRequestBody, create_mcp_request
         from services.community import community_catalog
 
         with patch(
@@ -250,7 +251,7 @@ class TestRequestInstalledMcp:
 
     def test_catalog_outage_still_502s_for_uninstalled(self, temp_db):
         _seed_agent()
-        from api.mcp.community import create_mcp_request, CreateRequestBody
+        from api.mcp.community import CreateRequestBody, create_mcp_request
         from services.community import community_catalog
 
         with patch(
@@ -291,8 +292,7 @@ class TestApproveWithInstanceId:
         on that one, not the lowest-id automatic choice."""
         _seed_agent()
         from services.community import community_installer
-        from storage.mcp import mcp_request_store
-        from storage.mcp import mcp_store
+        from storage.mcp import mcp_request_store, mcp_store
 
         first = mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "first", "field_values": {},
@@ -321,8 +321,7 @@ class TestApproveWithInstanceId:
         ``installing``, which only exits via installed/install_failed)."""
         _seed_agent()
         from services.community import community_installer
-        from storage.mcp import mcp_request_store
-        from storage.mcp import mcp_store
+        from storage.mcp import mcp_request_store, mcp_store
 
         alien = mcp_store.upsert_mcp_instance("other-mcp", {
             "instance_name": "alien", "field_values": {},
@@ -353,7 +352,8 @@ class TestApproveWithInstanceId:
                     row["id"], ADMIN_SUB, instance_id=1,
                 ))
         assert exc.value.status_code == 400
-        assert "auto-mode" in str(exc.value.detail)
+        assert exc.value.detail == (
+            "An instance can be chosen only for an installed MCP that asks for one.")
 
     def test_uninstalled_instance_id_400s(self, temp_db):
         _seed_agent()
@@ -370,15 +370,15 @@ class TestApproveWithInstanceId:
                     row["id"], ADMIN_SUB, instance_id=1,
                 ))
         assert exc.value.status_code == 400
-        assert "not installed" in str(exc.value.detail)
+        assert exc.value.detail == (
+            "An instance can be chosen only for an installed MCP that asks for one.")
 
     def test_omitted_instance_id_keeps_lowest_id_auto_attach(self, temp_db):
         """Backward compatibility: no instance_id → today's behavior, which
         the instance-save auto-retry hook depends on."""
         _seed_agent()
         from services.community import community_installer
-        from storage.mcp import mcp_request_store
-        from storage.mcp import mcp_store
+        from storage.mcp import mcp_request_store, mcp_store
 
         first = mcp_store.upsert_mcp_instance("prometheus", {
             "instance_name": "first", "field_values": {},
@@ -515,7 +515,9 @@ class TestAdminAgentInstallZeroInstances:
         from services.community.community_agent_installer import (
             install_from_extracted_template,
         )
-        from storage.agents.community_agent_template_store import load_template_from_dir
+        from services.community.community_agent_template_store import (
+            load_template_from_dir,
+        )
 
         tdir = self._write_template(tmp_path, "prometheus")
         template = load_template_from_dir(tdir)

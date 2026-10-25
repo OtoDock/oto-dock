@@ -69,6 +69,19 @@ class TestRegisterOnce:
         assert row["token_endpoint_auth_method"] == "none" and row["has_secret"] is False
 
     @pytest.mark.asyncio
+    async def test_the_registration_dials_on_the_resources_policy(self, vendor):
+        """A public MCP's server is posted to on public_only, a private
+        MCP's on the control-plane rule (the dial judges the address again)."""
+        from services.infra import pinned_http
+        vendor.routes[("POST", REGISTER)] = _answer
+        await ma.ensure_registration(_server(public_resource=True), redirect_uri=CB + "?public",
+                                     block={}, scope="")
+        assert dict(vendor.policies)[REGISTER] is pinned_http.public_only
+        vendor.policies.clear()
+        await ma.ensure_registration(_server(), redirect_uri=CB + "?private", block={}, scope="")
+        assert dict(vendor.policies)[REGISTER] is pinned_http.control_plane
+
+    @pytest.mark.asyncio
     async def test_loopback_callback_registers_a_native_client(self, vendor):
         posts = []
         vendor.routes[("POST", REGISTER)] = lambda r: (posts.append(json.loads(r.content)), _answer(r))[1]

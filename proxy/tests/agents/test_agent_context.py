@@ -15,14 +15,19 @@ from __future__ import annotations
 
 import logging
 import uuid
+
 import pytest
 
 from services.infra import external_data
 from services.mcp import dynamic_context, mcp_registry
-from services.mcp.mcp_registry import AgentContextBlock, McpManifest, ServerConfig, CredentialConfig
+from services.mcp.mcp_registry import (
+    AgentContextBlock,
+    CredentialConfig,
+    McpManifest,
+    ServerConfig,
+)
 from storage.identity import credential_store
 from storage.pg import get_conn
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

@@ -87,8 +87,8 @@ registered — it's a reference, not a selectable provider.)
   tests — `feed_transcript()` simulates STT output without a network.
 - VAD tests run fully offline (the model is bundled) —
   `vad/tests/test_silero.py` and `test_silero_model.py` need `onnxruntime`
-  (the `localmodels` extra) and skip without it; `test_silero_rates.py`
-  fakes the model and runs everywhere.
+  (a core dependency since the language identifier) and skip only where it
+  is missing; `test_silero_rates.py` fakes the model and runs everywhere.
 - A 5-second public-domain clip at `audio/tests/fixtures/sample.wav` is the
   intended fixture for `transcribe_file` smoke tests against a real key (kept out
   of the default suite). Drop one in when you wire batch transcription.

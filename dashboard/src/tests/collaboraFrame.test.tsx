@@ -106,7 +106,7 @@ describe('the workspace document preview', () => {
 
   it('a failed re-mint shows the error with Retry, not a token that may be past its end', async () => {
     apiFetchMock.mockResolvedValueOnce(minted('ws-1'))
-      .mockResolvedValueOnce({ ok: false, text: async () => 'Preview not found' })
+      .mockResolvedValueOnce({ ok: false, status: 404, text: async () => JSON.stringify({ detail: 'Preview not found' }) })
       .mockResolvedValueOnce(minted('ws-3'))
     render(<FilePreviewBody agent="pa" node={doc} canWrite onClose={() => {}} />)
     await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(1))

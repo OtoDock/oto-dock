@@ -17,8 +17,6 @@ import asyncio
 import json
 import os
 
-
-
 from tests._paths import CUSTOM_MCPS, load_mcp_server
 
 _MCP_DIR = CUSTOM_MCPS / "agent-config-mcp"
@@ -375,11 +373,26 @@ class TestListContextFiles:
         mod = self._load()
 
         async def fake_request(method, path, **kwargs):
-            return {"tree": [self._node("workspace", "dir", "workspace")]}
+            return {"tree": [self._node("workspace", "dir", "workspace"),
+                             self._node("config", "dir", "config", children=[])]}
 
         mod._request = fake_request
         out = asyncio.run(mod._tool_list_context_files())
         assert "not found" in out
+
+    def test_a_session_that_cannot_see_config_is_told_so(self):
+        """The files route hides ``config/`` from an editor or a viewer (and
+        an agent-scope task whose context lacks it): the folder exists, the
+        session cannot see it."""
+        mod = self._load()
+
+        async def fake_request(method, path, **kwargs):
+            return {"tree": [self._node("workspace", "dir", "workspace")]}
+
+        mod._request = fake_request
+        out = asyncio.run(mod._tool_list_context_files())
+        assert "cannot see the agent's `config/` folder" in out
+        assert "not found" not in out
 
 
 class TestEngineCatalog:

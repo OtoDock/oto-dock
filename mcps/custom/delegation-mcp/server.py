@@ -3,9 +3,10 @@
 stdio MCP server for visible parallel delegation: spawn worker sessions
 (background tasks or first-class chats), monitor sibling sessions, peek
 into delegated lanes, send file copies to a target's inbox (send_files,
-the passive half of cross-agent handoff), and, as a delegated worker,
-attach deliverables to the result (attach_result_files). Scheduling
-(recurring/one-time/trigger tasks) lives in the separate schedules-mcp.
+the passive half of cross-agent handoff), as a delegated worker, attach
+deliverables to the result (attach_result_files), and move a chat to
+another place (move_chat). Scheduling (recurring/one-time/trigger tasks)
+lives in the separate schedules-mcp.
 
 Environment variables (set in per-agent mcp-config.json):
   DELEGATION_MCP_AGENT    - Which agent this instance serves (e.g. "system-admin")
@@ -15,14 +16,18 @@ Environment variables (set in per-agent mcp-config.json):
 """
 
 import asyncio
+import logging
 import os
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+
+from _tool_args import ToolArgs
 
 AGENT = os.environ.get("DELEGATION_MCP_AGENT", "system-admin")
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
@@ -53,7 +58,9 @@ def _validate_output_dir(output_dir: str) -> str | None:
     return None
 
 
+logger = logging.getLogger("delegation-mcp")
 server = Server("delegation-mcp")
+TOOL_ARGS = ToolArgs()
 
 
 def _headers() -> dict:
@@ -71,13 +78,107 @@ async def _post(path: str, body: dict, *, timeout: float = 30.0) -> dict:
         return resp.json()
 
 
+# On a paired machine PROXY_URL is the satellite's loopback tunnel. The tunnel
+# and the platform's half of it answer some calls themselves, with
+# ``{"error": <code>}`` and no ``detail`` (satellite/PROTOCOL.md "The loopback
+# tunnel"). Every tool reads such an answer in the same sentences, each with
+# its own words: what did not happen, what an older satellite cannot do here
+# (and the way round it), and, for a call that may have landed before the
+# link failed, what may have happened and what to do ("" for a read, which
+# is safe to ask again).
+class _Words(NamedTuple):
+    outcome: str
+    action: str
+    alt: str = ""
+    maybe: str = ""
+
+
+_PLACES = "move_chat:places"
+_WORDS = {
+    "move_chat": _Words(
+        "the chat did not move", "move the chat",
+        alt=", or move the chat with the Runs on menu on its page",
+        maybe="If the move was accepted, the chat moves when this turn ends. Otherwise ask again."),
+    _PLACES: _Words(
+        "the places could not be listed", "list the places",
+        alt=", or see them in the Runs on menu on the chat's page"),
+    "send_files": _Words(
+        "the files did not go", "send files",
+        maybe="The files may still have arrived. Send them again only if the target does not "
+              "have them."),
+    "attach_result_files": _Words(
+        "the files were not attached", "attach files",
+        maybe="Files may still have landed. Name the paths in your report and do not attach "
+              "them again."),
+    "delegate": _Words(
+        "the work was not handed over", "hand work over",
+        maybe="The work may still have been handed over. Look at list_sessions before you "
+              "delegate it again."),
+    "list_sessions": _Words("the sessions could not be listed", "list the sessions"),
+    "peek_session": _Words("the session could not be read", "read a session"),
+    "adopt_project": _Words(
+        "the project was not adopted", "adopt a project",
+        maybe="The project may still have been adopted. Ask again to be sure."),
+}
+# The codes the call never got past: each a sentence of the tool's words.
+_REFUSED = {
+    "path-not-allowlisted": lambda w: (
+        f"This machine runs an older satellite, which cannot {w.action} from here. "
+        f"Ask the machine's owner or an admin to update it{w.alt}."),
+    "tunnel-not-connected": lambda w: (
+        f"This machine has lost its link to the platform, so {w.outcome}. "
+        "Try again once the machine is back online."),
+    "tunnel-shutting-down": lambda w: "This machine's satellite is restarting. Ask again in a moment.",
+}
+# The codes of a call that may have landed: no answer in time, or the link
+# dropped after the call left (the satellite's reconnect, the platform's
+# tunnel failing on its way, every ``upstream-*``).
+_NO_ANSWER = "The platform did not answer in time"
+_DROPPED = "The link to the platform dropped before an answer came back"
+_MAY_HAVE_LANDED = {
+    "tunnel-no-response": _NO_ANSWER,
+    "tunnel-disconnected": _DROPPED,
+    "dispatch-exception": _DROPPED,
+}
+_UPSTREAM = re.compile(r"upstream-")
+
+
+def _tunnel_sentence(key: str, status: int, data: dict) -> str:
+    """``key``'s sentence for an answer with no ``detail``: the tunnel's code
+    in words, else what did not happen and the status. A code is logged,
+    never put in the words."""
+    w = _WORDS[key]
+    code = str(data.get("error") or "")
+    logger.warning("%s: HTTP %s with no sentence (%s)", key, status, code or "no code")
+    if code in _REFUSED:
+        return _REFUSED[code](w)
+    lead = _MAY_HAVE_LANDED.get(code) or (_DROPPED if _UPSTREAM.match(code) else "")
+    if lead:
+        return f"{lead}. {w.maybe}" if w.maybe else f"{lead}, so {w.outcome}. Ask again."
+    return f"{w.outcome[0].upper()}{w.outcome[1:]}, and no reason came back (HTTP {status})."
+
+
+def _tunnel_failure(key: str, e: httpx.HTTPStatusError) -> str | None:
+    """``key``'s sentence when a failed call's answer came from the machine's
+    tunnel (``{"error": <code>}``, no ``detail``); None for any other."""
+    try:
+        data = e.response.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("detail") or not data.get("error"):
+        return None
+    return _tunnel_sentence(key, e.response.status_code, data)
+
+
 def _send_files_failure(target_agent: str, e: httpx.HTTPStatusError) -> str:
     """A send_files error must never read as partial success: name the
     outcome first, then the platform's reason verbatim."""
+    if (tunnel := _tunnel_failure("send_files", e)) is not None:
+        return tunnel
     status = e.response.status_code
     try:
         detail = e.response.json().get("detail") or e.response.text
-    except Exception:
+    except (ValueError, AttributeError):
         detail = e.response.text
     if status in (400, 403, 404, 413):
         # Pre-copy refusals: validation, roster/access, a missing source
@@ -93,10 +194,12 @@ def _send_files_failure(target_agent: str, e: httpx.HTTPStatusError) -> str:
 def _attach_failure(e: httpx.HTTPStatusError) -> str:
     """An attach refusal is one sentence and copies nothing; a 5xx may have
     landed some files, so it must not read as a clean refusal."""
+    if (tunnel := _tunnel_failure("attach_result_files", e)) is not None:
+        return tunnel
     status = e.response.status_code
     try:
         detail = e.response.json().get("detail") or e.response.text
-    except Exception:
+    except (ValueError, AttributeError):
         detail = e.response.text
     if isinstance(detail, list):
         # A validation answer: its messages, not the schema's dicts.
@@ -152,6 +255,23 @@ async def _get(path: str, params: dict | None = None) -> dict:
         return resp.json()
 
 
+# The machine the worker's runs use ("target" already names the target agent
+# here). Validated server-side for the delegating person on the worker agent.
+_MACHINE_ARG_SCHEMA = {
+    "type": "string",
+    "description": (
+        "OPTIONAL machine for the worker's runs: one of your own paired machines "
+        "or, for an admin, an admin machine, by its name or id; 'default' (or "
+        "omit) for the agent's default. A machine that is offline at run time: "
+        "the run uses the agent's default and its record says so. Ignored with "
+        "continue_id (the worker's chat keeps its own machine)."
+    ),
+}
+
+# move_chat's answer: the memory word of a scheduled move that continues
+# from a summary (its current place is offline); "files" otherwise.
+MEMORY_SUMMARY = "summary"
+
 _STATUS_LABEL = {
     "generating": "generating",
     "awaiting_user": "awaiting reply",
@@ -161,7 +281,7 @@ _STATUS_LABEL = {
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="delegate",
             description=(
@@ -186,7 +306,10 @@ async def list_tools() -> list[Tool]:
                 "delegate again just to acknowledge, thank, or confirm it. Delegate a "
                 "follow-up (continue_id) only when the user asked for more work or the "
                 "worker needs something only you can supply; otherwise fold the result "
-                "into your reply to the user and let them decide."
+                "into your reply to the user and let them decide. A result whose first "
+                "line says the worker ended without a report did not finish: continue "
+                "the lane with the continue_id it names instead of reading its last "
+                "message as the outcome."
             ),
             inputSchema={
                 "type": "object",
@@ -283,6 +406,7 @@ async def list_tools() -> list[Tool]:
                             "continue_id."
                         ),
                     },
+                    "machine": _MACHINE_ARG_SCHEMA,
                     "checks": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -298,6 +422,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["name", "prompt", "surface"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
         Tool(
             name="send_files",
@@ -351,6 +476,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["target_agent", "paths"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
         ),
         Tool(
             name="attach_result_files",
@@ -399,6 +525,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["paths"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
         Tool(
             name="list_sessions",
@@ -437,6 +564,7 @@ async def list_tools() -> list[Tool]:
                     },
                 },
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="peek_session",
@@ -463,6 +591,40 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["chat_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+        ),
+        Tool(
+            name="move_chat",
+            description=(
+                "Move this chat to another place (the OtoDock platform, one of the "
+                "person's own paired machines, or an admin machine for an admin). "
+                "Without `machine`: list the places this chat can run, the current "
+                "one marked. With `machine` (a name, an id, or 'default'): the chat "
+                "moves when this turn ends, with its memory when both places are "
+                "online, and you continue there on your own. End your turn after "
+                "calling it."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "machine": {
+                        "type": "string",
+                        "description": (
+                            "Where to move the chat: a place's name or id from the "
+                            "list, or 'default' for the person's default. Omit to "
+                            "list the places."
+                        ),
+                    },
+                    "chat_id": {
+                        "type": "string",
+                        "description": (
+                            "Another chat of the same person to move instead of this "
+                            "one (from list_sessions). Omit for this chat."
+                        ),
+                    },
+                },
+            },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
         Tool(
             name="adopt_project",
@@ -486,290 +648,391 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["project_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
         ),
+    ])
+
+
+async def _tool_delegate(arguments: dict) -> list[TextContent]:
+    surface = arguments.get("surface")
+    if surface not in ("chat", "task"):
+        return [TextContent(
+            type="text",
+            text=(
+                "Error: surface is required — pick 'chat' (visible, steerable "
+                "worker chat for user-present work) or 'task' (background run "
+                "for fire-and-forget work)."
+            ),
+        )]
+    # On continues the proxy derives the agent from the continued
+    # worker itself — an explicit value is only a cross-check there.
+    # Fresh spawns default to this agent.
+    if arguments.get("continue_id"):
+        target_agent = arguments.get("agent") or ""
+    else:
+        target_agent = arguments.get("agent") or AGENT
+
+    # Local roster check (fast feedback; the proxy re-validates).
+    if target_agent and target_agent != AGENT:
+        if not DELEGATION_TARGETS or target_agent not in DELEGATION_TARGETS:
+            available = ", ".join(DELEGATION_TARGETS) if DELEGATION_TARGETS else "(none configured)"
+            return [TextContent(
+                type="text",
+                text=f"Cannot delegate to '{target_agent}'. Cross-agent delegation targets for this agent: {available}. Self-delegation to '{AGENT}' is always allowed.",
+            )]
+
+    # The output_dir hint names a folder inside the WORKER's own
+    # workspace, whatever scope the proxy clamps the worker to; the
+    # worker's session resolves the tree.
+    output_dir = arguments.get("output_dir")
+    task_prompt = arguments["prompt"]
+    if output_dir:
+        err = _validate_output_dir(output_dir)
+        if err:
+            return [TextContent(type="text", text=f"Invalid output_dir '{output_dir}': {err}")]
+        clean_dir = str(Path(output_dir))
+        task_prompt = (
+            f"[TASK_OUTPUT_DIR]\n"
+            f"Save any output files under {clean_dir}/ inside your own "
+            f"workspace folder (create it if it does not exist), and attach "
+            f"them to your result with attach_result_files.\n"
+            f"[/TASK_OUTPUT_DIR]\n\n"
+            f"{task_prompt}"
+        )
+    # Worker-side framing (2026-09-03): the final message comes back
+    # to the caller as a REPORT. A worker that answers with a to-do
+    # list for the caller (which cannot delegate back — chain guard)
+    # makes the caller re-open the lane just to reply; two agents then
+    # ping-pong at a turn's cost each. Say so up front.
+    task_prompt = (
+        f"[DELEGATED_WORK]\n"
+        f"Delegated by agent '{AGENT}'. When you finish, your final message "
+        f"is delivered to that agent automatically as a report — write it as "
+        f"one: what you did, what you produced (with paths), and anything "
+        f"blocked. Do not send the caller a to-do list or questions to answer "
+        f"by delegation: it cannot delegate back to you and would have to "
+        f"re-open this lane just to reply. Put anything it must do on a single "
+        f"'Blocked on:' line. Attach the files you produced with "
+        f"attach_result_files(paths) before your final message and name "
+        f"them in the report: the delegating agent receives copies in its "
+        f"inbox.\n"
+        f"[/DELEGATED_WORK]\n\n"
+        f"{task_prompt}"
+    )
+
+    result = await _post("/v1/delegation/spawn", {
+        "name": arguments["name"],
+        "prompt": task_prompt,
+        "surface": surface,
+        "agent": target_agent,
+        "source_agent": AGENT,
+        "continue_id": arguments.get("continue_id"),
+        "project_id": arguments.get("project_id"),
+        "scope": PARENT_SCOPE,
+        "model": arguments.get("model"),
+        "layer": arguments.get("layer"),
+        "mode": arguments.get("mode"),
+        "machine": arguments.get("machine") or None,
+        "checks": arguments.get("checks") or None,
+    })
+
+    if result.get("steered"):
+        # The lane was working on this caller's run: the follow-up
+        # went INTO that turn, no second run exists.
+        lines = [
+            f"Steered '{arguments['name']}' into the running lane "
+            f"(run: {result['run_id']}, id: {result['task_id']}).",
+            f"Agent: {result.get('agent') or target_agent}",
+            f"Worker chat: {result.get('chat_id')}",
+            "The worker reads it at its next tool boundary — nothing was "
+            "interrupted — and the lane's report, delivered to this session "
+            "when that run completes, covers it. Continue your current work.",
+        ]
+        return [TextContent(type="text", text="\n".join(lines))]
+    lines = [
+        f"Delegated '{arguments['name']}' (surface={surface}, id: {result['task_id']}, run: {result['run_id']}).",
+        f"Agent: {result.get('agent') or target_agent}",
     ]
+    if result.get("chat_id"):
+        lines.append(f"Worker chat: {result['chat_id']}")
+    if result.get("scope_note"):
+        lines.append(result["scope_note"])
+    if result.get("project_id"):
+        lines.append(f"Project: {result['project_id']}")
+    lines.append(
+        "The result will be delivered to this session automatically when the "
+        "worker's turn completes — continue your current work."
+    )
+    return [TextContent(type="text", text="\n".join(lines))]
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def _tool_send_files(arguments: dict) -> list[TextContent]:
+    target_agent = (arguments.get("target_agent") or "").strip()
+    paths = arguments.get("paths") or []
+    if not target_agent or not paths:
+        return [TextContent(type="text", text="Error: target_agent and a non-empty paths list are required.")]
+    # Local fast checks (the proxy re-validates everything).
+    if target_agent == AGENT:
+        return [TextContent(type="text", text=f"'{AGENT}' is this agent — the files are already in your own tree.")]
+    if not DELEGATION_TARGETS or target_agent not in DELEGATION_TARGETS:
+        available = ", ".join(DELEGATION_TARGETS) if DELEGATION_TARGETS else "(none configured)"
+        return [TextContent(
+            type="text",
+            text=f"Cannot send files to '{target_agent}'. Delegation targets for this agent: {available}.",
+        )]
+    dest_dir = arguments.get("dest_dir") or ""
+    if dest_dir:
+        err = _validate_output_dir(dest_dir)
+        if err:
+            return [TextContent(type="text", text=f"Invalid dest_dir '{dest_dir}': {err}")]
+
     try:
-        if name == "delegate":
-            surface = arguments.get("surface")
-            if surface not in ("chat", "task"):
-                return [TextContent(
-                    type="text",
-                    text=(
-                        "Error: surface is required — pick 'chat' (visible, steerable "
-                        "worker chat for user-present work) or 'task' (background run "
-                        "for fire-and-forget work)."
-                    ),
-                )]
-            # On continues the proxy derives the agent from the continued
-            # worker itself — an explicit value is only a cross-check there.
-            # Fresh spawns default to this agent.
-            if arguments.get("continue_id"):
-                target_agent = arguments.get("agent") or ""
-            else:
-                target_agent = arguments.get("agent") or AGENT
+        result = await _post("/v1/delegation/send_files", {
+            "target_agent": target_agent,
+            "paths": paths,
+            "dest_dir": dest_dir,
+            "note": arguments.get("note") or "",
+            "source_agent": AGENT,
+            "scope": PARENT_SCOPE,
+            # On a remote machine the platform reads the sources
+            # through from the satellite first (a directory = one
+            # manifest + per-file pulls) — well past the 30 s default.
+        }, timeout=300.0)
+    except httpx.HTTPStatusError as e:
+        return [TextContent(type="text", text=_send_files_failure(target_agent, e))]
 
-            # Local roster check (fast feedback; the proxy re-validates).
-            if target_agent and target_agent != AGENT:
-                if not DELEGATION_TARGETS or target_agent not in DELEGATION_TARGETS:
-                    available = ", ".join(DELEGATION_TARGETS) if DELEGATION_TARGETS else "(none configured)"
-                    return [TextContent(
-                        type="text",
-                        text=f"Cannot delegate to '{target_agent}'. Cross-agent delegation targets for this agent: {available}. Self-delegation to '{AGENT}' is always allowed.",
-                    )]
+    files = result.get("files") or []
+    mb = (result.get("total_bytes") or 0) / (1024 * 1024)
+    lines = [
+        f"Sent {len(files)} file(s) ({mb:.1f} MB) to '{target_agent}' "
+        f"(transfer {result.get('transfer_id', '?')}).",
+    ]
+    lines.extend(f"  {p}" for p in files[:20])
+    if len(files) > 20:
+        lines.append(f"  … and {len(files) - 20} more")
+    if result.get("scope_note"):
+        lines.append(result["scope_note"])
+    skipped = result.get("skipped") or []
+    if skipped:
+        lines.append("Skipped: " + ", ".join(skipped[:10]))
+    lines.append(
+        "The target's sessions see the inbox in their workspace "
+        "listing; it is not actively notified. Use delegate(...) "
+        "pointing at the inbox path if it should act on the files now."
+    )
+    return [TextContent(type="text", text="\n".join(lines))]
 
-            # The output_dir hint names a folder inside the WORKER's own
-            # workspace, whatever scope the proxy clamps the worker to; the
-            # worker's session resolves the tree.
-            output_dir = arguments.get("output_dir")
-            task_prompt = arguments["prompt"]
-            if output_dir:
-                err = _validate_output_dir(output_dir)
-                if err:
-                    return [TextContent(type="text", text=f"Invalid output_dir '{output_dir}': {err}")]
-                clean_dir = str(Path(output_dir))
-                task_prompt = (
-                    f"[TASK_OUTPUT_DIR]\n"
-                    f"Save any output files under {clean_dir}/ inside your own "
-                    f"workspace folder (create it if it does not exist), and attach "
-                    f"them to your result with attach_result_files.\n"
-                    f"[/TASK_OUTPUT_DIR]\n\n"
-                    f"{task_prompt}"
-                )
-            # Worker-side framing (2026-09-03): the final message comes back
-            # to the caller as a REPORT. A worker that answers with a to-do
-            # list for the caller (which cannot delegate back — chain guard)
-            # makes the caller re-open the lane just to reply; two agents then
-            # ping-pong at a turn's cost each. Say so up front.
-            task_prompt = (
-                f"[DELEGATED_WORK]\n"
-                f"Delegated by agent '{AGENT}'. When you finish, your final message "
-                f"is delivered to that agent automatically as a report — write it as "
-                f"one: what you did, what you produced (with paths), and anything "
-                f"blocked. Do not send the caller a to-do list or questions to answer "
-                f"by delegation: it cannot delegate back to you and would have to "
-                f"re-open this lane just to reply. Put anything it must do on a single "
-                f"'Blocked on:' line. Attach the files you produced with "
-                f"attach_result_files(paths) before your final message and name "
-                f"them in the report: the delegating agent receives copies in its "
-                f"inbox.\n"
-                f"[/DELEGATED_WORK]\n\n"
-                f"{task_prompt}"
-            )
 
-            result = await _post("/v1/delegation/spawn", {
-                "name": arguments["name"],
-                "prompt": task_prompt,
-                "surface": surface,
-                "agent": target_agent,
-                "source_agent": AGENT,
-                "continue_id": arguments.get("continue_id"),
-                "project_id": arguments.get("project_id"),
-                "scope": PARENT_SCOPE,
-                "model": arguments.get("model"),
-                "layer": arguments.get("layer"),
-                "mode": arguments.get("mode"),
-                "checks": arguments.get("checks") or None,
-            })
+async def _tool_attach_result_files(arguments: dict) -> list[TextContent]:
+    paths = arguments.get("paths") or []
+    if not paths:
+        return [TextContent(type="text", text="Error: a non-empty paths list is required.")]
+    dest_dir = arguments.get("dest_dir") or ""
+    if dest_dir:
+        err = _validate_output_dir(dest_dir)
+        if err:
+            return [TextContent(type="text", text=f"Invalid dest_dir '{dest_dir}': {err}")]
+    try:
+        result = await _post("/v1/delegation/attach_result_files", {
+            "paths": paths,
+            "dest_dir": dest_dir,
+            # A remote machine's files are read through first: well
+            # past the 30 s default, as send_files.
+        }, timeout=300.0)
+    except httpx.HTTPStatusError as e:
+        return [TextContent(type="text", text=_attach_failure(e))]
+    except httpx.TimeoutException:
+        return [TextContent(type="text", text=(
+            "The platform gave no answer in 300 s: files may still have "
+            "landed. Name the paths in your report and do not attach them again."
+        ))]
+    return [TextContent(type="text", text=_attach_report(result))]
 
-            if result.get("steered"):
-                # The lane was working on this caller's run: the follow-up
-                # went INTO that turn, no second run exists.
-                lines = [
-                    f"Steered '{arguments['name']}' into the running lane "
-                    f"(run: {result['run_id']}, id: {result['task_id']}).",
-                    f"Agent: {result.get('agent') or target_agent}",
-                    f"Worker chat: {result.get('chat_id')}",
-                    "The worker reads it at its next tool boundary — nothing was "
-                    "interrupted — and the lane's report, delivered to this session "
-                    "when that run completes, covers it. Continue your current work.",
-                ]
-                return [TextContent(type="text", text="\n".join(lines))]
-            lines = [
-                f"Delegated '{arguments['name']}' (surface={surface}, id: {result['task_id']}, run: {result['run_id']}).",
-                f"Agent: {result.get('agent') or target_agent}",
-            ]
-            if result.get("chat_id"):
-                lines.append(f"Worker chat: {result['chat_id']}")
-            if result.get("scope_note"):
-                lines.append(result["scope_note"])
-            if result.get("project_id"):
-                lines.append(f"Project: {result['project_id']}")
+
+async def _tool_list_sessions(arguments: dict) -> list[TextContent]:
+    params = {"limit": arguments.get("limit", 30)}
+    if arguments.get("agent"):
+        params["agent"] = arguments["agent"]
+    result = await _get("/v1/delegation/sessions", params=params)
+    sessions = result.get("sessions", [])
+    if not sessions:
+        return [TextContent(type="text", text="No sessions in your visibility set.")]
+    lines = [f"Sessions ({len(sessions)}):"]
+    for s in sessions:
+        status = _STATUS_LABEL.get(s.get("status", ""), s.get("status", "?"))
+        marks = []
+        if s.get("is_current"):
+            marks.append("this session")
+        if s.get("parent_chat_id"):
+            marks.append("worker")
+        if s.get("project_id"):
+            marks.append(f"project:{s['project_id']}")
+        mark = f" [{', '.join(marks)}]" if marks else ""
+        title = s.get("title") or "(untitled)"
+        lines.append(
+            f"  {s['chat_id']} — {title} ({s.get('agent', '?')}, {status}, "
+            f"updated {s.get('updated_at', '—')}){mark}"
+        )
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
+async def _tool_peek_session(arguments: dict) -> list[TextContent]:
+    chat_id = arguments["chat_id"]
+    # The id lands in the request PATH — a strict shape check keeps a
+    # crafted value ("../..", "#", "?") from steering the URL at any
+    # other proxy endpoint under this server's credential.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", chat_id or ""):
+        return [TextContent(
+            type="text", text=f"Error: invalid chat_id: {chat_id!r}",
+        )]
+    params: dict = {}
+    if arguments.get("depth"):
+        params["depth"] = arguments["depth"]
+    result = await _get(f"/v1/delegation/sessions/{chat_id}/peek", params=params)
+    status = _STATUS_LABEL.get(result.get("status", ""), result.get("status", "?"))
+    lines = [
+        f"Session {chat_id} — {result.get('title') or '(untitled)'} "
+        f"({result.get('agent', '?')}, {status})",
+    ]
+    messages = result.get("messages", [])
+    if not messages:
+        lines.append("(no messages yet)")
+    for m in messages:
+        who = "User" if m.get("role") == "user" else "Assistant"
+        if m.get("in_progress"):
+            who += " — turn IN PROGRESS"
+        lines.append(f"\n[{who}]\n{m.get('content', '')}")
+    if result.get("truncated"):
+        lines.append("\n(older messages omitted — raise depth to see more)")
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
+async def _post_answer(path: str, body: dict) -> tuple[int, dict]:
+    """POST and hand back the status with the JSON body: a 4xx is an answer
+    here (its ``detail`` is the sentence), and so is the machine's tunnel
+    answering for itself (``error``, any status); any other 5xx raises."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(f"{PROXY_URL}{path}", json=body, headers=_headers())
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"detail": resp.text}
+        if not isinstance(data, dict):
+            data = {"detail": str(data)}
+        if resp.status_code >= 500 and not data.get("error"):
+            resp.raise_for_status()
+        return resp.status_code, data
+
+
+def _detail_sentence(status: int, data: dict, *, listing: bool = False) -> str:
+    """move_chat's sentence for a refused or failed call, never without a
+    reason: the platform's ``detail``, else the tunnel's own answer in words
+    or the status (``_tunnel_sentence``). ``listing``: the call asked for the
+    places, not a move."""
+    detail = data.get("detail")
+    if isinstance(detail, list):
+        # A validation answer: its messages, not the schema's dicts.
+        detail = "; ".join(str(d.get("msg", d)) if isinstance(d, dict) else str(d)
+                           for d in detail)
+    if detail:
+        return str(detail)
+    return _tunnel_sentence(_PLACES if listing else "move_chat", status, data)
+
+
+def _places_report(data: dict) -> str:
+    """The places a chat can run, one per line, the current one marked."""
+    current = (data.get("current") or {}).get("target") or ""
+    targets = data.get("targets") or []
+    if not targets:
+        return "This chat has no other place to run."
+    lines = ["Places this chat can run (* marks where it runs now; the id names it exactly):"]
+    for t in targets:
+        line = (("* " if t.get("target") == current else "  ")
+                + f"{t.get('label') or t.get('target')} (id: {t.get('target')})")
+        if t.get("is_default"):
+            line += " (default)"
+        if not t.get("reachable"):
+            line += " (offline)"
+        if not t.get("pickable") and t.get("why_not"):
+            line += f": {t['why_not']}"
+        lines.append(line)
+    lines.append("To move it, call move_chat with a place's name (or 'default'), then end your turn.")
+    return "\n".join(lines)
+
+
+async def _tool_move_chat(arguments: dict) -> list[TextContent]:
+    body = {k: arguments[k] for k in ("machine", "chat_id") if arguments.get(k)}
+    status, data = await _post_answer("/v1/chats/agent-move", body)
+    if status >= 400:
+        return [TextContent(type="text", text=_detail_sentence(
+            status, data, listing=not arguments.get("machine")))]
+    if data.get("scheduled"):
+        to = (data.get("to_phrase") or data.get("to_label") or arguments.get("machine")
+              or "the new place")
+        if data.get("at_turn_end") is False:
+            return [TextContent(type="text", text=f"The chat is moving to {to}.")]
+        if data.get("memory") == MEMORY_SUMMARY:
+            return [TextContent(type="text", text=(
+                f"The chat moves to {to} when this turn ends and continues there from a "
+                "summary of the conversation. You continue there on your own. End your turn "
+                "now."))]
+        return [TextContent(type="text", text=(
+            f"The chat moves to {to} when this turn ends, and you continue there on your "
+            "own. End your turn now."))]
+    return [TextContent(type="text", text=_places_report(data))]
+
+
+async def _tool_adopt_project(arguments: dict) -> list[TextContent]:
+    result = await _post("/v1/delegation/adopt", {
+        "project_id": arguments["project_id"],
+    })
+    lines = [
+        f"Adopted project '{result['project_id']}' — this session is now "
+        f"its orchestrator (board + lane overview anchor here).",
+    ]
+    lanes = result.get("lanes") or []
+    if lanes:
+        lines.append("Existing lanes:")
+        for lane in lanes:
+            role = f", {lane['delegate_role']}" if lane.get("delegate_role") else ""
             lines.append(
-                "The result will be delivered to this session automatically when the "
-                "worker's turn completes — continue your current work."
+                f"  {lane['id']} — {lane.get('title') or '(untitled)'} "
+                f"({lane.get('agent', '?')}{role})"
             )
-            return [TextContent(type="text", text="\n".join(lines))]
+    return [TextContent(type="text", text="\n".join(lines))]
 
-        elif name == "send_files":
-            target_agent = (arguments.get("target_agent") or "").strip()
-            paths = arguments.get("paths") or []
-            if not target_agent or not paths:
-                return [TextContent(type="text", text="Error: target_agent and a non-empty paths list are required.")]
-            # Local fast checks (the proxy re-validates everything).
-            if target_agent == AGENT:
-                return [TextContent(type="text", text=f"'{AGENT}' is this agent — the files are already in your own tree.")]
-            if not DELEGATION_TARGETS or target_agent not in DELEGATION_TARGETS:
-                available = ", ".join(DELEGATION_TARGETS) if DELEGATION_TARGETS else "(none configured)"
-                return [TextContent(
-                    type="text",
-                    text=f"Cannot send files to '{target_agent}'. Delegation targets for this agent: {available}.",
-                )]
-            dest_dir = arguments.get("dest_dir") or ""
-            if dest_dir:
-                err = _validate_output_dir(dest_dir)
-                if err:
-                    return [TextContent(type="text", text=f"Invalid dest_dir '{dest_dir}': {err}")]
 
-            try:
-                result = await _post("/v1/delegation/send_files", {
-                    "target_agent": target_agent,
-                    "paths": paths,
-                    "dest_dir": dest_dir,
-                    "note": arguments.get("note") or "",
-                    "source_agent": AGENT,
-                    "scope": PARENT_SCOPE,
-                    # On a remote machine the platform reads the sources
-                    # through from the satellite first (a directory = one
-                    # manifest + per-file pulls) — well past the 30 s default.
-                }, timeout=300.0)
-            except httpx.HTTPStatusError as e:
-                return [TextContent(type="text", text=_send_files_failure(target_agent, e))]
+_TOOL_HANDLERS = {
+    "delegate": _tool_delegate,
+    "send_files": _tool_send_files,
+    "attach_result_files": _tool_attach_result_files,
+    "list_sessions": _tool_list_sessions,
+    "peek_session": _tool_peek_session,
+    "adopt_project": _tool_adopt_project,
+    "move_chat": _tool_move_chat,
+}
 
-            files = result.get("files") or []
-            mb = (result.get("total_bytes") or 0) / (1024 * 1024)
-            lines = [
-                f"Sent {len(files)} file(s) ({mb:.1f} MB) to '{target_agent}' "
-                f"(transfer {result.get('transfer_id', '?')}).",
-            ]
-            lines.extend(f"  {p}" for p in files[:20])
-            if len(files) > 20:
-                lines.append(f"  … and {len(files) - 20} more")
-            if result.get("scope_note"):
-                lines.append(result["scope_note"])
-            skipped = result.get("skipped") or []
-            if skipped:
-                lines.append("Skipped: " + ", ".join(skipped[:10]))
-            lines.append(
-                "The target's sessions see the inbox in their workspace "
-                "listing; it is not actively notified. Use delegate(...) "
-                "pointing at the inbox path if it should act on the files now."
-            )
-            return [TextContent(type="text", text="\n".join(lines))]
 
-        elif name == "attach_result_files":
-            paths = arguments.get("paths") or []
-            if not paths:
-                return [TextContent(type="text", text="Error: a non-empty paths list is required.")]
-            dest_dir = arguments.get("dest_dir") or ""
-            if dest_dir:
-                err = _validate_output_dir(dest_dir)
-                if err:
-                    return [TextContent(type="text", text=f"Invalid dest_dir '{dest_dir}': {err}")]
-            try:
-                result = await _post("/v1/delegation/attach_result_files", {
-                    "paths": paths,
-                    "dest_dir": dest_dir,
-                    # A remote machine's files are read through first: well
-                    # past the 30 s default, as send_files.
-                }, timeout=300.0)
-            except httpx.HTTPStatusError as e:
-                return [TextContent(type="text", text=_attach_failure(e))]
-            except httpx.TimeoutException:
-                return [TextContent(type="text", text=(
-                    "The platform gave no answer in 300 s: files may still have "
-                    "landed. Name the paths in your report and do not attach them again."
-                ))]
-            return [TextContent(type="text", text=_attach_report(result))]
-
-        elif name == "list_sessions":
-            params = {"limit": arguments.get("limit", 30)}
-            if arguments.get("agent"):
-                params["agent"] = arguments["agent"]
-            result = await _get("/v1/delegation/sessions", params=params)
-            sessions = result.get("sessions", [])
-            if not sessions:
-                return [TextContent(type="text", text="No sessions in your visibility set.")]
-            lines = [f"Sessions ({len(sessions)}):"]
-            for s in sessions:
-                status = _STATUS_LABEL.get(s.get("status", ""), s.get("status", "?"))
-                marks = []
-                if s.get("is_current"):
-                    marks.append("this session")
-                if s.get("parent_chat_id"):
-                    marks.append("worker")
-                if s.get("project_id"):
-                    marks.append(f"project:{s['project_id']}")
-                mark = f" [{', '.join(marks)}]" if marks else ""
-                title = s.get("title") or "(untitled)"
-                lines.append(
-                    f"  {s['chat_id']} — {title} ({s.get('agent', '?')}, {status}, "
-                    f"updated {s.get('updated_at', '—')}){mark}"
-                )
-            return [TextContent(type="text", text="\n".join(lines))]
-
-        elif name == "peek_session":
-            chat_id = arguments["chat_id"]
-            # The id lands in the request PATH — a strict shape check keeps a
-            # crafted value ("../..", "#", "?") from steering the URL at any
-            # other proxy endpoint under this server's credential.
-            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", chat_id or ""):
-                return [TextContent(
-                    type="text", text=f"Error: invalid chat_id: {chat_id!r}",
-                )]
-            params: dict = {}
-            if arguments.get("depth"):
-                params["depth"] = arguments["depth"]
-            result = await _get(f"/v1/delegation/sessions/{chat_id}/peek", params=params)
-            status = _STATUS_LABEL.get(result.get("status", ""), result.get("status", "?"))
-            lines = [
-                f"Session {chat_id} — {result.get('title') or '(untitled)'} "
-                f"({result.get('agent', '?')}, {status})",
-            ]
-            messages = result.get("messages", [])
-            if not messages:
-                lines.append("(no messages yet)")
-            for m in messages:
-                who = "User" if m.get("role") == "user" else "Assistant"
-                if m.get("in_progress"):
-                    who += " — turn IN PROGRESS"
-                lines.append(f"\n[{who}]\n{m.get('content', '')}")
-            if result.get("truncated"):
-                lines.append("\n(older messages omitted — raise depth to see more)")
-            return [TextContent(type="text", text="\n".join(lines))]
-
-        elif name == "adopt_project":
-            result = await _post("/v1/delegation/adopt", {
-                "project_id": arguments["project_id"],
-            })
-            lines = [
-                f"Adopted project '{result['project_id']}' — this session is now "
-                f"its orchestrator (board + lane overview anchor here).",
-            ]
-            lanes = result.get("lanes") or []
-            if lanes:
-                lines.append("Existing lanes:")
-                for lane in lanes:
-                    role = f", {lane['delegate_role']}" if lane.get("delegate_role") else ""
-                    lines.append(
-                        f"  {lane['id']} — {lane.get('title') or '(untitled)'} "
-                        f"({lane.get('agent', '?')}{role})"
-                    )
-            return [TextContent(type="text", text="\n".join(lines))]
-
-        else:
+@server.call_tool(validate_input=False)
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
+    try:
+        handler = _TOOL_HANDLERS.get(name)
+        if handler is None:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
+        return await handler(arguments)
 
     except httpx.HTTPStatusError as e:
+        if name in _WORDS and (tunnel := _tunnel_failure(name, e)) is not None:
+            return [TextContent(type="text", text=tunnel)]
         error_body = e.response.text
         return [TextContent(
             type="text",
             text=f"API error {e.response.status_code}: {error_body}",
         )]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
 

@@ -16,27 +16,42 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
+from typing import cast
 
+import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 import config
-from adapters.phone import DIRECTIONS, INBOUND, PHONE_CONTEXT, PHONE_OUTBOUND, is_outbound
-from auth.providers import UserContext, get_current_user, mask_email, require_admin, require_user
-from services.phone import phone_adapters
-from storage.agents import agent_store
-from storage.identity import credential_store
-from storage import database as task_store
-from storage.phone import phone_call_log_store
-from storage.phone import phone_route_store
-from storage.phone import phone_server_store
-from storage.automation import trigger_store
-from services.phone.phone_config import (
-    OUTBOUND_PIN_CAPABILITY, daemon_capability, ensure_ami_user, ensure_register_secret,
-    notify_phone_config_changed,
+from adapters.phone import (
+    DIRECTIONS,
+    INBOUND,
+    PHONE_CONTEXT,
+    PHONE_OUTBOUND,
+    is_outbound,
 )
 from auth import roles
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    mask_email,
+    require_admin,
+    require_user,
+)
+from services.phone import phone_adapters, phone_settings
+from services.phone.phone_config import (
+    OUTBOUND_PIN_CAPABILITY,
+    daemon_capability,
+    ensure_ami_user,
+    ensure_register_secret,
+    notify_phone_config_changed,
+)
 from services.phone.phone_identity import EXTERNAL_ROUTE_ROLE, pin_allowed
+from storage import database as task_store
+from storage.agents import agent_store
+from storage.automation import trigger_store
+from storage.identity import credential_store
+from storage.phone import phone_call_log_store, phone_route_store, phone_server_store
 
 logger = logging.getLogger("otodock")
 # No route here takes an anonymous caller (auth.providers.require_user).
@@ -62,8 +77,10 @@ class PhoneRouteCreate(BaseModel):
     name: str = ""
     agent: str = "personal-assistant"
     language: str = "en"
-    # Identify the caller's language on the first utterance (the route's
-    # language stays the greeting's and the fallback). On for new routes.
+    # Read the caller's language from the audio and switch the call to it
+    # (the route's language stays the greeting's and the start). On for new
+    # routes. Any string is accepted here; a language the identifier has no
+    # label for runs the call without detection.
     language_detect: bool = True
     llm_mode: str = "proxy"
     # Where the agent may hand the caller: [{label, number}], the only
@@ -603,7 +620,7 @@ async def create_phone_route(
                          route["id"], type(e).__name__)
             await asyncio.to_thread(phone_route_store.delete_route, route["id"])
             raise HTTPException(
-                status_code=500, detail="Route not created: the PIN could not be stored")
+                status_code=500, detail="Route not created: the PIN could not be stored") from e
 
     adapter = await _load_adapter(server)
     try:
@@ -618,7 +635,7 @@ async def create_phone_route(
             "Provision failed for route %s on server %s: %s",
             route["id"], server["id"], e,
         )
-        raise _adapter_http_error(e)
+        raise _adapter_http_error(e) from e
 
     updated = await asyncio.to_thread(
         phone_route_store.set_adapter_data,
@@ -627,9 +644,9 @@ async def create_phone_route(
         audiosocket_uuid=handle.audiosocket_uuid,
     )
     route = updated or route
-    logger.info(f"Admin {mask_email(u.email)} created phone route: {route['id']} ({route['name']})")
+    logger.info("Admin %s created phone route: %s (%s)", mask_email(u.email), route['id'], route['name'])
     if req.pin is not None:
-        logger.info(f"Admin {mask_email(u.email)} set the PIN on phone route {route['id']}")
+        logger.info("Admin %s set the PIN on phone route %s", mask_email(u.email), route['id'])
     await notify_phone_config_changed()
     # ``provisioning_instructions`` is non-persisted human follow-up (e.g. the
     # manual adapter's AstDB command); the dashboard shows it after create.
@@ -722,7 +739,7 @@ async def update_phone_route(
         except Exception as e:
             logger.error("Storing the PIN for route %s failed: %s", route_id, type(e).__name__)
             raise HTTPException(
-                status_code=500, detail="The PIN could not be stored; the route is unchanged")
+                status_code=500, detail="The PIN could not be stored; the route is unchanged") from e
 
     identity_changed = any(
         f in data and data[f] != existing.get(f)
@@ -747,10 +764,10 @@ async def update_phone_route(
                 handle = await new_adapter.provision_route(merged)
             except phone_adapters.PhoneAdapterError as e:
                 logger.warning("Re-provision failed for route %s: %s", route_id, e)
-                raise _adapter_http_error(e)
+                raise _adapter_http_error(e) from e
             # Best-effort tear-down of the old provisioning (never blocks the edit).
             old_server = await asyncio.to_thread(
-                phone_server_store.get_server, existing.get("phone_server_id"),
+                phone_server_store.get_server, cast("int", existing.get("phone_server_id")),
             )
             if old_server:
                 try:
@@ -778,9 +795,9 @@ async def update_phone_route(
 
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
-    logger.info(f"Admin {mask_email(u.email)} updated phone route: {route_id}")
+    logger.info("Admin %s updated phone route: %s", mask_email(u.email), route_id)
     if req.pin is not None:
-        logger.info(f"Admin {mask_email(u.email)} set the PIN on phone route {route_id}")
+        logger.info("Admin %s set the PIN on phone route %s", mask_email(u.email), route_id)
     await notify_phone_config_changed()
     warnings = await asyncio.to_thread(_route_warnings, route)
     return {**route, "warnings": warnings}
@@ -823,9 +840,9 @@ async def delete_phone_route(
     # Best-effort: drop the route's encrypted PIN credential with it.
     try:
         await asyncio.to_thread(phone_route_store.delete_route_pin, route_id)
-    except Exception:
+    except psycopg.Error:
         logger.warning("PIN credential cleanup failed for route %s", route_id)
-    logger.info(f"Admin {mask_email(u.email)} deleted phone route: {route_id}")
+    logger.info("Admin %s deleted phone route: %s", mask_email(u.email), route_id)
     await notify_phone_config_changed()
     resp = {"status": "deleted"}
     if warning:
@@ -856,7 +873,7 @@ async def set_phone_route_pin(
     _require_pin_allowed(route)
     _validate_pin_value(req.value)
     await asyncio.to_thread(phone_route_store.set_route_pin, route_id, req.value)
-    logger.info(f"Admin {mask_email(u.email)} set the PIN on phone route {route_id}")
+    logger.info("Admin %s set the PIN on phone route %s", mask_email(u.email), route_id)
     await notify_phone_config_changed()
     return {"status": "ok", "pin_configured": True}
 
@@ -879,7 +896,7 @@ async def delete_phone_route_pin(
             has_pin=False, acknowledged=acknowledge_no_pin,
         )
     await asyncio.to_thread(phone_route_store.delete_route_pin, route_id)
-    logger.info(f"Admin {mask_email(u.email)} removed the PIN on phone route {route_id}")
+    logger.info("Admin %s removed the PIN on phone route %s", mask_email(u.email), route_id)
     await notify_phone_config_changed()
     # A user-tied inbound line just lost its gate — say so.
     warnings = await asyncio.to_thread(_route_warnings, route, pin_configured=False)
@@ -987,7 +1004,11 @@ async def create_phone_server(
     try:
         server = await asyncio.to_thread(phone_server_store.create_server, data)
     except Exception as e:  # unique name collision, etc.
-        raise HTTPException(status_code=400, detail=f"Could not create server: {e}")
+        logger.warning("POST /v1/admin/phone-servers: %s", e)
+        detail = ("A phone server with this name already exists."
+                  if isinstance(e, psycopg.errors.UniqueViolation)
+                  else "Could not add the phone server. The server log has the details.")
+        raise HTTPException(status_code=400, detail=detail) from e
     if req.ami_secret:
         await asyncio.to_thread(
             credential_store.set_infra_credentials,
@@ -999,7 +1020,7 @@ async def create_phone_server(
             _twilio_cred_name(server["id"]),
             {TWILIO_AUTH_TOKEN_KEY: req.twilio_auth_token},
         )
-    logger.info(f"Admin {mask_email(u.email)} created phone server: {server['name']} ({server['adapter_type']})")
+    logger.info("Admin %s created phone server: %s (%s)", mask_email(u.email), server['name'], server['adapter_type'])
     await notify_phone_config_changed()
     return _decorate_server(server)
 
@@ -1015,7 +1036,7 @@ async def update_phone_server(
     )
     if not server:
         raise HTTPException(status_code=404, detail="Phone server not found")
-    logger.info(f"Admin {mask_email(u.email)} updated phone server: {server_id}")
+    logger.info("Admin %s updated phone server: %s", mask_email(u.email), server_id)
     await notify_phone_config_changed()
     return _decorate_server(server)
 
@@ -1038,7 +1059,7 @@ async def delete_phone_server(
     await asyncio.to_thread(credential_store.delete_infra_credentials, _ami_cred_name(server_id))
     await asyncio.to_thread(credential_store.delete_infra_credentials, _register_cred_name(server_id))
     await asyncio.to_thread(credential_store.delete_infra_credentials, _twilio_cred_name(server_id))
-    logger.info(f"Admin {mask_email(u.email)} deleted phone server: {server_id}")
+    logger.info("Admin %s deleted phone server: %s", mask_email(u.email), server_id)
     await notify_phone_config_changed()
     return {"status": "deleted"}
 
@@ -1051,8 +1072,8 @@ async def set_phone_server_default(
     try:
         server = await asyncio.to_thread(phone_server_store.set_default, server_id)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    logger.info(f"Admin {mask_email(u.email)} set default phone server: {server_id}")
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    logger.info("Admin %s set default phone server: %s", mask_email(u.email), server_id)
     await notify_phone_config_changed()
     return _decorate_server(server)
 
@@ -1070,7 +1091,7 @@ async def set_phone_server_ami_secret(
         credential_store.set_infra_credentials,
         _ami_cred_name(server_id), {AMI_SECRET_KEY: req.value},
     )
-    logger.info(f"Admin {mask_email(u.email)} set AMI secret for phone server: {server_id}")
+    logger.info("Admin %s set AMI secret for phone server: %s", mask_email(u.email), server_id)
     await notify_phone_config_changed()
     return {"status": "saved"}
 
@@ -1081,7 +1102,7 @@ async def delete_phone_server_ami_secret(
 ):
     u = require_admin(user)
     await asyncio.to_thread(credential_store.delete_infra_credentials, _ami_cred_name(server_id))
-    logger.info(f"Admin {mask_email(u.email)} deleted AMI secret for phone server: {server_id}")
+    logger.info("Admin %s deleted AMI secret for phone server: %s", mask_email(u.email), server_id)
     await notify_phone_config_changed()
     return {"status": "deleted"}
 
@@ -1099,7 +1120,7 @@ async def set_phone_server_twilio_auth_token(
         credential_store.set_infra_credentials,
         _twilio_cred_name(server_id), {TWILIO_AUTH_TOKEN_KEY: req.value},
     )
-    logger.info(f"Admin {mask_email(u.email)} set Twilio auth token for phone server: {server_id}")
+    logger.info("Admin %s set Twilio auth token for phone server: %s", mask_email(u.email), server_id)
     await notify_phone_config_changed()
     return {"status": "saved"}
 
@@ -1111,7 +1132,7 @@ async def delete_phone_server_twilio_auth_token(
     u = require_admin(user)
     await asyncio.to_thread(
         credential_store.delete_infra_credentials, _twilio_cred_name(server_id))
-    logger.info(f"Admin {mask_email(u.email)} deleted Twilio auth token for phone server: {server_id}")
+    logger.info("Admin %s deleted Twilio auth token for phone server: %s", mask_email(u.email), server_id)
     await notify_phone_config_changed()
     return {"status": "deleted"}
 
@@ -1150,7 +1171,7 @@ async def get_phone_server_bootstrap(
     try:
         snippet = await adapter.get_bootstrap_snippet()
     except phone_adapters.PhoneAdapterError as e:
-        raise _adapter_http_error(e)
+        raise _adapter_http_error(e) from e
     return {
         "status": server["bootstrap_status"],
         "log": server["bootstrap_log"],
@@ -1177,15 +1198,15 @@ async def verify_phone_server_bootstrap(
     try:
         result = await adapter.verify_bootstrap()
     except phone_adapters.PhoneAdapterError as e:
-        raise _adapter_http_error(e)
+        raise _adapter_http_error(e) from e
     log = _bootstrap_log_append(
         server["bootstrap_log"], f"verify → {result.status}: {result.detail}",
     )
-    server = await asyncio.to_thread(
+    server = cast("dict", await asyncio.to_thread(
         phone_server_store.update_server, server_id,
         {"bootstrap_status": result.status, "bootstrap_log": log},
-    )
-    logger.info(f"Admin {mask_email(u.email)} verified phone server {server_id}: {result.status}")
+    ))
+    logger.info("Admin %s verified phone server %s: %s", mask_email(u.email), server_id, result.status)
     await notify_phone_config_changed()
     return _decorate_server(server)
 
@@ -1207,15 +1228,15 @@ async def apply_phone_server_bootstrap(
         await asyncio.to_thread(
             phone_server_store.update_server, server_id, {"bootstrap_log": log},
         )
-        raise _adapter_http_error(e)
+        raise _adapter_http_error(e) from e
     log = _bootstrap_log_append(
         server["bootstrap_log"], f"apply → {result.status}: {result.detail}",
     )
-    server = await asyncio.to_thread(
+    server = cast("dict", await asyncio.to_thread(
         phone_server_store.update_server, server_id,
         {"bootstrap_status": result.status, "bootstrap_log": log},
-    )
-    logger.info(f"Admin {mask_email(u.email)} applied bootstrap on phone server {server_id}: {result.status}")
+    ))
+    logger.info("Admin %s applied bootstrap on phone server %s: %s", mask_email(u.email), server_id, result.status)
     await notify_phone_config_changed()
     return _decorate_server(server)
 
@@ -1232,14 +1253,14 @@ async def check_phone_server_health(
         status = await adapter.health_check()
     except phone_adapters.PhoneAdapterError as e:
         status = phone_adapters.HealthStatus(healthy=False, detail=e.message)
-    server = await asyncio.to_thread(
+    server = cast("dict", await asyncio.to_thread(
         phone_server_store.update_server, server_id,
         {
             "last_health_check": datetime.now(timezone.utc).isoformat(),
             "last_health_status": "healthy" if status.healthy else "unhealthy",
             "last_health_detail": status.detail,
         },
-    )
+    ))
     return _decorate_server(server)
 
 
@@ -1271,14 +1292,19 @@ async def get_phone_prompt_defaults(user: UserContext | None = Depends(get_curre
 async def update_phone_settings(
     req: dict, user: UserContext | None = Depends(get_current_user),
 ):
-    """Partial update of phone_* settings. Keys arrive prefix-stripped."""
+    """Partial update of phone_* settings. Keys arrive prefix-stripped; an
+    unknown key or a malformed value answers 400 naming the key, and nothing
+    is written until every value passed (``services.phone.phone_settings``)."""
     u = require_admin(user)
-    for key, value in req.items():
-        if value is not None:
-            await asyncio.to_thread(
-                task_store.set_platform_setting, f"{_PHONE_SETTING_PREFIX}{key}", str(value),
-            )
-    logger.info(f"Admin {mask_email(u.email)} updated phone settings: {list(req.keys())}")
+    try:
+        writes = phone_settings.check_phone_settings(req)
+    except phone_settings.PhoneSettingError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    for key, value in writes.items():
+        await asyncio.to_thread(
+            task_store.set_platform_setting, f"{_PHONE_SETTING_PREFIX}{key}", value,
+        )
+    logger.info("Admin %s updated phone settings: %s", mask_email(u.email), list(writes))
     await notify_phone_config_changed()
     return {"status": "updated"}
 
@@ -1324,7 +1350,7 @@ async def update_external_data(
         await asyncio.to_thread(
             task_store.set_platform_setting, "external_retention_days", str(req.days),
         )
-    logger.info(f"Admin {mask_email(u.email)} updated caller-data retention: {req.model_dump(exclude_none=True)}")
+    logger.info("Admin %s updated caller-data retention: %s", mask_email(u.email), req.model_dump(exclude_none=True))
     return await asyncio.to_thread(external_retention.compute_usage)
 
 
@@ -1341,5 +1367,5 @@ async def forget_external_data(user: UserContext | None = Depends(get_current_us
             external_retention.forget_all,
             live.busy_external_homes, live.session_ids, live.pump_chat_ids,
         )
-    logger.info(f"Admin {mask_email(u.email)} forgot all caller data: {result}")
+    logger.info("Admin %s forgot all caller data: %s", mask_email(u.email), result)
     return result

@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -361,8 +362,8 @@ class TestApprove:
         invisible at runtime."""
         _seed_agent()
         row = _create_request()
-        from services.community import community_installer
         from core.config import deployment
+        from services.community import community_installer
         from storage.mcp import mcp_store
 
         install_mock = AsyncMock(return_value=FAKE_INSTALL_RESULT)
@@ -405,8 +406,8 @@ class TestApprove:
         never a silent kill-switch reversal."""
         _seed_agent()
         row = _create_request()
-        from services.community import community_installer
         from core.config import deployment
+        from services.community import community_installer
         from storage.mcp import mcp_store
 
         mcp_store.set_mcp_enabled("nextcloud", False)
@@ -441,8 +442,8 @@ class TestApprove:
     def test_approve_external_pool_never_starts_locally(self, temp_db):
         _seed_agent()
         row = _create_request()
-        from services.community import community_installer
         from core.config import deployment
+        from services.community import community_installer
 
         with patch(
             "services.community.community_installer.mcp_registry.get_manifest",
@@ -464,8 +465,8 @@ class TestApprove:
     def test_approve_nondocker_runtime_no_container_calls(self, temp_db):
         _seed_agent()
         row = _create_request()
-        from services.community import community_installer
         from core.config import deployment
+        from services.community import community_installer
 
         with patch(
             "services.community.community_installer.mcp_registry.get_manifest",
@@ -489,8 +490,8 @@ class TestApprove:
         request lands installed with the warning recorded in install_log."""
         _seed_agent()
         row = _create_request()
-        from services.community import community_installer
         from core.config import deployment
+        from services.community import community_installer
 
         with patch(
             "services.community.community_installer.mcp_registry.get_manifest",
@@ -1112,10 +1113,9 @@ class TestAdminAutoApprove:
         """Admin POSTs request → returned row is already ``installed``,
         no notification dispatched (admin doesn't bug themselves)."""
         _seed_agent()
-        from api.mcp.community import create_mcp_request, CreateRequestBody
+        from api.mcp.community import CreateRequestBody, create_mcp_request
         from services.community import community_installer
-        from storage.mcp import mcp_store
-        from storage.mcp import mcp_request_store
+        from storage.mcp import mcp_request_store, mcp_store
 
         fire_calls: list[dict] = []
         async def fake_fire(**kwargs):
@@ -1152,7 +1152,7 @@ class TestAdminAutoApprove:
         """Sanity: the auto-approve branch is admin-only — managers still
         land in pending + every admin gets pinged."""
         _seed_agent()
-        from api.mcp.community import create_mcp_request, CreateRequestBody
+        from api.mcp.community import CreateRequestBody, create_mcp_request
         from services.community import community_installer
         from storage.mcp import mcp_request_store
 
@@ -1185,7 +1185,7 @@ class TestAdminAutoApprove:
         MCP — auto-approve doesn't paper over the missing config, it
         surfaces the same admin_note the manager flow would."""
         _seed_agent()
-        from api.mcp.community import create_mcp_request, CreateRequestBody
+        from api.mcp.community import CreateRequestBody, create_mcp_request
         from services.community import community_installer
 
         class _Explicit:
@@ -1399,8 +1399,8 @@ class TestInstanceSaveAutoRetry:
         _seed_agent()
         # Manually plant an install_failed row (the request that an
         # admin would have hit before they configured an instance).
-        from storage.pg import get_conn
         from storage.mcp import mcp_request_store
+        from storage.pg import get_conn
         now = datetime.now(timezone.utc).isoformat()
         with get_conn() as conn:
             conn.execute(
@@ -1456,9 +1456,8 @@ class TestInstanceSaveAutoRetry:
         ``assigned_to_all=True`` even without naming the agent — the
         catch-all covers them."""
         _seed_agent()
+        from storage.mcp import mcp_request_store, mcp_store
         from storage.pg import get_conn
-        from storage.mcp import mcp_request_store
-        from storage.mcp import mcp_store
         now = datetime.now(timezone.utc).isoformat()
         with get_conn() as conn:
             conn.execute(
@@ -1504,8 +1503,8 @@ class TestInstanceSaveAutoRetry:
         when admin saves an instance authorizing only agent B."""
         _seed_agent("agent-a")
         _seed_agent("agent-b")
-        from storage.pg import get_conn
         from storage.mcp import mcp_request_store
+        from storage.pg import get_conn
         now = datetime.now(timezone.utc).isoformat()
         with get_conn() as conn:
             conn.execute(
@@ -1536,8 +1535,7 @@ class TestEndToEnd:
         _seed_agent()
         row = _create_request()
         from services.community import community_installer
-        from storage.mcp import mcp_store
-        from storage.mcp import mcp_request_store
+        from storage.mcp import mcp_request_store, mcp_store
 
         # Sanity: nothing enabled yet, request is pending.
         assert row["status"] == "pending"
@@ -1731,8 +1729,8 @@ class TestAgentDeleteCascade:
     previously orphaned."""
 
     def test_delete_agent_removes_dynamic_tasks(self, temp_db):
-        from storage.agents import agent_store
         from storage import database as db
+        from storage.agents import agent_store
         agent_store.create_agent("doomed", "Doomed")
         _insert_dynamic_task("doomed", scope="agent", created_by=ADMIN_SUB)
         _insert_dynamic_task("doomed", scope="user", created_by=REQUESTER_SUB)
@@ -1785,8 +1783,8 @@ class TestAgentDeleteCascade:
 
     def test_delete_agent_keeps_unrelated_agent_data(self, temp_db):
         """Deleting one agent must not touch another agent's rows."""
-        from storage.agents import agent_store
         from storage import database as db
+        from storage.agents import agent_store
         from storage.automation import trigger_store
         agent_store.create_agent("keeper", "Keeper")
         agent_store.create_agent("doomed", "Doomed")
@@ -1806,8 +1804,8 @@ class TestUserRemovalCascade:
     access. Agent-scope items stay."""
 
     def test_removing_user_from_agent_cleans_user_scope_tasks(self, temp_db):
-        from storage.agents import agent_store
         from storage import database as db
+        from storage.agents import agent_store
         agent_store.create_agent("a-test", "A Test")
         db.set_user_agents(REQUESTER_SUB, ["a-test"], assigned_by=ADMIN_SUB,
                            agent_roles={"a-test": "manager"})
@@ -1823,8 +1821,8 @@ class TestUserRemovalCascade:
         assert remaining[0]["scope"] == "agent"
 
     def test_removing_user_cleans_user_scope_triggers(self, temp_db):
-        from storage.agents import agent_store
         from storage import database as db
+        from storage.agents import agent_store
         from storage.automation import trigger_store
         agent_store.create_agent("a-test", "A Test")
         db.set_user_agents(REQUESTER_SUB, ["a-test"], assigned_by=ADMIN_SUB,
@@ -1839,8 +1837,8 @@ class TestUserRemovalCascade:
         assert remaining[0]["scope"] == "agent"
 
     def test_removing_user_cleans_user_scope_notifications(self, temp_db):
-        from storage.agents import agent_store
         from storage import database as db
+        from storage.agents import agent_store
         from storage.automation import notification_store
         agent_store.create_agent("a-test", "A Test")
         db.set_user_agents(REQUESTER_SUB, ["a-test"], assigned_by=ADMIN_SUB,
@@ -1857,8 +1855,8 @@ class TestUserRemovalCascade:
 
     def test_other_user_scope_items_survive(self, temp_db):
         """Removing user A from agent X must NOT touch user B's items on X."""
-        from storage.agents import agent_store
         from storage import database as db
+        from storage.agents import agent_store
         agent_store.create_agent("a-test", "A Test")
         db.set_user_agents(REQUESTER_SUB, ["a-test"], assigned_by=ADMIN_SUB,
                            agent_roles={"a-test": "manager"})
@@ -1873,3 +1871,151 @@ class TestUserRemovalCascade:
         remaining = db.list_dynamic_tasks(agent="a-test")
         assert len(remaining) == 1
         assert remaining[0]["created_by"] == "user-viewer"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Refusals in plain words: a sentence per request state, the catalog's host,
+# never the exception's own text
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _walk(row: dict, *statuses: str) -> None:
+    from storage.mcp import mcp_request_store
+    for status in statuses:
+        mcp_request_store.update_status(row["id"], status, resolved_by=ADMIN_SUB)
+
+
+def _refused(coro) -> tuple[int, str]:
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(coro)
+    return exc.value.status_code, exc.value.detail
+
+
+class TestRefusalSentences:
+    def test_each_request_state_has_its_own_sentence(self, temp_db):
+        from services.community import community_installer as ci
+        _seed_agent()
+        installed = _create_request("nextcloud")
+        _walk(installed, "approved", "installing", "installed")
+        assert _refused(ci.approve_request(installed["id"], ADMIN_SUB)) == (
+            409, "This request was already approved.")
+
+        failed = _create_request("prometheus")
+        _walk(failed, "approved", "installing", "install_failed")
+        assert _refused(ci.reject_request(failed["id"], ADMIN_SUB)) == (
+            409, "This request was approved, but its install failed. Retry the install instead.")
+        assert _refused(ci.cancel_request(failed["id"], REQUESTER_SUB)) == (
+            409, "This request was already approved, so it can no longer be cancelled.")
+
+        rejected = _create_request("unifi")
+        _walk(rejected, "rejected")
+        for coro in (ci.approve_request(rejected["id"], ADMIN_SUB),
+                     ci.cancel_request(rejected["id"], REQUESTER_SUB)):
+            assert _refused(coro) == (409, "This request was already rejected.")
+
+    def test_a_missing_request_and_someone_elses(self, temp_db):
+        from services.community import community_installer as ci
+        _seed_agent()
+        assert _refused(ci.approve_request(987654, ADMIN_SUB)) == (
+            404, "This request no longer exists.")
+        row = _create_request()
+        assert _refused(ci.cancel_request(row["id"], "user-viewer")) == (
+            403, "Only the person who asked can cancel this request.")
+
+    def test_an_instance_only_where_one_is_chosen(self, temp_db):
+        from services.community import community_installer as ci
+        _seed_agent()
+        row = _create_request("prometheus")
+        with patch("services.community.community_installer.mcp_registry.get_manifest",
+                   return_value=None):
+            assert _refused(ci.approve_request(row["id"], ADMIN_SUB, instance_id=3)) == (
+                400, "An instance can be chosen only for an installed MCP that asks for one.")
+        with patch("services.community.community_installer.mcp_registry.get_manifest",
+                   return_value=_StubExplicitManifest()), \
+                patch("storage.mcp.mcp_store.get_mcp_instances", return_value=[{"id": 1}]):
+            assert _refused(ci.approve_request(row["id"], ADMIN_SUB, instance_id=3)) == (
+                400, "That instance belongs to another MCP. Pick one of prometheus's instances.")
+
+    def test_the_catalog_names_the_host_and_keeps_the_cause_in_the_log(self, temp_db, caplog):
+        import httpx
+
+        from api.mcp.community import get_community_mcp, list_community_mcps
+        from services.community import community_catalog
+        boom = AsyncMock(side_effect=httpx.ConnectError("[Errno -3] name resolution failed"))
+        admin = TestAdminAutoApprove()._admin_ctx()
+        with patch.object(community_catalog, "fetch_registry", new=boom), \
+                caplog.at_level("WARNING", logger="otodock.community-api"):
+            for coro in (list_community_mcps(user=admin), get_community_mcp("x", user=admin)):
+                status, detail = _refused(coro)
+                assert (status, detail) == (502, "Could not load the community list. "
+                                                 "Check that this server can reach raw.githubusercontent.com.")
+        assert "name resolution failed" in caplog.text
+
+    def test_the_catalog_sentence_follows_the_cause(self):
+        import httpx
+
+        from services.community import community_catalog
+        url = "https://raw.githubusercontent.com/OtoDock/community-mcps/main/registry.json"
+        request = httpx.Request("GET", url)
+        gone = httpx.HTTPStatusError("404", request=request, response=httpx.Response(404, request=request))
+        busy = httpx.HTTPStatusError("503", request=request, response=httpx.Response(503, request=request))
+        cases = [
+            (httpx.ConnectTimeout("timed out"),
+             "Could not load the community list. Check that this server can reach raw.githubusercontent.com."),
+            (gone, "The community list was not found at raw.githubusercontent.com."),
+            (ValueError("Expecting value: line 1 column 1"),
+             "The community list could not be read. Try again in a minute."),
+            (busy, "Could not load the community list. Try again in a minute."),
+            (RuntimeError("registry GET returned no body and no cache"),
+             "Could not load the community list. Try again in a minute."),
+        ]
+        for exc, sentence in cases:
+            assert community_catalog.load_refusal("community list", url, exc) == sentence
+
+    def test_the_admin_request_that_stopped_says_it_was_saved(self, temp_db):
+        from api.mcp.community import CreateRequestBody, create_mcp_request
+        from services.community import community_installer
+        _seed_agent()
+        admin = TestAdminAutoApprove()._admin_ctx()
+        with TestAdminAutoApprove()._mock_catalog(), patch.object(
+            community_installer, "approve_request",
+            new=AsyncMock(side_effect=RuntimeError("psycopg: deadlock detected")),
+        ):
+            status, detail = _refused(create_mcp_request(
+                "test-agent", CreateRequestBody(mcp_name="nextcloud", reason=""), user=admin,
+            ))
+        assert status == 500
+        assert detail == ("Your request was saved, but its approval stopped on an error. "
+                          "The server log has the details.")
+
+    def test_a_background_install_names_a_full_disk_and_nothing_else(self):
+        import errno
+
+        from api.mcp import community
+        assert community._install_failure(OSError(errno.ENOSPC, "No space left on device")) \
+            == "The server's disk is full."
+        assert community._install_failure(KeyError("server")) == (
+            "The install stopped on an unexpected error. The server log has the details.")
+
+    @pytest.mark.parametrize(("answer", "sentence"), [
+        (403, "GitHub is limiting downloads from this server. Try again in an hour."),
+        (429, "GitHub is limiting downloads from this server. Try again in an hour."),
+        (404, "The community list's files were not found. Run Check updates and try again."),
+        (None, "Could not download from the community list. "
+               "This server must reach api.github.com and codeload.github.com."),
+    ])
+    def test_a_download_says_why_it_failed(self, monkeypatch, answer, sentence):
+        import httpx
+
+        from services.community import community_installer
+
+        def handler(request):
+            if answer is None:
+                raise httpx.ConnectError("connection refused")
+            return httpx.Response(answer, request=request)
+
+        real = httpx.AsyncClient
+        monkeypatch.setattr(community_installer.httpx, "AsyncClient",
+                            lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+        assert _refused(community_installer._fetch_catalog_tarball()) == (502, sentence)

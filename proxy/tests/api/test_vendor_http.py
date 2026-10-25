@@ -84,6 +84,7 @@ class TestCheck:
 
 def test_a_vendor_call_to_a_refused_url_never_leaves(monkeypatch):
     import httpx
+
     from services.webhooks import subscription_manager as sm
     sent = []
     real_client = httpx.AsyncClient

@@ -10,6 +10,7 @@ it calls. Kept whole alongside (not inside) sync_mcps, which stays in
 session_manager as a cohesive hot path.
 """
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -18,10 +19,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ..host import env_hygiene
-from ..config import atomic_replace, force_rmtree, kill_process_tree, venv_exe
-import contextlib
 from .. import config
+from ..config import atomic_replace, force_rmtree, kill_process_tree, venv_exe
+from ..host import env_hygiene
 
 logger = logging.getLogger("satellite")
 
@@ -393,7 +393,7 @@ async def _kill_warmup_proc(proc: "asyncio.subprocess.Process | None") -> None:
     if proc.returncode is None:
         try:
             await asyncio.to_thread(kill_process_tree, proc.pid, 5.0)
-        except Exception:
+        except Exception:  # noqa: BLE001  # tree-killing a warm-up process that is being torn down
             with contextlib.suppress(Exception):
                 proc.kill()
     with contextlib.suppress(Exception):
@@ -410,7 +410,7 @@ async def _warm_one_mcp(
     manifest_path = target_root / "manifest.json"
     try:
         server = (json.loads(manifest_path.read_text(encoding="utf-8")).get("server") or {})
-    except Exception as e:
+    except (OSError, ValueError, AttributeError) as e:
         logger.info("MCP %s warm-up skipped: manifest unreadable (%s)", name, e)
         return (name, f"warn:manifest unreadable ({e})")
 
@@ -423,7 +423,7 @@ async def _warm_one_mcp(
     cmd = _resolve_warmup_command(target_root, raw_cmd, server.get("args") or [])
 
     async with sem:
-        proc: "asyncio.subprocess.Process | None" = None
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -440,13 +440,13 @@ async def _warm_one_mcp(
         except asyncio.TimeoutError:
             logger.warning("MCP %s warm-up: timeout (imports still ran)", name)
             return (name, "warn:timeout")
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError) as e:
             stderr_tail = ""
             if proc is not None and proc.stderr is not None:
                 try:
                     data = await asyncio.wait_for(proc.stderr.read(4096), timeout=1.0)
                     stderr_tail = data.decode("utf-8", errors="replace").strip()[-500:]
-                except Exception:
+                except (asyncio.TimeoutError, OSError):
                     pass
             reason = f"{type(e).__name__}: {e}"
             logger.warning(
@@ -607,11 +607,11 @@ async def reconcile_mcp_runtimes(mcps_dir: Path, uv_bin: str | None) -> dict[str
     from .._vendored import mcp_installer
 
     results: dict[str, str] = {}
-    if not mcps_dir.is_dir():
+    if not mcps_dir.is_dir():  # noqa: ASYNC240  # runs at boot before the link connects (__main__)
         return results
     target = sys.version_info[:2]
 
-    for cat_dir in sorted(mcps_dir.iterdir()):
+    for cat_dir in sorted(mcps_dir.iterdir()):  # noqa: ASYNC240  # runs at boot before the link connects (__main__)
         if not cat_dir.is_dir():
             continue
         for mcp_dir in sorted(cat_dir.iterdir()):

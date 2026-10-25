@@ -12,13 +12,13 @@ HTTP calls are mocked via ``httpx.AsyncClient`` so tests are hermetic.
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from auth.oauth_providers import get_provider, list_provider_ids
 from auth.oauth_providers.base import TokenSet, UserInfo
-from auth.oauth_providers.google import GoogleOAuthProvider
 from auth.oauth_providers.generic import GenericOAuthProvider
-
+from auth.oauth_providers.google import GoogleOAuthProvider
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -193,7 +193,7 @@ class TestGoogleProvider:
         mock_client = MagicMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
-        mock_client.post = AsyncMock(side_effect=Exception("network"))
+        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("network"))
         with patch(
             "auth.oauth_providers.google.httpx.AsyncClient",
             return_value=mock_client,
@@ -333,6 +333,7 @@ class TestCredentialLocks:
     async def test_lock_actually_serializes_async_tasks(self):
         """Two coroutines competing for the same lock should serialize."""
         import asyncio
+
         from core.credentials import credential_locks
 
         order = []

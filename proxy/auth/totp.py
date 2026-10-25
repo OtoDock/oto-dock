@@ -8,11 +8,10 @@ import time
 import unicodedata
 from dataclasses import dataclass
 
-import jwt
 import pyotp
 
-import config
-from storage.identity.credential_store import _encrypt, _decrypt
+from auth import tokens
+from storage.identity.credential_store import _decrypt, _encrypt
 
 
 def generate_totp_secret() -> str:
@@ -133,15 +132,12 @@ def create_2fa_session_token(sub: str) -> str:
         "iat": int(time.time()),
         "exp": int(time.time()) + _2FA_TOKEN_TTL,
     }
-    return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
+    return tokens.mint(tokens.TWO_FACTOR, payload)
 
 
 def _step_payload(token: str) -> dict | None:
-    try:
-        payload = jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-        return None
-    if payload.get("purpose") != "2fa" or not payload.get("jti") or not payload.get("sub"):
+    payload = tokens.verify(token, tokens.TWO_FACTOR)
+    if payload is None or not payload.get("jti") or not payload.get("sub"):
         return None
     return payload
 

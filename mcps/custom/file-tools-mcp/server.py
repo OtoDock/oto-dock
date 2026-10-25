@@ -8,6 +8,8 @@ hook endpoint.
 Modules: shared.py, excel.py, word.py, powerpoint.py, pdf.py, images.py
 """
 
+import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -15,12 +17,13 @@ import uvicorn
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 import render
+from _tool_args import ToolArgs
 from shared import (
     MCP_PORT,
     _push_preview,
@@ -86,6 +89,7 @@ TOOLS = [
             },
             "required": ["path"],
         },
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
     Tool(
         name="write_docx",
@@ -142,6 +146,7 @@ TOOLS = [
             },
             "required": ["path", "operations"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="write_xlsx",
@@ -198,6 +203,7 @@ TOOLS = [
             },
             "required": ["path", "operations"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="write_pptx",
@@ -255,6 +261,7 @@ TOOLS = [
             },
             "required": ["path", "operations"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="write_pdf",
@@ -306,6 +313,7 @@ TOOLS = [
             },
             "required": ["path", "content"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="convert_document",
@@ -334,6 +342,7 @@ TOOLS = [
             },
             "required": ["input_path", "output_format"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="edit_pdf",
@@ -379,6 +388,7 @@ TOOLS = [
             },
             "required": ["path", "operations"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="pdf_to_images",
@@ -416,6 +426,7 @@ TOOLS = [
             },
             "required": ["path"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="screenshot_document",
@@ -452,6 +463,7 @@ TOOLS = [
             },
             "required": ["path"],
         },
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
     Tool(
         name="images_to_pdf",
@@ -485,6 +497,7 @@ TOOLS = [
             },
             "required": ["images", "output_path"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="edit_image",
@@ -530,6 +543,7 @@ TOOLS = [
             },
             "required": ["path", "operations"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     Tool(
         name="preview_document",
@@ -549,6 +563,7 @@ TOOLS = [
             },
             "required": ["path"],
         },
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
     Tool(
         name="analyze_image",
@@ -568,6 +583,7 @@ TOOLS = [
             },
             "required": ["path"],
         },
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
     Tool(
         name="create_chart",
@@ -647,6 +663,7 @@ TOOLS = [
             },
             "required": ["chart_type", "series"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
 ]
 
@@ -658,7 +675,7 @@ TOOLS = [
 
 async def _handle_read_document(args: dict) -> str:
     path = await _resolve_path(args["path"])
-    if not Path(path).exists():
+    if not await asyncio.to_thread(os.path.exists, path):
         return f"Error: File not found: {args['path']}"
 
     ext = Path(path).suffix.lower()
@@ -699,13 +716,13 @@ async def _handle_read_document(args: dict) -> str:
             return await run_parse(read_pptx, path)
         else:
             return f"Error: Unsupported format '{ext}'. Supported: .pdf, .docx, .xlsx, .pptx"
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return f"Error reading {ext} file: {exc}"
 
 
 async def _handle_preview_document(args: dict) -> str:
     path = await _resolve_path(args["path"])
-    if not Path(path).exists():
+    if not await asyncio.to_thread(os.path.exists, path):
         return f"Error: File not found: {args['path']}"
     await _push_preview(path)
     return f"Preview pushed for: {_to_agents_relative(path)}"
@@ -716,6 +733,7 @@ async def _handle_preview_document(args: dict) -> str:
 # ===================================================================
 
 mcp_server = Server("file-tools")
+TOOL_ARGS = ToolArgs()
 
 # Dual transport: SSE for Claude CLI, streamable HTTP for Codex CLI
 sse = SseServerTransport("/messages/")
@@ -724,11 +742,14 @@ session_manager = StreamableHTTPSessionManager(app=mcp_server, stateless=True)
 
 @mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
-    return TOOLS
+    return TOOL_ARGS.listed(TOOLS)
 
 
-@mcp_server.call_tool()
+@mcp_server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     handlers = {
         "read_document": _handle_read_document,
         "preview_document": _handle_preview_document,
@@ -794,7 +815,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if isinstance(result, list):
             return result
         return [TextContent(type="text", text=result)]
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  # the tool answers with the error text whatever failed
         logger.exception(f"Tool {name} failed")
         return [TextContent(type="text", text=f"Error: {exc}")]
 

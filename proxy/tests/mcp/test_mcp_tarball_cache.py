@@ -16,7 +16,10 @@ def _fake_manifest(mcp_dir: Path, name: str = "fake-mcp"):
 
 def test_tarball_excludes_heavy_dirs(tmp_path: Path, temp_db, monkeypatch):
     """venv/, node_modules/, __pycache__/, .git/ must not end up in the tarball."""
-    import tarfile, io, base64
+    import base64
+    import io
+    import tarfile
+
     import config as app_config
     from services.mcp import mcp_tarball
 
@@ -57,7 +60,10 @@ def test_tarball_excludes_data_dirs_and_keys(tmp_path: Path, temp_db, monkeypatc
     that syncs the MCP — including user-paired laptops — so shipping it was a
     key-material leak (masked only by cache staleness: key files don't drift
     compute_version_hash)."""
-    import tarfile, io, base64
+    import base64
+    import io
+    import tarfile
+
     import config as app_config
     from services.mcp import mcp_tarball
 
@@ -89,7 +95,10 @@ def test_tarball_excludes_data_dirs_and_keys(tmp_path: Path, temp_db, monkeypatc
 def test_tarball_keys_floor_without_declaration(tmp_path: Path, temp_db, monkeypatch):
     """keys/ is excluded even when the manifest declares NO data_dirs
     (defense in depth); other dirs like config/ ship normally then."""
-    import tarfile, io, base64
+    import base64
+    import io
+    import tarfile
+
     import config as app_config
     from services.mcp import mcp_tarball
 
@@ -120,7 +129,7 @@ def test_invalidate_drops_legacy_format_entries(tmp_path: Path, temp_db, monkeyp
     from before the exclusion fix and are never served again) and keeps only
     current-format entries whose hash matches a registered MCP."""
     import config as app_config
-    from services.mcp import mcp_tarball, mcp_installer
+    from services.mcp import mcp_installer, mcp_tarball
 
     monkeypatch.setattr(app_config, "BASE_DIR", tmp_path / "proxy")
 
@@ -169,6 +178,7 @@ def test_tarball_reuses_cache(tmp_path: Path, temp_db, monkeypatch):
 def test_gc_removes_stale(tmp_path: Path, temp_db, monkeypatch):
     """gc() evicts entries whose mtime is older than STALE_CACHE_AGE_S."""
     import os
+
     import config as app_config
     from services.mcp import mcp_tarball
 
@@ -198,6 +208,57 @@ def test_missing_mcp_raises(tmp_path: Path, temp_db, monkeypatch):
     with patch("services.mcp.mcp_registry.get_manifest", return_value=None):
         try:
             mcp_tarball.build_tarball("ghost")
-            assert False, "expected FileNotFoundError"
+            raise AssertionError("expected FileNotFoundError")
         except FileNotFoundError:
             pass
+
+
+def test_two_builds_at_once_leave_one_whole_entry(tmp_path: Path, temp_db, monkeypatch):
+    """Two machines syncing at once build one MCP in two worker threads:
+    each writes its own partial, the entry is whole, nothing is left over."""
+    import base64
+    import threading
+
+    import config as app_config
+    from services.mcp import mcp_tarball
+
+    mcp_dir = tmp_path / "m"
+    mcp_dir.mkdir()
+    (mcp_dir / "manifest.json").write_text('{"name":"m"}')
+    (mcp_dir / "server.py").write_text("x = 1\n" * 50_000)
+    monkeypatch.setattr(app_config, "BASE_DIR", tmp_path / "proxy")
+    results: list = []
+    with patch("services.mcp.mcp_registry.get_manifest",
+               return_value=_fake_manifest(mcp_dir, "m")):
+        threads = [threading.Thread(target=lambda: results.append(mcp_tarball.build_tarball("m")))
+                   for _ in range(4)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=30)
+    assert len(results) == 4
+    assert len({r.tarball_b64 for r in results}) == 1
+    cache = mcp_tarball._cache_path_for(results[0].version_hash)
+    assert cache.read_bytes() == base64.b64decode(results[0].tarball_b64)
+    assert [p.name for p in mcp_tarball._cache_dir().iterdir() if p.name.endswith(".partial")] == []
+
+
+def test_a_tree_changed_during_the_build_is_neither_cached_nor_shipped(
+    tmp_path: Path, temp_db, monkeypatch,
+):
+    import pytest
+
+    import config as app_config
+    from services.mcp import mcp_installer, mcp_tarball
+
+    mcp_dir = tmp_path / "m"
+    mcp_dir.mkdir()
+    (mcp_dir / "manifest.json").write_text('{"name":"m"}')
+    monkeypatch.setattr(app_config, "BASE_DIR", tmp_path / "proxy")
+    hashes = iter(["before", "after"])
+    monkeypatch.setattr(mcp_installer, "compute_version_hash", lambda d: next(hashes))
+    with patch("services.mcp.mcp_registry.get_manifest",
+               return_value=_fake_manifest(mcp_dir, "m")), \
+            pytest.raises(mcp_tarball.TreeChanged, match="changed while its tarball was built"):
+        mcp_tarball.build_tarball("m")
+    assert list(mcp_tarball._cache_dir().iterdir()) == []

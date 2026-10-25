@@ -13,12 +13,17 @@ import json
 
 import pytest
 
+import ws.dashboard  # noqa: F401  (assembles the mixins first)
 from storage import database as task_store
 from tests.fixtures.ws_dashboard_harness import (
-    FakeExecutionLayer, dashboard_connection, drain_startup, make_test_agent,
-    run_ws_scenario, session_cookie, stub_dashboard_seams,
+    FakeExecutionLayer,
+    dashboard_connection,
+    drain_startup,
+    make_test_agent,
+    run_ws_scenario,
+    session_cookie,
+    stub_dashboard_seams,
 )
-import ws.dashboard  # noqa: F401  (assembles the mixins first)
 from ws import dashboard_chat_resume as resume
 
 
@@ -138,7 +143,7 @@ class TestDeltas:
         import threading
 
         from core.events import stream_pump
-        from core.events.common_events import CommonEvent, TEXT
+        from core.events.common_events import TEXT, CommonEvent
         from core.session import session_kind
         from tests.session.test_pump_attach_races import _seed_live
 

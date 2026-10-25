@@ -62,6 +62,7 @@ def test_allowlist_accepts_known_hook_paths():
     assert _is_allowed_path("/v1/hooks/stop")
     assert _is_allowed_path("/v1/hooks/codex-question")
     import sys
+
     from tests._paths import REPO_ROOT
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
@@ -80,6 +81,7 @@ def test_allowlist_accepts_the_checks_routes():
     """checks-mcp on a satellite session (CHECKS.md, 0.5.123): attached,
     attach, detach and run ride the tunnel; both lists admit them."""
     import sys
+
     from tests._paths import REPO_ROOT
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
@@ -677,6 +679,16 @@ def test_allowlist_accepts_delegation_and_continuations():
     assert not _is_allowed_path("/v1/delegation/../admin")
 
 
+def test_allowlist_accepts_the_agents_move_and_not_the_persons():
+    # Twin of the satellite-side test (0.5.157): delegation-mcp's move_chat
+    # posts the session-token route; the person's move stays the dashboard's.
+    assert _is_allowed_path("/v1/chats/agent-move")
+    assert not _is_allowed_path("/v1/chats/c-1/move")
+    assert not _is_allowed_path("/v1/chats/c-1/targets")
+    assert not _is_allowed_path("/v1/chats/agent-move/x")
+    assert not _is_allowed_path("/v1/chats/agent-move/../c-1/move")
+
+
 # ===== Two clients, two stream classes =====
 
 
@@ -793,6 +805,7 @@ async def test_hooks_do_not_wait_behind_held_mcp_streams(monkeypatch):
     and two standing MCP GETs held, a hook is answered at once through its
     own pool instead of waiting the pool timeout for a 502."""
     import time
+
     from core.remote import satellite_http_tunnel as tun
 
     monkeypatch.setattr(tun, "_MCP_POOL_MAX", 2)
@@ -850,8 +863,8 @@ async def test_a_tunneled_request_from_a_gone_holder_is_refused(monkeypatch):
     agent-scope token pass; the answer is cached for the TTL and the cache
     is bounded."""
     from auth import providers as auth_providers, token_holder
-    from tests.conftest import live_session_token
     from core.remote import satellite_http_tunnel as tun
+    from tests.conftest import live_session_token
 
     token_holder.reset_for_tests()
     monkeypatch.setattr(tun, "_resolve_upstream_url", lambda p: "http://127.0.0.1:1/x")
@@ -920,8 +933,8 @@ async def test_the_holder_check_reads_the_bearer_as_the_routes_do(monkeypatch):
     too; a request with two Authorization headers (keys differing in case)
     is refused, since which one a server reads is its own choice."""
     from auth import token_holder
-    from tests.conftest import live_session_token
     from core.remote import satellite_http_tunnel as tun
+    from tests.conftest import live_session_token
 
     token_holder.reset_for_tests()
     monkeypatch.setattr(tun, "_resolve_upstream_url", lambda p: "http://127.0.0.1:1/x")
@@ -962,6 +975,7 @@ class _RecordingUpstream:
         self.server = None
         self.port = None
         self.heads: list[bytes] = []
+        self.bodies: list[bytes] = []
 
     async def _handle(self, reader, writer):
         try:
@@ -971,8 +985,7 @@ class _RecordingUpstream:
             for line in head.split(b"\r\n"):
                 if line.lower().startswith(b"content-length:"):
                     clen = int(line.split(b":", 1)[1])
-            if clen:
-                await reader.readexactly(clen)
+            self.bodies.append(await reader.readexactly(clen) if clen else b"")
             body = b'{"jsonrpc":"2.0","id":1,"result":{}}'
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                          b"Mcp-Session-Id: s-1\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
@@ -1007,6 +1020,7 @@ async def test_a_credentialed_sidecar_request_is_forwarded_through_the_gateway(m
     direct hop as before."""
     import base64
     import uuid
+
     from core.credentials import mcp_broker, mcp_gateway
     from core.credentials.mcp_gateway import GatewayCredential
     from core.remote import satellite_http_tunnel as tun
@@ -1066,6 +1080,7 @@ async def test_a_vendor_credential_never_leaves_the_platform_through_the_tunnel(
     and no upstream is dialled."""
     import base64
     import uuid
+
     from core.credentials import mcp_broker, mcp_gateway
     from core.credentials.mcp_gateway import GatewayCredential
     from core.remote import satellite_http_tunnel as tun
@@ -1103,6 +1118,79 @@ async def test_a_vendor_credential_never_leaves_the_platform_through_the_tunnel(
 
 
 @pytest.mark.asyncio
+async def test_a_narrowed_vendor_credential_is_forwarded_and_judged_by_the_platform(monkeypatch):
+    """A machine session's GitHub credential that an agent's reach narrows
+    comes through the tunnel (the machine never holds it): the platform
+    judges the call, adds the token and dials the vendor; a refused call
+    dials nothing. An MCP with no sidecar port is not "not found" then."""
+    import base64
+    import uuid
+
+    import httpx
+
+    from core.credentials import mcp_broker, mcp_gateway
+    from core.credentials.mcp_gateway import GatewayCredential
+    from core.remote import satellite_http_tunnel as tun
+    from storage.identity import bearer_allowlist
+    from tests.conftest import live_session_token
+
+    up = _RecordingUpstream()
+    await up.start()
+    sid = str(uuid.uuid4())
+    provider = f"gw-{uuid.uuid4().hex[:6]}"
+    bearer_allowlist.add_allowed(provider, "127.0.0.1", "test")
+    mcp_broker.provision(sid, {"github-mcp": mcp_broker.SecretBundle(gateway=GatewayCredential(
+        upstream=f"http://127.0.0.1:{up.port}", path="/mcp", allowlist_key=provider, value="ghu_real",
+        reach={"repositories": ["octo/hello"], "read_only": False}))})
+    monkeypatch.setattr(tun, "_resolve_upstream_url", lambda p: None)
+    monkeypatch.setattr(tun, "_takes_gateway_credential", lambda name: True)
+    monkeypatch.setattr(mcp_gateway, "_egress_refusal", lambda u: None)
+    plain = httpx.AsyncClient()
+    monkeypatch.setattr(mcp_gateway, "client", lambda *a, **k: plain)
+    monkeypatch.setattr("auth.token_holder.holder_ok", _ok)
+    token = live_session_token(sid, "agent", "user-1")
+    disp = SatelliteHttpTunnelDispatcher()
+    conn = FakeConnection()
+    mgr = FakeManager(conn)
+
+    def call(stream: str, repo: str, method: str = "POST", tool: str = "list_issues") -> dict:
+        arguments = {"owner": "octo", "repo": repo} if repo else {"query": "TODO"}
+        body = json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                           "params": {"name": tool, "arguments": arguments}})
+        return {"stream_id": stream, "method": method, "path": f"/mcp/github-mcp/mcp?session_id={sid}",
+                "headers": {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                "body_b64": base64.b64encode(body.encode()).decode(), "body_eof": True, "timeout_s": 30}
+    try:
+        await disp.handle_request_frame(mgr, "m1", call("ok", "hello"))
+        first = await _first_frame(conn, "ok")
+        assert first["status"] == 200 and first.get("error") is None
+        head = up.heads[-1].decode()
+        assert head.startswith("POST /mcp ") and "Authorization: Bearer ghu_real" in head
+        assert token not in head and "session_id" not in head
+        await disp.handle_request_frame(mgr, "m1", call("no", "secret"))
+        first = await _first_frame(conn, "no")
+        doc = json.loads(base64.b64decode(first["body_b64"]))
+        assert doc["id"] == 5 and "octo/secret is not one of them" in doc["error"]["message"]
+        assert len(up.heads) == 1
+        # A frame's method in lower case is judged all the same (httpx
+        # would send it as POST).
+        await disp.handle_request_frame(mgr, "m1", call("lower", "secret", method="post"))
+        doc = json.loads(base64.b64decode((await _first_frame(conn, "lower"))["body_b64"]))
+        assert "octo/secret is not one of them" in doc["error"]["message"] and len(up.heads) == 1
+        # What the judge rewrote is what the vendor receives.
+        await disp.handle_request_frame(mgr, "m1", call("search", "", tool="search_code"))
+        assert (await _first_frame(conn, "search"))["status"] == 200
+        sent = json.loads(up.bodies[-1])
+        assert sent["params"]["arguments"]["query"] == "TODO repo:octo/hello"
+    finally:
+        mcp_broker.purge_session(sid)
+        mcp_gateway.forget_memos()
+        await disp.shutdown()
+        await plain.aclose()
+        await up.stop()
+
+
+@pytest.mark.asyncio
 async def test_a_credentialed_sidecar_with_no_credential_is_refused_not_hopped(monkeypatch):
     """A store miss (a session adopted with no gateway descriptor) for a
     sidecar whose manifest takes a credential answers the JSON-RPC refusal:
@@ -1112,6 +1200,7 @@ async def test_a_credentialed_sidecar_with_no_credential_is_refused_not_hopped(m
     import base64
     import uuid
     from types import SimpleNamespace
+
     from core.remote import satellite_http_tunnel as tun
     from tests.conftest import live_session_token
 
@@ -1168,6 +1257,7 @@ def test_the_two_tunnel_allowlists_are_the_same_list():
     compares them whole, pattern by pattern, so an entry added on one side
     fails here instead of on a machine."""
     import sys
+
     from tests._paths import REPO_ROOT
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
@@ -1177,6 +1267,7 @@ def test_the_two_tunnel_allowlists_are_the_same_list():
     satellite_patterns = [r.pattern for r in sat._ALLOWLIST_REGEXES]
     assert proxy_patterns == satellite_patterns
     assert "/v1/mcp-gateway" not in "".join(proxy_patterns)
+    assert r"^/v1/chats/agent-move$" in proxy_patterns
 
 
 @pytest.mark.asyncio
@@ -1186,6 +1277,7 @@ async def test_a_tunneled_mcp_request_of_a_closed_or_earlier_life_is_refused(mon
     before its session's floor, answer 401 ``session-not-live`` and the
     upstream is never contacted; the current life's token passes."""
     import time as _time
+
     from auth import token_holder
     from auth.session_token import create_session_token
     from core.layers.direct.session import _direct_sessions

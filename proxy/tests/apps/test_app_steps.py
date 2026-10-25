@@ -26,17 +26,24 @@ import pytest
 from fastapi.testclient import TestClient
 
 import config
+from api.apps import app_proxy
 from app import app
-from api.apps import app_proxy, catalog
-from api.apps import manifest as _mf
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
 from core.session import session_state
-from services.apps import (app_deploy, app_handlers, app_sandbox, app_steps, app_supervisor,
-                           app_tokens, releases)
+from services.apps import (
+    app_deploy,
+    app_handlers,
+    app_sandbox,
+    app_steps,
+    app_supervisor,
+    app_tokens,
+    catalog,
+    manifest as _mf,
+    releases,
+)
 from services.scheduler import shared
-from storage import database as task_store
-from storage import db_app_deliveries as deliveries
+from storage import database as task_store, db_app_deliveries as deliveries
 from storage.pg import get_conn
 
 client = TestClient(app)
@@ -73,7 +80,7 @@ def _clean(monkeypatch):
     _as(ALICE)
     apps_api._fire_rate.clear()
     app_proxy._buckets.clear()
-    app_proxy._client = None
+    app_supervisor._client = None
     catalog._loop = None
     catalog._app_subs.clear()
     app_handlers._drains.clear()
@@ -88,7 +95,7 @@ def _clean(monkeypatch):
     app_handlers._step_runs.clear()
     app_supervisor._instances.clear()
     app_supervisor._locks.clear()
-    app_proxy._client = None
+    app_supervisor._client = None
 
 
 @pytest.fixture

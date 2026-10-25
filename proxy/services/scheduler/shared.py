@@ -16,7 +16,6 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel
 
-
 logger = logging.getLogger("otodock.scheduler")
 
 
@@ -116,6 +115,16 @@ class TaskDefinition(BaseModel):
     override_model: str | None = None
     override_execution_path: str | None = None
     override_execution_mode: str | None = None
+    # The machine THIS task's runs use (``dynamic_tasks.target_machine``):
+    # "" = the agent's default (the resolver), ``placement.LOCAL`` = the
+    # server, else a machine id. Validated on write for the task's run
+    # person (``chat_targets.resolve_work_machine``); re-checked at every
+    # run (``task_config_builder.task_target``): a machine the guard refuses
+    # or that is offline then gives way to the default, and the run says so.
+    target_machine: str = ""
+    # The run's permission mode, persisted: "" = Don't Ask (the unattended
+    # word), the Auto word = the engine's own review.
+    permission_mode: str = ""
     # A delegate continue that changed the worker's model (``override_model``
     # is the new one, already on the chat row): the runner closes the chat's
     # live session before the round and never rides it warm, so the round

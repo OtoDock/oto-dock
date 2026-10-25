@@ -140,7 +140,7 @@ def _forget(mcp_sid: str) -> None:
 
 async def _delete_upstream(mcp_sid: str) -> int:
     """Terminate an upstream MCP session → releases its server-side state."""
-    from aiohttp import ClientTimeout
+    from aiohttp import ClientError, ClientTimeout
     assert _client is not None
     try:
         async with _client.delete(
@@ -149,7 +149,7 @@ async def _delete_upstream(mcp_sid: str) -> int:
         ) as r:
             await r.read()
             return r.status
-    except Exception as e:
+    except (ClientError, asyncio.TimeoutError) as e:
         log.warning("delete mcp=%s failed: %s", mcp_sid[:8], e)
         return 0
 
@@ -205,7 +205,7 @@ async def close_session_handler(request):
     from aiohttp import web
     try:
         body = await request.json()
-    except Exception:
+    except (ValueError, LookupError):
         body = {}
     oto = (body.get("session_id") or "").strip()
     if not oto:
@@ -221,7 +221,7 @@ async def close_session_handler(request):
 
 async def proxy_handler(request):
     """Stream everything through to the upstream MCP server (transparent)."""
-    from aiohttp import ClientTimeout, web
+    from aiohttp import ClientError, ClientTimeout, web
     assert _client is not None
 
     path = request.rel_url.raw_path
@@ -249,7 +249,7 @@ async def proxy_handler(request):
                 sock_read=None if request.method == "GET" else PER_CALL_TIMEOUT_S,
             ),
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the client gets a 502 whatever the upstream request raised
         # Exception text can embed upstream URLs/headers — keep it in the
         # sidecar log; the client gets the exception class for triage.
         log.warning("upstream %s %s: %s", request.method, path, e)
@@ -300,7 +300,7 @@ async def proxy_handler(request):
         else:
             async for chunk in upstream.content.iter_any():
                 await resp.write(chunk)
-    except Exception as e:
+    except (ClientError, OSError, asyncio.TimeoutError) as e:
         log.warning("stream %s: %s", path, e)
     finally:
         upstream.release()
@@ -344,9 +344,11 @@ async def main() -> None:
     await web.TCPSite(runner, "0.0.0.0", LISTEN_PORT).start()
     log.info("session sidecar on :%d → %s (idle-GC %ds)",
              LISTEN_PORT, UPSTREAM, SESSION_IDLE_S)
-    asyncio.create_task(_gc_loop())
-    while True:
-        await asyncio.sleep(3600)
+    gc = asyncio.create_task(_gc_loop())
+    try:
+        await asyncio.Event().wait()  # serve until the process is stopped
+    finally:
+        gc.cancel()
 
 
 if __name__ == "__main__":

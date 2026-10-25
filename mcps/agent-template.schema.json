@@ -1,0 +1,566 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/OtoDock/oto-dock/v1.9.0/mcps/agent-template.schema.json",
+  "title": "OtoDock agent template",
+  "description": "The catalog rules for an OtoDock agent template (OtoDock is a fair source project): the template's folder validated as one document. The document is an object keyed by paths inside the folder (POSIX separators): each file x-otodock-documents names holds its parsed JSON, and every other file at the folder's top level holds true. Deeper files (the apps' trees, context/, the dashboards' pages) are not part of it. The platform's template loader (services/community/community_agent_template_store.py, through storage/catalog_schema.py) refuses a template that breaks these rules and adds the ones a schema cannot state: the template's mode against its apps and dashboards, duplicate slugs, the files a dashboard names, each app folder's files and its client/index.html, at most four apps and eight checks, the checks' own validator. Unknown files and keys are allowed: a catalog is additive. A field the platform reads with a default, or reads not at all, takes null and is read as absent.",
+  "$comment": "Custom annotation keywords, ignored by validators. x-otodock-documents (here): the folder paths read as JSON documents; a * stands for one path segment, the whole path must match, and a dot-name never matches. x-otodock-first-release (here): the platform release that first ships this schema. x-otodock-since: the platform release that first reads the field; x-otodock-floors: a list of {pattern, since}, a value matching the pattern needs that release. Both are read on properties and items, never under patternProperties. x-otodock-hint: the words a finding uses for the rule, {value} standing for the value found.",
+  "x-otodock-documents": [
+    "agent.json",
+    "mcps.json",
+    "skills.json",
+    "tasks.json",
+    "triggers.json",
+    "notifications.json",
+    "dashboards.json",
+    "apps/*/app.json",
+    "apps/*/blueprint.json",
+    "user-apps/*/app.json",
+    "user-apps/*/blueprint.json",
+    "checks/*/check.json"
+  ],
+  "x-otodock-first-release": "1.9.0",
+  "type": "object",
+  "required": ["agent.json", "mcps.json", "README.md"],
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "anyOf": [
+        {"required": ["agent.md"]},
+        {"required": ["prompt.md"]}
+      ],
+      "x-otodock-hint": "Missing required file: agent.md (or its pre-1.4 name prompt.md)"
+    }
+  ],
+  "properties": {
+    "agent.json": {"$ref": "#/$defs/agentJson"},
+    "agent.md": {"description": "The persona: the agent's instructions, in second person."},
+    "prompt.md": {
+      "description": "The persona's name before 1.4. agent.md wins when both exist; the catalog ships both, byte-identical, while platforms before 1.4 are served."
+    },
+    "README.md": {"description": "What the agent is for: the catalog's detail dialog."},
+    "mcps.json": {"$ref": "#/$defs/mcpsJson"},
+    "skills.json": {"$ref": "#/$defs/skillsJson"},
+    "tasks.json": {"$ref": "#/$defs/tasksJson"},
+    "triggers.json": {"$ref": "#/$defs/triggersJson"},
+    "notifications.json": {"$ref": "#/$defs/notificationsJson"},
+    "dashboards.json": {"$ref": "#/$defs/dashboardsJson"},
+    "setup.md": {
+      "description": "A one-time setup guide for a manager, loaded into the agent's context until the setup is completed."
+    },
+    "user-setup.md": {"description": "Per-member onboarding, copied into each member's own context when they join."},
+    "icon.png": {"description": "The catalog card's icon, 256 by 256 pixels."}
+  },
+  "patternProperties": {
+    "^(apps|user-apps)/[^/]+/app\\.json$": {"$ref": "#/$defs/appJson"},
+    "^user-apps/[^/]+/app\\.json$": {"$ref": "#/$defs/userAppJson"},
+    "^(apps|user-apps)/[^/]+/blueprint\\.json$": {"$ref": "#/$defs/blueprintJson"},
+    "^checks/[^/]+/check\\.json$": {"$ref": "#/$defs/checkJson"}
+  },
+  "$defs": {
+    "nonEmptyString": {"type": "string", "pattern": "\\S", "x-otodock-hint": "must not be empty"},
+    "scope": {
+      "enum": ["user", "agent"],
+      "description": "user: one copy per member, each their own; agent: one shared row for the agent."
+    },
+    "agentRoles": {
+      "description": "Per-agent roles: an item with roles is seeded only for members holding one of them; null or absent seeds it for every member.",
+      "type": ["array", "null"],
+      "items": {"enum": ["manager", "editor", "contributor", "viewer"]}
+    },
+    "schedule": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": true,
+      "properties": {
+        "type": {"enum": ["cron", "interval", "run_at"]},
+        "cron": {
+          "type": "string",
+          "pattern": "^\\s*[0-9*/,LW#?-]+(\\s+[0-9*/,LW#?-]+){4,5}\\s*$",
+          "x-otodock-hint": "invalid cron {value} (5 or 6 fields, each of digits and * / , - L W # ?)",
+          "description": "Five or six cron fields. An agent-scope item fires in the platform timezone and follows it; a user-scope item fires in the member's own zone. Never encode a zone offset into the hour."
+        },
+        "interval_seconds": {"type": "integer", "minimum": 1, "x-otodock-hint": "must be a whole number of seconds, at least 1"},
+        "run_at": {"$ref": "#/$defs/nonEmptyString", "description": "An ISO date and time for a one-shot item."}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {"const": "cron"}
+            },
+            "required": ["type"]
+          },
+          "then": {"required": ["cron"]}
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {"const": "interval"}
+            },
+            "required": ["type"]
+          },
+          "then": {"required": ["interval_seconds"]}
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {"const": "run_at"}
+            },
+            "required": ["type"]
+          },
+          "then": {"required": ["run_at"]}
+        }
+      ]
+    },
+    "defaultState": {
+      "enum": ["paused", "active"],
+      "description": "Whether the seeded row starts paused or running. Tasks and triggers default to paused, notifications to active."
+    },
+    "agentJson": {
+      "type": "object",
+      "description": "The template's manifest.",
+      "required": ["slug", "display_name", "version"],
+      "additionalProperties": true,
+      "properties": {
+        "$schema": {
+          "type": ["string", "null"],
+          "description": "The schema this file follows, for an editor: <this schema's $id>#/$defs/agentJson. Ignored by the platform."
+        },
+        "schema_version": {
+          "type": ["string", "integer", "null"],
+          "description": "The template format; \"1\". Read by no platform release."
+        },
+        "slug": {
+          "$ref": "#/$defs/slug",
+          "description": "The template's identity and the installed agent's default slug. In the catalog it equals the folder name."
+        },
+        "display_name": {"$ref": "#/$defs/nonEmptyString", "description": "The agent's name on its card."},
+        "description": {"type": ["string", "null"], "description": "One or two sentences for the agent's card."},
+        "color": {
+          "type": ["string", "null"],
+          "pattern": "^(#[0-9A-Fa-f]{6})?$",
+          "x-otodock-hint": "invalid color {value} (must be #RRGGBB)",
+          "not": {"type": "string", "pattern": "\\n"}
+        },
+        "version": {
+          "$ref": "#/$defs/nonEmptyString",
+          "description": "The template's release. A catalog entry uses MAJOR.MINOR.PATCH: the template updater compares it with the installed one."
+        },
+        "internal": {"type": ["boolean", "null"], "description": "Read by no platform release."},
+        "default_scope": {
+          "enum": ["user", "agent", null],
+          "description": "user (the default) or agent: whose workspace and chats the agent works in. With collaborative it selects the agent's mode. Absent or null means user."
+        },
+        "collaborative": {
+          "type": ["boolean", "null"],
+          "description": "Default true. false with default_scope user makes a personal-only agent, false with agent a shared-only one."
+        },
+        "core_mcps": {
+          "enum": ["all", "none", null],
+          "description": "all (the default): the platform's core MCPs are assigned on top of mcps.json. none: the agent gets only what mcps.json lists. Platforms up to 1.4.0 ignore the field."
+        },
+        "default_for_new_users": {
+          "type": ["object", "null"],
+          "description": "Attach every new platform user to the installed agent with this per-agent role. An admin decision: a creator's local template has it ignored and reported.",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": {"type": ["boolean", "null"]},
+            "role": {
+              "type": ["string", "null"],
+              "description": "One of the per-agent roles; required, and checked, when enabled is true."
+            }
+          },
+          "if": {
+            "properties": {
+              "enabled": {"const": true}
+            },
+            "required": ["enabled"]
+          },
+          "then": {
+            "required": ["role"],
+            "properties": {
+              "role": {"enum": ["manager", "editor", "contributor", "viewer"]}
+            }
+          }
+        },
+        "category": {
+          "type": ["string", "null"],
+          "examples": ["productivity", "infrastructure", "creative", "research", "customer-support", "experimental"],
+          "description": "The catalog's grouping."
+        },
+        "tags": {
+          "type": ["array", "null"],
+          "items": {"type": "string"},
+          "description": "Lowercase search words."
+        },
+        "author": {"type": ["string", "null"]},
+        "author_url": {"type": ["string", "null"]},
+        "license": {
+          "type": ["string", "null"],
+          "description": "An SPDX identifier (the catalog's entries are Apache-2.0)."
+        },
+        "platform_min_version": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+",
+          "x-otodock-hint": "invalid release {value} (MAJOR.MINOR.PATCH)",
+          "description": "The oldest platform release that installs the template. The catalog's registry offers the entry only from it, and the release gate's lint warns when the fields used need a later one."
+        },
+        "deprecated": {
+          "type": ["boolean", "null"],
+          "description": "A frozen entry kept for older installs; the catalog marks it."
+        },
+        "deprecation_note": {"type": ["string", "null"], "description": "What to install instead."}
+      }
+    },
+    "mcpsJson": {
+      "type": "object",
+      "description": "The MCPs the agent needs. Core MCPs are assigned without being listed.",
+      "additionalProperties": true,
+      "properties": {
+        "required": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": true,
+            "properties": {
+              "name": {
+                "$ref": "#/$defs/nonEmptyString",
+                "description": "The MCP's canonical name (its manifest's name, which is not always the folder's)."
+              },
+              "min_version": {
+                "type": ["string", "null"],
+                "description": "Recorded with the install; no release enforces it."
+              },
+              "skills": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "The skills of that MCP to load; absent loads its defaults."
+              }
+            }
+          }
+        }
+      }
+    },
+    "skillsJson": {
+      "type": "object",
+      "description": "Standalone skill packages from the skills catalog.",
+      "additionalProperties": true,
+      "properties": {
+        "required": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": true,
+            "properties": {
+              "name": {"$ref": "#/$defs/nonEmptyString", "description": "The package's name."},
+              "skills": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "The package's skills to enable; absent enables them all."
+              }
+            }
+          }
+        }
+      }
+    },
+    "tasksJson": {
+      "type": "object",
+      "description": "Scheduled tasks seeded with the agent.",
+      "additionalProperties": true,
+      "properties": {
+        "tasks": {
+          "type": ["array", "null"],
+          "items": {"$ref": "#/$defs/task"}
+        }
+      }
+    },
+    "task": {
+      "type": "object",
+      "required": ["slug", "scope", "prompt", "schedule"],
+      "additionalProperties": true,
+      "properties": {
+        "slug": {
+          "$ref": "#/$defs/slug",
+          "description": "The item's identity: one row per agent, or per member for a user-scope item."
+        },
+        "description": {"type": ["string", "null"], "description": "The task's name in the task list."},
+        "scope": {"$ref": "#/$defs/scope"},
+        "prompt": {"$ref": "#/$defs/nonEmptyString", "description": "What the task asks the agent at each run."},
+        "schedule": {"$ref": "#/$defs/schedule"},
+        "default_state": {"$ref": "#/$defs/defaultState"},
+        "auto_create_for_new_users": {
+          "type": ["boolean", "null"],
+          "description": "Default true: a member who joins later gets their own copy of a user-scope item."
+        },
+        "roles": {"$ref": "#/$defs/agentRoles"},
+        "override_model": {
+          "type": ["string", "null"],
+          "pattern": "^\\S+$",
+          "x-otodock-since": "1.9.0",
+          "x-otodock-hint": "invalid model id {value} (one word, such as claude-fable-5-1)",
+          "description": "Run this task on this model instead of the agent's default: the one exception to a template naming no model, for a task that needs a stronger or a cheaper model than the agent's own work. A retired id runs on its successor. A model the installed agent cannot use is dropped at install with its layer, the task runs on the agent's default and the install reports it.",
+          "not": {"type": "string", "pattern": "\\n"}
+        },
+        "layer": {
+          "type": ["string", "null"],
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "x-otodock-since": "1.9.0",
+          "x-otodock-hint": "invalid engine id {value} (lowercase letters, digits and dashes, such as claude-code-cli)",
+          "description": "Run this task on this engine (the execution layer) instead of the agent's default. It holds only when the installed agent has the engine enabled (an install enables the one engine it picks; a task never enables one): otherwise the pin, with its model, is dropped at install, the task runs on the agent's default and the install reports it.",
+          "not": {"type": "string", "pattern": "\\n"}
+        },
+        "notification_mode": {
+          "enum": ["auto", "manual", "none", null],
+          "description": "Who tells the person about a run: manual (the default) lets the task's agent send its own notification with the results, auto sends a plain completion notice, none sends nothing.",
+          "x-otodock-floors": [
+            {"pattern": "^(auto|none)$", "since": "1.9.0"}
+          ]
+        }
+      }
+    },
+    "triggersJson": {
+      "type": "object",
+      "description": "Webhook-fired tasks seeded with the agent: the same item without a schedule.",
+      "additionalProperties": true,
+      "properties": {
+        "triggers": {
+          "type": ["array", "null"],
+          "items": {"$ref": "#/$defs/trigger"}
+        }
+      }
+    },
+    "trigger": {
+      "type": "object",
+      "required": ["slug", "scope", "prompt"],
+      "additionalProperties": true,
+      "properties": {
+        "slug": {"$ref": "#/$defs/slug"},
+        "description": {"type": ["string", "null"]},
+        "scope": {"$ref": "#/$defs/scope"},
+        "prompt": {"$ref": "#/$defs/nonEmptyString"},
+        "default_state": {"$ref": "#/$defs/defaultState"},
+        "auto_create_for_new_users": {"type": ["boolean", "null"], "description": "Default false for a trigger."},
+        "roles": {"$ref": "#/$defs/agentRoles"}
+      }
+    },
+    "notificationsJson": {
+      "type": "object",
+      "description": "Scheduled notifications seeded with the agent.",
+      "additionalProperties": true,
+      "properties": {
+        "notifications": {
+          "type": ["array", "null"],
+          "items": {"$ref": "#/$defs/notification"}
+        }
+      }
+    },
+    "notification": {
+      "type": "object",
+      "required": ["slug", "title", "body", "scope", "schedule"],
+      "additionalProperties": true,
+      "properties": {
+        "slug": {"$ref": "#/$defs/slug"},
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "x-otodock-hint": "must be 1 to 80 characters"
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "x-otodock-hint": "must be 1 to 500 characters"
+        },
+        "deep_link": {
+          "type": ["string", "null"],
+          "description": "A dashboard path the notification opens; {agent_slug} is replaced with the installed agent's slug."
+        },
+        "scope": {"$ref": "#/$defs/scope"},
+        "schedule": {"$ref": "#/$defs/schedule"},
+        "default_state": {"$ref": "#/$defs/defaultState"},
+        "auto_create_for_new_users": {"type": ["boolean", "null"]},
+        "roles": {"$ref": "#/$defs/agentRoles"}
+      }
+    },
+    "dashboardsJson": {
+      "type": "object",
+      "description": "Display-only app dashboards pinned at install; each item's file lives under dashboards/.",
+      "required": ["dashboards"],
+      "additionalProperties": true,
+      "properties": {
+        "dashboards": {
+          "type": "array",
+          "maxItems": 4,
+          "x-otodock-hint": "at most 4 dashboards per template",
+          "items": {
+            "type": "object",
+            "required": ["slug", "file"],
+            "additionalProperties": true,
+            "properties": {
+              "slug": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]{0,39}$",
+                "x-otodock-hint": "invalid slug {value} (1 to 40 lowercase letters, digits and dashes, starting with a letter or a digit)",
+                "not": {"type": "string", "pattern": "\\n"}
+              },
+              "title": {"type": ["string", "null"]},
+              "file": {
+                "type": "string",
+                "pattern": "^[^/\\\\]+\\.html$",
+                "x-otodock-hint": "must be a bare *.html name under dashboards/ (got {value})"
+              },
+              "visibility": {
+                "enum": ["user", "agent", null],
+                "description": "agent (the default): one dashboard pinned for everyone; user: each member's own copy."
+              },
+              "auto_pin_for_new_users": {"type": ["boolean", "null"]}
+            }
+          }
+        }
+      }
+    },
+    "appJson": {
+      "type": "object",
+      "description": "A folder app's manifest (the document deploy_app takes). The template reads its title and requires.mcps (joined to the template's MCPs); the app platform's own validator owns every other key and runs over the folder when a template is validated.",
+      "additionalProperties": true,
+      "properties": {
+        "title": {"type": ["string", "null"]},
+        "requires": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "properties": {
+            "mcps": {
+              "type": ["array", "null"],
+              "items": {"type": "string"}
+            }
+          }
+        },
+        "handlers": {
+          "description": "The app's server handlers (the app manifest's own block). The names under on_trigger are what a blueprint trigger may aim at.",
+          "properties": {
+            "on_trigger": {"description": "The handler names a trigger wakes."}
+          }
+        }
+      }
+    },
+    "userAppJson": {
+      "description": "What a per-member app may not declare: a public route aims at one row, and a personal app's files stay under its owner's tree.",
+      "properties": {
+        "inbound": {
+          "enum": [
+            null,
+            false,
+            "",
+            [],
+            {}
+          ],
+          "x-otodock-hint": "a per-user app cannot receive inbound hooks"
+        },
+        "files": {
+          "properties": {
+            "read": {"$ref": "#/$defs/ownerPrefixes"},
+            "write": {"$ref": "#/$defs/ownerPrefixes"}
+          }
+        }
+      }
+    },
+    "ownerPrefixes": {
+      "items": {
+        "not": {"type": "string", "pattern": "^knowledge"},
+        "x-otodock-hint": "a per-user app's files stay under the owner's tree, never knowledge/ (got {value})"
+      }
+    },
+    "blueprintJson": {
+      "type": "object",
+      "description": "What an app brings besides its folder: the tasks its fire_task buttons fire and the triggers its handlers wake on, seeded with each copy.",
+      "additionalProperties": true,
+      "properties": {
+        "format": {
+          "type": ["integer", "null"],
+          "description": "1. An exported app's archive needs it; a template's folder is read without it."
+        },
+        "tasks": {
+          "type": ["array", "null"],
+          "maxItems": 16,
+          "x-otodock-hint": "at most 16 tasks in a blueprint",
+          "items": {
+            "type": "object",
+            "required": ["slug", "prompt"],
+            "additionalProperties": true,
+            "properties": {
+              "slug": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]{0,39}$",
+                "x-otodock-hint": "invalid task slug {value} (1 to 40 lowercase letters, digits, dashes and underscores, starting with a letter)",
+                "not": {"type": "string", "pattern": "\\n"}
+              },
+              "description": {"type": "string"},
+              "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 8000,
+                "pattern": "\\S",
+                "x-otodock-hint": "a prompt of 1 to 8000 characters is required"
+              }
+            }
+          }
+        },
+        "triggers": {
+          "type": ["array", "null"],
+          "maxItems": 8,
+          "x-otodock-hint": "at most 8 triggers in a blueprint",
+          "items": {
+            "type": "object",
+            "required": ["slug", "handler"],
+            "additionalProperties": true,
+            "properties": {
+              "slug": {
+                "type": "string",
+                "pattern": "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
+                "x-otodock-hint": "invalid trigger slug {value} (lowercase letters, digits and dashes)",
+                "not": {"type": "string", "pattern": "\\n"}
+              },
+              "handler": {
+                "$ref": "#/$defs/nonEmptyString",
+                "description": "One of the app manifest's handlers.on_trigger names."
+              },
+              "description": {"type": "string"}
+            }
+          }
+        },
+        "auto_create_for_new_users": {
+          "type": ["boolean", "null"],
+          "description": "A per-user app: default true, a member who joins later gets their own copy."
+        },
+        "roles": {"$ref": "#/$defs/agentRoles"}
+      }
+    },
+    "checkJson": {
+      "type": "object",
+      "description": "An agent check's document (the shape set_check takes). Its name is the folder's; the checks' own validator owns the rest.",
+      "required": ["name"],
+      "additionalProperties": true,
+      "properties": {
+        "name": {"type": "string"},
+        "mandatory": {
+          "description": "A request: without a person's consent the check installs offered, and a manager makes it mandatory."
+        },
+        "script": {
+          "description": "The script the check runs.",
+          "properties": {
+            "run": {"description": "A file in the check's folder (UTF-8, at most 256 KB)."}
+          }
+        }
+      }
+    },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,38}[a-z0-9]$",
+      "not": {"type": "string", "pattern": "\\n"},
+      "x-otodock-hint": "invalid slug {value} (3 to 40 lowercase letters, digits and dashes, starting with a letter and ending with a letter or a digit)"
+    }
+  }
+}

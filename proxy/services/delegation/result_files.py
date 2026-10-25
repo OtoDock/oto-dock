@@ -39,7 +39,10 @@ from services.delegation.file_transfer import SendFilesAuthz, validate_send_path
 from services.infra import safe_fs
 from services.infra.path_confinement import join_under
 from services.scheduler import task_kinds
-from services.scheduler.delivery_identity import _wake_visibility, resolve_delivery_person
+from services.scheduler.delivery_identity import (
+    _wake_visibility,
+    resolve_delivery_person,
+)
 from storage import database as task_store
 from storage.automation import db_result_files, run_status
 from storage.pg import run_db
@@ -163,7 +166,8 @@ def _source_mount_username(session_id: str, worker_agent: str, task_row: dict) -
     if ctx is not None and ctx.agent == worker_agent:
         return ctx.username if ctx.session_scope == SCOPE_USER else ""
     from core.config.task_config_builder import resolve_task_identity
-    scope = task_row.get("scope") if task_row.get("scope") is not None else SCOPE_USER
+    raw_scope = task_row.get("scope")
+    scope = raw_scope if raw_scope is not None else SCOPE_USER
     return resolve_task_identity(worker_agent, scope, task_row.get("created_by")).username
 
 
@@ -174,7 +178,8 @@ async def authorize(run: dict, task_row: dict, session_id: str) -> ResultAuthz:
     worker_agent = run.get("agent") or ""
     target_agent = task_row.get("on_complete_agent") or ""
     created_by = task_row.get("created_by") or ""
-    scope = task_row.get("scope") if task_row.get("scope") is not None else SCOPE_USER
+    raw_scope = task_row.get("scope")
+    scope = raw_scope if raw_scope is not None else SCOPE_USER
     src_mount = await run_db(_source_mount_username, session_id, worker_agent, task_row)
     identity = await resolve_delivery_person(
         task_row.get("on_complete_chat_id") or None,

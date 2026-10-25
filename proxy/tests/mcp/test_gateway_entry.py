@@ -10,15 +10,20 @@ import uuid
 from types import SimpleNamespace
 
 from tests._paths import PROXY_DIR
+
 if str(PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(PROXY_DIR))
 
-import config  # noqa: E402
-from auth.session_token import SESSION_JWT_SENTINEL_BEARER  # noqa: E402
-from core.credentials.mcp_gateway import GatewayCredential, TokenRef  # noqa: E402
-from services.mcp import mcp_registry  # noqa: E402
-from services.mcp.mcp_manifest_types import CredentialConfig, McpManifest, ServerConfig  # noqa: E402
-from storage.identity import bearer_allowlist  # noqa: E402
+import config
+from auth.session_token import SESSION_JWT_SENTINEL_BEARER
+from core.credentials.mcp_gateway import GatewayCredential, TokenRef
+from services.mcp import mcp_registry
+from services.mcp.mcp_manifest_types import (
+    CredentialConfig,
+    McpManifest,
+    ServerConfig,
+)
+from storage.identity import bearer_allowlist
 
 
 def _manifest(name, *, transport="streamable_http", url_template="https://mcp.example.com/mcp",
@@ -264,6 +269,7 @@ def test_the_direct_layer_forwards_the_swapped_session_token(monkeypatch):
     """The Direct layer connects through the route like every client: the
     sentinel becomes the session JWT and no vendor header is ever set."""
     import asyncio
+
     from core.layers.direct.mcp import MCPServerConnection
     from core.session import session_state
     captured = {}

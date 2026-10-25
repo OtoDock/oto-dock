@@ -24,13 +24,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 import config
-from api.apps import app_proxy
-from api.apps import apps as apps_api
-from api.apps import manifest as _mf
+from api.apps import app_proxy, apps as apps_api
 from app import app
 from auth.password import hash_password
 from auth.providers import UserContext, get_current_user
-from services.apps import app_deploy, app_supervisor, app_tokens, releases
+from services.apps import (
+    app_deploy,
+    app_supervisor,
+    app_tokens,
+    manifest as _mf,
+    releases,
+)
 from services.infra import turnstile
 from storage import database as task_store
 
@@ -159,7 +163,7 @@ def _mint(token: str):
 
 
 def test_the_external_block_is_validated_signed_and_carried():
-    v = lambda doc: app_deploy.validate_app_json(doc, AGENT, False)  # noqa: E731
+    v = lambda doc: app_deploy.validate_app_json(doc, AGENT, False)
     m = v({"title": "Shop", "external": {"links": ["Checkout.Stripe.com", "checkout.stripe.com"],
                                           "challenge": ["/register", "/register/", "/login"],
                                           "session_days": 7}})

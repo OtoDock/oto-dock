@@ -13,8 +13,9 @@ const h = vi.hoisted(() => ({
   listeners: {} as Record<string, (arg: never) => unknown>,
   permission: 'granted',
   registered: 0,
+  platform: 'android',
 }))
-vi.mock('@capacitor/core', () => ({ Capacitor: { isNativePlatform: () => true } }))
+vi.mock('@capacitor/core', () => ({ Capacitor: { isNativePlatform: () => true, getPlatform: () => h.platform } }))
 vi.mock('@capacitor/push-notifications', () => ({
   PushNotifications: {
     requestPermissions: async () => ({ receive: h.permission }),
@@ -27,6 +28,7 @@ vi.mock('@capacitor/push-notifications', () => ({
 }))
 vi.mock('@/api/notifications', () => ({ subscribePush: vi.fn(async () => {}) }))
 
+import { subscribePush } from '@/api/notifications'
 import { useFcmPush } from '@/hooks/useFcmPush'
 
 function Probe({ navigate }: { navigate: (p: string) => void }) {
@@ -49,6 +51,8 @@ beforeEach(() => {
   h.listeners = {}
   h.permission = 'granted'
   h.registered = 0
+  h.platform = 'android'
+  vi.mocked(subscribePush).mockClear()
 })
 afterEach(() => {
   delete (window as unknown as { OtoDockNative?: unknown }).OtoDockNative
@@ -100,5 +104,15 @@ describe('registering for push', () => {
     await settle()
     expect(h.registered).toBe(0)
     expect(h.listeners.pushNotificationActionPerformed).toBeUndefined()
+  })
+
+  // The relay adds Apple's block only to a token stored as an iPhone's.
+  it.each([['ios', 'ios'], ['android', 'android']])('stores the token of %s as %s', async (platform, stored) => {
+    h.platform = platform
+    render(<Probe navigate={vi.fn()} />)
+    await settle()
+    const onToken = h.listeners.registration as unknown as (t: { value: string }) => Promise<void>
+    await act(async () => { await onToken({ value: 'tok-1' }) })
+    expect(subscribePush).toHaveBeenCalledWith(stored, 'tok-1')
   })
 })

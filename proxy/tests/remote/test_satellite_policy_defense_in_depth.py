@@ -16,15 +16,15 @@ from pathlib import Path
 import pytest
 
 from tests._paths import REPO_ROOT as _REPO_ROOT
+
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from satellite.host import satellite_policy as _pol  # noqa: E402
-from satellite.sessions.session_manager import (  # noqa: E402
+from satellite.host import satellite_policy as _pol
+from satellite.sessions.session_manager import (
     _check_satellite_host_policy,
     _validate_satellite_host_path,
 )
-
 
 # ---------------------------------------------------------------------------
 # Policy cache

@@ -8,7 +8,8 @@ Two modes, both reached from the session's shell, never by the engine:
   for the hosts the session's manifests name (the resolver points
   ``credential.https://<host>.helper`` at this script through git's
   env-config). ``get`` reads the block git writes on stdin (``protocol``,
-  ``host``, an optional ``path``), asks the broker for the host and answers
+  ``host``, an optional ``path``), asks the broker for the host (with the
+  path, which an agent's narrowed GitHub reach is judged by) and answers
   ``username=`` and ``password=``; ``store`` and ``erase`` do nothing, the
   platform being the source of truth. A refusal, or a platform that cannot
   be reached, is written to stderr with ``quit=1`` on stdout: git stops at
@@ -16,7 +17,9 @@ Two modes, both reached from the session's shell, never by the engine:
 * ``credential_helper.py run <host> <command> -- <args...>`` is what the
   command wrappers call (``bin/gh``): the real command is found on the
   PATH with the wrapper directory removed and run with the token set under
-  the names the broker gives, in that one process's environment only. When
+  the names the broker gives, in that one process's environment only (the
+  broker is told the command's arguments and the working directory's git
+  remotes, which a narrowed reach is judged by). When
   the session holds no account for the host (the broker's quiet 404) the
   command runs plainly, as it would without the platform; every other
   refusal (an account that needs a reconnect, a platform that cannot be
@@ -24,9 +27,12 @@ Two modes, both reached from the session's shell, never by the engine:
   does not run, so an account the platform holds but refuses is never
   replaced by whatever identity the machine's own command would use.
 
-Environment (set by every spawn path; the hooks read the same three):
+Environment (set by every spawn path):
   PROXY_URL         the platform, or a satellite's loopback tunnel
-  PROXY_API_KEY     the session's own token (the bearer)
+  OTO_CLI_TOKEN     the session's command-line token (the bearer): the
+                    shell holds it, no MCP child does
+  PROXY_API_KEY     the session token, the bearer only for a session started
+                    before 1.9, which has no command-line token
   OTO_SESSION_ID    the session
 
 The token is held in memory for the one call and written nowhere; it never
@@ -55,6 +61,7 @@ _REFUSE_UPDATE = (
     "authenticate here"
 )
 _REFUSE_UNREACHABLE = "the platform cannot be reached to fetch the credential"
+_REFUSE_MCP = "the command-line credential is not available to MCP servers"
 # A satellite below 0.5.139 refuses the route on its tunnel with exactly
 # this body; a 403 with any other body is a refusal of the platform's.
 _OLD_TUNNEL_REFUSAL = {"error": "path-not-allowlisted"}
@@ -73,15 +80,21 @@ class _Refused(Exception):
         self.quiet = quiet
 
 
-def _fetch(host: str) -> dict:
-    """The broker's answer for ``host``: ``{username, password, env}``."""
+def _fetch(host: str, **names) -> dict:
+    """The broker's answer for ``host``: ``{username, password, env}``.
+    ``names``: what the command names (``path``, ``command``, ``remotes``,
+    gh's ``GH_REPO`` and ``GH_HOST``)."""
     proxy_url = os.environ.get("PROXY_URL", "").rstrip("/")
-    token = os.environ.get("PROXY_API_KEY", "")
+    if os.environ.get("OTO_CLI_TOKEN") == "":
+        # Named empty: an MCP server's own env (the platform blanks the key
+        # for every MCP), never a shell's.
+        raise _Refused(_REFUSE_MCP)
+    token = os.environ.get("OTO_CLI_TOKEN") or os.environ.get("PROXY_API_KEY", "")
     session_id = os.environ.get("OTO_SESSION_ID", "")
     if not proxy_url or not token or not session_id:
-        raise _Refused("the session carries no platform link (PROXY_URL, PROXY_API_KEY, OTO_SESSION_ID)")
-    body = json.dumps({"session_id": session_id, "host": host}).encode()
-    for attempt, wait in enumerate((*_BACKOFF_S, None)):
+        raise _Refused("the session carries no platform link (PROXY_URL, OTO_CLI_TOKEN, OTO_SESSION_ID)")
+    body = json.dumps({"session_id": session_id, "host": host, **names}).encode()
+    for _attempt, wait in enumerate((*_BACKOFF_S, None)):
         req = urllib.request.Request(
             f"{proxy_url}/v1/hooks/cli-credential", data=body, method="POST",
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
@@ -100,27 +113,27 @@ def _fetch(host: str) -> dict:
             detail = body.get("detail") if isinstance(body, dict) else None
             detail = detail if isinstance(detail, str) else ""
             if e.code == 404:
-                raise _Refused(detail or "no account is connected for this session", quiet=True)
+                raise _Refused(detail or "no account is connected for this session", quiet=True) from e
             if e.code == 403 and body == _OLD_TUNNEL_REFUSAL:
-                raise _Refused(_REFUSE_UPDATE)
+                raise _Refused(_REFUSE_UPDATE) from e
             if e.code in (502, 503, 504):
-                raise _Refused(_REFUSE_UNREACHABLE)
-            raise _Refused(detail or f"the platform refused the credential (HTTP {e.code})")
-        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+                raise _Refused(_REFUSE_UNREACHABLE) from e
+            raise _Refused(detail or f"the platform refused the credential (HTTP {e.code})") from e
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
             # A connection refused, a reset, a half-written or malformed
             # answer: a short retry, then the platform is reported as
             # unreachable.
             if wait is not None:
                 time.sleep(wait)
                 continue
-            raise _Refused(_REFUSE_UNREACHABLE)
+            raise _Refused(_REFUSE_UNREACHABLE) from exc
     raise _Refused(_REFUSE_UNREACHABLE)
 
 
 def _body_of(e: urllib.error.HTTPError):
     try:
         return json.loads(e.read().decode("utf-8"))
-    except Exception:
+    except (OSError, http.client.HTTPException, ValueError):
         return None
 
 
@@ -150,8 +163,8 @@ def _git(operation: str) -> int:
     try:
         if not host:
             raise _Refused("git named no host")
-        answer = _fetch(host)
-    except Exception as e:
+        answer = _fetch(host, path=request.get("path", ""))
+    except Exception as e:  # noqa: BLE001  # git's helper answers quit=1 whatever failed, never a traceback
         sys.stderr.write(f"otodock credential helper: {_reason(e)}\n")
         sys.stdout.write("quit=1\n")
         sys.stdout.flush()
@@ -160,6 +173,22 @@ def _git(operation: str) -> int:
     sys.stdout.write(f"password={answer['password']}\n")
     sys.stdout.flush()
     return 0
+
+
+def _remotes() -> list[str]:
+    """The working directory's git remote addresses (gh falls back on
+    them), at most a few, nothing when it is no repository."""
+    git = shutil.which("git")
+    if not git:
+        return []
+    try:
+        out = subprocess.run(
+            [git, "config", "--get-regexp", r"^remote\..*\.url$"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.split(None, 1)[1] for line in out.splitlines() if " " in line][:16]
 
 
 def _real_dir(path: str) -> str:
@@ -198,8 +227,9 @@ def _run(host: str, command: str, args: list[str]) -> int:
     env = dict(os.environ)
     env[_GUARD] = os.pathsep.join(sorted(excluded))
     try:
-        answer = _fetch(host)
-    except Exception as e:
+        answer = _fetch(host, command=args[:256], remotes=_remotes(),
+                        gh_repo=os.environ.get("GH_REPO", ""), gh_host=os.environ.get("GH_HOST", ""))
+    except Exception as e:  # noqa: BLE001  # the wrapper reports any fetch failure and never runs the command
         if not (isinstance(e, _Refused) and e.quiet):
             sys.stderr.write(f"otodock credential helper: {_reason(e)}\n")
             return 1
@@ -208,10 +238,14 @@ def _run(host: str, command: str, args: list[str]) -> int:
             if isinstance(name, str) and name:
                 env[name] = answer["password"]
     argv = [real, *args]
+    # The command and its arguments are the person's own command line, handed
+    # to the real binary found past this wrapper; the environment is this
+    # process's own plus the token names the broker gave. A wrapper, not a
+    # spawn of outside input (reviewed 2026-10-25).
     if os.name == "posix":
         sys.stdout.flush()
         sys.stderr.flush()
-        os.execve(real, argv, env)
+        os.execve(real, argv, env)  # nosemgrep: python.lang.security.audit.dangerous-os-exec-tainted-env-args.dangerous-os-exec-tainted-env-args
     return subprocess.run(argv, env=env).returncode
 
 

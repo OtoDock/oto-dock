@@ -24,8 +24,10 @@ import {
   useWebhookEventCatalog,
 } from '../../api/subscriptions'
 import { useAuth } from '../../contexts/AuthContext'
+import { INSTALLATION_TARGET_KIND } from '../../lib/kinds/oauthApp'
 import { SubscribeToEventsModal } from './SubscribeToEventsModal'
-import { SubscriptionRow, useDeleteWithConfirm } from './SubscriptionRow'
+import { SubscriptionRow } from './SubscriptionRow'
+import { useDeleteWithConfirm } from './useDeleteWithConfirm'
 
 interface Props {
   mcpName: string
@@ -67,9 +69,9 @@ export function SubscriptionsPanel({
   const registrationMode = catalog.data?.registration?.mode ?? 'manual'
 
   return (
-    <div className="mt-2 border-t border-p-border-light pt-2">
+    <div className="mt-2 border-t border-subtle pt-2">
       <div className="flex items-center justify-between mb-1">
-        <span className="text-xs font-semibold text-p-text-light">
+        <span className="text-xs font-semibold text-tertiary">
           Active subscriptions
         </span>
         <button
@@ -78,13 +80,13 @@ export function SubscriptionsPanel({
             del.setError(null)
             setShowModal(true)
           }}
-          className="text-xs text-brand hover:underline"
+          className="text-xs text-link hover:underline"
         >
           + Subscribe to events
         </button>
       </div>
       {rows.length === 0 ? (
-        <div className="text-xs text-p-text-light italic">
+        <div className="text-xs text-tertiary italic">
           No subscriptions yet.
         </div>
       ) : (
@@ -106,7 +108,7 @@ export function SubscriptionsPanel({
         </ul>
       )}
       {del.error && (
-        <div className="mt-2 text-xs text-red-600 dark:text-red-400">
+        <div className="mt-2 text-xs text-status-danger-fg">
           {del.error}
         </div>
       )}
@@ -122,7 +124,10 @@ export function SubscriptionsPanel({
             catalog.data.registration?.manual_instructions_url
           }
           vendorTargetPrefill={catalog.data.vendor_target_prefill}
+          installationTarget={catalog.data.target_kind === INSTALLATION_TARGET_KIND}
           serviceOptions={serviceBindings}
+          grantedScopes={catalog.data.granted_scopes}
+          scopeServices={catalog.data.scope_services}
           onClose={() => setShowModal(false)}
         />
       )}

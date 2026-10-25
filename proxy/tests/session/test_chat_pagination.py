@@ -6,7 +6,6 @@ the synthesized panel_only block, robust to '' event_data), the id-based cutoff
 helper, and the GET /v1/chats/{id}?before_id= older-page endpoint.
 """
 
-from core.events import tool_roles
 import asyncio
 import json
 
@@ -14,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from app import app
 from auth.providers import UserContext, get_current_user
+from core.events import tool_roles
 from storage import database as db
 
 client = TestClient(app)

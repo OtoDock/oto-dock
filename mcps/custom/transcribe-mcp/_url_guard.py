@@ -36,12 +36,29 @@ from urllib.parse import urlsplit
 try:  # what httpx and requests encode hostnames with; absent → the stdlib codec
     import idna as _idna
 except ImportError:  # pragma: no cover - the proxy and the MCP venvs carry it
-    _idna = None
+    _idna = None  # type: ignore[assignment]  # None marks the optional module absent
 
 #: Deprecated IPv6 site-local — ``ipaddress`` reads it as global.
 _SITE_LOCAL_V6 = ipaddress.ip_network("fec0::/10")
+#: The well-known NAT64 prefix (RFC 6052): a DNS64 resolver answers an
+#: IPv4-only name with that IPv4 address inside it. ``ipaddress`` reads the
+#: whole block as reserved.
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
 #: The schemes a fetch may use; ``require_https`` narrows it to the second.
 _SCHEMES = ("http", "https")
+
+
+def ipv4_inside(ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+                ) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """The address ``ip`` stands for: the IPv4 address inside an IPv4-mapped
+    IPv6 address or one under the NAT64 prefix (an IPv6-only host's answer
+    for an IPv4-only name), else ``ip`` itself."""
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:
+            return ip.ipv4_mapped
+        if ip in _NAT64:
+            return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip
 
 
 def ip_blocked(ip_str: str) -> bool:
@@ -49,14 +66,12 @@ def ip_blocked(ip_str: str) -> bool:
     CGNAT, the documentation ranges), loopback, link-local (the
     cloud-metadata address included), reserved, unspecified, multicast,
     the deprecated IPv6 site-local range, and anything ``ipaddress`` does
-    not call global; an IPv4-mapped IPv6 address is judged as its IPv4.
-    Unparseable → blocked."""
+    not call global; an IPv4-mapped or NAT64 IPv6 address is judged as
+    its IPv4 (``ipv4_inside``). Unparseable → blocked."""
     try:
-        ip = ipaddress.ip_address(ip_str)
+        ip = ipv4_inside(ipaddress.ip_address(ip_str))
     except ValueError:
         return True
-    if ip.version == 6 and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
     if ip.version == 6 and ip in _SITE_LOCAL_V6:
         return True
     return (
@@ -104,12 +119,13 @@ def validate_outbound_url(url: str, *, require_https: bool = False) -> str | Non
         port = 443 if scheme == "https" else 80
     try:
         infos = socket.getaddrinfo(label, port, proto=socket.IPPROTO_TCP)
-    except Exception:
+    except (OSError, UnicodeError):
         return f"the host {host!r} does not resolve"
     if not infos:
         return f"the host {host!r} does not resolve"
     for info in infos:
         addr = info[4][0]
-        if ip_blocked(addr):
+        # typeshed types getaddrinfo()[4][0] as str | int: a str for AF_INET and AF_INET6.
+        if ip_blocked(addr):  # type: ignore[arg-type]
             return f"the host {host!r} resolves to a private or internal address ({addr})"
     return None

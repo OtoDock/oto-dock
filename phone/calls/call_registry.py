@@ -29,7 +29,6 @@ import logging
 import threading
 import time
 
-
 logger = logging.getLogger("call_registry")
 
 # How long a registration stays in the cache if nothing claims it. Tight
@@ -83,7 +82,8 @@ class CallRegistry:
                     self._by_uuid.pop(oldest, None)
             self._by_uuid[key] = entry
         logger.info(
-            f"Registered call uuid={key} phone={phone!r} did={did!r} source={source!r}"
+            "Registered call uuid=%s phone=%r did=%r source=%r",
+            key, phone, did, source
         )
 
     def pop_for_uuid(self, audiosocket_uuid: str) -> dict:

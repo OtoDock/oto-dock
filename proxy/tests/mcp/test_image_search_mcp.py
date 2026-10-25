@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-
 from tests._paths import CUSTOM_MCPS, load_mcp_server
+
 MCP_DIR = CUSTOM_MCPS / "image-search-mcp"
 
 

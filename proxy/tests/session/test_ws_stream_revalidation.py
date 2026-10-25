@@ -33,7 +33,7 @@ from tests.fixtures.ws_dashboard_harness import (
 
 
 def _viewer(ws: FakeDashboardWebSocket, chat_id: str, sid: str, *, due: bool):
-    from services.notifications.notification_manager import LiveQueue
+    from services.notifications.notification_manager import LiveQueue, NotifyQueue
     from ws.dashboard import _AUTHZ_REVALIDATE_S, DashboardConnection
     conn = DashboardConnection.__new__(DashboardConnection)
     conn.websocket = ws
@@ -45,6 +45,7 @@ def _viewer(ws: FakeDashboardWebSocket, chat_id: str, sid: str, *, due: bool):
     conn.session_id = sid
     conn.streaming = False
     conn.live_queue = LiveQueue()
+    conn.notify_queue = NotifyQueue()
     conn._send_lock = asyncio.Lock()
     conn._client_pushback = collections.deque()
     conn._ended = asyncio.Event()
@@ -67,7 +68,7 @@ def _endless_pump(chat_id: str) -> stream_pump.ChatStreamPump:
 
 async def _stream_one_message(conn, pump, message: dict) -> dict:
     loop_task = asyncio.create_task(conn._stream_via_pump(pump))
-    while not pump._ws_queues:
+    while not pump._ws_queues:  # noqa: ASYNC110  # the pump's viewer queues: the pump has no attach event
         await asyncio.sleep(0)
     conn.websocket.client_send(message)
     return await asyncio.wait_for(loop_task, timeout=5)
@@ -139,7 +140,7 @@ async def test_the_check_is_throttled_inside_a_streaming_turn(temp_db, held_admi
     conn = _viewer(ws, "rv3", pump.session_id, due=False)
     try:
         loop_task = asyncio.create_task(conn._stream_via_pump(pump))
-        while not pump._ws_queues:
+        while not pump._ws_queues:  # noqa: ASYNC110  # the pump's viewer queues: the pump has no attach event
             await asyncio.sleep(0)
         await ws.expect({"type": "chat_status", "chat_id": "rv3", "status": "streaming"})
         ws.client_send({"type": "ping"})

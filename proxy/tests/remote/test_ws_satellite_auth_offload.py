@@ -399,3 +399,93 @@ async def test_a_wrong_first_frame_from_a_gone_peer_still_closes(loop_db_guard):
     with loop_db_guard.active():
         await sat_ws.ws_satellite_handler(ws)
     assert ws.closed == (4001, "Expected auth message")
+
+
+# ── a machine gone before the post-auth answer ──
+
+_CLOSED_TRANSPORT = RuntimeError(
+    "unable to perform operation on <TCPTransport closed=True reading=False>; "
+    "the handler is closed")
+
+
+class _GoneOnAnswer(FakeSatelliteWS):
+    """The auth frame arrives, then the peer is gone when the answer goes out."""
+
+    def __init__(self, *a, exc: BaseException, **kw):
+        super().__init__(*a, **kw)
+        self.exc = exc
+
+    async def send_text(self, text):
+        raise self.exc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", [WebSocketDisconnect(1006), _CLOSED_TRANSPORT],
+                         ids=["disconnect", "closed-transport"])
+async def test_a_machine_gone_before_the_answer_ends_the_handler_quietly(
+    loop_db_guard, monkeypatch, exc,
+):
+    from core.remote.satellite_connection import get_connection_manager
+    registered = []
+
+    async def _register(*a, **k):
+        registered.append(a)
+    monkeypatch.setattr(get_connection_manager(), "register", _register)
+    mid, secret = await _make_machine()
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(_GoneOnAnswer(_auth(mid, secret), exc=exc))
+        await _settle()
+    assert registered == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gone", [False, True], ids=["answered", "gone-before-answer"])
+async def test_an_update_that_landed_is_recorded_whether_or_not_the_answer_went_out(
+    loop_db_guard, monkeypatch, gone,
+):
+    """The version write precedes the answer, so the next connect reads the
+    new version as the row's own: the update's result is recorded on this
+    connect, the one that saw the version change, answered or not."""
+    from core.remote.satellite_connection import get_connection_manager
+    from storage import remote_store
+    from storage.pg import run_db
+    cm = get_connection_manager()
+    lanes, banners = [], []
+    real_persist = cm.persist_lane
+
+    def _persist(machine_id, lane, value):
+        lanes.append((lane, value))
+        return real_persist(machine_id, lane, value)
+
+    async def _updated(*a, **k):
+        banners.append(a[2])
+    monkeypatch.setattr(cm, "persist_lane", _persist)
+    monkeypatch.setattr(sat_ws, "_broadcast_satellite_updated", _updated)
+    mid, secret = await _make_machine()
+    await run_db(remote_store.set_satellite_version, mid, "0.5.100")
+    ws = (_GoneOnAnswer(_auth(mid, secret), exc=WebSocketDisconnect(1006)) if gone
+          else FakeSatelliteWS(_auth(mid, secret)))
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(ws)
+        await _settle()
+    latest = sat_ws.SATELLITE_VERSION_LATEST
+    assert [v for lane, v in lanes if lane == "update_result"] == [
+        {"target_version": latest, "error": None}]
+    assert banners == [latest]
+    # The next connect on the same version records nothing more.
+    lanes.clear()
+    banners.clear()
+    with loop_db_guard.active():
+        await sat_ws.ws_satellite_handler(FakeSatelliteWS(_auth(mid, secret)))
+        await _settle()
+    assert [lane for lane, _ in lanes if lane == "update_result"] == [] and banners == []
+
+
+@pytest.mark.asyncio
+async def test_a_fault_building_the_answer_is_not_read_as_a_gone_machine(loop_db_guard, monkeypatch):
+    def _broken(machine, **k):
+        raise RuntimeError("a policy builder bug")
+    monkeypatch.setattr(sat_ws, "_auth_ok", _broken)
+    mid, secret = await _make_machine()
+    with pytest.raises(RuntimeError, match="policy builder"):
+        await sat_ws.ws_satellite_handler(FakeSatelliteWS(_auth(mid, secret)))

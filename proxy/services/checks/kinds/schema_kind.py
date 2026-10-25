@@ -48,7 +48,7 @@ async def run(check, target, changed: dict, *, round_no: int) -> Verdict:
     started = time.monotonic()
     schema = check.doc.get("schema") or {}
     obj = last_json_block(changed.get("result") or "")
-    ms = lambda: int((time.monotonic() - started) * 1000)  # noqa: E731
+    ms = lambda: int((time.monotonic() - started) * 1000)
     if obj is None:
         return Verdict(section="schema", status="fail", findings=[{
             "location": "result", "severity": "error",

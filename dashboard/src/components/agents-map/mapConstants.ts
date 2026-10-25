@@ -49,7 +49,7 @@ export const EDGE_LIGHT = 0xdce8f4
 export const EDGE_LIGHT_LIFT = 0.12
 // The composed stage framing never dollies past this — on a phone the
 // widest row simply can't fit, so the row cap adapts instead (see
-// stageRowCap) and the arc FILLS the width.
+// rowCapFor in camera.ts) and the arc FILLS the width.
 export const STAGE_CAM_MAX = 78
 export const STAGE_CAM_MIN = 30
 // Semantic-zoom thresholds: dollying closer than ENTER over/near a cluster

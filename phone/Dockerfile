@@ -14,16 +14,16 @@
 # Telephony takes calls only once a PBX / SIP trunk or Twilio is configured
 # in the dashboard (Setup → Phone) — until then the service idles fail-closed.
 
-ARG PYTHON_IMAGE=python:3.13.16-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+ARG PYTHON_IMAGE=python:3.13.17-slim-bookworm@sha256:e32be0e55814a08977501ca863271d9bd02443710db8f2afaf8372e2c4508530
 FROM ${PYTHON_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# onnxruntime (Smart Turn + Silero VAD) needs libgomp at runtime; curl for the
-# healthcheck. Every Python dep installs from a wheel on amd64 and arm64 — no
-# build tools.
+# onnxruntime (Smart Turn, Silero VAD, the language identifier) needs libgomp
+# at runtime; curl for the healthcheck. Every Python dep installs from a wheel
+# on amd64 and arm64 — no build tools.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl libgomp1 \
  && rm -rf /var/lib/apt/lists/*
@@ -36,11 +36,11 @@ RUN python -m venv /opt/otodock/phone/venv \
  && /opt/otodock/phone/venv/bin/pip install --upgrade pip \
  && /opt/otodock/phone/venv/bin/pip install -r /opt/otodock/phone/requirements.txt
 
-# The `audio` package WITH the on-box [localmodels] stack (Silero VAD + Smart Turn
-# ONNX/transformers) — an editable local package whose deps are already pinned in
-# requirements.txt above but which is itself installed here (mirrors how the proxy
-# installs the lean core). Includes the VENDORED models/ (both ONNX models; no
-# runtime download).
+# The `audio` package WITH the [localmodels] extra (transformers, Smart Turn's
+# features; onnxruntime is in the core) — an editable local package whose deps
+# are already pinned in requirements.txt above but which is itself installed
+# here (mirrors how the proxy installs the core). Includes the VENDORED models/ (the VAD, Smart Turn and the
+# language identifier; no runtime download).
 # Its own dir for layer caching.
 COPY audio/ /opt/otodock/audio/
 RUN /opt/otodock/phone/venv/bin/pip install -e "/opt/otodock/audio[localmodels]"

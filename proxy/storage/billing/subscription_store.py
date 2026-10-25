@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from storage.billing import subscription_status
-from storage.identity.credential_store import _encrypt, _decrypt
+from storage.identity.credential_store import _decrypt, _encrypt
 from storage.pg import get_conn
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ def reset_active_sessions() -> int:
         conn.commit()
         count = cur.rowcount
         if count:
-            logger.info(f"Startup: reset active_sessions on {count} subscription(s)")
+            logger.info("Startup: reset active_sessions on %s subscription(s)", count)
         return count
 
 
@@ -1198,7 +1198,7 @@ def remap_retired_model(old_id: str, new_id: str) -> int:
         for table, col in (("agents", "default_model"), ("chats", "model"),
                            ("dynamic_tasks", "override_model")):
             cur = conn.execute(
-                f"UPDATE {table} SET {col} = %s WHERE {col} = %s",  # noqa: S608 — table/col are literals above
+                f"UPDATE {table} SET {col} = %s WHERE {col} = %s",
                 (new_id, old_id),
             )
             if cur.rowcount:
@@ -1214,7 +1214,7 @@ def remap_retired_model(old_id: str, new_id: str) -> int:
     total = sum(remapped.values())
     if total:
         detail = ", ".join(f"{k}={v}" for k, v in remapped.items())
-        logger.info(f"Startup: remapped retired model {old_id} -> {new_id} ({detail})")
+        logger.info("Startup: remapped retired model %s -> %s (%s)", old_id, new_id, detail)
     return total
 
 

@@ -13,8 +13,8 @@ import re
 
 import config
 from core.config import deployment
-from storage.mcp import mcp_store
 from services.mcp.mcp_manifest_types import McpManifest
+from storage.mcp import mcp_store
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,18 @@ logger = logging.getLogger(__name__)
 # the last one — stays proxy-side since the /v1/phone/calls relay). The
 # broker plumbing stays: any future secret token just gets listed here.
 _SECRET_TEMPLATE_TOKENS: tuple[str, ...] = ()
+
+
+def _dashboard_host() -> str:
+    """``host[:port]`` of ``DASHBOARD_PUBLIC_URL`` ("" without one): the port
+    stays, as a CSP host-source without one matches only the default port."""
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(config.DASHBOARD_PUBLIC_URL or "")
+        host, port = u.hostname or "", u.port
+    except ValueError:
+        return ""
+    return f"{host}:{port}" if host and port else host
 
 
 def _resolve_template(
@@ -110,7 +122,10 @@ def _resolve_template(
         # service-DNS name in Docker-Compose (sibling container).
         "${platform.proxy_url_for_docker}": f"http://{deployment.proxy_callback_host()}:{config.PORT}",
         "${platform.wopi_base_url}":      config.WOPI_BASE_URL,
-        "${platform.collabora_frame_ancestors}": config.COLLABORA_FRAME_ANCESTORS,
+        # No platform compose reads it since 1.9.0 (the relay's Host header
+        # gives Collabora its address); kept for a catalog manifest that
+        # names it, as the catalog's contributor guide lists it.
+        "${platform.collabora_frame_ancestors}": _dashboard_host(),
         "${platform.collabora_service_root}":    config.COLLABORA_SERVICE_ROOT,
         "${platform.collabora_ssl_termination}": config.COLLABORA_SSL_TERMINATION,
         "${platform.host_agents_dir}":    str(config.AGENTS_DIR),
@@ -137,10 +152,10 @@ def _resolve_template(
     # server.proxy_callbacks (per-session JWT header).
     if "${proxy_api_key}" in value or "${platform.api_key}" in value:
         logger.warning(
-            f"MCP '{manifest.name}' references the master key via a template "
-            f"(${{proxy_api_key}}/${{platform.api_key}}) — rejected for "
-            f"security. Stdio MCPs receive a session JWT automatically; Docker "
-            f"MCPs that call back must declare server.proxy_callbacks."
+            "MCP '%s' references the master key via a template "
+            "(${proxy_api_key}/${platform.api_key}) — rejected for "
+            "security. Stdio MCPs receive a session JWT automatically; Docker "
+            "MCPs that call back must declare server.proxy_callbacks.", manifest.name
         )
 
     result = value

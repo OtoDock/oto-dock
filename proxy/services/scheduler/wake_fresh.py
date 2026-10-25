@@ -24,6 +24,7 @@ import logging
 
 from core import placement
 from storage import database as task_store
+from ws import wire_events as wire
 
 logger = logging.getLogger("otodock")
 
@@ -36,11 +37,20 @@ def applies(session_id: str, target: str, chat_row: dict | None) -> bool:
     return (chat_row.get("session_id") or "") == session_id
 
 
+def applies_without_session(session_id: str, chat_row: dict | None) -> bool:
+    """A chat with no session at all (a move summarised it): nothing exists
+    to resume anywhere, so the answer is definite on every place. Asked only
+    by a caller that opts in (the platform's resume after the agent's own
+    move)."""
+    return bool(chat_row) and not session_id and not (chat_row or {}).get("session_id")
+
+
 async def run_echo(layer, new_sid: str, old_sid: str, chat_id: str, agent: str,
                    result_prompt: str, *, person: str) -> str | None:
     """The wake's turn on the started fresh session: "" when it ran, None
     when the chat was busy (the new session is closed; the caller stores the
-    wake)."""
+    wake). ``old_sid`` empty: the chat had no session, and its pending seed
+    (a summarised move's) stays the one its fresh turn consumes."""
     from core.events import input_queue
     from core.events.stream_pump import _active_pumps
     from core.session.history_seed import consume_pending_seed
@@ -54,21 +64,26 @@ async def run_echo(layer, new_sid: str, old_sid: str, chat_id: str, agent: str,
         if claim is None or _active_pumps.get(chat_id) is not None:
             await _close(layer, new_sid)
             return None
+        seed = wire.SEED_RESUME_FAILED
+        if not old_sid:
+            seed = ((await run_db(task_store.get_chat, chat_id)) or {}).get(
+                "pending_history_seed") or ""
         await run_db(task_store.update_chat, chat_id, session_id=new_sid,
-                     codex_thread_id=None, context_used=0,
-                     pending_history_seed="resume_failed")
-        subscription_pool.release_subscription(old_sid)
+                     codex_thread_id=None, context_used=0, pending_history_seed=seed)
+        if old_sid:
+            subscription_pool.release_subscription(old_sid)
         prompt, _notice = await run_db(consume_pending_seed, chat_id, result_prompt)
-        logger.info(f"Wake on chat {chat_id[:8]}: session {old_sid[:8]} left no "
-                    f"conversation, continued on a fresh session {new_sid[:8]}")
+        logger.info("Wake on chat %s: session %s left no "
+                    "conversation, continued on a fresh session %s",
+                    chat_id[:8], old_sid[:8] or "(none)", new_sid[:8])
         out = await _run_echo_turn_pumped(layer, new_sid, chat_id, agent, prompt,
                                           person=person, claim=claim)
         if out is None:
             # Not run after all (a starter that takes no claim registered a
-            # pump meanwhile): the chat goes back to its own session, and its
-            # next turn restores the history instead.
-            await run_db(task_store.update_chat, chat_id, session_id=old_sid,
-                         pending_history_seed="resume_failed")
+            # pump meanwhile): the chat goes back to its own session (or to
+            # none), and its next turn restores the history instead.
+            await run_db(task_store.update_chat, chat_id, session_id=old_sid or None,
+                         pending_history_seed=seed)
             await _close(layer, new_sid)
         return out
     finally:
@@ -78,6 +93,7 @@ async def run_echo(layer, new_sid: str, old_sid: str, chat_id: str, agent: str,
 async def _close(layer, session_id: str) -> None:
     try:
         await layer.close_session(session_id)
-    except Exception:
-        logger.warning(f"Wake: closing the unused fresh session {session_id[:8]} failed",
+    except Exception:  # noqa: BLE001  # closing a fresh session the wake did not use
+        logger.warning("Wake: closing the unused fresh session %s failed",
+                       session_id[:8],
                        exc_info=True)

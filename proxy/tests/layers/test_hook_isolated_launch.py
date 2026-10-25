@@ -7,12 +7,16 @@ are stdlib-only, so isolated mode runs them. Satellites are unchanged.
 import sys
 
 from tests._paths import PROXY_DIR
+
 if str(PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(PROXY_DIR))
 
-from core.layers.cli.config_dir import build_settings  # noqa: E402
-from core.layers.codex.config_dir import build_hooks  # noqa: E402
-from core.sandbox.interceptor_wrap import wrap_servers_json, wrap_toml_text  # noqa: E402
+from core.layers.cli.config_dir import build_settings
+from core.layers.codex.config_dir import build_hooks
+from core.sandbox.interceptor_wrap import (
+    wrap_servers_json,
+    wrap_toml_text,
+)
 
 
 def _commands(hooks: dict) -> list[str]:

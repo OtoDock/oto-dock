@@ -1,0 +1,58 @@
+{
+ "source": "collabora/code:26.04.5.1.1, a throwaway key, recorded 2026-10-17. The current and old keys are one key and Proof equals ProofOld in every call (Collabora does not rotate): these calls do not separate the three checks; tests/media/test_wopi_proof.py does that with its own keys.",
+ "proof_key": {
+  "value": "BgIAAACkAABSU0ExAAgAAAEAAQAbyRYSn0mSXSw5QJQpxFNh4xH9CHx6T7KrdEyG5htkAFhVysSIi0EVTz6VClk43y64DDfSCnkNEbOQZDaZmwS1gE65NtrtBvp5DtTvm5wJcMoFfdCg0NTqGdxlwzjW9F6JkLV2pHU8g0h+6MOMpiT4C4eMM19/hKTE5Eo7qDNcLPJGomDiyK/wUBJqGwTXvrB3gYKA6EkKzfHbijMuMxfg3BmbJhJoc2CZylLX4Rm8c8er6emdvazBY/Z+Xy0JRp5MYVAfUKzuTc136OmGCqrGTaJIfzOVNGe1xoEGweUwjuenSeV1fN1mlIcpRTU2FnKvaTwrUafexbgfPauPQWvR",
+  "modulus": "0WtBj6s9H7jF3qdRKzxpr3IWNjVFKYeUZt18deVJp+eOMOXBBoHGtWc0lTN/SKJNxqoKhunod81N7qxQH1BhTJ5GCS1ffvZjway9nenpq8dzvBnh11LKmWBzaBImmxnc4BczLjOK2/HNCknogIKBd7C+1wQbahJQ8K/I4mCiRvIsXDOoO0rkxKSEf18zjIcL+CSmjMPofkiDPHWkdrWQiV701jjDZdwZ6tTQoNB9BcpwCZyb79QOefoG7do2uU6AtQSbmTZkkLMRDXkK0jcMuC7fOFkKlT5PFUGLiMTKVVgAZBvmhkx0q7JPenwI/RHjYVPEKZRAOSxdkkmfEhbJGw==",
+  "exponent": "AQAB",
+  "oldvalue": "BgIAAACkAABSU0ExAAgAAAEAAQAbyRYSn0mSXSw5QJQpxFNh4xH9CHx6T7KrdEyG5htkAFhVysSIi0EVTz6VClk43y64DDfSCnkNEbOQZDaZmwS1gE65NtrtBvp5DtTvm5wJcMoFfdCg0NTqGdxlwzjW9F6JkLV2pHU8g0h+6MOMpiT4C4eMM19/hKTE5Eo7qDNcLPJGomDiyK/wUBJqGwTXvrB3gYKA6EkKzfHbijMuMxfg3BmbJhJoc2CZylLX4Rm8c8er6emdvazBY/Z+Xy0JRp5MYVAfUKzuTc136OmGCqrGTaJIfzOVNGe1xoEGweUwjuenSeV1fN1mlIcpRTU2FnKvaTwrUafexbgfPauPQWvR",
+  "oldmodulus": "0WtBj6s9H7jF3qdRKzxpr3IWNjVFKYeUZt18deVJp+eOMOXBBoHGtWc0lTN/SKJNxqoKhunod81N7qxQH1BhTJ5GCS1ffvZjway9nenpq8dzvBnh11LKmWBzaBImmxnc4BczLjOK2/HNCknogIKBd7C+1wQbahJQ8K/I4mCiRvIsXDOoO0rkxKSEf18zjIcL+CSmjMPofkiDPHWkdrWQiV701jjDZdwZ6tTQoNB9BcpwCZyb79QOefoG7do2uU6AtQSbmTZkkLMRDXkK0jcMuC7fOFkKlT5PFUGLiMTKVVgAZBvmhkx0q7JPenwI/RHjYVPEKZRAOSxdkkmfEhbJGw==",
+  "oldexponent": "AQAB"
+ },
+ "calls": [
+  {
+   "method": "GET",
+   "host": "host.docker.internal:8402",
+   "target": "/wopi/files/YWdlbnQveC9kb2MuZG9jeAoxNzYwNjU2MDAw?access_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJnb2xkZW4iOiJ2ZWN0b3IifQ.c2lnbmF0dXJl&access_token_ttl=0",
+   "override": "",
+   "timestamp": "639277926778968542",
+   "proof": "NsQVJqZnWpxRzlS7XUbLUSHc/M3bCbI7q42khr9hpxOpNYKqSIMwZvn2qPmyxocFoiqb6pJtkIAS/Hm2drH8uR8HGY2/ajyUZY6pfPG6/oKr+kc1dGrMRByEhea3lEYTT+Xz1dHWRKD0f9i82txUr2IxxLR3BDEnPD5t2kM4NPv2gphQ1653di6Kw0WsmWQtai8RWmiDOq9o/6IMGiqjeshuj3tvlTSXsPbCzj9HbT0gejEe8uSfA2DZl5SNWgBt0zQw5M5bjPoqzNx0cKWqXTGADYbs8NR5aSMOeH30NX/yNB7iCtm43dw1eSUrxePaEH1EEwkp1k3bbDmMKoN0Dg==",
+   "proof_old": "NsQVJqZnWpxRzlS7XUbLUSHc/M3bCbI7q42khr9hpxOpNYKqSIMwZvn2qPmyxocFoiqb6pJtkIAS/Hm2drH8uR8HGY2/ajyUZY6pfPG6/oKr+kc1dGrMRByEhea3lEYTT+Xz1dHWRKD0f9i82txUr2IxxLR3BDEnPD5t2kM4NPv2gphQ1653di6Kw0WsmWQtai8RWmiDOq9o/6IMGiqjeshuj3tvlTSXsPbCzj9HbT0gejEe8uSfA2DZl5SNWgBt0zQw5M5bjPoqzNx0cKWqXTGADYbs8NR5aSMOeH30NX/yNB7iCtm43dw1eSUrxePaEH1EEwkp1k3bbDmMKoN0Dg=="
+  },
+  {
+   "method": "GET",
+   "host": "host.docker.internal:8402",
+   "target": "/wopi/files/YWdlbnQveC9kb2MuZG9jeAoxNzYwNjU2MDAw/contents?access_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJnb2xkZW4iOiJ2ZWN0b3IifQ.c2lnbmF0dXJl&access_token_ttl=0",
+   "override": "",
+   "timestamp": "639277926779094045",
+   "proof": "pV2Bj9bx1o7hXb9vlb3O2+AqHYA/G1zN10PxtPLooqT27qDc3kgnaIfOJguqLAUxoBVP5TEc8xKFBRkPirBYIXdEQ6GbrDTW6y5C/fIlRtHvM4DRKirfnSB16EFowLjX+ls3ATBa4rO/oRoRAqfi7GdDuQPSiIlZhovAYL4XDo28lHnvdr3+kcuVMAMgX8gSmMr+auC2klAxrH0Nz3ah4EvLtjTIdhfDcb51ywMvd2juKv3Rcs0rJeOrhY+CBKtOZWamu+r190lU9PDazrLencxsCzI0Dau0TK5sSpGtNtvQVsHLSASquityJMKAbBRh29HMYBhQfaK2VfbHCPT1zg==",
+   "proof_old": "pV2Bj9bx1o7hXb9vlb3O2+AqHYA/G1zN10PxtPLooqT27qDc3kgnaIfOJguqLAUxoBVP5TEc8xKFBRkPirBYIXdEQ6GbrDTW6y5C/fIlRtHvM4DRKirfnSB16EFowLjX+ls3ATBa4rO/oRoRAqfi7GdDuQPSiIlZhovAYL4XDo28lHnvdr3+kcuVMAMgX8gSmMr+auC2klAxrH0Nz3ah4EvLtjTIdhfDcb51ywMvd2juKv3Rcs0rJeOrhY+CBKtOZWamu+r190lU9PDazrLencxsCzI0Dau0TK5sSpGtNtvQVsHLSASquityJMKAbBRh29HMYBhQfaK2VfbHCPT1zg=="
+  },
+  {
+   "method": "POST",
+   "host": "host.docker.internal:8402",
+   "target": "/wopi/files/YWdlbnQveC9kb2MuZG9jeAoxNzYwNjU2MDAw?access_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJnb2xkZW4iOiJ2ZWN0b3IifQ.c2lnbmF0dXJl&access_token_ttl=0",
+   "override": "LOCK",
+   "timestamp": "639277926780485699",
+   "proof": "DHgo+3QUvvPCtFPnv1OVUh7B5SPi1zKxIUU2QZ8hdGwJg7vF3Eu96I5pPXO0cR5Lfqj3A37s4xQF/YWwxyN69+a9hF3lDqPAeWIgreYwbFDOyTYDfAhpLhBmA+XpoKCQ5wukbi2zB0VzggkoJJU+GbNkEWfQBVvV7pUaZczMGWUe1Te44NQ+wwmv/xeMx1wMP0t/EySyZ3/qdljXlTPbGEBSZMWeNECrR6AopI+wlyd6BuH/1M4xbHRWc+KxarU+QhfLoLa7bROiJvOmYjyvlQiS00/OCwgkShSSBBKe5+qRdxlUze7NuD8ZaRJvs56uaYnGCnPmmhSbq4cBZYBxhw==",
+   "proof_old": "DHgo+3QUvvPCtFPnv1OVUh7B5SPi1zKxIUU2QZ8hdGwJg7vF3Eu96I5pPXO0cR5Lfqj3A37s4xQF/YWwxyN69+a9hF3lDqPAeWIgreYwbFDOyTYDfAhpLhBmA+XpoKCQ5wukbi2zB0VzggkoJJU+GbNkEWfQBVvV7pUaZczMGWUe1Te44NQ+wwmv/xeMx1wMP0t/EySyZ3/qdljXlTPbGEBSZMWeNECrR6AopI+wlyd6BuH/1M4xbHRWc+KxarU+QhfLoLa7bROiJvOmYjyvlQiS00/OCwgkShSSBBKe5+qRdxlUze7NuD8ZaRJvs56uaYnGCnPmmhSbq4cBZYBxhw=="
+  },
+  {
+   "method": "POST",
+   "host": "host.docker.internal:8402",
+   "target": "/wopi/files/YWdlbnQveC9kb2MuZG9jeAoxNzYwNjU2MDAw/contents?access_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJnb2xkZW4iOiJ2ZWN0b3IifQ.c2lnbmF0dXJl&access_token_ttl=0",
+   "override": "PUT",
+   "timestamp": "639277926804524102",
+   "proof": "lS9+mV0a/G6mhVI1Sb+S7RUWJ7xH3XGmoZj/SdaXMxD3v7aKpXR+HcGgv5CRjybRCzqh/H9fHatRHL7n/HXoz5T+tfjNwJkfbSnG/84k9P+TMjgeBZgfNusB8W15PKEbZ4NG4MMFwJqe3DEGwH55XF7bYOCsDoPJXFU+8xyLYYJAM1Z+Apre73+bbmcb4nwcy8ZCbxI0mw8NiV7DF4SGwS82RSKoCw6sVgyT7Tz9jv6s3iyFr4D2mvcIOkxl9lC6MC3i/hbf1C2iSkeCfJl6/KNtcZff6sgw8rr/OrlX7Tgs0D8KtGLt0kclyjKoHBIvKEV1RtOqc7nkuvK3PKuQCg==",
+   "proof_old": "lS9+mV0a/G6mhVI1Sb+S7RUWJ7xH3XGmoZj/SdaXMxD3v7aKpXR+HcGgv5CRjybRCzqh/H9fHatRHL7n/HXoz5T+tfjNwJkfbSnG/84k9P+TMjgeBZgfNusB8W15PKEbZ4NG4MMFwJqe3DEGwH55XF7bYOCsDoPJXFU+8xyLYYJAM1Z+Apre73+bbmcb4nwcy8ZCbxI0mw8NiV7DF4SGwS82RSKoCw6sVgyT7Tz9jv6s3iyFr4D2mvcIOkxl9lC6MC3i/hbf1C2iSkeCfJl6/KNtcZff6sgw8rr/OrlX7Tgs0D8KtGLt0kclyjKoHBIvKEV1RtOqc7nkuvK3PKuQCg=="
+  },
+  {
+   "method": "POST",
+   "host": "host.docker.internal:8402",
+   "target": "/wopi/files/YWdlbnQveC9kb2MuZG9jeAoxNzYwNjU2MDAw?access_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJnb2xkZW4iOiJ2ZWN0b3IifQ.c2lnbmF0dXJl&access_token_ttl=0",
+   "override": "UNLOCK",
+   "timestamp": "639277926904674244",
+   "proof": "SLXhikuF1yJutT8RrSHJAOLjfr4xBsdTijLnB8pY4whiUo6MvK5lJdDUuYe0TtzWjV62GfVBr1VyY6/M1lfWBx+cbQMrHAgVdOnbcPw3qAGj/jHUA4Uwa9nXL8TN6RQiaoKmKM3vAQ2ZoYp9JtMMeGjO0YXebqNP2SvxetrOKgipci4GJJTuLz6omOqayy34bt1g76UlWl9giWmZ4WiESCI8XQGshMxfUb5GC0sABR8RZVmhoooKlynOWHgdceTO6q0H0x20Uez8LZyc8WUrbN0uKXWzcbFH2ayS0csUOWU2MRlsRtP4NrU2cDDRbvM/O3WgRT9XjLBbP2iGla0w5A==",
+   "proof_old": "SLXhikuF1yJutT8RrSHJAOLjfr4xBsdTijLnB8pY4whiUo6MvK5lJdDUuYe0TtzWjV62GfVBr1VyY6/M1lfWBx+cbQMrHAgVdOnbcPw3qAGj/jHUA4Uwa9nXL8TN6RQiaoKmKM3vAQ2ZoYp9JtMMeGjO0YXebqNP2SvxetrOKgipci4GJJTuLz6omOqayy34bt1g76UlWl9giWmZ4WiESCI8XQGshMxfUb5GC0sABR8RZVmhoooKlynOWHgdceTO6q0H0x20Uez8LZyc8WUrbN0uKXWzcbFH2ayS0csUOWU2MRlsRtP4NrU2cDDRbvM/O3WgRT9XjLBbP2iGla0w5A=="
+  }
+ ]
+}

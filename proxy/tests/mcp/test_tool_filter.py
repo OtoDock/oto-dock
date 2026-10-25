@@ -21,7 +21,6 @@ import pytest
 
 from services.mcp import mcp_registry
 
-
 # ---------------------------------------------------------------------------
 # Manifest validator
 # ---------------------------------------------------------------------------
@@ -351,6 +350,7 @@ class TestToolFilterSave:
     def client(self, monkeypatch):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
+
         from api.mcp import mcps as mcps_api
         from auth.providers import get_current_user
         from storage.mcp import mcp_store

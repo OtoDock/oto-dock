@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 
-
 import config
 from core.events.common_events import ERROR, PRODUCER_DONE, CommonEvent
 from core.events.stream_pump import ChatStreamPump

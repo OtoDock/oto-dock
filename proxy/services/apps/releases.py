@@ -24,6 +24,7 @@ process may write. Synchronous helpers, called off the loop.
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import hashlib
 import json
@@ -34,12 +35,11 @@ import stat
 from pathlib import Path
 
 import config
-from services.infra import safe_fs
-from services.infra.path_confinement import join_under
-from services.infra.agent_dirs import agent_dirs
-from storage import database as task_store
-from storage import db_apps
 from core import layout
+from services.infra import safe_fs
+from services.infra.agent_dirs import agent_dirs
+from services.infra.path_confinement import join_under
+from storage import database as task_store, db_apps
 
 logger = logging.getLogger("otodock.apps")
 
@@ -290,8 +290,8 @@ def _link_is_dir(dirfd: int, name: str) -> bool:
 def _walk_sized(source_dir: Path) -> list[tuple[str, int]]:
     try:
         root, base = tree_root(source_dir)
-    except safe_fs.SafeFsError:
-        raise ReleaseInvalid("the app folder is reached through a link: make it a real folder")
+    except safe_fs.SafeFsError as exc:
+        raise ReleaseInvalid("the app folder is reached through a link: make it a real folder") from exc
     out: list[tuple[str, int]] = []
     total = 0
     started = False
@@ -318,14 +318,14 @@ def _walk_sized(source_dir: Path) -> list[tuple[str, int]]:
                 out.append((f"{rel_root}/{name}" if rel_root else name, size))
                 if len(out) > MAX_RELEASE_FILES:
                     raise ReleaseInvalid(f"the app has more than {MAX_RELEASE_FILES} files")
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
         if not started:
             return []
-        raise ReleaseInvalid("the app folder changed while it was read; try again")
-    except safe_fs.SymlinkRefused:
-        raise ReleaseInvalid("the app folder is reached through a link: make it a real folder")
+        raise ReleaseInvalid("the app folder changed while it was read; try again") from exc
+    except safe_fs.SymlinkRefused as exc:
+        raise ReleaseInvalid("the app folder is reached through a link: make it a real folder") from exc
     except OSError as e:
-        raise ReleaseInvalid(f"the app folder could not be read ({e.strerror or 'error'})")
+        raise ReleaseInvalid(f"the app folder could not be read ({e.strerror or 'error'})") from e
     return out
 
 
@@ -356,13 +356,13 @@ def copy_tree(source_dir: Path, dest_dir: Path, *, replace: bool = False) -> str
                 src_root, _join(src_base, rel), dst_root, _join(dst_base, rel),
                 max_size=MAX_RELEASE_FILE_BYTES, mode=RELEASE_FILE_MODE, mkdirs=True,
                 on_chunk=digest.update)
-        except safe_fs.FileTooLarge:
+        except safe_fs.FileTooLarge as exc:
             raise ReleaseInvalid(f"{rel.rsplit('/', 1)[-1]} is larger than "
-                                 f"{MAX_RELEASE_FILE_BYTES // (1024 * 1024)} MB")
+                                 f"{MAX_RELEASE_FILE_BYTES // (1024 * 1024)} MB") from exc
         except OSError as e:
             if e.errno in (errno.ENOSPC, errno.EDQUOT):
-                raise ReleaseInvalid("the disk or the storage quota is full")
-            raise ReleaseInvalid(f"{rel} changed while it was copied, deploy again")
+                raise ReleaseInvalid("the disk or the storage quota is full") from e
+            raise ReleaseInvalid(f"{rel} changed while it was copied, deploy again") from e
         total += size
         if total > MAX_RELEASE_BYTES:
             raise ReleaseInvalid(f"the app is larger than {MAX_RELEASE_BYTES // (1024 * 1024)} MB")
@@ -375,8 +375,8 @@ def copy_tree(source_dir: Path, dest_dir: Path, *, replace: bool = False) -> str
     # of that name in the tree is the app's mistake, not a server error.
     try:
         safe_fs.mkdirs_beneath(dst_root, _join(dst_base, "data"))
-    except (FileExistsError, NotADirectoryError):
-        raise ReleaseInvalid("data is reserved for the app's database, it cannot be a file")
+    except (FileExistsError, NotADirectoryError) as exc:
+        raise ReleaseInvalid("data is reserved for the app's database, it cannot be a file") from exc
     return text
 
 
@@ -578,3 +578,12 @@ def reconcile() -> dict[str, int]:
         logger.info("App releases reconciled: %d row(s) fell back, %d orphan dir(s) removed",
                     cleared, reaped)
     return {"cleared": cleared, "reaped": reaped}
+
+
+# One lock per row: a deploy is a copy plus one UPDATE of the pointer; two
+# pins of the same app a moment apart must not interleave them.
+_deploy_locks: dict[str, asyncio.Lock] = {}
+
+
+def _deploy_lock(app_id: str) -> asyncio.Lock:
+    return _deploy_locks.setdefault(app_id, asyncio.Lock())

@@ -83,13 +83,16 @@ export function buildOpenTarget(
       if (!(USER_SETTINGS_TABS as readonly string[]).includes(tab)) {
         return { error: 'invalid user settings tab' }
       }
-      const params = new URLSearchParams({ tab })
+      const params = new URLSearchParams()
       const provider = str(t.provider)
       if (provider) {
         if (!SLUG_RE.test(provider)) return { error: 'invalid provider' }
         params.set('provider', provider)
       }
-      return { kind, path: `/user-settings?${params.toString()}`, label: `your ${tab.replace('-', ' ')} settings` }
+      // The tab ids are the target's words and the sections' last path
+      // segments; a `/user-settings?tab=` link still redirects.
+      const query = params.toString()
+      return { kind, path: `/user-settings/${tab}${query ? `?${query}` : ''}`, label: `your ${tab.replace('-', ' ')} settings` }
     }
     case 'file': {
       const rel = str(t.path)

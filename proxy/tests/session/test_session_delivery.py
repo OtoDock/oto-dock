@@ -14,19 +14,20 @@ import asyncio
 import contextlib
 import time
 
-from core.session import interactive_session as isess
-from core.session import session_delivery as delivery
-from core.session import warmup_registry
-from core.session.session_delivery import deliver_prompt, oneshot_inflight
-from core.session.session_state import _dashboard_notify_queues, set_pump_callbacks
-from storage import database as task_store
-
-
 # The ws rung now has a LIVENESS GATE: queue presence alone no longer routes —
 # the target session must be alive. Tests that exercise the ws route register
 # a fake alive CLI session alongside their notify queue.
 from contextlib import contextmanager
 from types import SimpleNamespace
+
+from core.session import (
+    interactive_session as isess,
+    session_delivery as delivery,
+    warmup_registry,
+)
+from core.session.session_delivery import deliver_prompt, oneshot_inflight
+from core.session.session_state import _dashboard_notify_queues, set_pump_callbacks
+from storage import database as task_store
 
 
 @contextmanager
@@ -503,7 +504,7 @@ class TestOneshotGuard:
                     "chat-g5", "the result", source="delegate_result",
                     session_id="sid-dead", agent="pa", oneshot_fn=_oneshot,
                 ))
-                await asyncio.sleep(0.2)          # deliver is now polling
+                await asyncio.sleep(0.2)          # deliver is now waiting
                 claims_during_wait.append(oneshot_inflight("chat-g5"))
                 fake = _FakeISession("sid-warm", "chat-g5")
                 _install(fake)                    # the warmup produced a PTY

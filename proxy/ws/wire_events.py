@@ -69,10 +69,9 @@ module level without pulling the socket modules.
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple, TypedDict
+from typing import Any, NamedTuple, NotRequired, TypedDict
 
 from core.events import common_events as _ce
-
 
 # ---------------------------------------------------------------------------
 # The outbound frames of the dashboard socket
@@ -102,6 +101,7 @@ PERMISSION_PROMPT = "permission_prompt"
 PLAN_REVIEW = "plan_review"
 QUESTION = "question"
 PROMPT_RETIRED = "prompt_retired"   # a prompt card whose wait ended with no answer
+PERMISSION_RESOLVED = "permission_resolved"   # a card answered on another socket
 LOCATION_REQUEST = "location_request"
 PLAN_MODE = "plan_mode"
 SYSTEM = "system"
@@ -162,6 +162,9 @@ CHAT_READ = "chat_read"
 CHAT_ROWS = "chat_rows"
 CHAT_META = "chat_meta"
 CHAT_MOVED = "chat_moved"
+# A running move's transfer: ``move_id``, ``to_label``, ``done`` and ``total``
+# bytes (``total`` 0: unknown) and the ``phase`` (``MOVE_PHASES``).
+CHAT_MOVE_PROGRESS = "chat_move_progress"
 CHAT_VIEW_ONLY = "chat_view_only"
 ENGINE_SWITCHED = "engine_switched"
 SWITCH_ENGINE_DENIED = "switch_engine_denied"
@@ -263,11 +266,12 @@ FRAMES: dict[str, Frame] = {
     PLAN_REVIEW: Frame(True, PLAN_REVIEW),
     QUESTION: Frame(True, QUESTION),
     PROMPT_RETIRED: Frame(True, None),
+    PERMISSION_RESOLVED: Frame(True, None),
     LOCATION_REQUEST: Frame(True, None),
     PLAN_MODE: Frame(True, PLAN_MODE),
     SYSTEM: Frame(True, SYSTEM),
     METADATA: Frame(True, METADATA),
-    MCP_COST: Frame(True, None),
+    MCP_COST: Frame(True, MCP_COST),
     TODO_UPDATE: Frame(True, None),
     GOAL_UPDATE: Frame(True, None),
     CONTEXT_COMPACT: Frame(True, CONTEXT_COMPACT),
@@ -319,6 +323,7 @@ FRAMES: dict[str, Frame] = {
     CHAT_ROWS: Frame(True, None),
     CHAT_META: Frame(True, None),
     CHAT_MOVED: Frame(False, None),
+    CHAT_MOVE_PROGRESS: Frame(False, None),
     # The viewed chat is driven from outside (a phone call): sent before the
     # read-only history of a full resume; the page re-resumes on ready.
     CHAT_VIEW_ONLY: Frame(True, None),
@@ -390,10 +395,11 @@ LIVE_BLOCK_KINDS: frozenset[str] = frozenset({
 # The tables the pump reads: CommonEvent → wire, wire → block
 # ---------------------------------------------------------------------------
 
-# The frame a CommonEvent becomes (``core/events/stream_pump._process_event``
+# The frame a CommonEvent becomes (``core/events/pump_event_handlers._process_event``
 # forwards through ``_forward_event``; a type missing here is not forwarded
 # as a frame — DONE is a turn boundary, QUEUE_TURN and ARTIFACT_TURN are
-# queue drains handled in ``_run``; QUESTION and DELEGATE_RESULT are names
+# queue drains handled in ``_run``, BG_REVIEW_TURN a run's review boundary
+# that forwards ``bg_*_complete`` itself; QUESTION and DELEGATE_RESULT are names
 # the pump never receives: the hook queue mints the ``question`` frame and
 # the delivery ladder mints ``delegate_result``). The exceptions the table
 # cannot say: TOOL_RESULT also emits a content-carrying ``tool_result`` frame
@@ -531,6 +537,11 @@ SUBTYPE_UNDELIVERED_INPUT = "undelivered_input"
 # frame showed it: ``reason``, the ``message`` (the ending's line), its
 # ``detail`` and ``resets_at``, an ``exit_code`` for an exited process.
 SUBTYPE_TURN_ENDED = "turn_ended"
+# The one message the turn-ended card's Resume sends (the dashboard's
+# ``lib/messageBlocks.RESUME_TEXT``). The cancelled-context builder passes
+# over a row carrying it, so a second Resume still names the prompt that
+# started the work.
+RESUME_TEXT = "Continue from where you stopped."
 # ``undelivered_input.reason`` of a queued message nothing sent: a delivery
 # the drive gate or the session refused (``queued``) or the turn it waited
 # for ended other than cleanly (``turn_failed``), both written always (the
@@ -553,14 +564,53 @@ SUBTYPE_MEETING_FAILED = "meeting_failed"
 # written: a server kick, an interaction) while the chat's machine is still
 # reconnecting; ``message`` says to send it again.
 SUBTYPE_MACHINE_RECONNECTING = "machine_reconnecting"
+# Live, the same turn when the chat's machine is connected but did not answer
+# the resume probe within the inline budget; ``message`` says to send it
+# again. Persisted once in a task run's chat when the task's own machine gave
+# way to the agent's default (``services/scheduler/task_run._record_target``).
+SUBTYPE_MACHINE_NOT_ANSWERING = "machine_not_answering"
 # A permission request the engine raised on its own channel that was refused
 # with no person's answer (``core/session/engine_prompts``): ``message`` names
 # the call and why (nobody answered in time, a phone call, an older
 # satellite); the turn went on.
 SUBTYPE_ENGINE_PROMPT_REFUSED = "engine_prompt_refused"
+# A chat moved to another place (services/remote/chat_move.py): ``message``
+# says from where to where and whether its memory came with it; ``reason`` is
+# ``failed`` for a move that did not finish. The frame's word (``CHAT_MOVED``).
+SUBTYPE_CHAT_MOVED = CHAT_MOVED
+# The chat's line about its machine's tools (services/mcp/mcp_sync.py): its
+# session started with tools still installing there, named; a second line
+# says how they ended. ``message`` is the sentence.
+SUBTYPE_TOOLS_INSTALLING = "tools_installing"
+# A ``chat_moved`` row's ``reason``: the move did not finish; the agent moved
+# the chat ten times in a row with no message from a person, so it does not
+# continue by itself; the agent's move could not resume the chat by itself.
+MOVED_FAILED = "failed"
+MOVED_RESUME_STOPPED = "resume_stopped"
+MOVED_RESUME_SKIPPED = "resume_skipped"
+# ``chat_move_progress.phase``: the platform's own staging copy, the bytes on
+# the wire, the commit on the target.
+MOVE_PHASE_STAGE = "stage"
+MOVE_PHASE_COPY = "copy"
+MOVE_PHASE_COMMIT = "commit"
+MOVE_PHASES: tuple[str, ...] = (MOVE_PHASE_STAGE, MOVE_PHASE_COPY, MOVE_PHASE_COMMIT)
+# A ``schedule_wake`` row's ``source`` when the platform resumed a chat after
+# the agent moved it (no ``source``: a scheduled self-continuation).
+WAKE_SOURCE_MOVE = "move"
+# ``server_turn_start.cause``: the review of finished background work (its
+# nudge row and ``bg_*_complete`` frame came just before), a worker's result
+# answered, a scheduled wake, a backgrounded warmup's first turn.
+CAUSE_BG_REVIEW = "bg_review"
+CAUSE_DELEGATE_RESULT = DELEGATE_RESULT
+CAUSE_WAKE = "wake"
+CAUSE_KICK = "kick"
+SERVER_TURN_CAUSES: frozenset[str] = frozenset({
+    CAUSE_BG_REVIEW, CAUSE_DELEGATE_RESULT, CAUSE_WAKE, CAUSE_KICK,
+})
 SYSTEM_SUBTYPES: frozenset[str] = frozenset({
     SUBTYPE_SESSION_RESEEDED, SUBTYPE_UNDELIVERED_INPUT, SUBTYPE_TURN_ENDED, SUBTYPE_BG_WAKE,
-    SUBTYPE_CONTEXT_COMPRESSED, SUBTYPE_MACHINE_RECONNECTING, SUBTYPE_ENGINE_PROMPT_REFUSED,
+    SUBTYPE_CONTEXT_COMPRESSED, SUBTYPE_MACHINE_RECONNECTING, SUBTYPE_MACHINE_NOT_ANSWERING,
+    SUBTYPE_ENGINE_PROMPT_REFUSED, SUBTYPE_CHAT_MOVED, SUBTYPE_TOOLS_INSTALLING,
     SUBTYPE_MEETING_STARTED, SUBTYPE_MEETING_TURN_START, SUBTYPE_MEETING_TURN_END,
     SUBTYPE_MEETING_CONCLUDED, SUBTYPE_MEETING_AGENT_FAILED,
     SUBTYPE_MEETING_AGENT_LEFT, SUBTYPE_MEETING_FAILED,
@@ -615,12 +665,14 @@ class _PerChat(TypedDict, total=False):
 
 class TextFrame(_PerChat):
     content: str
+    note: NotRequired[bool]  # a progress note: the agent's words between steps, drawn faint
 
 
 class ThinkingFrame(_PerChat, total=False):
     phase: str            # start | delta | progress | end
     text: str
     estimated_tokens: int
+    note: bool            # on an end: the block is re-sent as a note text, the page drops it
 
 
 class ToolStartFrame(_PerChat, total=False):
@@ -673,6 +725,9 @@ class BgCommandDoneFrame(_PerChat, total=False):
 class CountFrame(_PerChat):
     """``bg_agents_complete`` / ``bg_commands_complete``."""
     count: int
+    # A run's own review starts here, inside the run's turn (the task
+    # producer's): the viewer ends the bubble and draws the nudge's line.
+    review: NotRequired[bool]
 
 
 class WorkflowStartFrame(_PerChat, total=False):
@@ -716,6 +771,10 @@ class DelegateResultFrame(_PerChat, total=False):
     # Background work (a command, a subagent) still running when the worker's
     # turn ended; the delegating chat's prompt names the count.
     background_pending: int
+    # The run's own end cut the worker's turn short and it left no report (no
+    # file, no "Blocked on:" line): services/scheduler/lanes.report_missing.
+    # Absent otherwise.
+    report_missing: bool
     # The deliverables the worker attached, as they landed in the
     # delegator's tree (``{path, bytes}``, agent-tree-relative), and the
     # ones that did not land, each with its reason (``{path, reason}``).
@@ -758,6 +817,18 @@ class QuestionFrame(_PerChat, total=False):
 
 class PromptRetiredFrame(_PerChat):
     request_id: str       # the permission, plan review or held question card
+
+
+class _PermissionResolvedBase(_PerChat):
+    request_id: str       # the permission, plan review or held question card
+
+
+class PermissionResolvedFrame(_PermissionResolvedBase, total=False):
+    """A card answered on another socket of the chat: every other viewer
+    closes it the way its own answer would (a permission with ``approved``,
+    a plan review with its ``action``, a question with the id alone)."""
+    approved: bool
+    action: str
 
 
 class LocationRequestFrame(_PerChat):
@@ -843,9 +914,13 @@ class ErrorFrame(_ErrorFrameBase, total=False):
     ``exited``, ``silent``, ``lost``) and ``resets_at`` (ISO-8601 UTC, ""
     when unknown). A pump's frame always carries ``chat_id`` and a ``done``
     follows it once the turn's rows landed; a bare error (the dispatcher's
-    refusal of one message) carries neither."""
+    refusal of one message) carries neither. The refusal of a message the
+    page drew no bubble for (a queue-only send during "Getting ready", a
+    busy send) names its ``queue_id`` and nothing else, so the page keeps
+    its warmup and hands the text back."""
     reason: str
     resets_at: str
+    queue_id: str
 
 
 class AbortedFrame(_PerChat):
@@ -1025,8 +1100,12 @@ class QueueClearedFrame(_PerChat, _Returned):
     reason: str           # cancel, stopped, turn_failed, drive_refused, revoked
 
 
-class QueueSnapshotFrame(_PerChat):
+class _QueueSnapshotBase(_PerChat):
     messages: list        # the chat's waiting messages, as ``_QueueChip`` entries
+
+
+class QueueSnapshotFrame(_QueueSnapshotBase, total=False):
+    queue_chat_id: str    # the queue's own chat when the viewed chat is a sibling run's
 
 
 class _SteerMeta(TypedDict, total=False):
@@ -1060,7 +1139,7 @@ class PlanStatusFrame(TypedDict):
 
 
 class ServerTurnStartFrame(_PerChat):
-    pass
+    cause: str            # SERVER_TURN_CAUSES: what started the turn
 
 
 class WarmupStartedFrame(TypedDict, total=False):
@@ -1140,7 +1219,7 @@ class _ChatHistoryDeltaKeys(TypedDict):
     since_id: int
 
 
-class ChatHistoryDeltaFrame(ChatHistoryFrame, _ChatHistoryDeltaKeys, total=False):
+class ChatHistoryDeltaFrame(ChatHistoryFrame, _ChatHistoryDeltaKeys, total=False):  # type: ignore[misc]  # mypy refuses bases that disagree on a key's requiredness; at run time the later base wins (the comment above)
     """A history re-send of the viewed chat for a client that declared
     ``history_deltas``: a ``resume_chat`` with ``delta`` or one of the
     server's re-sends (a task or meeting chat's turn end, a task chat's next
@@ -1181,9 +1260,17 @@ class ChatMetaFrame(TypedDict, total=False):
 
 
 class ChatMovedFrame(TypedDict, total=False):
+    """A chat moved to another place, or its move did not finish (``ok``):
+    the move's id, what travelled (``memory``: ``files`` or ``summary``),
+    where it runs now, both places' names and the sentence to show."""
     chat_id: str
+    move_id: str
+    ok: bool
+    memory: str
     new_target: str
-    resolved_label: str
+    label: str
+    from_label: str
+    message: str
 
 
 class EngineSwitchedFrame(TypedDict):
@@ -1335,7 +1422,8 @@ class TransferFrame(TypedDict, total=False):
     bytes_total: int
     bytes_sent: int
     started_at: str
-    machines: dict
+    machines: list
+    done: bool
     machine_id: str
     state: str
     error: str
@@ -1459,35 +1547,40 @@ MID_STREAM_DROP = "drop"      # logged and dropped until the turn ends
 class Inbound(NamedTuple):
     handler: str      # a DashboardConnection method: async (msg, *, stream=None)
     mid_stream: str   # MID_STREAM_*
+    # The frame drives the chat (answers, keys, picks, a stop): between turns
+    # the router refuses it while the chat's live session sits on another
+    # person's computer (ws/dashboard_chat_move.py). A send and a warmup ask
+    # in their own handlers (they may hand the chat over first).
+    drives: bool = False
 
 
 INBOUND: dict[str, Inbound] = {
     IN_PRE_WARMUP: Inbound("_on_pre_warmup", MID_STREAM_DETACH),
     IN_WARMUP: Inbound("_on_warmup", MID_STREAM_DETACH),
     IN_CHAT: Inbound("_on_chat", MID_STREAM_SAME),
-    IN_ARTIFACT_INTERACTION: Inbound("_on_artifact_interaction", MID_STREAM_SAME),
-    IN_APP_ACTION: Inbound("_on_app_action", MID_STREAM_SAME),
+    IN_ARTIFACT_INTERACTION: Inbound("_on_artifact_interaction", MID_STREAM_SAME, drives=True),
+    IN_APP_ACTION: Inbound("_on_app_action", MID_STREAM_SAME, drives=True),
     IN_RESUME_CHAT: Inbound("_on_resume_chat", MID_STREAM_DETACH),
     IN_CHAT_READ: Inbound("_on_chat_read", MID_STREAM_SAME),
-    IN_PERMISSION_RESPONSE: Inbound("_on_permission_response", MID_STREAM_SAME),
-    IN_QUESTION_RESPONSE: Inbound("_on_question_response", MID_STREAM_SAME),
-    IN_LOCATION_RESPONSE: Inbound("_on_location_response", MID_STREAM_SAME),
-    IN_PLAN_REVIEW_RESPONSE: Inbound("_on_plan_review_response", MID_STREAM_SAME),
+    IN_PERMISSION_RESPONSE: Inbound("_on_permission_response", MID_STREAM_SAME, drives=True),
+    IN_QUESTION_RESPONSE: Inbound("_on_question_response", MID_STREAM_SAME, drives=True),
+    IN_LOCATION_RESPONSE: Inbound("_on_location_response", MID_STREAM_SAME, drives=True),
+    IN_PLAN_REVIEW_RESPONSE: Inbound("_on_plan_review_response", MID_STREAM_SAME, drives=True),
     IN_PTY_ATTACH: Inbound("_on_pty_attach", MID_STREAM_DROP),
-    IN_PTY_TAKEOVER: Inbound("_on_pty_takeover", MID_STREAM_DROP),
-    IN_PTY_INPUT: Inbound("_on_pty_input", MID_STREAM_DROP),
+    IN_PTY_TAKEOVER: Inbound("_on_pty_takeover", MID_STREAM_DROP, drives=True),
+    IN_PTY_INPUT: Inbound("_on_pty_input", MID_STREAM_DROP, drives=True),
     IN_PTY_RESIZE: Inbound("_on_pty_resize", MID_STREAM_DROP),
-    IN_PTY_ATTACHMENTS: Inbound("_on_pty_attachments", MID_STREAM_DROP),
-    IN_MODE_CHANGE: Inbound("_on_mode_change", MID_STREAM_SAME),
-    IN_MODEL_CHANGE: Inbound("_on_model_change", MID_STREAM_SAME),
-    IN_EXECUTION_MODE_CHANGE: Inbound("_on_execution_mode_change", MID_STREAM_DROP),
-    IN_EXECUTION_MODE_SWITCH: Inbound("_on_execution_mode_switch", MID_STREAM_DROP),
-    IN_COMPACT_CONTEXT: Inbound("_on_compact_context", MID_STREAM_DROP),
+    IN_PTY_ATTACHMENTS: Inbound("_on_pty_attachments", MID_STREAM_DROP, drives=True),
+    IN_MODE_CHANGE: Inbound("_on_mode_change", MID_STREAM_SAME, drives=True),
+    IN_MODEL_CHANGE: Inbound("_on_model_change", MID_STREAM_SAME, drives=True),
+    IN_EXECUTION_MODE_CHANGE: Inbound("_on_execution_mode_change", MID_STREAM_DROP, drives=True),
+    IN_EXECUTION_MODE_SWITCH: Inbound("_on_execution_mode_switch", MID_STREAM_DROP, drives=True),
+    IN_COMPACT_CONTEXT: Inbound("_on_compact_context", MID_STREAM_DROP, drives=True),
     IN_MOVE_CHAT: Inbound("_on_move_chat", MID_STREAM_DROP),
-    IN_SWITCH_ENGINE: Inbound("_on_switch_engine", MID_STREAM_DROP),
+    IN_SWITCH_ENGINE: Inbound("_on_switch_engine", MID_STREAM_DROP, drives=True),
     IN_PROBE_LIVENESS: Inbound("_on_probe_liveness", MID_STREAM_DROP),
-    IN_IMPLEMENT_PLAN: Inbound("_on_implement_plan", MID_STREAM_DROP),
-    IN_ABORT: Inbound("_on_abort", MID_STREAM_SAME),
+    IN_IMPLEMENT_PLAN: Inbound("_on_implement_plan", MID_STREAM_DROP, drives=True),
+    IN_ABORT: Inbound("_on_abort", MID_STREAM_SAME, drives=True),
     IN_CANCEL_QUEUED: Inbound("_on_cancel_queued", MID_STREAM_SAME),
     IN_CANCEL_ALL_QUEUED: Inbound("_on_cancel_all_queued", MID_STREAM_SAME),
     IN_CLIENT_INFO: Inbound("_on_client_info", MID_STREAM_DROP),

@@ -1,7 +1,7 @@
 // Audio API hooks — STT/TTS providers, chat policy, turn classifier, settings.
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from './auth'
+import { apiJson, withMessage } from '../lib/http/apiJson'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -66,9 +66,8 @@ export function useAudioProviders() {
   return useQuery({
     queryKey: ['audio-providers'],
     queryFn: async (): Promise<AudioProvider[]> => {
-      const res = await apiFetch('/v1/admin/audio/providers')
-      if (!res.ok) throw new Error('Failed to fetch audio providers')
-      const data = await res.json()
+      const data = await apiJson<{ providers: AudioProvider[] }>('/v1/admin/audio/providers')
+        .catch(withMessage('Failed to fetch audio providers'))
       return data.providers
     },
   })
@@ -83,9 +82,8 @@ export function useKnownProviders() {
   return useQuery({
     queryKey: ['audio-known-providers'],
     queryFn: async (): Promise<KnownProviders> => {
-      const res = await apiFetch('/v1/admin/audio/known-providers')
-      if (!res.ok) throw new Error('Failed to fetch known providers')
-      return res.json()
+      return apiJson<KnownProviders>('/v1/admin/audio/known-providers')
+        .catch(withMessage('Failed to fetch known providers'))
     },
     staleTime: Infinity,  // the registry is static for the process
   })
@@ -95,12 +93,10 @@ export function useCreateAudioProvider() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (data: AudioProviderCreate) => {
-      const res = await apiFetch('/v1/admin/audio/providers', {
+      return apiJson('/v1/admin/audio/providers', {
         method: 'POST',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to create provider')
-      return res.json()
+      }, 'Failed to create provider')
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['audio-providers'] }) },
   })
@@ -110,14 +106,12 @@ export function useUpdateAudioProvider() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ id, data }: { id: number; data: AudioProviderUpdate }) => {
-      const res = await apiFetch(`/v1/admin/audio/providers/${id}`, {
+      return apiJson(`/v1/admin/audio/providers/${id}`, {
         method: 'PUT',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error('Failed to update provider')
-      return res.json()
+      }, 'Failed to update provider')
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['audio-providers'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['audio-providers'] }),
   })
 }
 
@@ -125,9 +119,7 @@ export function useDeleteAudioProvider() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: number) => {
-      const res = await apiFetch(`/v1/admin/audio/providers/${id}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to delete provider')
-      return res.json()
+      return apiJson(`/v1/admin/audio/providers/${id}`, { method: 'DELETE' }, 'Failed to delete provider')
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['audio-providers'] }) },
   })
@@ -137,11 +129,9 @@ export function useSetProviderDefault() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ id, context }: { id: number; context: 'calls' | 'chat' }) => {
-      const res = await apiFetch(`/v1/admin/audio/providers/${id}/default?context=${context}`, { method: 'PUT' })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to set default')
-      return res.json()
+      return apiJson(`/v1/admin/audio/providers/${id}/default?context=${context}`, { method: 'PUT' }, 'Failed to set default')
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['audio-providers'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['audio-providers'] }),
   })
 }
 
@@ -149,14 +139,12 @@ export function useSetProviderCredential() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ id, value }: { id: number; value: string }) => {
-      const res = await apiFetch(`/v1/admin/audio/providers/${id}/credential`, {
+      return apiJson(`/v1/admin/audio/providers/${id}/credential`, {
         method: 'PUT',
         body: JSON.stringify({ value }),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to save credential')
-      return res.json()
+      }, 'Failed to save credential')
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['audio-providers'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['audio-providers'] }),
   })
 }
 
@@ -164,9 +152,8 @@ export function useDeleteProviderCredential() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: number) => {
-      const res = await apiFetch(`/v1/admin/audio/providers/${id}/credential`, { method: 'DELETE' })
-      if (!res.ok) throw new Error('Failed to delete credential')
-      return res.json()
+      return apiJson(`/v1/admin/audio/providers/${id}/credential`, { method: 'DELETE' },
+        'Failed to delete credential')
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['audio-providers'] }) },
   })
@@ -180,9 +167,8 @@ export function useTurnClassifier() {
   return useQuery({
     queryKey: ['audio-turn-classifier'],
     queryFn: async (): Promise<TurnClassifier> => {
-      const res = await apiFetch('/v1/admin/audio/turn-classifier')
-      if (!res.ok) throw new Error('Failed to fetch turn classifier')
-      return res.json()
+      return apiJson<TurnClassifier>('/v1/admin/audio/turn-classifier')
+        .catch(withMessage('Failed to fetch turn classifier'))
     },
   })
 }
@@ -195,9 +181,7 @@ export function useAudioPolicy() {
   return useQuery({
     queryKey: ['audio-policy'],
     queryFn: async (): Promise<AudioPolicy> => {
-      const res = await apiFetch('/v1/admin/audio/policy')
-      if (!res.ok) throw new Error('Failed to fetch audio policy')
-      return res.json()
+      return apiJson<AudioPolicy>('/v1/admin/audio/policy').catch(withMessage('Failed to fetch audio policy'))
     },
   })
 }
@@ -206,14 +190,12 @@ export function useUpdateAudioPolicy() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (data: Partial<AudioPolicy>) => {
-      const res = await apiFetch('/v1/admin/audio/policy', {
+      return apiJson('/v1/admin/audio/policy', {
         method: 'PUT',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error('Failed to update audio policy')
-      return res.json()
+      }, 'Failed to update audio policy')
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['audio-policy'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['audio-policy'] }),
   })
 }
 
@@ -225,9 +207,7 @@ export function useAudioSettings() {
   return useQuery({
     queryKey: ['audio-settings'],
     queryFn: async (): Promise<AudioSettings> => {
-      const res = await apiFetch('/v1/admin/audio/settings')
-      if (!res.ok) throw new Error('Failed to fetch audio settings')
-      return res.json()
+      return apiJson<AudioSettings>('/v1/admin/audio/settings').catch(withMessage('Failed to fetch audio settings'))
     },
   })
 }
@@ -236,13 +216,12 @@ export function useSaveAudioSettings() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (data: Record<string, string>) => {
-      const res = await apiFetch('/v1/admin/audio/settings', {
+      // A refusal names the key and its rule: the message the toast shows.
+      return apiJson('/v1/admin/audio/settings', {
         method: 'PUT',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error('Failed to save audio settings')
-      return res.json()
+      }, 'Failed to save audio settings')
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['audio-settings'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['audio-settings'] }),
   })
 }

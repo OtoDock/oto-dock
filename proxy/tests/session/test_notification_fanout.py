@@ -115,8 +115,8 @@ async def test_the_install_id_is_read_once_and_shared_by_the_first_callers(monke
 # --- the file_updated window -----------------------------------------------
 
 def _wire_audience(monkeypatch, users: dict[str, _Conn]):
-    from api.apps import catalog
     from core.remote import file_sync
+    from services.apps import catalog
     from storage import database as task_store
     deltas: list[tuple[list[str], str, str]] = []
     monkeypatch.setattr(catalog, "file_changed",

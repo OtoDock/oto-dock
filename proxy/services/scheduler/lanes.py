@@ -16,7 +16,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-
+from typing import cast
 
 import config
 from storage import database as task_store
@@ -88,6 +88,76 @@ def _limit_notice(final_output: str) -> str | None:
     return None
 
 
+def _cut_short_phrases() -> dict[str, str]:
+    """The worker's own end before its report, by its ``turn_ending`` word,
+    as the delegating agent's callback says it. A person's Stop is not one
+    (its run reads ``user_interrupted``)."""
+    from core.events import turn_ending as te
+    return {
+        te.DECLINED: "the model declined to continue",
+        te.LIMIT: "the usage limit was reached",
+        te.ERROR: "the engine reported an error",
+        te.EXITED: "the program stopped",
+        te.SILENT: "it went silent and was ended",
+        te.LOST: "the machine's connection was lost",
+    }
+
+
+# The report's own line for what the caller must do (the delegation MCP asks
+# every worker for it): plain, bulleted, or in bold.
+_BLOCKED_ON_RE = re.compile(r"^\s*(?:[-*+>]\s+)?[*_]*\s*blocked on\s*[*_]*\s*:", re.IGNORECASE | re.MULTILINE)
+# How ``_collect_lane_output_since`` labels a person's message in the lane.
+_INTERJECTED = "[User interjected]:"
+
+
+def report_missing(cut_short: str, status: str, output: str,
+                   files: list | None, files_skipped: list | None,
+                   *, continued: bool = False) -> bool:
+    """Whether a delegate result ended without a report: the run's own end
+    cut the worker's turn short (``cut_short``, a ``turn_ending`` word the
+    runner decides from the session, never from the answer's length), the
+    run is not a person's Stop or a cancellation, the worker attached no
+    file and wrote no ``Blocked on:`` line, and nobody continued the lane
+    after its turn ended (``continued``: a person's message written after
+    the run's turn, ``user_rows_after``; a steer during the turn does not
+    count, the turn was still cut)."""
+    if cut_short not in _cut_short_phrases():
+        return False
+    if status in (run_status.USER_INTERRUPTED, run_status.CANCELLED):
+        return False
+    if files or files_skipped or continued:
+        return False
+    # The worker's own words: a person's interjected line is not its report.
+    own = "\n\n".join(part for part in (output or "").split("\n\n")
+                       if not part.startswith(_INTERJECTED))
+    return _BLOCKED_ON_RE.search(own) is None
+
+
+def _by_person(m: dict) -> bool:
+    return m["role"] == "user"
+
+
+def user_rows_after(chat_id: str, cursor: int) -> bool:
+    """Whether a person wrote in the worker chat after ``cursor`` (the
+    chat's last row when the run's turn ended)."""
+    if not cursor:
+        return False
+    return any(_by_person(m) and (m.get("id") or 0) > cursor
+               for m in task_store.get_chat_messages(chat_id))
+
+
+def missing_report_note(cut_short: str, worker_chat_id: str) -> str:
+    """The first line of a report-less result's callback: what ended the
+    worker's turn and how to get the report, so the delegating agent does not
+    read the worker's last message as the outcome."""
+    why = _cut_short_phrases().get(cut_short, "its turn ended early")
+    cont = (f'delegate(continue_id="{worker_chat_id}")' if worker_chat_id
+            else "delegate(continue_id=…)")
+    return (f"The worker ended without a report: {why}. Its last message "
+            f"below is not the outcome. Continue the lane with {cont} to get "
+            f"the report.")
+
+
 _PASTED_CONTENT_TAG_RE = re.compile(r"</?pasted_content\b[^>]*>")
 
 
@@ -124,7 +194,7 @@ def _collect_lane_output_since(chat_id: str, after_id: int = 0,
         content = m.get("content") or ""
         if m["role"] == "assistant" and content:
             parts.append(content)
-        elif m["role"] == "user" and content:
+        elif _by_person(m) and content:
             if own_prompt_pending and _prompt_key(content) == own_key:
                 own_prompt_pending = False
                 continue
@@ -175,12 +245,12 @@ async def _await_lane_quiescence(chat_id: str, *, ceiling_seconds: float = 1800.
             return
         if now - start >= ceiling_seconds:
             logger.warning(
-                f"Lane quiescence ceiling reached for chat {chat_id[:8]} "
-                f"({int(ceiling_seconds)}s) — collecting anyway"
+                "Lane quiescence ceiling reached for chat %s "
+                "(%ss) — collecting anyway", chat_id[:8], int(ceiling_seconds)
             )
             return
         if now - last_heartbeat >= 60.0:
-            logger.info(f"Delegate delivery waiting on active lane chat {chat_id[:8]}")
+            logger.info("Delegate delivery waiting on active lane chat %s", chat_id[:8])
             last_heartbeat = now
         await asyncio.sleep(1.0)
 
@@ -260,8 +330,8 @@ async def _try_reuse_warm_session(
     if await _remote_layer.is_session_process_dead(session_id):
         return False
     logger.info(
-        f"Task {run_id}: reusing warm remote session {session_id[:8]} "
-        f"on {info.machine_id[:8]} (no respawn)"
+        "Task %s: reusing warm remote session %s "
+        "on %s (no respawn)", run_id, session_id[:8], info.machine_id[:8]
     )
     return True
 
@@ -286,8 +356,8 @@ async def _close_for_model_change(session_id: str, run_id: str, *, slot_target: 
     async with holder.session_lock(session_id):
         await holder.close_session(session_id)
     logger.info(
-        f"Task {run_id}: closed live session {session_id[:8]} — the worker's "
-        f"model changed, the round resumes it on the new one"
+        "Task %s: closed live session %s — the worker's "
+        "model changed, the round resumes it on the new one", run_id, session_id[:8]
     )
     from core import concurrency
     await concurrency.acquire(session_id, "task", target=slot_target, blocking=True)
@@ -330,9 +400,9 @@ async def _reap_prior_lane_pump(chat_id: str, run_id: str) -> None:
     if prior is None or prior.is_done:
         return
     logger.warning(
-        f"Task {run_id}: prior round's pump still open on lane chat "
-        f"{chat_id[:8]} (session={prior.session_id[:8]}) — reaping so its "
-        f"turn persists before the new round"
+        "Task %s: prior round's pump still open on lane chat "
+        "%s (session=%s) — reaping so its "
+        "turn persists before the new round", run_id, chat_id[:8], prior.session_id[:8]
     )
     prior.abort()
     if prior._task is not None:
@@ -384,8 +454,8 @@ async def _watch_task_pump(layer, pump, run_id: str, chat_id: str,
                 and not pump.has_viewers):
             told = True
             try:
-                await on_parked()
-            except Exception:
+                await cast("Callable[[], Awaitable[None]]", on_parked)()  # told starts True when it is None
+            except Exception:  # noqa: BLE001  # the parked-prompt notice is the caller's callback, the watchdog goes on
                 logger.warning("Task watchdog: the parked-prompt notice for chat %s failed",
                                chat_id, exc_info=True)
         if pump.producer.done():
@@ -411,13 +481,13 @@ async def _watch_task_pump(layer, pump, run_id: str, chat_id: str,
             reason = (f"stalled: no stream events for {int(idle or 0)}s, "
                       f"process dead")
         logger.warning(
-            f"Task watchdog: reaping stalled turn run={run_id} chat={chat_id} "
-            f"session={session_id[:8]} ({reason})"
+            "Task watchdog: reaping stalled turn run=%s chat=%s "
+            "session=%s (%s)", run_id, chat_id, session_id[:8], reason
         )
         # The lost ending first: the run's record and a viewer get a
         # reason, then the producer's cancellation follows it on the queue.
         from core.events import turn_ending
-        from core.events.common_events import CommonEvent, ERROR
+        from core.events.common_events import ERROR, CommonEvent
         _ending = turn_ending.TurnEnding(reason=turn_ending.LOST, detail=reason)
         pump.event_queue.put_nowait(CommonEvent(type=ERROR, data={
             "message": _ending.line(), "ending": _ending.as_dict()}))
@@ -434,7 +504,7 @@ async def _watch_task_pump(layer, pump, run_id: str, chat_id: str,
             await layer.prepare_resume(session_id)
         except Exception:
             logger.exception(
-                f"Task watchdog: prepare_resume failed run={run_id}"
+                "Task watchdog: prepare_resume failed run=%s", run_id
             )
         raise _TaskTurnStalled(f"reaped by platform: {reason}")
 
@@ -527,13 +597,13 @@ async def _chat_turn_produce(layer, session_id: str, prompt: str,
     the chat's monitors), every event to the pump, a failure as the turn's
     ERROR, PRODUCER_DONE last. The caller arms the monitors once the pump
     has ended."""
-    from core.events.common_events import CommonEvent, ERROR, PRODUCER_DONE
+    from core.events.common_events import ERROR, PRODUCER_DONE, CommonEvent
     try:
         async with layer.session_lock(session_id):
             async for event in layer.send_message(session_id, prompt):
                 await event_queue.put(event)
     except Exception as e:
-        logger.error(f"Chat turn producer error: {e}", exc_info=True)
+        logger.exception("Chat turn producer error: %s", e)
         await event_queue.put(CommonEvent(type=ERROR, data={"message": str(e)}))
     finally:
         await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))

@@ -39,8 +39,7 @@ async def test_prewarm_reaper_touches_no_db(loop_db_guard, monkeypatch):
     # is no DB read left to offload — and nothing to raise for a deleted
     # agent, which previously stranded the concurrency slot and the
     # subscription seat permanently.
-    from core.session import prewarm_session_registry as reg
-    from core.session import session_manager
+    from core.session import prewarm_session_registry as reg, session_manager
 
     closed = []
 

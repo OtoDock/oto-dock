@@ -36,7 +36,6 @@ from ws import wire_events as wire
 MAX_PAYLOAD_BYTES = 8192
 MAX_TITLE_CHARS = 200
 MAX_SUBSTITUTED_PROMPT_CHARS = 8000
-QUEUE_CAP = 3
 MIN_INTERVAL_S = 1.0
 WINDOW_LIMIT = 12
 WINDOW_S = 60.0
@@ -101,7 +100,7 @@ def validate_app_action(
     execute via REST in api/apps); approval is checked against the live sig
     so a mutated manifest fails closed.
     """
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
 
     if not chat_id or not app_id or not action_id:
         return None, "missing chat, app, or action"
@@ -192,45 +191,3 @@ def frame_text(interactions: list[dict]) -> str:
     if "app" in kinds:
         parts.append(_APP_TRAILER)
     return "\n\n".join(parts)
-
-
-def event_row_json(interaction: dict) -> str:
-    """The persisted event row / ws frame payload (``artifact_interaction``
-    or ``app_action`` by kind)."""
-    if interaction.get("kind") == wire.APP_ACTION:
-        return json.dumps({
-            "type": wire.APP_ACTION,
-            "app_id": interaction["app_id"],
-            "slug": interaction["slug"],
-            "title": interaction["title"],
-            "action_id": interaction["action_id"],
-            "label": interaction["label"],
-            "prompt": interaction["prompt"],
-        })
-    return json.dumps({
-        "type": wire.ARTIFACT_INTERACTION,
-        "token": interaction["token"],
-        "title": interaction["title"],
-        "payload": interaction["payload"],
-    })
-
-
-def event_type(interaction: dict) -> str:
-    """The chat_messages.event_type for one interaction's persisted row."""
-    return wire.APP_ACTION if interaction.get("kind") == wire.APP_ACTION else wire.ARTIFACT_INTERACTION
-
-
-def ws_frame(interaction: dict, chat_id: str) -> dict:
-    """The live ws frame for one delivered interaction (chip render)."""
-    if interaction.get("kind") == wire.APP_ACTION:
-        return {
-            "type": wire.APP_ACTION, "app_id": interaction["app_id"],
-            "slug": interaction["slug"], "title": interaction["title"],
-            "action_id": interaction["action_id"], "label": interaction["label"],
-            "prompt": interaction["prompt"], "chat_id": chat_id,
-        }
-    return {
-        "type": wire.ARTIFACT_INTERACTION, "token": interaction["token"],
-        "title": interaction["title"], "payload": interaction["payload"],
-        "chat_id": chat_id,
-    }

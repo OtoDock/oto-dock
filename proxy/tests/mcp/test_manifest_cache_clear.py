@@ -49,3 +49,30 @@ class TestManifestCacheClear:
         mcp_registry.scan_manifests()
 
         assert "sentinel" not in oauth_providers._MANIFEST_CACHE
+
+    def test_rescan_runs_the_scan_in_a_worker_thread_one_at_a_time(self, monkeypatch):
+        """The routes rescan through ``rescan``: the scan runs in a worker
+        thread (never on the loop) and two rescans never overlap, so an
+        older scan cannot replace the registry a newer one built."""
+        import asyncio
+        import threading
+        import time
+
+        from services.mcp import mcp_registry
+        runs: list[tuple[int, float, float]] = []
+
+        def fake_scan():
+            t0 = time.monotonic()
+            time.sleep(0.2)
+            runs.append((threading.get_ident(), t0, time.monotonic()))
+            return {}
+
+        monkeypatch.setattr(mcp_registry, "scan_manifests", fake_scan)
+
+        async def two():
+            await asyncio.gather(mcp_registry.rescan(), mcp_registry.rescan())
+
+        asyncio.run(two())
+        assert len(runs) == 2 and all(tid != threading.get_ident() for tid, _, _ in runs)
+        first, second = sorted(runs, key=lambda r: r[1])
+        assert second[1] >= first[2]

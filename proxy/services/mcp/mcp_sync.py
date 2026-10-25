@@ -17,16 +17,21 @@ callbacks; this module is registry-agnostic.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
-from pathlib import Path
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from pathlib import Path
 
-from services.mcp import mcp_installer, mcp_registry, mcp_tarball
-from services.mcp import mcp_manifest_types as _mt
+from services.mcp import (
+    mcp_installer,
+    mcp_manifest_types as _mt,
+    mcp_registry,
+    mcp_tarball,
+)
 
 logger = logging.getLogger("otodock.mcp-sync")
 
@@ -118,7 +123,7 @@ async def version_hashes_for(names, *, force: bool = False) -> dict[str, str]:
         for name, manifest in manifests.items():
             try:
                 out[name] = _version_hash(manifest, force=force)
-            except Exception:
+            except (OSError, ValueError):
                 out[name] = ""
         return out
 
@@ -162,6 +167,13 @@ class SyncResult:
     # in use (swap blocked). NOT excluded — the session uses the working old
     # version; the update lands once the holder closes. name -> reason.
     deferred: dict[str, str] = field(default_factory=dict)
+    # MCPs of the plan not done when the session started (``early_start_s``):
+    # excluded too, never reported as failures; ``watch`` tells when they end.
+    still_installing: set[str] = field(default_factory=set)
+    # MCPs a start beside another session's plan found missing and outside
+    # that plan: excluded, never promised an end; the next start installs them.
+    not_installed: set[str] = field(default_factory=set)
+    watch: InstallWatch | None = field(default=None, repr=False, compare=False)
 
 
 def unavailable_reasons(result: SyncResult, assigned) -> dict[str, str]:
@@ -170,12 +182,338 @@ def unavailable_reasons(result: SyncResult, assigned) -> dict[str, str]:
     is the sync's business, never the prompt's."""
     out: dict[str, str] = {}
     for name in result.excluded_names & set(assigned):
+        if name in result.still_installing:
+            out[name] = "still installing on this machine, a new chat here can use it once it is done"
+            continue
+        if name in result.not_installed:
+            out[name] = "not installed yet on this machine, a new chat here installs it"
+            continue
         err = " ".join(str(result.failed.get(name) or "").split())
         if len(err) > 200:
             err = err[:197] + "..."
         out[name] = (f"could not be installed on this machine ({err})" if err
                      else "could not be installed on this machine")
     return out
+
+
+# Each MCP's install budget, counted from its own start (the satellite
+# installs a plan one MCP after the other): generous, as a slow machine takes
+# minutes for a heavy one. Past it the MCP reads as failed and the ones queued
+# behind it as not started; the satellite carries on, and the next session
+# finds them installed. One ceiling for a whole plan (600 s) ran out on a
+# slow machine with a long plan while every install was still on its way.
+INSTALL_BUDGET_S = 600.0
+SOURCE_BUILD_BUDGET_S = 1200.0   # a package the manifest lets build from source
+# The satellite's check after the last install (it boots each fresh MCP once).
+VERIFY_BUDGET_S = 180.0
+# How long a session start waits for its installs before it starts with the
+# tools that are ready (``SyncResult.still_installing``): a person's chat,
+# and a phone call sooner (a caller is on the line).
+EARLY_START_S = 120.0
+PHONE_EARLY_START_S = 45.0
+# The progress phase of the satellite's check after the installs (no ``mcp``).
+VERIFYING_PHASE = "verifying"
+# The phases of an MCP's own end: installed (or its update kept back), failed.
+_END_PHASES = {"done": True, "failed": False}
+# The plan running on each machine, while its listener runs.
+_watches: dict[str, InstallWatch] = {}
+
+
+_COUNT_WORDS = ("No", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight",
+                "Nine", "Ten")
+
+
+def tool_labels(names) -> list[str]:
+    """The tools' names as a person reads them (each manifest's label)."""
+    out = []
+    for name in names:
+        manifest = mcp_registry.get_manifest(name)
+        out.append(str(getattr(manifest, "label", "") or name))
+    return out
+
+
+def _listed(labels: list[str]) -> str:
+    return labels[0] if len(labels) == 1 else f"{', '.join(labels[:-1])} and {labels[-1]}"
+
+
+def installing_sentence(labels: list[str], place: str) -> str:
+    """The chat's line when its session starts with tools still installing."""
+    if len(labels) == 1:
+        return (f"One tool is still installing on {place}: {labels[0]}. Start a new chat on "
+                "this machine once it is done to use it.")
+    count = _COUNT_WORDS[len(labels)] if len(labels) < len(_COUNT_WORDS) else str(len(labels))
+    return (f"{count} tools are still installing on {place}: {_listed(labels)}. Start a new "
+            "chat on this machine once they are done to use them.")
+
+
+def finished_sentence(ok: list[str], failed: list[str], place: str) -> str:
+    """The chat's line once those tools ended: finished, or some failed."""
+    them = "it" if len(ok) == 1 else "them"
+    if not failed:
+        done = "The tool" if len(ok) == 1 else "The tools"
+        return f"{done} finished installing on {place}. Start a new chat on {place} to use {them}."
+    out = f"{_listed(failed)} could not be installed on {place}."
+    if ok:
+        out += f" {_listed(ok)} finished installing. Start a new chat on {place} to use {them}."
+    return out
+
+
+def early_start_for(client_type: str | None) -> float | None:
+    """How long a session start of this kind waits for its installs before
+    it starts with the tools that are ready: a person's chat, a phone call
+    sooner; ``None`` for a run nobody watches (it waits for its plan)."""
+    from core.session import session_kind
+    if session_kind.attended(client_type):
+        return EARLY_START_S
+    if session_kind.of(client_type) is session_kind.PHONE:
+        return PHONE_EARLY_START_S
+    return None
+
+
+def _install_budget(spec: dict) -> float:
+    return SOURCE_BUILD_BUDGET_S if spec.get("source_build") else INSTALL_BUDGET_S
+
+
+class InstallWatch:
+    """One sync's plan on a machine, read from the satellite's progress
+    events. The satellite installs the plan in its order and names each
+    MCP's own start and end (``mcp`` = the name; the installer's own lines
+    say ``<name>.new``), so each MCP is queued, installing or ended, and the
+    one installing is judged by its own budget from its own start."""
+
+    def __init__(self, machine_id: str, order: list[str], budgets: dict[str, float],
+                 installs: set[str]) -> None:
+        self.machine_id = machine_id
+        self.order = order
+        self.budgets = budgets
+        self.installs = installs           # the rest of the plan are updates
+        self.ended: dict[str, bool] = {}   # name -> installed (or kept), else failed
+        self.errors: dict[str, str] = {}
+        self.unstarted: set[str] = set()   # queued behind one past its budget: unknown
+        self.detached = False              # the session started: its progress_cb is done
+        self.told: set[str] = set()        # the chats whose line names this plan
+        self.changed = asyncio.Event()
+        self.result: SyncResult | None = None
+        self._since = time.monotonic()     # the start of the MCP installing now
+        self._verifying_since: float | None = None
+        self._listeners: list[Callable[[InstallWatch], object]] = []
+
+    def pending(self) -> list[str]:
+        return [n for n in self.order if n not in self.ended]
+
+    def ceiling(self) -> float:
+        """The plan's own command timeout: past every budget, so the watch
+        always ends the wait first."""
+        return sum(self.budgets.values()) + VERIFY_BUDGET_S
+
+    def on_event(self, ev: dict) -> None:
+        name = str(ev.get("mcp") or "")
+        phase = str(ev.get("phase") or "")
+        if phase == VERIFYING_PHASE:
+            self._verifying_since = time.monotonic()
+        elif name in self.budgets and name not in self.ended and phase in _END_PHASES:
+            self.ended[name] = _END_PHASES[phase]
+            if not self.ended[name]:
+                self.errors[name] = str(ev.get("error") or ev.get("message") or "install failed")
+            self._since = time.monotonic()
+        self.changed.set()
+
+    def deadline(self) -> float:
+        pending = self.pending()
+        if pending and self._verifying_since is None:
+            return self._since + self.budgets[pending[0]]
+        return (self._verifying_since or self._since) + VERIFY_BUDGET_S
+
+    def expire(self) -> None:
+        """The MCP installing ran past its budget: it reads as failed; the
+        ones queued behind it stay unknown (they never started)."""
+        pending = self.pending()
+        if pending and self._verifying_since is None:
+            name = pending[0]
+            self.ended[name] = False
+            self.errors[name] = (f"did not finish installing in "
+                                 f"{round(self.budgets[name] / 60)} minutes")
+        self.unstarted = set(self.pending())
+        logger.warning("sync_mcps %s: past the install budget, %s did not end",
+                       self.machine_id[:8], sorted(self.unstarted) or "the check")
+
+    def so_far(self) -> SyncResult:
+        """The plan as far as it went, for a session that starts before it
+        ends: an MCP not ended is still installing and left out (an install
+        is not there yet, an update may swap its folder under the session's
+        process)."""
+        result = SyncResult(watch=self)
+        for name in self.order:
+            end = self.ended.get(name)
+            if end is None:
+                result.still_installing.add(name)
+                result.excluded_names.add(name)
+            elif end:
+                (result.installed if name in self.installs else result.updated).append(name)
+            else:
+                result.failed[name] = self.errors.get(name, "install failed")
+                result.excluded_names.add(name)
+        return result
+
+    def outcome(self, names) -> tuple[list[str], list[str], list[str]]:
+        """``names`` split by how each ended: installed, failed, unknown."""
+        ok = [n for n in names if self.ended.get(n) is True]
+        failed = [n for n in names if self.ended.get(n) is False]
+        return ok, failed, [n for n in names if n not in self.ended]
+
+    def settle(self, result: SyncResult) -> None:
+        """The plan ended: the result's word on each MCP, then the listeners."""
+        for name in (*result.installed, *result.updated, *result.deferred):
+            self.ended[name] = True
+        for name in result.failed:
+            if name in self.budgets and name not in self.unstarted:
+                self.ended.setdefault(name, False)
+        self.result = result
+        listeners, self._listeners = self._listeners, []
+        for cb in listeners:
+            self._call(cb)
+
+    def when_settled(self, cb: Callable[[InstallWatch], object]) -> None:
+        """Call ``cb(watch)`` once the plan ended (now when it has)."""
+        if self.result is not None:
+            self._call(cb)
+        else:
+            self._listeners.append(cb)
+
+    def _call(self, cb) -> None:
+        try:
+            r = cb(self)
+            if asyncio.iscoroutine(r):
+                from core import background
+                background.spawn(r, name=f"settled-{self.machine_id[:8]}", owner="mcp-sync")
+        except Exception:  # a listener's failure never stops the others
+            logger.exception("sync_mcps: a settled listener failed")
+
+
+async def _await_plan(watch: InstallWatch, ack: asyncio.Future, *, until: float | None) -> bool:
+    """Wait for the plan's ack, the end of the current MCP's budget, or
+    ``until`` (the session's early start, a monotonic instant). True when the
+    plan ended (the ack, a failed command, a budget passed); False at
+    ``until``."""
+    while not ack.done():
+        now = time.monotonic()
+        deadline = watch.deadline()
+        if now >= deadline:
+            watch.expire()
+            return True
+        if until is not None and now >= until:
+            return False
+        stop = deadline if until is None else min(deadline, until)
+        watch.changed.clear()
+        changed = asyncio.ensure_future(watch.changed.wait())
+        try:
+            await asyncio.wait({ack, changed}, timeout=stop - now,
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            changed.cancel()
+    return True
+
+
+async def _finish_in_background(watch: InstallWatch, ack: asyncio.Future,
+                                stack: contextlib.AsyncExitStack,
+                                conclude: Callable[[], SyncResult],
+                                abandon: Callable[[], None]) -> None:
+    """The rest of a plan a session started beside: wait for the ack or the
+    budget, settle the watch (its listeners say how the plan ended), then
+    free the machine's install lock. A tail cancelled first (the proxy
+    shutting down) leaves no listener behind."""
+    try:
+        await _await_plan(watch, ack, until=None)
+        conclude()
+    finally:
+        abandon()
+        await stack.aclose()
+
+
+def _skip_known(machine_id: str, to_install: set[str], to_update: set[str],
+                hashes: dict[str, str], sat_ver: str, *, force: bool) -> dict[str, str]:
+    """Drop from the plan what this machine already answered: an update it
+    recently deferred (its old version in use) and an install the resolver
+    declared unsatisfiable for the same bytes. Returns the memoized ones with
+    their error; ``force`` (the retry button) clears both and skips nothing."""
+    # Re-shipping a deferred update would rebuild ~70s on the satellite
+    # every session for nothing; the session keeps the working old version.
+    # The backoff self-expires and is cleared on a successful install.
+    if to_update and not force:
+        deferred_now = {n for n in to_update if _is_update_deferred(machine_id, n)}
+        if deferred_now:
+            logger.info(
+                "sync_mcps: skipping %d deferred update(s) for %s (in use): %s",
+                len(deferred_now), machine_id[:8], sorted(deferred_now),
+            )
+            to_update -= deferred_now
+    memo_skips: dict[str, str] = {}
+    for name in sorted(to_install | to_update):
+        memo = _unsatisfiable_installs.get((machine_id, name))
+        if memo is None:
+            continue
+        if force:
+            _unsatisfiable_installs.pop((machine_id, name), None)
+            continue
+        if memo.get("satellite_version") != sat_ver:
+            # The satellite self-updated since the failure — installer
+            # behavior may have changed (e.g. a new python-floor retry) —
+            # the verdict deserves a fresh attempt.
+            _unsatisfiable_installs.pop((machine_id, name), None)
+            continue
+        current_hash = hashes.get(name, "")
+        if current_hash and current_hash == memo.get("hash"):
+            memo_skips[name] = memo.get("error", "install unsatisfiable")
+        else:
+            # Platform-side MCP changed — the verdict may differ now.
+            _unsatisfiable_installs.pop((machine_id, name), None)
+    if memo_skips:
+        to_install -= set(memo_skips)
+        to_update -= set(memo_skips)
+        logger.info(
+            "sync_mcps: skipping %d memoized unsatisfiable install(s) "
+            "for %s: %s", len(memo_skips), machine_id[:8],
+            sorted(memo_skips),
+        )
+    return memo_skips
+
+
+def _with_memo(result: SyncResult, memo_skips: dict[str, str]) -> SyncResult:
+    """``result`` with the memoized unsatisfiable installs excluded as
+    failed (no install was attempted for them this session)."""
+    for name, err in memo_skips.items():
+        result.failed[name] = err
+        result.excluded_names.add(name)
+        result.memoized.add(name)
+    return result
+
+
+async def _beside_running_sync(cm, machine_id: str, desired: set[str], *,
+                               force: bool) -> SyncResult:
+    """A session start while another session's plan still holds the
+    machine's install lock past the early start: no install of its own (the
+    running plan may be swapping the very folders). It starts with what the
+    satellite has. What the running plan still installs or updates reads as
+    still installing, and its watch tells when it ends; what the satellite
+    lacks outside that plan is left out as not installed yet (the next start
+    installs it, nothing here promises an end); the deferred updates and the
+    memoized unsatisfiable installs are answered as on the main path."""
+    installed = await _fetch_satellite_state(cm, machine_id)
+    hashes = await version_hashes_for(desired, force=force)
+    to_install, to_update, _ = _diff(desired=desired, installed=installed, force=force,
+                                     hashes=hashes)
+    sat_ver = getattr(cm.get_connection(machine_id), "satellite_version", "") or ""
+    memo_skips = _skip_known(machine_id, to_install, to_update, hashes, sat_ver, force=force)
+    watch = _watches.get(machine_id)
+    running = set(watch.pending()) if watch is not None else set()
+    still = (to_install | to_update) & running
+    missing = to_install - running
+    logger.info("sync_mcps: %s still installs for another session; this one starts without "
+                "%s (installing) and %s (not installed yet)",
+                machine_id[:8], sorted(still), sorted(missing))
+    return _with_memo(SyncResult(still_installing=still, not_installed=missing,
+                                 excluded_names=still | missing,
+                                 watch=watch if still else None), memo_skips)
 
 
 # The satellite version that removes an MCP from any category when the
@@ -262,10 +600,20 @@ async def lifted_by_context(config, launched: set[str]) -> set[str]:
             role=getattr(sc, "role", "") or "",
             placement=placement,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001  # lifting reads the store and the credential resolver, a miss lifts none
         logger.warning("sync_mcps: the lifted set failed for %s", config.agent_name,
                        exc_info=True)
         return set()
+
+
+async def _tarball_of(name: str) -> mcp_tarball.TarballResult:
+    """``name``'s tarball, off the loop (the walk and the gzip took over a
+    second on a session start), built once more when an install changed the
+    folder under the first build."""
+    try:
+        return await asyncio.to_thread(mcp_tarball.build_tarball, name)
+    except mcp_tarball.TreeChanged:
+        return await asyncio.to_thread(mcp_tarball.build_tarball, name)
 
 
 async def sync_mcps_for_session(
@@ -277,6 +625,7 @@ async def sync_mcps_for_session(
     plan_cb: Callable[[dict], Awaitable[None]] | None = None,
     progress_cb: ProgressCb = None,
     force: bool = False,
+    early_start_s: float | None = None,
 ) -> SyncResult:
     """Align the satellite's installed MCPs with what this session needs.
 
@@ -302,6 +651,14 @@ async def sync_mcps_for_session(
     Returns SyncResult detailing installs/updates/removes/failures. On any
     failed install, the MCP name is added to ``excluded_names``; callers
     should filter it from the shipped MCP config.
+
+    Each MCP of the plan is judged by its own budget (``INSTALL_BUDGET_S``
+    from its own start). With ``early_start_s`` (a session start) the sync
+    returns once that much time passed: what ended is in the result, the
+    rest in ``still_installing`` (excluded too), and the plan goes on in the
+    background with the machine's install lock until it ends; ``watch``
+    tells when. A start that finds another plan holding the lock that long
+    starts beside it, installing nothing.
     """
     from core.remote.remote_execution import get_remote_layer
     from core.remote.satellite_connection import get_connection_manager
@@ -322,7 +679,15 @@ async def sync_mcps_for_session(
             continue
         desired.update(getattr(other_info, "used_mcps", set()) or set())
 
-    async with cm.get_install_lock(machine_id):
+    until = None if early_start_s is None else time.monotonic() + early_start_s
+    stack = contextlib.AsyncExitStack()
+    try:
+        await asyncio.wait_for(stack.enter_async_context(cm.get_install_lock(machine_id)),
+                               timeout=early_start_s)
+    except TimeoutError:
+        return await _beside_running_sync(cm, machine_id, desired, force=force)
+    handed_off = False   # the lock goes with a plan that ends in the background
+    try:
         # Compute satellite state. Fresh verify on every sync to avoid
         # acting on stale capability reports (the heartbeat capability
         # doesn't refresh on each install — a reconnect might though).
@@ -349,60 +714,15 @@ async def sync_mcps_for_session(
             and (any_category or installed[n]["category"] != "core")
         }
 
-        # Drop updates the satellite recently DEFERRED (old version still in use
-        # → swap blocked). Re-shipping would rebuild ~70s on the satellite every
-        # session for nothing; the session keeps using the working old version.
-        # ``force`` overrides; the backoff self-expires and is cleared on a
-        # successful install below.
-        if to_update and not force:
-            deferred_now = {n for n in to_update if _is_update_deferred(machine_id, n)}
-            if deferred_now:
-                logger.info(
-                    "sync_mcps: skipping %d deferred update(s) for %s (in use): %s",
-                    len(deferred_now), machine_id[:8], sorted(deferred_now),
-                )
-                to_update -= deferred_now
-
-        # Memoized deterministic failures: don't re-attempt an install the
-        # resolver already declared unsatisfiable for the SAME platform bytes.
-        # ``force`` (the retry button) clears the memo and attempts anyway.
-        memo_skips: dict[str, str] = {}
+        # What this machine already answered: a recently deferred update, a
+        # memoized unsatisfiable install.
         _conn = cm.get_connection(machine_id)
         _sat_ver = getattr(_conn, "satellite_version", "") or ""
-        for name in sorted(to_install | to_update):
-            memo = _unsatisfiable_installs.get((machine_id, name))
-            if memo is None:
-                continue
-            if force:
-                _unsatisfiable_installs.pop((machine_id, name), None)
-                continue
-            if memo.get("satellite_version") != _sat_ver:
-                # The satellite self-updated since the failure — installer
-                # behavior may have changed (e.g. a new python-floor retry) —
-                # the verdict deserves a fresh attempt.
-                _unsatisfiable_installs.pop((machine_id, name), None)
-                continue
-            current_hash = hashes.get(name, "")
-            if current_hash and current_hash == memo.get("hash"):
-                memo_skips[name] = memo.get("error", "install unsatisfiable")
-            else:
-                # Platform-side MCP changed — the verdict may differ now.
-                _unsatisfiable_installs.pop((machine_id, name), None)
-        if memo_skips:
-            to_install -= set(memo_skips)
-            to_update -= set(memo_skips)
-            logger.info(
-                "sync_mcps: skipping %d memoized unsatisfiable install(s) "
-                "for %s: %s", len(memo_skips), machine_id[:8],
-                sorted(memo_skips),
-            )
+        memo_skips = _skip_known(machine_id, to_install, to_update, hashes, _sat_ver,
+                                 force=force)
 
         def _with_memo_skips(r: SyncResult) -> SyncResult:
-            for name, err in memo_skips.items():
-                r.failed[name] = err
-                r.excluded_names.add(name)
-                r.memoized.add(name)
-            return r
+            return _with_memo(r, memo_skips)
 
         if not (to_install or to_update or to_remove):
             return _with_memo_skips(SyncResult(ok=True))
@@ -434,7 +754,10 @@ async def sync_mcps_for_session(
                 # satellite install for both.
                 continue
             try:
-                tb = mcp_tarball.build_tarball(name)
+                tb = await _tarball_of(name)
+            except mcp_tarball.TreeChanged as e:
+                logger.warning("%s, twice: it is left out of this session's sync", e)
+                continue
             except Exception as e:
                 logger.exception("tarball build failed for %s: %s", name, e)
                 continue
@@ -442,6 +765,8 @@ async def sync_mcps_for_session(
             specs.append(_install_spec(name, manifest, tb))
 
         command_id = str(uuid.uuid4())
+        watch = InstallWatch(machine_id, [s["name"] for s in specs],
+                             {s["name"]: _install_budget(s) for s in specs}, set(to_install))
 
         async def _progress_forwarder(ev: dict):
             logger.debug(
@@ -449,7 +774,8 @@ async def sync_mcps_for_session(
                 command_id[:8], ev.get("mcp", "-"), ev.get("phase", "-"),
                 ev.get("pct", "-"), "set" if progress_cb else "NONE",
             )
-            if progress_cb is None:
+            watch.on_event(ev)
+            if progress_cb is None or watch.detached:
                 return
             r = progress_cb(ev)
             if asyncio.iscoroutine(r):
@@ -457,77 +783,141 @@ async def sync_mcps_for_session(
 
         cm.register_install_progress(command_id, _progress_forwarder)
         logger.info("mcp_sync: registered progress cb for command_id=%s", command_id[:8])
-        try:
-            # Critical: pass command_id as the kwarg, NOT just in the msg
-            # dict. ``SatelliteConnectionManager.send_command`` overwrites
-            # ``msg["command_id"]`` with the kwarg value (or generates a
-            # fresh UUID if the kwarg is None). Without this, the
-            # `register_install_progress` above keyed on `command_id`, but
-            # the satellite would receive a different generated id and emit
-            # `mcp_install_progress` events with that one — leaving the
-            # callback orphaned and the dashboard install bar stuck at 0%.
-            frame = {
-                "type": "sync_mcps",
-                "mcps_to_install": specs,
-                "mcps_to_remove": sorted(to_remove),
-            }
-            if any_category and to_remove:
-                frame["remove_any_category"] = True
-            ack = await cm.send_command(
-                machine_id, frame, timeout=600.0, command_id=command_id,
-            )  # 10 min ceiling for slow pip builds
-        except Exception as e:
-            logger.exception("sync_mcps command failed: %s", e)
-            cm.unregister_install_progress(command_id)
-            return _with_memo_skips(
-                SyncResult(ok=False, failed={"__transport__": str(e)})
-            )
-        finally:
-            cm.unregister_install_progress(command_id)
+        # Critical: pass command_id as the kwarg, NOT just in the msg
+        # dict. ``SatelliteConnectionManager.send_command`` overwrites
+        # ``msg["command_id"]`` with the kwarg value (or generates a
+        # fresh UUID if the kwarg is None). Without this, the
+        # `register_install_progress` above keyed on `command_id`, but
+        # the satellite would receive a different generated id and emit
+        # `mcp_install_progress` events with that one — leaving the
+        # callback orphaned and the dashboard install bar stuck at 0%.
+        frame: dict = {
+            "type": "sync_mcps",
+            "mcps_to_install": specs,
+            "mcps_to_remove": sorted(to_remove),
+        }
+        if any_category and to_remove:
+            frame["remove_any_category"] = True
+        # The command's own timeout lies past every budget: the watch ends
+        # the wait first, each MCP by its own budget.
+        ack = asyncio.ensure_future(cm.send_command(
+            machine_id, frame, timeout=watch.ceiling(), command_id=command_id,
+        ))
+        _watches[machine_id] = watch
 
-        results = ack.get("results", {}) or {}
-        result = SyncResult()
-        for name, info in results.items():
-            status = info.get("status", "error")
-            if status == "ok":
-                # Update landed — clear any deferral backoff for this MCP.
-                _deferred_updates.pop((machine_id, name), None)
-                _unsatisfiable_installs.pop((machine_id, name), None)
-                if name in to_install:
-                    result.installed.append(name)
-                else:
-                    result.updated.append(name)
-            elif status == "deferred":
-                # Update couldn't swap (old version in use); the satellite kept
-                # the working old version. NOT a failure — do not exclude. Back
-                # off so we don't re-ship + rebuild it every session until the
-                # holding session closes.
-                result.deferred[name] = info.get("error", "")
-                _mark_update_deferred(machine_id, name)
-            elif status == "removed":
-                result.removed.append(name)
-            elif status == "not_found":
-                # Nothing to remove — not a failure.
-                pass
+        ended = False
+
+        def _release() -> None:
+            nonlocal ended
+            ended = True
+            cm.unregister_install_progress(command_id)
+            if _watches.get(machine_id) is watch:
+                del _watches[machine_id]
+
+        def _conclude() -> SyncResult:
+            _release()
+            result = _concluded(watch, ack, machine_id=machine_id, to_install=to_install,
+                                shipped_hashes=shipped_hashes, sat_ver=_sat_ver)
+            watch.settle(result)
+            return result
+
+        def _abandon() -> None:
+            # A wait that never concluded (its caller cancelled: the person
+            # stopped or closed a starting chat; the tail at shutdown): the
+            # ack, the listener and the watch go with it, so no later event
+            # reaches a dead start. The satellite finishes on its own.
+            if ended:
+                return
+            _release()
+            ack.cancel()
+
+        try:
+            plan_ended = await _await_plan(watch, ack, until=until)
+        except BaseException:
+            _abandon()
+            raise
+        if plan_ended:
+            return _with_memo_skips(_conclude())
+        # The session starts now with the tools that are ready; the rest go
+        # on installing with the lock and the listener.
+        watch.detached = True
+        handed_off = True
+        from core import background
+        background.spawn(_finish_in_background(watch, ack, stack, _conclude, _abandon),
+                         name=f"plan-{machine_id[:8]}", owner="mcp-sync")
+        # One turn of the loop, so the tail is inside its ``finally`` before
+        # anything can cancel it: a task cancelled before its first step
+        # never runs its body, and the lock would stay held.
+        await asyncio.sleep(0)
+        logger.info("sync_mcps %s: the session starts while %s still install",
+                    machine_id[:8], watch.pending())
+        return _with_memo_skips(watch.so_far())
+    finally:
+        if not handed_off:
+            await stack.aclose()
+
+
+def _concluded(watch: InstallWatch, ack: asyncio.Future, *, machine_id: str,
+               to_install: set[str], shipped_hashes: dict[str, str],
+               sat_ver: str) -> SyncResult:
+    """The plan's result once it ended: the ack's, a failed command's, or,
+    past a budget, what the events said (an MCP not ended did not start)."""
+    if not ack.done() or ack.cancelled():
+        ack.cancel()
+        result = watch.so_far()
+        result.ok = False
+        result.watch = None
+        for name in sorted(result.still_installing):
+            result.failed[name] = "did not start installing"
+        result.still_installing = set()
+        return result
+    exc = ack.exception()
+    if exc is not None:
+        logger.error("sync_mcps command failed: %s", exc)
+        return SyncResult(ok=False, failed={"__transport__": str(exc)})
+    results = ack.result().get("results", {}) or {}
+    result = SyncResult()
+    for name, info in results.items():
+        status = info.get("status", "error")
+        if status == "ok":
+            # Update landed — clear any deferral backoff for this MCP.
+            _deferred_updates.pop((machine_id, name), None)
+            _unsatisfiable_installs.pop((machine_id, name), None)
+            if name in to_install:
+                result.installed.append(name)
             else:
-                err = info.get("error", "unknown")
-                result.failed[name] = err
-                result.excluded_names.add(name)
-                # A resolver-unsatisfiable failure is DETERMINISTIC for these
-                # platform bytes on this machine — memo it so every later
-                # session skips the doomed re-attempt (and its bar flash)
-                # until the MCP changes, an install succeeds, or force retry.
-                if _UNSAT_FAIL_RE.search(err) and shipped_hashes.get(name):
-                    _unsatisfiable_installs[(machine_id, name)] = {
-                        "hash": shipped_hashes[name], "error": err,
-                        "satellite_version": _sat_ver,
-                    }
-            # Pre-warm boot check. "warn:<reason>" = installed but
-            # didn't answer initialize in time. Advisory — not excluded.
-            warm = info.get("warmup", "")
-            if isinstance(warm, str) and warm.startswith("warn:"):
-                result.warmup_failed[name] = warm[len("warn:"):]
-        return _with_memo_skips(result)
+                result.updated.append(name)
+        elif status == "deferred":
+            # Update couldn't swap (old version in use); the satellite kept
+            # the working old version. NOT a failure — do not exclude. Back
+            # off so we don't re-ship + rebuild it every session until the
+            # holding session closes.
+            result.deferred[name] = info.get("error", "")
+            _mark_update_deferred(machine_id, name)
+        elif status == "removed":
+            result.removed.append(name)
+        elif status == "not_found":
+            # Nothing to remove — not a failure.
+            pass
+        else:
+            err = info.get("error", "unknown")
+            result.failed[name] = err
+            result.excluded_names.add(name)
+            # A resolver-unsatisfiable failure is DETERMINISTIC for these
+            # platform bytes on this machine — memo it so every later
+            # session skips the doomed re-attempt (and its bar flash)
+            # until the MCP changes, an install succeeds, or force retry.
+            if _UNSAT_FAIL_RE.search(err) and shipped_hashes.get(name):
+                _unsatisfiable_installs[(machine_id, name)] = {
+                    "hash": shipped_hashes[name], "error": err,
+                    "satellite_version": sat_ver,
+                }
+        # Pre-warm boot check. "warn:<reason>" = installed but
+        # didn't answer initialize in time. Advisory — not excluded.
+        warm = info.get("warmup", "")
+        if isinstance(warm, str) and warm.startswith("warn:"):
+            result.warmup_failed[name] = warm[len("warn:"):]
+    return result
 
 
 async def _fetch_satellite_state(cm, machine_id: str) -> dict[str, dict]:
@@ -537,7 +927,7 @@ async def _fetch_satellite_state(cm, machine_id: str) -> dict[str, dict]:
             "type": "sync_mcps_verify",
         }, timeout=15.0)
         return ack.get("mcps", {}) or {}
-    except Exception as e:
+    except RuntimeError as e:
         logger.warning("sync_mcps_verify failed: %s", e)
         # Fall back to the last-reported capabilities — better than nothing.
         conn = cm.get_connection(machine_id)
@@ -586,7 +976,7 @@ def _diff(
         else:
             try:
                 current_hash = _version_hash(manifest, force=force)
-            except Exception:
+            except (OSError, ValueError):
                 current_hash = ""
         if force or (current_hash and current_hash != info.get("version_hash", "")):
             to_update.add(name)

@@ -76,8 +76,8 @@ def focus_line(user_sub: str, *, connection_id: str | None = None) -> str:
     row = task_store.get_app(focus.get("app_id") or "")
     if not row or row.get("hidden"):
         return ""
-    from api.apps.apps import app_access
     from auth.providers import user_context_for_sub
+    from services.apps.audience import app_access
     user = user_context_for_sub(user_sub)
     if user is None or not app_access(row, user):
         return ""

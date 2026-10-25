@@ -1,10 +1,13 @@
 import { useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
+import { usePortalRoot } from '../ui/portalRoot'
+import { BUTTON_BASE, BUTTON_SIZE, BUTTON_VARIANT, POPOVER } from '../ui/classes'
 
 import {
   isBatchRunning, useTransferStore, type TransferItem, type TransferMachineRow,
 } from '../../store/transferStore'
-import { Bar, fmtSize, pct } from '../common/TransferBar'
+import { Bar } from '../common/TransferBar'
+import { fmtSize, pct } from '../common/transferFormat'
 
 /** Anchored popover listing the current section's active uploads/syncs:
  * per item a phase-1 upload bar (while the XHR runs), then phase-2 rows —
@@ -21,21 +24,21 @@ interface Props {
 
 function MachineRowView({ row }: { row: TransferMachineRow }) {
   const chip = {
-    queued: 'bg-p-surface-hover text-p-text-secondary',
-    active: 'bg-brand-surface text-brand',
-    done: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400',
-    failed: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400',
+    queued: 'bg-surface-muted text-secondary',
+    active: 'bg-status-info-bg text-status-info-fg',
+    done: 'bg-status-success-bg text-status-success-fg',
+    failed: 'bg-status-danger-bg text-status-danger-fg',
   }[row.state]
   return (
     <div className="flex flex-col gap-0.5 pl-5 pr-1 py-0.5" title={row.error || undefined}>
       <div className="flex items-center gap-2 min-w-0">
         {/* monitor icon — a remote machine */}
-        <svg width={11} height={11} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="shrink-0 text-p-text-light">
+        <svg width={11} height={11} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="shrink-0 text-tertiary">
           <rect x="2" y="4" width="20" height="13" rx="2" />
           <path strokeLinecap="round" d="M8 21h8m-4-4v4" />
         </svg>
-        <span className="text-[11px] text-p-text truncate flex-1">{row.name}</span>
-        <span className={`text-[9px] px-1.5 py-px rounded-full font-medium shrink-0 ${chip}`}>
+        <span className="text-2xs text-primary truncate flex-1">{row.name}</span>
+        <span className={`text-3xs px-1.5 py-px rounded-full font-medium shrink-0 ${chip}`}>
           {row.state === 'failed' ? 'failed' : row.state}
         </span>
       </div>
@@ -43,7 +46,7 @@ function MachineRowView({ row }: { row: TransferMachineRow }) {
         <Bar value={pct(row.bytesSent, row.bytesTotal)} />
       )}
       {row.state === 'failed' && (
-        <span className="text-[10px] text-p-text-light">retries at next sync</span>
+        <span className="text-3xs text-tertiary">Retries at next sync</span>
       )}
     </div>
   )
@@ -66,20 +69,20 @@ function ItemView({ item }: { item: TransferItem }) {
           ? 'Uploaded'
           : 'Processing…'
   return (
-    <div className="flex flex-col gap-1 px-3 py-2 border-b border-p-border-light last:border-b-0">
+    <div className="flex flex-col gap-1 px-3 py-2 border-b border-subtle last:border-b-0">
       <div className="flex items-center gap-2 min-w-0">
-        <svg width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="shrink-0 text-p-text-secondary">
+        <svg width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="shrink-0 text-secondary">
           <path strokeLinecap="round" strokeLinejoin="round" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
           <path strokeLinecap="round" strokeLinejoin="round" d="M14 2v6h6" />
         </svg>
-        <span className="text-xs text-p-text font-medium truncate flex-1" title={item.relPath}>
+        <span className="text-xs text-primary font-medium truncate flex-1" title={item.relPath}>
           {item.filename}
         </span>
-        <span className="text-[10px] text-p-text-light shrink-0">
+        <span className="text-3xs text-tertiary shrink-0">
           {fmtSize(item.uploadTotal)}
         </span>
       </div>
-      <span className={`text-[10px] ${item.uploadFailed ? 'text-red-600' : 'text-p-text-light'}`}>
+      <span className={`text-3xs ${item.uploadFailed ? 'text-status-danger-fg' : 'text-tertiary'}`}>
         {label}
       </span>
       {uploading && <Bar value={pct(item.uploadSent, item.uploadTotal)} />}
@@ -106,6 +109,7 @@ function runningBatches(items: TransferItem[]): Array<{ batchId: string; label: 
 
 export default function TransferPopup({ items, anchor, onClose }: Props) {
   const ref = useRef<HTMLDivElement>(null)
+  const portalRoot = usePortalRoot()
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -126,29 +130,29 @@ export default function TransferPopup({ items, anchor, onClose }: Props) {
     <div
       ref={ref}
       style={{ position: 'fixed', left: anchor.left, top: anchor.top, zIndex: 60 }}
-      className="w-[300px] max-w-[calc(100vw-16px)] max-h-[50vh] overflow-y-auto bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg"
+      className={`w-[300px] max-w-[calc(100vw-16px)] max-h-[50vh] overflow-y-auto ${POPOVER}`}
     >
-      <div className="px-3 py-1.5 border-b border-p-border-light text-[10px] font-semibold uppercase tracking-wide text-p-text-light">
-        Uploads &amp; sync
+      <div className="px-3 py-1.5 border-b border-subtle text-3xs font-semibold uppercase tracking-wide text-tertiary">
+        Uploads and sync
       </div>
       {runningBatches(items).map(({ batchId, label }) => (
-        <div key={batchId} className="flex items-center gap-2 px-3 py-1.5 border-b border-p-border-light">
-          <span className="text-[11px] text-p-text truncate flex-1">Uploading {label}</span>
+        <div key={batchId} className="flex items-center gap-2 px-3 py-1.5 border-b border-subtle">
+          <span className="text-2xs text-primary truncate flex-1">Uploading {label}</span>
           <button
             type="button"
             onClick={() => useTransferStore.getState().cancelBatch(batchId)}
-            className="text-[11px] px-2 py-0.5 rounded-sm border border-p-border-light text-p-text hover:bg-p-surface-hover shrink-0"
+            className={`${BUTTON_BASE} ${BUTTON_VARIANT.secondary} ${BUTTON_SIZE.xs} shrink-0`}
           >
             Cancel
           </button>
         </div>
       ))}
       {items.length === 0 ? (
-        <div className="px-3 py-3 text-[11px] text-p-text-light">Nothing in progress.</div>
+        <div className="px-3 py-3 text-2xs text-tertiary">Nothing in progress.</div>
       ) : (
         items.map((t) => <ItemView key={t.id} item={t} />)
       )}
     </div>,
-    document.body,
+    portalRoot,
   )
 }

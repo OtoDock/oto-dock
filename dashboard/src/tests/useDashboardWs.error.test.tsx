@@ -10,21 +10,7 @@ import { renderHook, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useDashboardWs } from '@/hooks/useDashboardWs'
 import { useChatStore } from '@/store/chatStore'
-
-class FakeWebSocket {
-  static OPEN = 1
-  static CONNECTING = 0
-  static instances: FakeWebSocket[] = []
-  readyState = FakeWebSocket.OPEN
-  sent: string[] = []
-  onopen: (() => void) | null = null
-  onclose: ((e?: { code: number; reason: string }) => void) | null = null
-  onerror: (() => void) | null = null
-  onmessage: ((e: { data: string }) => void) | null = null
-  constructor(public url: string) { FakeWebSocket.instances.push(this) }
-  send(data: string) { this.sent.push(data) }
-  close() { /* the test drives onclose */ }
-}
+import { FakeWebSocket } from './fakeWebSocket'
 
 function openSocket(viewedChatId: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })

@@ -9,7 +9,8 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render } from '@testing-library/react'
 
-import ImageLightbox, { triggerDownload } from '@/components/chat/media/ImageLightbox'
+import ImageLightbox from '@/components/chat/media/ImageLightbox'
+import { triggerDownload } from '@/components/chat/media/imageDownload'
 import { installFakeNativeChannel } from './fixtures/nativeChannel'
 
 describe('ImageLightbox stability under host re-renders', () => {

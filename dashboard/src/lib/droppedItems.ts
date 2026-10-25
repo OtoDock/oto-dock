@@ -149,11 +149,11 @@ function countLeftOut(out: CollectedItems, name: string): void {
   }
 }
 
-/** "2 folders left out (.git, node_modules)", or '' when none was. */
+/** "2 folders left out: .git, node_modules", or '' when none was. */
 export function leftOutNote(items: Pick<CollectedItems, 'leftOut' | 'leftOutNames'>): string {
   if (!items.leftOut) return ''
   const n = items.leftOut
-  return `${n} folder${n === 1 ? '' : 's'} left out (${items.leftOutNames.join(', ')})`
+  return `${n} folder${n === 1 ? '' : 's'} left out: ${items.leftOutNames.join(', ')}`
 }
 
 /** Walk a drop's roots into files with their folder paths. Left-out folders
@@ -274,7 +274,7 @@ export function insideFolder(files: CollectedFile[], top: string): CollectedFile
 
 /** Shown for an item the browser cannot open: a folder that reached the
  * upload as a file, or a file another program holds. */
-export const UNREADABLE_ITEM = "this item can't be read (a folder, or a file another program has open)"
+export const UNREADABLE_ITEM = "this item can't be read. It may be a folder, or a file another program has open."
 
 /** Whether the browser can read `file` at all: one byte, so a folder
  * placeholder or a locked file fails here with a reason, not mid-upload as

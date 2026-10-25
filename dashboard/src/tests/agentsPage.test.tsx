@@ -7,7 +7,7 @@
  * what keeps every other test that mounts this route from exploding.
  */
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import AgentsPage from '../pages/AgentsPage'
@@ -44,7 +44,7 @@ vi.mock('../api/agents', () => ({
     }],
     isLoading: false,
   }),
-  useSetDefaultAgent: () => ({ mutate: vi.fn() }),
+  useSetDefaultAgent: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()) }),
   useUpdateAgent: () => ({ mutate: vi.fn() }),
 }))
 
@@ -61,7 +61,7 @@ vi.mock('../api/departments', () => ({
 
 vi.mock('../api/userUiPrefs', () => ({
   useMyUiPrefs: () => ({ data: {} }),
-  useUpdateMyUiPrefs: () => ({ mutate: vi.fn() }),
+  useUpdateMyUiPrefs: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()) }),
 }))
 
 vi.mock('../components/AgentCard', () => ({
@@ -70,6 +70,7 @@ vi.mock('../components/AgentCard', () => ({
   ),
 }))
 vi.mock('../components/AgentInstallModal', () => ({ default: () => null }))
+vi.mock('../components/departments/DepartmentsEditor', () => ({ default: () => <div data-testid="departments-editor" /> }))
 vi.mock('../components/CommunityAgentsBrowser', () => ({ default: () => null }))
 
 function mount() {
@@ -91,6 +92,19 @@ describe('AgentsPage', () => {
     })
     const mapBtn = screen.getByRole('button', { name: 'Map' })
     expect(mapBtn).toBeDisabled()
+  })
+
+  it('the view switch is a named group whose pressed button follows the view', async () => {
+    mount()
+    await waitFor(() => {
+      expect(screen.getByTestId('agent-card')).toBeInTheDocument()
+    })
+    const view = screen.getByRole('group', { name: 'View' })
+    expect(within(view).getByRole('button', { name: 'Grid' })).toHaveAttribute('aria-pressed', 'true')
+    expect(within(view).getByRole('button', { name: 'Map' })).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(within(view).getByRole('button', { name: 'Departments' }))
+    expect(within(view).getByRole('button', { name: 'Departments' })).toHaveAttribute('aria-pressed', 'true')
+    expect(within(view).getByRole('button', { name: 'Grid' })).toHaveAttribute('aria-pressed', 'false')
   })
 
   it('shows the Departments tab for admins', async () => {

@@ -99,6 +99,18 @@ def test_the_catalog_rules_are_stricter_than_an_admins_zip():
     assert mf.schema_errors(pinned, SCHEMA) == []
 
 
+@pytest.mark.parametrize("value, ok", [
+    (600, True), (1, True), (3600, True),
+    (0, False), (3601, False), ("600", False), (True, False),
+])
+def test_tool_timeout_sec_is_whole_seconds_within_an_hour_and_asks_for_no_floor(value, ok):
+    data = _base(server={**_base()["server"], "tool_timeout_sec": value})
+    assert (mf.schema_errors(data, SCHEMA) == []) is ok
+    if ok:
+        # A platform that does not read the key ignores it.
+        assert mf.platform_floor(data, SCHEMA) == ("1.0.0", [])
+
+
 def test_unknown_keys_are_allowed_and_ask_for_no_floor():
     data = _base(some_future_field={"x": 1}, server={**_base()["server"], "future": True})
     data["$schema"] = SCHEMA["$id"]
@@ -108,7 +120,7 @@ def test_unknown_keys_are_allowed_and_ask_for_no_floor():
 
 def _properties(node, out: set) -> set:
     if isinstance(node, dict):
-        out |= set((node.get("properties") or {}))
+        out |= set(node.get("properties") or {})
         for value in node.values():
             _properties(value, out)
     elif isinstance(node, list):

@@ -15,8 +15,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Callable, Iterator
 
 from core.layers.cli.translator import ClaudeCLIEventTranslator
 
@@ -77,7 +77,9 @@ def run_ceilings(session_id: str, *, cmd: float, sub: float) -> Iterator[RunCeil
 # turns: a foreign result must not enter settle either, or the 5s
 # job-done fast-grace closes the turn just the same.
 
-from core.layers.cli.translator import RESUME_HANDSHAKE_RESULT  # noqa: F401 — re-export; historical home
+from core.layers.cli.translator import (
+    RESUME_HANDSHAKE_RESULT,
+)
 
 # Log throttle: warn per skip up to this many, then stay silent (the skip
 # REGIME is unbounded by design — the valve, not a count, ends it).
@@ -285,10 +287,12 @@ class SettleController:
             ceilings.started = self._settle_start
         self.translator.reset_for_settle()
         logger.info(
-            f"[{self.session_id[:8]}] entering settle "
-            f"(agents_spawned={self.translator.agents_spawned}, "
-            f"pending={self._registry().pending_count}, "
-            f"base_timeout={self.settle_after_result}s)"
+            "[%s] entering settle "
+            "(agents_spawned=%s, "
+            "pending=%s, "
+            "base_timeout=%ss)",
+            self.session_id[:8], self.translator.agents_spawned, self._registry().pending_count,
+            self.settle_after_result
         )
 
     def effective_timeout(self) -> float:
@@ -325,9 +329,10 @@ class SettleController:
             return True
         if self.stopped():
             logger.info(
-                f"[{self.session_id[:8]}] settle: the person stopped the turn — "
-                f"settling now ({reg.pending_count} subagent(s) + "
-                f"{bgreg.pending_count} bg-command(s) stay with the session)"
+                "[%s] settle: the person stopped the turn — "
+                "settling now (%s subagent(s) + "
+                "%s bg-command(s) stay with the session)",
+                self.session_id[:8], reg.pending_count, bgreg.pending_count
             )
             return True
 
@@ -360,9 +365,11 @@ class SettleController:
                 or (bgreg.has_pending and elapsed <= cmd_ceiling)):
             return False
         logger.warning(
-            f"[{self.session_id[:8]}] settle: {reg.pending_count} subagent(s) + "
-            f"{bgreg.pending_count} bg-command(s) still pending after "
-            f"{elapsed:.0f}s (ceilings {sub_ceiling:.0f}s / {cmd_ceiling:.0f}s) — settling"
+            "[%s] settle: %s subagent(s) + "
+            "%s bg-command(s) still pending after "
+            "%.0fs (ceilings %.0fs / %.0fs) — settling",
+            self.session_id[:8], reg.pending_count, bgreg.pending_count, elapsed, sub_ceiling,
+            cmd_ceiling
         )
         return True
 
@@ -383,11 +390,13 @@ class SettleController:
         hook_ago = f"{now - last_hook:.1f}s ago" if last_hook else "never"
         reg = self._registry()
         logger.info(
-            f"[{self.session_id[:8]}] settle heartbeat — "
-            f"elapsed={elapsed:.0f}s, "
-            f"agents_spawned={self.translator.agents_spawned}, "
-            f"pending={reg.pending_count}, last_hook={hook_ago}, "
-            f"process_alive={proc_alive}"
+            "[%s] settle heartbeat — "
+            "elapsed=%.0fs, "
+            "agents_spawned=%s, "
+            "pending=%s, last_hook=%s, "
+            "process_alive=%s",
+            self.session_id[:8], elapsed, self.translator.agents_spawned, reg.pending_count,
+            hook_ago, proc_alive
         )
 
     def log_presettle_heartbeat(
@@ -402,7 +411,8 @@ class SettleController:
             f"{time.monotonic() - last_hook:.1f}s ago" if last_hook else "never"
         )
         logger.info(
-            f"[{self.session_id[:8]}] pre-settle heartbeat — "
-            f"no stdout for 60s, agents_spawned={agents_spawned}, "
-            f"last_hook={hook_ago}, process_alive={proc_alive}"
+            "[%s] pre-settle heartbeat — "
+            "no stdout for 60s, agents_spawned=%s, "
+            "last_hook=%s, process_alive=%s",
+            self.session_id[:8], agents_spawned, hook_ago, proc_alive
         )

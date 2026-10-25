@@ -8,8 +8,14 @@ import {
   useFireTrigger,
 } from '../api/triggers'
 import { useAgents } from '../api/agents'
-import { TaskModelChip, linkedTaskModel } from '../components/common/TaskModelChip'
+import { TaskModelChip } from '../components/common/TaskModelChip'
 import TransferredFrom from '../components/TransferredFrom'
+import { linkedTaskModel } from '../components/common/TaskModelChip.helpers'
+import { toastError } from '../lib/http/apiJson'
+import { useDialogs } from '../components/ui/dialogs'
+import { Select } from '../components/ui/Field'
+import Button from '../components/ui/Button'
+import { BADGE_BASE, BADGE_TONE, BUTTON_DANGER_QUIET, CARD, PAGE_TITLE } from '../components/ui/classes'
 
 /**
  * Admin Triggers page — platform-wide list of every trigger across all
@@ -18,13 +24,19 @@ import TransferredFrom from '../components/TransferredFrom'
  * Filters: agent, scope, status, source. Admin can mutate any trigger
  * (override on permission flags). Static triggers cannot be deleted.
  */
+// The filter menus' values: a pick is read back through these lists, so the
+// state keeps its union.
+const SCOPE_FILTERS = ['all', 'user', 'agent'] as const
+const STATUS_FILTERS = ['all', 'active', 'paused'] as const
+const SOURCE_FILTERS = ['all', 'generic', 'vendor'] as const
+
 export default function Triggers() {
   const [agentFilter, setAgentFilter] = useState('')
-  const [scopeFilter, setScopeFilter] = useState<'all' | 'user' | 'agent'>('all')
-  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'paused'>('all')
+  const [scopeFilter, setScopeFilter] = useState<(typeof SCOPE_FILTERS)[number]>('all')
+  const [statusFilter, setStatusFilter] = useState<(typeof STATUS_FILTERS)[number]>('all')
   // Source filter replaced 'static/mcp/dashboard' (legacy `source`
   // column dropped) with 'generic' vs 'vendor' based on subscription_id.
-  const [sourceFilter, setSourceFilter] = useState<'all' | 'generic' | 'vendor'>('all')
+  const [sourceFilter, setSourceFilter] = useState<(typeof SOURCE_FILTERS)[number]>('all')
 
   // Admin audit page: full-audit view (every user's triggers); agent/scope are filters.
   const { data: triggers = [], isLoading } = useTriggers({
@@ -48,22 +60,23 @@ export default function Triggers() {
     })
   }, [triggers, statusFilter, sourceFilter])
 
-  if (isLoading) return <p className="text-sm text-p-text-secondary">Loading...</p>
+  if (isLoading) return <p className="text-sm text-secondary">Loading...</p>
 
   return (
     <div className="space-y-4">
-      <h1 className="text-xl font-bold text-p-text">Triggers</h1>
-      <p className="text-sm text-p-text-secondary">
-        Platform-wide webhook triggers. Admins can pause / resume / delete any
-        trigger here. Webhook URLs require a per-agent or per-user API key
-        (see the agent's API Keys section or User Settings → API Keys).
+      <h1 className={PAGE_TITLE}>Triggers</h1>
+      <p className="text-sm text-secondary">
+        Every webhook trigger on the platform. Admins can pause, resume or
+        delete any trigger here. A webhook URL needs an agent's or a user's
+        API key. Create one in the agent's API Keys section or in User
+        Settings, Integrations.
       </p>
 
       <div className="flex flex-wrap gap-2 items-center">
-        <select
+        <Select
           value={agentFilter}
           onChange={(e) => setAgentFilter(e.target.value)}
-          className="text-sm border border-p-border-light rounded-sm px-2 py-1 bg-white dark:bg-p-surface"
+          className="sm:w-auto"
         >
           <option value="">All agents</option>
           {agentNames.map((a) => (
@@ -71,41 +84,41 @@ export default function Triggers() {
               {a}
             </option>
           ))}
-        </select>
-        <select
+        </Select>
+        <Select
           value={scopeFilter}
-          onChange={(e) => setScopeFilter(e.target.value as any)}
-          className="text-sm border border-p-border-light rounded-sm px-2 py-1 bg-white dark:bg-p-surface"
+          onChange={(e) => setScopeFilter(SCOPE_FILTERS.find((v) => v === e.target.value) ?? 'all')}
+          className="sm:w-auto"
         >
           <option value="all">All scopes</option>
           <option value="user">User</option>
           <option value="agent">Agent</option>
-        </select>
-        <select
+        </Select>
+        <Select
           value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value as any)}
-          className="text-sm border border-p-border-light rounded-sm px-2 py-1 bg-white dark:bg-p-surface"
+          onChange={(e) => setStatusFilter(STATUS_FILTERS.find((v) => v === e.target.value) ?? 'all')}
+          className="sm:w-auto"
         >
           <option value="all">All statuses</option>
           <option value="active">Active</option>
           <option value="paused">Paused</option>
-        </select>
-        <select
+        </Select>
+        <Select
           value={sourceFilter}
-          onChange={(e) => setSourceFilter(e.target.value as any)}
-          className="text-sm border border-p-border-light rounded-sm px-2 py-1 bg-white dark:bg-p-surface"
+          onChange={(e) => setSourceFilter(SOURCE_FILTERS.find((v) => v === e.target.value) ?? 'all')}
+          className="sm:w-auto"
         >
           <option value="all">All sources</option>
           <option value="generic">Generic webhook</option>
           <option value="vendor">Vendor subscription</option>
-        </select>
-        <span className="text-xs text-p-text-secondary ml-auto">
+        </Select>
+        <span className="text-xs text-secondary ml-auto">
           {filtered.length} of {triggers.length}
         </span>
       </div>
 
       {filtered.length === 0 ? (
-        <p className="text-sm text-p-text-secondary py-6 text-center">No triggers match the current filters.</p>
+        <p className="text-sm text-secondary py-6 text-center">No triggers match the current filters.</p>
       ) : (
         <div className="space-y-3">
           {filtered.map((t) => (
@@ -119,81 +132,86 @@ export default function Triggers() {
 
 
 function AdminTriggerRow({ trigger }: { trigger: Trigger }) {
+  const dialogs = useDialogs()
   const pauseM = usePauseTrigger()
   const resumeM = useResumeTrigger()
   const deleteM = useDeleteTrigger()
   const fireM = useFireTrigger()
 
   const scopeBadge = trigger.subscription_id
-    ? { label: 'Vendor', cls: 'bg-purple-100 text-purple-700' }
+    ? { label: 'Vendor', cls: BADGE_TONE.info }
     : trigger.scope === 'agent'
-      ? { label: 'Agent', cls: 'bg-blue-100 text-blue-700' }
-      : { label: 'User', cls: 'bg-emerald-100 text-emerald-700' }
+      ? { label: 'Agent', cls: BADGE_TONE.agent }
+      : { label: 'User', cls: BADGE_TONE.neutral }
   const statusBadge = trigger.enabled
-    ? { label: 'Active', cls: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' }
-    : { label: 'Paused', cls: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' }
+    ? { label: 'Active', cls: BADGE_TONE.success }
+    : { label: 'Paused', cls: BADGE_TONE.warning }
 
   const onDelete = async () => {
-    if (!confirm(`Permanently delete trigger "${trigger.name}"? This cannot be undone.`)) return
-    try {
-      await deleteM.mutateAsync(trigger.id)
-    } catch (e: any) {
-      alert(`Delete failed: ${e?.message ?? e}`)
-    }
+    if (!(await dialogs.confirm({
+      title: `Delete the trigger "${trigger.name}"?`,
+      body: 'This cannot be undone.',
+      confirmLabel: 'Delete',
+      tone: 'danger',
+    }))) return
+    await deleteM.mutateAsync(trigger.id).catch(toastError('The trigger was not deleted'))
   }
 
   return (
-    <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4">
+    <div className={`${CARD} p-4`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-medium text-p-text">{trigger.name}</span>
+            <span className="font-medium text-primary">{trigger.name}</span>
             <TransferredFrom row={trigger} />
-            <span className={`px-2 py-0.5 rounded-sm text-xs font-medium ${scopeBadge.cls}`}>
+            <span className={`${BADGE_BASE} ${scopeBadge.cls}`}>
               {scopeBadge.label}
             </span>
-            <span className={`px-2 py-0.5 rounded-sm text-xs font-medium ${statusBadge.cls}`}>
+            <span className={`${BADGE_BASE} ${statusBadge.cls}`}>
               {statusBadge.label}
             </span>
-            <span className="text-xs text-p-text-secondary">{trigger.agent}</span>
+            <span className="text-xs text-secondary">{trigger.agent}</span>
             {trigger.scope === 'user' && trigger.created_by_name && (
-              <span className="text-xs text-p-text-secondary">by {trigger.created_by_name}</span>
+              <span className="text-xs text-secondary">by {trigger.created_by_name}</span>
             )}
           </div>
-          <p className="text-xs font-mono text-p-text-secondary mt-1 break-all">{trigger.slug}</p>
+          <p className="text-xs font-mono text-secondary mt-1 break-all">{trigger.slug}</p>
           {trigger.webhook_path && (
-            <p className="text-xs text-p-text-secondary mt-1 break-all font-mono">
+            <p className="text-xs text-secondary mt-1 break-all font-mono">
               {window.location.origin}{trigger.webhook_path}
             </p>
           )}
         </div>
         <div className="flex items-center gap-1.5 flex-wrap justify-end">
-          <button
-            onClick={() => fireM.mutate({ id: trigger.id, body: {} })}
-            className="px-2 py-1 rounded-sm text-xs font-medium bg-blue-100 text-blue-700 hover:bg-blue-200"
+          <Button
+            variant="secondary"
+            size="xs"
+            onClick={() => { void fireM.mutateAsync({ id: trigger.id, body: {} }).catch(toastError('The trigger was not fired')) }}
           >
             Test
-          </button>
+          </Button>
           {trigger.can_pause && (
-            <button
-              onClick={() => pauseM.mutate(trigger.id)}
-              className="px-2 py-1 rounded-sm text-xs font-medium bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
+            <Button
+              variant="secondary"
+              size="xs"
+              onClick={() => { void pauseM.mutateAsync(trigger.id).catch(toastError('The trigger was not paused')) }}
             >
               Pause
-            </button>
+            </Button>
           )}
           {trigger.can_resume && (
-            <button
-              onClick={() => resumeM.mutate(trigger.id)}
-              className="px-2 py-1 rounded-sm text-xs font-medium bg-green-100 text-green-700 hover:bg-green-200 dark:bg-green-900/30 dark:text-green-400 dark:hover:bg-green-900/50"
+            <Button
+              variant="secondary"
+              size="xs"
+              onClick={() => { void resumeM.mutateAsync(trigger.id).catch(toastError('The trigger was not resumed')) }}
             >
               Resume
-            </button>
+            </Button>
           )}
           {trigger.can_delete && (
             <button
               onClick={onDelete}
-              className="px-2 py-1 rounded-sm text-xs font-medium bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/30 dark:text-red-400 dark:hover:bg-red-900/50"
+              className={BUTTON_DANGER_QUIET}
             >
               Delete
             </button>
@@ -201,7 +219,7 @@ function AdminTriggerRow({ trigger }: { trigger: Trigger }) {
         </div>
       </div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-3 text-xs">
-        <span><span className="text-p-text-light">Action: </span>
+        <span><span className="text-tertiary">Action: </span>
           {trigger.task_id ? (
             <>
               Task: {trigger.task_name ?? trigger.task_id.slice(0, 8)}
@@ -215,15 +233,15 @@ function AdminTriggerRow({ trigger }: { trigger: Trigger }) {
           {trigger.notify_enabled ? `Notify` : ''}
           {!trigger.task_id && !trigger.app_id && !trigger.notify_enabled ? '—' : ''}
         </span>
-        <span><span className="text-p-text-light">Source: </span>
+        <span><span className="text-tertiary">Source: </span>
           {trigger.subscription_id ? 'Vendor' : 'Webhook'}
         </span>
-        <span><span className="text-p-text-light">Fires: </span>{trigger.fired_count}</span>
-        <span><span className="text-p-text-light">Last: </span>{trigger.last_fired_at ? new Date(trigger.last_fired_at).toLocaleString() : 'never'}</span>
-        <span><span className="text-p-text-light">Debounce: </span>{trigger.debounce_seconds > 0 ? `${trigger.debounce_seconds}s` : 'none'}</span>
+        <span><span className="text-tertiary">Fires: </span>{trigger.fired_count}</span>
+        <span><span className="text-tertiary">Last: </span>{trigger.last_fired_at ? new Date(trigger.last_fired_at).toLocaleString() : 'never'}</span>
+        <span><span className="text-tertiary">Debounce: </span>{trigger.debounce_seconds > 0 ? `${trigger.debounce_seconds}s` : 'none'}</span>
       </div>
       {trigger.last_error && (
-        <div className="text-xs bg-red-50 text-red-700 rounded-sm px-3 py-2 mt-2">
+        <div className="text-xs bg-status-danger-bg text-status-danger-fg rounded-card px-3 py-2 mt-2">
           Last error: {trigger.last_error}
         </div>
       )}

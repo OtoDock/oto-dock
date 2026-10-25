@@ -16,16 +16,21 @@ import asyncio
 import json
 import uuid
 
+import ws.dashboard  # noqa: F401  (assembles the mixins first)
 from core.events import stream_pump
 from core.events.common_events import PRODUCER_DONE, SYSTEM, CommonEvent
 from core.session import session_kind
 from storage import database as task_store
 from storage.chat import meeting_status
 from tests.fixtures.ws_dashboard_harness import (
-    FakeExecutionLayer, dashboard_connection, drain_startup, make_test_agent,
-    run_ws_scenario, session_cookie, stub_dashboard_seams,
+    FakeExecutionLayer,
+    dashboard_connection,
+    drain_startup,
+    make_test_agent,
+    run_ws_scenario,
+    session_cookie,
+    stub_dashboard_seams,
 )
-import ws.dashboard  # noqa: F401  (assembles the mixins first)
 from ws import wire_events as wire
 from ws.dashboard import _build_chat_restore
 

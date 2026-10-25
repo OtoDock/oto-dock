@@ -1,0 +1,49 @@
+<p class="muted">A table that becomes cards on a phone. From 768 px it is a table in its card. Below that each row is a small card with its labels, so the page never scrolls sideways. Row actions are small secondary buttons, and Delete is the quiet red one. Use it for every list with more than two columns.</p>
+
+<div class="card" style="padding: 0; overflow: hidden">
+  <table class="folding" id="bookings">
+    <thead>
+      <tr><th>When</th><th>Who</th><th>Status</th><th class="num">Paid</th><th><span class="sr-only">Actions</span></th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Tomorrow 11:00</td><td>Alice Papadopoulou</td><td><span class="badge success">Confirmed</span></td><td class="num">25.00</td>
+        <td class="actions"><button type="button" class="btn sm">Move</button><button type="button" class="btn quiet-danger">Cancel</button></td>
+      </tr>
+      <tr>
+        <td>Friday 15:30</td><td>Bob Lee</td><td><span class="badge warning">Awaiting payment</span></td><td class="num">0.00</td>
+        <td class="actions"><button type="button" class="btn sm">Move</button><button type="button" class="btn quiet-danger">Cancel</button></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<style>
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.folding .actions { text-align: right; white-space: nowrap; }
+.folding .actions .btn + .btn { margin-left: 8px; }
+@media (max-width: 767px) {
+  .folding thead { display: none; }
+  .folding, .folding tbody, .folding tr, .folding td { display: block; }
+  .folding tr { padding: 12px 16px; border-bottom: 1px solid var(--p-border-light); }
+  .folding tr:last-child { border-bottom: 0; }
+  .folding td { padding: 2px 0; border: 0; text-align: left; }
+  .folding td.num { text-align: left; }
+  .folding td[data-label]::before { content: attr(data-label); display: inline-block; min-width: 6em; margin-right: 8px; font-size: var(--p-font-size-xs); color: var(--p-text-light); }
+  .folding td.actions { padding-top: 8px; text-align: left; }
+  .folding tbody tr:hover { background: transparent; }
+}
+</style>
+
+<script>
+(function () {
+  // Each cell learns its column's heading, which the phone layout prints before it.
+  var table = document.getElementById('bookings')
+  var heads = Array.prototype.map.call(table.querySelectorAll('thead th'), function (th) { return th.textContent.trim() })
+  table.querySelectorAll('tbody tr').forEach(function (tr) {
+    Array.prototype.forEach.call(tr.children, function (td, i) {
+      if (heads[i] && heads[i] !== 'Actions') td.dataset.label = heads[i]
+    })
+  })
+})()
+</script>

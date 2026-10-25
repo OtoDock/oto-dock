@@ -3,8 +3,8 @@ VAD ordering (live-hit 2026-08-14: 6–17 pacing stalls per long playback on
 BOTH transports, each decorated with an ambience-bed frame → audible tick).
 """
 
-import contextlib
 import asyncio
+import contextlib
 import time
 
 from pipeline_fakes import FakeLLM, make_route

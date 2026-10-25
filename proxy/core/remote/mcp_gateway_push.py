@@ -78,14 +78,14 @@ async def _send(cm, machine_id: str, msg: dict) -> bool:
     try:
         await cm.send_command(machine_id, msg, timeout=_ACK_TIMEOUT_S)
         return True
-    except Exception as e:
+    except RuntimeError as e:
         logger.info("mcp-gateway: %s to machine %s not acknowledged: %s", msg.get("type"),
                     machine_id[:8], type(e).__name__)
         return False
 
 
 async def _push_one(cm, entry: _Entry, session_id: str, key: str, res: mcp_gateway.Resolved) -> bool:
-    lease = mcp_gateway.LEASE_S
+    lease: float = mcp_gateway.LEASE_S
     if res.expires_in is not None:
         lease = max(0.0, min(lease, res.expires_in))
     # The connection the frame goes out on: one that drops and comes back
@@ -182,8 +182,8 @@ async def push_session(session_id: str, machine_id: str, token_hash: str, *, cm=
     entry = _registry[session_id]
     pushed = 0
     for key, cred in creds.items():
-        if cred.proxy_local:
-            continue  # a sidecar's token stays on the proxy (the tunnel's forward)
+        if cred.forwarded_here:
+            continue  # a sidecar's, or a narrowed one's, stays on the proxy (the tunnel's forward)
         res = await asyncio.to_thread(mcp_gateway.resolve_credential, cred)
         if isinstance(res, mcp_gateway.Refusal):
             logger.info("mcp-gateway: %s of session %s not pushed: %s", key, session_id[:8],
@@ -270,7 +270,7 @@ async def _tick(cm, now: float, machine_id: str = "") -> int:
         creds = mcp_gateway.credentials_of(session_id)
         gen = _generation(cm, entry.machine_id)
         for key, cred in creds.items():
-            if cred.proxy_local:
+            if cred.forwarded_here:
                 continue
             res = await asyncio.to_thread(mcp_gateway.resolve_credential, cred)
             if _registry.get(session_id) is not entry:

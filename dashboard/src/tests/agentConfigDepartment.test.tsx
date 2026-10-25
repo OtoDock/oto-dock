@@ -50,24 +50,29 @@ const h = vi.hoisted(() => ({
   user: { role: 'admin', sub: 'u1', agent_roles: {} as Record<string, string> },
 }))
 
+const updateAgent = vi.hoisted(() => ({ mutate: (...a: unknown[]) => h.updateMock(...a), mutateAsync: (v: unknown) => { h.updateMock(v); return Promise.resolve({}) } }))
 vi.mock('@/api/agents', () => ({
   useAgentInfo: () => ({ data: h.agentInfo, isLoading: false }),
-  useUpdateAgent: () => ({ mutate: h.updateMock, isPending: false }),
-  useDeleteAgent: () => ({ mutate: vi.fn(), isPending: false }),
+  // One function for every render, as TanStack's own: the page's save
+  // effects list it.
+  useUpdateAgent: () => ({ mutate: updateAgent.mutate, mutateAsync: updateAgent.mutateAsync, isPending: false }),
+  useDeleteAgent: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false }),
   useDelegationTargets: () => ({ data: h.delegationData }),
-  useSetDelegationTargets: () => ({ mutate: h.setTargetsMock, isPending: false }),
+  useSetDelegationTargets: () => ({ mutate: h.setTargetsMock, mutateAsync: (v: unknown) => { h.setTargetsMock(v); return Promise.resolve({}) }, isPending: false }),
   useExecutionLayers: () => ({ data: undefined }),
   useSetDefaultForNewUsers: () => ({ mutate: vi.fn() }),
   useAgentUsers: () => ({ data: [] }),
   AgentUpdateError: class AgentUpdateError extends Error {},
   useKnowledgeAttachments: () => ({ data: undefined }),
   useKnowledgeLibraries: () => ({ data: undefined }),
-  useSetKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
-  useAttachKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
-  useDetachKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
+  useAttachKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
+  useDetachKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
   useAgentFiles: () => ({ data: undefined }),
 }))
-vi.mock('@/api/remoteMachines', () => ({ useRemoteMachines: () => ({ data: [] }) }))
+vi.mock('@/api/remoteMachines', async (orig) => ({
+  ...(await orig<typeof import('@/api/remoteMachines')>()), useRemoteMachines: () => ({ data: [] }),
+}))
 vi.mock('@/api/departments', () => ({ useDepartments: () => ({ data: h.departments }) }))
 vi.mock('@/api/memory', () => ({
   useAgentMemorySettings: () => ({
@@ -77,8 +82,8 @@ vi.mock('@/api/memory', () => ({
       master: { user_memory_enabled: true, agent_memory_enabled: true },
     },
   }),
-  useSetAgentMemoryToggle: () => ({ mutate: vi.fn() }),
-  useClearAgentMemory: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetAgentMemoryToggle: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})) }),
+  useClearAgentMemory: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
 }))
 vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: h.user }),
@@ -115,13 +120,14 @@ describe('AgentConfig — department row', () => {
     h.user = { role: 'member', sub: 'u1', agent_roles: { demo: 'manager' } }
     renderConfig()
     expect(screen.queryByLabelText('Department')).toBeNull()
-    expect(screen.queryByText(/Auto-wires delegation within the department/)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'About Department' })).toBeNull()
   })
 
   it('is visible for an admin', () => {
     renderConfig()
     expect(screen.getByLabelText('Department')).toBeTruthy()
-    expect(screen.getByText(/Auto-wires delegation within the department/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'About Department' }), { detail: 0 })
+    expect(screen.getByRole('tooltip').textContent).toMatch(/Auto-wires delegation within the department/)
   })
 
   it('selecting a department sends BOTH ids in one PATCH (first level by rank)', () => {
@@ -230,6 +236,7 @@ describe('AgentConfig — merged edge semantics (no separate observe toggle)', (
     expect(screen.queryByLabelText('Observe Helper')).toBeNull()
     expect(screen.queryByLabelText('Observe Ops')).toBeNull()
     // The card subtitle states the merged semantics.
-    expect(screen.getByText(/readable by this agent's autonomous runs/i)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'About Delegation Targets' }), { detail: 0 })
+    expect(screen.getByRole('tooltip').textContent).toMatch(/autonomous runs can also read a target's activity/i)
   })
 })

@@ -10,11 +10,19 @@ before it runs as them."""
 import asyncio
 import json
 
-import pytest  # noqa: F401  (temp_db / monkeypatch fixtures)
+import pytest
 
+import ws.dashboard  # noqa: F401  (resolves the dashboard↔dashboard_chat cycle)
 from core.events import chat_writer, input_queue, stream_pump
 from core.events.common_events import (
-    CommonEvent, DONE, ERROR, PRODUCER_DONE, TEXT, TOOL_RESULT, TOOL_USE, TurnInput,
+    DONE,
+    ERROR,
+    PRODUCER_DONE,
+    TEXT,
+    TOOL_RESULT,
+    TOOL_USE,
+    CommonEvent,
+    TurnInput,
 )
 from core.session import session_kind
 from storage import database as task_store
@@ -30,8 +38,6 @@ from tests.fixtures.ws_dashboard_harness import (
     stub_dashboard_seams,
     warm_new_chat,
 )
-
-import ws.dashboard  # noqa: F401  (resolves the dashboard↔dashboard_chat cycle)
 from ws import wire_events as wire
 
 
@@ -731,6 +737,7 @@ async def test_an_admin_cancels_another_persons_message_and_a_member_cannot(temp
 
 def test_a_shared_session_serves_only_the_person_it_was_warmed_for(monkeypatch):
     from types import SimpleNamespace
+
     from core.session import session_state
     from services.engines import subscription_pool
     from ws.dashboard_chat_send import ChatSendMixin
@@ -755,7 +762,7 @@ async def test_a_steer_is_recorded_in_stream_order_by_the_pump(temp_db):
     """The steer event waits behind the blocks the engine produced before it
     and ahead of the ones after: text that streams while its row is written
     is never cut from the live state."""
-    from core.events.stream_pump import ChatStreamPump, STEER_ACCEPTED
+    from core.events.stream_pump import STEER_ACCEPTED, ChatStreamPump
     cid = "chat-order"
     temp_db.create_chat(cid, "user-admin", "agent-a", "default")
     events: asyncio.Queue = asyncio.Queue()
@@ -828,9 +835,11 @@ async def test_a_steer_during_an_open_tool_keeps_the_tool_live_and_after_the_ste
 @pytest.mark.asyncio
 async def test_a_restart_leaves_a_steered_satellite_turn_to_its_replay_once(temp_db):
     """A satellite turn the proxy re-adopts after a restart is replayed
-    whole: the blocks its steer saved early are deleted at the shutdown,
-    so the replay writes them once (the steer's row stays)."""
+    whole: the blocks its steer saved early stay through the shutdown (a turn
+    nothing replays keeps them), named in the turn's open-turn record, and the
+    replay deletes them, so it writes them once (the steer's row stays)."""
     from core.events.stream_pump import ChatStreamPump, _recovery_suppress_flush
+    from storage.chat import open_turns
     cid = "chat-replay"
     temp_db.create_chat(cid, "user-admin", "agent-a", "default")
     events: asyncio.Queue = asyncio.Queue()
@@ -852,6 +861,9 @@ async def test_a_restart_leaves_a_steered_satellite_turn_to_its_replay_once(temp
         await chat_writer.drain(cid, timeout=5)
         assert [m["content"] for m in task_store.get_chat_messages(cid)] == ["early", "steer"]
         stream_pump.suppress_recovery_flush(cid)
+        assert [m["content"] for m in task_store.get_chat_messages(cid)] == ["early", "steer"]
+        early = open_turns.take_record(cid, pump._turn_token).early
+        assert task_store.delete_chat_message_ranges(cid, early) == 1
         assert [m["content"] for m in task_store.get_chat_messages(cid)] == ["steer"]
     finally:
         _recovery_suppress_flush.discard(cid)
@@ -1216,6 +1228,7 @@ async def test_a_headless_first_message_deferred_by_a_reconnect_leaves_its_card(
     import uuid
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
+
     from ws.dashboard import DashboardConnection
     from ws.dashboard_chat_text import TurnDeferred
     slug = make_test_agent()
@@ -1271,8 +1284,8 @@ def test_a_new_chat_pick_never_reaches_the_previous_chats_queued_delivery(temp_d
             await asyncio.sleep(0.3)
             conn = _conn()
             layer.mode_changes.clear()
-            ws.client_send({"type": "mode_change", "mode": "acceptEdits"})
-            await _wait_for(lambda: conn.deferred_mode == "acceptEdits")
+            ws.client_send({"type": "mode_change", "mode": "ask"})
+            await _wait_for(lambda: conn.deferred_mode == "ask")
             assert conn.deferred_for == ""
             q = await input_queue.loaded(chat_id)
             await q.add("q-a", "user-admin", TurnInput("queued in A"),
@@ -1281,9 +1294,9 @@ def test_a_new_chat_pick_never_reaches_the_previous_chats_queued_delivery(temp_d
             await _wait_for(lambda: len(layer.messages) == 1)
             await _wait_for(lambda: stream_pump._active_pumps.get(chat_id) is None)
             await chat_writer.drain(chat_id, timeout=5)
-            assert await asyncio.to_thread(_chat_mode, chat_id) == "default"
+            assert await asyncio.to_thread(_chat_mode, chat_id) == "autoReview"
             assert layer.mode_changes == []
-            assert (conn.deferred_mode, conn.deferred_for) == ("acceptEdits", "")
+            assert (conn.deferred_mode, conn.deferred_for) == ("ask", "")
     run_ws_scenario(scenario)
 
 
@@ -1310,16 +1323,16 @@ def test_a_new_chat_pick_never_reaches_the_previous_chat_after_a_woken_turn(temp
                             "queue_id": "q-a"})
             q = await input_queue.loaded(chat_id)
             await _wait_for(lambda: bool(q.items))
-            ws.client_send({"type": "mode_change", "mode": "acceptEdits"})
-            await _wait_for(lambda: conn.deferred_mode == "acceptEdits")
+            ws.client_send({"type": "mode_change", "mode": "ask"})
+            await _wait_for(lambda: conn.deferred_mode == "ask")
             gate.set()
             await asyncio.wait_for(echo, 5)
             await _wait_for(lambda: len(layer.messages) == 2)
             await _wait_for(lambda: stream_pump._active_pumps.get(chat_id) is None)
             await chat_writer.drain(chat_id, timeout=5)
-            assert await asyncio.to_thread(_chat_mode, chat_id) == "default"
+            assert await asyncio.to_thread(_chat_mode, chat_id) == "autoReview"
             assert layer.mode_changes == []
-            assert conn.deferred_mode == "acceptEdits"
+            assert conn.deferred_mode == "ask"
     run_ws_scenario(scenario)
 
 
@@ -1446,7 +1459,7 @@ def test_a_server_turn_is_kept_as_the_wake_while_another_starter_holds_the_chat(
             monkeypatch.setattr(conn, "_start_new_stream", _start)
             await conn._run_server_turn_or_keep(
                 "the job's review", target_session_id=sid, target_chat_id=chat_id,
-                target_layer=layer)
+                target_layer=layer, cause=wire.CAUSE_BG_REVIEW)
             assert started == []
             wakes = await asyncio.to_thread(task_store.claim_pending_wake_records, chat_id)
             assert [w.get("prompt") for w in wakes] == ["the job's review"]
@@ -1476,8 +1489,8 @@ async def test_a_cancel_frame_for_a_chat_the_person_cannot_open_loads_nothing(te
     """A cancel with no stream for a chat other than the viewed one asks the
     REST rule first: a chat the person cannot open, or none at all, is
     refused and never loaded into the registry."""
-    import api.agents.chats as chats_api
-    monkeypatch.setattr(chats_api, "can_access_chat", lambda ctx, chat: False)
+    from core.session import visibility
+    monkeypatch.setattr(visibility, "can_access_chat", lambda ctx, chat: False)
     temp_db.create_chat("chat-other", "user-admin", "agent-a", "default")
     conn = _ReachConnection("user-viewer", "member", "chat-mine")
     await conn._on_cancel_queued({"queue_id": "x", "chat_id": "chat-other"})
@@ -1962,3 +1975,112 @@ def test_a_delivery_types_the_authors_batch_into_their_own_terminal(temp_db, mon
             assert task_store.list_chat_input_queue(chat_id) == []
             assert layer.messages == []
     run_ws_scenario(scenario)
+
+
+def test_a_queued_turn_on_a_machine_that_does_not_answer_goes_out_when_it_does(
+        temp_db, monkeypatch):
+    """The dead session's machine is connected but silent past the inline
+    budget: the delivery defers and the chip says the machine is not
+    answering (never "reconnecting"). The probe stays out; when it answers,
+    the watcher arms the queue again with no reconnect, and the message
+    goes out on the resumed session."""
+    from core.session import resume_probe
+    from ws import dashboard_warmup, resume_wait
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+    monkeypatch.setattr(dashboard_warmup, "RESUME_PROBE_BUDGET_INLINE_S", 0.2)
+    monkeypatch.setattr(resume_probe, "_PROBE_PAUSE_S", 0.05)
+    monkeypatch.setattr(input_queue, "VIEWER_GRACE_S", 0.05)
+    resume_wait._watching.clear()
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, sid = await warm_new_chat(ws, layer, slug)
+            q = await input_queue.loaded(chat_id)
+            await q.add("q-silent", "user-admin", TurnInput("typed while it was silent"))
+            layer.alive.discard(sid)
+            layer.dead_processes.add(sid)      # the session is dead on its machine
+            layer.undecided.add(sid)           # and the machine does not answer the probe
+            assert await input_queue.deliver(chat_id) is False
+            assert [qi.queue_id for qi in q.items] == ["q-silent"]
+            assert q.items[0].waiting == input_queue.WAITING_MACHINE
+            snap = await _until(ws, "queue_snapshot")
+            assert snap["messages"][0]["waiting"] == input_queue.WAITING_MACHINE
+            assert layer.prepared_resume == [] and layer.messages == []
+            assert chat_id in resume_wait._watching
+            # The machine answers: its session is there to resume. No
+            # reconnect happened, nobody touched the chat.
+            layer.undecided.discard(sid)
+            layer.resumable.add(sid)
+            layer.probe_futures[sid].set_result({"status": "ok", "resumable": True})
+            await _wait_for(lambda: len(layer.messages) == 1)
+            assert layer.messages[0][:2] == (sid, "typed while it was silent")
+            assert layer.prepared_resume == [sid]
+            await _wait_for(lambda: chat_id not in resume_wait._watching)
+            assert sid in layer.forgotten_probes
+    run_ws_scenario(scenario)
+
+
+def test_a_message_typed_into_a_terminal_carries_the_chats_meeting_note(temp_db, monkeypatch):
+    """A composer message typed into a live terminal takes the chat's notes:
+    behind the time stamp, ahead of the text, a line every prelude matcher
+    strips, so the row stays the person's text; the note is claimed once."""
+    from core.session import interactive_session
+    layer, gate, slug = _setup(monkeypatch)
+    gate.set()
+    note = ('[Meeting "q3" (mtg-0123456789ab) ended 2026-10-16 01:00 UTC after 3 turns, '
+            "with Head, Alpha. Summary: keep 12 %. The person sees the whole meeting in "
+            "this chat; you have only this note.]")
+
+    async def scenario():
+        async with dashboard_connection(session_cookie()) as ws:
+            await drain_startup(ws)
+            chat_id, sid = await warm_new_chat(ws, layer, slug)
+            task_store.append_pending_delegate_wake(chat_id, note, note=True)
+            q = await input_queue.loaded(chat_id)
+            held = q.try_claim()
+            ws.client_send({"type": "chat", "text": "what did they decide?", "chat_id": chat_id,
+                            "queue_id": "q-note"})
+            await _until(ws, "queued")
+            term = _OwnTerminal(chat_id, sid)
+            monkeypatch.setattr(interactive_session, "find_live_for_chat",
+                                lambda cid: term if cid == chat_id else None)
+            q.release(held)
+            await _wait_for(lambda: term.typed)
+            typed = term.typed[0].decode()
+            assert typed.startswith("\x1b[200~[Current time: ")
+            assert typed.index(note) < typed.index("what did they decide?")
+            await _until(ws, "queue_sent")
+            await chat_writer.drain(chat_id, timeout=5)
+            assert ("user", "what did they decide?") in _rows(chat_id)
+            assert task_store.claim_pending_wake_records(chat_id, notes=True) == []
+    run_ws_scenario(scenario)
+
+
+def test_the_meeting_note_is_a_prelude_every_matcher_strips():
+    from core.session.codex_rollout_tailer import (
+        _title_from_prompt as codex_title,
+        _user_row_key,
+    )
+    from core.session.transcript_tailer import _title_from_prompt
+    from services.meetings.meeting_context import parent_note
+    from storage.chat.chat_titles import deterministic_title
+    from ws.dashboard_chat_text import _TIME_PRELUDE_RE as ws_re
+    note = parent_note({"id": "mtg-0123456789ab", "topic": "office\nmargins [q3]"}, turns=3,
+                       names=["Head", "Alpha"], last_words="We keep 12 %. ] then",
+                       summary=True, ended_at="2026-10-16 01:00")
+    stamp = "[Current time: Friday, October 16, 2026 01:00 (1:00 AM) UTC (UTC+00:00)]"
+    for text in (f"{stamp}\n\n{note}\n\nwhat did they decide?",
+                 f"{stamp} {note} what did they decide?"):
+        assert _title_from_prompt(text) == "what did they decide?"
+        assert codex_title(text) == "what did they decide?"
+        assert deterministic_title(text) == "what did they decide?"
+        assert _user_row_key(text) == "what did they decide?"
+        out = text
+        for _ in range(3):
+            out = ws_re.sub("", out, count=1)
+        assert out.strip() == "what did they decide?"
+    # A person quoting the note's tail mid-message is never touched.
+    quoted = 'say "you have only this note.]" back to me'
+    assert deterministic_title(quoted).startswith("say")

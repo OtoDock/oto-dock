@@ -37,6 +37,13 @@ _DEFAULT_SETTINGS: dict[str, str] = {
     "audio_smart_turn_threshold": "0.65",
     "audio_smart_turn_onnx_threads": "1",
     "audio_smart_turn_audio_window_s": "8.0",
+    # The caller's language — the local identifier (audio/providers/lid), on
+    # calls, live voice and dictation; the languages it may pick (the
+    # install's list: an install that speaks two languages cannot be moved
+    # to a third one)
+    "audio_language_identify_enabled": "true",
+    "audio_language_identify_threads": "1",
+    "audio_language_candidates": "en,el,de,es,fr,it",
     # Chat audio policy (chat sound/mic icons; consumed by the resolver)
     "audio_chat_user_policy": "native_preferred",
     "audio_show_experimental": "false",
@@ -76,7 +83,7 @@ _DEFAULT_SETTINGS: dict[str, str] = {
     "audio_wake_word_agent_boost": "2.0",
     "audio_wake_word_agent_threshold": "0.20",
     # Chat STT defaults (per-VAD/limits for the WS session)
-    "audio_chat_stt_max_seconds": "60",
+    "audio_chat_stt_max_seconds": "300",
     "audio_tts_max_chars_per_request": "5000",
     "audio_tts_rate_limit_chars_per_min": "10000",
     "audio_transcribe_max_upload_mb": "100",
@@ -404,6 +411,6 @@ def seed_phone_config() -> None:
             seeded_settings += 1
 
     if seeded_settings:
-        logger.info(f"Seeded {seeded_settings} audio/phone settings")
+        logger.info("Seeded %s audio/phone settings", seeded_settings)
 
     _seed_audio_providers()

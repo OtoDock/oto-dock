@@ -7,6 +7,11 @@ import {
 import { useAuth } from '../../contexts/AuthContext'
 import { canManageAgent } from '../../lib/permissions'
 import { isLocalTarget } from '../../lib/placement'
+import { toastError } from '../../lib/http/apiJson'
+import Button from '../../components/ui/Button'
+import { Input } from '../../components/ui/Field'
+import InfoTip from '../../components/ui/InfoTip'
+import { BADGE_BASE, BADGE_TONE, CARD } from '../../components/ui/classes'
 import { CheckEditorModal } from './AgentChecks.modals'
 
 // The Checks page (proxy CHECKS.md "Governance"): the agent's checks
@@ -23,7 +28,7 @@ export default function AgentChecks() {
   const [editing, setEditing] = useState<{ item?: CheckItem; own: boolean } | null>(null)
   const del = useDeleteCheck()
 
-  if (isLoading) return <p className="text-sm text-p-text-secondary">Loading...</p>
+  if (isLoading) return <p className="text-sm text-secondary">Loading...</p>
   const items = data?.checks ?? []
   const agents = items.filter((c) => !c.owner)
   const mine = items.filter((c) => !!c.owner)
@@ -32,40 +37,40 @@ export default function AgentChecks() {
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-xl font-bold text-p-text">Checks</h1>
-          <p className="text-sm text-p-text-secondary">
-            What judges <span className="font-medium text-p-text">{agent}</span>&apos;s work at the end of a turn
+          <h1 className="text-xl font-bold font-display text-primary">Checks</h1>
+          <p className="text-sm text-secondary">
+            What judges <span className="font-medium text-primary">{agent}</span>&apos;s work at the end of a turn
           </p>
         </div>
         <div className="flex gap-2">
           {data?.username && (
-            <button onClick={() => setEditing({ own: true })} data-testid="new-private-check"
-                    className="self-start sm:self-auto shrink-0 px-3 py-1.5 rounded-lg border border-p-border-light text-sm font-medium text-p-text">
+            <Button onClick={() => setEditing({ own: true })} data-testid="new-private-check"
+                    className="self-start sm:self-auto shrink-0">
               + My check
-            </button>
+            </Button>
           )}
           {canManage && (
-            <button onClick={() => setEditing({ own: false })} data-testid="new-check"
-                    className="self-start sm:self-auto shrink-0 px-3 py-1.5 rounded-lg bg-brand text-white text-sm font-medium hover:bg-brand-hover">
+            <Button variant="primary" onClick={() => setEditing({ own: false })} data-testid="new-check"
+                    className="self-start sm:self-auto shrink-0">
               + New check
-            </button>
+            </Button>
           )}
         </div>
       </div>
 
       {data?.tool_enabled === false && (
-        <p className="rounded-lg border border-amber-300 bg-amber-50 dark:bg-amber-900/20 dark:border-amber-800 px-3 py-2 text-sm text-amber-900 dark:text-amber-200" data-testid="checks-tool-off">
-          The checks tool is off for this agent: its sessions cannot list, attach or run checks, and the agent cannot
-          create any. Mandatory checks still run.
+        <p className="rounded-card border border-status-warning-border bg-status-warning-bg px-3 py-2 text-sm text-status-warning-fg" data-testid="checks-tool-off">
+          The checks tool is off for this agent. Its sessions cannot list, attach or run checks. The agent cannot
+          create any either. Mandatory checks still run.
           {canManage && <> Turn on <span className="font-medium">Checks</span> under <Link className="underline" to={`/agents/${agent}/mcps`}>MCPs</Link>.</>}
         </p>
       )}
 
       <section className="space-y-3">
-        <h2 className="text-sm font-semibold text-p-text-secondary uppercase">The agent&apos;s checks</h2>
+        <h2 className="text-sm font-semibold text-secondary uppercase">The agent&apos;s checks</h2>
         {agents.length === 0 ? (
-          <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-6 text-center">
-            <p className="text-sm text-p-text-secondary">
+          <div className={`${CARD} p-6 text-center`}>
+            <p className="text-sm text-tertiary">
               {canManage ? 'No checks yet. A check judges the agent’s work and hands it its findings for another round.'
                 : 'No checks offered on this agent yet.'}
             </p>
@@ -73,19 +78,19 @@ export default function AgentChecks() {
         ) : agents.map((c) => (
           <CheckRow key={c.ref} item={c} canEdit={canManage} agent={agent}
                     onEdit={() => setEditing({ item: c, own: false })}
-                    onDelete={() => del.mutate({ agent, name: c.name })} />
+                    onDelete={() => { del.mutateAsync({ agent, name: c.name }).catch(toastError('The check was not removed')) }} />
         ))}
       </section>
 
       {data?.username && (
         <section className="space-y-3">
-          <h2 className="text-sm font-semibold text-p-text-secondary uppercase">My checks</h2>
+          <h2 className="text-sm font-semibold text-secondary uppercase">My checks</h2>
           {mine.length === 0 ? (
-            <p className="text-sm text-p-text-secondary">None yet — a private check runs on your own sessions when you attach it (the checks tool in a chat: <code className="font-mono text-xs">attach_check</code>).</p>
+            <p className="text-sm text-tertiary">None yet. A private check runs on your own sessions once you attach it. In a chat, use the checks tool: <code className="font-mono text-xs">attach_check</code>.</p>
           ) : mine.map((c) => (
             <CheckRow key={c.ref} item={c} canEdit agent={agent}
                       onEdit={() => setEditing({ item: c, own: true })}
-                      onDelete={() => del.mutate({ agent, name: c.name, own: true })} />
+                      onDelete={() => { del.mutateAsync({ agent, name: c.name, own: true }).catch(toastError('The check was not removed')) }} />
           ))}
         </section>
       )}
@@ -106,39 +111,37 @@ function CheckRow({ item, canEdit, agent, onEdit, onDelete }: {
 }) {
   const [confirm, setConfirm] = useState(false)
   return (
-    <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4 space-y-1.5" data-testid={`check-${item.ref}`}>
+    <div className={`${CARD} p-4 space-y-1.5`} data-testid={`check-${item.ref}`}>
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-medium text-p-text">{item.name}</span>
-        <span className={`px-2 py-0.5 rounded-full text-xs ${item.mandatory
-          ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300'
-          : 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300'}`}>
+        <span className="font-medium text-primary">{item.name}</span>
+        {item.description && <InfoTip label={item.name}>{item.description}</InfoTip>}
+        <span className={`${BADGE_BASE} ${item.mandatory ? BADGE_TONE.warning : BADGE_TONE.info}`}>
           {item.owner ? 'mine' : item.mandatory ? 'mandatory' : 'offered'}
         </span>
         {item.sections.map((s) => (
-          <span key={s} className="px-2 py-0.5 rounded-full text-xs border border-p-border-light text-p-text-secondary">{s}</span>
+          <span key={s} className={`${BADGE_BASE} ${BADGE_TONE.neutral}`}>{s}</span>
         ))}
         {(item.problems?.length ?? 0) > 0 && (
-          <span className="text-xs text-red-600" title={item.problems!.join('; ')}>needs a fix</span>
+          <span className="text-xs text-status-danger-fg" title={item.problems!.join(' · ')}>Needs a fix</span>
         )}
         {canEdit && (
           <span className="ml-auto flex gap-2 text-xs">
-            <button className="text-brand" onClick={onEdit}>Edit</button>
+            <button className="text-link hover:text-link-hover" onClick={onEdit}>Edit</button>
             {confirm ? (
               <>
-                <button className="text-red-600" onClick={onDelete} data-testid={`delete-${item.ref}`}>Remove for good</button>
-                <button className="text-p-text-secondary" onClick={() => setConfirm(false)}>Keep</button>
+                <button className="text-status-danger-fg" onClick={onDelete} data-testid={`delete-${item.ref}`}>Remove for good</button>
+                <button className="text-secondary hover:text-primary" onClick={() => setConfirm(false)}>Keep</button>
               </>
             ) : (
-              <button className="text-p-text-secondary" onClick={() => setConfirm(true)}>Remove</button>
+              <button className="text-secondary hover:text-primary" onClick={() => setConfirm(true)}>Remove</button>
             )}
           </span>
         )}
       </div>
-      {item.description && <p className="text-sm text-p-text-secondary">{item.description}</p>}
-      <p className="text-xs text-p-text-light">
+      <p className="text-xs text-tertiary">
         Applies to {item.applies.join(', ')} · runs {conditionWords(item.condition)} · {item.rounds === 0 ? 'reports only' : `up to ${item.rounds} fix round${item.rounds === 1 ? '' : 's'}`}
         {item.updated_by && item.updated_at && <> · updated {item.updated_by === 'file' ? 'by file' : ''} {new Date(item.updated_at).toLocaleString()}</>}
-        {item.owner === '' && <> · <Link className="text-brand" to={`/agents/${agent}/checks`}>agent:{item.name}</Link></>}
+        {item.owner === '' && <> · <Link className="text-link hover:text-link-hover" to={`/agents/${agent}/checks`}>agent:{item.name}</Link></>}
       </p>
     </div>
   )
@@ -154,32 +157,40 @@ function SpendCap({ agent }: { agent: string }) {
   const cap = shown.trim() === '' ? null : Number(shown)
   const valid = cap === null || (Number.isFinite(cap) && cap >= 0)
   return (
-    <section className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light p-4 space-y-2" data-testid="check-spend">
-      <h2 className="text-sm font-semibold text-p-text-secondary uppercase">Judge spend</h2>
-      <p className="text-xs text-p-text-secondary">
-        A judge run costs what a task run of this agent costs. Once a daily cap is reached, the judges are skipped for the rest of the day and the verdict says so.
-        {data?.platform_default_usd != null ? ` The platform default is $${data.platform_default_usd}.` : ' The platform sets no default.'}
+    <section className={`${CARD} p-4 space-y-2`} data-testid="check-spend">
+      <div>
+        <h2 className="inline text-sm font-semibold text-secondary uppercase">Judge spend</h2>
+        <InfoTip label="Judge spend">
+          Once the daily cap is reached, judges are skipped for the rest of the day. The verdict says so.
+        </InfoTip>
+      </div>
+      <p className="text-xs text-secondary">
+        A judge run costs what a task run of this agent costs.
+        {data?.platform_default_usd != null ? ` The platform's default daily cap is $${data.platform_default_usd}.` : ' The platform sets no default daily cap.'}
       </p>
       <div className="flex items-center gap-2 text-sm">
-        <span className="text-p-text-secondary">Daily cap (USD, blank = {data?.platform_default_usd != null ? 'the platform default' : 'none'})</span>
-        <input className="w-28 px-2 py-1 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
+        <span className="text-secondary">Daily cap in USD, blank for {data?.platform_default_usd != null ? 'the platform default' : 'none'}</span>
+        <Input compact className="max-w-28 shrink-0"
                value={shown} onChange={(e) => setValue(e.target.value)} placeholder="none" data-testid="check-cap" />
-        <button className="px-3 py-1 rounded-lg bg-brand text-white text-xs font-medium disabled:opacity-50"
+        <Button variant="primary" size="xs"
                 disabled={save.isPending || value === null || !valid}
-                onClick={() => save.mutate({ agent, daily_cap_usd: cap },
-                  { onSuccess: () => setValue(null) })}>
+                onClick={() => {
+                  save.mutateAsync({ agent, daily_cap_usd: cap })
+                    .then(() => setValue(null))
+                    .catch(toastError('The daily cap was not saved'))
+                }}>
           Save
-        </button>
+        </Button>
       </div>
     </section>
   )
 }
 
 const STATUS_CLS: Record<CheckVerdict['status'], string> = {
-  pass: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300',
-  fail: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300',
-  error: 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300',
-  skipped: 'bg-p-bg text-p-text-secondary',
+  pass: BADGE_TONE.success,
+  fail: BADGE_TONE.danger,
+  error: BADGE_TONE.warning,
+  skipped: BADGE_TONE.neutral,
 }
 
 /** Verdicts per page; the list never grows past it (found on the VM pass
@@ -197,14 +208,14 @@ export function VerdictList({ agent }: { agent: string }) {
   const hasOlder = rows.length > VERDICT_PAGE
   return (
     <section className="space-y-2" data-testid="check-verdicts">
-      <h2 className="text-sm font-semibold text-p-text-secondary uppercase">Verdicts</h2>
+      <h2 className="text-sm font-semibold text-secondary uppercase">Verdicts</h2>
       {verdicts.length === 0 ? (
-        <p className="text-sm text-p-text-secondary">{cursors.length ? 'No older verdicts.' : 'No verdicts yet.'}</p>
+        <p className="text-sm text-tertiary">{cursors.length ? 'No older verdicts.' : 'No verdicts yet.'}</p>
       ) : (
-        <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light overflow-x-auto">
+        <div className={`${CARD} overflow-x-auto`}>
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-p-text-secondary border-b border-p-border-light bg-p-bg/30">
+              <tr className="text-left text-secondary border-b border-subtle bg-surface-sunken">
                 <th className="px-3 py-2 font-medium">When</th>
                 <th className="px-3 py-2 font-medium">Check</th>
                 <th className="px-3 py-2 font-medium">Verdict</th>
@@ -215,28 +226,28 @@ export function VerdictList({ agent }: { agent: string }) {
             </thead>
             <tbody>
               {verdicts.map((v) => (
-                <tr key={v.id} className="border-b border-p-border-light last:border-0 align-top">
-                  <td className="px-3 py-2 whitespace-nowrap text-p-text-secondary">{new Date(v.created_at).toLocaleString()}</td>
+                <tr key={v.id} className="border-b border-subtle last:border-0 align-top">
+                  <td className="px-3 py-2 whitespace-nowrap text-secondary">{new Date(v.created_at).toLocaleString()}</td>
                   <td className="px-3 py-2 whitespace-nowrap">
-                    <span className="font-medium text-p-text">{v.check_name}</span>
-                    <span className="text-xs text-p-text-light"> · {v.section} · round {v.round}</span>
-                    {v.chat_id && <><br /><Link className="text-xs text-brand" to={`/chat/${agent}/${v.chat_id}`}>open the chat</Link></>}
+                    <span className="font-medium text-primary">{v.check_name}</span>
+                    <span className="text-xs text-tertiary"> · {v.section} · round {v.round}</span>
+                    {v.chat_id && <><br /><Link className="text-xs text-link hover:text-link-hover" to={`/chat/${agent}/${v.chat_id}`}>Open the chat</Link></>}
                   </td>
                   <td className="px-3 py-2 whitespace-nowrap">
-                    <span className={`px-2 py-0.5 rounded-full text-xs ${STATUS_CLS[v.status]}`}>{v.status}</span>
-                    {v.score != null && <span className="ml-1 text-xs text-p-text-light">{v.score}</span>}
+                    <span className={`${BADGE_BASE} ${STATUS_CLS[v.status]}`}>{v.status}</span>
+                    {v.score != null && <span className="ml-1 text-xs text-tertiary">{v.score}</span>}
                   </td>
-                  <td className="px-3 py-2 text-p-text-secondary max-w-md">
+                  <td className="px-3 py-2 text-secondary max-w-md">
                     {v.summary || v.reason}
                     {v.findings.length > 0 && (
-                      <ul className="mt-1 text-xs text-p-text-light list-disc pl-4">
-                        {v.findings.slice(0, 3).map((f, i) => <li key={i}>{f.location ? `${f.location} — ` : ''}{f.text}</li>)}
+                      <ul className="mt-1 text-xs text-tertiary list-disc pl-4">
+                        {v.findings.slice(0, 3).map((f, i) => <li key={i}>{f.location ? `${f.location}: ` : ''}{f.text}</li>)}
                         {v.findings.length > 3 && <li>… {v.findings.length - 3} more</li>}
                       </ul>
                     )}
                   </td>
-                  <td className="px-3 py-2 whitespace-nowrap text-p-text-secondary">{isLocalTarget(v.ran_on) ? 'platform' : `machine ${v.ran_on.slice(0, 8)}`}</td>
-                  <td className="px-3 py-2 text-right whitespace-nowrap text-p-text-secondary">{v.cost_usd ? `$${v.cost_usd.toFixed(2)}` : '—'}</td>
+                  <td className="px-3 py-2 whitespace-nowrap text-secondary">{isLocalTarget(v.ran_on) ? 'platform' : `machine ${v.ran_on.slice(0, 8)}`}</td>
+                  <td className="px-3 py-2 text-right whitespace-nowrap text-secondary">{v.cost_usd ? `$${v.cost_usd.toFixed(2)}` : '—'}</td>
                 </tr>
               ))}
             </tbody>
@@ -245,25 +256,23 @@ export function VerdictList({ agent }: { agent: string }) {
       )}
       {(cursors.length > 0 || hasOlder) && (
         <div className="flex items-center gap-2 text-xs" data-testid="verdict-pages">
-          <button
-            type="button"
+          <Button
+            size="xs"
             onClick={() => setCursors((c) => c.slice(0, -1))}
             disabled={cursors.length === 0 || isFetching}
-            className="rounded-md border border-p-border-light px-2 py-1 text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-50"
             data-testid="verdicts-newer"
           >
             Newer
-          </button>
-          <span className="text-p-text-light">page {cursors.length + 1}</span>
-          <button
-            type="button"
+          </Button>
+          <span className="text-tertiary">page {cursors.length + 1}</span>
+          <Button
+            size="xs"
             onClick={() => setCursors((c) => [...c, verdicts[verdicts.length - 1].created_at])}
             disabled={!hasOlder || isFetching}
-            className="rounded-md border border-p-border-light px-2 py-1 text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-50"
             data-testid="verdicts-older"
           >
             Older
-          </button>
+          </Button>
         </div>
       )}
     </section>

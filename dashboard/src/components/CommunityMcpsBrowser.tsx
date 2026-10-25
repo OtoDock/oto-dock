@@ -27,6 +27,13 @@ import { useAuth } from '../contexts/AuthContext'
 import { isAdmin as isPlatformAdmin } from '../lib/permissions'
 import { safeHref } from '../lib/safeUrl'
 import McpIcon from './McpIcon'
+import Dialog from './ui/Dialog'
+import Button from './ui/Button'
+import { Input, Select } from './ui/Field'
+import { BADGE_TONE, DIALOG_PANEL, FIELD, FIELD_BORDER, FIELD_REGULAR } from './ui/classes'
+
+// The small chips of a catalog card: a badge's tones at a dense size.
+const CHIP = 'inline-flex items-center rounded-chip px-1.5 py-0.5 text-3xs font-medium'
 
 interface Props {
   open: boolean
@@ -36,7 +43,7 @@ interface Props {
 }
 
 export default function CommunityMcpsBrowser({ open, onClose, agentSlug }: Props) {
-  const { data, isLoading, isError, error } = useCommunityMcps(open, agentSlug)
+  const { data, isLoading, isError } = useCommunityMcps(open, agentSlug)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<string>('all')
 
@@ -93,63 +100,64 @@ export default function CommunityMcpsBrowser({ open, onClose, agentSlug }: Props
   if (!open) return null
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-8 pb-8" onClick={onClose}>
-      <div
-        className="bg-white dark:bg-gray-800 rounded-xl shadow-xl border border-p-border-light w-full max-w-6xl mx-4 max-h-[calc(100vh-4rem)] flex flex-col overflow-hidden"
-        onClick={e => e.stopPropagation()}
-      >
+    <Dialog
+      onClose={onClose}
+      placement="top"
+      aria-label="Browse Community MCPs"
+      panelClassName={`${DIALOG_PANEL} max-w-6xl max-h-[calc(100vh-4rem)] flex flex-col overflow-hidden`}
+    >
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-p-border-light">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-subtle">
           <div>
-            <h3 className="text-base font-semibold text-p-text">Browse Community MCPs</h3>
-            <p className="text-xs text-p-text-light mt-0.5">
+            <h3 className="text-base font-semibold text-primary">Browse Community MCPs</h3>
+            <p className="text-xs text-tertiary mt-0.5">
               {agentSlug
                 ? `Showing MCPs available for ${agentSlug}.`
-                : 'Catalog of installable MCPs from the OtoDock community.'}
+                : 'MCPs you can install, from the OtoDock community.'}
               {data?.fetched_from && (
                 <>
-                  {' '}Catalog updated {data.updated_at ? new Date(data.updated_at).toLocaleString() : ''}.
+                  {' '}Community list updated {data.updated_at ? new Date(data.updated_at).toLocaleString() : ''}.
                 </>
               )}
             </p>
           </div>
-          <button onClick={onClose} className="text-p-text-light hover:text-p-text text-lg leading-none">&times;</button>
+          <button onClick={onClose} className="text-tertiary hover:text-primary text-lg leading-none">&times;</button>
         </div>
 
         {/* Filters */}
-        <div className="flex flex-wrap items-center gap-2 px-5 py-3 border-b border-p-border-light bg-gray-50/50 dark:bg-gray-900/30">
-          <input
+        <div className="flex flex-wrap items-center gap-2 px-5 py-3 border-b border-subtle">
+          <Input
             type="text"
             value={search}
             onChange={e => setSearch(e.target.value)}
             placeholder="Search by name, label, description, tag..."
-            className="flex-1 min-w-[200px] text-sm px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-gray-800 text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/50"
+            className="flex-1 min-w-[200px]"
           />
-          <select
+          <Select
             value={statusFilter}
             onChange={e => setStatusFilter(e.target.value)}
-            className="text-sm px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-gray-800 text-p-text"
+            className="sm:w-auto"
           >
             <option value="all">All statuses</option>
             <option value="installed">Installed</option>
             <option value="not_installed">Not installed</option>
             {agentSlug && <option value="enabled_here">Enabled for this agent</option>}
             {agentSlug && <option value="pending_request">Request pending</option>}
-          </select>
+          </Select>
         </div>
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto px-5 py-4">
           {isLoading && (
-            <div className="text-sm text-p-text-light">Loading catalog...</div>
+            <div className="text-sm text-tertiary">Loading the community list...</div>
           )}
           {isError && (
-            <div className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 p-3 text-sm text-red-700 dark:text-red-400">
-              Failed to load catalog: {(error as Error)?.message || 'unknown error'}
+            <div className="rounded-card border border-status-danger-border bg-status-danger-bg p-3 text-sm text-status-danger-fg">
+              Could not load the community list. Try again in a minute.
             </div>
           )}
           {data && filtered.length === 0 && (
-            <div className="text-sm text-p-text-light">No MCPs match the current filters.</div>
+            <div className="text-sm text-tertiary">No MCPs match the current filters.</div>
           )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
@@ -160,19 +168,15 @@ export default function CommunityMcpsBrowser({ open, onClose, agentSlug }: Props
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-5 py-3 border-t border-p-border-light bg-gray-50/50 dark:bg-gray-900/30">
-          <p className="text-[11px] text-p-text-light">
+        <div className="flex items-center justify-between px-5 py-3 border-t border-subtle">
+          <p className="text-2xs text-tertiary">
             {data ? `${filtered.length} of ${data.mcps.length} MCPs` : ''}
           </p>
-          <button
-            onClick={onClose}
-            className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors"
-          >
+          <Button onClick={onClose}>
             Close
-          </button>
+          </Button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }
 
@@ -218,6 +222,10 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
   const isAdmin = isPlatformAdmin(user)
   const showAdminInstall = !agentSlug
   const [error, setError] = useState<string | null>(null)
+  const clearError = () => {
+    setError(null)
+    setDismissedJob(job ?? null)
+  }
   // Reason modal is a 2-step: click Request → modal opens → optional
   // reason typed → Submit fires the mutation. Optional in the UI, but
   // the admin sees it on the Requests page when present. Only shown
@@ -227,7 +235,7 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
   const [showReasonModal, setShowReasonModal] = useState(false)
   const [reasonInput, setReasonInput] = useState('')
 
-  const visibleEntry = !!agentSlug
+  const visibleEntry = agentSlug
     ? agentMcps.data?.mcps.find(m => m.name === mcp.name)
     : undefined
   // Manager can self-serve when the MCP is in the agent's visible list
@@ -236,7 +244,7 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
   const canEnableDirectly = !!visibleEntry && !visibleEntry.enabled
 
   const handleInstall = () => {
-    setError(null)
+    clearError()
     // The mutation only reports an *initial-POST* failure (e.g. 403/502). The
     // install runs in the background; its failure surfaces via the polled job
     // below. 202 leaves the bar to take over.
@@ -245,15 +253,16 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
     })
   }
 
-  // Surface a background-install failure (from the poll) in the same inline
-  // banner the synchronous path used. Cleared on the next install attempt.
-  useEffect(() => {
-    if (job?.status === 'failed' && job.error) setError(job.error)
-  }, [job?.status, job?.error])
+  // A background-install failure (from the poll) shows in the same inline
+  // banner the synchronous path uses, until the next install attempt
+  // dismisses that job.
+  const [dismissedJob, setDismissedJob] = useState<CatalogInstallJob | null>(null)
+  const jobError = job?.status === 'failed' && job.error && job !== dismissedJob ? job.error : null
+  const shownError = error ?? jobError
 
   const handleEnableDirectly = () => {
     if (!agentSlug || !agentMcps.data) return
-    setError(null)
+    clearError()
     const next = agentMcps.data.mcps
       .filter(m => m.enabled || m.name === mcp.name)
       .map(m => m.name)
@@ -267,7 +276,7 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
   }
 
   const openRequestModal = () => {
-    setError(null)
+    clearError()
     setReasonInput('')
     setShowReasonModal(true)
   }
@@ -287,7 +296,7 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
   // cascade synchronously and returns the resolved row). No modal —
   // admin shouldn't have to justify a request to themselves.
   const submitAdminDirect = () => {
-    setError(null)
+    clearError()
     createRequest.mutate(
       { mcp_name: mcp.name, reason: '' },
       {
@@ -298,23 +307,23 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
 
   const handleCancel = () => {
     if (!mcp.pending_request) return
-    setError(null)
+    clearError()
     cancelRequest.mutate(mcp.pending_request, {
       onError: e => setError((e as Error)?.message || 'Cancel failed'),
     })
   }
 
   return (
-    <div className="rounded-lg border border-p-border-light bg-white dark:bg-p-surface p-3 flex flex-col gap-2">
+    <div className="rounded-card border border-subtle p-3 flex flex-col gap-2">
       <div className="flex items-start gap-2">
         <McpIcon name={mcp.name} label={mcp.label} category="community" author={mcp.author} hasIcon={!!mcp.icon_url} />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5 flex-wrap">
-            <h4 className="text-sm font-medium text-p-text truncate">{mcp.label}</h4>
+            <h4 className="text-sm font-medium text-primary truncate">{mcp.label}</h4>
             {/* node/python catalog entries are unpinned (version ""); show the
                 installed version when present, the catalog version otherwise,
                 and fall back to "latest" so we never render a bare "v". */}
-            <span className="text-[10px] text-p-text-light">
+            <span className="text-3xs text-tertiary">
               {mcp.installed_version || mcp.version ? `v${mcp.installed_version || mcp.version}` : 'latest'}
             </span>
             {/* Where the server code comes from — the catalog entry's upstream project. */}
@@ -324,7 +333,7 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
                 target="_blank"
                 rel="noreferrer"
                 onClick={e => { if (!safeHref(mcp.author_url)) e.preventDefault() }}
-                className="text-[10px] px-1.5 py-0.5 rounded-sm bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 border border-blue-200 dark:border-blue-800 hover:underline"
+                className={`${CHIP} ${BADGE_TONE.neutral} hover:underline`}
                 title={`Server code by ${mcp.author}`}
               >
                 by {mcp.author}
@@ -332,9 +341,7 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
             )}
             {mcp.trust && (
               <span
-                className={`text-[10px] px-1 py-0.5 rounded-sm ${mcp.trust === 'third-party'
-                  ? 'bg-gray-100 dark:bg-gray-800 text-p-text-secondary'
-                  : 'bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-400'}`}
+                className={`${CHIP} ${BADGE_TONE[mcp.trust === 'third-party' ? 'neutral' : 'success']}`}
                 title={MCP_TRUST_TIERS[mcp.trust]?.title}
               >
                 {MCP_TRUST_TIERS[mcp.trust]?.label ?? mcp.trust}
@@ -342,44 +349,44 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
             )}
             {mcp.patched && (
               <span
-                className="text-[10px] px-1 py-0.5 rounded-sm bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
+                className={`${CHIP} ${BADGE_TONE.warning}`}
                 title={mcp.patch_note || 'Includes OtoDock patches'}
               >
                 patched
               </span>
             )}
             {mcp.deprecated && (
-              <span className="text-[10px] px-1 py-0.5 rounded-sm bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400">
+              <span className={`${CHIP} ${BADGE_TONE.danger}`}>
                 deprecated
               </span>
             )}
           </div>
-          <p className="text-xs text-p-text-light line-clamp-2 mt-0.5">{mcp.description}</p>
+          <p className="text-xs text-tertiary line-clamp-2 mt-0.5">{mcp.description}</p>
         </div>
       </div>
 
       <div className="flex items-center flex-wrap gap-1">
         {mcp.requires_credentials && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded-sm bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400">
-            per user credentials
+          <span className={`${CHIP} ${BADGE_TONE.info}`}>
+            Per user credentials
           </span>
         )}
         {mcp.assignment_mode === 'explicit' && (
           <span
-            className="text-[10px] px-1.5 py-0.5 rounded-sm bg-gray-100 dark:bg-gray-800 text-p-text-light"
-            title="Admin must configure an instance (URL/token) before agents can use it"
+            className={`${CHIP} ${BADGE_TONE.neutral}`}
+            title="An admin must add an instance with a URL and a token before agents can use it"
           >
-            admin assignment
+            Admin assignment
           </span>
         )}
         {mcp.tags.slice(0, 3).map(tag => (
-          <span key={tag} className="text-[10px] px-1.5 py-0.5 rounded-sm bg-gray-100 dark:bg-gray-800 text-p-text-light">
+          <span key={tag} className={`${CHIP} ${BADGE_TONE.neutral}`}>
             {tag}
           </span>
         ))}
       </div>
 
-      <div className="mt-auto pt-2 border-t border-p-border-light flex items-center justify-between gap-2">
+      <div className="mt-auto pt-2 border-t border-subtle flex items-center justify-between gap-2">
         <StatusPill
           mcp={mcp}
           enabledHere={enabledHere}
@@ -388,94 +395,91 @@ function Card({ mcp, agentSlug, job }: { mcp: CommunityMcpEntry; agentSlug?: str
         />
         <div className="flex items-center gap-1.5">
           {showAdminInstall && !installing && !mcp.installed && (
-            <button
-              onClick={handleInstall}
-              className="text-xs px-2 py-1 rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
-            >
+            <Button variant="primary" size="xs" onClick={handleInstall}>
               Install
-            </button>
+            </Button>
           )}
           {showAdminInstall && !installing && mcp.source_changed && (
             <span
-              className="text-[10px] px-1.5 py-0.5 rounded-sm bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
-              title="The catalog entry moved to another source. Run Check Updates on the MCP Servers page and switch it there."
+              className={`${CHIP} ${BADGE_TONE.warning}`}
+              title="Its community list entry moved to another source. Run Check Updates on the MCP Servers page and switch it there."
             >
-              source changed
+              Source changed
             </span>
           )}
           {showAdminInstall && !installing && mcp.catalog_unpinned && (
             <span
-              className="text-[10px] px-1.5 py-0.5 rounded-sm bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
-              title="The catalog pins this entry to a tag or a branch, not a commit. It can be updated once the catalog pins a commit."
+              className={`${CHIP} ${BADGE_TONE.warning}`}
+              title="The community list pins this MCP to a tag or a branch, not a commit. It can be updated once the list pins a commit."
             >
-              catalog pins no commit
+              No pinned commit
             </span>
           )}
           {showAdminInstall && !installing && mcp.update_available && (
-            <button
-              onClick={handleInstall}
-              className="text-xs px-2 py-1 rounded-sm border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 disabled:opacity-40 transition-colors"
-            >
+            <Button variant="secondary" size="xs" onClick={handleInstall}>
               Update
-            </button>
+            </Button>
           )}
           {!showAdminInstall && !enabledHere && !mcp.pending_request && authLoading && (
-            <span className="text-[10px] text-p-text-light italic">Loading…</span>
+            <span className="text-3xs text-tertiary italic">Loading…</span>
           )}
           {!showAdminInstall && !enabledHere && !mcp.pending_request && !authLoading && canEnableDirectly && (
-            <button
+            <Button
+              variant="primary"
+              size="xs"
               onClick={handleEnableDirectly}
               disabled={setAgentMcps.isPending}
-              className="text-xs px-2 py-1 rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
-              title="MCP is installed and available — enables directly without admin approval"
+              title="This MCP is installed and available. Enabling it needs no admin approval."
             >
               {setAgentMcps.isPending ? 'Enabling...' : 'Enable'}
-            </button>
+            </Button>
           )}
           {!showAdminInstall && !enabledHere && !mcp.pending_request && !authLoading && !canEnableDirectly && isAdmin && (
             // Admin → one-click; backend auto-approves (install + instance
             // attach + enable) without a request row sitting pending.
-            <button
+            <Button
+              variant="primary"
+              size="xs"
               onClick={submitAdminDirect}
               disabled={createRequest.isPending || agentMcps.isLoading}
-              className="text-xs px-2 py-1 rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
               title={mcp.installed
-                ? 'Attaches this agent to an existing instance (or fails clearly if no instance exists yet)'
+                ? 'Attaches this agent to an existing instance. It fails if there is no instance yet.'
                 : 'Installs the MCP and enables it for this agent in one step'}
             >
               {createRequest.isPending ? (mcp.installed ? 'Enabling...' : 'Installing...') : (mcp.installed ? 'Enable' : 'Install')}
-            </button>
+            </Button>
           )}
           {!showAdminInstall && !enabledHere && !mcp.pending_request && !authLoading && !canEnableDirectly && !isAdmin && (
-            <button
+            <Button
+              variant="primary"
+              size="xs"
               onClick={openRequestModal}
               disabled={createRequest.isPending || agentMcps.isLoading}
-              className="text-xs px-2 py-1 rounded-sm bg-brand text-white hover:bg-brand-hover disabled:opacity-40 transition-colors"
               title={mcp.installed
                 ? 'Requires admin to authorize this agent via an instance'
                 : 'Requires admin to install the MCP on the platform first'}
             >
               {createRequest.isPending ? 'Requesting...' : 'Request'}
-            </button>
+            </Button>
           )}
           {!showAdminInstall && mcp.pending_request && (
-            <button
+            <Button
+              size="xs"
               onClick={handleCancel}
               disabled={cancelRequest.isPending}
-              className="text-xs px-2 py-1 rounded-sm border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-40 transition-colors"
               title="Cancel pending request"
             >
               {cancelRequest.isPending ? 'Cancelling...' : 'Cancel request'}
-            </button>
+            </Button>
           )}
         </div>
       </div>
 
       {showAdminInstall && installing && <CatalogInstallBar job={job} />}
 
-      {error && (
-        <div className="rounded-sm border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-2 py-1.5">
-          <p className="text-[11px] text-red-700 dark:text-red-400 whitespace-pre-wrap">{error}</p>
+      {shownError && (
+        <div className="rounded-card border border-status-danger-border bg-status-danger-bg px-2 py-1.5">
+          <p className="text-2xs text-status-danger-fg whitespace-pre-wrap">{shownError}</p>
         </div>
       )}
 
@@ -511,13 +515,13 @@ function CatalogInstallBar({ job }: { job?: CatalogInstallJob }) {
   const message = job?.message || 'Starting…'
   const indeterminate = job?.phase === 'image'
   return (
-    <div className="mt-2 flex flex-col gap-1 text-[11px] text-p-text-light">
-      <div className="h-1 w-full bg-p-text-light/10 rounded-sm overflow-hidden">
+    <div className="mt-2 flex flex-col gap-1 text-2xs text-tertiary">
+      <div className="h-1 w-full bg-surface-muted rounded-full overflow-hidden">
         {indeterminate ? (
-          <div className="h-full w-full bg-p-text-light/60 animate-pulse" />
+          <div className="h-full w-full bg-status-info-solid animate-pulse" />
         ) : (
           <div
-            className="h-full bg-p-text-light/60 transition-[width] duration-300 ease-out"
+            className="h-full bg-status-info-solid transition-[width] duration-300 ease-out"
             style={{ width: `${pct}%` }}
           />
         )}
@@ -547,53 +551,45 @@ function RequestReasonModal({
   submitting: boolean
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
-      <div
-        className="bg-white dark:bg-gray-800 rounded-xl shadow-xl border border-p-border-light w-full max-w-md mx-4"
-        onClick={e => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-p-border-light">
-          <h3 className="text-base font-semibold text-p-text">
+    <Dialog
+      onClose={onClose}
+      busy={submitting}
+      aria-label="Request"
+      panelClassName={`${DIALOG_PANEL} max-w-md`}
+    >
+        <div className="flex items-center justify-between px-5 py-4 border-b border-subtle">
+          <h3 className="text-base font-semibold text-primary">
             Request <span className="font-mono">{mcpLabel}</span>
           </h3>
-          <button onClick={onClose} className="text-p-text-light hover:text-p-text text-lg leading-none">&times;</button>
+          <button onClick={onClose} className="text-tertiary hover:text-primary text-lg leading-none">&times;</button>
         </div>
         <div className="p-5 space-y-3">
-          <p className="text-xs text-p-text-secondary">
-            For agent <span className="font-mono">{agentSlug}</span>. The admin will see your reason on the request — helps them prioritise.
+          <p className="text-xs text-secondary">
+            For agent <span className="font-mono">{agentSlug}</span>. The admin sees your reason on the request. It helps them prioritise.
           </p>
           <label className="block">
-            <span className="text-xs text-p-text-secondary">
-              Reason <span className="text-p-text-light">(optional)</span>
+            <span className="text-xs text-secondary">
+              Reason<span className="text-tertiary">, optional</span>
             </span>
             <textarea
               value={reason}
               onChange={e => onChangeReason(e.target.value)}
               rows={3}
               maxLength={500}
-              className="mt-1 w-full text-sm px-3 py-2 rounded-lg border border-p-border-light bg-white dark:bg-gray-900 text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/50"
-              placeholder="e.g. need to search nearby restaurants for the user"
+              className={`${FIELD} ${FIELD_REGULAR} ${FIELD_BORDER} mt-1`}
+              placeholder="Need to search nearby restaurants for the user"
             />
           </label>
         </div>
-        <div className="flex justify-end gap-2 px-5 py-3 border-t border-p-border-light bg-gray-50/50 dark:bg-gray-900/30">
-          <button
-            onClick={onClose}
-            disabled={submitting}
-            className="px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors disabled:opacity-40"
-          >
+        <div className="flex justify-end gap-2 px-5 py-3 border-t border-subtle">
+          <Button onClick={onClose} disabled={submitting}>
             Cancel
-          </button>
-          <button
-            onClick={onSubmit}
-            disabled={submitting}
-            className="px-3 py-1.5 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors disabled:opacity-40"
-          >
+          </Button>
+          <Button variant="primary" onClick={onSubmit} disabled={submitting}>
             {submitting ? 'Submitting...' : 'Submit request'}
-          </button>
+          </Button>
         </div>
-      </div>
-    </div>
+    </Dialog>
   )
 }
 
@@ -611,54 +607,49 @@ function StatusPill({
 }) {
   if (agentScoped) {
     if (enabledHere) {
-      return <Pill tone="green">Enabled for this agent</Pill>
+      return <Pill tone="success">Enabled for this agent</Pill>
     }
     if (mcp.pending_request) {
-      return <Pill tone="amber">Request pending admin approval</Pill>
+      return <Pill tone="warning">Request pending admin approval</Pill>
     }
     if (canEnableDirectly) {
       // Installed + visible to this agent (auto-mode, or explicit-mode with
       // instance authorizing this agent) — manager can self-serve. No
       // admin request needed for this case.
-      return <Pill tone="green">Available — click Enable</Pill>
+      return <Pill tone="success">Available: click Enable</Pill>
     }
     if (mcp.installed) {
       // Installed but NOT visible to this agent → explicit-mode that needs
       // admin to attach an instance, OR community-only without the manager's
       // auto-mode authorization in place. Falls through to the Request flow.
-      return <Pill tone="amber">Installed — needs admin authorization</Pill>
+      return <Pill tone="warning">Installed: needs admin authorization</Pill>
     }
-    return <Pill tone="gray">Not installed</Pill>
+    return <Pill tone="neutral">Not installed</Pill>
   }
   // Admin (global) context.
   if (mcp.update_available) {
     // node/python catalog `version` is "" (unbounded) → an update here is an
     // integration-manifest change; only docker shows a version transition.
     return (
-      <Pill tone="amber">
+      <Pill tone="warning">
         {mcp.version
-          ? `Update available (${mcp.installed_version} → ${mcp.version})`
-          : 'Update available (integration change)'}
+          ? `Update available: ${mcp.installed_version} → ${mcp.version}`
+          : 'Update available: integration change'}
       </Pill>
     )
   }
   if (mcp.installed) {
     const n = mcp.enabled_for_agents.length
     const reqLabel = mcp.pending_request_count > 0 ? ` · ${mcp.pending_request_count} pending` : ''
-    return <Pill tone="green">{n > 0 ? `Installed · enabled on ${n} agent${n === 1 ? '' : 's'}${reqLabel}` : `Installed${reqLabel}`}</Pill>
+    return <Pill tone="success">{n > 0 ? `Installed · enabled on ${n} agent${n === 1 ? '' : 's'}${reqLabel}` : `Installed${reqLabel}`}</Pill>
   }
   if (mcp.pending_request_count > 0) {
-    return <Pill tone="amber">Not installed · {mcp.pending_request_count} pending request{mcp.pending_request_count === 1 ? '' : 's'}</Pill>
+    return <Pill tone="warning">Not installed · {mcp.pending_request_count} pending request{mcp.pending_request_count === 1 ? '' : 's'}</Pill>
   }
-  return <Pill tone="gray">Not installed</Pill>
+  return <Pill tone="neutral">Not installed</Pill>
 }
 
-function Pill({ tone, children }: { tone: 'green' | 'amber' | 'gray'; children: React.ReactNode }) {
-  const classes = {
-    green: 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400',
-    amber: 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400',
-    gray: 'bg-gray-100 dark:bg-gray-800 text-p-text-light',
-  }[tone]
-  return <span className={`text-[10px] px-1.5 py-0.5 rounded-sm ${classes}`}>{children}</span>
+function Pill({ tone, children }: { tone: 'success' | 'warning' | 'neutral'; children: React.ReactNode }) {
+  return <span className={`${CHIP} ${BADGE_TONE[tone]}`}>{children}</span>
 }
 

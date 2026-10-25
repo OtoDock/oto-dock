@@ -16,8 +16,9 @@ HTTP is mocked via httpx.AsyncClient.
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from auth.oauth_providers import get_provider
 from auth.oauth_providers.zoom import ZoomOAuthProvider

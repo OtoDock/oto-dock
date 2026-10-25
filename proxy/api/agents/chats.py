@@ -4,27 +4,40 @@ CRUD endpoints for chats and messages, authenticated via JWT session cookie.
 """
 
 import asyncio
-import time
 import functools
 import logging
 import re
+import time
 import unicodedata
 import uuid
+from typing import cast
 
+import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from api.agents._common import json_body, json_response
+from auth import roles
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_agent_access,
+    require_auth,
+    require_user,
+)
+from core import layout, placement
+from core.events import chat_writer
+from core.execution_layer import ASK_MODE, AUTO_REVIEW_MODE, entry_mode
+from core.session import session_kind, visibility as _vis
+from core.session.visibility import (
+    _run_for_chat,
+    can_access_chat,
+    is_phone_chat_owner,
+    is_task_chat_owner,
+)
 from storage import database as task_store
 from storage.pg import run_db
-from core import placement
-from core.events import chat_writer
-from auth.providers import UserContext, get_current_user, require_auth, require_agent_access, require_user
-from core.session import session_kind
-from core.session.visibility import is_phone_chat_owner, is_task_chat_owner
-from auth import roles
-from core.session import visibility as _vis
 from ws import chat_phase
-from core import layout
 
 logger = logging.getLogger("otodock.chat-api")
 # No route here takes an anonymous caller (auth.providers.require_user).
@@ -48,7 +61,7 @@ _TITLE_MAX_LEN = 160  # code points, matching the client input's maxLength
 
 class CreateChatRequest(BaseModel):
     agent: str
-    permission_mode: str = "default"
+    permission_mode: str = ""   # a PERMISSION_MODES word; none: Auto
 
 
 class UpdateChatRequest(BaseModel):
@@ -76,19 +89,6 @@ def _sanitize_title(raw: str) -> str:
     return t[:_TITLE_MAX_LEN].rstrip()
 
 
-def _run_for_chat(chat: dict) -> dict | None:
-    """The task run governing this chat's task-history permissions, or None
-    for a plain chat. Keys on run-row EXISTENCE, never the id prefix — a
-    chat-surface delegate worker has a plain-uuid chat id WITH a run row.
-    Falls back to deriving the run id from a ``task-`` id for the create→
-    stamp window (run row exists, ``chat_id`` not yet pointing at it)."""
-    chat_id = chat.get("id", "")
-    run = task_store.get_run_for_chat(chat_id)
-    if run is None and session_kind.is_task_chat_id(chat_id):
-        run = task_store.get_run(session_kind.run_id_of_chat(chat_id))
-    return run
-
-
 def _task_mutation_allowed(role: str, acting: str, scope: str,
                            created_by: str) -> bool:
     """The task mutation matrix (mirrors ``api/tasks``' ``_check_task_permission``):
@@ -100,41 +100,6 @@ def _task_mutation_allowed(role: str, acting: str, scope: str,
     if (scope or _vis.SCOPE_AGENT) == _vis.SCOPE_USER:
         return own
     return roles.may_mutate_shared(role, own=own)
-
-
-def can_access_chat(u: UserContext, chat: dict) -> bool:
-    """May this user open this chat by id? The one rule the REST routes, the
-    dashboard's resume and every frame naming a chat share.
-
-    Owner-equality (per-user chats) OR admin OR — for a Shared-only agent's
-    synthetic-owner chat — any user assigned to the agent OR — for a task-run
-    chat (synthetic ``task::`` owner) — the task listing's run rule:
-    agent-scoped runs for anyone with agent access, user-scoped runs only for
-    their creator. Without that branch the REST surface denies rows the
-    ``kind=tasks`` listing itself shows. A phone call's conversation opens
-    for the agent's managers, which is who the conversations list serves, on
-    a person's dashboard only: a manager's session token or API key reads no
-    call. The chat's OWNER decides, never the agent's current mode: a
-    per-user chat from before an agent turned Shared-only stays its owner's.
-    Mutations layer ``can_mutate_chat`` on top.
-    """
-    from core.session.visibility import is_phone_chat_owner, is_shared_chat_owner
-    if u.is_admin:
-        return True
-    owner = chat.get("user_sub", "")
-    if session_kind.of_chat(chat) is session_kind.PHONE or is_phone_chat_owner(owner):
-        return not u.is_api_key and u.can_manage_agent(chat.get("agent", ""))
-    if owner == u.sub:
-        return True
-    if is_shared_chat_owner(owner):
-        return u.can_access_agent(chat.get("agent", ""))
-    if is_task_chat_owner(owner) or session_kind.of_chat(chat) is session_kind.TASK:
-        run = _run_for_chat(chat)
-        if run is not None:
-            if (run.get("scope") or "agent") == "user":
-                return run.get("created_by") == (u.acting_sub or "")
-            return u.can_access_agent(chat.get("agent", ""))
-    return False
 
 
 def can_mutate_chat(u: UserContext, chat: dict, run: dict | None = None,
@@ -197,7 +162,7 @@ def _list_chats_sync(u: UserContext, agent: str | None, kind: str,
     from core.session.visibility import chat_history_owner
     owner = chat_history_owner(agent, u.sub) if agent else u.sub
     if owner != u.sub:
-        require_agent_access(u, agent)  # the shared pool is its members' only
+        require_agent_access(u, cast("str", agent))  # the shared pool is its members' only
     chats = task_store.list_chats(owner, agent=agent, limit=limit)
     _stamp_mutation_flags(u, chats)
     return chats
@@ -211,7 +176,13 @@ async def list_chats(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    return {"chats": await run_db(_list_chats_sync, u, agent, kind, limit)}
+    return json_response(await run_db(_chats_body, _list_chats_sync, u, agent, kind, limit))
+
+
+def _chats_body(rows_of, *args) -> bytes:
+    """A chat listing's answer, rows and bytes in the same executor job:
+    the sidebar's fifty rows are the largest answer a page load makes."""
+    return json_body({"chats": rows_of(*args)})
 
 
 def _stamp_mutation_flags(u: UserContext, rows: list[dict]) -> None:
@@ -385,7 +356,7 @@ async def list_active_chats(
     literal path isn't captured by the param route.
     """
     u = require_auth(user)
-    return {"chats": await viewer_active_rows(u)}
+    return json_response(await viewer_active_body(u))
 
 
 async def viewer_active_rows(u: UserContext) -> list[dict]:
@@ -393,15 +364,27 @@ async def viewer_active_rows(u: UserContext) -> list[dict]:
     the warmups and the recent finished-unread chats, through
     ``_shape_active_row``'s gates. The agents map reads its live pulse from
     the same rows (``api/agents/activity.py``), so it shows a viewer exactly
-    what the Active-now list shows them.
+    what the Active-now list shows them."""
+    rows, _ = await _active_entry(u)
+    return rows
 
-    The in-memory snapshot on the loop, the rows in one batched job, and
-    a 1 s memo keyed by everything the rows depend on besides the
-    database (the viewer and the id sets): the tabs of one person seeding
-    at once share one job, and a tab that navigates away cancels nobody's."""
-    from core.session.session_state import streaming_chat_ids as pump_streaming
-    from core.session import interactive_session, warmup_registry
+
+async def viewer_active_body(u: UserContext) -> bytes:
+    """The Active-now answer as JSON bytes, encoded in the rows' job."""
+    _, body = await _active_entry(u)
+    return body
+
+
+async def _active_entry(u: UserContext) -> tuple[list[dict], bytes]:
+    """The in-memory snapshot on the loop, the rows and their encoded
+    answer in one batched job, and a 1 s memo keyed by everything the rows
+    depend on besides the database (the viewer and the id sets): the tabs
+    of one person seeding at once share one job and its bytes, and a tab
+    that navigates away cancels nobody's."""
     from datetime import datetime, timedelta, timezone
+
+    from core.session import interactive_session, warmup_registry
+    from core.session.session_state import streaming_chat_ids as pump_streaming
 
     streaming = list(pump_streaming()) + list(interactive_session.streaming_chat_ids())
     warming = list(warmup_registry.inflight_chat_ids())
@@ -410,7 +393,13 @@ async def viewer_active_rows(u: UserContext) -> list[dict]:
            tuple(sorted(u.agents)), tuple(sorted(u.agent_roles.items())),
            tuple(sorted(set(streaming))), tuple(sorted(set(warming))))
     return await _active_memo.get(
-        key, lambda: run_db(_active_rows, u, streaming, warming, since))
+        key, lambda: run_db(_active_rows_and_body, u, streaming, warming, since))
+
+
+def _active_rows_and_body(u: UserContext, streaming_ids: list[str], warming_ids: list[str],
+                          since: str) -> tuple[list[dict], bytes]:
+    rows = _active_rows(u, streaming_ids, warming_ids, since)
+    return rows, json_body({"chats": rows})
 
 
 _ACTIVE_MEMO_TTL_S = 1.0
@@ -422,16 +411,17 @@ class _ActiveMemo:
     job's completion and single-flighted: concurrent callers of one key
     share the job (through ``asyncio.shield``, so a cancelled caller cancels
     nobody's), a job that raises leaves no entry, and expired entries are
-    pruned on insert, at most ``cap`` kept."""
+    pruned on insert, at most ``cap`` kept. The entry is whatever the job
+    answered (the rows with their encoded bytes)."""
 
     def __init__(self, ttl: float = _ACTIVE_MEMO_TTL_S, cap: int = _ACTIVE_MEMO_MAX) -> None:
         self.ttl = ttl
         self.cap = cap
-        self._done: dict[tuple, tuple[float, list]] = {}
+        self._done: dict[tuple, tuple[float, object]] = {}
         self._flights: dict[tuple, asyncio.Future] = {}
         self.hits = 0
 
-    async def get(self, key: tuple, job) -> list:
+    async def get(self, key: tuple, job):
         now = time.monotonic()
         entry = self._done.get(key)
         if entry is not None and now - entry[0] < self.ttl:
@@ -452,7 +442,7 @@ class _ActiveMemo:
         if not flight.cancelled() and flight.exception() is None:
             self._store(key, flight.result())
 
-    def _store(self, key: tuple, rows: list) -> None:
+    def _store(self, key: tuple, value: object) -> None:
         now = time.monotonic()
         if len(self._done) >= self.cap:
             for k, (at, _) in list(self._done.items()):
@@ -460,7 +450,7 @@ class _ActiveMemo:
                     del self._done[k]
             while len(self._done) >= self.cap:
                 del self._done[next(iter(self._done))]
-        self._done[key] = (now, rows)
+        self._done[key] = (now, value)
 
     def reset(self) -> None:
         self._done.clear()
@@ -544,7 +534,7 @@ async def search_chats(
     u = require_auth(user)
     if not agent:
         raise HTTPException(status_code=400, detail="agent parameter required")
-    return {"chats": await run_db(_search_chats_sync, u, agent, kind, q, limit)}
+    return json_response(await run_db(_chats_body, _search_chats_sync, u, agent, kind, q, limit))
 
 
 def _search_chats_sync(u: UserContext, agent: str, kind: str, q: str,
@@ -683,7 +673,8 @@ async def get_chat_pins(
         raise HTTPException(status_code=404, detail="Chat not found")
     if not allowed:
         raise HTTPException(status_code=403, detail="Access denied")
-    from api.apps.apps import app_access, shape_app_rows
+    from api.apps.apps import shape_app_rows
+    from services.apps.audience import app_access
 
     def _load() -> dict:
         out: dict = {"chat": None, "project": None, "files": []}
@@ -769,7 +760,9 @@ def _satellite_fold_candidate(agent: str, chat: dict, normalized: str) -> str:
     ``""``; an empty prefix would over-match any ``/{agent}/…`` path), or a
     path outside the reported tree."""
     import json as _json
+
     from services.path_policy_v2 import _is_under, expand_tilde, normalize_path
+    from services.remote import remote_status
     from storage import remote_store
 
     target = (chat.get("execution_target") or "").strip()
@@ -777,8 +770,8 @@ def _satellite_fold_candidate(agent: str, chat: dict, normalized: str) -> str:
         # create_chat's INSERT does not stamp execution_target on every path —
         # fall back to the agent-default resolution before skipping the rule.
         try:
-            target, _reason = remote_store.resolve_execution_target(agent)
-        except Exception:
+            target, _reason = remote_status.resolve_execution_target(agent)
+        except psycopg.Error:
             return ""
     # The offline sentinel still names the intended machine; the fold is pure
     # prefix translation against the platform-synced tree — reachability-free.
@@ -955,7 +948,7 @@ async def create_chat(
     u = require_auth(user)
     require_agent_access(u, req.agent)
     chat = await run_db(_create_chat_sync, u, req.agent, req.permission_mode)
-    from api.apps import catalog
+    from services.apps import catalog
     catalog.announce_new_chat(chat)
     return {"chat": chat}
 
@@ -967,8 +960,9 @@ def _create_chat_sync(u: UserContext, agent: str, permission_mode: str) -> dict:
     if _vis.is_shared_chat_owner(owner) and not roles.can_edit(u.acting_role(agent)):
         # The shared chat runs as the agent (editor tier and up): a caller
         # below it never leaves a pick of its own on the shared row.
-        permission_mode = "default"
-    return task_store.create_chat(str(uuid.uuid4()), owner, agent, permission_mode)
+        permission_mode = ASK_MODE
+    return task_store.create_chat(str(uuid.uuid4()), owner, agent,
+                                  entry_mode(permission_mode or AUTO_REVIEW_MODE))
 
 
 def _mutable_chat(u: UserContext, chat_id: str, action: str) -> dict:
@@ -1021,7 +1015,7 @@ async def update_chat(
                     chat.get("user_sub") or "", chat_id, updates["title"],
                     agent=chat.get("agent") or "",
                 )
-            except Exception:
+            except ImportError:
                 logger.debug("rename broadcast failed for %s", chat_id,
                              exc_info=True)
     # Echo the sanitized title so the client renders what was stored.
@@ -1032,6 +1026,9 @@ async def update_chat(
 # its own sentence; a session still starting is registered nowhere a close
 # can reach, so the delete waits for it to exist.
 _STILL_STARTING = "This chat is still starting. Wait a moment, then delete it."
+# A meeting runs on its parent chat's pump: a delete under it would end the
+# meeting mid-round. One that has ended has a done pump and deletes as usual.
+_MEETING_RUNNING = "A meeting is running on this chat. Stop it first, then delete the chat."
 
 
 async def _close_chat_terminal(chat_id: str) -> None:
@@ -1049,7 +1046,7 @@ async def _close_chat_terminal(chat_id: str) -> None:
         try:
             await interactive_session.close_session(
                 live.session_id, reason="chat_deleted", drop_queued=True)
-        except Exception:
+        except Exception:  # noqa: BLE001  # closing a deleted chat's terminal, the next round re-reads
             # The next round re-reads: a close that raised may have left
             # this session registered, or a respawn's twin behind it.
             logger.warning("Chat delete: closing terminal %s failed",
@@ -1075,7 +1072,7 @@ async def _close_chat_session(chat: dict) -> None:
         if layer is None:
             return
         await layer.close_session(session_id)
-    except Exception:
+    except Exception:  # noqa: BLE001  # closing a deleted chat's live session on whatever layer holds it
         logger.warning("Chat delete: closing live session %s failed",
                        session_id[:8], exc_info=True)
 
@@ -1096,26 +1093,50 @@ async def delete_chat(
             status_code=409,
             detail="A task run is still active on this chat — cancel it "
                    "first, then delete the history entry.")
+    from core.events import input_queue
+    from core.events.stream_pump import _active_pumps
     from core.session import session_delivery, warmup_registry
+    meeting_pump = _active_pumps.get(chat_id)
+    if (meeting_pump is not None and not meeting_pump.is_done
+            and meeting_pump.source_type == session_kind.MEETING.source_type):
+        raise HTTPException(status_code=409, detail=_MEETING_RUNNING)
+    # The hold (its first turn enqueued, not started) counts as starting
+    # too: the kick would run on a deleted chat.
     if warmup_registry.get(chat_id) is not None \
-            or session_delivery.oneshot_inflight(chat_id) is not None:
+            or session_delivery.oneshot_inflight(chat_id) is not None \
+            or input_queue.getting_ready(chat_id):
         raise HTTPException(status_code=409, detail=_STILL_STARTING)
     # A deleted chat must never be woken — cancel its pending continuations
     # (row + APScheduler job) before the row goes.
     from services.scheduler import scheduler
     for cont in await run_db(task_store.list_continuations_for_chat, chat_id):
         await scheduler.remove_dynamic_task(cont["id"])
-    await _close_chat_terminal(chat_id)
-    await _close_chat_session(chat)
-    # The chat's share rows cascade with it; their snapshot copies do not
-    # (SHARING.md): take them first, remove them after. The row delete
-    # rides the chat's writer lane so it lands behind any row job of the
-    # chat still queued (a turn ending right now) instead of racing it.
-    from services.sharing import chat_snapshot
-    from storage.sharing import share_store
-    doomed = await run_db(share_store.list_target_shares, "chat", chat_id)
-    await chat_writer.submit(
-        chat_id, functools.partial(task_store.delete_chat, chat_id), label="delete")
+    # From here to the row delete landing, nothing starts on the chat and
+    # no delivery runs on it; its pump ends first (its rows and turn-end
+    # job queue on the lane ahead of the delete), then the session goes.
+    # The mark outlives a landed delete a while (a slow viewer's loop asks
+    # after its ``done``) and is lifted by a failed one, whose queue is
+    # reloaded from the rows the cascade never took.
+    input_queue.mark_deleting(chat_id)
+    try:
+        pump = _active_pumps.get(chat_id)
+        if pump is not None:
+            await pump.end_for_delete()
+        await _close_chat_terminal(chat_id)
+        await _close_chat_session(chat)
+        # The chat's share rows cascade with it; their snapshot copies do not
+        # (SHARING.md): take them first, remove them after. The row delete
+        # rides the chat's writer lane so it lands behind any row job of the
+        # chat still queued (a turn ending right now) instead of racing it.
+        from services.sharing import chat_snapshot
+        from storage.sharing import share_store
+        doomed = await run_db(share_store.list_target_shares, "chat", chat_id)
+        await chat_writer.submit(
+            chat_id, functools.partial(task_store.delete_chat, chat_id), label="delete")
+    except BaseException:
+        input_queue.unmark_deleting(chat_id, landed=False)
+        raise
+    input_queue.unmark_deleting(chat_id, landed=True)
     for share in doomed:
         await asyncio.to_thread(chat_snapshot.remove, share)
     from services.media import preview_snapshots

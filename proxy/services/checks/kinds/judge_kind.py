@@ -18,6 +18,9 @@ import os
 import time
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+import psycopg
 
 import config
 from core import placement
@@ -27,6 +30,9 @@ from services.checks.kinds.schema_kind import last_json_block
 from services.checks.render import Verdict, parse_verdict_json
 from services.infra.path_confinement import resolve_under
 from storage.automation import run_status
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger("checks")
 
@@ -79,7 +85,7 @@ WAIT_TIMED_OUT = "timeout"
 WAIT_CANCELLED = "cancelled"
 
 
-async def wait_run(run_id: str, *, timeout: float, cancelled: "callable") -> str:
+async def wait_run(run_id: str, *, timeout: float, cancelled: Callable[[], bool]) -> str:
     """The run's terminal status, through ``on_run_finished`` (a future the
     writer's thread completes), with the row re-read in case it ended
     before the future existed; ``cancelled()`` polled every two seconds —
@@ -232,7 +238,7 @@ async def _ran_on(row: dict) -> str:
             target = (crow or {}).get("execution_target") or ""
             if target and not placement.is_offline_sentinel(target):
                 return target
-        except Exception:
+        except psycopg.Error:
             logger.debug("judge: the chat's placement could not be read", exc_info=True)
     return row.get("execution_target") or placement.LOCAL
 
@@ -245,7 +251,7 @@ def _last_assistant(chat_id: str) -> str:
     return ""
 
 
-async def _one_run(task, *, timeout: float, cancelled, trigger_source: str) -> dict | None:
+async def _one_run(task, *, timeout: float, cancelled, trigger_source: str) -> dict:
     from services.scheduler import scheduler, task_kinds
     from storage import database as task_store
     run_id = await scheduler.trigger_task_now(task, trigger_type=task_kinds.TRIGGER_CHECK,

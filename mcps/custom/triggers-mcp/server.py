@@ -31,13 +31,16 @@ import os
 
 import httpx
 from mcp.server import Server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+
+from _tool_args import ToolArgs
 
 AGENT = os.environ.get("TRIG_MCP_AGENT", "")
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
 API_KEY = os.environ.get("PROXY_API_KEY", "")
 
 server = Server("triggers-mcp")
+TOOL_ARGS = ToolArgs()
 _client = httpx.AsyncClient(timeout=30)
 
 
@@ -59,7 +62,7 @@ async def _post(path: str, body: dict) -> dict:
     if r.status_code >= 400:
         try:
             detail = r.json().get("detail", r.text)
-        except Exception:
+        except (ValueError, AttributeError):
             detail = r.text
         raise RuntimeError(f"HTTP {r.status_code}: {detail}")
     return r.json()
@@ -72,7 +75,7 @@ async def _patch(path: str, body: dict) -> dict:
     if r.status_code >= 400:
         try:
             detail = r.json().get("detail", r.text)
-        except Exception:
+        except (ValueError, AttributeError):
             detail = r.text
         raise RuntimeError(f"HTTP {r.status_code}: {detail}")
     return r.json()
@@ -83,7 +86,7 @@ async def _delete(path: str) -> dict:
     if r.status_code >= 400:
         try:
             detail = r.json().get("detail", r.text)
-        except Exception:
+        except (ValueError, AttributeError):
             detail = r.text
         raise RuntimeError(f"HTTP {r.status_code}: {detail}")
     return r.json()
@@ -96,7 +99,7 @@ async def _get(path: str, params: dict | None = None) -> dict:
     if r.status_code >= 400:
         try:
             detail = r.json().get("detail", r.text)
-        except Exception:
+        except (ValueError, AttributeError):
             detail = r.text
         raise RuntimeError(f"HTTP {r.status_code}: {detail}")
     return r.json()
@@ -109,7 +112,7 @@ async def _get(path: str, params: dict | None = None) -> dict:
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="create_trigger",
             description=(
@@ -285,6 +288,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["name"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
         ),
         Tool(
             name="list_subscriptions",
@@ -319,6 +323,7 @@ async def list_tools() -> list[Tool]:
                     },
                 },
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="list_triggers",
@@ -355,6 +360,7 @@ async def list_tools() -> list[Tool]:
                     },
                 },
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="get_trigger",
@@ -364,6 +370,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {"id": {"type": "string"}},
                 "required": ["id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="edit_trigger",
@@ -420,6 +427,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False),
         ),
         Tool(
             name="pause_trigger",
@@ -432,6 +440,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {"id": {"type": "string"}},
                 "required": ["id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
         ),
         Tool(
             name="resume_trigger",
@@ -441,6 +450,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {"id": {"type": "string"}},
                 "required": ["id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
         ),
         Tool(
             name="delete_trigger",
@@ -453,6 +463,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {"id": {"type": "string"}},
                 "required": ["id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
         ),
         Tool(
             name="fire_trigger",
@@ -473,8 +484,9 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
         ),
-    ]
+    ])
 
 
 # =====================================================================
@@ -482,8 +494,11 @@ async def list_tools() -> list[Tool]:
 # =====================================================================
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     try:
         if name == "create_trigger":
             return await _handle_create(arguments)
@@ -507,7 +522,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     except RuntimeError as e:
         # API errors: surface message verbatim
         return [TextContent(type="text", text=f"Error: {e}")]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Unexpected error: {type(e).__name__}: {e}")]
 
 

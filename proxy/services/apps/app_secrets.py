@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 
-from api.apps import manifest as _mf
+from services.apps import manifest as _mf
 from storage import db_app_secrets
 
 logger = logging.getLogger("otodock.apps")

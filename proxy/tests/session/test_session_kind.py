@@ -15,8 +15,10 @@ from tests._paths import PROXY_DIR, REPO_ROOT
 if str(PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(PROXY_DIR))
 
-from core.session import session_kind as sk  # noqa: E402
-from core.session import visibility as vis  # noqa: E402
+from core.session import (
+    session_kind as sk,
+    visibility as vis,
+)
 
 
 def test_the_table():

@@ -6,10 +6,12 @@ from __future__ import annotations
 
 from services.phone.phone_config import assemble_phone_config
 from storage import schema as pg_schema
-from storage.phone import phone_route_store
 from storage.pg import get_conn
+from storage.phone import phone_route_store
 from tests.phone.test_phone_route_identity import (  # noqa: F401 — the client fixture
-    _make_agent, _make_route, client,
+    _make_agent,
+    _make_route,
+    client,
 )
 
 TARGETS = [{"label": "Reception", "number": "200"}, {"label": "Maria", "number": "+306912345678"}]

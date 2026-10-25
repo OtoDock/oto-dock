@@ -10,7 +10,12 @@
 import type { AccountSummary, Integration } from '../../api/credentials'
 import type { AccountsOps } from './types'
 import { AccountForm } from './AccountForm'
+import { InstallationsPanel } from './InstallationsPanel'
 import { SubscriptionsPanel } from './SubscriptionsPanel'
+import { isGitHubApp } from '../../lib/kinds/oauthApp'
+import { useSaveState } from '../../hooks/useSaveState'
+import { CARD_BORDERED } from '../ui/classes'
+import { SaveState } from '../ui/SettingsControls'
 
 interface Props {
   integration: Integration
@@ -29,6 +34,7 @@ export function AccountCard({
   onEdit,
   onClose,
 }: Props) {
+  const { stateOf, run } = useSaveState()
   const isOAuth = !!integration.oauth
   const label = account.display_email || account.account_label
   // A user-chosen label (PAT saves) is otherwise invisible when the provider
@@ -41,18 +47,20 @@ export function AccountCard({
       ? account.account_label
       : ''
   const overridesCount = account.agent_overrides.length
+  const githubApp = isGitHubApp(account.kind)
+  const installationsCount = account.installations?.length ?? 0
 
   return (
-    <div className="border border-p-border-light rounded-lg bg-gray-50 dark:bg-gray-800/40">
+    <div className={CARD_BORDERED}>
       <div className="flex items-center justify-between px-3 py-2">
         <div className="flex items-center gap-3 min-w-0 flex-1">
           <button
             onClick={() => {
               if (account.is_default) return
-              ops.setDefault.mutate({
+              void run('default', () => ops.setDefault.mutateAsync({
                 mcpName: integration.mcp_name,
                 accountLabel: account.account_label,
-              })
+              }), { failTitle: 'The default account was not set' })
             }}
             disabled={account.is_default || ops.setDefault.isPending}
             title={
@@ -62,27 +70,38 @@ export function AccountCard({
             }
             className={`text-lg leading-none ${
               account.is_default
-                ? 'text-amber-500'
-                : 'text-gray-300 hover:text-amber-400'
+                ? 'text-link'
+                : 'text-tertiary hover:text-link'
             }`}
           >
             ★
           </button>
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium text-p-text truncate">
-              {label}
-              {customLabel && (
-                <span className="ml-2 text-xs text-p-text-light">
-                  ({customLabel})
-                </span>
-              )}
-              {account.is_default && (
-                <span className="ml-2 text-xs text-p-text-light">
-                  (default)
-                </span>
-              )}
+            {/* The save state sits outside the truncated name, so a long
+                address never cuts it off. */}
+            <div className="flex items-center">
+              <div className="min-w-0 text-sm font-medium text-primary truncate">
+                {label}
+                {customLabel && (
+                  <span className="ml-2 text-xs text-tertiary">
+                    {customLabel}
+                  </span>
+                )}
+                {account.is_default && (
+                  <span className="ml-2 text-xs text-tertiary">
+                    Default
+                  </span>
+                )}
+              </div>
+              <SaveState state={stateOf('default')} />
             </div>
-            <div className="text-xs text-p-text-light flex items-center gap-2 flex-wrap">
+            <div className="text-xs text-tertiary flex items-center gap-2 flex-wrap">
+              {githubApp && (
+                <span>
+                  {installationsCount} installation
+                  {installationsCount === 1 ? '' : 's'}
+                </span>
+              )}
               {isOAuth && account.connected_services.length > 0 && (
                 <span>
                   {account.connected_services.length} service
@@ -90,18 +109,18 @@ export function AccountCard({
                 </span>
               )}
               {overridesCount > 0 && (
-                <span className="text-brand">
+                <span className="text-status-info-fg">
                   Used for {overridesCount} agent
                   {overridesCount === 1 ? '' : 's'}
                 </span>
               )}
               {account.missing_scopes.length > 0 && (
-                <span className="text-amber-600 dark:text-amber-400">
+                <span className="text-status-warning-fg">
                   Missing access
                 </span>
               )}
               {account.needs_reconnect && (
-                <span className="text-amber-600 dark:text-amber-400">
+                <span className="text-status-warning-fg">
                   Reconnect needed
                 </span>
               )}
@@ -110,15 +129,19 @@ export function AccountCard({
         </div>
         <button
           onClick={onEdit}
-          className="text-sm text-brand hover:underline ml-2"
+          className="text-sm text-link hover:text-link-hover ml-2"
         >
           {isEditing ? 'Close' : 'Edit'}
         </button>
       </div>
 
-      {/* Vendor webhook subscriptions sub-panel. The component
-          self-hides for MCPs that don't declare a credentials.webhooks block. */}
+      {/* The installations of a GitHub-App account, then the vendor webhook
+          subscriptions sub-panel (self-hides for MCPs that don't declare a
+          credentials.webhooks block). */}
       <div className="px-3 pb-2">
+        {githubApp && (
+          <InstallationsPanel integration={integration} account={account} />
+        )}
         <SubscriptionsPanel
           mcpName={integration.mcp_name}
           accountLabel={account.account_label}
@@ -127,7 +150,7 @@ export function AccountCard({
       </div>
 
       {isEditing && (
-        <div className="border-t border-p-border-light p-3">
+        <div className="border-t border-subtle p-3">
           <AccountForm
             integration={integration}
             account={account}

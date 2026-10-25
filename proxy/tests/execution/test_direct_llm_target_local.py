@@ -8,7 +8,7 @@ satellite and its home dir and the MCP set carried the satellite's device
 grants for a chat that then ran on the server ("I'm running on My Desktop
 (C:/Users/…)" from a Direct LLM chat on qwen3.6). Three layers now agree:
 
-1. ``remote_store.resolve_execution_target`` answers ``local`` for a
+1. ``remote_status.resolve_execution_target`` answers ``local`` for a
    direct-llm AGENT (covers the chat/task/meeting/phone builders, the
    scheduler and the dashboard's pin logic);
 2. ``build_agent_config`` places a chat local when its EFFECTIVE path is
@@ -26,10 +26,10 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import patch
 
-from storage.agents import agent_store
-from storage import remote_store
-from storage import database as task_store
 from core import placement
+from services.remote import remote_status
+from storage import database as task_store, remote_store
+from storage.agents import agent_store
 
 _ADMIN = {"username": "ada", "display_name": "Ada", "email": "a@x", "role": "admin"}
 _DIRECT = {"execution_target": "machine-admin", "execution_path": "direct-llm"}
@@ -48,8 +48,8 @@ def _mk_user(sub: str, name: str, role: str = "admin") -> str:
 def test_resolver_answers_local_for_a_direct_llm_agent(temp_db):
     with patch("storage.agents.agent_store.get_agent", return_value=_DIRECT), \
          patch("services.remote.remote_status.is_reachable", return_value=True):
-        assert remote_store.resolve_execution_target("pa", None, "manager") == ("local", None)
-        assert remote_store.resolve_execution_target("pa", None, "admin") == ("local", None)
+        assert remote_status.resolve_execution_target("pa", None, "manager") == ("local", None)
+        assert remote_status.resolve_execution_target("pa", None, "admin") == ("local", None)
 
 
 def test_resolver_ignores_a_user_override_for_a_direct_llm_agent(temp_db):
@@ -59,14 +59,14 @@ def test_resolver_ignores_a_user_override_for_a_direct_llm_agent(temp_db):
          patch.object(remote_store, "get_user_remote_target",
                       return_value={"machine_id": "machine-mine"}), \
          patch("services.remote.remote_status.is_reachable", return_value=True):
-        assert remote_store.resolve_execution_target("pa", "user-1", "viewer") == ("local", None)
+        assert remote_status.resolve_execution_target("pa", "user-1", "viewer") == ("local", None)
 
 
 def test_resolver_keeps_the_machine_for_a_cli_agent(temp_db):
     # Regression guard: the short-circuit is keyed on the path, nothing else.
     with patch("storage.agents.agent_store.get_agent", return_value=_CLI), \
          patch("services.remote.remote_status.is_reachable", return_value=True):
-        assert remote_store.resolve_execution_target("pa", None, "manager") == ("machine-admin", None)
+        assert remote_status.resolve_execution_target("pa", None, "manager") == ("machine-admin", None)
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +92,7 @@ def _stub_builder(monkeypatch, tmp_path) -> dict:
     monkeypatch.setattr(cb.dynamic_context, "get_dynamic_contexts", _no_dyn)
     monkeypatch.setattr(cb.subscription_pool, "resolve_subscription_env",
                         lambda *a, **k: ("sub-test", {}))
-    monkeypatch.setattr(cb.remote_store, "resolve_execution_target",
+    monkeypatch.setattr(cb.remote_status, "resolve_execution_target",
                         lambda *a, **k: ("machine-1", None))
     monkeypatch.setattr(
         cb.remote_store, "placement_of",
@@ -100,7 +100,8 @@ def _stub_builder(monkeypatch, tmp_path) -> dict:
                                  if target == "machine-1" else placement.LOCAL_PLACEMENT),
     )
     monkeypatch.setattr(cb.remote_store, "get_remote_machine",
-                        lambda *a, **k: {"id": "machine-1", "capabilities": "{}"})
+                        lambda *a, **k: {"id": "machine-1", "capabilities": "{}",
+                                         "pairing_scope": "admin"})
     monkeypatch.setattr(cb.remote_store, "get_target_browser_settings", lambda *a, **k: None)
     monkeypatch.setattr(cb.config, "build_agent_prompt", lambda *a, **k: "PROMPT")
     monkeypatch.setattr(cb.config, "get_cli_model", lambda *a, **k: "m")
@@ -160,6 +161,33 @@ class TestBuilderPlacesDirectLlmLocal:
         assert cfg.security_context.placement.admin_paired
         assert captured["is_remote"] is True
 
+    def test_the_prompt_is_built_off_the_loop(self, temp_db, monkeypatch, tmp_path):
+        """``build_agent_prompt`` (the agent's files, the person's context
+        and memory, the workspace walk) runs in a worker thread: the loop
+        thread never builds it."""
+        import threading
+
+        from core.config import config_builder as cb
+        agent_store.create_agent("dl", "DL", execution_path="direct-llm")
+        _mk_user("sub-ada", "Ada")
+        _stub_builder(monkeypatch, tmp_path)
+        seen: dict = {}
+
+        def recorder(*a, **k):
+            seen["thread"] = threading.get_ident()
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                seen["loop"] = None
+            else:
+                seen["loop"] = "running"
+            return "PROMPT"
+
+        monkeypatch.setattr(cb.config, "build_agent_prompt", recorder)
+        cfg = _build("dl")
+        assert "PROMPT" in cfg.system_prompt
+        assert seen["thread"] != threading.get_ident() and seen["loop"] is None
+
 
 # ---------------------------------------------------------------------------
 # 3. The dashboard's locality-mismatch banner
@@ -181,12 +209,12 @@ def test_no_move_banner_for_a_direct_llm_chat(temp_db):
     task_store.create_chat("c-cli", "sub-ada", "cx")
     task_store.update_chat("c-cli", execution_target="local")
     ctl = _controller("sub-ada")
-    with patch.object(remote_store, "resolve_execution_target", return_value=("machine-1", None)), \
+    with patch.object(remote_status, "resolve_execution_target", return_value=("machine-1", None)), \
          patch.object(remote_store, "get_remote_machine", return_value={"name": "My Desktop"}), \
          patch("ws.dashboard_warmup.acting_role_of", return_value="admin"):
         assert ctl._target_mismatch_fields("c-dl") == {}
         # The same pin on a CLI chat still advertises the move.
         assert ctl._target_mismatch_fields("c-cli") == {
-            "pinned_target": "local", "pinned_label": "local sandbox",
+            "pinned_target": "local", "pinned_label": "the OtoDock platform",
             "resolved_target": "machine-1", "resolved_label": "My Desktop",
         }

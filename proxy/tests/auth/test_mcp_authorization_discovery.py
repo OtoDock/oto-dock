@@ -46,6 +46,8 @@ class Vendor:
     def __init__(self, routes=None):
         self.routes = dict(routes or {})
         self.requests: list[httpx.Request] = []
+        # (url, dial policy) per client the module built
+        self.policies: list[tuple[str, object]] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -60,7 +62,8 @@ class Vendor:
             return httpx.Response(status, json=body, headers=headers or {})
         return httpx.Response(status, text=body or "", headers=headers or {})
 
-    def client(self) -> httpx.AsyncClient:
+    def client(self, url: str = "", policy=None) -> httpx.AsyncClient:
+        self.policies.append((url, policy))
         return httpx.AsyncClient(
             transport=httpx.MockTransport(self.handler), follow_redirects=False,
             headers={"User-Agent": ma.user_agent()},
@@ -422,3 +425,68 @@ class TestHelpers:
         assert ma.scopes_for({}, service_scopes=[], server=server) == "default"
         assert ma.registration_scope({"scopes": ["offline"]}, {"services": [
             {"key": "a", "scopes": ["read"]}, {"key": "b", "scopes": ["read", "write"]}]}) == "read write offline"
+
+
+_PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+               "NO_PROXY", "no_proxy")
+
+
+class TestDialPolicy:
+    """The dial judges the address again: a public MCP's issuer is fetched on
+    ``public_only``, a private MCP's on ``control_plane``, and a name that
+    turns private between the pre-check and the connect reaches nothing."""
+
+    def test_the_client_dials_on_the_control_plane_policy_by_default(self, monkeypatch):
+        import asyncio
+
+        from services.infra import pinned_http
+        for var in _PROXY_VARS:
+            monkeypatch.delenv(var, raising=False)
+        c = ma._client(ISSUER)
+        assert isinstance(c._transport, pinned_http.CheckedTransport)
+        assert c._transport.policy is pinned_http.control_plane
+        assert c.headers["User-Agent"] == ma.user_agent()
+        asyncio.run(c.aclose())
+
+    @pytest.mark.asyncio
+    async def test_a_public_mcps_issuer_is_fetched_on_public_only(self, vendor, monkeypatch):
+        from services.infra import pinned_http
+        _standard(vendor)
+        server = await ma.discover(RESOURCE)
+        assert server.public_resource is True
+        policies = dict(vendor.policies)
+        assert policies[PRM_PATH] is None              # the MCP's own document: the default
+        assert policies[AS_META] is pinned_http.public_only
+        ma.clear_caches()
+        vendor.policies.clear()
+        # A private MCP (a homelab) keeps its issuer on the control-plane rule.
+        monkeypatch.setattr(ma, "_resolve_addresses", lambda host: ["10.0.0.5"])
+        server = await ma.discover(RESOURCE)
+        assert server.public_resource is False
+        assert dict(vendor.policies)[AS_META] is pinned_http.control_plane
+
+    @pytest.mark.asyncio
+    async def test_an_issuer_that_turns_private_at_the_dial_is_refused_with_no_connection(self, monkeypatch):
+        """The MCP's metadata (stubbed: the issuer is the rebinding party)
+        names an issuer whose pre-check answer is public; the dial resolves
+        it again, gets the listener's loopback and refuses, so discovery
+        finds no metadata and the listener sees no connection."""
+        from services.infra import pinned_http
+        from tests.core.test_pinned_http import Listener
+        for var in _PROXY_VARS:
+            monkeypatch.delenv(var, raising=False)
+        target = Listener()
+        issuer = f"https://as.example.com:{target.port}"
+
+        async def prm(resource):
+            return {"resource": RESOURCE, "authorization_servers": [issuer]}, []
+        monkeypatch.setattr(ma, "_protected_resource", prm)
+        monkeypatch.setattr(ma, "_resolve_addresses", lambda host: ["8.8.8.8"])
+        monkeypatch.setattr(pinned_http, "_getaddrinfo",
+                            lambda host, port: [(2, 1, 6, "", ("127.0.0.1", port))])
+        ma.clear_caches()
+        with pytest.raises(ma.AuthorizationError, match="publishes no authorization server metadata"):
+            await ma.discover(RESOURCE)
+        assert target.connections == 0
+        target.close()
+        ma.clear_caches()

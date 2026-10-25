@@ -15,18 +15,18 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 import config
-from storage import database as task_store
-from storage.pg import run_db
+from api.hooks import paths, routing
+from api.sessions.sessions import verify_session_match_async
 from auth.path_policy import (
     check_host_path_access,
 )
-from api.sessions.sessions import verify_session_match_async
+from core.session import session_kind
 from core.session.session_state import (
     get_permission_queue,
     get_session_security,
 )
-from api.hooks import paths, routing
-from core.session import session_kind
+from storage import database as task_store
+from storage.pg import run_db
 from ws import wire_events as wire
 
 logger = logging.getLogger("otodock")
@@ -80,8 +80,9 @@ async def hook_images(req: HookImagesRequest, authorization: str | None = Header
         "images": [item.model_dump() for item in req.images],
     })
     logger.info(
-        f"Hook images: session={req.session_id}, count={len(req.images)}, "
-        f"first_caption={req.images[0].caption[:50] if req.images else ''}"
+        "Hook images: session=%s, count=%s, "
+        "first_caption=%s",
+        req.session_id, len(req.images), req.images[0].caption[:50] if req.images else ''
     )
     return {"status": "ok"}
 
@@ -136,7 +137,7 @@ async def hook_url(req: HookUrlRequest, authorization: str | None = Header(None)
         "title": req.title,
         "description": req.description,
     })
-    logger.info(f"Hook url: session={req.session_id}, url={req.url}")
+    logger.info("Hook url: session=%s, url=%s", req.session_id, req.url)
     return {"status": "ok"}
 
 
@@ -217,7 +218,7 @@ async def hook_file(req: HookFileRequest, authorization: str | None = Header(Non
 
     queue = get_permission_queue(route.queue_session_id)
     await queue.put(result)
-    logger.info(f"Hook file: session={req.session_id}, file={filename}")
+    logger.info("Hook file: session=%s, file=%s", req.session_id, filename)
     return {"status": "ok", **result}
 
 
@@ -264,15 +265,15 @@ async def hook_media(req: HookMediaRequest, authorization: str | None = Header(N
             "title": req.title,
             "poster": req.poster if req.poster.startswith(("http://", "https://")) else "",
         })
-        logger.info(f"Hook media({kind}): session={req.session_id}, url")
+        logger.info("Hook media(%s): session=%s, url", kind, req.session_id)
         return {"status": "ok"}
 
     # Resolve to a proxy-local file via the shared classify-first resolver:
     # synced-tree paths pull_through into the workspace, satellite-host paths
     # (Desktop/Downloads) lazy-pull into the proxy cache (≤100MB), and the
     # credential/.ssh/.env denylist applies for remote sessions.
-    from services.media import media_pipeline
     from core.remote import remote_file_flow
+    from services.media import media_pipeline
 
     local_path, resolution = await paths._classify_and_pull(req.session_id, source)
     if local_path is None:
@@ -346,8 +347,9 @@ async def hook_media(req: HookMediaRequest, authorization: str | None = Header(N
         "poster": req.poster if req.poster.startswith(("http://", "https://")) else "",
     })
     logger.info(
-        f"Hook media({resolved_kind}): session={req.session_id}, "
-        f"token={token[:8]}..., cache_owned={cache_owned}"
+        "Hook media(%s): session=%s, "
+        "token=%s..., cache_owned=%s",
+        resolved_kind, req.session_id, token[:8], cache_owned
     )
     return {"status": "ok"}
 
@@ -457,7 +459,7 @@ async def hook_ui(req: HookUiRequest, authorization: str | None = Header(None)):
     await notification_manager.broadcast_file_updated(ctx.agent, rel, source="disk")
 
     if not req.display:
-        logger.info(f"Hook ui (save-only): session={req.session_id}, path={rel}")
+        logger.info("Hook ui (save-only): session=%s, path=%s", req.session_id, rel)
         return {"status": "ok", "path": sandbox_path}
 
     chat_id = await routing.resolve_hook_chat_id(req.session_id) or None
@@ -487,5 +489,5 @@ async def hook_ui(req: HookUiRequest, authorization: str | None = Header(None)):
         "height": req.height,
         "path": rel,
     })
-    logger.info(f"Hook ui: session={req.session_id}, token={token[:8]}..., path={rel}")
+    logger.info("Hook ui: session=%s, token=%s..., path=%s", req.session_id, token[:8], rel)
     return {"status": "ok", "path": sandbox_path, "ui_url": f"/v1/ui/{token}"}

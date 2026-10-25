@@ -14,6 +14,8 @@ npx vitest run                       # unit tests
 npm run lint                         # ESLint
 ```
 
-How the dashboard fits with the proxy:
+`android/` is the Capacitor shell of the Android app around the built
+dashboard; its build is in [`CONTRIBUTING.md`](../CONTRIBUTING.md), with every
+other suite. How the dashboard fits with the proxy:
 [`ARCHITECTURE.md`](../ARCHITECTURE.md). Using and running OtoDock:
 [docs.otodock.io](https://docs.otodock.io).

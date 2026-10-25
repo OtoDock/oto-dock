@@ -1,4 +1,5 @@
-"""Session retention + disk cleanup for LOCAL sandboxed agents.
+"""Session retention + disk cleanup for the local sandboxes and the paired
+machines.
 
 A platform install's disk is dominated by on-disk CLI session state, not user
 content: Claude session JSONLs (``.claude/projects``), Codex rollouts
@@ -13,8 +14,10 @@ Passes (the full list and its order are ``_run_sweep_sync``'s):
      default ON; ``session_retention_days``, default 180): local chats
      untouched for N days lose their session files and are flagged
      ``pending_history_seed='retention'`` — the next turn transparently
-     reseeds from DB history (core/session/history_seed.py). Remote/
-     satellite chats and direct-LLM are never candidates. Under the same
+     reseeds from DB history (core/session/history_seed.py). Chats pinned
+     to a paired machine are flagged the same way and their files are
+     named to the machine's satellite (``_pass_remote_sessions``);
+     direct-LLM chats are never candidates. Under the same
      knob and window, check verdicts (CHECKS.md) older than N days are
      deleted (``_pass_check_verdicts``).
   B. Orphans — fixed 7-day grace, always on: session files no DB row points
@@ -32,8 +35,10 @@ Passes (the full list and its order are ``_run_sweep_sync``'s):
      declined share rows 30 days after the revoke or the decision
      (``share_store.STALE_SHARE_DAYS``).
 
-Never touched: anything on a remote satellite, workspaces/user content,
-plans, ``state_*.sqlite``, token/credential dirs.
+On a remote machine only the CLI transcripts age out (``_pass_remote_sessions``:
+the chats pinned to it are flagged like local ones, and a 0.5.150 satellite
+removes the files no row and no live session names). Never touched:
+workspaces/user content, plans, ``state_*.sqlite``, token/credential dirs.
 
 Safety model: live sessions are excluded via a snapshot of the real runtime
 registries (cli ``_persistent_sessions``, codex ``_codex_sessions`` incl.
@@ -51,18 +56,18 @@ import logging
 import os
 import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
 
 import config
+from core import layout, placement
 from core.session import external_identity
 from core.session.external_identity import external_home_of
 from services.infra import external_retention
 from services.infra.agent_dirs import agent_dirs
 from storage import database as task_store
-from core import layout
 
 logger = logging.getLogger("otodock")
 
@@ -78,6 +83,9 @@ JUNK_MIN_AGE_S = 3600
 # manifest skips .partial, so these are never re-synced or otherwise cleaned.
 PARTIAL_ORPHAN_AGE_S = 3600
 _SWEEP_INTERVAL_S = 86400
+# A machine's answer to the retention frame: the walk of its agent trees
+# and the deletes, off its loop.
+_REMOTE_RETENTION_TIMEOUT_S = 60.0
 
 _last_run: float = 0.0
 _sweep_lock = asyncio.Lock()
@@ -357,11 +365,11 @@ def _build_live_snapshot() -> LiveSnapshot:
     (agent, username) busy-home only when its session is in a live registry.
     """
     snap = LiveSnapshot()
+    from core.events.stream_pump import _active_pumps
     from core.layers.cli.session import _persistent_sessions
     from core.layers.codex.session import _codex_sessions
     from core.layers.direct.session import _direct_sessions
     from core.session.session_state import _session_security
-    from core.events.stream_pump import _active_pumps
 
     snap.session_ids.update(_persistent_sessions.keys())
     # Direct-LLM sessions have no files of their own, but an external caller
@@ -458,7 +466,7 @@ def _unlink(path: Path, stats: dict, count_key: str, bytes_key: str,
             path.unlink()
         except OSError as e:
             stats["errors"] += 1
-            logger.warning(f"retention: failed to delete {path}: {e}")
+            logger.warning("retention: failed to delete %s: %s", path, e)
             return
     stats[count_key] += 1
     stats[bytes_key] += size
@@ -503,7 +511,14 @@ def _pass_aged_chats(days: int, live: LiveSnapshot, stats: dict,
             continue
         if chat["id"] in live.pump_chat_ids:
             continue
-        home = _home_for_chat(chat["agent"], chat.get("user_sub") or "")
+        try:
+            home = _home_for_chat(chat["agent"], chat.get("user_sub") or "")
+        except ValueError:
+            # A row naming no agent directory (``get_agent_dir``'s barrier):
+            # nothing of it is on disk to age out; the sweep goes on.
+            logger.warning("retention: chat %s names no agent directory (%r)",
+                           str(chat["id"])[:8], chat["agent"])
+            continue
         # Each engine names the files of one chat under a home
         # (``ExecutionLayer.chat_session_files``; the id-shape guard is the
         # sweep's).
@@ -531,6 +546,163 @@ def _pass_aged_chats(days: int, live: LiveSnapshot, stats: dict,
         for f in files:
             _unlink(f, stats, "session_files_deleted", "bytes_freed", dry_run)
     stats["chats_flagged"] += len(flagged)
+
+
+def _remote_layer_for_sweep():
+    from core.session.session_manager import _get_remote_layer
+    return _get_remote_layer()
+
+
+def _remote_live_ids() -> tuple[set[str], dict[str, set[str]]]:
+    """The session and thread ids live on machines (the remote layer's
+    registry, grace-held sessions included): all of them, and by machine."""
+    all_ids: set[str] = set()
+    by_machine: dict[str, set[str]] = {}
+    for info in list(_remote_layer_for_sweep()._sessions.values()):
+        ids = {info.session_id}
+        if info.resume_handle:
+            ids.add(info.resume_handle)
+        all_ids |= ids
+        by_machine.setdefault(info.machine_id, set()).update(ids)
+    return all_ids, by_machine
+
+
+def _int_of(value) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+# A keep list past this many ids is not sent: the frame would run to several
+# MB and the machine's socket closes on an oversized one, which would drop the
+# machine at every sweep. Its files stay and it counts as unreached.
+_KEEP_MAX = 100_000
+
+
+async def _ask_machine_retention(cm, machine_id: str, keep: set[str], dry_run: bool) -> dict:
+    """One machine's row of ``remote_machines``: what it holds after the
+    pass and what went, or ``reached: False`` when it did not answer or
+    its keep list is past ``_KEEP_MAX``."""
+    row: dict = {
+        "machine_id": machine_id, "name": cm.satellite_name(machine_id),
+        "files": 0, "bytes": 0, "deleted": 0, "deleted_bytes": 0,
+        "candidates": [], "reached": False,
+    }
+    if len(keep) > _KEEP_MAX:
+        logger.warning(
+            "retention: machine %s (%s) is not asked: its keep list holds %d ids, "
+            "over the %d one frame carries; its session files stay",
+            machine_id[:8], row["name"], len(keep), _KEEP_MAX,
+        )
+        return row
+    try:
+        ack = await cm.send_command(machine_id, {
+            "type": "session_files_retention", "keep": sorted(keep),
+            "min_age_s": ORPHAN_GRACE_S, "dry_run": dry_run,
+        }, timeout=_REMOTE_RETENTION_TIMEOUT_S)
+    except RuntimeError as e:
+        logger.info("retention: machine %s did not answer the session files "
+                    "retention: %s", machine_id[:8], e)
+        return row
+    if ack.get("status", "ok") != "ok":
+        return row
+    for key in ("files", "bytes", "deleted", "deleted_bytes"):
+        row[key] = _int_of(ack.get(key))
+    cands = ack.get("candidates")
+    row["candidates"] = [str(c) for c in cands][:50] if isinstance(cands, list) else []
+    row["reached"] = True
+    return row
+
+
+async def _pass_remote_sessions(days: int, enabled: bool, live: LiveSnapshot,
+                                stats: dict, dry_run: bool) -> None:
+    """The sweep's remote half, on the loop after the threaded passes: the
+    chats pinned to a machine age out like local ones (Pass A's guards and
+    flag; the live ids are the remote layer's), then every connected
+    machine at 0.5.150 is asked to remove the transcripts no row and no
+    live session names (``session_files_retention``, a per-machine keep
+    list, the orphan grace by the machine's clock), so an aged chat's old
+    files and the orphans go together. An offline or older machine keeps
+    its files until a sweep finds it connected: the flag is set either way
+    and the chat's next open reseeds, as a local aged chat's does."""
+    from core.remote.satellite_connection import get_connection_manager
+    from core.session.session_manager import get_all_layers
+    from storage.pg import run_db
+
+    cm = get_connection_manager()
+    live_ids, live_by_machine = _remote_live_ids()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    # The machines holding an aged chat this sweep could not reach.
+    unreached: set[str] = set()
+    # The ids of the chats this pass ages: a dry run writes nothing, so they
+    # leave the keep lists by hand, as the flagging takes them out of the rows
+    # a real run then reads (the machines name the same candidates either way).
+    aged_refs: set[str] = set()
+    if enabled:
+        fileless = [path for path, layer in get_all_layers().items()
+                    if layer.capabilities.behaviour.rebuilds_history_from_db]
+        candidates = await run_db(task_store.get_remote_retention_candidate_chats,
+                                  cutoff, fileless_paths=fileless)
+        planned: list[str] = []
+        if candidates:
+            prot_sids, prot_tids = await run_db(task_store.get_protected_session_refs, cutoff)
+            for chat in candidates:
+                sid = chat.get("session_id") or ""
+                tid = chat.get("codex_thread_id") or ""
+                if sid and (sid in prot_sids or sid in live_ids):
+                    continue
+                if tid and (tid in prot_tids or tid in live_ids):
+                    continue
+                if chat["id"] in live.pump_chat_ids:
+                    continue
+                planned.append(chat["id"])
+                aged_refs.update(ref for ref in (sid, tid) if ref)
+                unreached.add(chat["execution_target"])
+        if planned:
+            flagged = planned if dry_run else await run_db(
+                task_store.flag_chats_for_retention, planned, cutoff)
+            stats["chats_flagged"] += len(flagged)
+            stats["remote_chats_flagged"] += len(flagged)
+    machines = [mid for mid in cm.get_connected_machines()
+                if cm.satellite_supports_session_retention(mid)]
+    if machines:
+        # The ids by the machine their row names. The rows that name no place
+        # (``""``: the scheduled tasks' continued sessions, rows minted before
+        # the column was stamped) ride every machine's keep list; a row the
+        # sandbox minted (``local``) has its files here and rides none.
+        unowned: set[str] = set()
+        by_machine: dict[str, set[str]] = {}
+        for target, refs in (await run_db(task_store.get_session_refs_by_target)).items():
+            if not target:
+                unowned.update(refs)
+            elif (mid := placement.machine_of(target)):
+                by_machine.setdefault(mid, set()).update(refs)
+        if dry_run:
+            unowned -= aged_refs
+            for refs in by_machine.values():
+                refs -= aged_refs
+        rows = await asyncio.gather(*(
+            _ask_machine_retention(
+                cm, mid,
+                unowned | by_machine.get(mid, set()) | live_by_machine.get(mid, set()),
+                dry_run,
+            ) for mid in machines
+        ))
+        for row in rows:
+            stats["remote_machines"].append(row)
+            if not row["reached"]:
+                unreached.add(row["machine_id"])
+                continue
+            unreached.discard(row["machine_id"])
+            stats["remote_session_files_bytes"] = (
+                (stats["remote_session_files_bytes"] or 0) + row["bytes"])
+            stats["remote_session_files_deleted"] += row["deleted"]
+            stats["remote_bytes_freed"] += row["deleted_bytes"]
+            if dry_run and row["candidates"]:
+                logger.info(
+                    "retention: machine %s (%s) would remove %d session files, e.g. %s",
+                    row["machine_id"][:8], row["name"], len(row["candidates"]),
+                    ", ".join(row["candidates"][:5]),
+                )
+    stats["remote_machines_unreached"] = len(unreached)
 
 
 def _pass_check_verdicts(days: int, stats: dict, dry_run: bool) -> None:
@@ -666,6 +838,7 @@ def _pass_share_snapshots(stats: dict, dry_run: bool) -> None:
     """Chat snapshots (SHARING.md): a revoked share's copy goes seven days
     after the revoke; a directory with no share row at all goes at once."""
     from datetime import timedelta
+
     from services.sharing import chat_snapshot
     from storage.sharing import share_store
     cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
@@ -713,6 +886,15 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         "shares_deleted": 0,
         "recover_bin_rows_pruned": 0,
         "recover_bin_orphans_deleted": 0,
+        # The machines (``_pass_remote_sessions``, on the loop after this).
+        # ``remote_session_files_bytes`` is what the reached machines still
+        # hold, None until one answered.
+        "remote_chats_flagged": 0,
+        "remote_session_files_deleted": 0,
+        "remote_bytes_freed": 0,
+        "remote_session_files_bytes": None,
+        "remote_machines_unreached": 0,
+        "remote_machines": [],
         # Caller data (external routes) — services/infra/external_retention.py
         "callers_forgotten": 0,
         "callers_busy_skipped": 0,
@@ -754,23 +936,27 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
             fn()
         except Exception:
             stats["errors"] += 1
-            logger.exception(f"retention: pass '{name}' failed")
+            logger.exception("retention: pass '%s' failed", name)
     stats["duration_ms"] = int((time.monotonic() - started) * 1000)
     total = (stats["bytes_freed"] + stats["orphan_bytes"]
              + stats["codex_junk_bytes"] + stats["tarball_bytes"]
              + stats["caller_bytes_freed"] + stats["offboarded_bytes"])
     logger.info(
-        f"retention: sweep done in {stats['duration_ms']}ms "
-        f"(dry_run={dry_run}, enabled={enabled}): "
-        f"{stats['chats_flagged']} chats flagged, "
-        f"{stats['session_files_deleted']} session files, "
-        f"{stats['orphans_deleted']} orphans, "
-        f"{stats['codex_junk_files']} codex-junk files, "
-        f"{stats['callers_forgotten']} callers forgotten, "
-        f"{stats['phone_chats_deleted']} phone chats, "
-        f"{stats['shares_deleted']} share rows, "
-        f"{stats['recover_bin_rows_pruned']} recover-bin rows without bytes, "
-        f"{total} bytes total"
+        "retention: sweep done in %sms "
+        "(dry_run=%s, enabled=%s): "
+        "%s chats flagged, "
+        "%s session files, "
+        "%s orphans, "
+        "%s codex-junk files, "
+        "%s callers forgotten, "
+        "%s phone chats, "
+        "%s share rows, "
+        "%s recover-bin rows without bytes, "
+        "%s bytes total",
+        stats['duration_ms'], dry_run, enabled, stats['chats_flagged'],
+        stats['session_files_deleted'], stats['orphans_deleted'], stats['codex_junk_files'],
+        stats['callers_forgotten'], stats['phone_chats_deleted'], stats['shares_deleted'],
+        stats['recover_bin_rows_pruned'], total
     )
     return stats
 
@@ -792,6 +978,19 @@ async def run_sweep(*, dry_run: bool = False) -> dict:
         stats = await asyncio.to_thread(
             _run_sweep_sync, days, enabled, snapshot, dry_run,
         )
+        try:
+            await _pass_remote_sessions(days, enabled, snapshot, stats, dry_run)
+        except Exception:
+            stats["errors"] += 1
+            logger.exception("retention: pass 'remote-sessions' failed")
+        if stats["remote_machines"]:
+            logger.info(
+                "retention: %d session files (%d bytes) removed on %d of %d machines, "
+                "%d remote chats flagged",
+                stats["remote_session_files_deleted"], stats["remote_bytes_freed"],
+                sum(1 for r in stats["remote_machines"] if r["reached"]),
+                len(stats["remote_machines"]), stats["remote_chats_flagged"],
+            )
         if not dry_run:
             _last_run = time.monotonic()
             try:
@@ -868,15 +1067,19 @@ def compute_storage_usage() -> dict:
 
     # Chunked uploads in flight sit outside every agent tree (and every
     # quota) until they complete: shown here so an admin sees the disk they hold.
-    from api.media import uploads
+    from services.media import upload_staging
 
+    # What the machines held at the last sweep (their answers); None until
+    # a sweep reached one.
+    remote_bytes = (last_sweep or {}).get("remote_session_files_bytes")
     return {
         "agents_bytes": _tree_bytes(Path(config.AGENTS_DIR)),
         "session_files_bytes": session_files,
+        "remote_session_files_bytes": remote_bytes if isinstance(remote_bytes, int) else None,
         "codex_junk_bytes": codex_junk,
         "recover_bin_bytes": _tree_bytes(Path(config.RECOVER_BIN_DIR)),
         "sessions_dir_bytes": _tree_bytes(Path(config.SESSIONS_DIR)),
-        "upload_staging_bytes": uploads.staged_bytes_total(),
+        "upload_staging_bytes": upload_staging.staged_bytes_total(),
         "logs_bytes": logs,
         "retention": {
             "enabled": settings_enabled(),

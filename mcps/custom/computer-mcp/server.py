@@ -28,11 +28,12 @@ import time
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import ImageContent, TextContent, Tool
+from mcp.types import ImageContent, TextContent, Tool, ToolAnnotations
 
 import executor
 import geometry
 import screen
+from _tool_args import ToolArgs
 from environment import (
     DeviceUnavailable,
     check_capture_supported,
@@ -47,6 +48,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("computer-mcp")
 
 server = Server("computer")
+TOOL_ARGS = ToolArgs()
 
 # Actions that move/click/drag/scroll/type — i.e. need an input backend (and so
 # are refused on Wayland / headless) as opposed to read-only `screenshot` /
@@ -104,7 +106,7 @@ def _alloc_save_path(display) -> tuple[str | None, str | None]:
     subdir = os.path.join(ws, _SAVE_SUBDIR)
     try:
         os.makedirs(subdir, exist_ok=True)
-    except Exception:
+    except OSError:
         return None, None
     idx = display if isinstance(display, int) else 1
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int((time.time() % 1) * 1000):03d}"
@@ -177,8 +179,8 @@ def _run_action(args: dict) -> list:
     if display is not None:
         try:
             display = int(display)
-        except (TypeError, ValueError):
-            raise ValueError("'display' must be an integer monitor index (1 = primary).")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("'display' must be an integer monitor index (1 = primary).") from exc
 
     # --- read-only actions -------------------------------------------------
     if action == "screenshot":
@@ -190,8 +192,8 @@ def _run_action(args: dict) -> list:
         check_capture_supported()
         try:
             duration = float(args.get("duration", 1.0))
-        except (TypeError, ValueError):
-            raise ValueError("'duration' must be a number of seconds.")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("'duration' must be a number of seconds.") from exc
         time.sleep(max(0.0, min(duration, 60.0)))
         return _screenshot_blocks(display, f"Waited {duration:g}s.")
 
@@ -252,8 +254,8 @@ def _run_action(args: dict) -> list:
         direction = args.get("scroll_direction")
         try:
             amount = int(args.get("scroll_amount", 3))
-        except (TypeError, ValueError):
-            raise ValueError("'scroll_amount' must be an integer number of clicks.")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("'scroll_amount' must be an integer number of clicks.") from exc
         coord = _optional_coordinate(args)
         executor.scroll(
             direction, amount,
@@ -273,8 +275,8 @@ def _run_action(args: dict) -> list:
             raise ValueError("'hold_key' requires 'text' (the key combo to hold).")
         try:
             duration = float(args.get("duration", 1.0))
-        except (TypeError, ValueError):
-            raise ValueError("'duration' must be a number of seconds.")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("'duration' must be a number of seconds.") from exc
         executor.hold_keys(text, duration)
         summary = f"Held {text} for {duration:g}s."
     elif action == "type":
@@ -299,7 +301,7 @@ def _run_action(args: dict) -> list:
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="computer",
             description=(
@@ -369,6 +371,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["action"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
         ),
         Tool(
             name="check_permissions",
@@ -380,12 +383,16 @@ async def list_tools() -> list[Tool]:
                 "nothing."
             ),
             inputSchema={"type": "object", "properties": {}},
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
-    ]
+    ])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     arguments = arguments or {}
     if name == "check_permissions":
         try:

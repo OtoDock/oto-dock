@@ -268,7 +268,7 @@ def translate_codex_mcp_env_paths(
     # (the rule already returns forward-slash paths there). NOTE: this is
     # TOML-specific — the plain ``translate_paths_in_text`` (used for prompt text,
     # not TOML) must NOT forward-slash, so we don't route through it here.
-    def _sub(match: "re.Match") -> str:
+    def _sub(match: re.Match) -> str:
         return _translate(match.group(1), agent_dir, username).replace("\\", "/")
 
     return _SANDBOX_PATH_RE.sub(_sub, toml_text)

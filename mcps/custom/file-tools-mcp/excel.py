@@ -9,11 +9,14 @@ import datetime
 import re
 import uuid
 from copy import copy
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from equations import latex_to_png
 from isolation import run_parse
 from shared import (
+    _WRITE_OP_ADVICE,
     _checked_resolved,
     _dropped_note,
     _normalize_operations,
@@ -22,9 +25,8 @@ from shared import (
     _push_preview,
     _resolve_path,
     _to_agents_relative,
-    _WRITE_OP_ADVICE,
-    logger,
     cleanup_partials,
+    logger,
     safe_open_write,
 )
 
@@ -63,7 +65,7 @@ def _merged_anchor_map(ws) -> dict[tuple[int, int], tuple[int, int]]:
                 for c in range(rng.min_col, rng.max_col + 1):
                     if (r, c) != (rng.min_row, rng.min_col):
                         anchors[(r, c)] = (rng.min_row, rng.min_col)
-    except Exception:
+    except Exception:  # noqa: BLE001  # openpyxl on a user's workbook raises anything from its parser
         pass
     return anchors
 
@@ -117,7 +119,7 @@ def _iter_comments(ws):
         c = ws._cells[key]
         try:
             cm = c.comment
-        except Exception:
+        except Exception:  # noqa: BLE001  # openpyxl on a user's workbook raises anything from its parser
             continue
         if cm is not None and (cm.text or "").strip():
             yield c.coordinate, cm
@@ -198,7 +200,7 @@ def _sheet_xml_sizes(path: str) -> tuple[dict[str, int], int] | None:
                 member = rels.get(sh.get(f"{RNS}id"), "")
                 by_name[sh.get("name")] = sizes.get(member, 0)
             return by_name, sizes.get("xl/sharedStrings.xml", 0)
-    except Exception:
+    except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError):
         return None
 
 
@@ -382,7 +384,7 @@ def read_xlsx(
                 if dv.prompt:
                     info += f' ("{dv.prompt}")'
                 result.append(info)
-    except Exception:
+    except Exception:  # noqa: BLE001  # openpyxl on a user's workbook raises anything from its parser
         pass
 
     # Merged cells
@@ -390,7 +392,7 @@ def read_xlsx(
         if ws_form.merged_cells.ranges:
             merged = ", ".join(str(r) for r in ws_form.merged_cells.ranges)
             result.append(f"\n**Merged Cells**: {merged}")
-    except Exception:
+    except Exception:  # noqa: BLE001  # openpyxl on a user's workbook raises anything from its parser
         pass
 
     # Tables
@@ -399,7 +401,7 @@ def read_xlsx(
             result.append(f"\n**Tables**: {len(ws_form.tables)}")
             for tname, tref in ws_form.tables.items():
                 result.append(f"  - {tname}: {tref}")
-    except Exception:
+    except Exception:  # noqa: BLE001  # openpyxl on a user's workbook raises anything from its parser
         pass
 
     # Comments — read from the formulas load (the values load is absent under
@@ -424,7 +426,7 @@ def read_xlsx(
             result.extend(comment_lines[:30])
             if len(comment_lines) > 30:
                 result.append(f"  …and {len(comment_lines) - 30} more")
-    except Exception:
+    except Exception:  # noqa: BLE001  # openpyxl on a user's workbook raises anything from its parser
         pass
 
     # Anchored images (equation pictures included) — from the formulas load.
@@ -438,7 +440,7 @@ def read_xlsx(
                     cm = ws_form[ref].comment
                     if cm is not None and _equation_latex(cm.text or "") is not None:
                         tag = " [equation — LaTeX source in the cell comment]"
-                except Exception:
+                except Exception:  # noqa: BLE001  # openpyxl on a user's workbook raises anything from its parser
                     pass
             where = f"anchored at {ref}" if ref else "floating (no cell anchor)"
             img_lines.append(
@@ -447,7 +449,7 @@ def read_xlsx(
         if img_lines:
             result.append(f"\n**Images** ({len(img_lines)}):")
             result.extend(img_lines)
-    except Exception:
+    except Exception:  # noqa: BLE001  # openpyxl on a user's workbook raises anything from its parser
         pass
 
     # A cold read must not hide equations parked on other sheets.
@@ -467,7 +469,7 @@ def read_xlsx(
             result.append(
                 f"\n**Equation comments on other sheets**: {', '.join(others)}"
             )
-    except Exception:
+    except Exception:  # noqa: BLE001  # openpyxl on a user's workbook raises anything from its parser
         pass
 
     wb_form.close()
@@ -1601,157 +1603,195 @@ def _add_chart(wb, ws, op: dict, idx: int, touch, notes: list, errors: list) -> 
     each a range string referenced in place or a literal list written to a
     data block. Every series is built through Series(): a one-row values
     range must stay ONE series (chart.add_data splits it per column)."""
-    from openpyxl.chart import (
-        AreaChart,
-        BarChart,
-        DoughnutChart,
-        LineChart,
-        PieChart,
-        Reference,
-        ScatterChart,
-        Series,
-    )
-    from openpyxl.chart.label import DataLabelList
-    from openpyxl.utils import get_column_letter
-
     kind, stacked = _chart_kind(op.get("chart_type"))
     stacked = bool(op.get("stacked")) or stacked
     anchor = _parse_anchor(op.get("anchor") or "E1")
     warnings: list[str] = []
 
     # (values Reference, title text | None, title_from_data)
-    entries: list[tuple] = []
-    cats = None
-    n_points: int | None = None
-
     if op.get("data_range") is not None:
-        ws_d, (c1, r1, c2, r2) = _parse_ref_range(wb, ws, op["data_range"], "data_range")
-        tfd = bool(op.get("titles_from_data", True))
-        if c2 - c1 + 1 < 2:
-            raise ValueError(
-                f"data_range '{op['data_range']}' has a single column — a chart "
-                f"needs categories in the first column and at least one value "
-                f"column (e.g. A1:B7), or pass categories + series"
-            )
-        if tfd and r2 - r1 + 1 < 2:
-            raise ValueError(
-                f"data_range '{op['data_range']}' is only a header row — add "
-                f"data rows or pass titles_from_data: false"
-            )
-        first = r1 + 1 if tfd else r1
-        cats = Reference(ws_d, min_col=c1, min_row=first, max_row=r2)
-        n_points = r2 - first + 1
-        for n, col in enumerate(range(c1 + 1, c2 + 1), start=1):
-            ref = Reference(ws_d, min_col=col, min_row=r1 if tfd else first, max_row=r2)
-            entries.append((ref, None if tfd else f"Series {n}", tfd))
+        entries, cats = _entries_from_data_range(wb, ws, op)
     else:
-        series_in = op.get("series")
-        if isinstance(series_in, (dict, str)):
-            series_in = [series_in]
-        if not isinstance(series_in, list) or not series_in:
-            raise ValueError(
-                "series must be a list of {name?, values} objects (or range strings)"
-            )
-        specs: list[dict] = []
-        for i, item in enumerate(series_in):
-            if isinstance(item, str):
-                item = {"values": item}
-            if not isinstance(item, dict):
-                raise ValueError(
-                    f"series[{i}] must be an object {{name?, values}} or a range "
-                    f"string, got {type(item).__name__}"
-                )
-            item = {
-                {"title": "name", "label": "name", "data": "values", "range": "values",
-                 "y": "values", "y_values": "values"}.get(k, k): v
-                for k, v in item.items()
-            }
-            unknown = sorted(k for k in item if k not in ("name", "values"))
-            if unknown:
-                raise ValueError(
-                    f"series[{i}]: unknown key(s) {', '.join(repr(k) for k in unknown)}"
-                    f" — accepted: name, values"
-                )
-            if item.get("values") is None:
-                raise ValueError(f"series[{i}] has no values")
-            specs.append(item)
-
-        categories = op.get("categories")
-        cat_literal = isinstance(categories, list)
-        literal_cols = [i for i, sp in enumerate(specs) if isinstance(sp["values"], list)]
-        block_row = None
-        block_col = 1
-        tally = {"converted": 0, "warned": {}}
-
-        def _put(row: int, col: int, raw):
-            """Literal data lands with the same coercion as write_cells."""
-            val, kind_ = _coerce_cell_value(raw)
-            kind_ = _set_coerced(ws.cell(row=row, column=col), val, kind_, raw=raw)
-            if kind_ is not None:
-                _tally_coercion(tally, kind_, raw, f"{get_column_letter(col)}{row}")
-
-        if cat_literal or literal_cols:
-            block_row = _free_row(ws)
-
-        if categories is None:
-            pass
-        elif cat_literal:
-            n_points = len(categories)
-            ws.cell(row=block_row, column=block_col, value="Category")
-            for ri, cat in enumerate(categories):
-                _put(block_row + 1 + ri, block_col, cat)
-            cats = Reference(ws, min_col=block_col, min_row=block_row + 1,
-                             max_row=block_row + n_points)
-        else:
-            ws_c, b = _parse_ref_range(wb, ws, categories, "categories")
-            n_points = _series_length(b, "categories")
-            cats = Reference(ws_c, min_col=b[0], min_row=b[1], max_col=b[2], max_row=b[3])
-
-        for i, sp in enumerate(specs):
-            name = sp.get("name")
-            name = str(name) if name is not None else f"Series {i + 1}"
-            vals = sp["values"]
-            if isinstance(vals, list):
-                if n_points is None:
-                    n_points = len(vals)
-                if len(vals) != n_points:
-                    raise ValueError(
-                        f"series '{name}' has {len(vals)} values but there are "
-                        f"{n_points} categories"
-                    )
-                col = block_col + (1 if cat_literal else 0) + literal_cols.index(i)
-                ws.cell(row=block_row, column=col, value=name)
-                for ri, v in enumerate(vals):
-                    _put(block_row + 1 + ri, col, v)
-                ref = Reference(ws, min_col=col, min_row=block_row + 1,
-                                max_row=block_row + n_points)
-            else:
-                label = f"series '{name}' values"
-                ws_v, b = _parse_ref_range(wb, ws, vals, label)
-                length = _series_length(b, label)
-                if n_points is None:
-                    n_points = length
-                elif length != n_points:
-                    raise ValueError(
-                        f"series '{name}' covers {length} cells but there are "
-                        f"{n_points} categories"
-                    )
-                ref = Reference(ws_v, min_col=b[0], min_row=b[1], max_col=b[2], max_row=b[3])
-            entries.append((ref, name, False))
-
-        if block_row is not None:
-            n_block_cols = (1 if cat_literal else 0) + len(literal_cols)
-            last_row = block_row + (n_points or 0)
-            touch(ws, block_row, block_col, last_row, block_col + n_block_cols - 1)
-            notes.append(
-                f"add_chart on '{ws.title}': literal chart data written to "
-                f"{get_column_letter(block_col)}{block_row}:"
-                f"{get_column_letter(block_col + n_block_cols - 1)}{last_row}"
-            )
-        _flush_coercion(tally, idx, "add_chart", ws.title, notes, errors)
+        entries, cats = _entries_from_series(wb, ws, op, idx, touch, notes, errors)
 
     if not entries:
         raise ValueError("no series — the chart would be empty")
+
+    chart = _chart_with_series(kind, entries, cats)
+    _style_chart(chart, op, kind, stacked, warnings)
+    if kind in ("pie", "doughnut") and len(entries) > 1:
+        warnings.append(f"{kind} charts show only the first series ({len(entries)} given)")
+
+    ws.add_chart(chart, anchor)
+    notes.append(
+        f"add_chart on '{ws.title}': {kind} chart, {len(entries)} series, "
+        f"anchored at {anchor}"
+    )
+    errors.extend(f"Op #{idx} add_chart: Warning: {w}" for w in warnings)
+
+
+def _entries_from_data_range(wb, ws, op: dict) -> tuple[list[tuple], object]:
+    """(series entries, categories) of a `data_range` block: categories in
+    the first column, one series per further column."""
+    from openpyxl.chart import Reference
+
+    entries: list[tuple] = []
+    ws_d, (c1, r1, c2, r2) = _parse_ref_range(wb, ws, op["data_range"], "data_range")
+    tfd = bool(op.get("titles_from_data", True))
+    if c2 - c1 + 1 < 2:
+        raise ValueError(
+            f"data_range '{op['data_range']}' has a single column — a chart "
+            f"needs categories in the first column and at least one value "
+            f"column (e.g. A1:B7), or pass categories + series"
+        )
+    if tfd and r2 - r1 + 1 < 2:
+        raise ValueError(
+            f"data_range '{op['data_range']}' is only a header row — add "
+            f"data rows or pass titles_from_data: false"
+        )
+    first = r1 + 1 if tfd else r1
+    cats = Reference(ws_d, min_col=c1, min_row=first, max_row=r2)
+    for n, col in enumerate(range(c1 + 1, c2 + 1), start=1):
+        ref = Reference(ws_d, min_col=col, min_row=r1 if tfd else first, max_row=r2)
+        entries.append((ref, None if tfd else f"Series {n}", tfd))
+    return entries, cats
+
+
+def _series_specs(op: dict) -> list[dict]:
+    """The `series` argument as checked `{name?, values}` objects."""
+    series_in = op.get("series")
+    if isinstance(series_in, (dict, str)):
+        series_in = [series_in]
+    if not isinstance(series_in, list) or not series_in:
+        raise ValueError(
+            "series must be a list of {name?, values} objects (or range strings)"
+        )
+    specs: list[dict] = []
+    for i, item in enumerate(series_in):
+        if isinstance(item, str):
+            item = {"values": item}
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"series[{i}] must be an object {{name?, values}} or a range "
+                f"string, got {type(item).__name__}"
+            )
+        item = {
+            {"title": "name", "label": "name", "data": "values", "range": "values",
+             "y": "values", "y_values": "values"}.get(k, k): v
+            for k, v in item.items()
+        }
+        unknown = sorted(k for k in item if k not in ("name", "values"))
+        if unknown:
+            raise ValueError(
+                f"series[{i}]: unknown key(s) {', '.join(repr(k) for k in unknown)}"
+                f" — accepted: name, values"
+            )
+        if item.get("values") is None:
+            raise ValueError(f"series[{i}] has no values")
+        specs.append(item)
+    return specs
+
+
+def _entries_from_series(wb, ws, op: dict, idx: int, touch, notes: list,
+                         errors: list) -> tuple[list[tuple], object]:
+    """(series entries, categories) of `categories` + `series`: a range is
+    referenced in place, a literal list written to a data block below the
+    sheet's used range with write_cells' coercion."""
+    from openpyxl.chart import Reference
+    from openpyxl.utils import get_column_letter
+
+    entries: list[tuple] = []
+    cats = None
+    n_points: int | None = None
+    specs = _series_specs(op)
+
+    categories = op.get("categories")
+    cat_literal = isinstance(categories, list)
+    literal_cols = [i for i, sp in enumerate(specs) if isinstance(sp["values"], list)]
+    block_row = None
+    block_col = 1
+    tally = {"converted": 0, "warned": {}}
+
+    def _put(row: int, col: int, raw):
+        """Literal data lands with the same coercion as write_cells."""
+        val, kind_ = _coerce_cell_value(raw)
+        kind_ = _set_coerced(ws.cell(row=row, column=col), val, kind_, raw=raw)
+        if kind_ is not None:
+            _tally_coercion(tally, kind_, raw, f"{get_column_letter(col)}{row}")
+
+    if cat_literal or literal_cols:
+        block_row = _free_row(ws)
+
+    if categories is None:
+        pass
+    elif cat_literal:
+        n_points = len(categories)
+        ws.cell(row=block_row, column=block_col, value="Category")
+        for ri, cat in enumerate(categories):
+            _put(block_row + 1 + ri, block_col, cat)
+        cats = Reference(ws, min_col=block_col, min_row=block_row + 1,
+                         max_row=block_row + n_points)
+    else:
+        ws_c, b = _parse_ref_range(wb, ws, categories, "categories")
+        n_points = _series_length(b, "categories")
+        cats = Reference(ws_c, min_col=b[0], min_row=b[1], max_col=b[2], max_row=b[3])
+
+    for i, sp in enumerate(specs):
+        name = sp.get("name")
+        name = str(name) if name is not None else f"Series {i + 1}"
+        vals = sp["values"]
+        if isinstance(vals, list):
+            if n_points is None:
+                n_points = len(vals)
+            if len(vals) != n_points:
+                raise ValueError(
+                    f"series '{name}' has {len(vals)} values but there are "
+                    f"{n_points} categories"
+                )
+            col = block_col + (1 if cat_literal else 0) + literal_cols.index(i)
+            ws.cell(row=block_row, column=col, value=name)
+            for ri, v in enumerate(vals):
+                _put(block_row + 1 + ri, col, v)
+            ref = Reference(ws, min_col=col, min_row=block_row + 1,
+                            max_row=block_row + n_points)
+        else:
+            label = f"series '{name}' values"
+            ws_v, b = _parse_ref_range(wb, ws, vals, label)
+            length = _series_length(b, label)
+            if n_points is None:
+                n_points = length
+            elif length != n_points:
+                raise ValueError(
+                    f"series '{name}' covers {length} cells but there are "
+                    f"{n_points} categories"
+                )
+            ref = Reference(ws_v, min_col=b[0], min_row=b[1], max_col=b[2], max_row=b[3])
+        entries.append((ref, name, False))
+
+    if block_row is not None:
+        n_block_cols = (1 if cat_literal else 0) + len(literal_cols)
+        last_row = block_row + (n_points or 0)
+        touch(ws, block_row, block_col, last_row, block_col + n_block_cols - 1)
+        notes.append(
+            f"add_chart on '{ws.title}': literal chart data written to "
+            f"{get_column_letter(block_col)}{block_row}:"
+            f"{get_column_letter(block_col + n_block_cols - 1)}{last_row}"
+        )
+    _flush_coercion(tally, idx, "add_chart", ws.title, notes, errors)
+    return entries, cats
+
+
+def _chart_with_series(kind: str, entries: list[tuple], cats):
+    """The chart object of `kind` with its series and categories."""
+    from openpyxl.chart import (
+        AreaChart,
+        BarChart,
+        DoughnutChart,
+        LineChart,
+        PieChart,
+        ScatterChart,
+        Series,
+    )
 
     chart = {
         "column": BarChart, "bar": BarChart, "line": LineChart, "pie": PieChart,
@@ -1769,6 +1809,12 @@ def _add_chart(wb, ws, op: dict, idx: int, touch, notes: list, errors: list) -> 
             chart.series.append(Series(ref, title=title, title_from_data=tfd))
         if cats is not None:
             chart.set_categories(cats)
+    return chart
+
+
+def _style_chart(chart, op: dict, kind: str, stacked: bool, warnings: list[str]) -> None:
+    """Title, axis titles, style, size, stacking, legend and data labels."""
+    from openpyxl.chart.label import DataLabelList
 
     if op.get("title"):
         chart.title = str(op["title"])
@@ -1811,15 +1857,6 @@ def _add_chart(wb, ws, op: dict, idx: int, touch, notes: list, errors: list) -> 
             chart.dataLabels.showPercent = True
         if op.get("show_values"):
             chart.dataLabels.showVal = True
-    if kind in ("pie", "doughnut") and len(entries) > 1:
-        warnings.append(f"{kind} charts show only the first series ({len(entries)} given)")
-
-    ws.add_chart(chart, anchor)
-    notes.append(
-        f"add_chart on '{ws.title}': {kind} chart, {len(entries)} series, "
-        f"anchored at {anchor}"
-    )
-    errors.extend(f"Op #{idx} add_chart: Warning: {w}" for w in warnings)
 
 
 def _series_ref_strings(series):
@@ -1889,19 +1926,765 @@ async def handle_write_xlsx(args: dict) -> str:
     return msg + ("\n\n" + help_text if help_text else "")
 
 
+@dataclass
+class _XlsxJob:
+    """What one write_xlsx call's operations share: the workbook and the
+    result's bookkeeping (the core reads the same lists after the loop)."""
+    wb: Any
+    errors: list[str]
+    notes: list[str]
+    structural: list[str]
+    touched: dict[str, list[int]]
+    eq_tmp_files: list[str]
+    dv_name_refs: list[tuple[int, str]]
+
+    def touch(self, ws, row1: int, col1: int, row2: int | None = None, col2: int | None = None):
+        row2 = row2 if row2 is not None else row1
+        col2 = col2 if col2 is not None else col1
+        box = self.touched.setdefault(ws.title, [row1, col1, row2, col2])
+        box[0] = min(box[0], row1)
+        box[1] = min(box[1], col1)
+        box[2] = max(box[2], row2)
+        box[3] = max(box[3], col2)
+
+
+# ---------------------------------------------------------------------------
+# Write — sheet operations
+# ---------------------------------------------------------------------------
+
+
+def _op_create_sheet(job: _XlsxJob, idx: int, op: dict) -> None:
+    pos = op.get("position")
+    job.wb.create_sheet(title=op["name"], index=pos)
+
+
+def _op_delete_sheet(job: _XlsxJob, idx: int, op: dict) -> None:
+    name = op["name"]
+    if len(job.wb.sheetnames) <= 1:
+        job.errors.append(f"Op #{idx} delete_sheet: cannot delete the last sheet")
+        return
+    if name in job.wb.sheetnames:
+        del job.wb[name]
+
+
+def _op_rename_sheet(job: _XlsxJob, idx: int, op: dict) -> None:
+    old = op["old_name"]
+    new = op["new_name"]
+    if old in job.wb.sheetnames:
+        job.wb[old].title = new
+    else:
+        job.errors.append(f"Op #{idx} rename_sheet: sheet '{old}' not found")
+
+
+def _op_copy_sheet(job: _XlsxJob, idx: int, op: dict) -> None:
+    source = op["source"]
+    target = op["new_name"]
+    if source in job.wb.sheetnames:
+        copied = job.wb.copy_worksheet(job.wb[source])
+        copied.title = target
+    else:
+        job.errors.append(f"Op #{idx} copy_sheet: sheet '{source}' not found")
+
+
+def _op_protect_sheet(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    ws.protection.sheet = True
+    if op.get("password"):
+        ws.protection.password = op["password"]
+    # Permission flags (True = allowed)
+    if op.get("allow_formatting_cells"):
+        ws.protection.formatCells = False
+    if op.get("allow_formatting_columns"):
+        ws.protection.formatColumns = False
+    if op.get("allow_formatting_rows"):
+        ws.protection.formatRows = False
+    if op.get("allow_insert_columns"):
+        ws.protection.insertColumns = False
+    if op.get("allow_insert_rows"):
+        ws.protection.insertRows = False
+    if op.get("allow_sort"):
+        ws.protection.sort = False
+    if op.get("allow_filter"):
+        ws.protection.autoFilter = False
+
+
+# ---------------------------------------------------------------------------
+# Write — cell operations
+# ---------------------------------------------------------------------------
+
+
+def _op_write_cells(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.utils import get_column_letter
+
+    ws = _get_sheet(job.wb, op)
+    tally = {"converted": 0, "warned": {}}
+    # Format 1: individual cells
+    cells_list = op.get("cells")
+    if cells_list and isinstance(cells_list, list):
+        for c in cells_list:
+            ref = c.get("cell", "")
+            if ref:
+                val, kind = _coerce_cell_value(
+                    c.get("value", ""), c.get("type")
+                )
+                kind = _set_coerced(
+                    ws[ref], val, kind, c.get("format"),
+                    raw=c.get("value"),
+                )
+                if kind is not None:
+                    _tally_coercion(tally, kind, c.get("value"), ref)
+                try:
+                    col, row = _parse_cell_ref(ref)
+                    job.touch(ws, row, col)
+                except ValueError:
+                    pass
+    else:
+        # Format 2: 2D array (no per-cell type here; strict ISO only)
+        start = op.get("start_cell", "A1")
+        data = op.get("data", [])
+        start_col, start_row = _parse_cell_ref(start)
+        n_cols = 0
+        for ri, row in enumerate(data):
+            n_cols = max(n_cols, len(row))
+            for ci, val in enumerate(row):
+                cval, kind = _coerce_cell_value(val)
+                if kind is None:
+                    ws.cell(
+                        row=start_row + ri,
+                        column=start_col + ci,
+                        value=cval,
+                    )
+                else:
+                    kind = _set_coerced(
+                        ws.cell(row=start_row + ri, column=start_col + ci),
+                        cval, kind, raw=val,
+                    )
+                    _tally_coercion(
+                        tally, kind, val,
+                        f"{get_column_letter(start_col + ci)}"
+                        f"{start_row + ri}",
+                    )
+        if data and n_cols:
+            job.touch(ws, start_row, start_col,
+                   start_row + len(data) - 1, start_col + n_cols - 1)
+    _flush_coercion(tally, idx, "write_cells", ws.title, job.notes, job.errors)
+
+
+def _op_set_formula(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    formula = op["formula"]
+    if not formula.startswith("="):
+        formula = "=" + formula
+    err = _validate_formula(formula)
+    if err:
+        job.errors.append(f"Op #{idx} set_formula: {err}")
+        return
+    ws[op["cell"]] = formula
+    try:
+        col, row = _parse_cell_ref(op["cell"])
+        job.touch(ws, row, col)
+    except ValueError:
+        pass
+
+
+def _op_merge_cells(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    ws.merge_cells(op["range"])
+
+
+def _op_unmerge_cells(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    ws.unmerge_cells(op["range"])
+
+
+def _op_clear_range(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection
+    from openpyxl.utils import range_boundaries
+
+    ws = _get_sheet(job.wb, op)
+    min_c, min_r, max_c, max_r = range_boundaries(op["range"])
+    clear_styles = op.get("clear_styles", False)
+    for row in ws.iter_rows(
+        min_row=min_r, max_row=max_r,
+        min_col=min_c, max_col=max_c,
+    ):
+        for cell in row:
+            cell.value = None
+            if clear_styles:
+                cell.font = Font()
+                cell.border = Border()
+                cell.fill = PatternFill()
+                cell.number_format = "General"
+                cell.alignment = Alignment()
+                cell.protection = Protection()
+
+
+def _op_copy_range(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.utils import range_boundaries
+
+    ws_src = _get_sheet(job.wb, op)
+    target_sheet = op.get("target_sheet")
+    ws_dst = job.wb[target_sheet] if target_sheet and target_sheet in job.wb.sheetnames else ws_src
+
+    src_range = op["source_range"]
+    src_min_col, src_min_row, src_max_col, src_max_row = range_boundaries(src_range)
+
+    tgt_col, tgt_row = _parse_cell_ref(op["target_start"])
+
+    for row_off in range(src_max_row - src_min_row + 1):
+        for col_off in range(src_max_col - src_min_col + 1):
+            src_cell = ws_src.cell(
+                row=src_min_row + row_off,
+                column=src_min_col + col_off,
+            )
+            dst_cell = ws_dst.cell(
+                row=tgt_row + row_off,
+                column=tgt_col + col_off,
+            )
+            dst_cell.value = src_cell.value
+            if src_cell.has_style:
+                dst_cell.font = copy(src_cell.font)
+                dst_cell.border = copy(src_cell.border)
+                dst_cell.fill = copy(src_cell.fill)
+                dst_cell.number_format = src_cell.number_format
+                dst_cell.alignment = copy(src_cell.alignment)
+                dst_cell.protection = copy(src_cell.protection)
+    job.touch(ws_dst, tgt_row, tgt_col,
+           tgt_row + (src_max_row - src_min_row),
+           tgt_col + (src_max_col - src_min_col))
+
+
+# ---------------------------------------------------------------------------
+# Write — row / column operations
+# ---------------------------------------------------------------------------
+
+
+def _op_insert_rows(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    ws.insert_rows(int(op["row"]), int(op.get("count", 1)))
+    job.structural.append(
+        f"insert_rows at row {op['row']} (+{op.get('count', 1)}) on '{ws.title}'"
+    )
+
+
+def _op_insert_columns(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.utils import column_index_from_string, get_column_letter
+
+    ws = _get_sheet(job.wb, op)
+    col = op.get("column", 1)
+    if isinstance(col, str):
+        col = column_index_from_string(col.upper())
+    ws.insert_cols(int(col), int(op.get("count", 1)))
+    job.structural.append(
+        f"insert_columns at {get_column_letter(int(col))} (+{op.get('count', 1)}) on '{ws.title}'"
+    )
+
+
+def _op_delete_rows(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    ws.delete_rows(int(op["row"]), int(op.get("count", 1)))
+    job.structural.append(
+        f"delete_rows at row {op['row']} (-{op.get('count', 1)}) on '{ws.title}'"
+    )
+
+
+def _op_delete_columns(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.utils import column_index_from_string, get_column_letter
+
+    ws = _get_sheet(job.wb, op)
+    col = op.get("column", 1)
+    if isinstance(col, str):
+        col = column_index_from_string(col.upper())
+    ws.delete_cols(int(col), int(op.get("count", 1)))
+    job.structural.append(
+        f"delete_columns at {get_column_letter(int(col))} (-{op.get('count', 1)}) on '{ws.title}'"
+    )
+
+
+def _op_set_column_width(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    ws.column_dimensions[op["column"].upper()].width = float(op["width"])
+
+
+def _op_set_row_height(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    ws.row_dimensions[int(op["row"])].height = float(op["height"])
+
+
+def _op_auto_column_width(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.utils import column_index_from_string, get_column_letter
+
+    ws = _get_sheet(job.wb, op)
+    columns = op.get("columns")  # list of column letters, or None for all
+    if columns:
+        for col_letter in columns:
+            col_idx = column_index_from_string(col_letter.upper())
+            max_len = 0
+            for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
+                for cell in row:
+                    if cell.value is not None:
+                        max_len = max(max_len, len(str(cell.value)))
+            ws.column_dimensions[col_letter.upper()].width = max(max_len + 2, 8)
+    else:
+        for col_cells in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col_cells[0].column)
+            for cell in col_cells:
+                if cell.value is not None:
+                    max_len = max(max_len, len(str(cell.value)))
+            if max_len > 0:
+                ws.column_dimensions[col_letter].width = max(max_len + 2, 8)
+
+
+def _op_freeze_panes(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    ws.freeze_panes = op["cell"]
+
+
+# ---------------------------------------------------------------------------
+# Write — formatting
+# ---------------------------------------------------------------------------
+
+
+def _op_set_style(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
+    from openpyxl.utils import range_boundaries
+
+    ws = _get_sheet(job.wb, op)
+    min_c, min_r, max_c, max_r = range_boundaries(op["range"])
+
+    # Font
+    font_kw = {}
+    if op.get("bold") is not None:
+        font_kw["bold"] = op["bold"]
+    if op.get("italic") is not None:
+        font_kw["italic"] = op["italic"]
+    if op.get("underline"):
+        val = op["underline"]
+        font_kw["underline"] = "single" if val is True else str(val)
+    if op.get("strikethrough"):
+        font_kw["strike"] = True
+    if op.get("font_size"):
+        font_kw["size"] = int(op["font_size"])
+    fc = op.get("font_color")
+    if fc:
+        font_kw["color"] = _ensure_ff(fc)
+    if op.get("font_name"):
+        font_kw["name"] = op["font_name"]
+    font = Font(**font_kw) if font_kw else None
+
+    # Fill
+    fill = None
+    fill_val = op.get("fill_color")
+    if fill_val:
+        fc_str = _ensure_ff(fill_val)
+        fill = PatternFill(start_color=fc_str, end_color=fc_str, fill_type="solid")
+
+    # Alignment
+    align = None
+    align_val = op.get("alignment")
+    wrap = op.get("wrap_text")
+    rotation = op.get("text_rotation")
+    if align_val or wrap is not None or rotation is not None:
+        if isinstance(align_val, dict):
+            akw = {
+                "horizontal": align_val.get("horizontal"),
+                "vertical": align_val.get("vertical"),
+                "wrap_text": align_val.get("wrap_text", wrap),
+                "text_rotation": align_val.get("text_rotation", rotation),
+                "indent": align_val.get("indent"),
+            }
+            akw = {k: v for k, v in akw.items() if v is not None}
+            align = Alignment(**akw)
+        elif align_val:
+            akw = {"horizontal": str(align_val)}
+            if wrap is not None:
+                akw["wrap_text"] = wrap
+            if rotation is not None:
+                akw["text_rotation"] = rotation
+            align = Alignment(**akw)
+        else:
+            akw = {}
+            if wrap is not None:
+                akw["wrap_text"] = wrap
+            if rotation is not None:
+                akw["text_rotation"] = rotation
+            align = Alignment(**akw)
+
+    # Border
+    border = None
+    border_val = op.get("border")
+    if border_val:
+        if isinstance(border_val, dict):
+            bstyle = border_val.get("style", "thin")
+            bcolor = str(border_val.get("color", "000000")).lstrip("#")
+            side = Side(style=bstyle, color=bcolor)
+            border = Border(
+                left=side if border_val.get("left", True) else Side(),
+                right=side if border_val.get("right", True) else Side(),
+                top=side if border_val.get("top", True) else Side(),
+                bottom=side if border_val.get("bottom", True) else Side(),
+            )
+        else:
+            side = Side(style="thin")
+            border = Border(left=side, right=side, top=side, bottom=side)
+
+    # Number format — named preset or raw Excel code
+    nf = op.get("number_format")
+    if nf:
+        nf = _resolve_number_format(nf)
+
+    # Protection
+    prot = None
+    if op.get("protection"):
+        pv = op["protection"]
+        prot = Protection(**pv) if isinstance(pv, dict) else Protection(locked=bool(pv))
+
+    for row in ws.iter_rows(
+        min_row=min_r, max_row=max_r,
+        min_col=min_c, max_col=max_c,
+    ):
+        for cell in row:
+            if font:
+                cell.font = font
+            if fill:
+                cell.fill = fill
+            if align:
+                cell.alignment = align
+            if border:
+                cell.border = border
+            if nf:
+                cell.number_format = nf
+            if prot:
+                cell.protection = prot
+
+
+# ---------------------------------------------------------------------------
+# Write — features — tables, validation, conditional formatting
+# ---------------------------------------------------------------------------
+
+
+def _op_create_table(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+
+    ws = _get_sheet(job.wb, op)
+    table_range = op["range"]
+    table_name = op.get("name") or f"Table_{uuid.uuid4().hex[:8]}"
+    style = op.get("style", "TableStyleMedium9")
+    tab = Table(displayName=table_name, ref=table_range)
+    tab.tableStyleInfo = TableStyleInfo(
+        name=style,
+        showFirstColumn=op.get("show_first_column", False),
+        showLastColumn=op.get("show_last_column", False),
+        showRowStripes=op.get("show_row_stripes", True),
+        showColumnStripes=op.get("show_column_stripes", False),
+    )
+    ws.add_table(tab)
+
+
+def _op_add_data_validation(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    ws = _get_sheet(job.wb, op)
+    dv_range = op["range"]
+    if op.get("validation_type") is None:
+        if op.get("values") is None:
+            raise ValueError(
+                "validation_type is required (list | whole | decimal | "
+                "date | time | textLength | custom); values alone "
+                "implies list"
+            )
+        dv_type = "list"
+    else:
+        dv_type = _dv_type(op["validation_type"])
+    dv = DataValidation(type=dv_type)
+
+    if dv_type == "list":
+        values = op.get("values")
+        if values is None or values == [] or values == "":
+            raise ValueError(
+                "list validation needs values: an array of items or "
+                "a reference string ('=Names', \"'Data'!$B$2:$B$50\")"
+            )
+        if (
+            isinstance(values, list)
+            and len(values) == 1
+            and (
+                str(values[0]).startswith("=")
+                or _SHEET_RANGE_RE.fullmatch(str(values[0]))
+            )
+        ):
+            # The incident shape: values: ["=SupplierList"] was
+            # quote-wrapped into a literal one-item text list.
+            values = str(values[0])
+        if isinstance(values, list):
+            items = [str(v).replace('"', '""') for v in values]
+            joined = ",".join(items)
+            dv.formula1 = '"' + joined + '"'
+            if len(joined) > 255:
+                job.errors.append(
+                    f"Op #{idx} add_data_validation: Warning: "
+                    f"literal list is {len(joined)} chars — Excel "
+                    f"caps in-formula lists at 255; put the items "
+                    f"in cells and reference the range instead"
+                )
+            if any("," in str(v) for v in values):
+                job.errors.append(
+                    f"Op #{idx} add_data_validation: Warning: "
+                    f"literal items containing commas are split "
+                    f"into separate entries by Excel; put the "
+                    f"items in cells and reference the range "
+                    f"instead"
+                )
+        else:
+            # Named range or sheet-qualified range reference
+            ref = _strip_leading_eq(str(values))
+            dv.formula1 = ref
+            job.dv_name_refs.append((idx, ref))
+    elif dv_type == "custom":
+        if not op.get("formula"):
+            raise ValueError("custom validation needs formula")
+        dv.formula1 = _strip_leading_eq(str(op["formula"]))
+    else:
+        # whole / decimal / date / time / textLength: a rule with
+        # no bound accepts nothing and says nothing — refuse it.
+        default_op = "lessThanOrEqual" if dv_type == "textLength" else "between"
+        operator = _dv_operator(op.get("operator") or default_op)
+        dv.operator = operator
+        if operator in ("between", "notBetween"):
+            if op.get("min") is None or op.get("max") is None:
+                raise ValueError(
+                    f"{dv_type} validation with {operator} needs min and max"
+                )
+            dv.formula1 = _dv_bound(op["min"], dv_type)
+            dv.formula2 = _dv_bound(op["max"], dv_type)
+        else:
+            bound = next(
+                (op[k] for k in ("value", "formula", "max", "min")
+                 if op.get(k) is not None),
+                None,
+            )
+            if bound is None:
+                raise ValueError(
+                    f"{dv_type} validation with {operator} needs value"
+                )
+            dv.formula1 = _dv_bound(bound, dv_type)
+
+    if op.get("allow_blank") is not None:
+        dv.allow_blank = op["allow_blank"]
+    if op.get("show_error"):
+        dv.showErrorMessage = True
+        dv.error = op.get("error_message", "")
+        dv.errorTitle = op.get("error_title", "Invalid input")
+        dv.errorStyle = op.get("error_style", "stop")
+    if op.get("show_prompt"):
+        dv.showInputMessage = True
+        dv.prompt = op.get("prompt_message", "")
+        dv.promptTitle = op.get("prompt_title", "")
+
+    dv.add(dv_range)
+    # Re-running a corrected op must replace the rule on the same
+    # cells, not stack a second one — stacked same-sqref rules of
+    # any type put Excel into repair.
+    sq = str(dv.sqref)
+    ws.data_validations.dataValidation = [
+        r for r in ws.data_validations.dataValidation
+        if str(r.sqref) != sq
+    ]
+    for existing in ws.data_validations.dataValidation:
+        if _sqref_intersects(dv.sqref, existing.sqref):
+            job.errors.append(
+                f"Op #{idx} add_data_validation: new rule "
+                f"overlaps existing validation at "
+                f"{existing.sqref} — Excel allows one rule per "
+                f"cell; use remove_data_validation first"
+            )
+    ws.add_data_validation(dv)
+
+
+def _op_remove_data_validation(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.worksheet.cell_range import MultiCellRange
+
+    ws = _get_sheet(job.wb, op)
+    rules = ws.data_validations.dataValidation
+    if op.get("range"):
+        target = MultiCellRange(op["range"])
+        keep = [
+            r for r in rules
+            if not _sqref_intersects(r.sqref, target)
+        ]
+        removed = len(rules) - len(keep)
+        ws.data_validations.dataValidation = keep
+        if removed == 0:
+            job.errors.append(
+                f"Op #{idx} remove_data_validation: no "
+                f"validation rules intersect {op['range']}"
+            )
+    elif op.get("all"):
+        removed = len(rules)
+        ws.data_validations.dataValidation = []
+    else:
+        job.errors.append(
+            f"Op #{idx} remove_data_validation: provide range "
+            f"or all: true"
+        )
+        return
+    job.notes.append(
+        f"remove_data_validation on '{ws.title}': "
+        f"{removed} rule(s) removed"
+    )
+
+
+def _op_conditional_format(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    _conditional_format(ws, op, idx, job.notes, job.errors)
+
+
+def _op_remove_conditional_format(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    _remove_conditional_format(ws, op, idx, job.notes, job.errors)
+
+
+def _op_auto_filter(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    ws.auto_filter.ref = op["range"]
+
+
+def _op_define_name(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.workbook.defined_name import DefinedName
+
+    name = op["name"]
+    cell_range = _strip_leading_eq(str(op["range"]))
+    if "!" in cell_range:
+        # Already sheet-qualified — prefixing again produces an
+        # invalid double-qualified reference.
+        ref = cell_range
+    else:
+        sheet_name = op.get("sheet", job.wb.sheetnames[0])
+        ref = f"'{sheet_name}'!{cell_range}"
+    defn = DefinedName(name, attr_text=ref)
+    job.wb.defined_names.add(defn)
+
+
+# ---------------------------------------------------------------------------
+# Write — charts
+# ---------------------------------------------------------------------------
+
+
+def _op_add_chart(job: _XlsxJob, idx: int, op: dict) -> None:
+    ws = _get_sheet(job.wb, op)
+    _add_chart(job.wb, ws, op, idx, job.touch, job.notes, job.errors)
+
+
+# ---------------------------------------------------------------------------
+# Write — images
+# ---------------------------------------------------------------------------
+
+
+def _op_add_image(job: _XlsxJob, idx: int, op: dict) -> None:
+    from openpyxl.drawing.image import Image as XlImage
+
+    ws = _get_sheet(job.wb, op)
+    img_path = _checked_resolved(op.get("image_path", ""))
+    img = XlImage(img_path)
+    if op.get("width"):
+        img.width = int(op["width"])
+    if op.get("height"):
+        img.height = int(op["height"])
+    ws.add_image(img, op.get("cell", "A1"))
+
+
+def _op_add_equation(job: _XlsxJob, idx: int, op: dict) -> None:
+    # LaTeX equation as a floating PNG anchored at a cell, plus
+    # the source LaTeX in a cell comment (xlsx has no in-cell
+    # math). The comment is the machine-readable source of truth;
+    # picture and comment both survive later edits of the file.
+    import tempfile
+
+    from openpyxl.drawing.image import Image as XlImage
+    from openpyxl.utils import get_column_letter
+
+    ws = _get_sheet(job.wb, op)
+    latex = op.get("latex") or ""
+    cell = op.get("cell", "A1")
+    height_px = int(op.get("height", 40))
+    col, row = _parse_cell_ref(cell)
+    # A covered merged cell can't hold the marker comment and
+    # would detach it from the picture — anchor both at the
+    # merge anchor.
+    row, col = _merged_anchor_map(ws).get((row, col), (row, col))
+    cell = f"{get_column_letter(col)}{row}"
+    # One equation per cell: an existing marked equation is
+    # replaced. With several images at the anchor there is no
+    # safe way to tell the equation from e.g. a logo — refuse.
+    existing = [i for i in ws._images if _anchor_cell(i) == (col, row)]
+    prior = ws[cell].comment
+    if prior is not None and _equation_latex(prior.text or "") is not None and existing:
+        if len(existing) > 1:
+            raise ValueError(
+                f"{len(existing)} images are anchored at {cell}; "
+                "cannot replace the equation safely — move or "
+                "remove the other image(s) first"
+            )
+        ws._images.remove(existing[0])
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp.close()
+    # Rendered at 4× the display height; scale back for placement.
+    # The file must outlive wb.save() — openpyxl reads it then.
+    w_px, h_px = latex_to_png(latex, tmp.name, display=True,
+                              height_px=height_px)
+    job.eq_tmp_files.append(tmp.name)
+    # Comment before picture: if either step fails, nothing is
+    # left half-placed (an unmarked picture could never be
+    # replaced later).
+    from openpyxl.comments import Comment
+
+    ws[cell].comment = Comment(f"LaTeX: {latex}", "file-tools")
+    img = XlImage(tmp.name)
+    img.width = max(w_px // 4, 1)
+    img.height = max(h_px // 4, 1)
+    ws.add_image(img, cell)
+    job.touch(ws, row, col)
+
+
+_HANDLERS = {
+    "create_sheet": _op_create_sheet,
+    "delete_sheet": _op_delete_sheet,
+    "rename_sheet": _op_rename_sheet,
+    "copy_sheet": _op_copy_sheet,
+    "protect_sheet": _op_protect_sheet,
+    "write_cells": _op_write_cells,
+    "set_formula": _op_set_formula,
+    "merge_cells": _op_merge_cells,
+    "unmerge_cells": _op_unmerge_cells,
+    "clear_range": _op_clear_range,
+    "copy_range": _op_copy_range,
+    "insert_rows": _op_insert_rows,
+    "insert_columns": _op_insert_columns,
+    "delete_rows": _op_delete_rows,
+    "delete_columns": _op_delete_columns,
+    "set_column_width": _op_set_column_width,
+    "set_row_height": _op_set_row_height,
+    "auto_column_width": _op_auto_column_width,
+    "freeze_panes": _op_freeze_panes,
+    "set_style": _op_set_style,
+    "create_table": _op_create_table,
+    "add_data_validation": _op_add_data_validation,
+    "remove_data_validation": _op_remove_data_validation,
+    "conditional_format": _op_conditional_format,
+    "remove_conditional_format": _op_remove_conditional_format,
+    "auto_filter": _op_auto_filter,
+    "define_name": _op_define_name,
+    "add_chart": _op_add_chart,
+    "add_image": _op_add_image,
+    "add_equation": _op_add_equation,
+}
+
+
 def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> str:
     """Worker core: op application + atomic save + readback message."""
     from openpyxl import Workbook, load_workbook
-    from openpyxl.drawing.image import Image as XlImage
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
-    from openpyxl.utils import (
-        column_index_from_string,
-        get_column_letter,
-        range_boundaries,
-    )
-    from openpyxl.worksheet.cell_range import MultiCellRange
-    from openpyxl.worksheet.datavalidation import DataValidation
-    from openpyxl.worksheet.table import Table, TableStyleInfo
+    from openpyxl.utils import get_column_letter
 
     if Path(path).exists() and not create_new:
         # Charts, images and comments all survive the load+save round trip
@@ -1925,14 +2708,7 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
     # (define_name after add_data_validation) doesn't matter.
     dv_name_refs: list[tuple[int, str]] = []
 
-    def _touch(ws, row1: int, col1: int, row2: int | None = None, col2: int | None = None):
-        row2 = row2 if row2 is not None else row1
-        col2 = col2 if col2 is not None else col1
-        box = touched.setdefault(ws.title, [row1, col1, row2, col2])
-        box[0] = min(box[0], row1)
-        box[1] = min(box[1], col1)
-        box[2] = max(box[2], row2)
-        box[3] = max(box[3], col2)
+    job = _XlsxJob(wb, errors, notes, structural, touched, eq_tmp_files, dv_name_refs)
 
     for idx, op in enumerate(ops):
         ot, op = _canonical_op(op)
@@ -1946,642 +2722,8 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
         if ot == "help":
             continue  # answered by the parent; a no-op inside the workbook
         try:
-            # =============================================================
-            # SHEET OPERATIONS
-            # =============================================================
-
-            if ot == "create_sheet":
-                pos = op.get("position")
-                wb.create_sheet(title=op["name"], index=pos)
-
-            elif ot == "delete_sheet":
-                name = op["name"]
-                if len(wb.sheetnames) <= 1:
-                    errors.append(f"Op #{idx} delete_sheet: cannot delete the last sheet")
-                    continue
-                if name in wb.sheetnames:
-                    del wb[name]
-
-            elif ot == "rename_sheet":
-                old = op["old_name"]
-                new = op["new_name"]
-                if old in wb.sheetnames:
-                    wb[old].title = new
-                else:
-                    errors.append(f"Op #{idx} rename_sheet: sheet '{old}' not found")
-
-            elif ot == "copy_sheet":
-                source = op["source"]
-                target = op["new_name"]
-                if source in wb.sheetnames:
-                    copied = wb.copy_worksheet(wb[source])
-                    copied.title = target
-                else:
-                    errors.append(f"Op #{idx} copy_sheet: sheet '{source}' not found")
-
-            elif ot == "protect_sheet":
-                ws = _get_sheet(wb, op)
-                ws.protection.sheet = True
-                if op.get("password"):
-                    ws.protection.password = op["password"]
-                # Permission flags (True = allowed)
-                if op.get("allow_formatting_cells"):
-                    ws.protection.formatCells = False
-                if op.get("allow_formatting_columns"):
-                    ws.protection.formatColumns = False
-                if op.get("allow_formatting_rows"):
-                    ws.protection.formatRows = False
-                if op.get("allow_insert_columns"):
-                    ws.protection.insertColumns = False
-                if op.get("allow_insert_rows"):
-                    ws.protection.insertRows = False
-                if op.get("allow_sort"):
-                    ws.protection.sort = False
-                if op.get("allow_filter"):
-                    ws.protection.autoFilter = False
-
-            # =============================================================
-            # CELL OPERATIONS
-            # =============================================================
-
-            elif ot == "write_cells":
-                ws = _get_sheet(wb, op)
-                tally = {"converted": 0, "warned": {}}
-                # Format 1: individual cells
-                cells_list = op.get("cells")
-                if cells_list and isinstance(cells_list, list):
-                    for c in cells_list:
-                        ref = c.get("cell", "")
-                        if ref:
-                            val, kind = _coerce_cell_value(
-                                c.get("value", ""), c.get("type")
-                            )
-                            kind = _set_coerced(
-                                ws[ref], val, kind, c.get("format"),
-                                raw=c.get("value"),
-                            )
-                            if kind is not None:
-                                _tally_coercion(tally, kind, c.get("value"), ref)
-                            try:
-                                col, row = _parse_cell_ref(ref)
-                                _touch(ws, row, col)
-                            except ValueError:
-                                pass
-                else:
-                    # Format 2: 2D array (no per-cell type here; strict ISO only)
-                    start = op.get("start_cell", "A1")
-                    data = op.get("data", [])
-                    start_col, start_row = _parse_cell_ref(start)
-                    n_cols = 0
-                    for ri, row in enumerate(data):
-                        n_cols = max(n_cols, len(row))
-                        for ci, val in enumerate(row):
-                            cval, kind = _coerce_cell_value(val)
-                            if kind is None:
-                                ws.cell(
-                                    row=start_row + ri,
-                                    column=start_col + ci,
-                                    value=cval,
-                                )
-                            else:
-                                kind = _set_coerced(
-                                    ws.cell(row=start_row + ri, column=start_col + ci),
-                                    cval, kind, raw=val,
-                                )
-                                _tally_coercion(
-                                    tally, kind, val,
-                                    f"{get_column_letter(start_col + ci)}"
-                                    f"{start_row + ri}",
-                                )
-                    if data and n_cols:
-                        _touch(ws, start_row, start_col,
-                               start_row + len(data) - 1, start_col + n_cols - 1)
-                _flush_coercion(tally, idx, ot, ws.title, notes, errors)
-
-            elif ot == "set_formula":
-                ws = _get_sheet(wb, op)
-                formula = op["formula"]
-                if not formula.startswith("="):
-                    formula = "=" + formula
-                err = _validate_formula(formula)
-                if err:
-                    errors.append(f"Op #{idx} set_formula: {err}")
-                    continue
-                ws[op["cell"]] = formula
-                try:
-                    col, row = _parse_cell_ref(op["cell"])
-                    _touch(ws, row, col)
-                except ValueError:
-                    pass
-
-            elif ot == "merge_cells":
-                ws = _get_sheet(wb, op)
-                ws.merge_cells(op["range"])
-
-            elif ot == "unmerge_cells":
-                ws = _get_sheet(wb, op)
-                ws.unmerge_cells(op["range"])
-
-            elif ot == "clear_range":
-                ws = _get_sheet(wb, op)
-                min_c, min_r, max_c, max_r = range_boundaries(op["range"])
-                clear_styles = op.get("clear_styles", False)
-                for row in ws.iter_rows(
-                    min_row=min_r, max_row=max_r,
-                    min_col=min_c, max_col=max_c,
-                ):
-                    for cell in row:
-                        cell.value = None
-                        if clear_styles:
-                            cell.font = Font()
-                            cell.border = Border()
-                            cell.fill = PatternFill()
-                            cell.number_format = "General"
-                            cell.alignment = Alignment()
-                            cell.protection = Protection()
-
-            elif ot == "copy_range":
-                ws_src = _get_sheet(wb, op)
-                target_sheet = op.get("target_sheet")
-                ws_dst = wb[target_sheet] if target_sheet and target_sheet in wb.sheetnames else ws_src
-
-                src_range = op["source_range"]
-                src_min_col, src_min_row, src_max_col, src_max_row = range_boundaries(src_range)
-
-                tgt_col, tgt_row = _parse_cell_ref(op["target_start"])
-
-                for row_off in range(src_max_row - src_min_row + 1):
-                    for col_off in range(src_max_col - src_min_col + 1):
-                        src_cell = ws_src.cell(
-                            row=src_min_row + row_off,
-                            column=src_min_col + col_off,
-                        )
-                        dst_cell = ws_dst.cell(
-                            row=tgt_row + row_off,
-                            column=tgt_col + col_off,
-                        )
-                        dst_cell.value = src_cell.value
-                        if src_cell.has_style:
-                            dst_cell.font = copy(src_cell.font)
-                            dst_cell.border = copy(src_cell.border)
-                            dst_cell.fill = copy(src_cell.fill)
-                            dst_cell.number_format = src_cell.number_format
-                            dst_cell.alignment = copy(src_cell.alignment)
-                            dst_cell.protection = copy(src_cell.protection)
-                _touch(ws_dst, tgt_row, tgt_col,
-                       tgt_row + (src_max_row - src_min_row),
-                       tgt_col + (src_max_col - src_min_col))
-
-            # =============================================================
-            # ROW / COLUMN OPERATIONS
-            # =============================================================
-
-            elif ot == "insert_rows":
-                ws = _get_sheet(wb, op)
-                ws.insert_rows(int(op["row"]), int(op.get("count", 1)))
-                structural.append(
-                    f"insert_rows at row {op['row']} (+{op.get('count', 1)}) on '{ws.title}'"
-                )
-
-            elif ot == "insert_columns":
-                ws = _get_sheet(wb, op)
-                col = op.get("column", 1)
-                if isinstance(col, str):
-                    col = column_index_from_string(col.upper())
-                ws.insert_cols(int(col), int(op.get("count", 1)))
-                structural.append(
-                    f"insert_columns at {get_column_letter(int(col))} (+{op.get('count', 1)}) on '{ws.title}'"
-                )
-
-            elif ot == "delete_rows":
-                ws = _get_sheet(wb, op)
-                ws.delete_rows(int(op["row"]), int(op.get("count", 1)))
-                structural.append(
-                    f"delete_rows at row {op['row']} (-{op.get('count', 1)}) on '{ws.title}'"
-                )
-
-            elif ot == "delete_columns":
-                ws = _get_sheet(wb, op)
-                col = op.get("column", 1)
-                if isinstance(col, str):
-                    col = column_index_from_string(col.upper())
-                ws.delete_cols(int(col), int(op.get("count", 1)))
-                structural.append(
-                    f"delete_columns at {get_column_letter(int(col))} (-{op.get('count', 1)}) on '{ws.title}'"
-                )
-
-            elif ot == "set_column_width":
-                ws = _get_sheet(wb, op)
-                ws.column_dimensions[op["column"].upper()].width = float(op["width"])
-
-            elif ot == "set_row_height":
-                ws = _get_sheet(wb, op)
-                ws.row_dimensions[int(op["row"])].height = float(op["height"])
-
-            elif ot == "auto_column_width":
-                ws = _get_sheet(wb, op)
-                columns = op.get("columns")  # list of column letters, or None for all
-                if columns:
-                    for col_letter in columns:
-                        col_idx = column_index_from_string(col_letter.upper())
-                        max_len = 0
-                        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
-                            for cell in row:
-                                if cell.value is not None:
-                                    max_len = max(max_len, len(str(cell.value)))
-                        ws.column_dimensions[col_letter.upper()].width = max(max_len + 2, 8)
-                else:
-                    for col_cells in ws.columns:
-                        max_len = 0
-                        col_letter = get_column_letter(col_cells[0].column)
-                        for cell in col_cells:
-                            if cell.value is not None:
-                                max_len = max(max_len, len(str(cell.value)))
-                        if max_len > 0:
-                            ws.column_dimensions[col_letter].width = max(max_len + 2, 8)
-
-            elif ot == "freeze_panes":
-                ws = _get_sheet(wb, op)
-                ws.freeze_panes = op["cell"]
-
-            # =============================================================
-            # FORMATTING
-            # =============================================================
-
-            elif ot == "set_style":
-                ws = _get_sheet(wb, op)
-                min_c, min_r, max_c, max_r = range_boundaries(op["range"])
-
-                # Font
-                font_kw = {}
-                if op.get("bold") is not None:
-                    font_kw["bold"] = op["bold"]
-                if op.get("italic") is not None:
-                    font_kw["italic"] = op["italic"]
-                if op.get("underline"):
-                    val = op["underline"]
-                    font_kw["underline"] = "single" if val is True else str(val)
-                if op.get("strikethrough"):
-                    font_kw["strike"] = True
-                if op.get("font_size"):
-                    font_kw["size"] = int(op["font_size"])
-                fc = op.get("font_color")
-                if fc:
-                    font_kw["color"] = _ensure_ff(fc)
-                if op.get("font_name"):
-                    font_kw["name"] = op["font_name"]
-                font = Font(**font_kw) if font_kw else None
-
-                # Fill
-                fill = None
-                fill_val = op.get("fill_color")
-                if fill_val:
-                    fc_str = _ensure_ff(fill_val)
-                    fill = PatternFill(start_color=fc_str, end_color=fc_str, fill_type="solid")
-
-                # Alignment
-                align = None
-                align_val = op.get("alignment")
-                wrap = op.get("wrap_text")
-                rotation = op.get("text_rotation")
-                if align_val or wrap is not None or rotation is not None:
-                    if isinstance(align_val, dict):
-                        akw = {
-                            "horizontal": align_val.get("horizontal"),
-                            "vertical": align_val.get("vertical"),
-                            "wrap_text": align_val.get("wrap_text", wrap),
-                            "text_rotation": align_val.get("text_rotation", rotation),
-                            "indent": align_val.get("indent"),
-                        }
-                        akw = {k: v for k, v in akw.items() if v is not None}
-                        align = Alignment(**akw)
-                    elif align_val:
-                        akw = {"horizontal": str(align_val)}
-                        if wrap is not None:
-                            akw["wrap_text"] = wrap
-                        if rotation is not None:
-                            akw["text_rotation"] = rotation
-                        align = Alignment(**akw)
-                    else:
-                        akw = {}
-                        if wrap is not None:
-                            akw["wrap_text"] = wrap
-                        if rotation is not None:
-                            akw["text_rotation"] = rotation
-                        align = Alignment(**akw)
-
-                # Border
-                border = None
-                border_val = op.get("border")
-                if border_val:
-                    if isinstance(border_val, dict):
-                        bstyle = border_val.get("style", "thin")
-                        bcolor = str(border_val.get("color", "000000")).lstrip("#")
-                        side = Side(style=bstyle, color=bcolor)
-                        border = Border(
-                            left=side if border_val.get("left", True) else Side(),
-                            right=side if border_val.get("right", True) else Side(),
-                            top=side if border_val.get("top", True) else Side(),
-                            bottom=side if border_val.get("bottom", True) else Side(),
-                        )
-                    else:
-                        side = Side(style="thin")
-                        border = Border(left=side, right=side, top=side, bottom=side)
-
-                # Number format — named preset or raw Excel code
-                nf = op.get("number_format")
-                if nf:
-                    nf = _resolve_number_format(nf)
-
-                # Protection
-                prot = None
-                if op.get("protection"):
-                    pv = op["protection"]
-                    prot = Protection(**pv) if isinstance(pv, dict) else Protection(locked=bool(pv))
-
-                for row in ws.iter_rows(
-                    min_row=min_r, max_row=max_r,
-                    min_col=min_c, max_col=max_c,
-                ):
-                    for cell in row:
-                        if font:
-                            cell.font = font
-                        if fill:
-                            cell.fill = fill
-                        if align:
-                            cell.alignment = align
-                        if border:
-                            cell.border = border
-                        if nf:
-                            cell.number_format = nf
-                        if prot:
-                            cell.protection = prot
-
-            # =============================================================
-            # FEATURES — Tables, Validation, Conditional Formatting
-            # =============================================================
-
-            elif ot == "create_table":
-                ws = _get_sheet(wb, op)
-                table_range = op["range"]
-                table_name = op.get("name") or f"Table_{uuid.uuid4().hex[:8]}"
-                style = op.get("style", "TableStyleMedium9")
-                tab = Table(displayName=table_name, ref=table_range)
-                tab.tableStyleInfo = TableStyleInfo(
-                    name=style,
-                    showFirstColumn=op.get("show_first_column", False),
-                    showLastColumn=op.get("show_last_column", False),
-                    showRowStripes=op.get("show_row_stripes", True),
-                    showColumnStripes=op.get("show_column_stripes", False),
-                )
-                ws.add_table(tab)
-
-            elif ot == "add_data_validation":
-                ws = _get_sheet(wb, op)
-                dv_range = op["range"]
-                if op.get("validation_type") is None:
-                    if op.get("values") is None:
-                        raise ValueError(
-                            "validation_type is required (list | whole | decimal | "
-                            "date | time | textLength | custom); values alone "
-                            "implies list"
-                        )
-                    dv_type = "list"
-                else:
-                    dv_type = _dv_type(op["validation_type"])
-                dv = DataValidation(type=dv_type)
-
-                if dv_type == "list":
-                    values = op.get("values")
-                    if values is None or values == [] or values == "":
-                        raise ValueError(
-                            "list validation needs values: an array of items or "
-                            "a reference string ('=Names', \"'Data'!$B$2:$B$50\")"
-                        )
-                    if (
-                        isinstance(values, list)
-                        and len(values) == 1
-                        and (
-                            str(values[0]).startswith("=")
-                            or _SHEET_RANGE_RE.fullmatch(str(values[0]))
-                        )
-                    ):
-                        # The incident shape: values: ["=SupplierList"] was
-                        # quote-wrapped into a literal one-item text list.
-                        values = str(values[0])
-                    if isinstance(values, list):
-                        items = [str(v).replace('"', '""') for v in values]
-                        joined = ",".join(items)
-                        dv.formula1 = '"' + joined + '"'
-                        if len(joined) > 255:
-                            errors.append(
-                                f"Op #{idx} add_data_validation: Warning: "
-                                f"literal list is {len(joined)} chars — Excel "
-                                f"caps in-formula lists at 255; put the items "
-                                f"in cells and reference the range instead"
-                            )
-                        if any("," in str(v) for v in values):
-                            errors.append(
-                                f"Op #{idx} add_data_validation: Warning: "
-                                f"literal items containing commas are split "
-                                f"into separate entries by Excel; put the "
-                                f"items in cells and reference the range "
-                                f"instead"
-                            )
-                    else:
-                        # Named range or sheet-qualified range reference
-                        ref = _strip_leading_eq(str(values))
-                        dv.formula1 = ref
-                        dv_name_refs.append((idx, ref))
-                elif dv_type == "custom":
-                    if not op.get("formula"):
-                        raise ValueError("custom validation needs formula")
-                    dv.formula1 = _strip_leading_eq(str(op["formula"]))
-                else:
-                    # whole / decimal / date / time / textLength: a rule with
-                    # no bound accepts nothing and says nothing — refuse it.
-                    default_op = "lessThanOrEqual" if dv_type == "textLength" else "between"
-                    operator = _dv_operator(op.get("operator") or default_op)
-                    dv.operator = operator
-                    if operator in ("between", "notBetween"):
-                        if op.get("min") is None or op.get("max") is None:
-                            raise ValueError(
-                                f"{dv_type} validation with {operator} needs min and max"
-                            )
-                        dv.formula1 = _dv_bound(op["min"], dv_type)
-                        dv.formula2 = _dv_bound(op["max"], dv_type)
-                    else:
-                        bound = next(
-                            (op[k] for k in ("value", "formula", "max", "min")
-                             if op.get(k) is not None),
-                            None,
-                        )
-                        if bound is None:
-                            raise ValueError(
-                                f"{dv_type} validation with {operator} needs value"
-                            )
-                        dv.formula1 = _dv_bound(bound, dv_type)
-
-                if op.get("allow_blank") is not None:
-                    dv.allow_blank = op["allow_blank"]
-                if op.get("show_error"):
-                    dv.showErrorMessage = True
-                    dv.error = op.get("error_message", "")
-                    dv.errorTitle = op.get("error_title", "Invalid input")
-                    dv.errorStyle = op.get("error_style", "stop")
-                if op.get("show_prompt"):
-                    dv.showInputMessage = True
-                    dv.prompt = op.get("prompt_message", "")
-                    dv.promptTitle = op.get("prompt_title", "")
-
-                dv.add(dv_range)
-                # Re-running a corrected op must replace the rule on the same
-                # cells, not stack a second one — stacked same-sqref rules of
-                # any type put Excel into repair.
-                sq = str(dv.sqref)
-                ws.data_validations.dataValidation = [
-                    r for r in ws.data_validations.dataValidation
-                    if str(r.sqref) != sq
-                ]
-                for existing in ws.data_validations.dataValidation:
-                    if _sqref_intersects(dv.sqref, existing.sqref):
-                        errors.append(
-                            f"Op #{idx} add_data_validation: new rule "
-                            f"overlaps existing validation at "
-                            f"{existing.sqref} — Excel allows one rule per "
-                            f"cell; use remove_data_validation first"
-                        )
-                ws.add_data_validation(dv)
-
-            elif ot == "remove_data_validation":
-                ws = _get_sheet(wb, op)
-                rules = ws.data_validations.dataValidation
-                if op.get("range"):
-                    target = MultiCellRange(op["range"])
-                    keep = [
-                        r for r in rules
-                        if not _sqref_intersects(r.sqref, target)
-                    ]
-                    removed = len(rules) - len(keep)
-                    ws.data_validations.dataValidation = keep
-                    if removed == 0:
-                        errors.append(
-                            f"Op #{idx} remove_data_validation: no "
-                            f"validation rules intersect {op['range']}"
-                        )
-                elif op.get("all"):
-                    removed = len(rules)
-                    ws.data_validations.dataValidation = []
-                else:
-                    errors.append(
-                        f"Op #{idx} remove_data_validation: provide range "
-                        f"or all: true"
-                    )
-                    continue
-                notes.append(
-                    f"remove_data_validation on '{ws.title}': "
-                    f"{removed} rule(s) removed"
-                )
-
-            elif ot == "conditional_format":
-                ws = _get_sheet(wb, op)
-                _conditional_format(ws, op, idx, notes, errors)
-
-            elif ot == "remove_conditional_format":
-                ws = _get_sheet(wb, op)
-                _remove_conditional_format(ws, op, idx, notes, errors)
-
-            elif ot == "auto_filter":
-                ws = _get_sheet(wb, op)
-                ws.auto_filter.ref = op["range"]
-
-            elif ot == "define_name":
-                from openpyxl.workbook.defined_name import DefinedName
-
-                name = op["name"]
-                cell_range = _strip_leading_eq(str(op["range"]))
-                if "!" in cell_range:
-                    # Already sheet-qualified — prefixing again produces an
-                    # invalid double-qualified reference.
-                    ref = cell_range
-                else:
-                    sheet_name = op.get("sheet", wb.sheetnames[0])
-                    ref = f"'{sheet_name}'!{cell_range}"
-                defn = DefinedName(name, attr_text=ref)
-                wb.defined_names.add(defn)
-
-            # =============================================================
-            # CHARTS
-            # =============================================================
-
-            elif ot == "add_chart":
-                ws = _get_sheet(wb, op)
-                _add_chart(wb, ws, op, idx, _touch, notes, errors)
-
-            # =============================================================
-            # IMAGES
-            # =============================================================
-
-            elif ot == "add_image":
-                ws = _get_sheet(wb, op)
-                img_path = _checked_resolved(op.get("image_path", ""))
-                img = XlImage(img_path)
-                if op.get("width"):
-                    img.width = int(op["width"])
-                if op.get("height"):
-                    img.height = int(op["height"])
-                ws.add_image(img, op.get("cell", "A1"))
-
-            elif ot == "add_equation":
-                # LaTeX equation as a floating PNG anchored at a cell, plus
-                # the source LaTeX in a cell comment (xlsx has no in-cell
-                # math). The comment is the machine-readable source of truth;
-                # picture and comment both survive later edits of the file.
-                import tempfile
-
-                ws = _get_sheet(wb, op)
-                latex = op.get("latex") or ""
-                cell = op.get("cell", "A1")
-                height_px = int(op.get("height", 40))
-                col, row = _parse_cell_ref(cell)
-                # A covered merged cell can't hold the marker comment and
-                # would detach it from the picture — anchor both at the
-                # merge anchor.
-                row, col = _merged_anchor_map(ws).get((row, col), (row, col))
-                cell = f"{get_column_letter(col)}{row}"
-                # One equation per cell: an existing marked equation is
-                # replaced. With several images at the anchor there is no
-                # safe way to tell the equation from e.g. a logo — refuse.
-                existing = [i for i in ws._images if _anchor_cell(i) == (col, row)]
-                prior = ws[cell].comment
-                if prior is not None and _equation_latex(prior.text or "") is not None and existing:
-                    if len(existing) > 1:
-                        raise ValueError(
-                            f"{len(existing)} images are anchored at {cell}; "
-                            "cannot replace the equation safely — move or "
-                            "remove the other image(s) first"
-                        )
-                    ws._images.remove(existing[0])
-                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                tmp.close()
-                # Rendered at 4× the display height; scale back for placement.
-                # The file must outlive wb.save() — openpyxl reads it then.
-                w_px, h_px = latex_to_png(latex, tmp.name, display=True,
-                                          height_px=height_px)
-                eq_tmp_files.append(tmp.name)
-                # Comment before picture: if either step fails, nothing is
-                # left half-placed (an unmarked picture could never be
-                # replaced later).
-                from openpyxl.comments import Comment
-
-                ws[cell].comment = Comment(f"LaTeX: {latex}", "file-tools")
-                img = XlImage(tmp.name)
-                img.width = max(w_px // 4, 1)
-                img.height = max(h_px // 4, 1)
-                ws.add_image(img, cell)
-                _touch(ws, row, col)
-
-        except Exception as exc:
+            _HANDLERS[ot](job, idx, op)
+        except Exception as exc:  # noqa: BLE001  # an op's failure becomes its error line, the other ops still run
             hint = _HELP_HINT % ot if isinstance(exc, (KeyError, TypeError, AttributeError)) else ""
             errors.append(f"Op #{idx} {ot}: {_friendly_error(exc)}{hint}")
             logger.warning(f"write_xlsx op #{idx} '{ot}' failed: {exc}")
@@ -2654,7 +2796,7 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
                 # write and retry it.
                 try:
                     cm = cell_obj.comment
-                except Exception:
+                except Exception:  # noqa: BLE001  # openpyxl on a user's workbook raises anything from its parser
                     cm = None
                 if cm is not None and _equation_latex(cm.text or "") is not None:
                     return "[equation]"

@@ -15,8 +15,10 @@ import {
   useSubscriptions,
   useWebhookEventCatalog,
 } from '../../api/subscriptions'
+import { INSTALLATION_TARGET_KIND } from '../../lib/kinds/oauthApp'
 import { SubscribeToEventsModal } from './SubscribeToEventsModal'
-import { SubscriptionRow, useDeleteWithConfirm } from './SubscriptionRow'
+import { SubscriptionRow } from './SubscriptionRow'
+import { useDeleteWithConfirm } from './useDeleteWithConfirm'
 
 interface Props {
   agentName: string
@@ -46,9 +48,9 @@ export function AgentServiceSubscriptions({ agentName, mcpName, accountLabel }: 
   const registrationMode = catalog.data.registration?.mode ?? 'manual'
 
   return (
-    <div className="mt-2 pl-1 border-l-2 border-p-border-light" data-testid="agent-service-subscriptions">
+    <div className="mt-2 pl-1 border-l-2 border-subtle" data-testid="agent-service-subscriptions">
       <div className="flex items-center justify-between gap-2 flex-wrap">
-        <span className="text-[10px] uppercase tracking-wide text-p-text-light">
+        <span className="text-3xs uppercase tracking-wide text-tertiary">
           Event subscriptions of this agent
         </span>
         <button
@@ -57,13 +59,13 @@ export function AgentServiceSubscriptions({ agentName, mcpName, accountLabel }: 
             del.setError(null)
             setShowModal(true)
           }}
-          className="text-xs text-brand hover:underline"
+          className="text-xs text-link hover:underline"
         >
           + Subscribe to events for this agent
         </button>
       </div>
       {rows.length === 0 ? (
-        <div className="text-xs text-p-text-light italic mt-1">
+        <div className="text-xs text-tertiary italic mt-1">
           None yet. An agent trigger, or a shared app woken by vendor events,
           needs one of these.
         </div>
@@ -84,7 +86,7 @@ export function AgentServiceSubscriptions({ agentName, mcpName, accountLabel }: 
         </ul>
       )}
       {del.error && (
-        <div className="mt-1 text-xs text-red-600 dark:text-red-400">{del.error}</div>
+        <div className="mt-1 text-xs text-status-danger-fg">{del.error}</div>
       )}
       {showModal && (
         <SubscribeToEventsModal
@@ -96,6 +98,9 @@ export function AgentServiceSubscriptions({ agentName, mcpName, accountLabel }: 
           registrationMode={registrationMode}
           manualInstructionsUrl={catalog.data.registration?.manual_instructions_url}
           vendorTargetPrefill={catalog.data.vendor_target_prefill}
+          installationTarget={catalog.data.target_kind === INSTALLATION_TARGET_KIND}
+          grantedScopes={catalog.data.granted_scopes}
+          scopeServices={catalog.data.scope_services}
           scope="service"
           agent={agentName}
           onClose={() => setShowModal(false)}

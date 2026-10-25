@@ -7,32 +7,36 @@ One of the pieces of the hook callback API assembled by ``api/hooks/hooks.py``
 """
 
 import asyncio
+import contextlib
 import logging
 import uuid
+from typing import TYPE_CHECKING, cast
 
-import httpx
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 import config
-from storage import database as task_store
+from api.hooks import routing
 from api.sessions.sessions import verify_api_key_async, verify_session_match_async
 from core.session.session_state import (
-    _sessions,
     _dashboard_notify_queues,
-    record_hook_activity,
+    _sessions,
     get_permission_queue,
-    resolve_permission,
     get_permission_request_session,
     get_session_security,
-    push_pump_event,
-    wait_for_location,
     get_subagent_registry,
     mark_subagent_done,
+    push_pump_event,
+    record_hook_activity,
+    resolve_permission,
+    wait_for_location,
 )
-import contextlib
-from api.hooks import routing
+from services.infra import pinned_http
+from storage import database as task_store
 from ws import wire_events as wire
+
+if TYPE_CHECKING:
+    from core.session.interactive_session import InteractiveSession
 
 logger = logging.getLogger("otodock")
 router = APIRouter()
@@ -162,7 +166,7 @@ async def hook_stop(req: HookStopRequest, authorization: str | None = Header(Non
     if tail is not None:
         # Blocking file read + DB writes → off the event loop.
         stats = await asyncio.to_thread(
-            tail, req.session_id, sess.chat_id, req.transcript_path,
+            tail, req.session_id, cast("InteractiveSession", sess).chat_id, req.transcript_path,
         )
 
     engine = getattr(sess, "transcript_kind", "") if sess is not None else ""
@@ -277,8 +281,14 @@ async def hook_file_written(
     # normalizes back to absolute under AGENTS_DIR before checking.
     abs_form = req.path
     if not abs_form.startswith("/"):
-        abs_form = str(config.AGENTS_DIR / abs_form)
-    if remote_file_flow.is_host_cache_path(abs_form):
+        # Below the agents root or nothing: a form that leaves it names no
+        # cache file (the agent-tree path below refuses it too).
+        from services.infra.path_confinement import join_under
+        try:
+            abs_form = str(join_under(config.AGENTS_DIR, abs_form))
+        except ValueError:
+            abs_form = ""
+    if abs_form and remote_file_flow.is_host_cache_path(abs_form):
         ok = await remote_file_flow.push_back_host_path(
             req.session_id, abs_form,
         )
@@ -307,9 +317,13 @@ async def hook_file_written(
     slug = getattr(ctx, "agent", "") if ctx is not None else ""
     from auth.path_policy import check_host_path_access
     from core.remote.file_sync import is_engine_machinery_path
-    if (ctx is None or not slug or not is_canonical_rel_path(rel)
+    try:
+        agent_dir = config.get_agent_dir(slug) if slug else None
+    except ValueError:
+        agent_dir = None
+    if (ctx is None or agent_dir is None or not is_canonical_rel_path(rel)
             or is_engine_machinery_path(rel)
-            or not check_host_path_access((config.AGENTS_DIR / slug / rel).resolve(), ctx,
+            or not check_host_path_access((agent_dir / rel).resolve(), ctx,
                                           writing=True).allowed):
         # Routine, not an attack: file-tools posts this for every preview,
         # of a read-only file too. Nothing is pushed.
@@ -323,7 +337,7 @@ async def hook_file_written(
     if slug:
         try:
             changed = await _note_written(slug, rel)
-        except Exception:
+        except ImportError:
             logger.warning("file-written: noting the write of %s failed", rel, exc_info=True)
     ok = await remote_file_flow.push_back(req.session_id, rel)
     if slug:
@@ -344,12 +358,16 @@ async def _note_written(agent_slug: str, rel: str) -> bool:
     from core.remote.file_sync import is_canonical_rel_path
     if not is_canonical_rel_path(rel):
         return False
+    try:
+        agent_dir = config.get_agent_dir(agent_slug)
+    except ValueError:
+        return False
     from api.hooks import preview
     from api.media.wopi import encode_file_id
     agents_rel = f"{agent_slug}/{rel}"
     file_id = encode_file_id(agents_rel)
     if preview.pushed_generation(file_id):
-        digest = await asyncio.to_thread(preview.file_digest, config.AGENTS_DIR / agents_rel)
+        digest = await asyncio.to_thread(preview.file_digest, agent_dir / rel)
         if preview.unchanged_since_push(file_id, agents_rel, digest):
             return False
         preview.note_next_generation(file_id, digest)
@@ -390,7 +408,7 @@ async def permission_response(
     if not found:
         raise HTTPException(status_code=404, detail="No pending permission request with that ID")
 
-    logger.info(f"Permission resolved: session={session_id}, request={req.request_id}, approved={req.approved}")
+    logger.info("Permission resolved: session=%s, request=%s, approved=%s", session_id, req.request_id, req.approved)
     return {"status": "ok"}
 
 
@@ -427,10 +445,12 @@ async def _address_hint(agent: str, lat, lng) -> str:
         api_key = await run_db(_maps_geocode_key, agent)
         if not api_key:
             return ""
-        async with httpx.AsyncClient(timeout=5) as gc:
+        # Google's public host: the dial is checked.
+        async with pinned_http.checked_client(
+                GEOCODE_URL, pinned_http.public_only, timeout=5) as gc:
             resp = await gc.get(GEOCODE_URL, params={"latlng": f"{lat},{lng}", "key": api_key})
         if resp.status_code != 200:
-            logger.info(f"Location address hint: Geocoding answered HTTP {resp.status_code}")
+            logger.info("Location address hint: Geocoding answered HTTP %s", resp.status_code)
             return ""
         data = resp.json()
         results = data.get("results") or []
@@ -440,8 +460,8 @@ async def _address_hint(agent: str, lat, lng) -> str:
                             "(REQUEST_DENIED: enable the Geocoding API in its Google Cloud project)")
             return ""
         return str(results[0].get("formatted_address") or "")
-    except Exception as exc:
-        logger.debug(f"Reverse geocode for location address hint failed: {exc}")
+    except Exception as exc:  # noqa: BLE001  # the address hint is optional, the location answers without it
+        logger.debug("Reverse geocode for location address hint failed: %s", exc)
         return ""
 
 
@@ -505,7 +525,7 @@ async def request_user_location(
         else:
             return {"error": "No active dashboard session -- user may not be online"}
 
-    logger.info(f"Location request: session={latest_sid[:8]}, request_id={request_id}")
+    logger.info("Location request: session=%s, request_id=%s", latest_sid[:8], request_id)
 
     # Block waiting for dashboard response
     result = await wait_for_location(request_id, timeout=30.0, session_id=latest_sid)

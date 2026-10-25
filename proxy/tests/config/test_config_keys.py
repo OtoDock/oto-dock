@@ -118,3 +118,73 @@ def test_a_stock_env_file_raises_no_warning():
     t1 = {"DATABASE_URL", "CLAUDE_BIN", "CODEX_BIN", "CREDENTIAL_ENCRYPTION_KEY", "OTODOCK_VERSION"}
     known = keys_read() | config.FOREIGN_CONFIG_KEYS | config.LAZY_CONFIG_KEYS
     assert config.unknown_config_keys(template | persisted | t1, known) == []
+
+
+# ── the egress proxy a Docker install's .env names ────────────────────────
+
+def test_the_egress_proxy_in_the_file_reaches_the_environment():
+    from configuration.readers import export_egress_proxy
+    env: dict[str, str] = {"PATH": "/usr/bin"}
+    file_cfg = {"HTTPS_PROXY": "http://proxy.example.com:3128", "NO_PROXY": ".lan,10.0.0.0/8",
+                "HTTP_PROXY": "http://proxy.example.com:3128", "ALL_PROXY": "socks5://proxy.example.com:1080",
+                "TZ": "Europe/Athens"}
+    assert sorted(export_egress_proxy(file_cfg, env)) == ["HTTPS_PROXY", "NO_PROXY"]
+    assert env == {"PATH": "/usr/bin", "HTTPS_PROXY": "http://proxy.example.com:3128",
+                   "NO_PROXY": ".lan,10.0.0.0/8"}
+
+
+def test_an_https_proxy_with_no_exceptions_spares_this_machine_and_its_network():
+    """No NO_PROXY anywhere: the exported proxy never takes a call to this
+    machine or to a name the server dials on its own Docker networks."""
+    from configuration.readers import DEFAULT_NO_PROXY, export_egress_proxy
+    env: dict[str, str] = {}
+    assert export_egress_proxy({"https_proxy": "http://proxy.example.com:3128"}, env) == [
+        "https_proxy", "NO_PROXY"]
+    assert env["NO_PROXY"] == DEFAULT_NO_PROXY
+    names = set(DEFAULT_NO_PROXY.split(","))
+    assert {"localhost", "127.0.0.1", "::1", "otodock-postgres", "docker-socket-proxy",
+            "collabora", "otodock-phone"} <= names
+    # A source install's unit hands the file's line over in the environment.
+    env_unit = {"HTTPS_PROXY": "http://proxy.example.com:3128"}
+    assert export_egress_proxy({"HTTPS_PROXY": "http://proxy.example.com:3128"}, env_unit) == ["NO_PROXY"]
+    assert env_unit["NO_PROXY"] == DEFAULT_NO_PROXY
+    # The environment's own NO_PROXY, even an empty one, is left as it is.
+    env2 = {"no_proxy": ""}
+    assert export_egress_proxy({"HTTPS_PROXY": "http://proxy.example.com:3128"}, env2) == ["HTTPS_PROXY"]
+    assert env2 == {"no_proxy": "", "HTTPS_PROXY": "http://proxy.example.com:3128"}
+
+
+def test_the_default_exceptions_name_the_compose_services_the_server_dials():
+    """DEFAULT_NO_PROXY's service names are the compose files' own."""
+    from configuration.readers import DEFAULT_NO_PROXY
+    services = set()
+    for path in COMPOSE_FILES:
+        if path.exists():
+            services |= set(re.findall(r"^  ([a-z][a-z0-9-]*):\n", path.read_text(encoding="utf-8"), re.M))
+    hosts = {"localhost", "127.0.0.1", "::1", "host.docker.internal"}
+    assert set(DEFAULT_NO_PROXY.split(",")) - hosts <= services
+
+
+def test_the_environment_keeps_its_own_egress_proxy():
+    """Either spelling in the environment (a systemd unit's EnvironmentFile,
+    an override file, a Docker client config) keeps the whole pair: urllib
+    and httpx prefer the lowercase one, so a file's would otherwise win."""
+    from configuration.readers import export_egress_proxy
+    env = {"https_proxy": "http://from-docker-config:3128", "NO_PROXY": ""}
+    file_cfg = {"HTTPS_PROXY": "http://from-the-file:3128", "https_proxy": "http://from-the-file:3128",
+                "NO_PROXY": ".lan", "no_proxy": ".lan"}
+    assert export_egress_proxy(file_cfg, env) == []
+    assert env == {"https_proxy": "http://from-docker-config:3128", "NO_PROXY": ""}
+
+
+def test_an_empty_egress_line_exports_nothing():
+    from configuration.readers import export_egress_proxy
+    env: dict[str, str] = {}
+    assert export_egress_proxy({"HTTPS_PROXY": "", "https_proxy": None, "NO_PROXY": "  "}, env) == []
+    assert env == {}
+
+
+def test_the_egress_proxy_names_draw_no_unknown_key_line():
+    known = keys_read() | config.FOREIGN_CONFIG_KEYS | config.LAZY_CONFIG_KEYS
+    names = {"HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"}
+    assert config.unknown_config_keys(names, known) == []

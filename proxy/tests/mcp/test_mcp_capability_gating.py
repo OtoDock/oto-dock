@@ -11,8 +11,8 @@ DB-free: the audio helpers are exercised by monkeypatching
 
 from types import SimpleNamespace
 
-from services.media import audio_service
 from services.mcp import mcp_registry
+from services.media import audio_service
 
 
 def _m(cap):

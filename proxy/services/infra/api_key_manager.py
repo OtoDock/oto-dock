@@ -23,11 +23,12 @@ import logging
 import secrets
 
 import bcrypt
+import psycopg
 
 import config
-from storage.identity import api_key_store
-from storage.automation import notification_store
 from core.background import spawn
+from storage.automation import notification_store
+from storage.identity import api_key_store
 
 logger = logging.getLogger("otodock.api-keys")
 
@@ -162,7 +163,7 @@ def create_agent_key(
         key_hash=key_hash, prefix=prefix,
         permissions=perms, created_by=created_by,
     )
-    logger.info(f"Minted agent_api_key id={row['id'][:8]} agent={agent} by={created_by[:8]}")
+    logger.info("Minted agent_api_key id=%s agent=%s by=%s", row['id'][:8], agent, created_by[:8])
     return row, raw_key
 
 
@@ -181,7 +182,7 @@ def create_user_key(
         key_hash=key_hash, prefix=prefix,
         permissions=perms,
     )
-    logger.info(f"Minted user_api_key id={row['id'][:8]} user={user_sub[:8]}")
+    logger.info("Minted user_api_key id=%s user=%s", row['id'][:8], user_sub[:8])
     return row, raw_key
 
 
@@ -348,8 +349,8 @@ def _schedule_last_used_update(kind: str, key_id: str) -> None:
                 await asyncio.to_thread(api_key_store.update_agent_key_last_used, key_id)
             else:
                 await asyncio.to_thread(api_key_store.update_user_key_last_used, key_id)
-        except Exception as e:
-            logger.warning(f"Failed to update last_used_at for {kind} key {key_id[:8]}: {e}")
+        except psycopg.Error as e:
+            logger.warning("Failed to update last_used_at for %s key %s: %s", kind, key_id[:8], e)
 
     spawn(_do(), name="touch_last_used", owner="api_key_manager")
 

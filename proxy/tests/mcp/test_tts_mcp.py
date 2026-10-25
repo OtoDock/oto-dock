@@ -74,6 +74,7 @@ class TestManifest:
             "transport": "stdio",
             "command": "venv/bin/python",
             "args": ["server.py"],
+            "tool_timeout_sec": 600,   # a synthesis past Codex's 60 s default
         }
 
     def test_thin_client_shape(self, manifest):

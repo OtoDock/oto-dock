@@ -63,8 +63,9 @@ from typing import Any, Literal
 
 import httpx
 from mcp.server import Server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
 
+from _tool_args import ToolArgs
 
 # ---------------------------------------------------------------------------
 # Env-derived permission matrix
@@ -131,6 +132,7 @@ def _resolve_tool_set() -> set[str]:
 ENABLED_TOOLS = _resolve_tool_set()
 
 server = Server("mcps-mcp")
+TOOL_ARGS = ToolArgs()
 _client = httpx.AsyncClient(timeout=10.0)
 
 
@@ -190,7 +192,7 @@ async def _request(
         if r.status_code >= 400:
             try:
                 detail = r.json().get("detail", r.text)
-            except Exception:
+            except (ValueError, AttributeError):
                 detail = r.text
             raise _ApiError(f"HTTP {r.status_code}: {detail}")
 
@@ -291,6 +293,7 @@ _ALL_TOOLS: dict[str, Tool] = {
             "table (name | description | category)."
         ),
         inputSchema={"type": "object", "properties": {}},
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
     "list_available_mcps": Tool(
         name="list_available_mcps",
@@ -305,6 +308,7 @@ _ALL_TOOLS: dict[str, Tool] = {
             "installed at all, browse list_community_mcps instead."
         ),
         inputSchema={"type": "object", "properties": {}},
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
     "list_community_mcps": Tool(
         name="list_community_mcps",
@@ -332,6 +336,7 @@ _ALL_TOOLS: dict[str, Tool] = {
                 },
             },
         },
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     ),
     "list_community_skills": Tool(
         name="list_community_skills",
@@ -359,6 +364,7 @@ _ALL_TOOLS: dict[str, Tool] = {
                 },
             },
         },
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     ),
     "request_skill_install": Tool(
         name="request_skill_install",
@@ -387,6 +393,7 @@ _ALL_TOOLS: dict[str, Tool] = {
             },
             "required": ["skill_name", "reason"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
     ),
     "request_mcp_install": Tool(
         name="request_mcp_install",
@@ -418,6 +425,7 @@ _ALL_TOOLS: dict[str, Tool] = {
             },
             "required": ["mcp_name", "reason"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
     ),
     "request_mcp_access": Tool(
         name="request_mcp_access",
@@ -446,6 +454,7 @@ _ALL_TOOLS: dict[str, Tool] = {
             },
             "required": ["mcp_name", "reason"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
     ),
     "disable_mcp_for_agent": Tool(
         name="disable_mcp_for_agent",
@@ -469,6 +478,7 @@ _ALL_TOOLS: dict[str, Tool] = {
             },
             "required": ["mcp_name"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False),
     ),
     "get_request_status": Tool(
         name="get_request_status",
@@ -485,6 +495,7 @@ _ALL_TOOLS: dict[str, Tool] = {
             },
             "required": ["request_id"],
         },
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
     "cancel_my_request": Tool(
         name="cancel_my_request",
@@ -500,6 +511,7 @@ _ALL_TOOLS: dict[str, Tool] = {
             },
             "required": ["request_id"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
     ),
     "validate_mcp_package": Tool(
         name="validate_mcp_package",
@@ -523,13 +535,14 @@ _ALL_TOOLS: dict[str, Tool] = {
             },
             "required": ["path"],
         },
+        annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
     ),
 }
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [tool for name, tool in _ALL_TOOLS.items() if name in ENABLED_TOOLS]
+    return TOOL_ARGS.listed([tool for name, tool in _ALL_TOOLS.items() if name in ENABLED_TOOLS])
 
 
 # ---------------------------------------------------------------------------
@@ -1040,8 +1053,11 @@ _DISPATCH = {
 }
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     if name not in ENABLED_TOOLS:
         return [TextContent(
             type="text",
@@ -1054,7 +1070,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         text = await handler(arguments or {})
     except _ApiError as exc:
         text = f"❌ Error: {exc}"
-    except Exception as exc:  # noqa: BLE001 — last-resort guard
+    except Exception as exc:  # noqa: BLE001  # last-resort guard
         text = f"❌ Unexpected error: {type(exc).__name__}: {exc}"
     return [TextContent(type="text", text=text)]
 

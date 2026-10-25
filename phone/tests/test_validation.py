@@ -7,7 +7,7 @@ be rejected.
 
 import pytest
 
-from validation import validate_outbound_call, validate_register, ValidationError
+from validation import ValidationError, validate_outbound_call, validate_register
 
 
 def test_outbound_accepts_legit_phone_mcp_payload():

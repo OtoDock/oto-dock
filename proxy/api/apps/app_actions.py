@@ -2,7 +2,7 @@
 ``/actions/batch``) — APPS.md "Action execution".
 
 Buttons in app JS call ``otodock.action(id, args)``: declared ids only,
-validated against the user-approved manifest (api/apps/manifest.py).
+validated against the user-approved manifest (services/apps/manifest.py).
 fire_task and mcp_tool execute HERE; send_prompt rides the chat WS
 (ws/dashboard_chat.py) with the backchannel authority downgrades. Page args
 NEVER reach a prompt or a tool un-gated: fire_task substitutes them only
@@ -18,20 +18,20 @@ import asyncio
 import hashlib
 import json
 import logging
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from api.apps import manifest as _mf
 from api.apps.apps import (
     _can_approve_surface,
     _check_fire_rate,
-    _manifest_target_error,
     _visible_row,
 )
 from auth.providers import UserContext, get_current_user, require_auth, require_human
+from services.apps import manifest as _mf
+from services.apps.manifest import _manifest_target_error
 from storage import database as task_store
 
 logger = logging.getLogger("otodock.apps")
@@ -71,18 +71,24 @@ async def approve_app(
         raise HTTPException(status_code=403, detail=err)
     ok = await asyncio.to_thread(task_store.approve_app_actions, app_id, req.sig, u.sub)
     if not ok:
-        raise HTTPException(status_code=409, detail="The manifest changed — review it again")
+        raise HTTPException(status_code=409, detail="The app.json changed. Review it again.")
+    fresh = await asyncio.to_thread(task_store.get_app, app_id) or row
+    out: dict = {"status": "ok"}
     # An approval here (the plain card — the deploy card runs its own
     # go-live) is also what makes the app's handlers real: its schedules
     # become task rows and its events reach the index (APPS.md "Handlers").
     if task_store.app_kind_of(row).may_serve:
         from services.apps import app_handlers
-        fresh = await asyncio.to_thread(task_store.get_app, app_id)
         try:
-            await app_handlers.sync_rows(fresh or row)
+            await app_handlers.sync_rows(fresh)
         except Exception:
             logger.exception("App %s: handler rows out of step after approval", row.get("slug"))
-    return {"status": "ok"}
+    # The folders of the manifest the live release carries (a rollback put
+    # it back); a waiting release makes its own at its approval.
+    from services.apps import app_folders
+    if app_folders.declares_folders(fresh) and not int(fresh.get("pending_release") or 0):
+        out["folders"] = await asyncio.to_thread(app_folders.ensure_created_dirs, fresh)
+    return out
 
 
 class ActionRequest(BaseModel):
@@ -101,7 +107,7 @@ def _validate_action_args(action: dict, args) -> dict:
     validated, err = _mf.validate_args(schema, args)
     if err:
         raise HTTPException(status_code=400, detail=err)
-    return validated
+    return cast("dict", validated)
 
 
 def merge_checks(task_checks: list[str], action_checks: list[str]) -> list[str]:
@@ -203,7 +209,7 @@ async def _run_action(row: dict, action_id: str, args, u: UserContext | None,
     _check_fire_rate(app_id, action_id, who)
 
     from services.scheduler import scheduler
-    task_def = scheduler._row_to_task(dyn)
+    task_def = scheduler._row_to_task(cast("dict", dyn))
     task_def.checks = merge_checks(task_def.checks, action.get("checks") or [])
     prompt_override = None
     if action.get("args_schema"):
@@ -230,8 +236,9 @@ async def _run_action(row: dict, action_id: str, args, u: UserContext | None,
         prompt_override=prompt_override,
     )
     logger.info(
-        f"App action fired: app={row['slug']}, action={action_id}, "
-        f"task={task_id}, by={who[:24]}, run={run_id}"
+        "App action fired: app=%s, action=%s, "
+        "task=%s, by=%s, run=%s",
+        row['slug'], action_id, task_id, who[:24], run_id
     )
     return {"status": "ok", "run_id": run_id}
 
@@ -310,6 +317,7 @@ async def run_app_actions_batch(
     batch itself is limited to one per second per (app, viewer); the host
     page paces its calls to that."""
     handler, actor = "", ""
+    row: dict | None
     if user is None:
         got = await _delivery_caller(request, app_id)
         if got is None:
@@ -329,7 +337,7 @@ async def run_app_actions_batch(
     ids = [c.call_id for c in calls]
     if len(set(ids)) != len(ids) or not all(0 < len(i) <= 64 and i.isprintable() for i in ids):
         raise HTTPException(status_code=400, detail="call_id must be unique, 1 to 64 characters")
-    _check_fire_rate(app_id, "\x00batch", actor or u.sub, interval=BATCH_MIN_INTERVAL_S)
+    _check_fire_rate(app_id, "\x00batch", actor or cast("UserContext", u).sub, interval=BATCH_MIN_INTERVAL_S)
 
     fire_seen = False
     entries: list[tuple[BatchCall, bool]] = []
@@ -378,6 +386,7 @@ async def run_app_action(
     """One declared action (``_run_action``); the batch route is the same
     execution for several. Without a user, the app's own handler may be
     pressing (``_delivery_caller``)."""
+    row: dict | None
     if user is None:
         got = await _delivery_caller(request, app_id)
         if got is None:

@@ -193,9 +193,9 @@ def _adopt_key_from_receipt(receipt: str, stored_key: str) -> None:
 
 async def _check(key: str) -> None:
     """Weekly liveness check for an activated subscription key. Fail-open."""
+    import auth.license as L
     from storage import database as db
     from storage.pg import run_db
-    import auth.license as L
 
     await run_db(db.set_platform_setting, "license_last_check_at", _now_iso())
     try:

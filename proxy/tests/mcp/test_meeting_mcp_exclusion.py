@@ -27,8 +27,9 @@ _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from tests.mcp.test_mcp_broker_activation import (  # noqa: E402
-    _FakeManifest, _stub_assembly,
+from tests.mcp.test_mcp_broker_activation import (
+    _FakeManifest,
+    _stub_assembly,
 )
 
 
@@ -141,8 +142,7 @@ def test_prompt_only_advertises_servers_the_config_loads(monkeypatch, tmp_path, 
     """Every server the prompt catalog names, and the owner of every inline
     skill, must be a key of the mcpServers config built for the same session
     — an advertised server the CLI cannot load is a tool the agent is told
-    it has. The reverse also holds except for the deliberate catalog
-    suppression of the meta MCP."""
+    it has. The reverse also holds: every loaded server is advertised."""
     from services.mcp import mcp_registry
 
     manifests = [
@@ -177,5 +177,5 @@ def test_prompt_only_advertises_servers_the_config_loads(monkeypatch, tmp_path, 
 
     assert advertised, catalog
     assert _keys(advertised | skill_owners) <= loaded
-    assert loaded - _keys(advertised) == {"mcps-mcp"}
+    assert loaded == _keys(advertised)
 

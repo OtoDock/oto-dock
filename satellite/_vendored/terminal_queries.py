@@ -167,7 +167,7 @@ _PARTIAL_TAIL_RE = re.compile(
 )
 
 
-def split_trailing_partial(data: bytes) -> "tuple[bytes, bytes]":
+def split_trailing_partial(data: bytes) -> tuple[bytes, bytes]:
     """Split ``data`` into ``(complete, partial)`` where ``partial`` is a
     trailing incomplete escape sequence (possibly a bare ESC) and ``complete``
     is everything before it. ``partial`` is empty when the chunk ends cleanly."""
@@ -179,9 +179,12 @@ def split_trailing_partial(data: bytes) -> "tuple[bytes, bytes]":
     return data[: m.start()], data[m.start():]
 
 
-# A bracketed-paste toggle (``CSI ? … 2004 … h`` on, ``… l`` off, alone or
-# among other private modes) and RIS (``ESC c``, a full reset: off after it).
-_PASTE_TOGGLE_RE = re.compile(rb"\x1b\[\?(?:\d+;)*2004(?:;\d+)*([hl])|\x1bc")
+# A bracketed-paste toggle (``CSI ? … 2004 … h`` on, ``… l`` off), its save
+# (``… s``, XTSAVE) and restore (``… r``, XTRESTORE), each alone or among
+# other private modes, and RIS (``ESC c``, a full reset: off, nothing saved).
+# The ``?`` keeps out ``CSI s`` (the cursor save) and ``CSI t;b r`` (the
+# scroll region).
+_PASTE_TOGGLE_RE = re.compile(rb"\x1b\[\?(?:\d+;)*2004(?:;\d+)*([hlsr])|\x1bc")
 PASTE_MODE_ON = b"\x1b[?2004h"
 # A toggle split across two reads is short; a longer unfinished tail is an
 # OSC or DCS body, never one.
@@ -198,23 +201,33 @@ class PasteModeTracker:
     trimmed that away, ``replay_prefix`` gives the mode back, written BEFORE
     the ring (a ring can end inside an escape sequence). A program that
     turned the mode off keeps it off; an untrimmed ring carries its own
-    toggles. Not tracked: XTSAVE/XTRESTORE of the mode."""
+    toggles. A saved mode (XTSAVE) comes back on its restore (XTRESTORE),
+    as a real terminal applies it: the tracker follows what the program
+    expects, which decides whether a paste must be bracketed (xterm.js 5.5
+    itself ignores the two)."""
 
-    __slots__ = ("on", "trimmed", "_carry")
+    __slots__ = ("on", "saved", "trimmed", "_carry")
 
     def __init__(self) -> None:
         self.on = False
+        self.saved: bool | None = None
         self.trimmed = False
         self._carry = b""
 
     def feed(self, data: bytes) -> None:
         whole, partial = split_trailing_partial(self._carry + data)
         self._carry = partial if len(partial) <= _PASTE_CARRY_MAX else b""
-        last = None
-        for last in _PASTE_TOGGLE_RE.finditer(whole):
-            pass
-        if last is not None:
-            self.on = last.group(1) == b"h"
+        for match in _PASTE_TOGGLE_RE.finditer(whole):
+            final = match.group(1)
+            if final is None:            # RIS
+                self.on, self.saved = False, None
+            elif final == b"s":
+                self.saved = self.on
+            elif final == b"r":
+                if self.saved is not None:
+                    self.on = self.saved
+            else:
+                self.on = final == b"h"
 
     def replay_prefix(self) -> bytes:
         return PASTE_MODE_ON if self.trimmed and self.on else b""

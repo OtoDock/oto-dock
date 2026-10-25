@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { answerDialog, findAlertDialog, renderWithDialogs } from './dialogsHarness'
 
 // ─── Admin MCP Servers page: a catalog source change (1.7.1) ───
 //
@@ -25,11 +26,6 @@ import * as authApi from '@/api/auth'
 import McpServersPage from '@/pages/admin/McpServersPage'
 
 const fetchSpy = vi.spyOn(authApi, 'apiFetch')
-let confirmSpy: ReturnType<typeof vi.spyOn> | undefined
-
-function confirmAnswers(value: boolean) {
-  confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(value)
-}
 
 const MCPS = {
   mcps: [{
@@ -89,7 +85,7 @@ function mockApi(state: unknown, calls: Call[], onState?: () => unknown) {
 
 function renderPage() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  return renderWithDialogs(
     <MemoryRouter>
       <QueryClientProvider client={qc}>
         <McpServersPage />
@@ -105,24 +101,21 @@ async function expandRow() {
 describe('McpServersPage — source changes', () => {
   afterEach(() => {
     fetchSpy.mockReset()
-    confirmSpy?.mockRestore()
-    confirmSpy = undefined
   })
 
   it('shows a pending change from the persisted state and switches with the exact pair', async () => {
     const calls: Call[] = []
     mockApi(sourceState(false), calls)
-    confirmAnswers(true)
     renderPage()
 
     // The badge and the header chip come from the persisted state, no check pressed.
     expect(await screen.findByText('1 update')).toBeInTheDocument()
-    expect(screen.getByText('source changed')).toBeInTheDocument()
+    expect(screen.getByText('Source changed')).toBeInTheDocument()
     expect(fetchSpy.mock.calls.some(c => String(c[0]).includes('/check-updates'))).toBe(false)
 
     await expandRow()
     expect(screen.getByText('Source change')).toBeInTheDocument()
-    expect(screen.getByText(/possible compromise/)).toBeInTheDocument()
+    expect(screen.getByText(/may have been tampered with/)).toBeInTheDocument()
     expect(screen.getByText('https://www.npmjs.com/package/nextcloud-mcp-server')).toHaveAttribute('href')
     expect(screen.getByText('https://www.npmjs.com/package/nextcloud-mcp')).toHaveAttribute('href')
     expect(screen.getByText('NEXTCLOUD_URL')).toBeInTheDocument()
@@ -132,6 +125,9 @@ describe('McpServersPage — source changes', () => {
     expect(screen.queryByText('Update Available')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Switch' }))
+    const ask = await findAlertDialog('Switch "Nextcloud" to its new source?')
+    expect(ask.textContent).toContain('verify the new source first')
+    await act(async () => { await answerDialog('Switch') })
     await waitFor(() => expect(calls.length).toBe(1))
     expect(calls[0]).toEqual({
       url: '/v1/admin/mcps/nextcloud/accept-source', method: 'POST',
@@ -159,12 +155,13 @@ describe('McpServersPage — source changes', () => {
   it('a declared change reads as such and a cancelled confirm posts nothing', async () => {
     const calls: Call[] = []
     mockApi(sourceState(true), calls)
-    confirmAnswers(false)
     renderPage()
     await expandRow()
-    expect(await screen.findByText(/declares that it replaces/)).toBeInTheDocument()
-    expect(screen.queryByText(/possible compromise/)).not.toBeInTheDocument()
+    expect(await screen.findByText(/entry says it replaces/)).toBeInTheDocument()
+    expect(screen.queryByText(/may have been tampered with/)).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Switch' }))
+    await act(async () => { await answerDialog('Cancel') })
+    expect(screen.queryByRole('alertdialog')).toBeNull()
     expect(calls).toEqual([])
   })
 
@@ -233,14 +230,14 @@ describe('McpServersPage — source changes', () => {
       checked: 1, checked_at: '2026-10-01T10:00:00Z',
     }
     mockApi(state, calls)
-    confirmAnswers(true)
     renderPage()
     await screen.findByText('Nextcloud')
     expect(screen.queryByText('1 update')).not.toBeInTheDocument()
     expect(screen.queryByText(/available/)).not.toBeInTheDocument()
     await expandRow()
-    expect(await screen.findByText(/ahead of the catalog/)).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Revert to catalog 1.0.0' }))
+    expect(await screen.findByText(/newer than the community version/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Revert to 1.0.0' }))
+    await act(async () => { await answerDialog('Revert', 'Revert "Nextcloud" to the community version 1.0.0?') })
     await waitFor(() => expect(calls).toEqual([{ url: '/v1/admin/mcps/nextcloud/update', method: 'POST', body: undefined }]))
   })
 
@@ -257,6 +254,6 @@ describe('McpServersPage — source changes', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: /Check Updates/ }))
     expect(await screen.findByText('1 update')).toBeInTheDocument()
-    expect(screen.getByText('source changed')).toBeInTheDocument()
+    expect(screen.getByText('Source changed')).toBeInTheDocument()
   })
 })

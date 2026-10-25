@@ -23,12 +23,11 @@ _MCP_DIR = Path(__file__).resolve().parent.parent
 if str(_MCP_DIR) not in sys.path:
     sys.path.insert(0, str(_MCP_DIR))
 
-import environment  # noqa: E402
-import executor  # noqa: E402
-import geometry  # noqa: E402
-import screen  # noqa: E402
-import server  # noqa: E402
-
+import environment
+import executor
+import geometry
+import screen
+import server
 
 # ===========================================================================
 # geometry — scaling

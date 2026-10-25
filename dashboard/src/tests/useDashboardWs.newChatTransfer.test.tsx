@@ -6,27 +6,11 @@
  * frame with the flag still on it.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { renderHook, act } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act } from '@testing-library/react'
 import { useDashboardWs } from '@/hooks/useDashboardWs'
 import { useChatStore, newChatKey } from '@/store/chatStore'
-
-class FakeWebSocket {
-  static OPEN = 1
-  static CONNECTING = 0
-  static instances: FakeWebSocket[] = []
-  readyState = FakeWebSocket.OPEN
-  sent: string[] = []
-  onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
-  onmessage: ((e: { data: string }) => void) | null = null
-  constructor(public url: string) {
-    FakeWebSocket.instances.push(this)
-  }
-  send(data: string) { this.sent.push(data) }
-  close() { /* keep reconnect logic out of the test */ }
-}
+import { FakeWebSocket } from './fakeWebSocket'
+import { connectDashboardWs } from './dashboardWsHarness'
 
 const AGENT = 'agent-x'
 const MINTED = 'chat-minted'
@@ -53,15 +37,7 @@ describe('useDashboardWs new-chat draft transfer at warmup_started', () => {
   })
 
   function connect(viewedChatId: string | null | undefined) {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    const wrapper = ({ children }: { children: React.ReactNode }) => (
-      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
-    )
-    const hook = renderHook(() => useDashboardWs({ viewedChatId }), { wrapper })
-    act(() => { hook.result.current.connect() })
-    const ws = FakeWebSocket.instances[0]
-    act(() => { ws.onopen?.() })
-    return { hook, ws }
+    return connectDashboardWs(() => ({ viewedChatId }))
   }
 
   function warmupStarted(ws: FakeWebSocket, newChat?: boolean) {

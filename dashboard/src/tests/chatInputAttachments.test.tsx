@@ -171,12 +171,12 @@ describe('ChatInput attachments', () => {
       // 1200 bytes in all, over the 1000-byte cap: a folder's own files are what the cap checks.
       { id: 'f', name: 'failed', size: 1200, folder: true, fileCount: 2, folderFiles: files, error: 'b.md: HTTP 500' },
       { id: 'x', name: 'refused', size: 0, folder: true, fileCount: 0, error: 'An empty folder: nothing to attach' },
-      { id: 'g', name: 'good', size: 7, folder: true, fileCount: 1, uploadedPath: 'w/good', note: '1 folder left out (.git)' },
+      { id: 'g', name: 'good', size: 7, folder: true, fileCount: 1, uploadedPath: 'w/good', note: '1 folder left out: .git' },
     ]
     const { container } = render(<ChatInput {...props} />)
     expect(container.textContent).toContain('readingFolder')
     expect(container.textContent).toContain('Reading the folder…')
-    expect(container.textContent).toContain('1 folder left out (.git)')
+    expect(container.textContent).toContain('1 folder left out: .git')
     const retries = screen.getAllByLabelText('Retry upload')
     expect(retries).toHaveLength(1)
     fireEvent.click(retries[0])

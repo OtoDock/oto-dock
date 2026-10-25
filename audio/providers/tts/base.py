@@ -12,10 +12,11 @@ is the active voice, selectable via ``select_voice``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, ClassVar
+from typing import Any, ClassVar
 
-from audio.capabilities import TTSCapabilities, BillingUnit
+from audio.capabilities import BillingUnit, TTSCapabilities
 from audio.providers.credential_resolver import CredentialResolver
 from audio.providers.model_succession import successor_of
 
@@ -95,7 +96,7 @@ class TTSProvider(ABC):
 
     @classmethod
     @abstractmethod
-    def from_row(cls, row: dict, resolver: CredentialResolver) -> "TTSProvider":
+    def from_row(cls, row: dict, resolver: CredentialResolver) -> TTSProvider:
         """Build an instance from an ``audio_providers`` row + a credential resolver."""
 
     # ── Capability / billing metadata ──────────────────────────────
@@ -151,8 +152,8 @@ class TTSProvider(ABC):
     def has_voice_for(self, language: str) -> bool:
         """A voice meant for ``language`` exists (the admin's map or the
         provider's defaults), as opposed to the English fallback
-        ``select_voice`` takes. The language lock asks before it moves a
-        call to a language the line has no voice for."""
+        ``select_voice`` takes. A call's language detection asks before it
+        opens a candidate stream in a language the line has no voice for."""
         return bool(self.voices.get(language) or self.default_voices.get(language))
 
     # ── Voice discovery (optional surface) ─────────────────────────
@@ -232,6 +233,17 @@ class TTSProvider(ABC):
     @abstractmethod
     async def send_text_chunk(self, text: str, is_last: bool = False) -> None:
         """Send a text chunk to the current streaming context."""
+
+    async def flush(self) -> None:  # noqa: B027 — a default no-op: an engine that generates as the text arrives has nothing to release
+        """Synthesize what the context holds without ending the utterance.
+
+        A streaming engine may hold a short chunk until more text arrives;
+        the bridge calls this when the engine pauses after a complete
+        sentence (a tool call, a short answer), so the sentence plays while
+        the context stays open for more text. Never a close: ``is_last``
+        still ends the utterance. Default: nothing, for an engine that
+        generates as the text arrives.
+        """
 
     @abstractmethod
     async def receive_audio(self) -> AsyncGenerator[bytes, None]:

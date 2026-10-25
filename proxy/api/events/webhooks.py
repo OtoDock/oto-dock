@@ -67,7 +67,7 @@ async def _drain_small(request: Request, source: str) -> None:
     try:
         if declared is not None and int(declared) <= _DRAIN_MAX:
             await webhook_body.read(request, cap=_DRAIN_MAX, source=source)
-    except Exception:
+    except (ValueError, webhook_body.TooLarge, webhook_body.Busy, TimeoutError, ClientDisconnect):
         pass
 
 
@@ -147,6 +147,44 @@ async def receive_relay_webhook(provider_id: str, request: Request) -> Response:
             return 500, {"error": "internal_error"}, {"content-type": "application/json"}
 
     return await _receive(request, dispatch, source=f"relay/{provider_id}")
+
+
+@router.post(
+    "/v1/webhooks/{provider_id}/app",
+    include_in_schema=False,
+)
+async def receive_app_webhook(provider_id: str, request: Request) -> Response:
+    """Receive a delivery of a GitHub App's own webhook (the app-level
+    secret, no subscription in the URL: the payload's installation routes
+    it). Declared ABOVE the generic vendor route like the relay's: ``app``
+    sits in the subscription-id position, and no subscription id is that
+    word.
+    POST-only; the same forward-auth bypass requirement."""
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    loaded: dict = {}
+
+    async def dispatch(raw_body: bytes):
+        try:
+            return await webhook_dispatcher.dispatch_app_webhook(
+                provider_id=provider_id, raw_body=raw_body, headers=headers,
+                context=loaded["context"],
+            )
+        except Exception:
+            logger.exception("app webhook dispatcher raised unexpectedly for provider=%s", provider_id)
+            return 500, {"error": "internal_error"}, {"content-type": "application/json"}
+
+    async def prepare():
+        context, early = await webhook_dispatcher.load_app_receive_context(provider_id)
+        if early is not None:
+            return early, 0, None
+        loaded["context"] = context
+        cap = webhook_body.unknown_cap()
+        if (provider_id in webhook_providers.LARGE_BODY_PROVIDERS
+                and context.webhooks_block.get("signature")):
+            cap = webhook_body.signed_cap()
+        return None, cap, None
+
+    return await _receive(request, dispatch, source=f"{provider_id}/app", prepare=prepare)
 
 
 @router.api_route(

@@ -12,35 +12,46 @@ import functools
 import json
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
+
 from fastapi import WebSocketDisconnect
-from storage import database as task_store
-from storage.pg import run_db
+
+from core.background import spawn
 from core.events import artifact_events, chat_writer, input_queue
-from core.session.session_state import (
-    _chat_streaming_state,
-    get_session_mode,
-    get_permission_queue,
-)
 from core.events.common_events import (
-    CommonEvent, ERROR, QUEUE_TURN, ARTIFACT_TURN, PRODUCER_DONE, TurnInput,
+    ARTIFACT_TURN,
+    ERROR,
+    PRODUCER_DONE,
+    QUEUE_TURN,
+    CommonEvent,
+    TurnInput,
 )
-from core.execution_layer import ExecutionLayer
-from core.session.history_seed import consume_pending_seed
+from core.events.pump_bg_monitors import arm_bg_monitors
 from core.events.stream_pump import (
     PUMP_RESYNC,
     ChatStreamPump,
     _active_pumps,
 )
-from core.events.pump_bg_monitors import arm_bg_monitors
+from core.execution_layer import ExecutionLayer
 from core.session import session_kind, visibility as _vis
-from ws.dashboard_chat_text import (
-    HEAL_READY, HEAL_RECONNECTING, HEAL_REFUSED, TurnDeferred, _queued_outgoing, grace_layer,
+from core.session.history_seed import consume_pending_seed
+from core.session.session_state import (
+    _chat_streaming_state,
+    get_permission_queue,
 )
-from ws import chat_phase
-from ws import wire_events as wire
+from services.notifications.notification_manager import _notify_coalesce_key
+from storage import database as task_store
+from storage.pg import run_db
+from ws import chat_phase, wire_events as wire
+from ws.dashboard_chat_text import (
+    HEAL_READY,
+    HEAL_RECONNECTING,
+    HEAL_REFUSED,
+    TurnDeferred,
+    _queued_outgoing,
+    grace_layer,
+)
 from ws.dashboard_dispatch import StreamCtx
-from core.background import spawn
 
 if TYPE_CHECKING:
     from ws.dashboard_host import DashboardHost as _Host
@@ -52,14 +63,91 @@ logger = logging.getLogger("otodock")
 # Pump items a viewer sends per wake before it yields to its next wait.
 _VIEWER_DRAIN_MAX = 256
 
+# How long a task chat's or a meeting's viewer waits between two looks for
+# the next pump (the notify queue is read meanwhile).
+_PUMP_POLL_S = 2.0
+
+# The notify-queue frames a streaming turn lets through at once: each starts
+# no turn and moves no turn state of the viewed chat (the page shows a toast,
+# a badge, a refetch, a machine's or an install's progress, or pings for
+# another chat).
+_TURN_FREE_FRAMES = frozenset({
+    wire.NOTIFICATION, wire.NOTIFICATION_SILENT, wire.NOTIFICATION_COUNT,
+    wire.SHARE_INBOX, wire.TURN_COMPLETE, wire.FILE_UPDATED,
+    wire.INSTALL_STARTED, wire.INSTALL_MCP_PLAN, wire.INSTALL_PROGRESS,
+    wire.INSTALL_HEARTBEAT, wire.INSTALL_VERIFYING, wire.INSTALL_DONE, wire.INSTALL_FAILED,
+    wire.TRANSFER_STARTED, wire.TRANSFER_MACHINE_STATE, wire.TRANSFER_PROGRESS,
+    wire.TRANSFER_DONE, wire.TRANSFER_STATE,
+    wire.SATELLITE_UPDATING, wire.SATELLITE_UPDATED, wire.SATELLITE_UPDATE_FAILED,
+    wire.SATELLITE_UPDATE_SYNC,
+})
+
+
+def _hold(held: list[dict], item: dict) -> None:
+    """``item`` joins the items held for the turn's end the way the notify
+    queue takes it: a status, read-receipt, progress or heartbeat frame
+    replaces the held one of its key in place, so a long turn keeps one
+    frame per key instead of every one it read."""
+    key = _notify_coalesce_key(item) if isinstance(item, dict) else None
+    if key is not None:
+        for i, old in enumerate(held):
+            if _notify_coalesce_key(old) == key:
+                held[i] = item
+                return
+    held.append(item)
+
 
 class ChatStreamMixin(_Host):
     """The producer/pump plumbing: starting a stream, streaming through the pump,"""
+
+    # The connection state this mixin assigns, declared where it assigns it:
+    # the type checker reads an attribute a mixin assigns from the mixin
+    # first. Annotations only (strings), no class attributes.
+    _resume_live: "dict | None"
+    chat_id: "str | None"
+    chat_plan_filename: "str"
+    implementing_plan: "str"
+    promised_pump_chat: "str | None"
+    session_id: "str | None"
 
     # The socket dropped while a turn streamed: the loop's way out starts no
     # turn for it (the chat's queue goes out at the pump's end, as its
     # author, through a delivery that re-reads their standing).
     _socket_gone = False
+
+    async def _warm_dead_target(self, sid: str, target_chat_id: str, target_layer,
+                                is_viewed: bool):
+        """Re-warm a turn's dead target session: the viewed chat is adopted
+        into the connection, a server turn's chat is warmed headless. Returns
+        ``(session_id, layer)`` for the turn, or None after a failure the
+        person was told about. A resume probe the machine did not answer
+        defers the turn (``TurnDeferred``) as a grace-held session does."""
+        try:
+            if is_viewed:
+                logger.info("WS dashboard: session %s process dead, auto-resuming", sid)
+                await self._resume_dead_session_for_chat(
+                    sid, target_chat_id, target_layer, adopt=True,
+                )
+                # _create_or_resume_session adopted the (re)created id into the
+                # self.session_id — adopt it as this turn's session.
+                return self.session_id, target_layer
+            logger.info(
+                "WS dashboard: server-turn target session %s dead and chat "
+                "%s not viewed — warming headless", sid, target_chat_id
+            )
+            res = await self._resume_dead_session_for_chat(
+                sid, target_chat_id, target_layer, adopt=False,
+            )
+            # Use the freshly-warmed session + layer for this turn ONLY;
+            # the viewed attributes were never touched (adopt=False).
+            return res.session_id, res.layer
+        except TurnDeferred:
+            raise
+        except Exception as e:
+            logger.exception("WS dashboard: auto-resume failed: %s", e)
+            if is_viewed:
+                await self._send_error(f"Session died and auto-resume failed: {e}")
+            return None
 
     async def _start_new_stream(self,
         prompt: str,
@@ -71,8 +159,13 @@ class ChatStreamMixin(_Host):
         headless: bool = False,
         rows_first: asyncio.Future | None = None,
         reconnect_waited: bool = False,
+        typed: bool = False,
     ) -> ChatStreamPump | None:
         """Create a producer + pump for a streaming turn on an EXPLICIT target.
+
+        ``typed``: the turn carries a person's message (a send, a drained or
+        queued batch); it also takes the chat's notes (``WAKE_NOTE``), which
+        wait for exactly such a turn. A server turn leaves them.
 
         The turn executes against ``(target_session_id, target_chat_id,
         target_layer)`` — NOT the connection's *viewed* chat. The pump is keyed
@@ -131,7 +224,7 @@ class ChatStreamMixin(_Host):
         # delegate result then never ran (the 18:56 no-resume bug). The layer
         # predicates keep their semantics; this chokepoint is where "absent"
         # and "dead" must both mean "warm it".
-        process_dead = bool(target_layer) and (
+        process_dead = target_layer is not None and (
             await target_layer.is_session_process_dead(sid)
             or not await target_layer.is_session_alive(sid)
         )
@@ -139,10 +232,11 @@ class ChatStreamMixin(_Host):
         if process_dead and not reconnect_waited:
             # A machine in its reconnect grace is coming back, not dead: the
             # resume below would drop the live session's record and state.
-            process_dead = not await holder.wait_session_reconnect(sid)
-        if process_dead and holder.is_session_grace_held(sid):
-            logger.info(f"WS dashboard: the turn on session {sid[:8]} waits — its machine "
-                        f"is still reconnecting")
+            # process_dead holds only with a layer, which grace_layer falls back to.
+            process_dead = not await cast("ExecutionLayer", holder).wait_session_reconnect(sid)
+        if process_dead and cast("ExecutionLayer", holder).is_session_grace_held(sid):
+            logger.info("WS dashboard: the turn on session %s waits — its machine "
+                        "is still reconnecting", sid[:8])
             raise TurnDeferred(sid)
         if (not process_dead and target_chat_id == self.chat_id and sid == self.session_id
                 and (self.deferred_mode or self.deferred_model)):
@@ -151,6 +245,11 @@ class ChatStreamMixin(_Host):
             # before the turn reaches the engine; a new-chat page's pick is
             # not this chat's and stays for the warmup that mints its chat.
             await self._reapply_deferred_after_warmup(target_chat_id)
+        elif not process_dead and target_layer is not None:
+            # A pick made while the session was away, by a socket since gone:
+            # the row and the hook have it, the engine takes it now.
+            from ws.dashboard_chat_support import apply_owed_engine_mode
+            await apply_owed_engine_mode(target_layer, sid)
         if target_layer and not process_dead:
             # Turn-start token guard: never dispatch a turn onto an OAuth token
             # that expires within the turn-safety margin — a long turn would
@@ -168,52 +267,32 @@ class ChatStreamMixin(_Host):
             # the CLI's 401-recovery re-reads the file once a later attempt
             # repairs it, and blocking the turn would help nothing.
             from services.engines.subscription_pool import (
-                TURN_MIN_TOKEN_RUNWAY_MS, ensure_fresh_and_fan_out,
-                get_session_subscription, session_token_expiry_ms,
+                TURN_MIN_TOKEN_RUNWAY_MS,
+                ensure_fresh_and_fan_out,
+                get_session_subscription,
+                session_token_expiry_ms,
             )
             _exp_ms = session_token_expiry_ms(sid)
             if _exp_ms and time.time() * 1000 > _exp_ms - TURN_MIN_TOKEN_RUNWAY_MS:
                 _sub_id = get_session_subscription(sid)
                 if _sub_id:
                     logger.info(
-                        f"WS dashboard: session {sid} token runway low — "
-                        f"refresh + fan-out before dispatching the turn"
+                        "WS dashboard: session %s token runway low — "
+                        "refresh + fan-out before dispatching the turn", sid
                     )
                     _fresh = await asyncio.to_thread(
                         ensure_fresh_and_fan_out, _sub_id, TURN_MIN_TOKEN_RUNWAY_MS,
                     )
                     if not _fresh:
                         logger.warning(
-                            f"WS dashboard: token refresh failed for session {sid} — "
-                            f"dispatching on the aging token (401-recovery backstop)"
+                            "WS dashboard: token refresh failed for session %s — "
+                            "dispatching on the aging token (401-recovery backstop)", sid
                         )
         if process_dead:
-            try:
-                if is_viewed:
-                    logger.info(f"WS dashboard: session {sid} process dead, auto-resuming")
-                    await self._resume_dead_session_for_chat(
-                        sid, target_chat_id, target_layer, adopt=True,
-                    )
-                    # _create_or_resume_session adopted the (re)created id into the
-                    # self.session_id — adopt it as this turn's session.
-                    sid = self.session_id
-                else:
-                    logger.info(
-                        f"WS dashboard: server-turn target session {sid} dead and chat "
-                        f"{target_chat_id} not viewed — warming headless"
-                    )
-                    res = await self._resume_dead_session_for_chat(
-                        sid, target_chat_id, target_layer, adopt=False,
-                    )
-                    # Use the freshly-warmed session + layer for this turn ONLY;
-                    # the viewed attributes were never touched (adopt=False).
-                    sid = res.session_id
-                    target_layer = res.layer
-            except Exception as e:
-                logger.error(f"WS dashboard: auto-resume failed: {e}", exc_info=True)
-                if is_viewed:
-                    await self._send_error(f"Session died and auto-resume failed: {e}")
+            warmed = await self._warm_dead_target(sid, target_chat_id, target_layer, is_viewed)
+            if warmed is None:
                 return None
+            sid, target_layer = warmed
 
         if not target_layer or not await target_layer.is_session_alive(sid):
             await self._send_error("Session not found — send warmup")
@@ -239,13 +318,16 @@ class ChatStreamMixin(_Host):
         # (dead parent, resume failed) were stored on the chat — inject them
         # ahead of this turn's prompt so the orchestrator finally processes
         # them. Same chokepoint rationale + atomic claim as the seed above.
+        # A typed turn takes the notes too (a concluded meeting's).
         if target_chat_id:
-            pending_wakes = await run_db(task_store.claim_pending_delegate_wake, target_chat_id)
+            pending_wakes = await run_db(
+                task_store.claim_pending_delegate_wake, target_chat_id, notes=typed)
             if pending_wakes:
                 prompt = "\n\n".join(pending_wakes + [prompt])
                 logger.info(
-                    f"WS dashboard: injected {len(pending_wakes)} pending delegate "
-                    f"wake(s) into turn for chat={target_chat_id[:8]}"
+                    "WS dashboard: injected %s pending delegate "
+                    "wake(s) into turn for chat=%s",
+                    len(pending_wakes), target_chat_id[:8]
                 )
 
         perm_queue = get_permission_queue(sid)
@@ -286,7 +368,7 @@ class ChatStreamMixin(_Host):
                         f"{prompt}\n\n<system-reminder>{_nudge_line}"
                         "</system-reminder>"
                     )
-            except Exception:
+            except Exception:  # noqa: BLE001  # the memory nudge is optional, the prompt goes out without it
                 pass
 
         # Fallback usage scope — on a Shared-only agent the chat row's owner is
@@ -346,8 +428,8 @@ class ChatStreamMixin(_Host):
                         for subtype, kwargs in self.pending_control_requests:
                             try:
                                 await target_layer.send_control_request(sid, subtype, **kwargs)
-                            except Exception as e:
-                                logger.warning(f"Between-turn control_request {subtype} error: {e}")
+                            except Exception as e:  # noqa: BLE001  # a control request the engine refuses must not end the producer
+                                logger.warning("Between-turn control_request %s error: %s", subtype, e)
                         self.pending_control_requests.clear()
                     # After a turn that yielded an ERROR the session may be
                     # dead: nothing more is sent into it, and the pump's end
@@ -406,7 +488,7 @@ class ChatStreamMixin(_Host):
                     # typed message sent after it waits in the chat's queue
                     # for the pump's end, an utterance is refused by the pump.
                     pump.close_queue()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # the producer turns any failure into an error event for the pump
                 await event_queue.put(CommonEvent(type=ERROR, data={"message": str(e)}))
             finally:
                 await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))
@@ -484,19 +566,16 @@ class ChatStreamMixin(_Host):
         # showing (background chats must not render into the wrong view).
         frame_chat_id = self.chat_id or pump.chat_id
         stream = StreamCtx(pump, ws_queue, frame_chat_id)
-        # The person the pump's turns run as: a pushed document's token
-        # reaches only their connections (artifact_events.for_viewer).
-        pusher = getattr(pump, "wake_person", "") or ""
 
         live = _chat_streaming_state.get(pump.chat_id)
         # The blocks the resume's cut left to the live state that a save has
         # persisted (and trimmed) since: their rows are above the cut, so
         # they go out here, ahead of the blocks still live.
-        held, self._resume_live = (self._resume_live or {}).get(pump.chat_id), None
+        held_live, self._resume_live = (self._resume_live or {}).get(pump.chat_id), None
         restored: list = []
-        if live is not None and held is not None and held[0] is pump:
+        if live is not None and held_live is not None and held_live[0] is pump:
             still = {id(b) for b in live.get("live_blocks") or ()}
-            restored = [b for b in held[1] if id(b) not in still]
+            restored = [b for b in held_live[1] if id(b) not in still]
         snapshot: str | None = None
         if live and (restored or live.get("streaming")
                      # ^ an active turn with NO output yet must still be
@@ -514,7 +593,7 @@ class ChatStreamMixin(_Host):
             frame = {"type": wire.LIVE_STATE, **live, "chat_id": frame_chat_id}
             blocks = restored + list(live.get("live_blocks") or ())
             if blocks:
-                frame["live_blocks"] = [self._for_this_viewer(b, pusher) for b in blocks]
+                frame["live_blocks"] = [self._for_this_viewer(b) for b in blocks]
             snapshot = json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
 
         # Tell the client the viewed chat is streaming, DIRECTLY on this
@@ -531,9 +610,12 @@ class ChatStreamMixin(_Host):
                      "status": chat_phase.STREAMING})
         if snapshot is not None:
             await self._send_text(snapshot)
-            logger.info(f"WS dashboard: sent live_state after attach for chat={pump.chat_id}")
+            logger.info("WS dashboard: sent live_state after attach for chat=%s", pump.chat_id)
 
-        recv_task = get_task = live_task = None
+        recv_task = get_task = live_task = notify_task = None
+        # The notify queue's items read during the turn that must wait for
+        # its end (a server turn, the viewed chat's own status), in order.
+        held: list[dict] = []
         try:
             while True:
                 if recv_task is None:
@@ -542,11 +624,22 @@ class ChatStreamMixin(_Host):
                     get_task = asyncio.create_task(ws_queue.get())
                 if live_task is None:
                     live_task = asyncio.create_task(self.live_queue.get())
+                if notify_task is None:
+                    notify_task = asyncio.create_task(self.notify_queue.get())
                 done, _ = await asyncio.wait(
-                    {recv_task, get_task, live_task},
+                    {recv_task, get_task, live_task, notify_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                # Live-app frames first: they must reach the screen during
+                # The notify item first: a turn-free frame goes out now, the
+                # rest waits in order (so a break below never leaves a read
+                # item behind: the settle takes an unprocessed result).
+                if notify_task in done:
+                    item, notify_task = notify_task.result(), None
+                    if self._runs_mid_turn(item, pump.chat_id):
+                        await self._handle_server_notification(item)
+                    else:
+                        _hold(held, item)
+                # Live-app frames next: they must reach the screen during
                 # the turn.
                 if live_task in done:
                     frame, live_task = live_task.result(), None
@@ -558,22 +651,43 @@ class ChatStreamMixin(_Host):
                         break
                 if get_task in done:
                     item, get_task = get_task.result(), None
-                    if await self._stream_pump_items(item, ws_queue, frame_chat_id, result,
-                                                     pusher=pusher):
+                    if await self._stream_pump_items(item, ws_queue, frame_chat_id, result):
                         break
         finally:
             self.streaming = False
             pump.detach(ws_queue)
-            await self._settle_stream_tasks(recv_task, get_task, live_task)
+            await self._settle_stream_tasks(recv_task, get_task, live_task, notify_task, held)
 
         return result
 
-    async def _settle_stream_tasks(self, recv_task, get_task, live_task) -> None:
+    def _runs_mid_turn(self, item: dict, pump_chat_id: str) -> bool:
+        """Whether a notify-queue item read during the viewed chat's turn
+        runs now: a frame that starts no turn and carries no turn state for
+        this view (a notification, the badge count, the share inbox, another
+        chat's end-of-turn alert, a file's change, the install, transfer and
+        satellite lifecycles), or a status, read receipt or warmup heartbeat
+        of a chat other than the viewed one and the pump's (the sidebar dots
+        and badges of the other chats; the viewed chat's own ``ready`` would
+        turn Stop back into Send). Everything else (a server turn, the
+        viewed chat's status, the rows) waits for the turn's end."""
+        kind = item.get("type") if isinstance(item, dict) else None
+        if kind in _TURN_FREE_FRAMES:
+            return True
+        if kind in (wire.CHAT_STATUS, wire.CHAT_READ, wire.WARMUP_HEARTBEAT):
+            cid = item.get("chat_id") or ""
+            return bool(cid) and cid not in (self.chat_id, pump_chat_id)
+        return False
+
+    async def _settle_stream_tasks(self, recv_task, get_task, live_task, notify_task=None,
+                                   held: list[dict] | None = None) -> None:
         """Leave the viewer loop: cancel every pending task, await them
         together, then keep what completed meanwhile: a client message goes
         back to the connection (the multiplex reads it before the socket), a
-        live-app frame is sent. A pump item is dropped (the viewer is gone)."""
-        tasks = [t for t in (recv_task, get_task, live_task) if t is not None]
+        live-app frame is sent, a notify item joins the held ones and the
+        held ones go back to the front of the notify queue in their order
+        (the between-turns loop runs them next). A pump item is dropped (the
+        viewer is gone)."""
+        tasks = [t for t in (recv_task, get_task, live_task, notify_task) if t is not None]
         for t in tasks:
             t.cancel()
         if tasks:
@@ -584,6 +698,36 @@ class ChatStreamMixin(_Host):
         if (live_task is not None and not live_task.cancelled()
                 and live_task.exception() is None):
             await self._send(live_task.result())
+        held = held if held is not None else []
+        if (notify_task is not None and not notify_task.cancelled()
+                and notify_task.exception() is None):
+            _hold(held, notify_task.result())
+        if held:
+            self.notify_queue.unget(held)
+
+    async def _wait_between_pumps(self, seconds: float) -> None:
+        """The wait for a task chat's or a meeting's next pump, with the
+        notify queue read meanwhile the way the stream loop reads it: a
+        turn-free item runs, anything else goes back to the front when the
+        wait ends."""
+        held: list[dict] = []
+        deadline = time.monotonic() + seconds
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                try:
+                    item = await asyncio.wait_for(self.notify_queue.get(), remaining)
+                except asyncio.TimeoutError:
+                    return
+                if self._runs_mid_turn(item, self.chat_id or ""):
+                    await self._handle_server_notification(item)
+                else:
+                    _hold(held, item)
+        finally:
+            if held:
+                self.notify_queue.unget(held)
 
     async def _stream_client_message(self, task, pump, ws_queue, stream, result) -> bool:
         """One client message during streaming; True ends the loop."""
@@ -605,7 +749,8 @@ class ChatStreamMixin(_Host):
             spec = wire.INBOUND.get(cm_type)
             if spec is None or spec.mid_stream == wire.MID_STREAM_DROP:
                 logger.warning(
-                    f"WS dashboard: unhandled client message type={cm_type!r} during pump streaming: dropped"
+                    "WS dashboard: unhandled client message type=%r during pump streaming: dropped",
+                    cm_type
                 )
             elif spec.mid_stream == wire.MID_STREAM_DETACH:
                 # Chat-switch intent (resume_chat) or a warmup for a
@@ -616,7 +761,7 @@ class ChatStreamMixin(_Host):
                 # loop for normal dispatch. Swallowed here, the new
                 # chat's first turn would be lost and this chat's
                 # frames would keep rendering into the new view.
-                logger.info(f"WS dashboard: {cm_type} during pump streaming: detaching")
+                logger.info("WS dashboard: %s during pump streaming: detaching", cm_type)
                 pump.detach(ws_queue)
                 self.pending_control_requests.clear()
                 result["detached"] = True
@@ -631,7 +776,7 @@ class ChatStreamMixin(_Host):
                 if outcome == wire.HANDLED_BREAK:
                     return True
         except (WebSocketDisconnect, RuntimeError):
-            logger.info(f"WS dashboard: WS disconnected during pump streaming")
+            logger.info("WS dashboard: WS disconnected during pump streaming")
             self._socket_gone = True
             pump.detach(ws_queue)
             result["detached"] = True
@@ -640,16 +785,16 @@ class ChatStreamMixin(_Host):
             pass
         return False
 
-    def _for_this_viewer(self, event: dict, pusher: str) -> dict:
+    def _for_this_viewer(self, event: dict) -> dict:
         """A pushed document's live frame as this connection gets it: its
-        WOPI token only when this socket's person is the one whose session
-        pushed it (``artifact_events.for_viewer``); any other frame as is."""
+        WOPI token only when this socket's person is the one it was minted
+        for (``artifact_events.for_viewer``); any other frame as is."""
         if not any(k in event for k in artifact_events.LIVE_ONLY_KEYS):
             return event
-        return artifact_events.for_viewer(event, pusher, self.user_sub)
+        return artifact_events.for_viewer(event, self.user_sub)
 
     async def _stream_pump_items(self, first: dict, ws_queue, frame_chat_id: str,
-                                 result: dict, *, pusher: str = "") -> bool:
+                                 result: dict) -> bool:
         """``first`` plus every item already waiting (up to the drain cap),
         each sent in order; True ends the loop (the rest of the batch is
         dropped, as the loop never reads past its end). The send does not
@@ -661,26 +806,20 @@ class ChatStreamMixin(_Host):
             except asyncio.QueueEmpty:
                 break
         for item in items:
-            if await self._stream_pump_item(item, frame_chat_id, result, pusher=pusher):
+            if await self._stream_pump_item(item, frame_chat_id, result):
                 return True
         await asyncio.sleep(0)
         return False
 
-    async def _stream_pump_item(self, item: dict, frame_chat_id: str, result: dict,
-                                *, pusher: str = "") -> bool:
-        """One pump item to the socket; True ends the loop. ``pusher`` is
-        the person the pump's turns run as: a frame's live-only fields
-        reach only their connections."""
+    async def _stream_pump_item(self, item: dict, frame_chat_id: str, result: dict) -> bool:
+        """One pump item to the socket; True ends the loop."""
         pt = item.get("pump_type", "")
 
         if pt == wire.PUMP_WS_EVENT:
             event = item["event"]
-            # Plan mode: track pre-plan mode for restoration
-            if event.get("type") == wire.PLAN_MODE:
-                if event.get("action") == "enter":
-                    self.pre_plan_mode_holder[0] = get_session_mode(self.session_id) or "default"
-                # session mode is already set by the pump
-            event = self._for_this_viewer(event, pusher)
+            # Plan mode's entry: the session's mode is already set by the pump
+            # (the pre-plan mode is session state: session_state.pre_plan_mode).
+            event = self._for_this_viewer(event)
             await self._send({**event, "chat_id": frame_chat_id})
 
         elif pt == wire.PUMP_PERMISSION_PROMPT:
@@ -766,7 +905,7 @@ class ChatStreamMixin(_Host):
             # This viewer fell a full queue behind: resync it the way a
             # reconnect does (chat_history, then a fresh live_state) through
             # a same-chat resume that never reaps the pump.
-            logger.info(f"WS dashboard: viewer behind on chat={frame_chat_id}: resyncing")
+            logger.info("WS dashboard: viewer behind on chat=%s: resyncing", frame_chat_id)
             result["detached"] = True
             result["resume_msg"] = {"type": wire.IN_RESUME_CHAT,
                                     "chat_id": frame_chat_id, "_resync": True}
@@ -809,7 +948,7 @@ class ChatStreamMixin(_Host):
         history_resend_budget = 2
         resynced = False
         while True:
-            pump = _active_pumps.get(self.chat_id)
+            pump = _active_pumps.get(cast("str", self.chat_id))
             # Never attach to an active external session's pump (phone/website/
             # webhook): attach() would steal its stream and kill the live call.
             # These are viewed read-only via chat_history (_handle_resume_chat).
@@ -829,7 +968,7 @@ class ChatStreamMixin(_Host):
                 )
                 if should_poll:
                     task_wait_retries += 1
-                    await asyncio.sleep(2)
+                    await self._wait_between_pumps(_PUMP_POLL_S)
                     continue
                 # Resume promised an attach for this chat (its history went out
                 # TRUNCATED at the pump's cutoff) but the pump finished in the
@@ -843,8 +982,8 @@ class ChatStreamMixin(_Host):
                     history_resend_budget -= 1
                     self.promised_pump_chat = None
                     logger.info(
-                        f"WS dashboard: promised pump gone before attach for "
-                        f"chat={self.chat_id} — re-sending history"
+                        "WS dashboard: promised pump gone before attach for "
+                        "chat=%s — re-sending history", self.chat_id
                     )
                     await self._handle_resume_chat({"chat_id": self.chat_id, "_delta": True})
                     continue
@@ -874,6 +1013,18 @@ class ChatStreamMixin(_Host):
                 # closed pump queue held are recorded for the chat they were
                 # queued in, also when the viewer loop raised.
                 self._take_artifact_leftover(pump, self.chat_id or pump.chat_id)
+
+            if self.chat_id and input_queue.deleting(self.chat_id) and not result.get("resume_msg"):
+                # The chat is being deleted under this view: nothing of the
+                # loop's way out runs for it (no re-send, no monitor, no
+                # drain), what the connection held for it goes, and the
+                # socket leaves the chat so no poll names it again.
+                self._cancel_artifacts(self.chat_id)
+                self.implement_queue[:] = [
+                    it for it in self.implement_queue if (it.chat_id or self.chat_id) != self.chat_id]
+                self.chat_id = None
+                self.session_id = None
+                break
 
             if result.get("resume_msg"):
                 rm = result["resume_msg"]
@@ -915,9 +1066,10 @@ class ChatStreamMixin(_Host):
                     self.chat_plan_filename = pump._plan_filename
                 if pump.implementing_plan and not pump.message_queue:
                     chat_writer.submit(
-                        self.chat_id,
+                        cast("str", self.chat_id),
                         functools.partial(task_store.update_chat_plan_status,
-                                          self.chat_id, pump.implementing_plan, "implemented"),
+                                          cast("str", self.chat_id), pump.implementing_plan,
+                                          "implemented"),
                         label="plan_implemented",
                     )
                     await self._send({"type": wire.PLAN_STATUS,
@@ -953,7 +1105,7 @@ class ChatStreamMixin(_Host):
         the drain on the loop's way out. False at the cap."""
         if not pump.queue_closed:
             return pump.queue_artifact(interaction)
-        from ws.artifact_interactions import QUEUE_CAP
+        from core.events.artifact_events import QUEUE_CAP
         self._take_artifact_leftover(pump, chat_id)
         if sum(it.get("chat_id", chat_id) == chat_id for it in self.artifact_queue) >= QUEUE_CAP:
             return False
@@ -993,6 +1145,10 @@ class ChatStreamMixin(_Host):
             return False
         cid = self.chat_id
         if not (cid and self.agent_name):
+            return False
+        # A chat getting ready starts nothing here: its first turn takes what
+        # waits. A chat being deleted starts nothing ever again.
+        if input_queue.deleting(cid) or input_queue.getting_ready(cid):
             return False
         # The connection's own throttled re-check, as before a client
         # message: a turn this socket starts runs as its person.
@@ -1045,7 +1201,7 @@ class ChatStreamMixin(_Host):
                 # send persists them before its framed turn (a live terminal
                 # taking the turn below persists none). Lane-ordered after the
                 # finished turn's rows and before the next pump's.
-                rows = [(_ai.event_type(it), _ai.event_row_json(it)) for it in arts]
+                rows = [(artifact_events.event_type(it), artifact_events.event_row_json(it)) for it in arts]
 
                 def _rows_job() -> None:
                     for etype, edata in rows:
@@ -1054,12 +1210,12 @@ class ChatStreamMixin(_Host):
 
                 await chat_writer.submit(cid, _rows_job, label="artifact_batch")
                 for it in arts:
-                    await self._send(_ai.ws_frame(it, cid))
+                    await self._send(artifact_events.ws_frame(it, cid))
             if taken or spoken:
                 batch = TurnInput.combine([qi.item for qi in taken] + spoken)
                 logger.info(
-                    f"WS dashboard: {len(taken) + len(spoken)} queued message(s) out as "
-                    f"the next turn, chat={cid[:8]}"
+                    "WS dashboard: %s queued message(s) out as "
+                    "the next turn, chat=%s", len(taken) + len(spoken), cid[:8]
                 )
                 # The interactions ride the same turn, framed after the
                 # messages: their rows stand already, so only the model's
@@ -1067,7 +1223,7 @@ class ChatStreamMixin(_Host):
                 cli_text = batch.cli_text
                 if arts:
                     cli_text = f"{cli_text}\n\n{_ai.frame_text(arts)}"
-                probe = {"text": cli_text, "chat_id": cid}
+                probe: dict[str, Any] = {"text": cli_text, "chat_id": cid}
             else:
                 probe = {"text": _ai.frame_text(arts), "chat_id": cid, "_artifact_framed": True}
             heal = await self._heal_viewed_session(probe)
@@ -1120,11 +1276,13 @@ class ChatStreamMixin(_Host):
                     target_layer=self.layer,
                     images=(batch.images or None) if batch is not None else None,
                     rows_first=rows_first,
+                    typed=batch is not None,
                 )
-            except TurnDeferred:
+            except TurnDeferred as deferred:
                 self._restore_abort_flags(cid, consumed)
                 handed = True
-                await self._defer_drain(cid, q, claim, taken, spoken, with_interactions=bool(arts))
+                await self._defer_drain(cid, q, claim, taken, spoken, with_interactions=bool(arts),
+                                        waiting=deferred.waiting, deferred=deferred)
                 released = True
                 return False
             handed = pump is not None
@@ -1159,15 +1317,17 @@ class ChatStreamMixin(_Host):
 
     async def _defer_drain(self, cid: str, q, claim, taken: list, spoken: list, *,
                            with_interactions: bool,
-                           waiting: str = input_queue.WAITING_RECONNECT) -> None:
+                           waiting: str = input_queue.WAITING_RECONNECT,
+                           deferred: TurnDeferred | None = None) -> None:
         """The drain's turn waits (for the chat's machine, or ``waiting``: a
         teammate's terminal to close): the queued messages go back (marked,
         so their chips say why), the connection's spoken items too; the
         interactions' rows are written already, so they get the not-sent line
-        instead. The claim goes without re-arming (the reconnect pass, or the
-        terminal's close, arms the queue). No ``done``, as on the drain's other
-        exits without a turn: the page is not streaming here, and a ``done``
-        on an empty bubble makes it refetch, which drains again."""
+        instead. The claim goes without re-arming (the reconnect pass, the
+        resume watcher or the terminal's close arms the queue). No ``done``,
+        as on the drain's other exits without a turn: the page is not
+        streaming here, and a ``done`` on an empty bubble makes it refetch,
+        which drains again."""
         for qi in taken:
             qi.waiting = waiting
         q.put_back([qi for qi in taken if qi not in q.items])
@@ -1176,7 +1336,7 @@ class ChatStreamMixin(_Host):
         if taken:
             input_queue.fan_out_snapshot(cid)
         if with_interactions:
-            await self._send_reconnecting_line(cid)
+            await self._send_deferred_line(cid, deferred)
 
     async def _await_chat_pump(self, cid: str, timeout: float = 3.0) -> bool:
         """Wait for the pump another starter is bringing up on ``cid``: True

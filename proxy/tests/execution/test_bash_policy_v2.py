@@ -13,6 +13,7 @@ import sys
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
@@ -152,6 +153,7 @@ class TestRecursiveDeleteFloor:
         """The gate runs on the event loop: 64 KB of `rm` words must not
         take the quadratic path an unbounded operand run does."""
         import time
+
         from auth import path_shell
         pattern = path_shell._DANGEROUS_PATTERNS[0][0]
         for text in ("rm -rf " * 9400, "rm -rf x " * 7300):
@@ -411,6 +413,7 @@ class TestTheTwoTargetsEndTheHost:
 
     def test_a_long_command_is_judged_in_linear_time(self):
         import time
+
         from auth import path_shell
         patterns = [p for p, r in path_shell._CATASTROPHE_PATTERNS
                     if r == path_shell._ENDS_THE_HOST_REASON]

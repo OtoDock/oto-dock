@@ -17,18 +17,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from services import path_roles
-from services.path_policy_v2 import _protected_path_denial
 from auth.path_policy import (
-    SecurityContext,
     _AGENTS_DIR,
+    SecurityContext,
     _check_bash,
     _check_read_path,
     _check_write_path,
     check_tool_access,
 )
 from core import placement
-
+from services import path_roles
+from services.path_policy_v2 import _protected_path_denial
 
 # ---------------------------------------------------------------------------
 # is_protected_agent_config_path — the core matcher

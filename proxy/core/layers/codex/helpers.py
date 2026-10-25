@@ -10,8 +10,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from core.permission_modes import (
+    AUTO_REVIEW_MODE,
+    DONT_ASK_MODE,
+    JUDGE_MODE,
+    PLAN_MODE,
+    UNATTENDED_MODE,
+)
 from core.session import session_kind
-
 
 # Child-env variable that carries a key-protected LOCAL endpoint's bearer into
 # the Codex process — the custom provider's ``env_key`` names it. Never
@@ -126,24 +132,30 @@ def permission_to_sandbox(permission_mode: str, allow_full_fs: bool = False) -> 
     "danger-full-access"`` (verified vs codex 0.120.0 — the exec-era
     ``"workspace-write-auto"`` is NOT a valid app-server SandboxMode).
 
-    - ``dontAsk`` / ``auto`` → ``danger-full-access`` (no boundary, nothing prompts)
-    - ``plan``               → ``read-only`` (planning — reads only)
-    - everything else        → ``workspace-write`` (default / acceptEdits — Codex
-      has no separate auto-edit tier; in-workspace edits run, escapes prompt)
+    - Don't Ask / the unattended ``auto`` → ``danger-full-access`` (no
+      boundary, nothing asks)
+    - ``plan`` / ``judge``   → ``read-only`` (reads only)
+    - Auto                  → ``workspace-write``, on every machine: the
+      sandbox is the boundary Codex's reviewer judges crossings of
+    - everything else       → ``workspace-write`` (Ask, and the words a
+      satellite before 1.9 is sent: ``default`` / ``acceptEdits``)
 
     ``allow_full_fs`` is the machine pairing's full-filesystem grant
     (``security_context.target_allow_full_fs`` — remote targets only). It
-    lifts default/acceptEdits to ``danger-full-access``: Claude runs
-    unsandboxed on such pairings and Codex's own workspace-write boundary
-    would re-confine what the admin already granted (OtoDock's permission
-    floor + path policy still gate every call). ``plan`` stays read-only.
+    lifts Ask (and the words before 1.9) to ``danger-full-access``: Claude
+    runs unsandboxed on such pairings and Codex's own workspace-write
+    boundary would re-confine what the admin already granted (OtoDock's
+    permission floor + path policy still gate every call). ``plan`` stays
+    read-only, Auto keeps its boundary.
     """
-    if permission_mode in ("dontAsk", "auto"):
+    if permission_mode in (DONT_ASK_MODE, UNATTENDED_MODE):
         return "danger-full-access"
-    if permission_mode in ("plan", "judge"):
+    if permission_mode in (PLAN_MODE, JUDGE_MODE):
         # ``judge`` (CHECKS.md): the same read-only sandbox, without the
         # plan collaboration mode — the session answers, it does not plan.
         return "read-only"
+    if permission_mode == AUTO_REVIEW_MODE:
+        return "workspace-write"
     return "danger-full-access" if allow_full_fs else "workspace-write"
 
 
@@ -191,7 +203,7 @@ _EFFORT_TO_CODEX: dict[str, str] = {
 # must not inherit the unlock, and "gpt-6-sol" does not match "gpt-6.1-sol".
 # The retired 5.6 Sol / Luna and GPT-6 Sol prefixes stay: a custom re-add,
 # or a live session whose row remaps at the next boot, keeps its ceiling
-# (Codex 0.160.0 and 0.162.1 catalogs: GPT-6.1 Sol and GPT-6 Sol low…max +
+# (Codex 0.160.0 to 0.163.0 catalogs: GPT-6.1 Sol and GPT-6 Sol low…max +
 # ultra, GPT-6 Luna low…max).
 _MAX_EFFORT_MODEL_PREFIXES = ("gpt-5.6", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna")
 _ULTRA_EFFORT_MODEL_PREFIXES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol")
@@ -216,6 +228,37 @@ def map_effort_to_codex(effort: str, model: str = "") -> str:
     if effort == "max" and m.startswith(_MAX_EFFORT_MODEL_PREFIXES):
         return "max"
     return _EFFORT_TO_CODEX.get(effort, "")
+
+
+# The reasoning summary every turn asks for (``turn/start`` ``summary``,
+# which holds for later turns too; thread/start has no such field). Codex's
+# catalog defaults every hosted model to "none" (0.162.1, 0.163.0), so without it no
+# reasoning text ever streams. The satellite's turn params send the same.
+REASONING_SUMMARY = "auto"
+
+# How the Responses API refuses a reasoning summary (an organization that is
+# not verified, on an API key): a 400 naming the parameter.
+_SUMMARY_REFUSAL = "verified to generate reasoning summaries"
+_SUMMARY_PARAM = "reasoning.summary"
+
+
+def summary_refused(params) -> bool:
+    """Whether an ``error`` notification or a failed ``turn/completed``
+    reports the API's refusal of the reasoning summary: the turn runs again
+    once without it and the session stops asking (the satellite twin reads
+    the same words)."""
+    if not isinstance(params, dict):
+        return False
+    err = params.get("error")
+    if not isinstance(err, dict):
+        turn = params.get("turn")
+        err = turn.get("error") if isinstance(turn, dict) else None
+    if not isinstance(err, dict):
+        return False
+    text = f"{err.get('message') or ''} {err.get('additionalDetails') or ''}".lower()
+    if _SUMMARY_REFUSAL in text:
+        return True
+    return _SUMMARY_PARAM in text and ("400" in text or err.get("codexErrorInfo") == "badRequest")
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +294,7 @@ def build_auth_json(token: str, *, auth_blob: dict) -> dict:
 
 def will_retry(params) -> bool:
     """Whether Codex retries the error an ``error`` notification reports.
-    The flag sits at the params' top level (0.156.1 to 0.162.1 schema); older builds
+    The flag sits at the params' top level (0.156.1 to 0.163.0 schema); older builds
     nested it in ``error``."""
     if not isinstance(params, dict):
         return False

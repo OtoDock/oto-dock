@@ -170,22 +170,31 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
       for (const id of left) next.set(id, leaveAt)
       return next
     })
+  }, [activePairs])
+  // The clock the rows are judged by: the last sweep's time. A sweep is
+  // armed for the soonest linger still ahead of it, so an entry past its
+  // linger never paints once read.
+  const [sweptAt, setSweptAt] = useState(() => Date.now())
+  useEffect(() => {
+    const ahead = [...finished.values()].filter((at) => at > sweptAt)
+    if (ahead.length === 0) return
     const t = setTimeout(() => {
+      const now = Date.now()
+      setSweptAt(now)
       setFinished((prev) => {
-        const now = Date.now()
         const live = useChatStore.getState().byChat
         const next = new Map(
           [...prev].filter(([id, at]) => at > now || live[id]?.unread),
         )
         return next.size === prev.size ? prev : next
       })
-    }, FINISHED_LINGER_MS + 50)
+    }, Math.max(0, Math.min(...ahead) - Date.now()) + 50)
     return () => clearTimeout(t)
-  }, [activePairs])
+  }, [finished, sweptAt])
 
   return useMemo(() => {
     if (!enabled) return []
-    const now = Date.now()
+    const now = sweptAt
     const rows: ActiveChatRow[] = []
     const shown = new Set<string>()
     // Title fallback: a chat the client already lists (any agent's cached
@@ -231,5 +240,5 @@ export function useActiveChats(enabled = true): ActiveChatRow[] {
       (a, b) => order[a.phase] - order[b.phase] || a.agent.localeCompare(b.agent),
     )
     return rows
-  }, [activePairs, finished, metaById, byChat, enabled, seed.data, queryClient])
+  }, [activePairs, finished, metaById, byChat, enabled, seed.data, queryClient, sweptAt])
 }

@@ -93,6 +93,7 @@ class _FakeMCP:
 @pytest.fixture
 def openai_session(monkeypatch):
     import openai as _openai
+
     from core.layers.direct.session import DirectSession
     from core.layers.providers import openai_adapter as oa
 
@@ -118,7 +119,10 @@ def openai_session(monkeypatch):
     # which fails closed without the session's SecurityContext — a live
     # session always has one; give this fixture its own.
     from auth.path_policy import SecurityContext
-    from core.session.session_state import cleanup_session_permission_state, set_session_security
+    from core.session.session_state import (
+        cleanup_session_permission_state,
+        set_session_security,
+    )
     set_session_security(session.session_id, SecurityContext(
         role="manager", username="alice", agent=AGENT, is_admin_agent=False,
     ))

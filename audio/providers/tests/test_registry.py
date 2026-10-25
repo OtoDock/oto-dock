@@ -1,7 +1,6 @@
 """Registry contract: discovery maps, lazy resolution, stub behavior, from_row routing."""
 
 import pytest
-
 from audio.providers import registry
 
 
@@ -61,7 +60,12 @@ def test_stub_flag_marks_unimplemented_providers():
 
 
 def test_a_retired_model_id_resolves_to_its_chain_end_at_build_time():
-    from audio.providers.model_succession import DEFAULT_MODELS, FORMER_DEFAULTS, MODEL_SUCCESSORS, successor_of
+    from audio.providers.model_succession import (
+        DEFAULT_MODELS,
+        FORMER_DEFAULTS,
+        MODEL_SUCCESSORS,
+        successor_of,
+    )
     assert successor_of({"a": "b", "b": "c"}, "a") == "c"
     assert successor_of({"a": "b", "b": "a"}, "a") in ("a", "b")       # cycle-safe
     assert successor_of({}, "x") == "x" and successor_of({}, "") == ""

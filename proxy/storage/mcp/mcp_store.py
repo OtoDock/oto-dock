@@ -6,6 +6,8 @@ All functions are synchronous (called via asyncio.to_thread from async code).
 import json
 from datetime import datetime, timezone
 
+from cryptography.fernet import InvalidToken
+
 from storage.pg import get_conn
 
 
@@ -329,7 +331,7 @@ def _normalize_instance_row(d: dict) -> dict:
     from storage.identity.credential_store import _decrypt
     try:
         d["field_values"] = json.loads(_decrypt(d.pop("field_values_enc")))
-    except Exception:
+    except (InvalidToken, ValueError, KeyError):
         d["field_values"] = {}
         d.pop("field_values_enc", None)
     try:

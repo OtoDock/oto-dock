@@ -98,6 +98,25 @@ manifest_value() { # manifest_value <KEY>: '' when absent
   sed -nE "s/^$1=(.*)$/\1/p" "$MANIFEST" | head -n1
 }
 
+# upgrade.sh's snapshot holds the database, .env and the compose files, never
+# the trees: trees=none since 1.9.0. One written by 1.8.x says agents=skipped
+# and is told apart from a backup.sh run by its shape (its dump keeps its
+# timestamped name; every backup.sh run records db.sql.gz, host= and sessions=)
+# or by its folder's name.
+UPGRADE_SNAPSHOT=false
+if [ -n "$MANIFEST" ]; then
+  if [ "$(manifest_value trees)" = none ]; then
+    UPGRADE_SNAPSHOT=true
+  elif [ "$(manifest_value agents)" = skipped ]; then
+    _db_name="$(manifest_value db)"
+    if { [[ "$_db_name" == otodock-otodock-*.sql.gz ]] && [ -z "$(manifest_value host)" ] \
+           && [ -z "$(manifest_value sessions)" ]; } \
+        || [[ "$(basename "$SRC")" =~ ^upgrade-[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]]; then
+      UPGRADE_SNAPSHOT=true
+    fi
+  fi
+fi
+
 # The value of the last active KEY= line of an env file (quotes and a trailing
 # comment dropped); fails when there is none.
 env_value() { # env_value <KEY> <file>
@@ -278,6 +297,12 @@ case "$(version_cmp "$BACKUP_VERSION" "$RUNNING_VERSION")" in
   refuse the database at boot (migrations only run forward). Upgrade first (upgrade.sh --to $BACKUP_VERSION)
   and restore then, or pass --allow-newer and start the server with OTODOCK_ALLOW_NEWER_DATABASE=true."
     if [ "$ALLOW_NEWER" = true ]; then warn "WARNING: $msg"; else fail "$msg"; fi ;;
+  -1)
+    if [ "$UPGRADE_SNAPSHOT" = true ]; then
+      warn "this snapshot was taken on OtoDock $BACKUP_VERSION and this install runs $RUNNING_VERSION: its
+  next start migrates the restored database to $RUNNING_VERSION again. To go back to $BACKUP_VERSION, copy
+  .env and the compose files from $SRC into the install folder before you start it."
+    fi ;;
   "?")
     if [ -z "$MANIFEST" ]; then
       warn "a dump alone: its release is not recorded, so the version check is skipped (a run directory carries it)"
@@ -389,6 +414,11 @@ if [ -n "$MANIFEST" ] && [ "$DB_ONLY" = false ]; then
       SESSIONS_DIR="${OTODOCK_SESSIONS_DIR:-${PLATFORM_DATA_DIR:-.}/sessions}"
       [ -d "$AGENTS_DIR" ] || fail "agents directory not found at $AGENTS_DIR (set OTODOCK_AGENTS_DIR)"
     fi
+  elif [ "$UPGRADE_SNAPSHOT" = true ]; then
+    warn "this is the snapshot upgrade.sh takes before it changes anything: it holds the database, .env and
+  the compose files, never the trees. The database is restored and the files on disk stay as they are.
+  restore.sh puts back the database only: to go back to the release the snapshot was taken on, copy .env
+  and the compose files from $SRC into the install folder first."
   elif [ "$(manifest_value agents)" = pruned ]; then
     warn "this run's tree archives were pruned by the retention: the database and nothing else is restored"
   elif [ "$(manifest_value agents)" = skipped ]; then

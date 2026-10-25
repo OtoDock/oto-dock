@@ -12,7 +12,10 @@ import json
 
 import pytest
 
-from auth.path_policy import SecurityContext  # noqa: I001 — path_policy first: path_prompt imports it
+from auth.path_policy import SecurityContext
+
+# isort: split
+# (path_policy loads first: path_prompt imports it)
 from auth import path_prompt
 from core import placement
 from tests._paths import PROXY_DIR

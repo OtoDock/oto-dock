@@ -16,15 +16,16 @@ from pathlib import Path
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
-from storage import database as task_store
-from storage.pg import run_db
+from api.hooks import paths, routing
 from api.sessions.sessions import verify_session_match_async
+from core.events.artifact_events import TOKEN_PERSON
 from core.session.session_state import (
     _sessions,
     get_permission_queue,
     get_session_security,
 )
-from api.hooks import paths, routing
+from storage import database as task_store
+from storage.pg import run_db
 from ws import wire_events as wire
 
 logger = logging.getLogger("otodock")
@@ -118,18 +119,48 @@ def unchanged_since_push(file_id: str, rel_path: str, digest: str) -> bool:
 
 
 def _person_claims(sub: str, tree_rel: str, host_cache: bool, agent: str,
-                   session_person: str = "") -> tuple[str, str]:
+                   session_person: str = "") -> tuple[str, str] | None:
     """``(user_name, permissions)`` of a pushed token minted for a person:
     the name a dashboard mint gives them and the live mint's write decision
-    for their own role on the agent. Store reads: call it on the DB
-    executor."""
+    for their own role on the agent; None when ``sub`` has no users row (a
+    delegated lane's session carries the source agent's slug when no person
+    acts). Store reads: call it on the DB executor."""
     from api.media.wopi import live_permissions
     from auth.providers import acting_role_of
-    user = task_store.get_user(sub) or {}
+    user = task_store.get_user(sub)
+    if not user:
+        return None
     username = task_store.get_username_by_sub(sub) or ""
     name = user.get("name") or user.get("display_name") or username or "User"
     return name, live_permissions(tree_rel, acting_role_of(sub, agent), username, agent,
                                   host_cache=host_cache, session_person=session_person)
+
+
+def _push_person(chat_id: str, queue_session_id: str) -> str:
+    """The one person a push reaches, "" when none: its token is minted for
+    them. A chat's pump turn runs as its ``wake_person``, and the pump's
+    sockets hand the token to that person's connections only
+    (``artifact_events.for_viewer``). A terminal chat has no pump: its
+    session's drainer hands every push to the socket holding the prompt
+    slot, which only the session's sole driver may hold
+    (``InteractiveSession.sole_driver``). Nobody for a task run, a wake, a
+    meeting, a terminal anyone may drive (a task chat), a terminal of
+    another chat or already closing, or a session id both a pump and a
+    terminal read (either may take the push). Loop-only reads, no await: the hook asks again in
+    the step it queues the push."""
+    from core.events.stream_pump import _active_pumps
+    from core.session import interactive_session
+    pump = _active_pumps.get(chat_id) if chat_id else None
+    if pump is not None and (pump.is_done or pump.session_id != queue_session_id):
+        pump = None
+    terminal = interactive_session.get(queue_session_id)
+    if terminal is not None and (not terminal.alive or terminal.closing):
+        terminal = None
+    if pump is not None:
+        return "" if terminal is not None else pump.wake_person or ""
+    if terminal is not None and chat_id and terminal.chat_id == chat_id:
+        return terminal.sole_driver
+    return ""
 
 
 class HookDocumentPreviewRequest(BaseModel):
@@ -145,7 +176,12 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     await verify_session_match_async(authorization, req.session_id)
 
     import config as cfg
-    from api.media.wopi import build_cool_url, encode_file_id, encode_wopi_id, create_wopi_token
+    from api.media.wopi import (
+        build_cool_url,
+        create_wopi_token,
+        encode_file_id,
+        encode_wopi_id,
+    )
 
     if not cfg.COLLABORA_URL:
         # Match the loud-fail behaviour of /v1/documents/wopi-url. Without this,
@@ -171,8 +207,8 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     # Compute relative path from AGENTS_DIR
     try:
         rel_path = str(file_path.resolve().relative_to(cfg.AGENTS_DIR.resolve()))
-    except ValueError:
-        raise HTTPException(status_code=400, detail="File must be within agents directory")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="File must be within agents directory") from exc
 
     file_id = encode_file_id(rel_path)
 
@@ -191,30 +227,16 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
         document_generation = max(generation, noted + 1) if noted else generation
     note_pushed_generation(file_id, document_generation, digest)
 
-    # Role-gate WRITE capability on the pushed Collabora token. The
-    # session's authenticated SecurityContext carries the previewing human's
-    # effective per-agent role + username — the same values the satellite
-    # write-back guard uses. A viewer iterating on a SHARED workspace file gets a
-    # view-only document (can't save); an editor/manager — or ANY role on
-    # their OWN users/{u}/ files — gets edit. Fail-closed to "view" when there's
-    # no security context. A turn that runs as a person (below) mints the
-    # token for that person instead: their name and their own write decision.
     session_meta = _sessions.get(req.session_id, {})
-    user_sub = "agent"
-    user_name = "Agent"
-    from core.remote.file_sync import can_write_back
     sec = get_session_security(req.session_id)
     tree_rel = rel_path.partition("/")[2]  # strip "<agent>/" → agent-tree-relative
-    permissions = "view"
     # Host-cache doc (a Desktop/Downloads file pulled through THIS session's
     # cache): the agent-tree write matrix doesn't apply — the platform copy is
     # a mirror of a file on the session's own machine. Only the session's own
-    # person edits it (the person branch below), PutFile pushing the bytes
-    # back to the real file (wopi.wopi_put_file), where the satellite's own
-    # host write policy is the next gate; a token with no person (a task run,
-    # a wake, a meeting) reaches whoever opens the chat and views it.
-    # Session-scoped: only THIS session's cache root qualifies, so another
-    # session's cached files stay view-only here.
+    # person edits it (_person_claims), PutFile pushing the bytes back to the
+    # real file (wopi.wopi_put_file), where the satellite's own host write
+    # policy is the next gate. Session-scoped: only THIS session's cache root
+    # qualifies, so another session's cached files stay view-only here.
     _is_host_cache = False
     if sec is not None:
         from core.remote import remote_file_flow
@@ -224,67 +246,50 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
             )
         except OSError:
             _is_host_cache = False
-    if sec is not None and not _is_host_cache:
-        from core.remote.file_sync import library_mirror_source
-        _wl = None
-        if library_mirror_source(tree_rel) is not None:
-            from storage.knowledge import db_knowledge_libraries
-            _wl = await run_db(
-                db_knowledge_libraries.writable_pairs_for,
-                getattr(sec, "agent", "") or "")
-        if can_write_back(
-            tree_rel, getattr(sec, "role", "") or "",
-            getattr(sec, "username", "") or "",
-            mount_username=getattr(sec, "mount_username", None),
-            writable_libraries=_wl,
-        ):
-            permissions = "edit"
 
     # The chat the push lands in: its pane's saves refresh this push's
     # version, so the token names it.
     chat_id = await routing.resolve_hook_chat_id(req.session_id) or None
 
-    # The token reaches only the connections of the person the chat's turn
-    # runs as (artifact_events.for_viewer: the pump's ``wake_person``, never
-    # the chat row's owner, which is the agent on a shared chat), so it is
-    # minted for them: a save from their pane reads "by <name>", records
-    # them as the file's author and skips their own dashboards. No person
-    # (a task run, a wake, a meeting) keeps the agent's token.
-    person = ""
+    # The token is minted only for the one person the push reaches
+    # (_push_person, never the chat row's owner, which is the agent on a
+    # shared chat): their name and their own role's write decision, so a
+    # save from their pane reads "by <name>", records them as the file's
+    # author and skips their own dashboards. With no person the push
+    # carries no token and mints none: every viewer's pane mints its own
+    # at its own role (/v1/documents/preview-wopi-url).
     queue_session_id = routing.resolve_hook_route(req.session_id).queue_session_id
-    if chat_id:
-        from core.events.stream_pump import _active_pumps
-        pump = _active_pumps.get(chat_id)
-        if pump is not None and not pump.is_done and pump.session_id == queue_session_id:
-            person = pump.wake_person or ""
+    person = _push_person(chat_id or "", queue_session_id)
+    claims: tuple[str, str] | None = None
     if person:
-        user_name, permissions = await run_db(
+        claims = await run_db(
             _person_claims, person, tree_rel, _is_host_cache, getattr(sec, "agent", "") or "",
             getattr(sec, "username", "") or "",
         )
-        user_sub = person
-
-    # Reuse a WOPI token while it is still valid and opens this push's
-    # document (a token opens one document generation: a push that made a
-    # new one mints, and its entry replaces the old). Keyed by
-    # permission too, so a viewer never receives a
-    # cached edit token — or vice-versa — for the same shared file_id, and by
-    # chat, so a token never carries another chat's claim.
-    cache_key = (file_id, permissions, chat_id or "", user_sub)
-    cached = _wopi_token_cache.get(cache_key)
-    if cached and cached["expires"] > now and cached["generation"] == document_generation:
-        wopi_token, token_ttl = cached["token"], cached["ttl"]
-    else:
-        wopi_token, token_ttl = create_wopi_token(
-            rel_path, user_sub, user_name, permissions, session_meta.get("agent", ""),
-            chat_id=chat_id or "", generation=document_generation,
-        )
-        for key in [k for k, v in _wopi_token_cache.items() if v["expires"] <= now]:
-            del _wopi_token_cache[key]
-        _wopi_token_cache[cache_key] = {
-            "token": wopi_token, "ttl": token_ttl, "generation": document_generation,
-            "expires": now + 12600,  # cache for 3.5 hours (token lasts 4 hours)
-        }
+    wopi_token, token_ttl = "", 0
+    if claims is not None:
+        user_name, permissions = claims
+        # Reuse a WOPI token while it is still valid and opens this push's
+        # document (a token opens one document generation: a push that made
+        # a new one mints, and its entry replaces the old). Keyed by
+        # permission too, so a viewer never receives a cached edit token —
+        # or vice-versa — for the same shared file_id, by chat, so a token
+        # never carries another chat's claim, and by person.
+        cache_key = (file_id, permissions, chat_id or "", person)
+        cached = _wopi_token_cache.get(cache_key)
+        if cached and cached["expires"] > now and cached["generation"] == document_generation:
+            wopi_token, token_ttl = cached["token"], cached["ttl"]
+        else:
+            wopi_token, token_ttl = create_wopi_token(
+                rel_path, person, user_name, permissions, session_meta.get("agent", ""),
+                chat_id=chat_id or "", generation=document_generation,
+            )
+            for key in [k for k, v in _wopi_token_cache.items() if v["expires"] <= now]:
+                del _wopi_token_cache[key]
+            _wopi_token_cache[cache_key] = {
+                "token": wopi_token, "ttl": token_ttl, "generation": document_generation,
+                "expires": now + 12600,  # cache for 3.5 hours (token lasts 4 hours)
+            }
 
     # The host page URL carries no token. Its WOPISrc is keyed by the push's
     # document generation: Collabora opens a fresh document for it (the
@@ -303,7 +308,7 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     if chat_id:
         from services.media import preview_snapshots
         snapshot_id = await asyncio.to_thread(
-            preview_snapshots.create_snapshot, chat_id, file_path,
+            preview_snapshots.create_snapshot, chat_id, file_path,  # type: ignore[arg-type]  # mypy solves to_thread's return from the target's declared str through `or ""` (checker limitation)
         ) or ""
         version = await run_db(preview_snapshots.stamp_and_cap, chat_id, file_id)
 
@@ -326,22 +331,29 @@ async def hook_document_preview(req: HookDocumentPreviewRequest,
     # (baking it in too would duplicate the param).
     download_url = f"/v1/media/{download_token}?download=1"
 
-    # Push to permission queue → stream pump → WS
-    queue = get_permission_queue(queue_session_id)
-    await queue.put({
+    # Push to permission queue → stream pump (or the terminal's drainer) → WS
+    item = {
         "event_type": wire.DOCUMENT_PREVIEW,
         "wopi_url": wopi_url,
-        # Live only: the document pane posts it into its frame; the stored row
-        # drops it (stream_pump._serialize_turn_rows) and a later load mints.
-        "access_token": wopi_token,
-        "access_token_ttl": token_ttl,
         "filename": filename,
         "file_id": file_id,
         "download_url": download_url,
         "snapshot_id": snapshot_id,
         "generation": generation,
         "version": version,
-    })
+    }
+    # The person is read again in the loop step the push is queued: a
+    # takeover while this hook awaited starts closing the terminal, and the
+    # next person's re-warm reuses the session id and reads the queue under
+    # it, so the token rides only while the push still reaches the person it
+    # names. Live only: the document pane posts it into its frame; the
+    # stored row drops it (stream_pump._serialize_turn_rows) and a later
+    # load mints.
+    if wopi_token and _push_person(chat_id or "", queue_session_id) == person:
+        item["access_token"] = wopi_token
+        item["access_token_ttl"] = token_ttl
+        item[TOKEN_PERSON] = person
+    get_permission_queue(queue_session_id).put_nowait(item)
 
-    logger.info(f"Hook document-preview: session={req.session_id}, file={filename}")
+    logger.info("Hook document-preview: session=%s, file=%s", req.session_id, filename)
     return {"status": "ok", "wopi_url": wopi_url, "file_id": file_id}

@@ -1,4 +1,45 @@
 {
+  "1.9.0": {
+    "everyone": [
+      {
+        "icon": "sparkle",
+        "title": "A new look",
+        "text": "A new logo, font and dark theme, with clearer colours and plainer words."
+      },
+      {
+        "icon": "mobile",
+        "title": "The Android app",
+        "text": "Agents send notifications and alarms straight to your phone, and can see where you are when you allow it. It comes to Google Play after this release."
+      },
+      {
+        "icon": "machine",
+        "title": "Choose where a chat runs",
+        "text": "A new remote machines icon on the chat page shows where the chat runs. Tap it to pick or change the place."
+      },
+      {
+        "icon": "shield",
+        "title": "Auto, the default mode",
+        "text": "Auto is now the default permission mode for every chat."
+      }
+    ],
+    "admins": [
+      {
+        "icon": "key",
+        "title": "An admin command line",
+        "text": "Admins can run the otodock-admin.sh script to reset a password, turn off a lost authenticator or print support information."
+      },
+      {
+        "icon": "chat",
+        "title": "Report a reply",
+        "text": "People can flag an agent's reply. You read the reports under Admin, Reports."
+      },
+      {
+        "icon": "document",
+        "title": "GitHub through a GitHub App",
+        "text": "GitHub now signs in through a GitHub App, OtoDock's hosted one by default. An admin can add their own under Admin, MCP Servers."
+      }
+    ]
+  },
   "1.8.1": {
     "everyone": [
       {

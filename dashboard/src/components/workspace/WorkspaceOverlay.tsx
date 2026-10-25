@@ -45,6 +45,10 @@ import { buildSections, listChildren, type ScopeKey, type WorkspaceSection } fro
 import { useFileUpdateBurst } from '../../hooks/useFileUpdateBurst'
 import { buildActions as buildActionsImpl, buildEmptyActions as buildEmptyActionsImpl } from './fileMenuActions'
 import { useWorkspaceKeyboardShortcuts } from './useWorkspaceKeyboardShortcuts'
+import { debugWarn } from '../../lib/debug/log'
+import { useDialogs, type Dialogs } from '../ui/dialogs'
+import { Input } from '../ui/Field'
+import { toastError } from '../../lib/http/apiJson'
 
 /** Per-scope plain-text description rendered above the file area as a
  * dismissable-feeling info banner. Kept short so it fits in one line on
@@ -54,13 +58,13 @@ const SCOPE_INFO: Record<ScopeKey, string> = {
   'my-workspace':
     'Your personal workspace for day-to-day work with this agent. Files here are visible only to you.',
   'my-context':
-    'Your personal context — Markdown / text files here are auto-loaded into every user scoped chat or task you run with this agent.',
+    'Your personal context. Text and Markdown files here load into your own chats and tasks with this agent.',
   'agent-workspace':
-    'The shared collaborative agent workspace where you can share files with other users of this agent. This is the operational working folder for this agent and is used for agent scoped tasks (triggers, schedules, internal-agent runs).',
+    'The shared workspace. Share files here with everyone who uses this agent. The agent also works here on its own tasks, such as triggers and schedules.',
   'agent-knowledge':
-    'The agent’s reference library — docs, templates, and reference material curated by a manager. Not auto-loaded into context — the agent reads files here on demand. Universal (the same files in every session, user-scope or agent-scope).',
+    'The agent’s reference library: docs, templates and other material a manager keeps. The agent reads these files only when it needs them. Every chat and task sees the same files.',
   'agent-config':
-    'The agent’s configuration folder. agent.md (the persona) plus every .md file under context/ is auto-loaded into every session for this agent.',
+    'The agent’s settings folder. The persona in agent.md and every .md file in context/ load into every chat and task.',
 }
 
 type WSState = ReturnType<typeof useWorkspaceState>['state']
@@ -95,6 +99,8 @@ interface ContextMenuPayload {
   /** Null when opened on empty grid background (paste / new-file menu). */
   node: FileNode | null
   point: { clientX: number; clientY: number }
+  /** Built as the menu opens: the clipboard it shows is that moment's. */
+  actions: MenuAction[]
 }
 
 interface PendingDelete {
@@ -117,6 +123,20 @@ const IS_DESKTOP = typeof window === 'undefined' ? true : !window.matchMedia('(h
  * the supplied action callbacks.
  */
 
+/** A new file's or folder's name: one path segment. */
+function validEntryName(value: string): string | null {
+  const name = value.trim()
+  if (!name) return 'Type a name.'
+  if (name.includes('/')) return 'A name cannot contain a slash.'
+  return null
+}
+
+/** What a copy or move left undone: its count as the title, the items under it. */
+function showLeftUndone(dialogs: Dialogs, left: string): Promise<void> {
+  const cut = left.indexOf('\n')
+  return dialogs.alert({ title: left.slice(0, cut).replace(/:$/, '.'), body: left.slice(cut + 1) })
+}
+
 export default function WorkspaceOverlay({
   agent,
   canManage,
@@ -129,6 +149,7 @@ export default function WorkspaceOverlay({
   initialRecover,
   onRecoverConsumed,
 }: Props) {
+  const dialogs = useDialogs()
   // The workspace tier (contributor + editor + manager + admin) writes
   // /workspace/. Default canEdit to canManage when the caller hasn't been
   // updated (preserves the owner-only behavior — workspace gated to manager).
@@ -243,9 +264,14 @@ export default function WorkspaceOverlay({
     setSearchOpen(false)
     setSearchQuery('')
   }, [])
-  useEffect(() => {
-    closeSearch()
-  }, [activeSection?.key, agent, closeSearch])
+  // A section or agent change closes the search, in render.
+  const searchScope = `${agent}|${activeSection?.key ?? ''}`
+  const [searchScopeSeen, setSearchScopeSeen] = useState(searchScope)
+  if (searchScopeSeen !== searchScope) {
+    setSearchScopeSeen(searchScope)
+    setSearchOpen(false)
+    setSearchQuery('')
+  }
   const searchActive = searchOpen && searchQuery.trim().length > 0
   const searchResult = useMemo(
     () => (searchActive && activeSection
@@ -272,24 +298,25 @@ export default function WorkspaceOverlay({
 
   // Transfer-progress popup (Feature E): anchored under the toolbar icon;
   // items are the CURRENT section's active uploads/machine-syncs.
-  const [transferAnchor, setTransferAnchor] = useState<{ left: number; top: number } | null>(null)
+  // The popup is open for one agent and while it has items: the last item
+  // pruning away or an agent change closes it for good (in render), so the
+  // next transfer waits for a click.
+  const [transferPopup, setTransferPopup] = useState<{ agent: string; left: number; top: number } | null>(null)
   const transfers = useTransfersForSection(
     agent, activeSection?.key ?? '', user?.username,
   )
-  // Close the popup when the last item prunes away or the agent changes.
-  useEffect(() => {
-    if (transfers.length === 0) setTransferAnchor(null)
-  }, [transfers.length])
-  useEffect(() => {
-    setTransferAnchor(null)
-  }, [agent])
+  if (transferPopup && (transferPopup.agent !== agent || transfers.length === 0)) setTransferPopup(null)
+  const transferAnchor = transferPopup
   // Deep-link: a `?recover=1` arrival (file-conflict notification) opens the
   // Recover bin straight away. Consume the flag so it doesn't re-fire.
+  const wantRecover = !!initialRecover
+  const [recoverSeen, setRecoverSeen] = useState(false)
+  if (recoverSeen !== wantRecover) {
+    setRecoverSeen(wantRecover)
+    if (wantRecover) setShowRecover(true)
+  }
   useEffect(() => {
-    if (initialRecover) {
-      setShowRecover(true)
-      onRecoverConsumed?.()
-    }
+    if (initialRecover) onRecoverConsumed?.()
   }, [initialRecover, onRecoverConsumed])
   // Hidden file input used by the empty-space context menu's "Upload" item.
   const emptyUploadInputRef = useRef<HTMLInputElement>(null)
@@ -310,23 +337,33 @@ export default function WorkspaceOverlay({
     async (ext: string) => {
       if (!activeSection || !activeSection.canWrite) return
       const dir = state.path || activeSection.pathPrefix
-      const base = window.prompt(`Name for new ${ext.replace('.', '')} file:`)?.trim()
+      const base = (await dialogs.prompt({
+        title: 'New file',
+        label: `Name of the new ${ext.replace('.', '')} file`,
+        confirmLabel: 'Create',
+        validate: validEntryName,
+      }))?.trim()
       if (!base) return
       const filename = base.endsWith(ext) ? base : base + ext
       const path = `${dir}/${filename}`
-      await createFile.mutateAsync({ agent, path, fileType: ext })
+      await createFile.mutateAsync({ agent, path, fileType: ext }).catch(toastError('The file was not created'))
     },
-    [activeSection, state.path, agent, createFile],
+    [activeSection, state.path, agent, createFile, dialogs],
   )
 
   const handleNewFolder = useCallback(async () => {
     if (!activeSection || !activeSection.canWrite) return
     const dir = state.path || activeSection.pathPrefix
-    const name = window.prompt('Folder name:')?.trim()
+    const name = (await dialogs.prompt({
+      title: 'New folder',
+      label: 'Folder name',
+      confirmLabel: 'Create',
+      validate: validEntryName,
+    }))?.trim()
     if (!name) return
     const path = `${dir}/${name}`
-    await createDir.mutateAsync({ agent, path })
-  }, [activeSection, state.path, agent, createDir])
+    await createDir.mutateAsync({ agent, path }).catch(toastError('The folder was not created'))
+  }, [activeSection, state.path, agent, createDir, dialogs])
 
   // One upload batch into the folder on show (./uploadCollected: each
   // top-level folder reserved on the server, one Cancel, one summary).
@@ -451,7 +488,7 @@ export default function WorkspaceOverlay({
       if (nodes.length === 1 && nodes[0].type === 'file') {
         downloadSingleFile(nodes[0])
       } else if (nodes.length > 0) {
-        zipPaths.mutate({ agent, paths: nodes.map((n) => n.path) })
+        zipPaths.mutateAsync({ agent, paths: nodes.map((n) => n.path) }).catch(toastError('The download was not prepared'))
       }
     },
     [downloadSingleFile, zipPaths, agent],
@@ -476,12 +513,12 @@ export default function WorkspaceOverlay({
         // the user never sees a paste fail because of a now-missing source.
         actions.dropFromClipboard(valid)
         const left = batchFailureMessage('moved', res.failed)
-        if (left) alert(left)
+        if (left) void showLeftUndone(dialogs, left)
       } catch (e) {
-        alert(e instanceof Error ? e.message : 'The move failed')
+        toastError('The move failed')(e)
       }
     },
-    [movePaths, agent, actions],
+    [movePaths, agent, actions, dialogs],
   )
 
   /** Paste into `destDir`. Move if clipboard.mode === 'cut' (clipboard then
@@ -503,7 +540,7 @@ export default function WorkspaceOverlay({
         actions.clearSelection()
         // A path the server refused (the copy caps among the reasons) is
         // named, else the paste looks done with nothing landed.
-        if (left) alert(left)
+        if (left) void showLeftUndone(dialogs, left)
       } catch (e) {
         // On a cut-mode failure the sources are almost certainly already
         // moved by a prior drag (the common cause is exactly that: user
@@ -512,10 +549,10 @@ export default function WorkspaceOverlay({
         // keep failing. Copy-mode failures keep the clipboard so the user
         // can retry against a different destination.
         if (mode === 'cut') actions.clearClipboard()
-        alert(e instanceof Error ? e.message : 'The paste failed')
+        toastError('The paste failed')(e)
       }
     },
-    [actions, movePaths, copyPaths, agent],
+    [actions, movePaths, copyPaths, agent, dialogs],
   )
 
   const binCap = useFlag('recover_bin_max_bytes')
@@ -577,8 +614,10 @@ export default function WorkspaceOverlay({
         emptyUploadFolderInputRef,
         onRefresh: handleRefresh,
       }),
-    [activeSection, state.path, actions.clipboard, handleNewFile, handleNewFolder, handlePaste, handleRefresh],
+    [activeSection, state, actions, handleNewFile, handleNewFolder, handlePaste, handleRefresh],
   )
+  const openMenu = (node: FileNode | null, point: ContextMenuPayload['point']) =>
+    setMenu({ node, point, actions: node ? buildActions(node) : buildEmptyActions() })
 
   const confirmDelete = useCallback(async () => {
     if (!pendingDelete) return
@@ -592,10 +631,14 @@ export default function WorkspaceOverlay({
         return deletePath.mutateAsync({ agent, path: n.path, recursive, skipInvalidate: true })
       }),
     )
-    const failed = settled.filter((r) => r.status === 'rejected').length
+    const rejected = settled.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+    const failed = rejected.length
     if (failed > 0) {
-      // eslint-disable-next-line no-console
-      console.warn(`Delete: ${failed} of ${pendingDelete.nodes.length} failed`)
+      const total = pendingDelete.nodes.length
+      debugWarn(`Delete: ${failed} of ${total} failed`)
+      const title = failed === total ? (total === 1 ? 'The item was not deleted' : 'The items were not deleted')
+        : `${failed} of ${total} items ${failed === 1 ? 'was' : 'were'} not deleted`
+      toastError(title)(rejected[0].reason)
     }
     // Once for the whole batch: the listing, open file contents, the bin.
     invalidateAfterDelete(qc, agent)
@@ -671,7 +714,7 @@ export default function WorkspaceOverlay({
   const showSelectionBar = !IS_DESKTOP && state.selectionMode
 
   return (
-    <div className={`h-full flex flex-col bg-p-bg ${topPadding ? 'pt-14' : ''}`}>
+    <div className={`h-full flex flex-col bg-surface-page ${topPadding ? 'pt-14' : ''}`}>
       {showSelectionBar && (
         <SelectionModeBar
           selectedCount={state.selected.length}
@@ -703,7 +746,7 @@ export default function WorkspaceOverlay({
             scopeLabel={activeSection.label}
             onNavigate={(p) => actions.setPath(p)}
           />
-          <div className="border-t border-p-border-light" />
+          <div className="border-t border-subtle" />
           <WorkspaceToolbar
             canWrite={activeSection.canWrite}
             view={state.view}
@@ -718,7 +761,7 @@ export default function WorkspaceOverlay({
             transferCount={transfers.length}
             transferActive={transfers.some((t) => isTransferActive(t))}
             onOpenTransfers={(anchor) =>
-              setTransferAnchor((cur) => (cur ? null : anchor))
+              setTransferPopup(transferAnchor ? null : { agent, ...anchor })
             }
             searchOpen={searchOpen}
             onToggleSearch={() => {
@@ -733,8 +776,9 @@ export default function WorkspaceOverlay({
           />
           {searchOpen && (
             <div className="flex items-center gap-2 px-3 pb-2">
-              <span className="text-p-text-light"><Icon name="search" /></span>
-              <input
+              <span className="text-tertiary"><Icon name="search" /></span>
+              <Input
+                compact
                 ref={searchInputRef}
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
@@ -745,12 +789,12 @@ export default function WorkspaceOverlay({
                   }
                 }}
                 placeholder={`Search ${activeSection.label}…`}
-                className="flex-1 min-w-0 px-2 py-1 text-xs rounded-sm border border-p-border-light bg-white dark:bg-p-surface text-p-text placeholder:text-p-text-light focus:outline-none focus:border-brand/60"
+                className="flex-1"
               />
               {searchQuery && (
                 <button
                   onClick={() => setSearchQuery('')}
-                  className="text-xs text-p-text-light hover:text-p-text"
+                  className="text-xs text-tertiary hover:text-primary"
                   title="Clear"
                 >
                   ✕
@@ -774,7 +818,7 @@ export default function WorkspaceOverlay({
               />
             </div>
           )}
-          <div className="border-t border-p-border-light" />
+          <div className="border-t border-subtle" />
           <div
             ref={fileAreaRef}
             tabIndex={-1}
@@ -788,7 +832,7 @@ export default function WorkspaceOverlay({
               // pr-24 keeps the description text out from under the
               // floating "Done · N" pill (which shows whenever the user
               // is in selection mode).
-              className={`flex items-start gap-1.5 px-3 py-1.5 text-[11px] text-p-text-light border-b border-p-border-light/60 bg-p-bg/60 ${
+              className={`flex items-start gap-1.5 px-3 py-1.5 text-2xs text-tertiary border-b border-subtle bg-surface-page ${
                 state.selectionMode ? 'pr-24' : ''
               }`}
             >
@@ -804,7 +848,7 @@ export default function WorkspaceOverlay({
             {state.selectionMode && (
               <button
                 onClick={() => actions.exitSelectionMode()}
-                className="absolute top-1.5 right-2 z-20 px-2.5 py-1 text-[11px] font-medium rounded-full bg-brand text-white shadow-sm hover:bg-brand-hover transition-colors"
+                className="absolute top-1.5 right-2 z-20 px-2.5 py-1 text-2xs font-medium rounded-full bg-action text-action-fg shadow-elevation-2 hover:bg-action-hover transition-colors"
                 title="Exit selection mode"
               >
                 {state.selected.length > 0 ? `Done · ${state.selected.length}` : 'Done'}
@@ -813,7 +857,7 @@ export default function WorkspaceOverlay({
             {state.view === 'grid' && searchActive && searchResult ? (
               <div className="h-full overflow-auto pb-24 px-2 py-1">
                 {searchResult.matches.length === 0 ? (
-                  <div className="flex items-center justify-center h-24 text-xs text-p-text-light">
+                  <div className="flex items-center justify-center h-24 text-xs text-tertiary">
                     No matches for “{searchQuery.trim()}”
                   </div>
                 ) : (
@@ -833,29 +877,29 @@ export default function WorkspaceOverlay({
                         }}
                         onContextMenu={(e) => {
                           e.preventDefault()
-                          setMenu({ node, point: { clientX: e.clientX, clientY: e.clientY } })
+                          openMenu(node, { clientX: e.clientX, clientY: e.clientY })
                         }}
-                        className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left hover:bg-p-surface-hover min-w-0"
+                        className="w-full flex items-center gap-2 px-2 py-1.5 rounded-control text-left hover:bg-surface-hover min-w-0"
                       >
                         {node.type === 'dir' ? (
-                          <span className="text-p-text-secondary shrink-0"><Icon name="folder" /></span>
+                          <span className="text-secondary shrink-0"><Icon name="folder" /></span>
                         ) : (
-                          <svg className="w-3.5 h-3.5 shrink-0 text-p-text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                          <svg className="w-3.5 h-3.5 shrink-0 text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
                             <path strokeLinecap="round" strokeLinejoin="round" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
                             <path strokeLinecap="round" strokeLinejoin="round" d="M14 2v6h6" />
                           </svg>
                         )}
                         <span className="flex-1 min-w-0">
-                          <span className="block text-xs text-p-text truncate">{node.name}</span>
-                          <span className="block text-[10px] text-p-text-light truncate">
-                            {parentRel || '(section root)'}
+                          <span className="block text-xs text-primary truncate">{node.name}</span>
+                          <span className="block text-3xs text-tertiary truncate">
+                            {parentRel || 'Top of the section'}
                           </span>
                         </span>
                       </button>
                     ))}
                     {searchResult.truncated && (
-                      <div className="px-2 py-2 text-[11px] text-p-text-light">
-                        Showing the first {searchResult.matches.length} matches — refine your search.
+                      <div className="px-2 py-2 text-2xs text-tertiary">
+                        Showing the first {searchResult.matches.length} matches. Refine your search.
                       </div>
                     )}
                   </>
@@ -877,7 +921,7 @@ export default function WorkspaceOverlay({
                 }
                 onOpen={handleOpen}
                 onClearSelection={() => actions.clearSelection()}
-                onContextMenu={(node, point) => setMenu({ node, point })}
+                onContextMenu={openMenu}
                 onLongPress={(node) => actions.enterSelectionMode(node.path)}
                 onDropItems={
                   activeSection.canWrite
@@ -889,7 +933,7 @@ export default function WorkspaceOverlay({
                     ? (dest, srcs) => void handleMoveDrop(dest, srcs)
                     : undefined
                 }
-                onEmptyContextMenu={(point) => setMenu({ node: null, point })}
+                onEmptyContextMenu={(point) => openMenu(null, point)}
                 renderRename={(node) =>
                   renamingPath === node.path ? (
                     <InlineRename
@@ -915,7 +959,7 @@ export default function WorkspaceOverlay({
                   // contextmenu, so anything that bubbles up here is the
                   // empty area below the tree or the gap between rows.
                   e.preventDefault()
-                  setMenu({ node: null, point: { clientX: e.clientX, clientY: e.clientY } })
+                  openMenu(null, { clientX: e.clientX, clientY: e.clientY })
                 }}
               >
                 <FileTree
@@ -949,7 +993,7 @@ export default function WorkspaceOverlay({
                   }
                   onSelectDir={(p) => actions.setPath(p)}
                   onOpenFile={(p) => actions.openPreview(p)}
-                  onContextMenu={(node, point) => setMenu({ node, point })}
+                  onContextMenu={openMenu}
                   onLongPress={(node) => actions.enterSelectionMode(node.path)}
                   onMoveDrop={
                     activeSection.canWrite
@@ -967,7 +1011,7 @@ export default function WorkspaceOverlay({
         <FileContextMenu
           x={menu.point.clientX}
           y={menu.point.clientY}
-          actions={menu.node ? buildActions(menu.node) : buildEmptyActions()}
+          actions={menu.actions}
           onClose={() => setMenu(null)}
         />
       )}
@@ -1014,7 +1058,7 @@ export default function WorkspaceOverlay({
         <TransferPopup
           items={transfers}
           anchor={transferAnchor}
-          onClose={() => setTransferAnchor(null)}
+          onClose={() => setTransferPopup(null)}
         />
       )}
       {previewNode && (

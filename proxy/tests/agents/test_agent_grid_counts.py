@@ -12,16 +12,18 @@ Run: cd proxy && venv/bin/pytest tests/agents/test_agent_grid_counts.py -v
 
 from __future__ import annotations
 
+import json
 import sys
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from storage.agents import agent_store  # noqa: E402
-from storage import database as task_store  # noqa: E402
-from storage.automation import trigger_store  # noqa: E402
+from storage import database as task_store
+from storage.agents import agent_store
+from storage.automation import trigger_store
 
 A = "user-admin"      # seeded by conftest._seed_users
 M = "user-manager"
@@ -110,9 +112,9 @@ class TestUserVisibleCounts:
 # The listing off the loop: one job, a bulk MCP view, one model per engine
 # ---------------------------------------------------------------------------
 
-import asyncio  # noqa: E402
+import asyncio
 
-from auth.providers import UserContext  # noqa: E402
+from auth.providers import UserContext
 
 
 def _manifest(name, *, assignment_mode="auto", category="custom", cap=None):
@@ -159,7 +161,7 @@ class TestListingOffLoop:
         from services.media import audio_service
         self._seed_mcps(monkeypatch, tts_available=True)
         for available in (True, False):
-            monkeypatch.setattr(audio_service, "tts_capability_available", lambda: available)
+            monkeypatch.setattr(audio_service, "tts_capability_available", lambda available=available: available)
             slugs = ["ag1", "ag2", "ag3"]
             bulk = discovery._mcp_names_by_agent(slugs)
             assert bulk == {s: discovery._get_mcp_info(s)[1] for s in slugs}
@@ -185,13 +187,47 @@ class TestListingOffLoop:
             return before, after, everyone, info
 
         before, after, everyone, info = asyncio.run(scenario())
-        assert after == before
+        # The answers are encoded in the job: pre-built JSON bodies.
+        assert after.body == before.body and after.media_type == "application/json"
+        after, everyone, info = (json.loads(r.body) for r in (after, everyone, info))
         assert [a["name"] for a in after["agents"]] == ["ag1", "ag2"]
         by = {a["name"]: a for a in after["agents"]}
         assert by["ag1"]["mcp_names"] == ["auto-a", "cap-d", "expl-b"]
         assert by["ag1"]["mcp_count"] == 3 and by["ag2"]["mcp_count"] == 1
         assert [a["name"] for a in everyone["agents"]] == ["ag1", "ag2", "ag3"]
         assert info["mcps"] == ["auto-a", "cap-d", "expl-b"]
+        assert info["template_update"] is None
+
+    def test_the_bodies_are_what_fastapi_would_have_encoded(self, temp_db, monkeypatch):
+        """``json_body`` writes the bytes ``JSONResponse`` writes for the
+        encoded payload: on the listing's real rows, and on a payload that
+        needs the encoder (a datetime, a Path, a Decimal, an Enum)."""
+        import enum
+        from datetime import datetime, timezone
+        from decimal import Decimal
+        from pathlib import Path
+
+        from fastapi.encoders import jsonable_encoder
+        from fastapi.responses import JSONResponse
+
+        from api.agents import discovery
+        from api.agents._common import json_body
+        self._seed_mcps(monkeypatch, tts_available=True)
+        u = _member("ag1", "ag2")
+        rows = discovery._list_agents_rows(u, False)
+        assert rows and discovery._list_agents_sync(u, False) == JSONResponse(
+            jsonable_encoder({"agents": rows})).body
+
+        class Kind(enum.Enum):
+            A = "a"
+
+        payload = {"when": datetime(2026, 10, 16, 9, 30, tzinfo=timezone.utc),
+                   "where": Path("/x/y"), "cost": Decimal("1.50"), "kind": Kind.A,
+                   "rows": [{"n": None, "ok": True, "k": 3}], "text": "ώρα"}
+        assert json_body(payload) == JSONResponse(jsonable_encoder(payload)).body
+        decoded = json.loads(json_body(payload))
+        assert decoded["when"] == payload["when"].isoformat() and decoded["cost"] == 1.5
+        assert decoded["where"] == "/x/y" and decoded["kind"] == "a"
 
     def test_the_layer_default_model_is_resolved_once_per_engine(self, temp_db, monkeypatch):
         import config
@@ -210,7 +246,7 @@ class TestListingOffLoop:
         monkeypatch.setattr(config, "resolve_layer_default_model", fake_default)
         u = _member("un1", "un2", "pin", "other")
         rows = {a["name"]: a["default_model"]
-                for a in asyncio.run(discovery.list_agents(all=False, user=u))["agents"]}
+                for a in json.loads(asyncio.run(discovery.list_agents(all=False, user=u)).body)["agents"]}
         assert rows == {"un1": "m-default", "un2": "m-default",
                         "pin": "claude-fable-5-1", "other": ""}
         assert sorted(calls) == ["claude-code-cli", "codex-cli"]

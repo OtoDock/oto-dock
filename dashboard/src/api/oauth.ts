@@ -1,5 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { apiJson, withMessage, apiOk } from '../lib/http/apiJson'
+import { eventCatalogKey } from './subscriptions'
 
 /**
  * Generic OAuth provider hooks — work for any provider declared in an
@@ -21,11 +23,9 @@ export const useOAuthAccounts = (provider: string, mcpName: string) =>
   useQuery({
     queryKey: ['oauth-accounts', provider, mcpName],
     queryFn: async (): Promise<OAuthAccountsResponse> => {
-      const res = await apiFetch(
+      return apiJson<OAuthAccountsResponse>(
         `/v1/oauth/${provider}/accounts?mcp_name=${encodeURIComponent(mcpName)}`,
-      )
-      if (!res.ok) throw new Error('Failed to load OAuth accounts')
-      return res.json()
+      ).catch(withMessage('Failed to load OAuth accounts'))
     },
     enabled: !!provider && !!mcpName,
   })
@@ -37,6 +37,9 @@ export interface OAuthStartParams {
   accountLabel?: string
   isService?: boolean
   mobile?: boolean
+  /** The kind of app the person picked (`oauth_meta.connect_kinds`); empty
+   * takes the kind in use. */
+  appKind?: string
 }
 
 /**
@@ -55,20 +58,16 @@ export async function exchangeOAuthCode(provider: string, link: string): Promise
   const code = params.get('code')
   const state = params.get('state')
   if (!code || !state) return
-  const res = await apiFetch(`/v1/oauth/${provider}/exchange`, {
+  await apiOk(`/v1/oauth/${provider}/exchange`, {
     method: 'POST',
     body: JSON.stringify({ code, state, iss: params.get('iss') || '' }),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error(err.detail || 'Failed to complete the connect')
-  }
+  }, 'Failed to complete the connect')
 }
 
 export const useStartOAuth = () => {
   return useMutation({
     mutationFn: async (params: OAuthStartParams): Promise<{ url: string }> => {
-      const res = await apiFetch(`/v1/oauth/${params.provider}/start`, {
+      return apiJson<{ url: string }>(`/v1/oauth/${params.provider}/start`, {
         method: 'POST',
         body: JSON.stringify({
           mcp_name: params.mcpName,
@@ -76,13 +75,9 @@ export const useStartOAuth = () => {
           account_label: params.accountLabel || '',
           is_service: params.isService || false,
           mobile: params.mobile || false,
+          app_kind: params.appKind || '',
         }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to start OAuth')
-      }
-      return res.json()
+      }, 'Failed to start OAuth')
     },
   })
 }
@@ -109,23 +104,15 @@ export const useStartDeviceCode = () => {
       accountLabel?: string
       isService?: boolean
     }): Promise<DeviceCodeStartResult> => {
-      const res = await apiFetch(
-        `/v1/oauth/${params.provider}/device-code/start`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            mcp_name: params.mcpName,
-            services: params.services,
-            account_label: params.accountLabel || '',
-            is_service: params.isService || false,
-          }),
-        },
-      )
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to start device-code flow')
-      }
-      return res.json()
+      return apiJson<DeviceCodeStartResult>(`/v1/oauth/${params.provider}/device-code/start`, {
+        method: 'POST',
+        body: JSON.stringify({
+          mcp_name: params.mcpName,
+          services: params.services,
+          account_label: params.accountLabel || '',
+          is_service: params.isService || false,
+        }),
+      }, 'Failed to start device-code flow')
     },
   })
 }
@@ -187,7 +174,7 @@ export const usePatSave = () => {
       accountLabel?: string
       isService?: boolean
     }): Promise<{ status: string; email: string; account_label: string }> => {
-      const res = await apiFetch(`/v1/oauth/${params.provider}/pat/save`, {
+      return apiJson<{ status: string; email: string; account_label: string }>(`/v1/oauth/${params.provider}/pat/save`, {
         method: 'POST',
         body: JSON.stringify({
           mcp_name: params.mcpName,
@@ -196,12 +183,7 @@ export const usePatSave = () => {
           account_label: params.accountLabel || '',
           is_service: params.isService || false,
         }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to save token')
-      }
-      return res.json()
+      }, 'Failed to save token')
     },
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({
@@ -225,25 +207,68 @@ export const useDisconnectOAuth = () => {
       accountLabel: string
       isService?: boolean
     }) => {
-      const res = await apiFetch(`/v1/oauth/${provider}/disconnect`, {
+      return apiJson(`/v1/oauth/${provider}/disconnect`, {
         method: 'POST',
         body: JSON.stringify({
           mcp_name: mcpName,
           account_label: accountLabel,
           is_service: isService,
         }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to disconnect')
-      }
-      return res.json()
+      }, 'Failed to disconnect')
     },
     onSuccess: (_data, vars) => {
       // Invalidate the right query depending on which scope we touched.
       qc.invalidateQueries({
         queryKey: [vars.isService ? 'admin-integrations' : 'my-integrations'],
       })
+    },
+  })
+}
+
+// ───────────────────────────────────────────────────────────────────
+// GitHub App installations
+// ───────────────────────────────────────────────────────────────────
+
+/** GitHub's page to install the app for one of the caller's GitHub-App
+ * accounts; the page returns to OtoDock, which re-lists the installations. */
+export const useAppInstallUrl = () => {
+  return useMutation({
+    mutationFn: async (params: {
+      provider: string
+      mcpName: string
+      accountLabel: string
+      mobile?: boolean
+    }): Promise<{ url: string }> => {
+      return apiJson<{ url: string }>(`/v1/oauth/${params.provider}/app/install-url`, {
+        method: 'POST',
+        body: JSON.stringify({
+          mcp_name: params.mcpName,
+          account_label: params.accountLabel,
+          mobile: params.mobile || false,
+        }),
+      }, 'Failed to open the install page')
+    },
+  })
+}
+
+/** Re-list the installations of one of the caller's GitHub-App accounts. */
+export const useRefreshInstallations = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (params: {
+      provider: string
+      mcpName: string
+      accountLabel: string
+    }): Promise<{ status: string; installations: unknown[] }> => {
+      return apiJson<{ status: string; installations: unknown[] }>(
+        `/v1/oauth/${params.provider}/app/installations/refresh`, {
+          method: 'POST',
+          body: JSON.stringify({ mcp_name: params.mcpName, account_label: params.accountLabel }),
+        }, 'Failed to refresh the installations')
+    },
+    onSuccess: (_data, params) => {
+      qc.invalidateQueries({ queryKey: ['my-integrations'] })
+      qc.invalidateQueries({ queryKey: eventCatalogKey(params.mcpName) })
     },
   })
 }
@@ -273,21 +298,13 @@ export const useStartAdminConsent = () => {
       mcpName: string
       mobile?: boolean
     }): Promise<{ url: string }> => {
-      const res = await apiFetch(
-        '/v1/oauth/microsoft/admin-consent/start',
-        {
+      return apiJson<{ url: string }>('/v1/oauth/microsoft/admin-consent/start', {
           method: 'POST',
           body: JSON.stringify({
             mcp_name: params.mcpName,
             mobile: params.mobile || false,
           }),
-        },
-      )
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to start admin-consent flow')
-      }
-      return res.json()
+        }, 'Failed to start admin-consent flow')
     },
   })
 }
@@ -308,9 +325,8 @@ export const useBearerAllowlist = () =>
   useQuery({
     queryKey: ['oauth-bearer-allowlist'],
     queryFn: async (): Promise<BearerAllowlistEntry[]> => {
-      const res = await apiFetch('/v1/admin/oauth-bearer-allowlist')
-      if (!res.ok) throw new Error('Failed to load allowlist')
-      const data = await res.json()
+      const data = await apiJson<{ entries?: BearerAllowlistEntry[] }>('/v1/admin/oauth-bearer-allowlist')
+        .catch(withMessage('Failed to load allowlist'))
       return data.entries || []
     },
   })
@@ -325,18 +341,13 @@ export const useAddBearerAllowlist = () => {
       providerId: string
       hostPattern: string
     }) => {
-      const res = await apiFetch('/v1/admin/oauth-bearer-allowlist', {
+      return apiJson('/v1/admin/oauth-bearer-allowlist', {
         method: 'POST',
         body: JSON.stringify({
           provider_id: providerId,
           host_pattern: hostPattern,
         }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to add')
-      }
-      return res.json()
+      }, 'Failed to add')
     },
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ['oauth-bearer-allowlist'] }),
@@ -347,12 +358,10 @@ export const useRemoveBearerAllowlist = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (rowId: number) => {
-      const res = await apiFetch(
+      return apiJson(
         `/v1/admin/oauth-bearer-allowlist/${rowId}`,
         { method: 'DELETE' },
-      )
-      if (!res.ok) throw new Error('Failed to remove')
-      return res.json()
+      ).catch(withMessage('Failed to remove'))
     },
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ['oauth-bearer-allowlist'] }),
@@ -363,12 +372,10 @@ export const useRestoreBearerAllowlist = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async () => {
-      const res = await apiFetch(
+      return apiJson(
         '/v1/admin/oauth-bearer-allowlist/restore-defaults',
         { method: 'POST' },
-      )
-      if (!res.ok) throw new Error('Failed to restore defaults')
-      return res.json()
+      ).catch(withMessage('Failed to restore defaults'))
     },
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ['oauth-bearer-allowlist'] }),
@@ -409,9 +416,8 @@ export const useClientRegistrations = (enabled = true) =>
     queryKey: ['oauth-client-registrations'],
     enabled,
     queryFn: async (): Promise<ClientRegistration[]> => {
-      const res = await apiFetch('/v1/admin/oauth-client-registrations')
-      if (!res.ok) throw new Error('Failed to load registrations')
-      const data = await res.json()
+      const data = await apiJson<{ registrations?: ClientRegistration[] }>('/v1/admin/oauth-client-registrations')
+        .catch(withMessage('Failed to load registrations'))
       return data.registrations || []
     },
   })
@@ -420,15 +426,7 @@ export const useForgetClientRegistration = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (rowId: number) => {
-      const res = await apiFetch(
-        `/v1/admin/oauth-client-registrations/${rowId}/forget`,
-        { method: 'POST' },
-      )
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Failed to forget the registration')
-      }
-      return res.json()
+      return apiJson(`/v1/admin/oauth-client-registrations/${rowId}/forget`, { method: 'POST' }, 'Failed to forget the registration')
     },
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ['oauth-client-registrations'] }),

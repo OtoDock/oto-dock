@@ -38,22 +38,22 @@ import logging
 import re
 import time
 from collections import OrderedDict
+from typing import NoReturn, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
-from api.events import webhook_body
 
-from storage.automation import trigger_store
+from api.events import webhook_body
+from auth import roles
+from auth.providers import UserContext, get_current_user, require_auth
+from core.session import visibility as _vis
+from core.session.visibility import nouser_read_targets
+from services.infra import api_key_manager
+from services.scheduler import trigger_manager
 from storage import database as task_store
-from storage.automation import notification_store
+from storage.automation import notification_store, trigger_store
 from storage.identity import api_key_store
 from storage.pg import run_db
-from services.scheduler import trigger_manager
-from services.infra import api_key_manager
-from auth.providers import UserContext, get_current_user, require_auth
-from core.session.visibility import nouser_read_targets
-from auth import roles
-from core.session import visibility as _vis
 
 logger = logging.getLogger("otodock.triggers")
 router = APIRouter()
@@ -73,7 +73,7 @@ def _webhook_throttle(key: str, bucket: str = "webhook") -> None:
         )
 
 
-def _webhook_auth_failed(request: Request) -> None:
+def _webhook_auth_failed(request: Request) -> NoReturn:
     """Record + throttle a failed webhook auth by source address (strict
     bucket, keyed by ``auth_bucket_key``), then raise 403 (or 429 once the
     address trips the limit) — so a leaked-URL brute force is rate-limited
@@ -103,6 +103,7 @@ class _VerifyGate:
     (the test suite runs several loops)."""
 
     def __init__(self) -> None:
+        # Bound to the running loop by current(); its readers cast.
         self.loop: asyncio.AbstractEventLoop | None = None
         self.sem: asyncio.Semaphore | None = None
         self.waiting = 0
@@ -145,12 +146,13 @@ def _cached_key_row(kind: str, owner: str, key_id: str, key_hash: str) -> dict |
     one of the users the username segment names. Runs on the DB executor."""
     if kind == _vis.SCOPE_AGENT:
         row = api_key_store.get_agent_api_key(key_id)
-        owner_ok = bool(row) and row.get("agent") == owner
+        owner_ok = bool(row) and cast("dict", row).get("agent") == owner
     else:
         row = api_key_store.get_user_api_key(key_id)
-        owner_ok = bool(row) and row.get("user_sub") in notification_store.resolve_username_candidates(owner)
-    if (not owner_ok or row.get("revoked_at") or row.get("key_hash") != key_hash
-            or not api_key_store.has_permission(row, "triggers")):
+        owner_ok = bool(row) and cast("dict", row).get("user_sub") in notification_store.resolve_username_candidates(owner)
+    # owner_ok is True only for a found row
+    if (not owner_ok or cast("dict", row).get("revoked_at") or cast("dict", row).get("key_hash") != key_hash
+            or not api_key_store.has_permission(cast("dict", row), "triggers")):
         return None
     if kind == _vis.SCOPE_AGENT:
         api_key_store.update_agent_key_last_used(key_id)
@@ -175,7 +177,7 @@ async def _verify_fire_key(request: Request, kind: str, owner: str, slug: str) -
     auth = request.headers.get("authorization") or ""
     prefix = _fire_key_prefix(auth)
     if prefix is None:
-        logger.info(f"Webhook auth failed {kind}={owner} slug={slug} code=format")
+        logger.info("Webhook auth failed %s=%s slug=%s code=format", kind, owner, slug)
         _webhook_auth_failed(request)
 
     digest = hashlib.sha256(auth.split(" ", 1)[1].strip().encode()).hexdigest()
@@ -199,7 +201,7 @@ async def _verify_fire_key(request: Request, kind: str, owner: str, slug: str) -
     ok, retry_after = rate_limiter.check_rate_limit("webhook_prefix", prefix)
     if not ok:
         raise HTTPException(429, "Too many requests", headers={"Retry-After": str(retry_after)})
-    if gate.sem.locked() and gate.waiting >= config.WEBHOOK_KEY_VERIFY_MAX_WAITERS:
+    if cast("asyncio.Semaphore", gate.sem).locked() and gate.waiting >= config.WEBHOOK_KEY_VERIFY_MAX_WAITERS:
         raise HTTPException(503, "Busy", headers={"Retry-After": "5", "Connection": "close"})
 
     future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -208,7 +210,7 @@ async def _verify_fire_key(request: Request, kind: str, owner: str, slug: str) -
     try:
         gate.waiting += 1
         try:
-            await gate.sem.acquire()
+            await cast("asyncio.Semaphore", gate.sem).acquire()
         finally:
             gate.waiting -= 1
         try:
@@ -223,11 +225,11 @@ async def _verify_fire_key(request: Request, kind: str, owner: str, slug: str) -
         except api_key_manager.KeyMismatch as e:
             # All failures → 403 (don't distinguish auth-format from missing-key
             # to attackers). Log the code for ops debugging; throttle the source address.
-            logger.info(f"Webhook auth failed {kind}={owner} slug={slug} code={e.code}")
+            logger.info("Webhook auth failed %s=%s slug=%s code=%s", kind, owner, slug, e.code)
             if e.code == "unknown":
                 rate_limiter.record_attempt("webhook_prefix", prefix)
         finally:
-            gate.sem.release()
+            cast("asyncio.Semaphore", gate.sem).release()
     finally:
         gate.inflight.pop(cache_key, None)
         if not future.done():
@@ -632,13 +634,13 @@ async def create_trigger_endpoint(
             caller_is_admin=bool(u.is_admin or u.is_service),
         )
     except trigger_manager.TriggerConflict as e:
-        raise HTTPException(409, str(e))
+        raise HTTPException(409, str(e)) from e
     except trigger_manager.TriggerValidationError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     except Exception as e:
         # Likely UniqueViolation on (scope, owner, slug). Surface as 400.
         if "unique" in str(e).lower() or "duplicate" in str(e).lower():
-            raise HTTPException(400, "Trigger slug already exists in this scope")
+            raise HTTPException(400, "Trigger slug already exists in this scope") from e
         raise
     response = {"status": "created",
                 "trigger": _decorate_for_user(row, u, await run_db(_decoration_maps, [row]))}
@@ -760,7 +762,7 @@ async def _edit_impl(
         ok, err = trigger_manager.update_trigger(
             trigger_id, fields, caller_is_admin=bool(user.is_admin or user.is_service))
     except trigger_manager.TriggerConflict as e:
-        raise HTTPException(409, str(e))
+        raise HTTPException(409, str(e)) from e
     if err:
         raise HTTPException(409 if "approve" in err else 400, err)
     if not ok:
@@ -945,7 +947,7 @@ def _linked_tasks_for(rows: list[dict]) -> dict[str, dict]:
     from services.scheduler import scheduler
     out: dict[str, dict] = {}
     resolve = _make_model_resolver()
-    for task_id in {r.get("task_id") for r in rows if r.get("task_id")}:
+    for task_id in cast("set[str]", {r.get("task_id") for r in rows if r.get("task_id")}):
         task = task_store.get_dynamic_task(task_id)
         if not task:
             out[task_id] = dict(_LINKED_TASK_EMPTY)

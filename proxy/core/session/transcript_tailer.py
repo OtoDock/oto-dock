@@ -51,13 +51,21 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 from core.session.history_seed import strip_seed_prefix
-from core.session.session_state import get_subagent_registry
+from core.session.session_state import SubagentRegistry, get_subagent_registry
 from core.session.transcript_tool_events import (
-    TailLocks, ToolEventBuffer, attach_result, consume_sent_prompt,
-    extract_result_text, persist_event, record_batch_usage, truncate_result,
+    TailLocks,
+    ToolEventBuffer,
+    attach_result,
+    consume_sent_prompt,
+    extract_result_text,
+    persist_event,
+    record_batch_usage,
+    truncate_result,
 )
 from ws import wire_events as wire
 
@@ -144,7 +152,7 @@ def seek_past_existing(session_id: str, chat_id: str = "") -> int:
     n = 0
     if path and os.path.isfile(path):
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            with open(path, encoding="utf-8", errors="replace") as fh:
                 n = sum(1 for _ in fh)
         except Exception:
             logger.exception("seek_past_existing failed for %s", session_id[:8])
@@ -207,7 +215,8 @@ def resolve_and_tail(session_id: str, chat_id: str) -> dict:
 # a line break or, on a single-lined satellite prompt, in spaces.
 _TIME_PRELUDE_RE = re.compile(
     r"^\[(?:(?:Current time: |The user is looking at the app )[^\]\n]{1,200}"
-    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\.)\]"
+    r"|Parallel activity — [^\n]{0,2000}?\(peek_session / get_task_result\)\."
+    r'|Meeting "[^\n]{0,4000}? you have only this note\.)\]'
     r"(?:[ \t]*(?:\r?\n+|$)|[ \t]+)"
 )
 
@@ -369,7 +378,8 @@ def _on_tool_use(buf: ToolEventBuffer, reg, task_store, chat_id: str,
     ``tool_result`` on answer / approve / reject unparks."""
     name = block.get("name", "")
     tuid = block.get("id", "")
-    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+    block_input = block.get("input")
+    tool_input = block_input if isinstance(block_input, dict) else {}
 
     if name == "mcp__delegation-mcp__delegate":
         if tuid:
@@ -444,7 +454,7 @@ def tail_transcript(session_id: str, chat_id: str, transcript_path: str) -> dict
         processed = start
         new_lines: list[str] = []
         try:
-            with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            with open(transcript_path, encoding="utf-8", errors="replace") as fh:
                 for idx, raw in enumerate(fh):
                     if idx < start:
                         continue
@@ -476,6 +486,64 @@ def tail_lines(session_id: str, chat_id: str, lines: list[str]) -> dict:
     return _process_lines(session_id, chat_id, lines)
 
 
+@dataclass
+class _LineBatch:
+    """One batch of transcript lines: what the parse loop reads and the
+    counters it fills, handed to the per-line-kind functions and to the
+    batch's end. The context first (the session, the chat, the registry
+    the spawns drive, the buffer the pairing waits in, the store)."""
+    session_id: str
+    chat_id: str
+    reg: SubagentRegistry
+    buf: ToolEventBuffer
+    task_store: Any
+    persisted: int = 0
+    message_rows: int = 0
+    # Early-title counters (interactive_session accumulates them across
+    # batches and fires the LLM title upgrade mid-turn at char/tool
+    # thresholds — the interactive twin of the pump's early triggers).
+    # Incremented ONLY at actual persist sites, after every resume/replay/
+    # dedup guard, so pre-existing history never counts.
+    assistant_chars: int = 0
+    tool_rows: int = 0  # persisted "tool"/"task_spawn" event rows (result-paired)
+    first_user_text: str | None = None  # for the chat-title backfill (below)
+    # Turn-end signal for the interactive completion watcher: an assistant
+    # message with stop_reason=="end_turn" is the turn
+    # boundary (vs "tool_use" = more tools coming). Track the LAST assistant
+    # message seen this batch; interactive_session gates the actual completion on
+    # bg-registry-empty + min-turn-time + fire-once, so this is just the signal.
+    last_stop_reason: str | None = None
+    last_assistant_text: str = ""
+    # The LAST turn-relevant record in the batch — a batch can straddle a turn
+    # boundary (e.g. [assistant end_turn, user new-prompt] within one debounce
+    # window), where ``turn_complete`` alone would read "idle" while a new turn
+    # is actually opening. Consumers deriving turn-open state must use THIS,
+    # not ``turn_complete``. Values: "user" (a prompt opened a turn),
+    # "tool_use" (mid-turn), "end_turn" (turn closed), None (nothing
+    # turn-relevant in the batch — tool_result-only lines don't count).
+    last_signal: str | None = None
+    # The journal time of the line that set ``last_signal`` (the CLI host's
+    # clock): a terminal parked on a dialog ignores a reopen from before it.
+    last_signal_at: float | None = None
+    # AskUserQuestion / ExitPlanMode ids asked this batch and not yet
+    # answered. The harness BLOCKS the turn on the dialog (no further
+    # assistant lines until the tool_result), so an id still open at batch
+    # end means the CLI is parked on the question cards or the plan
+    # approval — the batch folds to a turn close below, the interactive twin
+    # of headless's turn ending after the question / plan-review card.
+    open_questions: set[str] = field(default_factory=set)
+    # compact_boundary seen this batch (see the system-line handler below).
+    # compact_trigger carries compactMetadata.trigger ("manual" | "auto") so
+    # interactive_session can close a stale-open turn on a MANUAL /compact —
+    # manual compaction only completes with the CLI idle at the prompt.
+    compacted: bool = False
+    compact_trigger: str = ""
+    # Provider usage newly consumed this batch, keyed by model (a session can
+    # switch models mid-life via /model). Flushed once at batch end — see
+    # transcript_tool_events.record_batch_usage.
+    usage_by_model: dict[str, dict[str, int]] = field(default_factory=dict)
+
+
 def _process_lines(session_id: str, chat_id: str, lines, *,
                    min_line_ts: float | None = None) -> dict:
     """Parse transcript JSONL lines → persist user/assistant text to
@@ -496,51 +564,8 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
     reg = get_subagent_registry(session_id)
     buf = _tool_events.setdefault(session_id, ToolEventBuffer())
 
-    persisted = 0
-    message_rows = 0
-    # Early-title counters (interactive_session accumulates them across
-    # batches and fires the LLM title upgrade mid-turn at char/tool
-    # thresholds — the interactive twin of the pump's early triggers).
-    # Incremented ONLY at actual persist sites, after every resume/replay/
-    # dedup guard, so pre-existing history never counts.
-    assistant_chars = 0
-    tool_rows = 0  # persisted "tool"/"task_spawn" event rows (result-paired)
-    first_user_text: str | None = None  # for the chat-title backfill (below)
-    # Turn-end signal for the interactive completion watcher: an assistant
-    # message with stop_reason=="end_turn" is the turn
-    # boundary (vs "tool_use" = more tools coming). Track the LAST assistant
-    # message seen this batch; interactive_session gates the actual completion on
-    # bg-registry-empty + min-turn-time + fire-once, so this is just the signal.
-    last_stop_reason: str | None = None
-    last_assistant_text = ""
-    # The LAST turn-relevant record in the batch — a batch can straddle a turn
-    # boundary (e.g. [assistant end_turn, user new-prompt] within one debounce
-    # window), where ``turn_complete`` alone would read "idle" while a new turn
-    # is actually opening. Consumers deriving turn-open state must use THIS,
-    # not ``turn_complete``. Values: "user" (a prompt opened a turn),
-    # "tool_use" (mid-turn), "end_turn" (turn closed), None (nothing
-    # turn-relevant in the batch — tool_result-only lines don't count).
-    last_signal: str | None = None
-    # The journal time of the line that set ``last_signal`` (the CLI host's
-    # clock): a terminal parked on a dialog ignores a reopen from before it.
-    last_signal_at: float | None = None
-    # AskUserQuestion / ExitPlanMode ids asked this batch and not yet
-    # answered. The harness BLOCKS the turn on the dialog (no further
-    # assistant lines until the tool_result), so an id still open at batch
-    # end means the CLI is parked on the question cards or the plan
-    # approval — the batch folds to a turn close below, the interactive twin
-    # of headless's turn ending after the question / plan-review card.
-    open_questions: set[str] = set()
-    # compact_boundary seen this batch (see the system-line handler below).
-    # compact_trigger carries compactMetadata.trigger ("manual" | "auto") so
-    # interactive_session can close a stale-open turn on a MANUAL /compact —
-    # manual compaction only completes with the CLI idle at the prompt.
-    compacted = False
-    compact_trigger = ""
-    # Provider usage newly consumed this batch, keyed by model (a session can
-    # switch models mid-life via /model). Flushed once at batch end — see
-    # transcript_tool_events.record_batch_usage.
-    usage_by_model: dict[str, dict[str, int]] = {}
+    b = _LineBatch(session_id=session_id, chat_id=chat_id, reg=reg, buf=buf,
+                   task_store=task_store)
     for raw in lines:
         raw = (raw or "").strip()
         if not raw:
@@ -564,28 +589,7 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
             # (the "still working forever after /compact" symptom).
             continue
         if kind == "system" and obj.get("subtype") == "compact_boundary":
-            # Compaction finished. Surface it in the rich history and flag the
-            # batch so interactive_session can run turn-end effects when the
-            # session is idle (manual /compact) — an auto-compact mid-turn
-            # keeps its open turn and the real end_turn closes it normally.
-            meta = obj.get("compactMetadata") or {}
-            trigger = meta.get("trigger") or ""
-            pre = meta.get("preTokens")
-            post = meta.get("postTokens")
-            detail = ""
-            if isinstance(pre, int) and isinstance(post, int) and pre > post:
-                detail = f" ({pre - post:,} tokens freed)"
-            # Same subtype the live headless compact path appends — SystemEvent
-            # renders the amber "Context compressed" separator for both.
-            persist_event(task_store, chat_id, {
-                "type": wire.SYSTEM,
-                "subtype": wire.SUBTYPE_CONTEXT_COMPRESSED,
-                "message": f"Conversation compacted{detail}",
-                "trigger": trigger,
-            })
-            persisted += 1
-            compacted = True
-            compact_trigger = trigger
+            _compact_boundary_line(b, obj)
             continue
         if min_line_ts is not None:
             # Resume-replay guard (see docstring): a line stamped before the
@@ -614,175 +618,245 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
                     "tailer limit-detection failed for %s", session_id[:8])
 
         if kind == "user":
-            results = _tool_result_blocks(content)
-            if results:
-                # Tool outputs, not user input — drive the registry and pair
-                # each result with its pending block (persisted here, at the
-                # result's transcript position).
-                for rb in results:
-                    tuid = rb.get("tool_use_id", "")
-                    if not tuid:
-                        continue
-                    open_questions.discard(tuid)  # question answered in-batch
-                    reg.mark_done(tuid, buffer=False)
-                    blk = buf.close(tuid)
-                    if blk is None:
-                        continue  # pre-buffer call or deliberately skipped
-                    text = extract_result_text(rb.get("content"))
-                    if blk["type"] == "task_spawn":
-                        # A denied spawn (permission-rejected — the result is
-                        # the error) never started; headless persists no row
-                        # for it (task_started never fires), so neither do we.
-                        if rb.get("is_error"):
-                            continue
-                        # fg subagent report — bg results are just the
-                        # "launched" ack, which the pump skips too.
-                        if not blk.get("run_in_background") and text:
-                            blk["tool_result"] = truncate_result(text)
-                    else:
-                        attach_result(blk, text,
-                                      is_error=bool(rb.get("is_error")))
-                        # The Claude terminal's ONE post_tool source is this
-                        # tailer (the forwarder stands down under
-                        # OTO_INTERACTIVE) — session_events / HOOKS.md.
-                        from core.session import session_events
-                        session_events.post_tool(
-                            session_id, blk.get("name") or "", tool_use_id=tuid,
-                            tool_input=blk.get("tool_input") or {},
-                            is_error=bool(rb.get("is_error")), source="tailer",
-                        )
-                    persist_event(task_store, chat_id, blk)
-                    persisted += 1
-                    tool_rows += 1  # blocks in the buffer are tool/task_spawn
-                continue
-            if obj.get("isMeta"):
-                continue  # local-command caveat / CLI meta — never user text
-            # Drop any restored-history digest the reseed prepended to the
-            # cold prompt — only the real prompt belongs in chat_messages.
-            text = strip_seed_prefix(_extract_text(content))
-            if _is_harness_injected_user_line(obj, text):
-                continue  # bg task-notification — harness, not the user
-            if text.strip().startswith("[Request interrupted by user"):
-                # ESC / dashboard Stop landed mid-turn: the CLI writes this
-                # marker instead of a result event ("… by user]" text-phase,
-                # "… by user for tool use]" tool-phase; content is a plain
-                # string or one text block depending on entrypoint). It is
-                # turn STATE, not a prompt — close the turn and keep the
-                # marker out of chat history. Pending fg spawns died with
-                # the turn (mirror the new-prompt un-pend below).
-                for tuid, blk in list(buf.pending.items()):
-                    if (blk.get("type") == "task_spawn"
-                            and not blk.get("run_in_background")):
-                        buf.pending.pop(tuid, None)
-                        reg.mark_done(tuid, buffer=False)
-                last_signal = "end_turn"
-                last_signal_at = line_time(obj)
-                continue
-            if text.strip():
-                cleaned = _strip_command_noise(text)
-                if cleaned is None:
-                    continue  # slash-command record — local output, not a prompt
-                # Claimed by line uuid like assistant text: the CLI inserts
-                # its file-history-snapshot line BEFORE the prompt it just
-                # appended, so a byte-offset tail (the satellite's, polling
-                # every 0.8 s) can read the shifted prompt line a second
-                # time and the row landed twice (T1, 2026-09-21).
-                luid = obj.get("uuid")
-                if luid and not buf.claim(f"user:{luid}"):
-                    continue
-                # A fg subagent can't span a user turn — a new REAL prompt
-                # means any still-pending fg spawn was interrupted without a
-                # result line. Un-pend it (drop the block, complete the
-                # registry entry) so the bg_pending gates can't wedge the
-                # session; the pump doesn't persist aborted spawns either.
-                for tuid, blk in list(buf.pending.items()):
-                    if (blk.get("type") == "task_spawn"
-                            and not blk.get("run_in_background")):
-                        buf.pending.pop(tuid, None)
-                        reg.mark_done(tuid, buffer=False)
-                last_signal = "user"
-                last_signal_at = line_time(obj)
-                if first_user_text is None:
-                    first_user_text = cleaned
-                if consume_sent_prompt(chat_id, cleaned):
-                    # The dashboard warmup already persisted this exact prompt
-                    # at send-time — skip the row, keep the turn signal/title.
-                    continue
-                task_store.add_chat_message(
-                    chat_id, "user", cleaned,
-                    author_sub=author_sub_for(session_id), sync_search=False,
-                )
-                persisted += 1
-                message_rows += 1
-
+            _user_line(b, obj, content)
         elif kind == "assistant" and isinstance(content, list):
-            # Usage accounting: the CLI writes one transcript line PER CONTENT
-            # BLOCK of an API message, each repeating the SAME message.id with
-            # IDENTICAL usage (verified on real transcripts) — so claim by
-            # message id and count once, whether the blocks land in one batch
-            # or straddle two. Synthetic lines (API-error rows) carry no id
-            # and are skipped.
-            usage = msg.get("usage")
-            msg_id = msg.get("id")
-            if (isinstance(usage, dict) and msg_id
-                    and buf.claim(f"usage:{msg_id}")):
-                acc = usage_by_model.setdefault(msg.get("model") or "", {
-                    "input_tokens": 0, "output_tokens": 0,
-                    "cache_read": 0, "cache_write": 0,
-                })
-                acc["input_tokens"] += int(usage.get("input_tokens") or 0)
-                acc["output_tokens"] += int(usage.get("output_tokens") or 0)
-                acc["cache_read"] += int(usage.get("cache_read_input_tokens") or 0)
-                acc["cache_write"] += int(usage.get("cache_creation_input_tokens") or 0)
-            msg_text_parts: list[str] = []
-            for bi, block in enumerate(content):
-                if not isinstance(block, dict):
-                    continue
-                btype = block.get("type")
-                if btype == "text":
-                    text = block.get("text", "")
-                    if text.strip():
-                        # Claimed by line uuid + block index, exactly like
-                        # thinking below: the CLI can re-write a line and a
-                        # concurrent-tail race can re-deliver one — text was
-                        # the only unclaimed block type, so the SAME assistant
-                        # text persisted twice (live-hit 2026-07-19: 37
-                        # consecutive duplicate rows in one interactive chat;
-                        # tool/thinking/usage were already claim-protected).
-                        luid = obj.get("uuid") or ""
-                        if luid and not buf.claim(f"text:{luid}:{bi}"):
-                            continue
-                        task_store.add_chat_message(chat_id, "assistant", text,
-                                                    sync_search=False)
-                        persisted += 1
-                        message_rows += 1
-                        assistant_chars += len(text)
-                        msg_text_parts.append(text)
-                elif btype == "thinking":
-                    # Headless parity: the pump persists a thinking block per
-                    # phase with its text; adaptive-effort models emit empty
-                    # thinking (signature only) — nothing to persist then.
-                    # Claimed by line uuid + block index so a concurrent-tail
-                    # race can't double-persist (thinking has no tool id).
-                    t = block.get("thinking", "")
-                    if t.strip():
-                        luid = obj.get("uuid") or ""
-                        if luid and not buf.claim(f"think:{luid}:{bi}"):
-                            continue
-                        persist_event(task_store, chat_id,
-                                      {"type": wire.THINKING, "content": t})
-                        persisted += 1
-                elif btype == "tool_use":
-                    persisted += _on_tool_use(buf, reg, task_store, chat_id,
-                                              block, open_questions)
-            # Track the last assistant message's turn-boundary signal.
-            sr = msg.get("stop_reason")
-            if sr:
-                last_stop_reason = sr
-                last_assistant_text = "".join(msg_text_parts)
-                last_signal = "end_turn" if sr == "end_turn" else "tool_use"
-                last_signal_at = line_time(obj)
+            _assistant_line(b, obj, msg, content)
+    return _finish_batch(b)
 
+
+def _compact_boundary_line(b: _LineBatch, obj: dict) -> None:
+    """A ``compact_boundary`` system line (before the replay guard: an old
+    boundary a re-warm copies is persisted as it always was)."""
+    # Compaction finished. Surface it in the rich history and flag the
+    # batch so interactive_session can run turn-end effects when the
+    # session is idle (manual /compact) — an auto-compact mid-turn
+    # keeps its open turn and the real end_turn closes it normally.
+    meta = obj.get("compactMetadata") or {}
+    trigger = meta.get("trigger") or ""
+    pre = meta.get("preTokens")
+    post = meta.get("postTokens")
+    detail = ""
+    if isinstance(pre, int) and isinstance(post, int) and pre > post:
+        detail = f" ({pre - post:,} tokens freed)"
+    # Same subtype the live headless compact path appends — SystemEvent
+    # renders the amber "Context compressed" separator for both.
+    persist_event(b.task_store, b.chat_id, {
+        "type": wire.SYSTEM,
+        "subtype": wire.SUBTYPE_CONTEXT_COMPRESSED,
+        "message": f"Conversation compacted{detail}",
+        "trigger": trigger,
+    })
+    b.persisted += 1
+    b.compacted = True
+    b.compact_trigger = trigger
+
+
+def _user_tool_results(b: _LineBatch, results: list[dict], at: float | None) -> None:
+    """A user line's tool results: the registry marked, each result paired
+    with its pending block and persisted at the result's position. The
+    answer to the dialog that parked the turn (a question, a plan approval)
+    reopens it at the line's time ``at``; no other result moves the turn."""
+    answered = False
+    for rb in results:
+        tuid = rb.get("tool_use_id", "")
+        if not tuid:
+            continue
+        if tuid in b.open_questions or tuid in b.buf.dialogs:
+            # An error answer is Esc on the dialog: the interrupt marker
+            # that follows it ends the turn.
+            answered = answered or not rb.get("is_error")
+        b.open_questions.discard(tuid)  # question answered in-batch
+        b.buf.dialogs.discard(tuid)
+        b.reg.mark_done(tuid, buffer=False)
+        blk = b.buf.close(tuid)
+        if blk is None:
+            continue  # pre-buffer call or deliberately skipped
+        text = extract_result_text(rb.get("content"))
+        if blk["type"] == "task_spawn":
+            # A denied spawn (permission-rejected — the result is
+            # the error) never started; headless persists no row
+            # for it (task_started never fires), so neither do we.
+            if rb.get("is_error"):
+                continue
+            # fg subagent report — bg results are just the
+            # "launched" ack, which the pump skips too.
+            if not blk.get("run_in_background") and text:
+                blk["tool_result"] = truncate_result(text)
+        else:
+            attach_result(blk, text,
+                          is_error=bool(rb.get("is_error")))
+            # The Claude terminal's ONE post_tool source is this
+            # tailer (the forwarder stands down under
+            # OTO_INTERACTIVE) — session_events / HOOKS.md.
+            from core.session import session_events
+            session_events.post_tool(
+                b.session_id, blk.get("name") or "", tool_use_id=tuid,
+                tool_input=blk.get("tool_input") or {},
+                is_error=bool(rb.get("is_error")), source="tailer",
+            )
+        persist_event(b.task_store, b.chat_id, blk)
+        b.persisted += 1
+        b.tool_rows += 1  # blocks in the buffer are tool/task_spawn
+    if answered and not (b.open_questions or b.buf.dialogs):
+        # The person answered and no other dialog of the turn still shows:
+        # the model answers the result, the turn runs again.
+        b.last_signal = SIGNAL_TOOL_USE
+        b.last_signal_at = at
+
+
+def _user_line(b: _LineBatch, obj: dict, content) -> None:
+    """A ``user`` line: the tool results it carries, else the prompt."""
+    results = _tool_result_blocks(content)
+    if results:
+        # Tool outputs, not user input — drive the registry and pair
+        # each result with its pending block (persisted here, at the
+        # result's transcript position).
+        _user_tool_results(b, results, line_time(obj))
+        return
+    if obj.get("isMeta"):
+        return  # local-command caveat / CLI meta — never user text
+    # Drop any restored-history digest the reseed prepended to the
+    # cold prompt — only the real prompt belongs in chat_messages.
+    text = strip_seed_prefix(_extract_text(content))
+    if _is_harness_injected_user_line(obj, text):
+        return  # bg task-notification — harness, not the user
+    if text.strip().startswith("[Request interrupted by user"):
+        # ESC / dashboard Stop landed mid-turn: the CLI writes this
+        # marker instead of a result event ("… by user]" text-phase,
+        # "… by user for tool use]" tool-phase; content is a plain
+        # string or one text block depending on entrypoint). It is
+        # turn STATE, not a prompt — close the turn and keep the
+        # marker out of chat history. Pending fg spawns died with
+        # the turn (mirror the new-prompt un-pend below).
+        for tuid, blk in list(b.buf.pending.items()):
+            if (blk.get("type") == "task_spawn"
+                    and not blk.get("run_in_background")):
+                b.buf.pending.pop(tuid, None)
+                b.reg.mark_done(tuid, buffer=False)
+        _drop_dialogs(b)
+        b.last_signal = "end_turn"
+        b.last_signal_at = line_time(obj)
+        return
+    if text.strip():
+        cleaned = _strip_command_noise(text)
+        if cleaned is None:
+            return  # slash-command record — local output, not a prompt
+        # Claimed by line uuid like assistant text: the CLI inserts
+        # its file-history-snapshot line BEFORE the prompt it just
+        # appended, so a byte-offset tail (the satellite's, polling
+        # every 0.8 s) can read the shifted prompt line a second
+        # time and the row landed twice (T1, 2026-09-21).
+        luid = obj.get("uuid")
+        if luid and not b.buf.claim(f"user:{luid}"):
+            return
+        # A fg subagent can't span a user turn — a new REAL prompt
+        # means any still-pending fg spawn was interrupted without a
+        # result line. Un-pend it (drop the block, complete the
+        # registry entry) so the bg_pending gates can't wedge the
+        # session; the pump doesn't persist aborted spawns either.
+        for tuid, blk in list(b.buf.pending.items()):
+            if (blk.get("type") == "task_spawn"
+                    and not blk.get("run_in_background")):
+                b.buf.pending.pop(tuid, None)
+                b.reg.mark_done(tuid, buffer=False)
+        _drop_dialogs(b)
+        b.last_signal = "user"
+        b.last_signal_at = line_time(obj)
+        if b.first_user_text is None:
+            b.first_user_text = cleaned
+        if consume_sent_prompt(b.chat_id, cleaned):
+            # The dashboard warmup already persisted this exact prompt
+            # at send-time — skip the row, keep the turn signal/title.
+            return
+        b.task_store.add_chat_message(
+            b.chat_id, "user", cleaned,
+            author_sub=author_sub_for(b.session_id), sync_search=False,
+        )
+        b.persisted += 1
+        b.message_rows += 1
+
+
+def _drop_dialogs(b: _LineBatch) -> None:
+    """A dialog never outlives its turn: a new prompt or the interrupt
+    marker ends whatever question was still open."""
+    b.open_questions.clear()
+    b.buf.dialogs.clear()
+
+
+def _assistant_line(b: _LineBatch, obj: dict, msg: dict, content: list) -> None:
+    """An ``assistant`` line: its usage once per message id, its text,
+    thinking and tool_use blocks, its stop reason as the turn signal."""
+    # Usage accounting: the CLI writes one transcript line PER CONTENT
+    # BLOCK of an API message, each repeating the SAME message.id with
+    # IDENTICAL usage (verified on real transcripts) — so claim by
+    # message id and count once, whether the blocks land in one batch
+    # or straddle two. Synthetic lines (API-error rows) carry no id
+    # and are skipped.
+    usage = msg.get("usage")
+    msg_id = msg.get("id")
+    if (isinstance(usage, dict) and msg_id
+            and b.buf.claim(f"usage:{msg_id}")):
+        acc = b.usage_by_model.setdefault(msg.get("model") or "", {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read": 0, "cache_write": 0,
+        })
+        acc["input_tokens"] += int(usage.get("input_tokens") or 0)
+        acc["output_tokens"] += int(usage.get("output_tokens") or 0)
+        acc["cache_read"] += int(usage.get("cache_read_input_tokens") or 0)
+        acc["cache_write"] += int(usage.get("cache_creation_input_tokens") or 0)
+    msg_text_parts: list[str] = []
+    for bi, block in enumerate(content):
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text = block.get("text", "")
+            if text.strip():
+                # Claimed by line uuid + block index, exactly like
+                # thinking below: the CLI can re-write a line and a
+                # concurrent-tail race can re-deliver one — text was
+                # the only unclaimed block type, so the SAME assistant
+                # text persisted twice (live-hit 2026-07-19: 37
+                # consecutive duplicate rows in one interactive chat;
+                # tool/thinking/usage were already claim-protected).
+                luid = obj.get("uuid") or ""
+                if luid and not b.buf.claim(f"text:{luid}:{bi}"):
+                    continue
+                b.task_store.add_chat_message(b.chat_id, "assistant", text,
+                                            sync_search=False)
+                b.persisted += 1
+                b.message_rows += 1
+                b.assistant_chars += len(text)
+                msg_text_parts.append(text)
+        elif btype == "thinking":
+            # Headless parity: the pump persists a thinking block per
+            # phase with its text; adaptive-effort models emit empty
+            # thinking (signature only) — nothing to persist then.
+            # Claimed by line uuid + block index so a concurrent-tail
+            # race can't double-persist (thinking has no tool id).
+            t = block.get("thinking", "")
+            if t.strip():
+                luid = obj.get("uuid") or ""
+                if luid and not b.buf.claim(f"think:{luid}:{bi}"):
+                    continue
+                persist_event(b.task_store, b.chat_id,
+                              {"type": wire.THINKING, "content": t})
+                b.persisted += 1
+        elif btype == "tool_use":
+            b.persisted += _on_tool_use(b.buf, b.reg, b.task_store, b.chat_id,
+                                      block, b.open_questions)
+    # Track the last assistant message's turn-boundary signal.
+    sr = msg.get("stop_reason")
+    if sr:
+        b.last_stop_reason = sr
+        b.last_assistant_text = "".join(msg_text_parts)
+        b.last_signal = "end_turn" if sr == "end_turn" else "tool_use"
+        b.last_signal_at = line_time(obj)
+
+
+def _finish_batch(b: _LineBatch) -> dict:
+    """The batch's end: the question fold, the search rebuild, the title
+    backfill, the usage flush, the log line and the result."""
     # Question fold: an AskUserQuestion or ExitPlanMode still unanswered at
     # batch end means the harness is blocked on the dialog — close the turn
     # (headless parity: the -p pump's turn ends right after the question /
@@ -792,69 +866,74 @@ def _process_lines(session_id: str, chat_id: str, lines, *,
     # Never overrides a REAL later signal: "user" (question dismissed, new
     # prompt) and "end_turn" (ESC interrupt marker / real end) win — those
     # paths must not read as question-parked.
-    question_pending = bool(open_questions) and last_signal in ("tool_use", None)
+    question_pending = bool(b.open_questions) and b.last_signal in ("tool_use", None)
     if question_pending:
-        last_signal = "end_turn"
+        b.last_signal = "end_turn"
+    # The ids still open carry over to recognise their answer in a later
+    # batch; the fold above reads this batch's alone.
+    b.buf.dialogs |= b.open_questions
 
     # The message rows skipped the per-row search rebuild: one per batch.
-    if message_rows and chat_id:
-        task_store.rebuild_chat_search(chat_id)
+    if b.message_rows and b.chat_id:
+        b.task_store.rebuild_chat_search(b.chat_id)
 
     # Backfill the chat title from the first user prompt — interactive chats
     # can't title at send-time (the prompt rides the PTY). Only when still
     # untitled, so we never overwrite an existing title and it's idempotent
     # across batches (a later batch finds the title already set).
     title_set = False
-    if first_user_text and chat_id:
+    if b.first_user_text and b.chat_id:
         try:
-            rec = task_store.get_chat(chat_id)
+            rec = b.task_store.get_chat(b.chat_id)
             if rec and not (rec.get("title") or "").strip():
-                new_title = _title_from_prompt(first_user_text)
+                new_title = _title_from_prompt(b.first_user_text)
                 if new_title:
-                    task_store.update_chat(chat_id, title=new_title)
+                    b.task_store.update_chat(b.chat_id, title=new_title)
                     title_set = True
                     # Push to the user's dashboards so the sidebar updates now
                     # (vs waiting for a navigation refetch). Best-effort.
                     try:
                         from services.notifications import notification_manager
                         notification_manager.broadcast_chat_title(
-                            rec.get("user_sub", ""), chat_id, new_title,
+                            rec.get("user_sub", ""), b.chat_id, new_title,
                             agent=rec.get("agent") or "",
                         )
-                    except Exception:
+                    except Exception:  # noqa: BLE001  # the title fan-out must not fail a title already saved
                         pass
         except Exception:
-            logger.exception("transcript title backfill failed for %s", session_id[:8])
+            logger.exception("transcript title backfill failed for %s", b.session_id[:8])
 
     usage_rows = 0
-    if usage_by_model and chat_id:
-        usage_rows = record_batch_usage(session_id, chat_id, usage_by_model,
-                                        task_store)
+    if b.usage_by_model and b.chat_id:
+        usage_rows = record_batch_usage(b.session_id, b.chat_id, b.usage_by_model,
+                                        b.task_store)
 
-    if persisted:
+    if b.persisted:
         logger.info(
             "interactive %s: persisted %d transcript message(s) to chat %s%s",
-            session_id[:8], persisted, chat_id, " (titled)" if title_set else "",
+            b.session_id[:8], b.persisted, b.chat_id, " (titled)" if title_set else "",
         )
     return {
-        "persisted": persisted,
+        "persisted": b.persisted,
         "title_set": title_set,
         # Interactive completion signal (consumed by interactive_session).
-        "turn_complete": last_stop_reason == "end_turn",
-        "last_message": last_assistant_text,
-        "last_signal": last_signal,
-        "last_signal_at": last_signal_at,
+        "turn_complete": b.last_stop_reason == "end_turn",
+        "last_message": b.last_assistant_text,
+        "last_signal": b.last_signal,
+        "last_signal_at": b.last_signal_at,
         # Turn parked on an unanswered AskUserQuestion (folded to end_turn
         # above) — the session words the end-of-turn ping as a question.
         "question_pending": question_pending,
         # A compact_boundary landed in this batch — interactive_session runs
         # turn-end effects when the session is idle, and a MANUAL trigger
         # additionally closes a stale-open turn (see _post_batch_effects).
-        "compacted": compacted,
-        "compact_trigger": compact_trigger,
+        "compacted": b.compacted,
+        "compact_trigger": b.compact_trigger,
         # usage_records rows written for this batch (0 = no new usage lines).
         "usage_rows": usage_rows,
         # Early-title counters (see the init comment above).
-        "assistant_chars": assistant_chars,
-        "tool_rows": tool_rows,
+        "assistant_chars": b.assistant_chars,
+        "tool_rows": b.tool_rows,
     }
+
+

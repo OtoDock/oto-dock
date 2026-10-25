@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -28,7 +27,10 @@ def _now() -> str:
 def _make_manifest(name, assignment_mode="auto", category="custom", has_instances=False, delivery="env"):
     """Construct a minimal McpManifest for tests."""
     from services.mcp.mcp_registry import (
-        McpManifest, ServerConfig, CredentialConfig, InstanceConfig,
+        CredentialConfig,
+        InstanceConfig,
+        McpManifest,
+        ServerConfig,
     )
     instances = None
     if has_instances:
@@ -159,8 +161,8 @@ class TestVisibilityHelpers:
         assert bulk["alice"] == {"image-gen", "ssh-server"}
 
     def test_bulk_visibility_skips_a_bad_agents_column(self, temp_db):
-        from storage.pg import get_conn
         from storage.mcp import mcp_store
+        from storage.pg import get_conn
         _make_instance("image-gen", "gen-a", agents=["alice"])
         with get_conn() as conn:
             conn.execute("UPDATE mcp_instances SET agents='not json' "
@@ -424,6 +426,7 @@ class TestApiEndpoint:
         """Bring up the FastAPI app with an admin user injected."""
         from fastapi import Request
         from fastapi.testclient import TestClient
+
         from auth.providers import UserContext, get_current_user
 
         admin_ctx = UserContext(
@@ -561,6 +564,7 @@ class TestOriginalBugIntegration:
           7. Admin re-authorizes → manifest comes back at runtime, manager's enable is preserved.
         """
         from fastapi.testclient import TestClient
+
         from auth.providers import UserContext, get_current_user
         from services.mcp import mcp_registry
         from storage.mcp import mcp_store
@@ -658,3 +662,76 @@ class TestMigration:
             schema.run_migrations(conn)
             schema.run_migrations(conn)
             conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# The order of an agent's MCPs across processes
+# ---------------------------------------------------------------------------
+
+_ORDER_PROBE = '''
+import json, sys
+from pathlib import Path
+from services.mcp import mcp_registry
+from services.mcp.mcp_registry import CredentialConfig, McpManifest, ServerConfig, SkillDef
+from storage.mcp import mcp_store
+
+root = Path(sys.argv[1])
+names = sys.argv[2:]
+manifests = {}
+for name in names:
+    folder = root / name
+    (folder / "skills").mkdir(parents=True, exist_ok=True)
+    (folder / "skills" / "card.md").write_text(name + " card")
+    manifests[name] = McpManifest(
+        name=name, label=name, description="", version="1.0.0", category="custom",
+        server=ServerConfig(runtime="python", transport="stdio"),
+        credentials=CredentialConfig(type="none"), config=[], env={}, agent_env={},
+        exclude_from=[], mcp_dir=folder,
+        skills=[SkillDef(id=name + "-usage", file="skills/card.md", loading="always")],
+    )
+mcp_registry._manifests = manifests
+mcp_store.get_manager_enabled_mcps = lambda agent: list(reversed(names))
+mcp_store.get_all_mcp_states = lambda: {n: True for n in names}
+mcp_store.get_visible_explicit_mcps = lambda agent: set()
+mcp_store.get_agent_skills = lambda agent: []
+print(json.dumps({
+    "mcps": [m.name for m in mcp_registry.get_agent_mcps("pa")],
+    "skills": [s[0] for s in mcp_registry.get_skills_for_agent("pa")],
+}))
+'''
+
+
+def test_an_agents_mcps_keep_one_order_whatever_the_hash_seed(tmp_path):
+    """The prompt's inline skills and the session's MCP config follow the
+    agent's MCP order: it must not follow the process's hash seed, or every
+    restart changes the prompt (and a provider's prompt cache loses its
+    prefix). Two interpreters with different seeds see the same order: the
+    names sorted. The probe reads ``get_agent_mcps`` and
+    ``get_skills_for_agent``, the two the prompt rendering
+    (``configuration.prompts``) and the session config read."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from tests._paths import PROXY_DIR
+
+    script = tmp_path / "probe.py"
+    script.write_text(_ORDER_PROBE)
+    names = ["kilo-mcp", "alpha-mcp", "india-mcp", "delta-mcp",
+             "golf-mcp", "bravo-mcp", "hotel-mcp", "echo-mcp"]
+    (tmp_path / "config").mkdir()
+    (tmp_path / "data").mkdir()
+    outputs = []
+    for seed in ("1", "2"):
+        env = {**os.environ, "PYTHONHASHSEED": seed,
+               "PLATFORM_CONFIG_DIR": str(tmp_path / "config"),
+               "PLATFORM_DATA_DIR": str(tmp_path / "data"),
+               "PYTHONPATH": os.pathsep.join(filter(None, [str(PROXY_DIR), os.environ.get("PYTHONPATH")]))}
+        run = subprocess.run([sys.executable, str(script), str(tmp_path / f"mcps-{seed}"), *names],
+                             cwd=str(PROXY_DIR), env=env, capture_output=True, text=True, timeout=120)
+        assert run.returncode == 0, run.stderr[-2000:]
+        outputs.append(json.loads(run.stdout.strip().splitlines()[-1]))
+    for out in outputs:
+        assert out["mcps"] == sorted(names)
+        assert out["skills"] == [n + "-usage" for n in sorted(names)]

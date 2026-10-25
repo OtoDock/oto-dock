@@ -13,7 +13,7 @@ pptx = pytest.importorskip("pptx")
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import powerpoint as ppt_mod  # noqa: E402
+import powerpoint as ppt_mod
 
 
 async def _async_ident(p, writing=False, **kw):

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 
 // ─── Subscription pool caps on the Usage pages, the composer's budget
@@ -32,7 +32,11 @@ vi.mock('@/api/usage', async (importOriginal) => {
     useSetMyPoolCap: mutation,
     useSetAdminPoolCap: mutation,
     useMyLimits: () => ({ data: limitsRef.current }),
-    useSetMyLimit: () => ({ mutate: (u: unknown) => { myLimitSaves.push(u) }, isPending: false }),
+    useSetMyLimit: () => ({
+      mutate: (u: unknown) => { myLimitSaves.push(u) },
+      mutateAsync: (u: unknown) => { myLimitSaves.push(u); return Promise.resolve() },
+      isPending: false,
+    }),
   }
 })
 
@@ -42,6 +46,7 @@ import { describeLimitReached, describeLimitWarning, hitText } from '@/component
 import { warmupFailSubtype } from '@/hooks/useChatStream'
 import SystemEvent from '@/components/chat/SystemEvent'
 import type { PoolCapStatus } from '@/api/usage'
+import { tooltipProps, useChartColors } from '@/components/usage/chartColors'
 
 function status(overrides: Partial<PoolCapStatus> = {}): PoolCapStatus {
   return {
@@ -67,10 +72,10 @@ describe('pool cap section', () => {
     render(<MyPoolCapSection />)
     expect(screen.getByText('My subscriptions')).toBeInTheDocument()
     expect(screen.getByText(/cap your own connected accounts/)).toBeInTheDocument()
-    // The note behind the ⓘ opens in place.
-    expect(screen.queryByTestId('pool-cap-info')).toBeNull()
-    fireEvent.click(screen.getByLabelText('More about this cap'))
-    expect(screen.getByTestId('pool-cap-info')).toHaveTextContent('all the enabled subscriptions')
+    // The note behind the info button opens on a click.
+    expect(screen.queryByRole('tooltip')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'About My subscriptions' }), { detail: 0 })
+    expect(screen.getByRole('tooltip')).toHaveTextContent('all the enabled subscriptions')
     const lines = screen.getAllByTestId('pool-engine')
     expect(lines).toHaveLength(2)
     expect(lines[0]).toHaveTextContent('Claude Code CLI')  // the engine's own name, from the catalog
@@ -81,12 +86,12 @@ describe('pool cap section', () => {
     expect(week).toHaveTextContent('Weekly window')
     expect(week).toHaveTextContent('52%')
     expect(week).toHaveTextContent('/ 50%')
-    expect(week.querySelector('.text-p-error')).toHaveTextContent('52%')
+    expect(week.querySelector('.text-status-danger-fg')).toHaveTextContent('52%')
     expect(lines[0].querySelector('[data-testid="pool-reading-week_usd"]')).toHaveTextContent('API cost, 7 days')
     expect(lines[0].querySelector('[data-testid="pool-reading-week_usd"]')).toHaveTextContent('$12.50')
     expect(lines[0].querySelector('[data-testid="pool-reading-day_usd"]')).toHaveTextContent('API cost, 24 h')
     expect(lines[1]).toHaveTextContent('Codex')
-    expect(lines[1].querySelector('.text-p-error')).toBeNull()
+    expect(lines[1].querySelector('.text-status-danger-fg')).toBeNull()
     // The form starts from the row and posts every field (empty = null).
     expect(screen.getByLabelText('Week %')).toHaveValue(50)
     fireEvent.change(screen.getByLabelText('Week %'), { target: { value: '' } })
@@ -99,9 +104,9 @@ describe('pool cap section', () => {
   it('says when the pool has no accounts and still offers the form', () => {
     capRef.current = { caps: { week_pct: null, day_pct: null, week_usd: null, day_usd: null }, on_reached: 'stop', engines: {} }
     render(<PlatformPoolCapSection />)
-    expect(screen.getByText('Subscription pool')).toBeInTheDocument()
-    expect(screen.getByText(/cap the accounts in the agent pool/)).toBeInTheDocument()
-    expect(screen.getByText('No subscription accounts in the agent pool.')).toBeInTheDocument()
+    expect(screen.getByText('Shared subscriptions')).toBeInTheDocument()
+    expect(screen.getByText(/cap the shared subscriptions of each engine/)).toBeInTheDocument()
+    expect(screen.getByText('No subscription accounts are shared with agents.')).toBeInTheDocument()
     expect(screen.getByLabelText('Week %')).toHaveValue(null)
     expect(screen.getByText(/Less than 14.3% a day/)).toBeInTheDocument()
   })
@@ -137,7 +142,7 @@ describe('the composer names the budget', () => {
     const pool = describeLimitReached({ pool: status() }, LABELS)
     expect(pool.title).toBe('Subscription cap reached.')
     expect(pool.body).toContain('Claude Code CLI: the week is at 52% of the 50% cap')
-    expect(pool.body).toContain('User Settings → Usage')
+    expect(pool.body).toContain('User Settings, Usage')
     expect(describeLimitReached({ pool: status() }).body).toContain('claude-code-cli: the week')
     const own = describeLimitReached({ self: { monthly: { limit: 10, used: 10.5, percent: 105, start: '', end: '' } } })
     expect(own.title).toBe('Your API-key budget is reached.')
@@ -149,7 +154,7 @@ describe('the composer names the budget', () => {
 
   it('warning text: continuing on a key, a near cap, an own-key budget, the platform budget', () => {
     expect(describeLimitWarning({ pool: status({ on_reached: 'continue' }) }))
-      .toBe('Subscription cap reached (the week is at 52% of the 50% cap); continuing on an API key.')
+      .toBe('Subscription cap reached: the week is at 52% of the 50% cap. Continuing on an API key.')
     expect(describeLimitWarning({ pool: status({ hits: [], allowed: true, readings: { week_pct: 42, day_pct: 1, week_usd: 1, day_usd: 0 } }) }, LABELS))
       .toBe('Subscription cap: the week is at 42% of the 50% cap on Claude Code CLI.')
     expect(describeLimitWarning({ self: { weekly: { limit: 5, used: 4.2, percent: 84, start: '', end: '' } } }))
@@ -171,5 +176,32 @@ describe('a cap-refused warmup', () => {
     expect(screen.getByText('Subscription cap reached')).toBeInTheDocument()
     expect(screen.getByText(/the week is at 52%/)).toBeInTheDocument()
     expect(screen.getByText('Open the Usage tab')).toHaveAttribute('href', '/user-settings?tab=usage')
+  })
+})
+
+describe('the usage charts read the tokens', () => {
+  function Probe() {
+    return <p data-testid="bar">{useChartColors().bar}</p>
+  }
+
+  it('reads the series colour again when the theme changes', async () => {
+    const root = document.documentElement
+    root.style.setProperty('--ot-status-info-solid', '#111111')
+    render(<Probe />)
+    expect(screen.getByTestId('bar')).toHaveTextContent('#111111')
+    act(() => {
+      root.style.setProperty('--ot-status-info-solid', '#222222')
+      root.classList.add('dark')
+    })
+    await waitFor(() => expect(screen.getByTestId('bar')).toHaveTextContent('#222222'))
+    root.classList.remove('dark')
+    root.style.removeProperty('--ot-status-info-solid')
+  })
+
+  it("sets the tooltip's fill on the longhand the chart library uses", () => {
+    const props = tooltipProps({ bar: '', axis: '', tooltipBg: '#333333', tooltipBorder: '#444444', tooltipText: '#555555', cursor: '' })
+    expect(props.contentStyle).toMatchObject({ backgroundColor: '#333333', color: '#555555' })
+    expect(props.contentStyle).not.toHaveProperty('background')
+    expect(props.itemStyle.color).toBe('#555555')
   })
 })

@@ -12,6 +12,7 @@ a token needs ``own``; the extension's ``NAME=value`` paste is accepted.
 import uuid
 
 import pytest
+from cryptography.fernet import InvalidToken
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -120,7 +121,7 @@ def test_undecryptable_token_degrades_to_no_token(machine, monkeypatch):
     remote_store.set_browser_extension_token(machine["id"], "D" * 43)
 
     def _bad(_enc):
-        raise ValueError("key mismatch")
+        raise InvalidToken  # a row written under another key
     monkeypatch.setattr(credential_store, "decrypt_secret", _bad)
     s = remote_store.get_target_browser_settings(_p(placement.KIND_ADMIN_REMOTE, machine["id"]))
     assert (s.mode, s.extension_token) == ("own", None)
@@ -292,26 +293,33 @@ def test_the_unattended_permission_is_stored_and_reported(machine):
 def test_the_upgrade_keeps_unattended_use_where_a_token_is_saved(machine):
     """The forward migration adds the column once and sets it where a token
     is stored; a database that already has it is left alone."""
-    from storage import schema
+    from storage import pg, schema
     from storage.pg import get_conn
     remote_store.set_browser_mode(machine["id"], "own")
     remote_store.set_browser_extension_token(machine["id"], "T" * 43)
     other = remote_store.create_remote_machine(
         machine_id=str(uuid.uuid4()), name=f"no-token-{uuid.uuid4().hex[:6]}",
         registered_by="user-sub-admin")
-    with get_conn() as conn:
-        conn.execute("ALTER TABLE remote_machines DROP COLUMN browser_unattended")
-        schema.run_migrations(conn)
-        conn.commit()
-    rows = {r["id"]: r["browser_unattended"] for r in (
-        remote_store.get_remote_machine(machine["id"]), remote_store.get_remote_machine(other["id"]))}
-    assert rows == {machine["id"]: True, other["id"]: False}
-    # Run again on a database that has the column: an owner's later choice stays.
-    remote_store.set_browser_unattended(machine["id"], False)
-    with get_conn() as conn:
-        schema.run_migrations(conn)
-        conn.commit()
-    assert remote_store.get_remote_machine(machine["id"])["browser_unattended"] is False
+    try:
+        with get_conn() as conn:
+            conn.execute("ALTER TABLE remote_machines DROP COLUMN browser_unattended")
+            schema.run_migrations(conn)
+            conn.commit()
+        # The DROP and the ADD reordered the rows' columns: every pooled
+        # session's cached plan of a SELECT * is stale, so the pools close.
+        pg.close_pool(timeout=2.0)
+        rows = {r["id"]: r["browser_unattended"] for r in (
+            remote_store.get_remote_machine(machine["id"]),
+            remote_store.get_remote_machine(other["id"]))}
+        assert rows == {machine["id"]: True, other["id"]: False}
+        # Run again on a database that has the column: an owner's later choice stays.
+        remote_store.set_browser_unattended(machine["id"], False)
+        with get_conn() as conn:
+            schema.run_migrations(conn)
+            conn.commit()
+        assert remote_store.get_remote_machine(machine["id"])["browser_unattended"] is False
+    finally:
+        pg.close_pool(timeout=2.0)
 
 
 def test_the_unattended_routes(monkeypatch):

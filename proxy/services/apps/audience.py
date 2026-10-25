@@ -9,13 +9,19 @@ receive frames for that long. Synchronous: call it on the DB executor.
 
 from __future__ import annotations
 
+import asyncio
 import time
+from typing import TYPE_CHECKING, cast
 
-from storage import database as task_store
-from storage.automation import notification_store
-from storage.identity import db_users
 from auth import roles
 from core.session import session_kind
+from storage import database as task_store, db_apps
+from storage.automation import notification_store
+from storage.identity import db_users
+from ws import wire_events as wire
+
+if TYPE_CHECKING:
+    from auth.providers import UserContext
 
 _CACHE_TTL_S = 2.0
 _cache: dict[str, tuple[float, list[str]]] = {}
@@ -151,10 +157,14 @@ def _compute(row: dict) -> list[str]:
 
 def _may_open_chat(sub: str, is_admin: bool, is_member: bool, chat: dict, *,
                    is_manager: bool = False) -> bool:
-    """``api.agents.chats.can_access_chat`` for a user known by sub and
+    """``core.session.visibility.can_access_chat`` for a user known by sub and
     membership alone, so the fan-out builds no principal per candidate."""
-    from api.agents.chats import _run_for_chat
-    from core.session.visibility import is_phone_chat_owner, is_shared_chat_owner, is_task_chat_owner
+    from core.session.visibility import (
+        _run_for_chat,
+        is_phone_chat_owner,
+        is_shared_chat_owner,
+        is_task_chat_owner,
+    )
     if is_admin:
         return True
     owner = chat.get("user_sub", "") or ""
@@ -171,3 +181,78 @@ def _may_open_chat(sub: str, is_admin: bool, is_member: bool, chat: dict, *,
                 return run.get("created_by") == sub
             return is_member
     return False
+
+
+def app_access(row: dict, user: UserContext) -> bool:
+    """May ``user`` see/serve this app? Personal rows → owner only; shared
+    rows → anyone assigned to the agent; a live internal share grants
+    either (SHARING.md); admin always. A chat- or project-scoped pin is
+    additionally reachable only from its scope (``_scope_access``), grant or
+    not. Reads the DB for scoped rows and for non-member callers — call it
+    off the loop (``_visible_row``)."""
+    # A session acts on the agent it was minted for and never across one,
+    # whoever drives it (the app API's agent basis keeps the same rule): its
+    # bearer resolves to its user, who may belong to other agents too.
+    if user.is_session and (row.get("agent") or "") != (user.agent or ""):
+        return False
+    if user.is_admin:
+        return True
+    # A personal app whose owner lost the agent is dormant (APPS.md
+    # "Lifecycle"): to the owner, a grantee and the render alike it is gone.
+    if db_apps.personal_row_dormant(row):
+        return False
+    # The platform's own headless render sees the one app it was minted for
+    # (auth/render_principal.py), whatever the row's scope.
+    if user.render_app and user.render_app == row.get("id"):
+        return True
+    if row.get("username"):
+        direct = (row.get("owner_sub") or "") == user.sub
+    else:
+        direct = user.can_access_agent(row.get("agent") or "")
+    if not direct and not _granted(row, user):
+        return False
+    return _scope_access(row, user)
+
+
+def _granted(row: dict, user: UserContext) -> bool:
+    """A live share admits the viewer: their own person share, or an agent
+    or department placement on an agent they hold (SHARING.md)."""
+    from storage.sharing import share_store
+    app_id = row.get("id") or ""
+    if share_store.internal_grant("app", app_id, user.sub) is not None:
+        return True
+    return bool(share_store.placements_for_user(app_id, user.sub, list(user.agents)))
+
+
+def _scope_access(row: dict, user: UserContext) -> bool:
+    """A Dock pin follows its chat's access rule: the chat itself, or for a
+    project pin any lane of the project the viewer may open. Without this a
+    dashboard pinned in a private chat would serve to any member holding
+    its id (the Dock route checked the anchor chat; the app routes did
+    not)."""
+    chat_id = row.get("scope_chat_id") or ""
+    project_id = row.get("scope_project_id") or ""
+    if not chat_id and not project_id:
+        return True
+    from core.session.visibility import can_access_chat
+    if chat_id:
+        chat = task_store.get_chat(chat_id)
+        return bool(chat) and can_access_chat(user, cast("dict", chat))
+    return any(can_access_chat(user, c)
+               for c in task_store.list_chats_by_project(project_id))
+
+
+async def announce_deploy(row: dict, release: int, *, file_updated: bool = True) -> int:
+    """Tell every screen that may see the row that a new release serves:
+    ``app_deployed`` on the live queue (the frame reloads once its row
+    carries this manifest signature) and, for dashboards built before the
+    frame existed, the working file's ``file_updated``."""
+    from services.notifications import notification_manager
+    if file_updated:
+        await notification_manager.broadcast_file_updated(
+            row["agent"], row["rel_path"], source="disk",
+        )
+    frame = {"type": wire.APP_DEPLOYED, "app_id": row["id"], "release": release,
+             "actions_sig": task_store.manifest_sig(row)}
+    subs = await asyncio.to_thread(app_audience, row)
+    return sum(notification_manager.push_live(sub, frame) for sub in subs)

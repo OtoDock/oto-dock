@@ -9,7 +9,8 @@ const h = vi.hoisted(() => ({
   status: { data: undefined as any },
 }))
 
-vi.mock('@/api/communityAgents', () => ({
+vi.mock('@/api/communityAgents', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/api/communityAgents')>()),
   useTemplateUpdatePlan: () => h.plan,
   useApplyTemplateUpdate: () => ({ mutateAsync: h.applyMock, isPending: false }),
   useTemplateUpdateStatus: () => h.status,
@@ -58,6 +59,7 @@ describe('AgentUpdateModal', () => {
     h.plan.data = PLAN
     h.plan.isLoading = false
     h.plan.isError = false
+    h.plan.error = null
     h.status.data = undefined
   })
 
@@ -122,6 +124,39 @@ describe('AgentUpdateModal', () => {
     await waitFor(() => expect(h.applyMock).toHaveBeenCalled())
     await waitFor(() => expect(screen.getByText(/the platform restarted while it ran/)).toBeTruthy())
     expect(screen.getByTestId('update-submit')).toBeTruthy()
+  })
+
+  it("lists the tasks whose model choice is left out, in the plan and in the report", async () => {
+    const note = "The task 'digest' runs on the agent's usual model and engine. The model gpt-x is not turned on for OpenAI Codex."
+    h.plan.data = { ...PLAN, task_pins_dropped: [note] }
+    h.applyMock.mockResolvedValue({ job_id: 'j1', to_version: '3.0.0' })
+    renderModal()
+    expect(screen.getByText('Model choices left out')).toBeTruthy()
+    expect(screen.getByText("The task 'digest' runs on the agent's usual model and engine. The model gpt-x is not turned on for OpenAI Codex.")).toBeTruthy()
+    h.status.data = { running: false, status: 'done', report: { ...PLAN, task_pins_dropped: [note] } }
+    fireEvent.click(screen.getByTestId('update-submit'))
+    await waitFor(() => expect(screen.getByTestId('update-report')).toBeTruthy())
+    expect(screen.getByTestId('update-report').textContent).toContain('Model choices left out')
+  })
+
+  it('says nothing of model choices when the proxy sends none', () => {
+    renderModal()
+    expect(screen.queryByText('Model choices left out')).toBeNull()
+  })
+
+  it("lists a refused new version's problems apart", () => {
+    h.plan.data = undefined
+    h.plan.isError = true
+    h.plan.error = Object.assign(new Error('a; b'), {
+      body: { detail: { error: 'invalid_template', message: 'a; b', problems: ['tasks/digest.json: cron is not valid', 'agent.json: name is missing'] } },
+    })
+    renderModal()
+    const box = screen.getByTestId('plan-problems')
+    expect(box.querySelectorAll('li')).toHaveLength(2)
+    expect(box.textContent).toContain('cron is not valid')
+    h.plan.error = new Error('already at 3.0.0')
+    renderModal()
+    expect(screen.getAllByText('already at 3.0.0').length).toBeGreaterThan(0)
   })
 
   it('lists the pieces the manager removed apart, with nothing to take', () => {

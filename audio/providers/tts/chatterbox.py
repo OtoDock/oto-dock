@@ -28,7 +28,7 @@ class ChatterboxTTS(TTSProvider):
         raise NotImplementedError(_HINT)
 
     @classmethod
-    def from_row(cls, row: dict, resolver: CredentialResolver) -> "ChatterboxTTS":
+    def from_row(cls, row: dict, resolver: CredentialResolver) -> ChatterboxTTS:
         return cls()
 
     async def connect(self, *, output_sample_rate: int | None = None) -> None: ...

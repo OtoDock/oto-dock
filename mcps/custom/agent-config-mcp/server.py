@@ -38,13 +38,14 @@ from typing import Any
 
 import httpx
 from mcp.server import Server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+
+from _tool_args import ToolArgs
 
 # The sibling module (the tool schemas, pure data): found on sys.path[0] when
 # the MCP runs as ``python server.py`` from its folder, and put there by the
 # proxy's test loader while this module executes.
-from agent_config_tool_schemas import _TOOL_SCHEMAS  # noqa: E402
-
+from agent_config_tool_schemas import _TOOL_SCHEMAS
 
 # ---------------------------------------------------------------------------
 # Env + permission matrix
@@ -152,7 +153,7 @@ async def _request(method: str, path: str, **kwargs) -> Any:
                 try:
                     js = resp.json()
                     detail = js.get("detail") or js
-                except Exception:
+                except (ValueError, AttributeError):
                     pass
                 raise _ApiError(f"{method} {path} → {resp.status_code}: {detail}")
             if resp.status_code == 204 or not resp.content:
@@ -497,7 +498,13 @@ async def _tool_list_context_files() -> str:
     # a synthetic dir root so the descent is uniform (tolerate a dict root
     # too, should the endpoint shape ever change).
     root = tree if isinstance(tree, dict) else {"type": "dir", "children": tree}
-    # Walk the tree to find the ``config/context`` subtree.
+    # Walk the tree to find the ``config/context`` subtree. The files route
+    # shows ``config/`` to the agent's managers and admins only: without it
+    # in the tree the folder is hidden from this session, not missing.
+    if _find_subtree(root, ["config"]) is None:
+        return ("_This session cannot see the agent's `config/` folder: only the "
+                "agent's managers and admins see it, so its context files cannot be "
+                "listed here._")
     context_subtree = _find_subtree(root, ["config", "context"])
     if context_subtree is None:
         return "_`config/context/` not found for this agent._"
@@ -1105,6 +1112,7 @@ _TOOL_HANDLERS = {
 # ---------------------------------------------------------------------------
 
 server = Server("agent-config-mcp")
+TOOL_ARGS = ToolArgs()
 
 
 async def _engine_schemas() -> dict[str, dict[str, Any]]:
@@ -1138,15 +1146,19 @@ async def _engine_schemas() -> dict[str, dict[str, Any]]:
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     schemas = await _engine_schemas()
-    return [
-        Tool(name=name, description=schema["description"], inputSchema=schema["inputSchema"])
+    return TOOL_ARGS.listed([
+        Tool(name=name, description=schema["description"], inputSchema=schema["inputSchema"],
+             annotations=ToolAnnotations(**schema["annotations"]))
         for name, schema in schemas.items()
         if name in ENABLED_TOOLS
-    ]
+    ])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     if name not in ENABLED_TOOLS:
         return [TextContent(type="text", text=f"❌ Error: tool '{name}' not available in this session")]
     handler = _TOOL_HANDLERS.get(name)
@@ -1156,7 +1168,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         result = await handler(arguments or {})
     except _ApiError as exc:
         return [TextContent(type="text", text=f"❌ Error: {exc}")]
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"❌ Error: {type(exc).__name__}: {exc}")]
     return [TextContent(type="text", text=str(result))]
 

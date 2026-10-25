@@ -28,6 +28,7 @@ import inspect
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from auth import roles
 
@@ -98,7 +99,7 @@ class OffboardEvent:
     platform_after: str | None = None
 
 
-Subscriber = Callable[[OffboardEvent], Awaitable[None] | None]
+Subscriber = Callable[[OffboardEvent], Awaitable[object] | None]
 _subscribers: dict[str, tuple[int, Subscriber]] = {}
 _background: set[asyncio.Task] = set()
 
@@ -189,10 +190,10 @@ async def dispatch_losses(sub: str, agent_losses: Iterable[AgentLoss], actor_sub
     caller waits for it at most ``ROUTE_WAIT_S``."""
     agent_losses = list(agent_losses)
     person = person or {}
-    common = dict(actor_sub=actor_sub, username=person.get("username") or "",
-                  email=person.get("email") or "",
-                  display_name=person.get("display_name") or person.get("name") or "",
-                  platform_before=platform_before, platform_after=platform_after)
+    common: dict[str, Any] = dict(actor_sub=actor_sub, username=person.get("username") or "",
+                                  email=person.get("email") or "",
+                                  display_name=person.get("display_name") or person.get("name") or "",
+                                  platform_before=platform_before, platform_after=platform_after)
     if deleted:
         events = [OffboardEvent(sub, DELETED, tuple(agent_losses), **common)]
     else:

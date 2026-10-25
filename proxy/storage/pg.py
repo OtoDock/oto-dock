@@ -299,10 +299,21 @@ class _Liveness:
 
     def _probe_async(self) -> None:
         started = time.monotonic()
-        alive = self.probe()
-        with self._lock:
-            self._result = (started, time.monotonic(), alive)
-            self._running = False
+        alive: bool | None = None
+        try:
+            alive = self.probe()
+        except Exception:
+            # In the proxy's log format: the thread's own hook would print a
+            # bare traceback.
+            logger.exception("Database liveness probe raised")
+            raise
+        finally:
+            # A raise records no verdict (the last one stands), but the next
+            # ``verdict`` may start a probe again.
+            with self._lock:
+                if alive is not None:
+                    self._result = (started, time.monotonic(), alive)
+                self._running = False
 
     def probe(self) -> bool:
         with self._conn_lock:
@@ -313,7 +324,7 @@ class _Liveness:
                     return True
                 except DatabaseUnresponsive:
                     return False
-                except Exception:
+                except Exception:  # noqa: BLE001  # the liveness probe thread's body: a raise would wedge the probe
                     if not (conn.closed or conn.broken):
                         return True  # the server answered, with an error
                     # The sentinel itself died (a restart): a fresh one decides.
@@ -322,7 +333,7 @@ class _Liveness:
                 self._conn = self._conn_class.connect(self._conninfo, **self._kwargs)
                 self._conn.execute("SELECT 1")
                 return True
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # the liveness probe thread's body: a raise would wedge the probe
                 with contextlib.suppress(Exception):
                     if self._conn is not None:
                         self._conn.close()
@@ -501,7 +512,7 @@ class LoopPool:
                     pool.putconn(conn)
                 self._trip("Postgres stopped answering", slow=True)
                 raise DatabaseUnavailable("database unavailable (no answer)") from e
-            except Exception:
+            except Exception:  # noqa: BLE001  # a connection that failed its check goes back to the pool
                 with contextlib.suppress(Exception):
                     pool.putconn(conn)  # closed or broken: discarded
             finally:
@@ -574,7 +585,7 @@ class LoopPool:
                         return
                     fresh.close(timeout=1.0)
                     continue  # a new trip arrived meanwhile: judge again
-            except Exception:
+            except Exception:  # noqa: BLE001  # the breaker's recovery loop: one failed attempt must not end it
                 logger.debug("loop DB pool recovery attempt failed", exc_info=True)
             time.sleep(self._BACKOFF_S[min(attempt, len(self._BACKOFF_S) - 1)])
             attempt += 1
@@ -630,7 +641,7 @@ def arm_loop_pool(thread_ident: int | None = None, *, open_wait_s: float = 2.0) 
     )
     try:
         lp.open(wait_s=open_wait_s)
-    except Exception:
+    except psycopg.Error:
         logger.warning("loop DB pool: not full after %.0fs; it keeps connecting", open_wait_s)
     old = _loop_db
     _set_loop_pool(lp)

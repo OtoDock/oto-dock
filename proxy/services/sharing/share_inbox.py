@@ -56,7 +56,4 @@ async def send(targets: dict[str, set[str]] | dict[str, list[str]]) -> None:
         frame = {"type": wire.SHARE_INBOX, "pending": counts.get(sub, 0),
                  "agents": sorted(a for a in agents if a)}
         for c in nm.get_all_connections(sub):
-            try:
-                c.queue.put_nowait(frame)
-            except Exception as e:
-                logger.debug("share_inbox to %s: %s", c.connection_id[:8], e)
+            c.queue.put_nowait(frame)

@@ -90,4 +90,66 @@ describe('useSwipeGesture iframe routing', () => {
     act(() => emitIframeSwipe({ el: innerFrame, dir: 'left' }))
     expect(onSwipeLeft).not.toHaveBeenCalled()
   })
+
+  it('ignores forwarded swipes when asked (a settings page)', () => {
+    renderHook(() => {
+      const ref = useRef<HTMLElement | null>(container)
+      useSwipeGesture(ref, { onSwipeRight, ignoreIframeSwipes: true })
+    })
+    act(() => emitIframeSwipe({ el: innerFrame, dir: 'right' }))
+    expect(onSwipeRight).not.toHaveBeenCalled()
+  })
+})
+
+describe('useSwipeGesture edge dead zone', () => {
+  const onSwipeRight = vi.fn()
+  let container: HTMLDivElement
+  const originalWidth = window.innerWidth
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    Object.defineProperty(window, 'innerWidth', { value: 400, configurable: true })
+    container = document.createElement('div')
+    document.body.append(container)
+  })
+
+  afterEach(() => {
+    Object.defineProperty(window, 'innerWidth', { value: originalWidth, configurable: true })
+    vi.restoreAllMocks()
+    container.remove()
+  })
+
+  function touch(type: string, x: number, at: number) {
+    vi.spyOn(Date, 'now').mockReturnValue(at)
+    const e = new Event(type)
+    const point = [{ clientX: x, clientY: 300 }]
+    Object.defineProperty(e, type === 'touchend' ? 'changedTouches' : 'touches', { value: point })
+    container.dispatchEvent(e)
+  }
+
+  function swipeRight(fromX: number) {
+    touch('touchstart', fromX, 1000)
+    touch('touchend', fromX + 150, 1200)
+  }
+
+  function mount(edgeDeadZone?: number) {
+    renderHook(() => {
+      const ref = useRef<HTMLElement | null>(container)
+      useSwipeGesture(ref, { onSwipeRight, edgeDeadZone })
+    })
+  }
+
+  it('counts a swipe from the screen edge by default', () => {
+    mount()
+    swipeRight(5)
+    expect(onSwipeRight).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves the edge to the system back gesture with a dead zone', () => {
+    mount(20)
+    swipeRight(5)
+    expect(onSwipeRight).not.toHaveBeenCalled()
+    swipeRight(60)
+    expect(onSwipeRight).toHaveBeenCalledTimes(1)
+  })
 })

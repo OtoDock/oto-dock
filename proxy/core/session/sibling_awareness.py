@@ -24,8 +24,8 @@ import asyncio
 import logging
 import time
 
-from storage import database as task_store
 from core.session import session_kind
+from storage import database as task_store
 
 logger = logging.getLogger("otodock.siblings")
 
@@ -201,7 +201,7 @@ async def prelude_line(session_id: str) -> str:
             return ""
         return await asyncio.to_thread(_line_for_chat_sync, chat_id)
     except Exception:
-        logger.exception(f"sibling prelude failed for session {session_id[:8]}")
+        logger.exception("sibling prelude failed for session %s", session_id[:8])
         return ""
 
 
@@ -212,7 +212,7 @@ async def prepend_if_changed(chat_id: str, text: str) -> str:
     try:
         line = await asyncio.to_thread(_line_for_chat_sync, chat_id)
     except Exception:
-        logger.exception(f"sibling piggyback failed for chat {chat_id[:8]}")
+        logger.exception("sibling piggyback failed for chat %s", chat_id[:8])
         return text
     return f"{line}\n\n{text}" if line else text
 
@@ -226,7 +226,7 @@ def context_block(agent_name: str, user_sub: str) -> str | None:
                  if user_sub else shared_chat_owner(agent_name))
         siblings, tasks = _gather_sync(agent_name, owner, own_chat_id="")
     except Exception:
-        logger.exception(f"sibling context block failed for agent {agent_name}")
+        logger.exception("sibling context block failed for agent %s", agent_name)
         return None
     if not siblings and not tasks:
         return None

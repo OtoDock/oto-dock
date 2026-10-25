@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 import config
 from app import app
-from auth import session_revocation, token_holder
+from auth import session_revocation, token_holder, tokens
 from auth.providers import create_session_jwt, validate_session_jwt
 from storage import database as task_store
 from tests.conftest import live_session_token
@@ -78,8 +78,8 @@ class TestLogout:
         # Past the halfway point of its life: the sliding refresh re-mints
         # it, with the same sign-in id.
         now = int(time.time())
-        old = jwt.encode({**jwt.decode(_cookie(), config.JWT_SECRET, algorithms=["HS256"]),
-                          "iat": now - 3600, "exp": now + 600}, config.JWT_SECRET, algorithm="HS256")
+        old = tokens.mint(tokens.SIGN_IN, {**tokens.decode(_cookie(), tokens.SIGN_IN),
+                                           "iat": now - 3600, "exp": now + 600})
         r = _me(old)
         assert r.status_code == 200
         minted = [v for v in r.headers.get_list("set-cookie") if v.startswith("session=")]
@@ -122,7 +122,10 @@ class TestLogout:
         assert kept_until >= payload["exp"]
 
     def test_the_socket_refuses_a_revoked_cookie_at_connect(self):
-        from tests.fixtures.ws_dashboard_harness import FakeDashboardWebSocket, run_ws_scenario
+        from tests.fixtures.ws_dashboard_harness import (
+            FakeDashboardWebSocket,
+            run_ws_scenario,
+        )
         from ws import dashboard
         first = _cookie()
         client.post("/auth/logout", headers={"Cookie": f"session={first}"})
@@ -142,10 +145,9 @@ class TestLogout:
 def _older_cookie(sub: str, age_s: int = 60) -> str:
     """A cookie minted ``age_s`` ago (the epoch has a 5 s grace)."""
     _backdate_row(sub)
-    payload = jwt.decode(_cookie(sub), config.JWT_SECRET, algorithms=["HS256"])
+    payload = tokens.decode(_cookie(sub), tokens.SIGN_IN)
     now = int(time.time())
-    return jwt.encode({**payload, "iat": now - age_s, "exp": now + 7200},
-                      config.JWT_SECRET, algorithm="HS256")
+    return tokens.mint(tokens.SIGN_IN, {**payload, "iat": now - age_s, "exp": now + 7200})
 
 
 class TestEpoch:
@@ -274,6 +276,7 @@ class TestPlatformRoleLowered:
 
     def test_a_sign_in_the_identity_provider_lowers_keeps_its_new_cookie(self):
         import asyncio
+
         from api.auth.admin_users import apply_platform_role_change
         task_store.update_user_role("user-viewer", "creator")
         before = task_store.get_user("user-viewer")

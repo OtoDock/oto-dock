@@ -22,9 +22,9 @@ import logging
 from pathlib import Path
 
 import config
+from core import layout
 from storage import database as task_store
 from storage.agents import agent_store
-from core import layout
 
 logger = logging.getLogger("otodock.agents")
 
@@ -66,7 +66,7 @@ async def remove_synced_setup_file(agent: str, abs_path: Path | None, rel_path: 
     config write back), author clear, live-delete fan-out, and a commit in
     the owning git repo when the file is tracked (so the dashboard revert
     button cannot silently resurrect a completed setup)."""
-    if abs_path is None or not abs_path.is_file():
+    if abs_path is None or not await asyncio.to_thread(abs_path.is_file):
         return False
     try:
         await asyncio.to_thread(abs_path.unlink)
@@ -74,6 +74,7 @@ async def remove_synced_setup_file(agent: str, abs_path: Path | None, rel_path: 
         logger.exception("complete-setup: failed to remove %s for %s", rel_path, agent)
         return False
     import time as _time
+
     from storage.files import file_author_store, file_tombstones_store
     await asyncio.to_thread(file_tombstones_store.record, agent, rel_path, _time.time(),
                             origin="complete-setup")
@@ -102,7 +103,7 @@ async def complete_user_setup(agent: str, username: str, user_sub: str) -> dict:
         agent, user_setup_path(agent, username), rel, layout.context_dir(agent_dir, username))
     if removed:
         try:
-            from api.apps import catalog
+            from services.apps import catalog
             catalog.file_changed([user_sub], agent, rel, source="setup")
         except Exception:
             logger.exception("complete-setup: file_changes delta failed for %s", rel)

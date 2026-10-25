@@ -20,8 +20,8 @@ import sys
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
@@ -54,8 +54,8 @@ def _make_default_agent(slug: str, role: str = "viewer") -> None:
 
 class TestAssignDefaultAgents:
     def test_attaches_user_to_single_default_agent(self, temp_db):
-        from storage import database as db
         from services.community.default_agent_assigner import assign_default_agents
+        from storage import database as db
 
         _make_user("u1", "u1@example.com")
         _make_default_agent("default-a", role="viewer")
@@ -69,8 +69,8 @@ class TestAssignDefaultAgents:
         assert db.is_default_agents_assigned("u1") is True
 
     def test_attaches_to_multiple_default_agents(self, temp_db):
-        from storage import database as db
         from services.community.default_agent_assigner import assign_default_agents
+        from storage import database as db
 
         _make_user("u1", "u1@example.com")
         _make_default_agent("default-a", role="viewer")
@@ -84,8 +84,8 @@ class TestAssignDefaultAgents:
     def test_no_defaults_still_marks_user_assigned(self, temp_db):
         """When no agent has default_for_new_users_role set, the user is
         still flagged so OIDC re-logins skip the (cheap) pass."""
-        from storage import database as db
         from services.community.default_agent_assigner import assign_default_agents
+        from storage import database as db
 
         _make_user("u1", "u1@example.com")
         assign_default_agents("u1")
@@ -95,8 +95,8 @@ class TestAssignDefaultAgents:
     def test_second_call_short_circuits_via_assigned_bool(self, temp_db):
         """OIDC re-login should not re-attach after admin
         removes the user from the default agent."""
-        from storage import database as db
         from services.community.default_agent_assigner import assign_default_agents
+        from storage import database as db
 
         _make_user("u1", "u1@example.com")
         _make_default_agent("default-a", role="viewer")
@@ -115,8 +115,8 @@ class TestAssignDefaultAgents:
     def test_pk_conflict_keeps_existing_higher_role(self, temp_db):
         """Admin is already manager → default-as-viewer
         attempt hits the PK and no-ops; admin stays manager."""
-        from storage import database as db
         from services.community.default_agent_assigner import assign_default_agents
+        from storage import database as db
 
         _make_user("admin1", "admin@example.com", role="admin")
         _make_default_agent("default-a", role="viewer")
@@ -150,8 +150,8 @@ class TestAssignDefaultAgents:
         installer path; firing again on the conflict path would double the
         idempotent-guard work for the installer's own pair.
         """
-        from storage import database as db
         from services.community.default_agent_assigner import assign_default_agents
+        from storage import database as db
 
         _make_user("u1", "u1@example.com")
         _make_default_agent("default-a", role="viewer")
@@ -165,8 +165,8 @@ class TestAssignDefaultAgents:
 
     def test_hook_failure_keeps_attach(self, temp_db):
         """Hook raises → attach stays, error logged, other agents still run."""
-        from storage import database as db
         from services.community.default_agent_assigner import assign_default_agents
+        from storage import database as db
 
         _make_user("u1", "u1@example.com")
         _make_default_agent("default-a", role="viewer")
@@ -185,8 +185,8 @@ class TestAssignDefaultAgents:
 
     def test_per_agent_attach_error_doesnt_abort_loop(self, temp_db):
         """One add_user_agent failure shouldn't block the other agents."""
-        from storage import database as db
         from services.community.default_agent_assigner import assign_default_agents
+        from storage import database as db
 
         _make_user("u1", "u1@example.com")
         _make_default_agent("default-a", role="viewer")
@@ -220,8 +220,8 @@ class TestAssignDefaultAgents:
         is NOT retroactively attached. assign_default_agents was already
         called on user creation (when there were no defaults), and the
         bool prevents a re-run from doing anything."""
-        from storage import database as db
         from services.community.default_agent_assigner import assign_default_agents
+        from storage import database as db
 
         _make_user("u1", "u1@example.com")
         # User creation path — no defaults exist yet — marks them assigned.

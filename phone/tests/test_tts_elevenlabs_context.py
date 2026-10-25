@@ -15,7 +15,6 @@ import base64
 import json
 
 import pytest
-
 from audio.providers.tts import elevenlabs as el
 
 _AUDIO = base64.b64encode(b"\x00" * 320).decode()

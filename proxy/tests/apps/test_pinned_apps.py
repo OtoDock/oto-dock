@@ -20,13 +20,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 import config
-from api.apps import manifest as _mf
 from app import app
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
-from tests.conftest import live_session_token
 from core.session import session_state
+from services.apps import manifest as _mf
 from storage import database as task_store
+from tests.conftest import live_session_token
 
 client = TestClient(app)
 
@@ -816,7 +816,7 @@ def test_htmlless_pin_reads_the_file_through_from_the_satellite(agent_tree):
 
     async def _pull(machine_id, ref, dest_path, *, agent_slug="", timeout=180.0):
         pulls.append(ref.value)
-        Path(dest_path).write_text("<p>v2 edited on the satellite</p>")
+        Path(dest_path).write_text("<p>v2 edited on the satellite</p>")  # noqa: ASYNC240  # a test's own temporary files
         return True
 
     cm = MagicMock()
@@ -865,7 +865,7 @@ def fake_mcps(monkeypatch):
     no manifests in the test env). The manifest name 'test-mcp-manifest' maps
     to the same canonical server key, mirroring assigned_mcp_keys."""
     monkeypatch.setattr(
-        "api.apps.manifest.assigned_mcp_keys",
+        "services.apps.manifest.assigned_mcp_keys",
         lambda agent: {"test-mcp": "test-mcp", "test-mcp-manifest": "test-mcp"},
     )
 
@@ -1008,7 +1008,7 @@ def test_mcp_tool_exec_recheck_and_list_flags(agent_tree, fake_mcps, monkeypatch
     monkeypatch.setattr("services.apps.headless_exec.execute_app_tool", boom)
 
     # MCP unassigned since approval → 409 at click time; the list flags it.
-    monkeypatch.setattr("api.apps.manifest.assigned_mcp_keys", lambda agent: {})
+    monkeypatch.setattr("services.apps.manifest.assigned_mcp_keys", lambda agent: {})
     r = client.post(f"/v1/apps/{app_id}/actions/run", json={"args": {"text": "x"}})
     assert r.status_code == 409 and "no longer available" in r.json()["detail"]
     listed = client.get(f"/v1/apps?agent={AGENT}").json()["apps"]
@@ -1018,7 +1018,7 @@ def test_mcp_tool_exec_recheck_and_list_flags(agent_tree, fake_mcps, monkeypatch
 
     # Approver demoted to viewer → approval stale (mcp_tool runs on the
     # approver's standing surface authority).
-    monkeypatch.setattr("api.apps.manifest.assigned_mcp_keys",
+    monkeypatch.setattr("services.apps.manifest.assigned_mcp_keys",
                         lambda agent: {"test-mcp": "test-mcp"})
     task_store.set_user_agents("alice-sub", [AGENT], "test",
                                agent_roles={AGENT: "viewer"})
@@ -1076,6 +1076,7 @@ def test_fire_task_args_from_a_link_visitor_are_fenced(agent_tree, monkeypatch):
     """F54: an external link's visitor is an outside party, so the values
     they pass are fenced in the task prompt; a signed-in person's are not."""
     import asyncio
+
     from api.apps import app_actions
     from services.infra import external_data
     from storage import database as task_store
@@ -1477,6 +1478,7 @@ def test_warm_endpoint_on_a_freshly_booted_host(agent_tree, fake_mcps, monkeypat
     # "fired at zero", or the first warm after a reboot is refused for the
     # whole interval (CI runners are minutes old when the suite reaches here).
     from types import SimpleNamespace
+
     from api.apps import apps as apps_api
     monkeypatch.setattr(apps_api, "time", SimpleNamespace(monotonic=lambda: 12.0))
 

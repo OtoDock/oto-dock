@@ -8,17 +8,34 @@ itself up after firing), and **trigger-fired** (no schedule — runs when a wire
 fires). Chats can also schedule a **continuation** — a bounded future wake of the same
 conversation.
 
-- **Scopes**: *user* (private to the creator — any user) vs *agent* (team-visible,
-  results in the shared workspace — needs per-agent **editor+**). Agent-scope runs
-  created by a **manager/admin** get knowledge write access; editor-created stay
-  read-only. A **Shared only** agent offers the agent scope alone, so its tasks need
-  editor+; a viewer's or contributor's personal task from before the switch fails each
-  run with a message saying so.
+- **Scopes**: *user* (private to the creator — any user) vs *agent* (team-visible, results
+  in the shared workspace — needs per-agent **editor+**). Agent-scope runs created by a
+  **manager/admin** get knowledge write access; editor-created stay read-only. A task or
+  trigger that runs without a person reaches the agent's shared workspace and knowledge,
+  never a person's private folder, and the agent's settings only when its creator manages
+  the agent (since 1.9.0). A **Shared only** agent offers the agent scope alone, so its
+  tasks need editor+; a viewer's or contributor's personal task from before the switch
+  fails each run with a message saying so.
 - **Completion notification** (required per task): *auto* (generic "Task Complete/
   Failed"), *manual* (the agent writes its own, with real results — the common choice),
   *none* (silent). Failures always notify except in *none*.
 - **Checks**: a task can name checks that judge each run; a run whose check still fails
   is reported failed (see Checks below).
+- **Permission mode**: a task runs in **Don't Ask** by default (nobody is there to
+  answer, so every tool runs; the few tools that always ask are refused). A task can be
+  set to **Auto** instead (`permission_mode` on the tasks API): reading and editing run,
+  and the engine's own reviewer checks everything else (on Codex only what reaches
+  beyond the workspace: a command inside it runs without a check); something that
+  needs a check and cannot get one is refused, and the run says why. Auto needs Claude
+  Code or Codex; a task on Direct LLM is refused Auto. An Auto task always runs
+  headless, never in a terminal.
+- **Machine**: a task can name the machine its runs use instead of the agent's usual
+  place (`machine` on the schedules tools, or the row's Settings). A person's own task
+  can run on one of their own computers, and an admin can also pick an admin machine. A
+  task that runs without a person never runs on a personal computer. A delegated job
+  takes a machine the same way (`machine` on `delegate`). When the machine is offline
+  at run time, the run uses the agent's usual place and its chat says so.
+  `get_task` shows the machine, and `get_task_history` shows where each run ran.
 - **Model pinning**: a task can pin a specific model and engine for its runs, leaving
   the agent's default untouched — the lever for "lighter default, one demanding daily job
   on a strong model". Ask the user before pinning; read the current pin back from
@@ -27,7 +44,7 @@ conversation.
   pick by capability tier (`[t1]` frontier … `[t4]` fast), never by the id's name.
   Both Scheduled Tasks pages show the effective model per task as a chip carrying the
   tier dots (the word in the tooltip); both Triggers pages show the linked task's model
-  beside the task name; an app-handler task row carries no model (no LLM turn).
+  beside the task name, and an **App server** task row carries no model (no LLM turn).
 - Every run's first prompt carries the current time in the task's zone and the agent's
   other running tasks, so a run knows when it is and what else is going on.
 - Tasks sharing a fire time have their session starts spaced a few seconds apart
@@ -51,9 +68,10 @@ conversation.
   their rows (hover for the date). A transferred task runs without writing knowledge
   until a manager of the agent (or an admin) adopts it by editing its prompt.
 - **Managing**: Agent Settings → Monitoring → Scheduled Tasks (run/pause/resume/delete,
-  role-gated per row); run history in the sidebar's Task history view (rename/delete,
+  role-gated per row, and **Settings** for the task's machine and mode for a person who
+  may edit the task); run history in the sidebar's Task history view (rename/delete,
   role-gated); a finished run's chat can be continued — and, once over, switched to
-  another engine/model from its picker (editor+, platform-pool credentials).
+  another engine/model from its picker (editor+, on the subscriptions admins share with agents).
 
 ## Triggers
 
@@ -71,23 +89,23 @@ through the agent in chat.
   payload fields substitute into task prompts and notification text as
   `{{placeholders}}`.
 - **Vendor events**: connected integrations with an event API (GitHub, Linear, Slack,
-  Microsoft 365, Zoom, Notion) register subscriptions automatically — subscribe from
-  the account card under **User Settings → Integrations**, then create a trigger
-  against the subscription with an event filter (`event_type` must be one of the
-  subscription's event names). GitHub offers **One repository** or **Every repository
-  in an organization** (one hook for every present and future repository; the connected
-  account needs the Organization webhooks permission and owner rights on the
-  organization). A subscription has a scope: **Subscribe as: Me** makes a personal one
+  Microsoft 365, Zoom, Notion) register subscriptions automatically — subscribe from the
+  account card under **User Settings → Integrations**, then create a trigger against the
+  subscription with an event filter (`event_type` must be one of the subscription's event
+  names). GitHub offers **One repository** or **Every repository in an organization** (one
+  hook for every present and future repository; the connected account needs the
+  Organization webhooks permission and owner rights on the organization). A GitHub account
+  connected through a GitHub App subscribes one of its installations instead, picked from
+  a list. A subscription has a scope: **Subscribe as: Me** makes a personal one
   (user-scope triggers only); **Subscribe as: <agent>**, or Agent Settings → MCPs →
   **Subscribe to events for this agent** *(manager)*, subscribes the agent on its own
-  behalf through its service account, the only kind an agent-scope trigger (one that
-  wakes a shared app, say) can link to. A
-  user trigger links only to a personal subscription, an agent trigger only to that
-  agent's; the trigger form's picker lists just the matching ones. Deleting a
-  subscription that triggers still fire from asks twice; the triggers stay but stop
-  receiving events. Delivery is asynchronous — wait ~10–15 s before judging a test. A
-  GitHub event that reaches the install twice (a repository's and its organization's
-  subscription, or two accounts) wakes an action once.
+  behalf through its service account, the only kind an agent-scope trigger (one that wakes
+  a shared app, say) can link to. A user trigger links only to a personal subscription, an
+  agent trigger only to that agent's; the trigger form's picker lists just the matching
+  ones. Deleting a subscription that triggers still fire from asks twice; the triggers
+  stay but stop receiving events. Delivery is asynchronous — wait ~10–15 s before judging
+  a test. A GitHub event that reaches the install twice (a repository's and its
+  organization's subscription, or two accounts) wakes an action once.
 - Extras: per-trigger debounce; pause/resume; test-fire from chat; the trigger rows and
   webhook URLs live on **Agent Settings → Monitoring → Triggers**.
 
@@ -109,7 +127,7 @@ rounds, 3 by default). The judge never writes; the worker fixes.
   someone attached it.
 - **Who**: managers and admins create, edit and remove the agent's checks, mark them
   mandatory and set a daily spending cap, on **Agent Settings → Checks** or through the
-  agent. Everyone with access sees that tab (the checks and the verdicts they may see)
+  agent. Everyone with access sees that section (the checks and the verdicts they may see)
   and, through you, attaches an offered check to the current chat, runs one by hand,
   or names checks on a task or a delegation. Attaching is your tool, not a dashboard
   button: a user who wants a check on their chat asks you. A person with personal chats
@@ -124,12 +142,12 @@ The checks MCP carries the tools (`list_checks`, `attach_check`, `detach_check`,
 `delete_private_check`) and the `checks` skill; load that skill before you create,
 attach or explain one. It is a core tool for agents created since 1.7; an older agent
 gets it when a manager enables it on **Agent Settings → MCPs** or updates the agent from
-its template (until then the Checks tab says the tool is off).
+its template (until then the Checks section says the tool is off).
 
 ## Notifications
 
-Delivered where the user is: dashboard toast + bell inbox when active, browser push when
-away; every notification lands in the inbox regardless. Severities: info/success
+Delivered where the user is: dashboard toast + bell inbox when active, browser push and
+the Android app when away. Every notification lands in the inbox regardless. Severities: info/success
 (chime), warning (amber, distinct sound), **danger** (stays until dismissed, alarm —
 reserve for genuine emergencies). Titles cap at 100 chars, bodies ~2 short sentences —
 write headlines, details stay in the linked chat/run. Notifications can be scheduled

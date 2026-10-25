@@ -31,7 +31,7 @@ import pytest
 from services.scheduler import runner, scheduler, shared
 from storage import database as task_store
 from storage.automation import db_tasks, run_status
-from tests.tasks.test_run_stream_terminal import _Layer, _drive, _settle
+from tests.tasks.test_run_stream_terminal import _drive, _Layer, _settle
 
 pytestmark = pytest.mark.asyncio
 
@@ -225,3 +225,65 @@ async def test_a_delivery_that_raises_after_the_verdict_is_retried_with_the_same
     assert notifications == ["Task Complete: count"]  # sent before the delivery, once
     assert retries == []
     assert _row_gone(task_id)
+
+
+# ---------------------------------------------------------------------------
+# What the runner tells the delivery about the run's own end (the delegate
+# result's "ended without a report")
+# ---------------------------------------------------------------------------
+def _recorded_deliveries(monkeypatch) -> list[dict]:
+    from services.scheduler import delivery
+    seen: list[dict] = []
+
+    async def _record(task_def, final_status, final_output, **kw):
+        seen.append({"status": final_status, "output": final_output, **kw})
+
+    monkeypatch.setattr(delivery, "_deliver_task_result", _record)
+    return seen
+
+
+async def test_a_failure_after_the_turn_finished_never_marks_the_report_cut(temp_db, monkeypatch, notifications, retries):
+    from services.scheduler import lanes
+    run_id, task_id = "run-rm1", "t-rm1"
+    task = _one_time(task_id)
+    seen = _recorded_deliveries(monkeypatch)
+
+    def _boom(chat_row):
+        raise RuntimeError("a read after the turn failed")
+
+    monkeypatch.setattr(lanes, "_post_run_session_action", _boom)
+    t, _q = _drive(monkeypatch, _Layer(hold=False), task, run_id, "77777777-7777-4777-8777-777777rm0001")
+    try:
+        await asyncio.wait_for(t, 20)
+        await _settle(f"task-{run_id}")
+        await _tick()
+    finally:
+        shared._run_subscribers.pop(run_id, None)
+    assert [(d["status"], d["output"], d["cut_short"]) for d in seen] == [
+        (run_status.FAILED, "1\n2\n", "")]
+
+
+async def test_a_turn_the_engine_ends_half_way_is_cut_short(temp_db, monkeypatch, notifications, retries):
+    from core.events.common_events import DONE, ERROR, TEXT, CommonEvent
+    run_id, task_id = "run-rm2", "t-rm2"
+    task = _one_time(task_id)
+    seen = _recorded_deliveries(monkeypatch)
+
+    class _ErrorsHalfWay(_Layer):
+        async def send_message(self, session_id, prompt, **kw):
+            yield CommonEvent(type=TEXT, data={"content": "Now I will run the gates.\n"})
+            yield CommonEvent(type=ERROR, data={"message": "Not logged in"})
+            yield CommonEvent(type=DONE, data={})
+
+    t, _q = _drive(monkeypatch, _ErrorsHalfWay(hold=False), task, run_id, "77777777-7777-4777-8777-777777rm0002")
+    try:
+        await asyncio.wait_for(t, 20)
+        await _settle(f"task-{run_id}")
+        await _tick()
+    finally:
+        shared._run_subscribers.pop(run_id, None)
+    assert len(seen) == 1
+    assert seen[0]["status"] == run_status.FAILED
+    assert seen[0]["cut_short"] == "error"
+    # The chat's last row when the turn ended: a later person's row continues the lane.
+    assert seen[0]["turn_end_cursor"] > 0

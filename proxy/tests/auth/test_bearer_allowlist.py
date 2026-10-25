@@ -7,10 +7,11 @@ functions exercised with synthetic inputs.
 """
 
 import uuid
+
 import pytest
 
-from storage.identity import bearer_allowlist
 from services.mcp import mcp_registry
+from storage.identity import bearer_allowlist
 
 
 def _fresh_provider() -> str:

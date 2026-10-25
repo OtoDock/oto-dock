@@ -31,7 +31,7 @@ export default function ResponsiveDrawer({
     <>
       {/* Mobile backdrop */}
       <div
-        className={`fixed inset-0 bg-black/40 z-40 md:hidden transition-opacity duration-200
+        className={`fixed inset-0 bg-surface-scrim z-40 md:hidden transition-opacity duration-200
           ${open ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
         onClick={onClose}
       />

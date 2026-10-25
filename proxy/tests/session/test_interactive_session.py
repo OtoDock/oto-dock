@@ -743,8 +743,8 @@ class TestInteractiveSession:
         # and dropped: it could not be answered from the history and the
         # late-arriving reply text rendered below it). The park only flips
         # the live state and pings.
-        from services.notifications import notification_manager as nm
         from core.session import transcript_tool_events as tte
+        from services.notifications import notification_manager as nm
         rows = []
         monkeypatch.setattr(nm, "broadcast_chat_status", lambda *a, **k: None)
         monkeypatch.setattr(nm, "agent_label", lambda a: a)
@@ -1046,6 +1046,23 @@ class TestPostBatchEffects:
         s._post_batch_effects({"persisted": 2})
         assert len(calls) == 1
 
+    async def test_a_batch_reaches_the_duplex_feed_through_its_listener(self, monkeypatch):
+        """Core never imports the socket package: the duplex feed registers
+        itself as a batch listener when ``ws.duplex_attach`` is imported, and
+        the listener reads ``on_interactive_batch`` at call time."""
+        from services.notifications import notification_manager as nm
+        from ws import duplex_attach
+        assert duplex_attach._feed_listener in isess._batch_listeners
+        fed = []
+        monkeypatch.setattr(nm, "broadcast_chat_rows", lambda *a, **k: None)
+        monkeypatch.setattr(duplex_attach, "on_interactive_batch",
+                            lambda chat_id, **kw: fed.append((chat_id, kw)))
+        s = isess.InteractiveSession(session_id="pb-feed", chat_id="c-feed",
+                                     agent_name="agent", user_sub="u1")
+        s._chat_owner_sub = "u1"
+        s._post_batch_effects({"persisted": 2})
+        assert fed == [("c-feed", {"persisted": 2, "turn_open": s._turn_open})]
+
     async def test_compaction_while_idle_runs_turn_end(self, monkeypatch):
         s = isess.InteractiveSession(session_id="pb-3", chat_id="c-pb3",
                                      agent_name="agent", user_sub="u1")
@@ -1177,6 +1194,22 @@ class TestDelegateWakeReplayOnRegister:
             assert queued == ["REPLAYED WAKE"]
             # Claimed atomically — the store is empty now.
             assert task_store.claim_pending_delegate_wake("chat-wake") == []
+        finally:
+            await s.close(reason="test-end")
+
+    @pytest.mark.asyncio
+    async def test_a_meeting_note_stays_for_the_next_typed_message(self, temp_db):
+        """A terminal's start replays the wakes only: a note waits for the
+        person's next message, never queued as a turn of its own."""
+        from storage import database as task_store
+        task_store.create_chat("chat-note", "user-1", "agent")
+        task_store.append_pending_delegate_wake("chat-note", "A WAKE")
+        task_store.append_pending_delegate_wake("chat-note", "A NOTE", note=True)
+
+        s = await _register("sid-note", chat_id="chat-note")
+        try:
+            assert [item["text"] for item in s._prompt_queue] == ["A WAKE"]
+            assert task_store.claim_pending_notes("chat-note") == ["A NOTE"]
         finally:
             await s.close(reason="test-end")
 
@@ -1317,6 +1350,7 @@ async def test_register_records_the_owner_and_takes_a_spawn_slot(monkeypatch):
     per-person count (never refused on the cap: the person asked for this
     chat) and the local spawn runs inside a spawn slot."""
     import contextlib
+
     from core.sandbox import pty_relay
 
     seen: dict = {}
@@ -1352,6 +1386,7 @@ async def test_reap_idle_reads_the_cached_timeout(monkeypatch):
     """The reaper's default timeout comes from the cached, off-loop
     read; the setting is never read on the loop per tick."""
     from unittest.mock import AsyncMock
+
     from core.session import session_state
     monkeypatch.setattr(session_state, "cached_idle_timeout", AsyncMock(return_value=1))
     s = await _register("sid-cached-timeout")
@@ -1408,7 +1443,7 @@ def _fake_satellite(monkeypatch):
 
 
 async def _register_remote_parked(session_id: str, payload: dict):
-    from core.execution_layer import DEFAULT_EXECUTION_PATH
+    from storage.agents.schema import DEFAULT_EXECUTION_PATH
     s = await isess.register_remote(
         session_id=session_id, chat_id="chat-1", agent_name="agent",
         machine_id="machine-1", execution_path=DEFAULT_EXECUTION_PATH,

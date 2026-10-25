@@ -1,5 +1,6 @@
 import { memo, useEffect } from 'react'
-import { useSearch } from '../../contexts/SearchContext'
+import { useSearch } from '../../contexts/useSearch'
+
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -38,13 +39,14 @@ function SearchHighlightInner({ text, matchId, order, inUserBubble }: Props) {
   const globalOffset = getGlobalOffset(matchId)
   let localIdx = 0
 
-  // Colors: inside user bubble (white on brand blue) vs assistant message
+  // Colors: inside the user bubble (its white on the action fill) vs an
+  // assistant message
   const normalCls = inUserBubble
-    ? 'bg-white/30 rounded-sm'
-    : 'bg-brand-100 rounded-sm'
+    ? 'bg-action-fg/30 rounded-sm'
+    : 'bg-action-subtle rounded-sm'
   const activeCls = inUserBubble
-    ? 'bg-white/50 ring-1 ring-white/70 rounded-sm'
-    : 'bg-brand/20 ring-1 ring-brand rounded-sm'
+    ? 'bg-action-fg/50 ring-1 ring-action-fg rounded-sm'
+    : 'bg-action-subtle-hover ring-1 ring-action rounded-sm'
 
   return (
     <>

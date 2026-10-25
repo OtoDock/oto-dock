@@ -7,10 +7,16 @@ telephony providers (3CX, Twilio media streams) implement the same surface.
 import inspect
 
 from telephony.audio_socket import (
-    AudioSocketConnection, AudioSocketError, TYPE_AUDIO, TYPE_HANGUP,
+    TYPE_AUDIO,
+    TYPE_HANGUP,
+    AudioSocketConnection,
+    AudioSocketError,
 )
 from transport.base import (
-    FRAME_AUDIO, FRAME_HANGUP, MediaTransport, TransportError,
+    FRAME_AUDIO,
+    FRAME_HANGUP,
+    MediaTransport,
+    TransportError,
 )
 
 

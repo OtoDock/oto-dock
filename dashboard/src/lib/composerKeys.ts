@@ -45,7 +45,7 @@ export function withSendHint(text: string, touchPrimary: boolean): string {
  * reaches the box's onChange through its input event; where it is missing or
  * refused the value is set directly and handed to `onChange`. */
 export function insertNewline(ta: HTMLTextAreaElement, onChange: (value: string) => void): void {
-  let inserted = false
+  let inserted: boolean
   try {
     inserted = typeof document.execCommand === 'function' && document.execCommand('insertText', false, '\n')
   } catch {

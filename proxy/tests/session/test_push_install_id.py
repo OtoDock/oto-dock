@@ -38,7 +38,7 @@ async def test_delivery_push_tags_install_id(monkeypatch):
 async def test_ephemeral_push_tags_install_id(monkeypatch):
     captured = {}
 
-    async def fake_send_fcm(token, payload):
+    async def fake_send_fcm(token, payload, platform="android"):
         captured["payload"] = payload
 
     import services.notifications.push_sender as ps

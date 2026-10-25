@@ -6,10 +6,12 @@ point is :func:`build_permission_context`; the security-context type it reads
 lives in ``auth.path_policy``.
 """
 
-from auth.path_policy import SecurityContext
-from core.session.external_identity import external_home_of, is_external_ctx
+import psycopg
+
 from auth import roles
+from auth.path_policy import SecurityContext
 from core import layout
+from core.session.external_identity import external_home_of, is_external_ctx
 
 
 def _behaviour_of(execution_path: str):
@@ -162,7 +164,7 @@ def _build_execution_scope_section(
         agent_row = agent_store.get_agent(ctx.agent) or {}
         default_scope = agent_row.get("default_scope") or "user"
         collaborative = bool(agent_row.get("collaborative", True))
-    except Exception:
+    except (ImportError, psycopg.Error):
         default_scope = "user"
         collaborative = True
     if default_scope not in ("user", "agent"):
@@ -538,7 +540,7 @@ def _get_default_scope(agent: str) -> str:
         row = agent_store.get_agent(agent) or {}
         ds = row.get("default_scope") or "user"
         return ds if ds in ("user", "agent") else "user"
-    except Exception:
+    except (ImportError, psycopg.Error):
         return "user"
 
 
@@ -944,7 +946,7 @@ def _build_building_agents_section(
                 f"hold, capture that in the persona via {persona_write} "
                 "rather than only in memory.\n\n"
             )
-    except Exception:  # noqa: BLE001 — a prompt notice never breaks a session
+    except Exception:  # noqa: BLE001  # a prompt notice never breaks a session
         notice = ""
 
     return (
@@ -1089,7 +1091,8 @@ def build_permission_context(
         #   - admin role: always available
         #   - manager/editor on remote satellite: available (admin/user
         #     pairing = trust delegation)
-        #   - manager/editor on local sandbox: not available
+        #   - manager/editor on local sandbox: ssh/scp/sftp/rsync to the
+        #     agent's attached SSH hosts only (auth/path_shell_hosts)
         #   - viewer: never available
         if roles.is_admin(ctx.role):
             perm_lines.append(
@@ -1112,10 +1115,13 @@ def build_permission_context(
             )
         else:
             perm_lines.append(
-                "- Host-touching commands (`docker`, `systemctl`, `ssh`, "
+                "- Host-touching commands (`docker`, `systemctl`, `journalctl`, "
                 "`apt`): not available on local sandbox sessions for your "
-                "role. On admin-paired remote satellites, manager / "
-                "editor roles get access.\n"
+                "role. `ssh`, `scp`, `sftp` and `rsync` run to the SSH hosts "
+                "an admin attached to this agent (listed under SSH Hosts when "
+                "there are any), as the user each one names. On admin-paired "
+                "remote satellites, manager / editor roles get every "
+                "host-touching command.\n"
             )
 
         perm_lines.append(

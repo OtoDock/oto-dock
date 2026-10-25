@@ -15,12 +15,17 @@ import logging
 import random
 from datetime import datetime, timezone
 
+import psycopg
 
 import config
-from storage import database as task_store
-from services.scheduler import delivery, shared
-from services.scheduler.delivery_identity import _shared_chat_person, _standing_of, _wake_refused
 from auth import roles
+from services.scheduler import delivery, shared
+from services.scheduler.delivery_identity import (
+    _shared_chat_person,
+    _standing_of,
+    _wake_refused,
+)
+from storage import database as task_store
 from ws import wire_events as wire
 
 logger = logging.getLogger("otodock.scheduler")
@@ -141,7 +146,7 @@ async def _creator_of(task_id: str) -> str:
     try:
         row = await run_db(task_store.get_dynamic_task, task_id)
         return str((row or {}).get("created_by") or "")
-    except Exception:
+    except psycopg.Error:
         logger.debug("spawn gate: creator lookup failed for %s", task_id, exc_info=True)
         return ""
 
@@ -197,13 +202,15 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
     Guards, in order: chat gone → self-cancel; past ``until_at`` → self-cancel;
     coalesce (previous wake unprocessed → skip). Post-fire: one-shot rows
     auto-delete; recurring rows count fires and self-cancel at ``max_runs``."""
-    from services.scheduler import scheduler as _api  # the registry API; a module import would cycle with the facade
     from core.session.session_delivery import deliver_prompt
+
+    # the registry API; a module import would cycle with the facade
+    from services.scheduler import scheduler as _api
 
     chat_id = task.target_chat_id or ""
     chat = await asyncio.to_thread(task_store.get_chat, chat_id) if chat_id else None
     if not chat:
-        logger.info(f"Continuation {task.id}: chat {chat_id[:8] or '-'} gone — cancelling")
+        logger.info("Continuation %s: chat %s gone — cancelling", task.id, chat_id[:8] or '-')
         await _api.remove_dynamic_task(task.id)
         _continuation_cursors.pop(chat_id, None)
         _continuation_skip_counts.pop(task.id, None)
@@ -215,11 +222,11 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
             if until.tzinfo is None:
                 until = until.replace(tzinfo=_api._resolve_task_tz(task))
             if datetime.now(timezone.utc) >= until:
-                logger.info(f"Continuation {task.id}: past until={task.until_at} — cancelling")
+                logger.info("Continuation %s: past until=%s — cancelling", task.id, task.until_at)
                 await _api.remove_dynamic_task(task.id)
                 return ""
         except ValueError:
-            logger.warning(f"Continuation {task.id}: bad until_at {task.until_at!r} — ignoring bound")
+            logger.warning("Continuation %s: bad until_at %r — ignoring bound", task.id, task.until_at)
 
     last_id = await asyncio.to_thread(task_store.get_last_chat_message_id, chat_id)
     prev = _continuation_cursors.get(chat_id)
@@ -227,8 +234,8 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
         skips = _continuation_skip_counts.get(task.id, 0) + 1
         _continuation_skip_counts[task.id] = skips
         logger.info(
-            f"Continuation {task.id}: previous wake still unprocessed on "
-            f"chat {chat_id[:8]} — coalesced (skipped ×{skips})"
+            "Continuation %s: previous wake still unprocessed on "
+            "chat %s — coalesced (skipped ×%s)", task.id, chat_id[:8], skips
         )
         recurring = bool(task.schedule) or task.interval_seconds is not None
         if recurring and task.max_runs and skips > _SKIP_AGING_GRACE:
@@ -237,8 +244,8 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
             )
             if new_count >= task.max_runs:
                 logger.info(
-                    f"Continuation {task.id}: dead-chat skips reached "
-                    f"max_runs={task.max_runs} — cancelling"
+                    "Continuation %s: dead-chat skips reached "
+                    "max_runs=%s — cancelling", task.id, task.max_runs
                 )
                 await _api.remove_dynamic_task(task.id)
                 _continuation_skip_counts.pop(task.id, None)
@@ -260,8 +267,9 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
         # wakes nothing and stores nothing. The fire still counts, so the
         # row ends the way a delivered one does.
         logger.info(
-            f"Continuation {task.id} not delivered: {person[:8]} no longer "
-            f"holds agent '{task.agent}': chat={chat_id[:8]}"
+            "Continuation %s not delivered: %s no longer "
+            "holds agent '%s': chat=%s",
+            task.id, person[:8], task.agent, chat_id[:8]
         )
         await _end_fired_row(task)
         return ""
@@ -315,20 +323,22 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
                     (await run_db(_standing_of, deliver_user_sub, task.agent))[0],
                     shared=bool(shared_person)):
                 logger.info(
-                    f"Continuation {task.id} wake not stored: {deliver_user_sub[:8]} "
-                    f"no longer holds agent '{task.agent}': chat={chat_id[:8]}"
+                    "Continuation %s wake not stored: %s "
+                    "no longer holds agent '%s': chat=%s",
+                    task.id, deliver_user_sub[:8], task.agent, chat_id[:8]
                 )
             elif not spawns:
                 logger.info(
-                    f"Continuation {task.id} wake not stored: no live process took it "
-                    f"and none may start at {deliver_role}: chat={chat_id[:8]}"
+                    "Continuation %s wake not stored: no live process took it "
+                    "and none may start at %s: chat=%s",
+                    task.id, deliver_role, chat_id[:8]
                 )
             elif await delivery._store_undelivered_wakes(
                     chat_id, [wake_prompt], person=deliver_user_sub or "", role=deliver_role,
                     by=creator):
                 logger.info(
-                    f"Continuation {task.id} wake undeliverable: stored for the "
-                    f"chat's next turn: chat={chat_id[:8]}"
+                    "Continuation %s wake undeliverable: stored for the "
+                    "chat's next turn: chat=%s", task.id, chat_id[:8]
                 )
         # The echo lands on the chat's lane behind the wake's own rows (the
         # search row rebuild runs off the loop with it).
@@ -366,12 +376,12 @@ async def _fire_continuation(task: shared.TaskDefinition) -> str:
             oneshot_fn=delivery._deliver_via_oneshot if spawns else None,
             on_outcome=_save_echo,
         )
-        logger.info(f"Continuation {task.id} fired via {outcome.path}: chat={chat_id[:8]}")
+        logger.info("Continuation %s fired via %s: chat=%s", task.id, outcome.path, chat_id[:8])
     except Exception:
         # A rung that raises never reaches the ladder's hook: the event row
         # is written if no rung wrote it, and the wake is stored the way the
         # hook stores an undelivered one (the standing re-check included).
-        logger.exception(f"Continuation {task.id} delivery failed: chat={chat_id[:8]}")
+        logger.exception("Continuation %s delivery failed: chat=%s", task.id, chat_id[:8])
         from core.session.session_delivery import DeliveryOutcome
         if not persisted:
             _persist_wake(chat_id)
@@ -398,5 +408,5 @@ async def _end_fired_row(task: shared.TaskDefinition) -> None:
         task_store.increment_dynamic_task_run_count, task.id,
     )
     if task.max_runs and new_count >= task.max_runs:
-        logger.info(f"Continuation {task.id}: reached max_runs={task.max_runs}, cancelling")
+        logger.info("Continuation %s: reached max_runs=%s, cancelling", task.id, task.max_runs)
         await _api.remove_dynamic_task(task.id)

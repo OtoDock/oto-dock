@@ -29,13 +29,17 @@ import signal
 import time
 from pathlib import Path
 
+from .. import config
+from .._vendored import layout
 from ..config import (
-    force_rmtree, kill_process_tree, otodock_dir, reap_descendants, snapshot_descendants,
+    force_rmtree,
+    kill_process_tree,
+    otodock_dir,
+    reap_descendants,
+    snapshot_descendants,
 )
 from ..host.auth_paths import is_safe_slug
 from ..host.env_hygiene import curate_satellite_env
-from .. import config
-from .._vendored import layout
 
 logger = logging.getLogger("satellite")
 
@@ -72,7 +76,7 @@ def wipe_steps_root() -> None:
     if root.exists():
         try:
             force_rmtree(root)
-        except Exception:
+        except OSError:
             logger.warning("steps: could not wipe %s", root, exc_info=True)
 
 
@@ -143,8 +147,8 @@ def _validate(msg: dict, agents_dir: Path) -> dict:
         from ..terminal.pty_session_base import resolve_work_cwd
         try:
             cwd = resolve_work_cwd(cwd_abs, agent_dir, ws_rel)
-        except Exception as e:  # noqa: BLE001 — the guard's own words are the reason
-            raise StepRefused(f"the working folder is refused: {e}")
+        except Exception as e:  # the guard's own words are the reason
+            raise StepRefused(f"the working folder is refused: {e}") from e
     else:
         cwd = _resolve_inside(agent_dir, ws_rel)
         if not cwd.is_dir():
@@ -276,7 +280,7 @@ async def run_step(msg: dict, ws, agents_dir: Path, local_tunnel_port: int,
         async def _exited() -> None:
             # The return code, not wait(): wait() also waits for the pipe,
             # which a child the script left behind can hold open.
-            while proc.returncode is None:
+            while proc.returncode is None:  # noqa: ASYNC110  # wait() also waits for the pipes a stray child may hold open
                 await asyncio.sleep(0.1)
 
         timed_out = False
@@ -318,7 +322,7 @@ async def run_step(msg: dict, ws, agents_dir: Path, local_tunnel_port: int,
                    output=cap.text(), timed_out=timed_out, seconds=round(seconds, 1))
     except asyncio.CancelledError:
         raise
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the step answers an error ack whatever failed before its verdict
         logger.warning("step %s: failed before its verdict", plan["delivery"][:8], exc_info=True)
         if not acked:
             with contextlib.suppress(Exception):
@@ -326,7 +330,7 @@ async def run_step(msg: dict, ws, agents_dir: Path, local_tunnel_port: int,
     finally:
         try:
             force_rmtree(step_dir)
-        except Exception:
+        except Exception:  # noqa: BLE001  # removing a finished step's scratch dir in its finally
             logger.warning("step %s: scratch dir not removed", plan["delivery"][:8], exc_info=True)
 
 
@@ -383,7 +387,7 @@ def kill_running(running: dict[str, asyncio.subprocess.Process], reason: str) ->
                 else:
                     kill_process_tree(proc.pid, timeout=5.0)
                 n += 1
-            except Exception:
+            except Exception:  # noqa: BLE001  # one step's kill as the link drops must not spare the rest
                 logger.warning("step %s: kill failed (%s)", delivery[:8], reason, exc_info=True)
     if n:
         logger.info("steps: killed %d running script(s): %s", n, reason)

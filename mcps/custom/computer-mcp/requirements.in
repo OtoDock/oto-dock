@@ -7,8 +7,8 @@
 # pattern as satellite/requirements.txt. A plain (Linux-flavored) compile
 # hard-pins the Linux backend, drops the others, and breaks macOS/Windows
 # installs.
-mcp>=1.28.1,<2.0
+mcp>=1.30.0,<2.0
 mss>=9.0
-Pillow>=12.2
+Pillow>=13.0
 pyautogui>=0.9.54
 pyperclip>=1.8

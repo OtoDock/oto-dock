@@ -56,6 +56,7 @@ class TestExecutionModeChange:
 
     def test_the_row_write_runs_off_the_loop_before_the_ack(self, temp_db, monkeypatch):
         import asyncio
+
         from storage import database as task_store
         layer = FakeExecutionLayer()
         stub_dashboard_seams(monkeypatch, layer)

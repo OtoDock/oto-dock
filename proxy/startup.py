@@ -12,20 +12,19 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from typing import cast
 
 from fastapi import FastAPI
 
 import config
-from services.scheduler import scheduler
-from services.notifications import notification_manager
-from storage import database as task_store
-from storage import pg as pg_pool
-from storage import schema as pg_schema
-from core.session.session_state import set_pump_callbacks
 from core.events.stream_pump import _active_pumps
 from core.layers.cli import reap_idle_sessions
-from core.layers.direct import reap_idle_direct_sessions
 from core.layers.codex import reap_idle_codex_sessions
+from core.layers.direct import reap_idle_direct_sessions
+from core.session.session_state import set_pump_callbacks
+from services.notifications import notification_manager
+from services.scheduler import scheduler
+from storage import database as task_store, pg as pg_pool, schema as pg_schema
 
 logger = logging.getLogger("otodock")
 
@@ -111,7 +110,7 @@ def warm_routes(app: FastAPI) -> None:
         for scope in scopes:
             try:
                 route.matches(dict(scope))
-            except Exception:
+            except Exception:  # noqa: BLE001  # Starlette's matcher on a synthetic scope may raise anything
                 logger.debug("route warm-up skipped %r", route, exc_info=True)
 
 _SWEEP_CONCURRENCY = 4
@@ -158,8 +157,254 @@ def _purge_mcp_build_outputs() -> None:
         shutil.rmtree(config.SESSIONS_DIR / name, ignore_errors=True)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+# Register pump callbacks so scheduler / session_state can push events
+# and queue prompts on active pumps without circular imports.
+def _push_to_pump(chat_id: str, event: dict) -> bool:
+    pump = _active_pumps.get(chat_id)
+    if pump:
+        return pump.push_ws_event(event)
+    return False
+
+
+def _queue_on_pump(chat_id: str, text: str, system: bool = False) -> bool:
+    pump = _active_pumps.get(chat_id)
+    if pump and not pump.is_done:
+        # Only pumps whose producer DRAINS system_queue may accept —
+        # a task/scheduler pump would swallow the prompt forever while
+        # the delivery ladder thinks it succeeded (silent-loss hole
+        # from the 2026-09-02 delegate trace). Refusal makes the
+        # caller fall through to persistent/one-shot/direct delivery.
+        # A person's message never comes this way: the chat owns its
+        # queue (core/events/input_queue.py).
+        if not system or not getattr(pump, "system_queue_consumer", False):
+            return False
+        pump.system_queue.append(text)
+        return True
+    return False
+
+
+def _inject_to_pump(chat_id: str, event) -> bool:
+    # Inject a CommonEvent into the pump's event stream (processed in-order
+    # → persisted in the turn + live-state). Used for proxy-emitted
+    # delegate_spawn at task-create time.
+    pump = _active_pumps.get(chat_id)
+    if pump and not pump.is_done:
+        pump.event_queue.put_nowait(event)
+        return True
+    return False
+
+
+# Docker MCP bring-up runs in the BACKGROUND: on a fresh box it pulls
+# multi-GB images (file-tools → Collabora), and doing that synchronously
+# here blocked the HTTP bind for minutes with the service reading as
+# `active` but unbound — indistinguishable from a hang. Sessions that
+# start before a container is up get connect-refused tool errors until it
+# is (same behavior as a boot where docker was unavailable); the pull
+# progress itself is logged by docker_manager.
+async def _docker_mcp_bringup(docker_manager) -> None:
+    """The docker MCPs brought up off the loop, a failure logged."""
+    try:
+        await asyncio.to_thread(docker_manager.startup_docker_mcps)
+    except Exception:
+        logger.exception("Docker MCP bring-up failed (non-fatal)")
+
+
+# The language identifier (dictation's Automatic pick): the 22 MB model
+# (about 100 MB resident) loads once per process, off the loop, ahead of
+# the first socket (one that lands first loads it itself, off the loop),
+# and only where a chat STT provider exists.
+def _prewarm_language_identifier() -> None:
+    from services.media import audio_service
+    if audio_service.language_identify_prewarm_wanted():
+        from audio.providers.lid.ecapa import prewarm_language_identifier
+        prewarm_language_identifier(None, audio_service.language_identify_threads())
+
+
+# Delegate wakes parked across the restart: redeliver once boot settles.
+# Delayed so satellites get their reconnect window first — a wake whose
+# machine is still offline just re-persists and the machine's own
+# reconnect pass (run_recovery.on_sessions_alive) retries it.
+async def _boot_wake_redelivery() -> None:
+    await asyncio.sleep(15)
+    try:
+        woken = await scheduler.redeliver_pending_wakes()
+        if woken:
+            logger.info("Startup wake redelivery: woke %d chat(s)", woken)
+    except Exception:
+        logger.exception("Startup wake redelivery sweep failed")
+
+
+# The 60 s sweep's items, each isolated (one that raises is logged and
+# the next runs) and run concurrently, _SWEEP_CONCURRENCY at a time: a
+# slow one no longer pushes the rest back, and an item still running
+# from the last tick is skipped (a hung sweep holds one slot, never
+# four, and the fingerprint merge never runs twice). Every store touch
+# goes through run_db (storage/pg.py's event-loop rule): a periodic
+# DELETE + COMMIT on the loop is exactly what froze the proxy on
+# 2026-09-03 when the disk went slow; the two file sweeps run in a
+# worker thread for the same reason.
+
+async def _sweep_media():
+    from services.media import media_pipeline as _mp
+    from storage import database as _db
+    await asyncio.to_thread(_mp.sweep_host_media_cache)      # TTL satellite-host media
+    await pg_pool.run_db(_db.sweep_expired_media_tokens)  # reap expired workspace tokens
+
+
+async def _sweep_preview_snapshots():
+    # Version-pinned preview snapshots: reap dirs of deleted chats
+    # (internally throttled to hourly).
+    from services.media import preview_snapshots as _psnap
+    await asyncio.to_thread(_psnap.sweep_orphans)
+
+
+async def _sweep_recover_bin():
+    # Workspace Recover Bin: reap entries past their 7-day TTL
+    # (DB rows + on-disk bytes). Quick indexed delete, usually 0.
+    from storage.files import recover_bin_store as _rbstore
+    await pg_pool.run_db(_rbstore.delete_expired)
+
+
+async def _sweep_tombstones():
+    # File-sync delete tombstones: reap past their 30-day TTL (an
+    # offline satellite is assumed long-since caught up). Indexed delete.
+    from storage.files import file_tombstones_store as _tstore
+    await pg_pool.run_db(_tstore.delete_expired)
+
+
+async def _sweep_idle_fingerprints():
+    # Fingerprint-gated periodic idle sync — for each connected
+    # satellite whose agent tree changed OUT-OF-TURN (no active session),
+    # run the merge so it (and the dashboard) catches up without waiting
+    # for the next session. No-op for quiet / pre-0.5.32 satellites.
+    from core.session.session_manager import _get_remote_layer as _grl
+    _layer = _grl()
+    if _layer is not None:
+        await _layer.run_idle_fingerprint_sweep()
+
+
+async def _sweep_retention():
+    # Session retention + disk cleanup: ages out LOCAL chats' on-disk
+    # session files (admin knob; chats reseed from DB history via
+    # #11), reaps orphaned session files + Codex telemetry junk, and
+    # runs the MCP tarball-cache GC. Internally gated to once/24h.
+    from services.infra import retention as _retention
+    await _retention.maybe_run_daily()
+
+
+async def _sweep_quotas():
+    # Storage quotas: measure each agent's shared + per-user buckets
+    # and fire the 90/95/100% warning notifications (with hysteresis).
+    # Cheap when no limit is set (early-returns); uses the kernel quota
+    # report when enforcing, else a throttled tree walk.
+    from services.infra import quota_monitor as _qm
+    await _qm.check_quotas()
+
+
+async def _sweep_subscription_health():
+    # OAuth grant health: warn owners before a login grant's
+    # finite lifetime lapses (72h/24h out) and once when a row
+    # flips to expired. Self-throttled to 15 min; dedup stamps
+    # persist inside the credential blob.
+    from services.infra import subscription_health as _sub_health
+    await _sub_health.check_subscription_health()
+
+
+async def _sweep_window_alerts():
+    # Provider windows: tell an account's owner when a weekly
+    # window passes 90 % and when it is reached. Self-throttled
+    # to 5 min; dedup rows persist per window instance.
+    from services.infra import subscription_window_alerts as _win_alerts
+    await _win_alerts.check_window_alerts()
+
+
+async def _sweep_mcp_autoupdate():
+    # Automatic MCP updates: once a week in a low-traffic window,
+    # apply available community-MCP updates (deferring in-use docker
+    # MCPs). Persisted wall-clock gate; launches the run as its own
+    # task so the multi-hour defer loop never blocks this sweep.
+    from services.mcp import mcp_autoupdate as _mcp_autoupdate
+    await _mcp_autoupdate.maybe_run_weekly()
+
+
+async def _sweep_agent_updates():
+    # Community agent templates: once a day, the managers of an
+    # agent whose template has a newer catalog version hear it,
+    # once per version (the update itself is theirs to press).
+    from services.community import community_agent_updater as _agent_updater
+    await _agent_updater.maybe_notify_updates()
+
+
+async def _sweep_catalog_installs():
+    from core.credentials import (
+        catalog_install_registry as _catalog_install_registry,
+    )
+    await _catalog_install_registry.sweep_stale()
+
+
+def _sweep_items(_warmup_registry, _install_registry, _transfer_registry) -> list:
+    """The 60 s sweep's items: the registries' stale sweeps and the store and
+    disk sweeps above, in the order they run."""
+    sweep_items = [
+        ("warmup_registry sweep", _warmup_registry.sweep_stale),
+        ("install_registry sweep", _install_registry.sweep_stale),
+        ("transfer_registry sweep", _transfer_registry.sweep_stale),
+        ("catalog_install_registry sweep", _sweep_catalog_installs),
+        ("media cache sweep", _sweep_media),
+        ("preview snapshot sweep", _sweep_preview_snapshots),
+        ("recover-bin reap", _sweep_recover_bin),
+        ("tombstone reap", _sweep_tombstones),
+        ("idle fingerprint sweep", _sweep_idle_fingerprints),
+        ("retention sweep", _sweep_retention),
+        ("quota monitor sweep", _sweep_quotas),
+        ("subscription health sweep", _sweep_subscription_health),
+        ("subscription window alert sweep", _sweep_window_alerts),
+        ("mcp auto-update sweep", _sweep_mcp_autoupdate),
+        ("agent template update sweep", _sweep_agent_updates),
+    ]
+    return sweep_items
+
+
+# The 60 s sweep's ticks in flight: a tick holds itself here until it ends.
+_sweep_ticks: set[asyncio.Task] = set()
+
+
+async def _registry_sweep_loop(sweep_items: list, ticks: set[asyncio.Task]) -> None:
+    """One tick a minute, each its own task."""
+    # A tick is started, not awaited: an item that hangs is skipped at
+    # the next tick and holds nothing of it (each tick has its own
+    # slots), instead of holding every later tick back.
+    while True:
+        await asyncio.sleep(60)
+        tick = asyncio.create_task(run_sweep_items(sweep_items))
+        ticks.add(tick)
+        tick.add_done_callback(ticks.discard)
+
+
+# Hosted turn-classifier token refresh. When the Groq turn classifier runs
+# through the hosted relay, the minted token baked into the pushed phone
+# config expires server-side after 24h, and the proxy re-mints at most every
+# 12h (in-process cache). Re-push the phone config every 6h so a long-lived
+# phone daemon always holds a fresh, non-expired token. Cheap + gated: a
+# no-op unless the hosted classifier is actually in use (an active relay Groq
+# sub with no BYO key overriding it — base_url is empty otherwise), and with
+# no phone daemon connected nothing is sent (the config is still assembled).
+async def _phone_classifier_token_refresh_loop():
+    from services.phone import phone_config
+    while True:
+        await asyncio.sleep(6 * 3600)
+        try:
+            _, base_url = await phone_config.classifier_credentials()
+            if base_url:
+                await phone_config.notify_phone_config_changed()
+        except Exception:
+            logger.exception("phone classifier token refresh failed")
+
+
+def _boot_process() -> ThreadPoolExecutor:
+    """The process: the SIGUSR1 dump, the nofile limit, the default executor,
+    the build outputs purged, the adapters, the pump callbacks, the sandbox
+    preflights, the agents directory, the storage quotas."""
     # SIGUSR1 → all-thread stack dump on stderr; the field tool for shutdown
     # hangs ("Finished server process" logged but the process never exits).
     try:
@@ -175,50 +420,13 @@ async def lifespan(app: FastAPI):
 
     # Startup — register client adapters
     from adapters import register_adapter
-    from adapters.phone import PhoneAdapter
     from adapters.dashboard import DashboardAdapter
+    from adapters.phone import PhoneAdapter
     register_adapter(PhoneAdapter())
     register_adapter(DashboardAdapter())
 
-    # Register pump callbacks so scheduler / session_state can push events
-    # and queue prompts on active pumps without circular imports.
-    def _push_to_pump(chat_id: str, event: dict) -> bool:
-        pump = _active_pumps.get(chat_id)
-        if pump:
-            try:
-                return pump.push_ws_event(event)
-            except Exception:
-                pass
-        return False
 
-    def _queue_on_pump(chat_id: str, text: str, system: bool = False) -> bool:
-        pump = _active_pumps.get(chat_id)
-        if pump and not pump.is_done:
-            # Only pumps whose producer DRAINS system_queue may accept —
-            # a task/scheduler pump would swallow the prompt forever while
-            # the delivery ladder thinks it succeeded (silent-loss hole
-            # from the 2026-09-02 delegate trace). Refusal makes the
-            # caller fall through to persistent/one-shot/direct delivery.
-            # A person's message never comes this way: the chat owns its
-            # queue (core/events/input_queue.py).
-            if not system or not getattr(pump, "system_queue_consumer", False):
-                return False
-            pump.system_queue.append(text)
-            return True
-        return False
 
-    def _inject_to_pump(chat_id: str, event) -> bool:
-        # Inject a CommonEvent into the pump's event stream (processed in-order
-        # → persisted in the turn + live-state). Used for proxy-emitted
-        # delegate_spawn at task-create time.
-        pump = _active_pumps.get(chat_id)
-        if pump and not pump.is_done:
-            try:
-                pump.event_queue.put_nowait(event)
-                return True
-            except Exception:
-                pass
-        return False
 
     set_pump_callbacks(_push_to_pump, _queue_on_pump, _inject_to_pump)
 
@@ -228,7 +436,9 @@ async def lifespan(app: FastAPI):
     # and materialize the stub-resolver resolv.conf swap so every later sandbox
     # build is a pure argv transform.
     from core.sandbox.sandbox import (
-        netns_preflight, cli_version_preflight, tmpfs_cap_preflight,
+        cli_version_preflight,
+        netns_preflight,
+        tmpfs_cap_preflight,
     )
     netns_preflight()
 
@@ -261,7 +471,12 @@ async def lifespan(app: FastAPI):
     # boot — the soft tier is always a valid mode.
     from services.infra.storage_quota import quotas_preflight
     quotas_preflight()
+    return default_executor
 
+
+async def _boot_database() -> None:
+    """The database: the schema and its migrations, the version guard, the
+    network self-check, the credential sweep."""
     # Initialize PostgreSQL schema (all tables + migrations). One
     # transaction; its DDL may wait on locks a running pg_dump holds, so the
     # pool's statement timeout does not apply to it, and it waits longer for
@@ -271,7 +486,8 @@ async def lifespan(app: FastAPI):
     with pg_pool.get_conn(timeout=60) as _pg_conn:
         _pg_conn.execute("SET LOCAL statement_timeout = 0")
         pg_schema.migrate_database(
-            _pg_conn, config.PINNED_OTODOCK_VERSION, allow_newer=config.ALLOW_NEWER_DATABASE)
+            _pg_conn, config.PINNED_OTODOCK_VERSION,
+            allow_newer=cast("bool", config.ALLOW_NEWER_DATABASE))  # default False: never None
         _pg_conn.commit()
         # Drift guard: one loud ERROR when the live DB is missing columns the
         # code expects (a CREATE TABLE-only addition never reaches existing
@@ -288,10 +504,27 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(_cred_resolver.purge_agent_tree_credentials)
     except Exception:
         logger.exception("agent-tree credentials sweep failed (continuing)")
+
+
+async def _boot_registrations() -> None:
+    """The registrations and the one-time passes: offboarding, the app
+    lifecycle, the key canary, the timezone seed, the edge recompile, the
+    run recovery, the security index, the revocations, the persona
+    migration, the app releases, the catalog, the checks, the seeder, the
+    app handlers, the license and phone seeds."""
+    # The stores' post-commit steps (an agent's repo and quota, a person's
+    # folders): installed before anything below can create an agent or
+    # change a membership.
+    from services.agents import agent_provisioning
+    agent_provisioning.install()
     # Offboarding: a person's live sessions close with their access, their
     # automations follow the admin who took it away, and the service
     # bindings they lent follow their standing.
-    from services.agents import offboarding_bindings, offboarding_sessions, offboarding_transfer
+    from services.agents import (
+        offboarding_bindings,
+        offboarding_sessions,
+        offboarding_transfer,
+    )
     offboarding_sessions.register()
     offboarding_transfer.register()
     offboarding_bindings.register()
@@ -329,10 +562,18 @@ async def lifespan(app: FastAPI):
     orphaned_meetings = task_store.mark_orphaned_meetings_failed()
     if parked_runs or orphaned_runs or orphaned_meetings:
         logger.info(
-            f"Startup recovery: parked {parked_runs} run(s) for re-adopt, "
-            f"marked {orphaned_runs} orphaned run(s) and "
-            f"{orphaned_meetings} orphaned meeting(s) as failed"
+            "Startup recovery: parked %s run(s) for re-adopt, "
+            "marked %s orphaned run(s) and "
+            "%s orphaned meeting(s) as failed",
+            parked_runs, orphaned_runs, orphaned_meetings
         )
+    # The turns the last process cut: a closing row each now, or, for a turn
+    # its satellite may replay, when that machine reports (or the deadline).
+    from services.scheduler import cut_turns
+    waiting, closed = cut_turns.defer_at_boot(run_recovery.RECOVERY_DEADLINE_S)
+    if waiting or closed:
+        logger.info("Startup recovery: %s cut turn(s) closed, %s waiting for their machine",
+                    closed, waiting)
     # Startup recovery: reload the persisted per-session SecurityContext
     # index so a session that survived a proxy crash on a satellite (and its
     # background sub-agents) keeps full path-policy enforcement at the permission
@@ -344,11 +585,10 @@ async def lifespan(app: FastAPI):
     from auth import session_revocation
     await asyncio.to_thread(session_revocation.load)
 
-    from storage.agents import agent_store
     # Converge pre-1.4 agents on the agent.md persona filename before any
     # session builds a prompt (readers accept both names; this makes disk,
     # git and satellite sync agree on the new one).
-    migrated = await asyncio.to_thread(agent_store.migrate_persona_filenames)
+    migrated = await asyncio.to_thread(agent_provisioning.migrate_persona_filenames)
     if migrated:
         logger.info("Persona filename migration: %d agent(s) converged", migrated)
     # App releases: a row whose release copy is gone falls back to the
@@ -361,7 +601,7 @@ async def lifespan(app: FastAPI):
     # The platform catalog: remembers the loop for deltas raised off it and
     # listens for finished task runs.
     try:
-        from api.apps import catalog as _catalog
+        from services.apps import catalog as _catalog
         _catalog.install()
     except Exception:
         logger.exception("Platform catalog install failed (continuing)")
@@ -395,7 +635,9 @@ async def lifespan(app: FastAPI):
         logger.info("Seeded license_key from OTODOCK_LICENSE_KEY (bootstrap)")
     # Phone server: seed default settings and routes if tables are empty
     from services.phone.phone_config_seed import (
-        remap_retired_audio_models, remap_shipped_call_prompts, seed_phone_config,
+        remap_retired_audio_models,
+        remap_shipped_call_prompts,
+        seed_phone_config,
     )
     seed_phone_config()
     # The audio providers' model ids: a retired id moves to its successor
@@ -410,10 +652,12 @@ async def lifespan(app: FastAPI):
         remap_shipped_call_prompts()
     except Exception:
         logger.exception("call prompt remap failed (non-fatal)")
+
+
+async def _boot_mcps() -> None:
+    """The MCPs: the manifest scan, the bundled venvs, the docker bring-up."""
     # MCP Framework: discover manifests, seed DB, start Docker MCPs
-    from services.mcp import mcp_registry
-    from services.mcp import docker_manager
-    from services.mcp import mcp_venv_bootstrap
+    from services.mcp import docker_manager, mcp_registry, mcp_venv_bootstrap
     mcp_registry.scan_manifests()
     # Ensure every bundled Python MCP has a current venv before any session
     # tries to launch it. Idempotent — fast no-op when every venv is fresh.
@@ -430,20 +674,8 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Bundled MCP venv bootstrap failed (non-fatal)")
 
-    # Docker MCP bring-up runs in the BACKGROUND: on a fresh box it pulls
-    # multi-GB images (file-tools → Collabora), and doing that synchronously
-    # here blocked the HTTP bind for minutes with the service reading as
-    # `active` but unbound — indistinguishable from a hang. Sessions that
-    # start before a container is up get connect-refused tool errors until it
-    # is (same behavior as a boot where docker was unavailable); the pull
-    # progress itself is logged by docker_manager.
-    async def _docker_mcp_bringup() -> None:
-        try:
-            await asyncio.to_thread(docker_manager.startup_docker_mcps)
-        except Exception:
-            logger.exception("Docker MCP bring-up failed (non-fatal)")
 
-    _bg_tasks.append(asyncio.create_task(_docker_mcp_bringup()))
+    _bg_tasks.append(asyncio.create_task(_docker_mcp_bringup(docker_manager)))
     # NOTE: there is deliberately NO boot backfill of core MCPs onto existing
     # agents (removed 2026-07-26; it ran every boot until then). Core MCPs are
     # assigned at exactly two moments — agent creation
@@ -454,6 +686,11 @@ async def lifespan(app: FastAPI):
     # introduced by a FUTURE version reaches only agents created after the
     # upgrade; pre-existing agents pick it up via re-install or a release-note
     # instruction, never silently.
+
+
+def _boot_subscriptions() -> None:
+    """The subscriptions: the hosted instances, the session counters, the
+    stale bindings, the model sync, the retired remaps."""
     # Create/remove the platform-managed ("Hosted by OtoDock") system
     # instances to match the hosted-relay state — relay usable AND the master
     # toggle on AND connected (relay_client.system_relay_active()). Extracted so
@@ -482,13 +719,13 @@ async def lifespan(app: FastAPI):
     try:
         pruned = subscription_store.prune_stale_session_bindings()
         if pruned:
-            logger.info(f"Pruned {pruned} stale session-subscription binding(s)")
+            logger.info("Pruned %s stale session-subscription binding(s)", pruned)
         # Rows whose subscription is gone (deleted or replaced while a
         # session was bound) — no TTL saves them: they would bind a
         # re-adopted session to nothing and attribute usage to a ghost.
         orphans = subscription_store.prune_orphan_session_bindings()
         if orphans:
-            logger.info(f"Pruned {orphans} orphan session-subscription binding(s)")
+            logger.info("Pruned %s orphan session-subscription binding(s)", orphans)
     except Exception:
         logger.exception("session-binding prune failed (non-fatal)")
     # Sync built-in models into execution_layer_models so the DB fallback in
@@ -515,7 +752,13 @@ async def lifespan(app: FastAPI):
         subscription_store.remap_retired_models(config.MODEL_SUCCESSORS)
     except Exception:
         logger.exception("retired-model remaps failed (non-fatal)")
-    logger.info(f"Synced builtin models for {len(_caps)} execution layer(s)")
+    logger.info("Synced builtin models for %s execution layer(s)", len(_caps))
+
+
+async def _boot_services() -> None:
+    """The services and the background loops: concurrency, the scheduler,
+    notifications, the reapers, the gateway push, the sweeps, the tunnel,
+    the broadcasters, the six workers."""
     # Initialize concurrency control (reads limits from DB)
     from core import concurrency
     concurrency.init()
@@ -524,13 +767,13 @@ async def lifespan(app: FastAPI):
     notification_manager.start()
     _bg_tasks.append(asyncio.create_task(reap_idle_sessions()))
     logger.info(
-        f"Persistent session reaper started "
-        f"(timeout={config.PERSISTENT_SESSION_TIMEOUT}s)"
+        "Persistent session reaper started "
+        "(timeout=%ss)", config.PERSISTENT_SESSION_TIMEOUT
     )
     _bg_tasks.append(asyncio.create_task(reap_idle_direct_sessions()))
     logger.info(
-        f"Direct session reaper started "
-        f"(timeout={config.DIRECT_SESSION_TIMEOUT}s)"
+        "Direct session reaper started "
+        "(timeout=%ss)", config.DIRECT_SESSION_TIMEOUT
     )
     _bg_tasks.append(asyncio.create_task(reap_idle_codex_sessions()))
     logger.info("Codex session reaper started")
@@ -562,6 +805,8 @@ async def lifespan(app: FastAPI):
     logger.info("Concurrency maintenance loop started (parked-task wakeups + eviction)")
     from core.session import prewarm_session_registry
     _bg_tasks.append(asyncio.create_task(prewarm_session_registry.reap_loop()))
+
+    _bg_tasks.append(asyncio.create_task(asyncio.to_thread(_prewarm_language_identifier)))
     logger.info("Pre-warm TTL reaper started")
     from services.knowledge import library_projector
     _bg_tasks.append(asyncio.create_task(library_projector.reconcile_loop()))
@@ -572,6 +817,7 @@ async def lifespan(app: FastAPI):
     logger.info("App supervisor sweep started (30s interval)")
     # Start satellite heartbeat monitor
     from core.remote.satellite_connection import get_connection_manager
+    from services.scheduler import run_recovery
     _sat_cm = get_connection_manager()
     # Wire Mode C run-recovery: the satellite's post-auth sessions_alive report
     # re-adopts parked in-flight runs. Registered before the heartbeat monitor
@@ -580,18 +826,6 @@ async def lifespan(app: FastAPI):
     _bg_tasks.append(asyncio.create_task(_sat_cm.heartbeat_monitor()))
     logger.info("Satellite heartbeat monitor started")
 
-    # Delegate wakes parked across the restart: redeliver once boot settles.
-    # Delayed so satellites get their reconnect window first — a wake whose
-    # machine is still offline just re-persists and the machine's own
-    # reconnect pass (run_recovery.on_sessions_alive) retries it.
-    async def _boot_wake_redelivery() -> None:
-        await asyncio.sleep(15)
-        try:
-            woken = await scheduler.redeliver_pending_wakes()
-            if woken:
-                logger.info("Startup wake redelivery: woke %d chat(s)", woken)
-        except Exception:
-            logger.exception("Startup wake redelivery sweep failed")
     _bg_tasks.append(asyncio.create_task(_boot_wake_redelivery()))
 
     # Start the HTTP-over-WS tunnel dispatcher (sweeps leaked streams,
@@ -605,8 +839,8 @@ async def lifespan(app: FastAPI):
     # (warmup) and RemoteExecutionLayer.start_session (install); in
     # practice those handle all real paths and the sweep only kicks in
     # if a code path is added that forgets to unregister.
-    from core.session import warmup_registry as _warmup_registry
     from core.remote import install_registry as _install_registry
+    from core.session import warmup_registry as _warmup_registry
 
     # Wire install-progress delivery to the per-user dashboard notify channel
     # (the same path satellite-update events use). install_registry stays in
@@ -621,154 +855,28 @@ async def lifespan(app: FastAPI):
     from ws.satellite import push_transfer_event as _push_transfer_event
     _transfer_registry.set_broadcaster(_push_transfer_event)
 
-    # The 60 s sweep's items, each isolated (one that raises is logged and
-    # the next runs) and run concurrently, _SWEEP_CONCURRENCY at a time: a
-    # slow one no longer pushes the rest back, and an item still running
-    # from the last tick is skipped (a hung sweep holds one slot, never
-    # four, and the fingerprint merge never runs twice). Every store touch
-    # goes through run_db (storage/pg.py's event-loop rule): a periodic
-    # DELETE + COMMIT on the loop is exactly what froze the proxy on
-    # 2026-09-03 when the disk went slow; the two file sweeps run in a
-    # worker thread for the same reason.
-    from storage.pg import run_db as _run_db
 
-    async def _sweep_media():
-        from services.media import media_pipeline as _mp
-        from storage import database as _db
-        await asyncio.to_thread(_mp.sweep_host_media_cache)      # TTL satellite-host media
-        await _run_db(_db.sweep_expired_media_tokens)  # reap expired workspace tokens
 
-    async def _sweep_preview_snapshots():
-        # Version-pinned preview snapshots: reap dirs of deleted chats
-        # (internally throttled to hourly).
-        from services.media import preview_snapshots as _psnap
-        await asyncio.to_thread(_psnap.sweep_orphans)
 
-    async def _sweep_recover_bin():
-        # Workspace Recover Bin: reap entries past their 7-day TTL
-        # (DB rows + on-disk bytes). Quick indexed delete, usually 0.
-        from storage.files import recover_bin_store as _rbstore
-        await _run_db(_rbstore.delete_expired)
 
-    async def _sweep_tombstones():
-        # File-sync delete tombstones: reap past their 30-day TTL (an
-        # offline satellite is assumed long-since caught up). Indexed delete.
-        from storage.files import file_tombstones_store as _tstore
-        await _run_db(_tstore.delete_expired)
 
-    async def _sweep_idle_fingerprints():
-        # Fingerprint-gated periodic idle sync — for each connected
-        # satellite whose agent tree changed OUT-OF-TURN (no active session),
-        # run the merge so it (and the dashboard) catches up without waiting
-        # for the next session. No-op for quiet / pre-0.5.32 satellites.
-        from core.session.session_manager import _get_remote_layer as _grl
-        _layer = _grl()
-        if _layer is not None:
-            await _layer.run_idle_fingerprint_sweep()
 
-    async def _sweep_retention():
-        # Session retention + disk cleanup: ages out LOCAL chats' on-disk
-        # session files (admin knob; chats reseed from DB history via
-        # #11), reaps orphaned session files + Codex telemetry junk, and
-        # runs the MCP tarball-cache GC. Internally gated to once/24h.
-        from services.infra import retention as _retention
-        await _retention.maybe_run_daily()
 
-    async def _sweep_quotas():
-        # Storage quotas: measure each agent's shared + per-user buckets
-        # and fire the 90/95/100% warning notifications (with hysteresis).
-        # Cheap when no limit is set (early-returns); uses the kernel quota
-        # report when enforcing, else a throttled tree walk.
-        from services.infra import quota_monitor as _qm
-        await _qm.check_quotas()
 
-    async def _sweep_subscription_health():
-        # OAuth grant health: warn owners before a login grant's
-        # finite lifetime lapses (72h/24h out) and once when a row
-        # flips to expired. Self-throttled to 15 min; dedup stamps
-        # persist inside the credential blob.
-        from services.infra import subscription_health as _sub_health
-        await _sub_health.check_subscription_health()
 
-    async def _sweep_window_alerts():
-        # Provider windows: tell an account's owner when a weekly
-        # window passes 90 % and when it is reached. Self-throttled
-        # to 5 min; dedup rows persist per window instance.
-        from services.infra import subscription_window_alerts as _win_alerts
-        await _win_alerts.check_window_alerts()
 
-    async def _sweep_mcp_autoupdate():
-        # Automatic MCP updates: once a week in a low-traffic window,
-        # apply available community-MCP updates (deferring in-use docker
-        # MCPs). Persisted wall-clock gate; launches the run as its own
-        # task so the multi-hour defer loop never blocks this sweep.
-        from services.mcp import mcp_autoupdate as _mcp_autoupdate
-        await _mcp_autoupdate.maybe_run_weekly()
 
-    async def _sweep_agent_updates():
-        # Community agent templates: once a day, the managers of an
-        # agent whose template has a newer catalog version hear it,
-        # once per version (the update itself is theirs to press).
-        from services.community import community_agent_updater as _agent_updater
-        await _agent_updater.maybe_notify_updates()
 
-    async def _sweep_catalog_installs():
-        from core.credentials import catalog_install_registry as _catalog_install_registry
-        await _catalog_install_registry.sweep_stale()
 
-    sweep_items = [
-        ("warmup_registry sweep", _warmup_registry.sweep_stale),
-        ("install_registry sweep", _install_registry.sweep_stale),
-        ("transfer_registry sweep", _transfer_registry.sweep_stale),
-        ("catalog_install_registry sweep", _sweep_catalog_installs),
-        ("media cache sweep", _sweep_media),
-        ("preview snapshot sweep", _sweep_preview_snapshots),
-        ("recover-bin reap", _sweep_recover_bin),
-        ("tombstone reap", _sweep_tombstones),
-        ("idle fingerprint sweep", _sweep_idle_fingerprints),
-        ("retention sweep", _sweep_retention),
-        ("quota monitor sweep", _sweep_quotas),
-        ("subscription health sweep", _sweep_subscription_health),
-        ("subscription window alert sweep", _sweep_window_alerts),
-        ("mcp auto-update sweep", _sweep_mcp_autoupdate),
-        ("agent template update sweep", _sweep_agent_updates),
-    ]
 
-    ticks: set[asyncio.Task] = set()
 
-    async def _registry_sweep_loop():
-        # A tick is started, not awaited: an item that hangs is skipped at
-        # the next tick and holds nothing of it (each tick has its own
-        # slots), instead of holding every later tick back.
-        while True:
-            await asyncio.sleep(60)
-            tick = asyncio.create_task(run_sweep_items(sweep_items))
-            ticks.add(tick)
-            tick.add_done_callback(ticks.discard)
 
-    _bg_tasks.append(asyncio.create_task(_registry_sweep_loop()))
+    sweep_items = _sweep_items(_warmup_registry, _install_registry, _transfer_registry)
+    _bg_tasks.append(asyncio.create_task(_registry_sweep_loop(sweep_items, _sweep_ticks)))
     logger.info("Warmup + install registry sweeper started (60s interval)")
     from api.media import uploads as _uploads
     _bg_tasks.append(asyncio.create_task(_uploads.staging_sweep_loop()))
 
-    # Hosted turn-classifier token refresh. When the Groq turn classifier runs
-    # through the hosted relay, the minted token baked into the pushed phone
-    # config expires server-side after 24h, and the proxy re-mints at most every
-    # 12h (in-process cache). Re-push the phone config every 6h so a long-lived
-    # phone daemon always holds a fresh, non-expired token. Cheap + gated: a
-    # no-op unless the hosted classifier is actually in use (an active relay Groq
-    # sub with no BYO key overriding it — base_url is empty otherwise), and the
-    # broadcast itself no-ops when no phone daemon is connected.
-    async def _phone_classifier_token_refresh_loop():
-        from services.phone import phone_config
-        while True:
-            await asyncio.sleep(6 * 3600)
-            try:
-                _, base_url = phone_config.direct_llm_groq_credentials()
-                if base_url:
-                    await phone_config.notify_phone_config_changed()
-            except Exception:
-                logger.exception("phone classifier token refresh failed")
 
     _bg_tasks.append(asyncio.create_task(_phone_classifier_token_refresh_loop()))
     logger.info("Hosted phone-classifier token refresh started (6h interval)")
@@ -815,6 +923,10 @@ async def lifespan(app: FastAPI):
     from services.engines import token_fanout
     token_fanout.start_worker()
 
+
+def _boot_arm(app: FastAPI, default_executor: ThreadPoolExecutor) -> None:
+    """The last step before the first request: the routes warmed, the loop
+    pool, the watchdog."""
     # The first request that falls through every route would otherwise pay
     # FastAPI's lazy route-state build on the loop; pay it now.
     try:
@@ -842,10 +954,16 @@ async def lifespan(app: FastAPI):
             config.LOOP_WATCHDOG_THRESHOLD_S, config.LOOP_WATCHDOG_REPORT_S,
         )
 
-    yield
-    # ── Graceful Shutdown ──
-    logger.info("Proxy shutdown starting...")
 
+async def _stop_workers() -> None:
+    """The six workers stop in order, a failure logged and the next still
+    stopped."""
+    from services.billing import license_check_worker
+    from services.engines import token_fanout
+    from services.infra import release_check
+    from services.oauth import oauth_refresh_worker
+    from services.phone import phone_health_worker
+    from services.webhooks import subscription_renewer
     # Cancel the refresh worker BEFORE _shutdown_sessions so a refresh
     # never lands mid-drain.
     try:
@@ -877,6 +995,24 @@ async def lifespan(app: FastAPI):
         await token_fanout.stop_worker()
     except Exception:
         logger.exception("Token-freshness worker shutdown failed (continuing)")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    default_executor = _boot_process()
+    await _boot_database()
+    await _boot_registrations()
+    await _boot_mcps()
+    _boot_subscriptions()
+    await _boot_services()
+    _boot_arm(app, default_executor)
+
+    yield
+    # ── Graceful Shutdown ──
+    logger.info("Proxy shutdown starting...")
+    from core.events.stream_pump import note_platform_ending
+    note_platform_ending()
+    await _stop_workers()
 
     try:
         await asyncio.wait_for(_shutdown_sessions(logger), timeout=30)
@@ -930,12 +1066,12 @@ async def _flush_active_pumps(logger) -> None:
             task = getattr(pump, "_task", None)
             if task is not None:
                 waits.append(task)
-        except Exception as e:
-            logger.warning(f"Shutdown: pump flush {chat_id[:8]} error: {e}")
+        except Exception as e:  # noqa: BLE001  # the shutdown's per-pump step: one pump must not stop the rest
+            logger.warning("Shutdown: pump flush %s error: %s", chat_id[:8], e)
     if waits:
         with contextlib.suppress(Exception):
             await asyncio.wait(waits, timeout=5)
-        logger.info(f"Shutdown: flushed {len(waits)} open pump(s)")
+        logger.info("Shutdown: flushed %s open pump(s)", len(waits))
 
 
 def _arm_exit_failsafe() -> None:
@@ -986,12 +1122,24 @@ async def _shutdown_cleanup(logger) -> None:
         orphaned_meetings = task_store.mark_orphaned_meetings_failed()
         if orphaned_runs or orphaned_meetings or keep:
             logger.info(
-                f"Shutdown cleanup: marked {orphaned_runs} run(s) and "
-                f"{orphaned_meetings} meeting(s) as failed; "
-                f"left {len(keep)} recoverable run(s) running"
+                "Shutdown cleanup: marked %s run(s) and "
+                "%s meeting(s) as failed; "
+                "left %s recoverable run(s) running",
+                orphaned_runs, orphaned_meetings, len(keep)
             )
-    except Exception as e:
-        logger.error(f"Shutdown DB cleanup failed: {e}")
+    except Exception as e:  # noqa: BLE001  # a shutdown step: a failure must not skip the steps after it
+        logger.error("Shutdown DB cleanup failed: %s", e)
+
+    # A Docker MCP build or pull still running (the boot's bring-up) ends
+    # with its process group: the worker threads it holds would keep the
+    # process alive until the build's own timeout.
+    try:
+        from services.mcp import docker_manager
+        ended = await asyncio.to_thread(docker_manager.end_running_compose)
+        if ended:
+            logger.info("Shutdown: ended %s Docker compose run(s)", ended)
+    except Exception as e:  # noqa: BLE001  # a shutdown step: a failure must not skip the steps after it
+        logger.error("Ending the Docker compose runs failed: %s", e)
 
     # Cancel the lifespan's own background loops so their teardown doesn't
     # race the closed pool below (asyncio.run would cancel them anyway —
@@ -1015,9 +1163,9 @@ async def _shutdown_cleanup(logger) -> None:
     )
     _bg_tasks.clear()
     if isinstance(waited[1], BaseException):
-        logger.error(f"Shutdown: background task cancel failed (continuing): {waited[1]!r}")
+        logger.error("Shutdown: background task cancel failed (continuing): %r", waited[1])
     elif waited[1]:
-        logger.info(f"Shutdown: cancelled {waited[1]} background task(s) still running after 2 s")
+        logger.info("Shutdown: cancelled %s background task(s) still running after 2 s", waited[1])
 
     scheduler.stop()
 
@@ -1095,8 +1243,8 @@ async def _shutdown_sessions(logger):
         for sid in layer.local_session_ids():
             try:
                 await layer.close_session(sid)
-            except Exception as e:
-                logger.warning(f"Shutdown: {path} {sid[:8]} error: {e}")
+            except Exception as e:  # noqa: BLE001  # a shutdown close: one session must not stop the rest
+                logger.warning("Shutdown: %s %s error: %s", path, sid[:8], e)
 
     from core.session.session_manager import _remote_layer
     if _remote_layer:
@@ -1119,11 +1267,12 @@ async def _shutdown_remote_sessions(remote_layer, logger) -> None:
         caps = get_layer_capabilities(getattr(info, "execution_path", "") or "") if info else None
         if caps is not None and caps.runtime.readopts_idle_session:
             logger.info(
-                f"Shutdown: leaving remote {sid[:8]} open for re-adoption "
-                f"({'mid-turn' if getattr(info, 'turn_active', False) else 'idle'})"
+                "Shutdown: leaving remote %s open for re-adoption "
+                "(%s)",
+                sid[:8], 'mid-turn' if getattr(info, 'turn_active', False) else 'idle'
             )
             continue
         try:
             await remote_layer.close_session(sid)
-        except Exception as e:
-            logger.warning(f"Shutdown: Remote {sid[:8]} error: {e}")
+        except Exception as e:  # noqa: BLE001  # a shutdown close: one session must not stop the rest
+            logger.warning("Shutdown: Remote %s error: %s", sid[:8], e)

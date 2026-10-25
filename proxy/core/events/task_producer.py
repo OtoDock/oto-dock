@@ -16,15 +16,26 @@ import contextlib
 import logging
 import time
 
+from core.events.bg_command_state import get_bg_command_registry
 from core.events.common_events import (
-    CommonEvent, SUBAGENT_START, TEXT, TOOL_USE, TOOL_RESULT,
-    DONE, ERROR, QUEUE_TURN, PRODUCER_DONE,
+    BG_REVIEW_TURN,
+    DONE,
+    ERROR,
+    PRODUCER_DONE,
+    SUBAGENT_START,
+    TEXT,
+    TOOL_RESULT,
+    TOOL_USE,
+    CommonEvent,
+)
+from core.events.pump_bg_monitors import (
+    format_job_list,
+    hold_bg_monitors,
+    ride_out_grace,
 )
 from core.execution_layer import ExecutionLayer
-from core.session.session_state import get_subagent_registry
-from core.events.bg_command_state import get_bg_command_registry
-from core.events.pump_bg_monitors import format_job_list, hold_bg_monitors, ride_out_grace
-from core.session.session_state import has_pending_prompt
+from core.session.session_state import get_subagent_registry, has_pending_prompt
+from ws import wire_events as wire
 
 logger = logging.getLogger("otodock")
 
@@ -178,8 +189,8 @@ async def task_produce(
 
             if _stopped():
                 logger.info(
-                    f"Task {run_id[:8]}: the person stopped the run — no review "
-                    f"of its background work"
+                    "Task %s: the person stopped the run — no review "
+                    "of its background work", run_id[:8]
                 )
                 return
 
@@ -232,24 +243,26 @@ async def task_produce(
                 if _stopped():
                     # A Stop during a review turn, or while this loop waited.
                     logger.info(
-                        f"Task {run_id[:8]}: the person stopped the run — no "
-                        f"further review of its background work"
+                        "Task %s: the person stopped the run — no "
+                        "further review of its background work", run_id[:8]
                     )
                     break
                 rounds += 1
                 if rounds > bg_max_rounds:
                     logger.warning(
-                        f"Task {run_id[:8]}: bg review exceeded "
-                        f"{bg_max_rounds} rounds — stopping "
-                        f"(agents pending={reg.pending_count}, "
-                        f"commands pending={bgreg.pending_count})"
+                        "Task %s: bg review exceeded "
+                        "%s rounds — stopping "
+                        "(agents pending=%s, "
+                        "commands pending=%s)",
+                        run_id[:8], bg_max_rounds, reg.pending_count, bgreg.pending_count
                     )
                     break
                 if reg.pending_count or bgreg.pending_count:
                     logger.info(
-                        f"Task {run_id[:8]}: waiting on bg work "
-                        f"(agents={reg.pending_count}, "
-                        f"commands={bgreg.pending_count})"
+                        "Task %s: waiting on bg work "
+                        "(agents=%s, "
+                        "commands=%s)",
+                        run_id[:8], reg.pending_count, bgreg.pending_count
                     )
                 last_progress = time.monotonic()
                 snapshot = (reg.pending_count, bgreg.pending_count,
@@ -269,25 +282,26 @@ async def task_produce(
                     if subs_pending and now >= sub_deadline:
                         abandoned_subs = True
                         logger.warning(
-                            f"Task {run_id[:8]}: {subs_pending} bg agent(s) "
-                            f"still pending at the {bg_sub_ceiling:.0f}s "
-                            f"ceiling (lost SubagentStop?) — giving up on them"
+                            "Task %s: %s bg agent(s) "
+                            "still pending at the %.0fs "
+                            "ceiling (lost SubagentStop?) — giving up on them",
+                            run_id[:8], subs_pending, bg_sub_ceiling
                         )
                         continue
                     if cmds_pending and now >= cmd_deadline:
                         abandoned_cmds = True
                         logger.warning(
-                            f"Task {run_id[:8]}: {cmds_pending} bg command(s) "
-                            f"still running at the {bg_cmd_ceiling:.0f}s "
-                            f"ceiling — giving up on them (no nudge for "
-                            f"still-running work)"
+                            "Task %s: %s bg command(s) "
+                            "still running at the %.0fs "
+                            "ceiling — giving up on them (no nudge for "
+                            "still-running work)", run_id[:8], cmds_pending, bg_cmd_ceiling
                         )
                         continue
                     # A machine in its reconnect grace is waited for, not
                     # read as gone (the horizons above keep running).
                     if not await ride_out_grace(layer, session_id):
                         logger.info(
-                            f"Task {run_id[:8]}: session gone during bg wait"
+                            "Task %s: session gone during bg wait", run_id[:8]
                         )
                         session_gone = True
                         break
@@ -335,6 +349,9 @@ async def task_produce(
                     continue  # the loop's top logs and leaves
 
                 bits = []
+                # The review's rows, one per kind, with the prompt's counts,
+                # and the finished jobs' badges to clear.
+                nudges: list[dict] = []
                 # Agents join the nudge only once EVERY one of them finished
                 # (their reports are per-cohort); commands join per completion.
                 # Each fragment names WHICH jobs finished (labels captured at
@@ -344,27 +361,35 @@ async def task_produce(
                     # Named: the agents no review named yet (a chat monitor
                     # waits out this run's report and then owes only the rest).
                     named = sorted(reg.owed)
-                    listed = format_job_list([reg.label_for(t) for t in named])
+                    labels = [reg.label_for(t) for t in named]
+                    listed = format_job_list(labels)
                     bits.append(f"{bg_count} background agent(s)"
                                 + (f" ({listed})" if listed else ""))
+                    nudges.append({"event_type": wire.PERSISTED_BG_NUDGE,
+                                   "count": bg_count, "labels": labels,
+                                   "tool_use_ids": [reg.tuid_for(t) for t in named]})
                     reg.mark_reviewed(named)
                 # Snapshot the unsurfaced ids NOW — clear_unsurfaced() below
                 # destroys the set right after this nudge is composed.
                 bash_unseen_ids = sorted(bgreg.unsurfaced)
                 if bash_unseen_ids:
-                    listed = format_job_list(
-                        [bgreg.label_for(t) for t in bash_unseen_ids])
+                    labels = [bgreg.label_for(t) for t in bash_unseen_ids]
+                    listed = format_job_list(labels)
                     bits.append(f"{len(bash_unseen_ids)} background command(s)"
                                 + (f" ({listed})" if listed else ""))
+                    nudges.append({"event_type": wire.PERSISTED_BG_COMMAND_NUDGE,
+                                   "count": len(bash_unseen_ids), "labels": labels,
+                                   "tool_use_ids": [bgreg.tuid_for(t) for t in bash_unseen_ids]})
                 if not bits:
                     # Nothing completed-but-unseen — only abandoned/pending
                     # work remains. Never nudge for that: the message would
                     # be false and the loop unbounded (the 144-nudge bug).
                     if reg.pending_count or bgreg.pending_count:
                         logger.warning(
-                            f"Task {run_id[:8]}: finishing with bg work "
-                            f"still running (agents={reg.pending_count}, "
-                            f"commands={bgreg.pending_count}) — no nudge"
+                            "Task %s: finishing with bg work "
+                            "still running (agents=%s, "
+                            "commands=%s) — no nudge",
+                            run_id[:8], reg.pending_count, bgreg.pending_count
                         )
                     break
                 # The CLI's own self-wake review turn (≥2.1.243) may already
@@ -375,8 +400,8 @@ async def task_produce(
                 from core.events import wake_capture
                 if wake_capture.recently_captured(session_id, within_s=120.0):
                     logger.info(
-                        f"Task {run_id[:8]}: self-wake turn covered the bg "
-                        f"cohort — skipping the review nudge"
+                        "Task %s: self-wake turn covered the bg "
+                        "cohort — skipping the review nudge", run_id[:8]
                     )
                     bgreg.clear_unsurfaced()
                     bg_count = 0
@@ -405,14 +430,14 @@ async def task_produce(
                         f" Note: {still_running} background job(s) are still "
                         f"running — do not treat their output as final."
                     )
-                logger.info(f"Task {run_id[:8]}: sending bg completion nudge ({what})")
+                logger.info("Task %s: sending bg completion nudge (%s)", run_id[:8], what)
                 # The review turn we are about to send surfaces them.
                 bgreg.clear_unsurfaced()
                 bg_count = 0  # reviewed — later rounds re-tally new spawns
 
-                # Emit as queued user message so pump shows it as a turn boundary
+                # The review's boundary: its nudge rows, never a person's.
                 await event_queue.put(
-                    CommonEvent(type=QUEUE_TURN, data={"text": nudge})
+                    CommonEvent(type=BG_REVIEW_TURN, data={"nudges": nudges})
                 )
 
                 async with layer.session_lock(session_id):
@@ -440,7 +465,7 @@ async def task_produce(
                 )
 
     except Exception as e:
-        logger.error(f"Task producer error: {e}", exc_info=True)
+        logger.exception("Task producer error: %s", e)
         await event_queue.put(CommonEvent(type=ERROR, data={"message": str(e)}))
 
     finally:

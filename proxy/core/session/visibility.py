@@ -33,9 +33,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, cast
+
+import psycopg
 
 from auth import roles
 from auth.roles import OWNER_TIER
+from core.session import session_kind
+from core.session.session_kind import SHARED_CHAT_OWNER_PREFIX, TASK_CHAT_OWNER_PREFIX
+
+if TYPE_CHECKING:
+    from auth.providers import UserContext
 
 # The two scopes a session mounts and an automation is stored in
 # (``agents.default_scope``, ``tasks.scope`` and its siblings): the person's
@@ -125,7 +133,7 @@ def _read_memory_toggles(agent_name: str) -> tuple[bool, bool]:
             and toggles.get("agent_memory_enabled", True)
         )
         return memory_user, memory_agent
-    except Exception:
+    except (ImportError, psycopg.Error):
         return True, True
 
 
@@ -146,8 +154,9 @@ def mode_for(collaborative: bool, default_scope: str) -> str:
 
 
 # The synthetic chat-row owners — the three ``chats.user_sub`` values that name
-# no users row (retention keys on that: ``services/infra/retention.py``), each
-# spelled HERE and asked of through the predicates below (core-seams phase 4):
+# no users row (retention keys on that: ``services/infra/retention.py``), the
+# two prefixes spelled in the ``session_kind`` leaf (storage builds SQL with
+# them) and ``phone`` here, each asked of through the predicates below:
 #
 # * ``agent::<slug>`` — a Shared-only agent's one shared history: every assigned
 #   user's dashboard chats collapse into ONE list per agent under this owner;
@@ -156,8 +165,6 @@ def mode_for(collaborative: bool, default_scope: str) -> str:
 #   run's chat carries the CREATOR's sub instead — the row's kind, not its
 #   owner, says it is a task: ``core/session/session_kind.of_chat``).
 # * ``phone`` — a phone call's chat (a caller has no user).
-SHARED_CHAT_OWNER_PREFIX = "agent::"
-TASK_CHAT_OWNER_PREFIX = "task::"
 PHONE_CHAT_OWNER = "phone"
 
 
@@ -173,12 +180,12 @@ def task_chat_owner(agent_name: str) -> str:
 
 def is_shared_chat_owner(owner: str | None) -> bool:
     """True if a chat row's ``user_sub`` is a Shared-only synthetic owner."""
-    return bool(owner) and owner.startswith(SHARED_CHAT_OWNER_PREFIX)
+    return bool(owner) and cast("str", owner).startswith(SHARED_CHAT_OWNER_PREFIX)
 
 
 def is_task_chat_owner(owner: str | None) -> bool:
     """True if a chat row's ``user_sub`` is the scheduler's agent-scope owner."""
-    return bool(owner) and owner.startswith(TASK_CHAT_OWNER_PREFIX)
+    return bool(owner) and cast("str", owner).startswith(TASK_CHAT_OWNER_PREFIX)
 
 
 def is_phone_chat_owner(owner: str | None) -> bool:
@@ -329,3 +336,75 @@ def resolve_visibility(
         is_service=not bool(username),
         history_owner=history_owner,
     )
+
+
+def _run_for_chat(chat: dict) -> dict | None:
+    """The task run governing this chat's task-history permissions, or None
+    for a plain chat. Keys on run-row EXISTENCE, never the id prefix — a
+    chat-surface delegate worker has a plain-uuid chat id WITH a run row.
+    Falls back to deriving the run id from a ``task-`` id for the create→
+    stamp window (run row exists, ``chat_id`` not yet pointing at it)."""
+    from storage import database as task_store
+    chat_id = chat.get("id", "")
+    run = task_store.get_run_for_chat(chat_id)
+    if run is None and session_kind.is_task_chat_id(chat_id):
+        run = task_store.get_run(session_kind.run_id_of_chat(chat_id))
+    return run
+
+
+def can_access_chat(u: UserContext, chat: dict) -> bool:
+    """May this user open this chat by id? The one rule the REST routes, the
+    dashboard's resume and every frame naming a chat share.
+
+    Owner-equality (per-user chats) OR admin OR — for a Shared-only agent's
+    synthetic-owner chat — any user assigned to the agent OR — for a task-run
+    chat (synthetic ``task::`` owner) — the task listing's run rule:
+    agent-scoped runs for anyone with agent access, user-scoped runs only for
+    their creator. Without that branch the REST surface denies rows the
+    ``kind=tasks`` listing itself shows. A phone call's conversation opens
+    for the agent's managers, which is who the conversations list serves, on
+    a person's dashboard only: a manager's session token or API key reads no
+    call. The chat's OWNER decides, never the agent's current mode: a
+    per-user chat from before an agent turned Shared-only stays its owner's.
+    Mutations layer ``can_mutate_chat`` on top.
+    """
+    if u.is_admin:
+        return True
+    owner = chat.get("user_sub", "")
+    if session_kind.of_chat(chat) is session_kind.PHONE or is_phone_chat_owner(owner):
+        return not u.is_api_key and u.can_manage_agent(chat.get("agent", ""))
+    if owner == u.sub:
+        return True
+    if is_shared_chat_owner(owner):
+        return u.can_access_agent(chat.get("agent", ""))
+    if is_task_chat_owner(owner) or session_kind.of_chat(chat) is session_kind.TASK:
+        run = _run_for_chat(chat)
+        if run is not None:
+            if (run.get("scope") or SCOPE_AGENT) == SCOPE_USER:
+                return run.get("created_by") == (u.acting_sub or "")
+            return u.can_access_agent(chat.get("agent", ""))
+    return False
+
+
+def _task_continue_allowed(run: dict, *, effective_role: str, user_sub: str) -> bool:
+    """Whether a user may CONTINUE (drive a new session for) a task run.
+
+    A continued task is an interactive chat in the task's stored scope, so
+    the gate matches the CREATE gate:
+
+    - **Agent-scoped** task → editor+ on the agent (``can_edit_agent``: the
+      same tier that may create agent-scope tasks). Continuing drives an
+      agent-scope ``/workspace``-RW session, which a viewer must never do —
+      even the original creator, if since demoted to viewer.
+    - **User-scoped** task → the creator or a platform admin.
+
+    ``effective_role`` is the live per-agent role from
+    ``acting_role_of`` ("admin" for platform admins, which is why the
+    user-scope branch needs no separate admin check beyond it).
+
+    NOTE: this gates CONTINUING. Read-only VIEWING of an agent-scoped run
+    (history load) follows the broader REST ``_check_run_access`` rule.
+    """
+    if (run.get("scope") or SCOPE_AGENT) == SCOPE_USER:
+        return run.get("created_by") == user_sub or roles.is_admin(effective_role)
+    return roles.can_edit(effective_role)

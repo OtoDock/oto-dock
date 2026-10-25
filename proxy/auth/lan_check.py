@@ -274,7 +274,7 @@ def resolve(scope) -> ClientAddress:
             # would be without them.
             return replace(_outside(peer, peer), case="untrusted_forwarder")
         return _outside(peer, peer)
-    except Exception:  # a resolver that raised would drop the request
+    except Exception:  # noqa: BLE001  # every request reads its address here: a raise would drop it
         logger.debug("client address unreadable; using the peer %s", peer, exc_info=True)
         return ClientAddress(peer, peer, "", shared=True)
 

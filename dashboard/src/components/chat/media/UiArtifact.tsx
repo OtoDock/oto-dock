@@ -1,9 +1,13 @@
-import { useEffect, useRef, useState } from 'react'
-import { useTheme } from '../../../contexts/ThemeContext'
+import { useEffect, useRef, useState, useLayoutEffect } from 'react'
+
 import { onFileUpdate } from '../../../lib/fileUpdates'
 import { emitIframeSwipe } from '../../../lib/iframeGestures'
 import { hasUserActivation, openExternalUrl, validateBridgedUrl } from '../../../lib/openExternal'
 import FilePreviewPortal from '../../workspace/FilePreviewPortal'
+import { useTheme } from '../../../contexts/useTheme'
+import { isRecord } from '../../../lib/json/guards'
+import { POPOVER } from '../../ui/classes'
+import Button from '../../ui/Button'
 
 /**
  * Sandboxed display_ui artifact — agent-authored HTML served by /v1/ui/{token}.
@@ -64,6 +68,7 @@ function readConsent(key: string): Consent {
   } catch { return 'unset' }
 }
 
+const NO_INTERSECTION_OBSERVER = typeof IntersectionObserver === 'undefined'
 const MIN_H = 60
 const DEFAULT_H = 320
 
@@ -76,7 +81,7 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
   const { resolvedTheme } = useTheme()
   // Initial theme is baked into the URL; live switches ride postMessage —
   // remounting on theme change would re-run the artifact's scripts.
-  const initialThemeRef = useRef(resolvedTheme)
+  const [initialTheme] = useState(resolvedTheme)
   // Live update-in-place: nonce bumps on a matching file_updated → full
   // reload with the file's current content (same pattern as AppFrame).
   const [nonce, setNonce] = useState(0)
@@ -86,13 +91,16 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
       if (u.agent_slug === agent && u.rel_path === path) setNonce((n) => n + 1)
     })
   }, [agent, path])
-  const src = `${uiUrl}?theme=${initialThemeRef.current}${nonce ? `&v=${nonce}` : ''}`
+  const src = `${uiUrl}?theme=${initialTheme}${nonce ? `&v=${nonce}` : ''}`
   const iframeRef = useRef<HTMLIFrameElement | null>(null)
   const fsIframeRef = useRef<HTMLIFrameElement | null>(null)
   const wrapRef = useRef<HTMLDivElement | null>(null)
   const fixedHeight = typeof height === 'number' && height > 0
   const [frameH, setFrameH] = useState<number>(fixedHeight ? clampHeight(height) : DEFAULT_H)
-  const [visible, setVisible] = useState(!!embedded)
+  // Off-screen artifacts mount once seen; without an IntersectionObserver
+  // (old engines, jsdom) they mount at once.
+  const [seen, setSeen] = useState(false)
+  const visible = !!embedded || NO_INTERSECTION_OBSERVER || seen
   const [fullscreen, setFullscreen] = useState(false)
   const rafRef = useRef(0)
   const pendingHRef = useRef<number | null>(null)
@@ -107,7 +115,7 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
   const openTimesRef = useRef<number[]>([])
   const lastSendAtRef = useRef(0)
   const onInteractionRef = useRef(onInteraction)
-  onInteractionRef.current = onInteraction
+  useLayoutEffect(() => { onInteractionRef.current = onInteraction })
 
   const ackTo = (win: Window, status: string, reason?: string) => {
     try {
@@ -130,7 +138,7 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
   const deliverOpen = async (win: Window, url: string) => {
     const r = await openExternalUrl(url)
     if (r === 'opened') openAck(win, 'opened')
-    else openAck(win, 'blocked', 'popup blocked — try again')
+    else openAck(win, 'blocked', 'popup blocked, try again')
   }
 
   const deliverAction = async (win: Window, payload: unknown) => {
@@ -155,8 +163,8 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
         win === fsIframeRef.current?.contentWindow
       )
       if (!mine) return
-      const d: any = e.data
-      if (!d || d.source !== 'otodock-artifact') return
+      const d: unknown = e.data
+      if (!isRecord(d) || d.source !== 'otodock-artifact') return
       if (d.type === 'swipe') {
         // Drawer gesture forwarded out of the frame (iframes swallow
         // touches) — emit the MATCHING frame element; useSwipeGesture
@@ -244,27 +252,27 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
   // the wrapper's FIRST child: sticky can only pin from its flow position.
   const consentChip = consentPrompt ? (
     <div className="sticky top-2 z-10 mx-2 h-0" data-testid="ui-consent-chip">
-      <div ref={chipRef} className="flex flex-wrap items-center gap-2 rounded-lg border border-p-border-light/60 bg-white/95 px-3 py-2 text-xs shadow-md backdrop-blur-sm dark:bg-p-surface/95">
-        <span className="text-p-text-secondary">
+      <div ref={chipRef} className={`flex flex-wrap items-center gap-2 ${POPOVER} px-3 py-2 text-xs`}>
+        <span className="text-secondary">
           {consentPrompt?.kind === 'open_url' ? (
-            <>This artifact wants to open <span className="font-medium text-p-text">{consentPrompt.origin}</span> in a new tab.</>
+            <>This artifact wants to open <span className="font-medium text-primary">{consentPrompt.origin}</span> in a new tab.</>
           ) : (
             'This artifact wants to send an interaction to the chat.'
           )}
         </span>
         <span className="ml-auto flex gap-1.5">
-          <button
+          <Button
+            size="xs" variant="primary"
             onClick={() => resolveConsent(true)}
-            className="rounded-md bg-blue-500 px-2.5 py-1 font-medium text-white transition-colors hover:bg-blue-600"
           >
             Allow
-          </button>
-          <button
+          </Button>
+          <Button
+            size="xs"
             onClick={() => resolveConsent(false)}
-            className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface"
           >
             Block
-          </button>
+          </Button>
         </span>
       </div>
     </div>
@@ -273,17 +281,13 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
   // Lazy-mount off-screen artifacts: each one may boot ECharts/Tailwind, and
   // /v1/ui is no-store, so scroll-back would otherwise re-run them all.
   useEffect(() => {
-    if (embedded) return
+    if (embedded || NO_INTERSECTION_OBSERVER) return
     const el = wrapRef.current
     if (!el) return
-    if (typeof IntersectionObserver === 'undefined') {
-      setVisible(true)
-      return
-    }
     const io = new IntersectionObserver(
       (entries) => {
         if (entries.some((e) => e.isIntersecting)) {
-          setVisible(true)
+          setSeen(true)
           io.disconnect()
         }
       },
@@ -300,8 +304,8 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
       // Identity is the source-window reference. Never trust e.origin — it is
       // "null" for sandboxed frames — and never react to other windows.
       if (!iframeRef.current || e.source !== iframeRef.current.contentWindow) return
-      const d: any = e.data
-      if (!d || d.source !== 'otodock-artifact' || d.type !== 'height') return
+      const d: unknown = e.data
+      if (!isRecord(d) || d.source !== 'otodock-artifact' || d.type !== 'height') return
       if (typeof d.height !== 'number' || !isFinite(d.height)) return
       // rAF-coalesce + delta-gate: a hostile artifact can flood postMessage
       // (the child-side throttle is best-effort only), and applying no-op
@@ -326,12 +330,12 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
 
   // Live theme switch → child (payload carries only the theme string).
   useEffect(() => {
-    if (resolvedTheme === initialThemeRef.current) return
+    if (resolvedTheme === initialTheme) return
     iframeRef.current?.contentWindow?.postMessage(
       { source: 'otodock-host', type: 'theme', theme: resolvedTheme },
       '*',
     )
-  }, [resolvedTheme])
+  }, [resolvedTheme, initialTheme])
 
   const label = title || 'Generated UI artifact'
 
@@ -385,7 +389,7 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
             propagate from a sandboxed (out-of-process) iframe to the
             parent's ancestor chain. */}
         <div className="flex items-center justify-end gap-1 pr-1 pt-0.5">
-          <span className="pointer-events-none select-none text-[9px] font-semibold uppercase tracking-[0.08em] text-p-text-light/80">
+          <span className="pointer-events-none select-none text-3xs font-semibold uppercase tracking-[0.08em] text-tertiary/80">
             generated
           </span>
           {/* No open-in-new-tab affordance: an externally-opened artifact is
@@ -396,7 +400,7 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
           <button
             onClick={() => setFullscreen(true)}
             title="Fullscreen"
-            className="rounded-sm p-0.5 text-p-text-light transition-colors hover:bg-p-surface hover:text-p-text-secondary"
+            className="rounded-sm p-0.5 text-tertiary transition-colors hover:bg-surface-muted hover:text-secondary"
           >
             <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m0-4.5L15 9m5.25 11.25h-4.5m4.5 0v-4.5m0 4.5L15 15" />
@@ -412,7 +416,7 @@ export default function UiArtifact({ token, uiUrl, title, height, path, agent, e
         <FilePreviewPortal
           filename={label}
           onClose={() => setFullscreen(false)}
-          bodyBg="bg-p-bg"
+          bodyBg="bg-surface-page"
         >
           <div className="relative h-full w-full">
             {consentChip}

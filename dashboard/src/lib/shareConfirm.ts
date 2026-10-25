@@ -72,12 +72,18 @@ export function saveConfirm(sub: string, token: string): void {
   write(CONFIRM + sub, { token, at: Date.now() }, sessionStorage)
 }
 
-/** The confirm token, taken; null when there is none or it is stale. */
-export function takeConfirm(sub: string): string | null {
+/** The confirm token, still fresh, left in place. */
+export function peekConfirm(sub: string): string | null {
   const e = read<{ token: string; at: number }>(CONFIRM + sub, sessionStorage)
-  drop(CONFIRM + sub, sessionStorage)
   if (!e || typeof e.at !== 'number' || Date.now() - e.at > TTL_MS || !e.token) return null
   return e.token
+}
+
+/** The confirm token, taken; null when there is none or it is stale. */
+export function takeConfirm(sub: string): string | null {
+  const token = peekConfirm(sub)
+  drop(CONFIRM + sub, sessionStorage)
+  return token
 }
 
 /** Every account's entries: the sign-out sweep. */

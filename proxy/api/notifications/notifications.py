@@ -12,11 +12,6 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
 import config
-from storage.automation import notification_store
-from storage.pg import run_db
-from services.notifications import notification_manager
-from core.session.session_state import get_user_tz
-from core.session.visibility import nouser_read_targets
 from auth.providers import (
     UserContext,
     get_current_user,
@@ -24,6 +19,12 @@ from auth.providers import (
     require_user,
 )
 from core.session import visibility as _vis
+from core.session.session_state import get_user_tz
+from core.session.visibility import nouser_read_targets
+from services.notifications import notification_manager
+from services.notifications.push_sender import NATIVE_PUSH_PLATFORMS
+from storage.automation import notification_store
+from storage.pg import run_db
 
 logger = logging.getLogger("otodock.notification-api")
 # No route here takes an anonymous caller (auth.providers.require_user).
@@ -39,6 +40,8 @@ router = APIRouter(dependencies=[Depends(require_user)])
 # these clamps are the defensive server-side floor for every other caller.
 NOTIFICATION_TITLE_MAX = 100
 NOTIFICATION_BODY_MAX = 480
+# A browser's Web Push subscription, or an app's push token.
+_PUSH_PLATFORMS = ("web", *NATIVE_PUSH_PLATFORMS)
 
 
 def _clamp_text(value: str, limit: int) -> str:
@@ -68,7 +71,7 @@ class CreateNotificationRequest(BaseModel):
 
 
 class PushSubscribeRequest(BaseModel):
-    platform: str  # "web" | "android"
+    platform: str  # "web", or an app platform (push_sender.NATIVE_PUSH_PLATFORMS)
     subscription_data: str  # JSON string (Web Push) or FCM token
 
 
@@ -78,7 +81,9 @@ def _validate_user_tz(value: str | None) -> str | None:
     try:
         zoneinfo.ZoneInfo(value)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid user_tz: {e}")
+        raise HTTPException(
+            status_code=400, detail="That time zone is not known. Use a name like Europe/Athens.",
+        ) from e
     return value
 
 
@@ -656,8 +661,8 @@ async def push_subscribe(
     user: UserContext | None = Depends(get_current_user),
 ):
     u = require_auth(user)
-    if req.platform not in ("web", "android"):
-        raise HTTPException(status_code=400, detail="Platform must be 'web' or 'android'")
+    if req.platform not in _PUSH_PLATFORMS:
+        raise HTTPException(status_code=400, detail="Platform must be 'web', 'android' or 'ios'")
 
     sub = await asyncio.to_thread(
         notification_store.save_push_subscription,

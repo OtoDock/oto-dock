@@ -18,10 +18,12 @@ import signal
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from core.session.session_state import _active_processes, _aborted_sessions
+from core.session.session_state import _aborted_sessions, _active_processes
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from core.sandbox.pty_relay import PipedProcess
 
 logger = logging.getLogger("otodock")
 
@@ -157,7 +159,7 @@ def _extract_turn_context(event: dict) -> int:
 # ---------------------------------------------------------------------------
 
 
-async def _kill_process(proc: asyncio.subprocess.Process, session_id: str) -> None:
+async def _kill_process(proc: "PipedProcess", session_id: str) -> None:
     """Kill a Claude subprocess and its entire process group (including MCP servers).
 
     Uses process groups (start_new_session=True) so child processes like MCP
@@ -169,15 +171,15 @@ async def _kill_process(proc: asyncio.subprocess.Process, session_id: str) -> No
         os.killpg(pgid, signal.SIGTERM)
         try:
             await asyncio.wait_for(proc.wait(), timeout=5)
-            logger.info(f"Process group terminated for session {session_id} (exit={proc.returncode})")
+            logger.info("Process group terminated for session %s (exit=%s)", session_id, proc.returncode)
         except asyncio.TimeoutError:
             os.killpg(pgid, signal.SIGKILL)
             await proc.wait()
-            logger.warning(f"Process group force-killed (SIGKILL) for session {session_id}")
+            logger.warning("Process group force-killed (SIGKILL) for session %s", session_id)
     except ProcessLookupError:
-        logger.info(f"Process already exited for session {session_id}")
-    except Exception as e:
-        logger.error(f"Error killing process for session {session_id}: {e}")
+        logger.info("Process already exited for session %s", session_id)
+    except Exception as e:  # noqa: BLE001  # killing a process group that may already be gone
+        logger.error("Error killing process for session %s: %s", session_id, e)
 
 
 async def abort_session(session_id: str) -> bool:
@@ -188,8 +190,8 @@ async def abort_session(session_id: str) -> bool:
     proc = _active_processes.get(session_id)
     if proc and proc.returncode is None:
         _aborted_sessions.add(session_id)
-        logger.info(f"Aborting session {session_id} (pid={proc.pid})")
+        logger.info("Aborting session %s (pid=%s)", session_id, proc.pid)
         await _kill_process(proc, session_id)
         return True
-    logger.info(f"Abort requested for session {session_id} but no active process found")
+    logger.info("Abort requested for session %s but no active process found", session_id)
     return False

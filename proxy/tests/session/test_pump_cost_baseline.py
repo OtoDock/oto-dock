@@ -16,8 +16,7 @@ import asyncio
 
 import pytest
 
-from core.events import chat_writer
-from core.events import stream_pump as sp
+from core.events import chat_writer, stream_pump as sp
 from core.events.common_events import METADATA, CommonEvent
 from core.events.stream_pump import ChatStreamPump
 from services.engines import subscription_pool

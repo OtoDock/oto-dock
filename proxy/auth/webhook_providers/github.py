@@ -7,9 +7,11 @@ listening" signal). Per-repo signing secrets stored in
 ``webhook_subscriptions.signing_secret_enc``.
 
 This subclass exists as documentation that we've evaluated GitHub's quirks
-and confirmed generic handles them. Future quirks (re-redelivery handling,
-``ping`` event filtering, GitHub App-style webhooks with different signing)
-get added here instead of polluting ``generic.py``.
+and confirmed generic handles them. A GitHub App's one webhook signs the
+same way with the app-level secret (the ``app_webhook`` block; the
+dispatcher's ``dispatch_app_webhook`` routes its deliveries by
+``installation.id``). Future quirks (re-redelivery handling, ``ping`` event
+filtering) get added here instead of polluting ``generic.py``.
 """
 
 from __future__ import annotations

@@ -128,7 +128,8 @@ async def create_temp_image_url(
     try:
         target, resolution = await _classify_and_pull(req.session_id, req.abs_path)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"invalid path: {e}")
+        logger.warning("POST /v1/images/temp: %s could not be read: %s", req.abs_path, e)
+        raise HTTPException(status_code=400, detail="That file could not be read. Check the path.") from e
     if target is None:
         if resolution is not None and not resolution.allowed:
             raise HTTPException(status_code=403, detail=resolution.error)
@@ -141,7 +142,7 @@ async def create_temp_image_url(
     agent_dir = config.get_agent_dir(ctx.agent).resolve()
     try:
         target.relative_to(agent_dir)
-    except ValueError:
+    except ValueError as exc:
         raise HTTPException(
             status_code=403,
             detail=(
@@ -149,7 +150,7 @@ async def create_temp_image_url(
                 f"directory ({agent_dir}) — sandbox translation failed or "
                 f"path is out of scope"
             ),
-        )
+        ) from exc
     mime = RASTER_MIME.get(target.suffix.lower())
     if mime is None:
         raise HTTPException(
@@ -166,13 +167,13 @@ async def create_temp_image_url(
             safe_fs.read_bytes_beneath, config.AGENTS_DIR, rel,
             max_size=config.TEMP_IMAGE_MAX_BYTES,
         )
-    except safe_fs.FileTooLarge:
+    except safe_fs.FileTooLarge as exc:
         raise HTTPException(
             status_code=413,
             detail=f"image is larger than {config.TEMP_IMAGE_MAX_BYTES // (1024 * 1024)} MB",
-        )
-    except OSError:
-        raise HTTPException(status_code=404, detail=f"file not found: {req.abs_path}")
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail=f"file not found: {req.abs_path}") from exc
 
     _purge_expired()
     live = sum(1 for e in _temp_image_tokens.values() if e.session_id == req.session_id)
@@ -209,8 +210,8 @@ async def create_temp_image_url(
     public_url = f"{base}/v1/images/temp/{token}"
 
     logger.info(
-        f"Images temp URL minted: session={req.session_id}, "
-        f"file={Path(rel).name}, ttl={ttl}s"
+        "Images temp URL minted: session=%s, "
+        "file=%s, ttl=%ss", req.session_id, Path(rel).name, ttl
     )
     return {"url": public_url, "expires_in": ttl}
 

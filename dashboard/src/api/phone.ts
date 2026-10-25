@@ -3,6 +3,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { raiseApiError, apiJson, withMessage } from '../lib/http/apiJson'
 import type { AgentRole } from '../lib/permissions'
 
 // ---------------------------------------------------------------------------
@@ -25,14 +26,23 @@ export interface PhoneTransferTarget {
   number: string
 }
 
+/** What a route write answers: the server's notes for the person (a route
+ * with no PIN, a provisioning step, a delete's warning). */
+export interface PhoneRouteWriteResult {
+  warnings?: string[]
+  warning?: string
+  provisioning_instructions?: string
+}
+
 export interface PhoneRoute {
   id: string
   direction: PhoneDirection
   name: string
   agent: string
   language: string
-  // Identify the caller's language on the first utterance and lock the
-  // call to it; `language` stays the greeting's and the fallback.
+  // Read the caller's language from the audio and switch the call to it as
+  // the first words are heard (among the Languages card's list); `language`
+  // stays the greeting's and the start.
   language_detect: boolean
   llm_mode: string
   transfer_targets: PhoneTransferTarget[]
@@ -158,9 +168,8 @@ export function usePhoneRoutes() {
   return useQuery({
     queryKey: ['phone-routes'],
     queryFn: async (): Promise<PhoneRoute[]> => {
-      const res = await apiFetch('/v1/admin/phone/routes')
-      if (!res.ok) throw new Error('Failed to fetch phone routes')
-      const data = await res.json()
+      const data = await apiJson<{ routes: PhoneRoute[] }>('/v1/admin/phone/routes')
+        .catch(withMessage('Failed to fetch phone routes'))
       return data.routes
     },
   })
@@ -170,12 +179,10 @@ export function useCreatePhoneRoute() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (data: PhoneRouteCreate) => {
-      const res = await apiFetch('/v1/admin/phone/routes', {
+      return apiJson<PhoneRouteWriteResult>('/v1/admin/phone/routes', {
         method: 'POST',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to create route')
-      return res.json()
+      }, 'Failed to create route')
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-routes'] }) },
   })
@@ -185,14 +192,12 @@ export function useUpdatePhoneRoute() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ id, data }: { id: string; data: PhoneRouteUpdate }) => {
-      const res = await apiFetch(`/v1/admin/phone/routes/${id}`, {
+      return apiJson<PhoneRouteWriteResult>(`/v1/admin/phone/routes/${id}`, {
         method: 'PUT',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to update route')
-      return res.json()
+      }, 'Failed to update route')
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-routes'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['phone-routes'] }),
   })
 }
 
@@ -200,9 +205,7 @@ export function useDeletePhoneRoute() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: string) => {
-      const res = await apiFetch(`/v1/admin/phone/routes/${id}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to delete route')
-      return res.json()
+      return apiJson<PhoneRouteWriteResult>(`/v1/admin/phone/routes/${id}`, { method: 'DELETE' }, 'Failed to delete route')
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-routes'] }) },
   })
@@ -215,9 +218,7 @@ export function useDeleteRoutePin() {
   return useMutation({
     mutationFn: async ({ id, acknowledgeNoPin }: { id: string; acknowledgeNoPin?: boolean }) => {
       const query = acknowledgeNoPin ? '?acknowledge_no_pin=true' : ''
-      const res = await apiFetch(`/v1/admin/phone/routes/${id}/pin${query}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to remove the PIN')
-      return res.json()
+      return apiJson<PhoneRouteWriteResult>(`/v1/admin/phone/routes/${id}/pin${query}`, { method: 'DELETE' }, 'Failed to remove the PIN')
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-routes'] }) },
   })
@@ -233,9 +234,8 @@ export function usePhoneRouteCallLog(routeId: string, open: boolean, offset = 0,
       const params = new URLSearchParams({
         route_id: routeId, offset: String(offset), limit: String(limit),
       })
-      const res = await apiFetch(`/v1/admin/phone/call-log?${params}`)
-      if (!res.ok) throw new Error('Failed to fetch the call log')
-      return res.json()
+      return apiJson<{ calls: PhoneCallLogEntry[]; total: number }>(`/v1/admin/phone/call-log?${params}`)
+        .catch(withMessage('Failed to fetch the call log'))
     },
   })
 }
@@ -255,9 +255,8 @@ export function useRouteMcpPreview(agent: string, identityMode: PhoneRoute['iden
     enabled: !!agent,
     queryFn: async (): Promise<RouteMcpPreview> => {
       const params = new URLSearchParams({ agent, identity_mode: identityMode })
-      const res = await apiFetch(`/v1/admin/phone/routes/mcp-preview?${params}`)
-      if (!res.ok) throw new Error('Failed to preview the tools on this route')
-      return res.json()
+      return apiJson<RouteMcpPreview>(`/v1/admin/phone/routes/mcp-preview?${params}`)
+        .catch(withMessage('Failed to preview the tools on this route'))
     },
   })
 }
@@ -288,9 +287,8 @@ export function useExternalData() {
   return useQuery({
     queryKey: ['phone-external-data'],
     queryFn: async (): Promise<ExternalDataStatus> => {
-      const res = await apiFetch('/v1/admin/phone/external-data')
-      if (!res.ok) throw new Error('Failed to fetch the caller-data status')
-      return res.json()
+      return apiJson<ExternalDataStatus>('/v1/admin/phone/external-data')
+        .catch(withMessage('Failed to fetch the caller-data status'))
     },
   })
 }
@@ -299,14 +297,12 @@ export function useSaveExternalData() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (data: { enabled?: boolean; days?: number }) => {
-      const res = await apiFetch('/v1/admin/phone/external-data', {
+      return apiJson<ExternalDataStatus>('/v1/admin/phone/external-data', {
         method: 'PUT',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to save')
-      return res.json() as Promise<ExternalDataStatus>
+      }, 'Failed to save')
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-external-data'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['phone-external-data'] }),
   })
 }
 
@@ -314,9 +310,7 @@ export function useForgetExternalData() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async () => {
-      const res = await apiFetch('/v1/admin/phone/external-data/forget', { method: 'POST' })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to forget caller data')
-      return res.json() as Promise<ForgetExternalDataResult>
+      return apiJson<ForgetExternalDataResult>('/v1/admin/phone/external-data/forget', { method: 'POST' }, 'Failed to forget caller data')
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['phone-external-data'] })
@@ -333,9 +327,8 @@ export function usePhoneServers() {
   return useQuery({
     queryKey: ['phone-servers'],
     queryFn: async (): Promise<PhoneServer[]> => {
-      const res = await apiFetch('/v1/admin/phone-servers')
-      if (!res.ok) throw new Error('Failed to fetch phone servers')
-      const data = await res.json()
+      const data = await apiJson<{ servers: PhoneServer[] }>('/v1/admin/phone-servers')
+        .catch(withMessage('Failed to fetch phone servers'))
       return data.servers
     },
     refetchInterval: 15000,  // keep health + bootstrap badges fresh
@@ -346,12 +339,10 @@ export function useCreatePhoneServer() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (data: PhoneServerCreate) => {
-      const res = await apiFetch('/v1/admin/phone-servers', {
+      return apiJson('/v1/admin/phone-servers', {
         method: 'POST',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to create server')
-      return res.json()
+      }, 'Failed to create server')
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },
   })
@@ -361,14 +352,12 @@ export function useUpdatePhoneServer() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ id, data }: { id: number; data: PhoneServerUpdate }) => {
-      const res = await apiFetch(`/v1/admin/phone-servers/${id}`, {
+      return apiJson(`/v1/admin/phone-servers/${id}`, {
         method: 'PUT',
         body: JSON.stringify(data),
-      })
-      if (!res.ok) throw new Error('Failed to update server')
-      return res.json()
+      }).catch(withMessage('Failed to update server'))
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['phone-servers'] }),
   })
 }
 
@@ -376,9 +365,7 @@ export function useDeletePhoneServer() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: number) => {
-      const res = await apiFetch(`/v1/admin/phone-servers/${id}`, { method: 'DELETE' })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to delete server')
-      return res.json()
+      return apiJson(`/v1/admin/phone-servers/${id}`, { method: 'DELETE' }, 'Failed to delete server')
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },
   })
@@ -388,9 +375,8 @@ export function useSetDefaultPhoneServer() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: number) => {
-      const res = await apiFetch(`/v1/admin/phone-servers/${id}/default`, { method: 'PUT' })
-      if (!res.ok) throw new Error('Failed to set default server')
-      return res.json()
+      return apiJson(`/v1/admin/phone-servers/${id}/default`, { method: 'PUT' })
+        .catch(withMessage('Failed to set default server'))
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },
   })
@@ -400,14 +386,12 @@ export function useSetPhoneServerAmiSecret() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ id, value }: { id: number; value: string }) => {
-      const res = await apiFetch(`/v1/admin/phone-servers/${id}/ami-secret`, {
+      return apiJson(`/v1/admin/phone-servers/${id}/ami-secret`, {
         method: 'PUT',
         body: JSON.stringify({ value }),
-      })
-      if (!res.ok) throw new Error('Failed to save AMI secret')
-      return res.json()
+      }).catch(withMessage('Failed to save AMI secret'))
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['phone-servers'] }),
   })
 }
 
@@ -415,9 +399,8 @@ export function useDeletePhoneServerAmiSecret() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: number) => {
-      const res = await apiFetch(`/v1/admin/phone-servers/${id}/ami-secret`, { method: 'DELETE' })
-      if (!res.ok) throw new Error('Failed to delete AMI secret')
-      return res.json()
+      return apiJson(`/v1/admin/phone-servers/${id}/ami-secret`, { method: 'DELETE' })
+        .catch(withMessage('Failed to delete AMI secret'))
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },
   })
@@ -427,14 +410,12 @@ export function useSetPhoneServerTwilioAuthToken() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ id, value }: { id: number; value: string }) => {
-      const res = await apiFetch(`/v1/admin/phone-servers/${id}/twilio-auth-token`, {
+      return apiJson(`/v1/admin/phone-servers/${id}/twilio-auth-token`, {
         method: 'PUT',
         body: JSON.stringify({ value }),
-      })
-      if (!res.ok) throw new Error('Failed to save Twilio auth token')
-      return res.json()
+      }).catch(withMessage('Failed to save Twilio auth token'))
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['phone-servers'] }),
   })
 }
 
@@ -442,9 +423,8 @@ export function useDeletePhoneServerTwilioAuthToken() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: number) => {
-      const res = await apiFetch(`/v1/admin/phone-servers/${id}/twilio-auth-token`, { method: 'DELETE' })
-      if (!res.ok) throw new Error('Failed to delete Twilio auth token')
-      return res.json()
+      return apiJson(`/v1/admin/phone-servers/${id}/twilio-auth-token`, { method: 'DELETE' })
+        .catch(withMessage('Failed to delete Twilio auth token'))
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },
   })
@@ -473,9 +453,8 @@ export function useServerBootstrap(id: number, enabled: boolean) {
     queryKey: ['phone-server-bootstrap', id],
     enabled,
     queryFn: async (): Promise<ServerBootstrap> => {
-      const res = await apiFetch(`/v1/admin/phone-servers/${id}/bootstrap`)
-      if (!res.ok) throw new Error('Failed to fetch bootstrap')
-      return res.json()
+      return apiJson<ServerBootstrap>(`/v1/admin/phone-servers/${id}/bootstrap`)
+        .catch(withMessage('Failed to fetch bootstrap'))
     },
   })
 }
@@ -484,9 +463,7 @@ export function useVerifyServerBootstrap() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: number) => {
-      const res = await apiFetch(`/v1/admin/phone-servers/${id}/bootstrap/verify`, { method: 'POST' })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Verify failed')
-      return res.json()
+      return apiJson(`/v1/admin/phone-servers/${id}/bootstrap/verify`, { method: 'POST' }, 'Verify failed')
     },
     onSuccess: (_d, id) => {
       qc.invalidateQueries({ queryKey: ['phone-servers'] })
@@ -499,11 +476,9 @@ export function useApplyServerBootstrap() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async ({ id, creds }: { id: number; creds: Record<string, string> }) => {
-      const res = await apiFetch(`/v1/admin/phone-servers/${id}/bootstrap/apply`, {
+      return apiJson(`/v1/admin/phone-servers/${id}/bootstrap/apply`, {
         method: 'POST', body: JSON.stringify(creds),
-      })
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Apply failed')
-      return res.json()
+      }, 'Apply failed')
     },
     onSuccess: (_d, { id }) => {
       qc.invalidateQueries({ queryKey: ['phone-servers'] })
@@ -516,9 +491,8 @@ export function useCheckServerHealth() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: async (id: number) => {
-      const res = await apiFetch(`/v1/admin/phone-servers/${id}/health`, { method: 'POST' })
-      if (!res.ok) throw new Error('Health check failed')
-      return res.json()
+      return apiJson(`/v1/admin/phone-servers/${id}/health`, { method: 'POST' })
+        .catch(withMessage('Health check failed'))
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-servers'] }) },
   })
@@ -532,9 +506,7 @@ export function usePhoneSettings() {
   return useQuery({
     queryKey: ['phone-settings'],
     queryFn: async (): Promise<PhoneSettings> => {
-      const res = await apiFetch('/v1/admin/phone/settings')
-      if (!res.ok) throw new Error('Failed to fetch phone settings')
-      return res.json()
+      return apiJson<PhoneSettings>('/v1/admin/phone/settings').catch(withMessage('Failed to fetch phone settings'))
     },
   })
 }
@@ -547,10 +519,11 @@ export function useSavePhoneSettings() {
         method: 'PUT',
         body: JSON.stringify(data),
       })
-      if (!res.ok) throw new Error('Failed to save phone settings')
+      // A refusal names the key and its rule: the message the toast shows.
+      if (!res.ok) await raiseApiError(res, 'Failed to save phone settings')
       return res.json()
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-settings'] }) },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['phone-settings'] }),
   })
 }
 
@@ -561,9 +534,8 @@ export function usePhonePromptDefaults() {
   return useQuery({
     queryKey: ['phone-prompt-defaults'],
     queryFn: async (): Promise<PhonePromptDefaults> => {
-      const res = await apiFetch('/v1/admin/phone/settings/defaults')
-      if (!res.ok) throw new Error('Failed to fetch the call prompt defaults')
-      return res.json()
+      return apiJson<PhonePromptDefaults>('/v1/admin/phone/settings/defaults')
+        .catch(withMessage('Failed to fetch the call prompt defaults'))
     },
     staleTime: Infinity,
   })

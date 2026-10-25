@@ -36,6 +36,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 from urllib.parse import unquote, urlsplit
 
 from ws import wire_events as wire
@@ -111,6 +112,11 @@ _NAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 _TOOL_UNSAFE = re.compile(r"[^A-Za-z0-9_-]+")
 _EXT_RE = re.compile(r"^\.[A-Za-z0-9]{1,8}$")
 _WS_RE = re.compile(r"\s+")
+# A size group closing a tool's text ("Map generated (67917 bytes, 640x480)"):
+# the byte count tells a person nothing, the dimensions stay. Matched within
+# the text's last ``_SIZE_TAIL_SPAN`` characters only.
+_SIZE_TAIL_RE = re.compile(r"\s*\(\d{1,3}(?:,?\d{3})* bytes(?:, (\d+ ?[x×] ?\d+))?\)$")
+_SIZE_TAIL_SPAN = 80
 _NAME_TRIES = 20
 
 # Push tasks still running past ``PUSH_WAIT_S`` (held so they are not
@@ -186,6 +192,7 @@ def blobs_of(blocks) -> list[Blob]:
             res = b.get("resource")
             data = res.get("blob") if isinstance(res, dict) else None
             if isinstance(data, str) and data:
+                res = cast("dict", res)
                 hint = res.get("name") if isinstance(res.get("name"), str) else ""
                 out.append(Blob(kind=kind, mime=str(res.get("mimeType") or ""),
                                 data=data, name_hint=hint or str(res.get("uri") or "")))
@@ -283,7 +290,10 @@ def _save(ctx, subdir: str, tool: str, blobs: list[Blob]) -> list[_Outcome]:
     block gets an outcome; a block past a cap or failing the check is left
     to the model."""
     import config
-    from services.mcp.mcp_output_relocation import session_workspace_dir, session_workspace_shown
+    from services.mcp.mcp_output_relocation import (
+        session_workspace_dir,
+        session_workspace_shown,
+    )
     agents_root = Path(os.path.realpath(config.AGENTS_DIR))
     dest_dir = agents_root / safe_rel(session_workspace_dir(ctx), config.AGENTS_DIR) / subdir
     shown_dir = f"{session_workspace_shown(ctx)}/{subdir}"
@@ -386,7 +396,7 @@ def _check_picture(raw: bytes):
             if w * h > MAX_PICTURE_PIXELS:
                 return f"{w}x{h} is too many pixels"
             img.verify()
-    except Exception:
+    except Exception:  # noqa: BLE001  # Pillow on a tool's file raises anything from a decoder
         return "not a png, jpeg, webp or gif picture"
     return PICTURE_FORMATS[fmt]
 
@@ -407,7 +417,7 @@ def _chat_copy(raw: bytes, mime: str) -> tuple[str, str]:
         img.seek(0)
         frame = ImageOps.exif_transpose(img)
         if max(frame.size) > CHAT_COPY_MAX_DIM:
-            frame.thumbnail((CHAT_COPY_MAX_DIM, CHAT_COPY_MAX_DIM), Image.LANCZOS)
+            frame.thumbnail((CHAT_COPY_MAX_DIM, CHAT_COPY_MAX_DIM), Image.LANCZOS)  # type: ignore[attr-defined]  # Pillow sets its module-level resampling aliases with setattr at import; its annotations declare Image.Resampling.LANCZOS only
         buf = io.BytesIO()
         if frame.mode in ("RGBA", "LA", "PA") or "transparency" in frame.info:
             frame.convert("RGBA").save(buf, format="PNG", optimize=True)
@@ -515,7 +525,10 @@ async def _show(session_id: str, ctx, outcomes: list[_Outcome], text: str) -> No
     """One gallery for the result's pictures, one card per other file, on
     the queue of the pump that renders the session (a meeting
     participant's goes to the meeting's)."""
-    from core.session.session_state import get_meeting_session_info, get_permission_queue
+    from core.session.session_state import (
+        get_meeting_session_info,
+        get_permission_queue,
+    )
     from services.sharing.chat_snapshot import redact_tokens
     info = get_meeting_session_info(session_id)
     queue = get_permission_queue(info["pump_session_id"] if info else session_id)
@@ -546,6 +559,7 @@ async def _file_card(session_id: str, ctx, o: _Outcome, caption: str, info) -> d
     """The card ``/v1/hooks/file`` puts in the chat: a durable media token
     for the saved file when the session's adapter serves downloads."""
     import secrets
+
     import config
     from adapters import get_adapter, get_session_adapter
     from core.session import session_kind
@@ -554,7 +568,7 @@ async def _file_card(session_id: str, ctx, o: _Outcome, caption: str, info) -> d
     adapter = get_adapter(session_kind.DASHBOARD.name) if info else get_session_adapter(session_id)
     if adapter is None:
         return None
-    path = Path(os.path.realpath(config.AGENTS_DIR)) / o.rel
+    path = Path(await asyncio.to_thread(os.path.realpath, config.AGENTS_DIR)) / o.rel
     download_url = ""
     if getattr(adapter, "serves_file_downloads", False):
         chat_id = (info or {}).get("parent_chat_id") or ""
@@ -573,6 +587,8 @@ async def _file_card(session_id: str, ctx, o: _Outcome, caption: str, info) -> d
 
 def _caption(text: str) -> str:
     one = _WS_RE.sub(" ", text or "").strip()
+    head, tail = one[:-_SIZE_TAIL_SPAN], one[-_SIZE_TAIL_SPAN:]
+    one = (head + _SIZE_TAIL_RE.sub(lambda m: f" ({m.group(1)})" if m.group(1) else "", tail)).strip()
     return one if len(one) <= CAPTION_MAX else one[:CAPTION_MAX - 1].rstrip() + "…"
 
 

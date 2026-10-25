@@ -17,41 +17,127 @@ import tempfile
 import time
 import zipfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import BinaryIO, cast
 
 from fastapi import Depends, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 import config
+from api.agents._common import _get_agent_dir
+from api.agents._router import router
 from auth.providers import (
-    PrincipalKind, UserContext, get_current_user, require_agent_access, require_auth,
+    PrincipalKind,
+    UserContext,
+    get_current_user,
+    require_agent_access,
+    require_auth,
     session_bound_to,
 )
 from services.infra import safe_fs
 from storage import database as task_store
 from storage.pg import run_db
 
-from api.agents._common import _get_agent_dir
-from api.agents._router import router
-
 # A session token acts only on the agent it was started for; every
 # files route carries the binding (a cookie, the master key and an agent's
 # own session are unchanged).
 _BOUND = [Depends(session_bound_to("name"))]
 from api.media.media import FdFileResponse
+from auth import roles, tokens
+from auth.request_path import has_traversal
+from core import layout
+
 # The write / delete bookkeeping every platform writer shares (tombstones,
 # authorship, library projection, satellite fan-out, recover-bin capture)
 # lives in services/infra/file_bookkeeping — the Direct-LLM builtin file
 # tools run the same sequence through the same module.
 from services.infra import file_bookkeeping
-from auth.request_path import has_traversal
-from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path, resolve_under
-from auth import roles
-from core import layout
+from services.infra.path_confinement import (
+    PathOutsideRoot,
+    normalize_rel_path,
+    resolve_under,
+)
 
 logger = logging.getLogger("otodock.agents")
+
+
+@dataclass(frozen=True)
+class _SessionGrant:
+    """What a no-user session (an agent-scope task, a trigger, a delegate
+    worker, a meeting, a check's judge) reaches through the files API: the
+    tree its sandbox mounts (``core/sandbox/sandbox.py``, the no-user
+    branch), judged with its live context. ``workspace/`` and ``knowledge/``
+    are read; ``workspace/`` is written at the workspace tier, ``knowledge/``
+    only with the manager-provenance grant (``knowledge_rw``); ``config/`` is
+    read and, at the owner tier, written only when the context shows it; no
+    person's folder; a read-only context (a judge) writes nothing."""
+
+    session_id: str
+    role: str
+    config_visible: bool
+    knowledge_rw: bool
+    read_only: bool
+
+    @classmethod
+    def of(cls, session_id: str, ctx) -> "_SessionGrant":
+        return cls(
+            session_id=session_id, role=str(ctx.role or ""),
+            config_visible=bool(ctx.effective_config_visible),
+            knowledge_rw=bool(getattr(ctx, "knowledge_rw", False)),
+            read_only=getattr(ctx, "read_only", False) is True,
+        )
+
+    def check(self, path: str, *, writing: bool) -> None:
+        def under(scope: str) -> bool:
+            return path == scope or path.startswith(scope + "/")
+        if under(layout.CONFIG):
+            if not self.config_visible:
+                raise HTTPException(status_code=403, detail="This session does not see the agent's config")
+            if writing and not roles.can_manage(self.role):
+                raise HTTPException(status_code=403, detail="This session cannot change the agent's config")
+        elif under(layout.KNOWLEDGE):
+            if writing and not self.knowledge_rw:
+                raise HTTPException(status_code=403, detail="This session cannot change the agent's knowledge")
+        elif under(layout.WORKSPACE):
+            if writing and not roles.can_write_workspace(self.role):
+                raise HTTPException(status_code=403, detail="This session cannot write the workspace")
+        else:
+            raise HTTPException(status_code=403, detail="Access denied: path outside allowed scope")
+        if writing and self.read_only:
+            raise HTTPException(status_code=403, detail="This session writes no files")
+
+
+#: The role a files call is judged at: a person's role on the agent, or a
+#: no-user session's grant.
+FileRole = str | _SessionGrant
+
+
+def _grant_of_session(session_id: str) -> _SessionGrant:
+    """The grant of a no-user session, from its live context; 403 when the
+    session has none (gone, or closing: the context goes before the token
+    stops being taken)."""
+    from core.session.session_state import get_session_security
+    ctx = get_session_security(session_id) if session_id else None
+    if ctx is None:
+        raise HTTPException(status_code=403, detail="This session has no files access")
+    return _SessionGrant.of(session_id, ctx)
+
+
+def _session_grant(u: UserContext) -> _SessionGrant | None:
+    """``u``'s grant when it is a no-user session, else None (a person is
+    judged at their role, the master key keeps the admin tier)."""
+    return _grant_of_session(u.session_id or "") if u.is_no_user_session else None
+
+
+def _sees_config(role: FileRole) -> bool:
+    """Whether ``config/`` is in the caller's view: the owner tier, or a
+    session whose context shows it."""
+    if isinstance(role, _SessionGrant):
+        return role.config_visible
+    return roles.can_manage(role)
 
 
 TEXT_EXTENSIONS = {
@@ -77,16 +163,45 @@ def _check_path_traversal(resolved: Path, agent_dir: Path) -> None:
     """Raise 403 if the resolved path escapes the agent directory."""
     if not resolved.is_relative_to(agent_dir):
         raise HTTPException(
-            status_code=403, detail="Path traversal not allowed"
+            status_code=403, detail=_OUTSIDE
         )
 
 
+_OUTSIDE = "That path is outside this agent's files."
+_GONE = "That file or folder no longer exists."
+_TAKEN = "Something with that name already exists."
+_QUOTA_FULL = "This folder reached its storage limit. An admin can raise it in Setup, System Settings."
+_DISK_FULL = "The server's disk is full."
+_IN_USE = "The file is in use. Try again in a moment."
+_BUSY = "The server is busy. Try again in a moment."
+_NOT_ALLOWED = "OtoDock is not allowed to read or change this file."
+# What a person reads for a filesystem error, by its class; the OS's own
+# text carries server paths and goes to the log only.
+_FS_ERRNO_SENTENCES = {
+    errno.ENOENT: _GONE,
+    errno.EEXIST: _TAKEN,
+    errno.ENOTDIR: "A file is in the way of that folder.",
+    errno.EISDIR: "A folder is in the way of that file.",
+    errno.EACCES: _NOT_ALLOWED,
+    errno.EPERM: _NOT_ALLOWED,
+    errno.EROFS: "These files cannot be changed.",
+    errno.EDQUOT: _QUOTA_FULL,
+    errno.ENOSPC: _DISK_FULL,
+    errno.ENAMETOOLONG: "The name is too long.",
+    errno.ENOTEMPTY: "The folder is not empty.",
+    errno.EBUSY: _IN_USE,
+    errno.ETXTBSY: _IN_USE,
+    errno.EMFILE: _BUSY,
+    errno.ENFILE: _BUSY,
+    errno.EIO: "The disk could not be read or written.",
+}
+
+
 def _fs_error_reason(e: OSError | shutil.Error) -> str:
-    """Client-safe reason for a failed file operation — raw OSError text
-    embeds server-side absolute paths, so return only the errno description."""
-    if isinstance(e, OSError) and e.strerror:
-        return e.strerror
-    return "file operation failed (see proxy logs)"
+    """The sentence a person reads for a failed file operation."""
+    if isinstance(e, OSError) and e.errno in _FS_ERRNO_SENTENCES:
+        return _FS_ERRNO_SENTENCES[e.errno]
+    return "Could not change the file. The server log has the details."
 
 
 def _dir_node(name: str, rel: str, mtime: float, children: list[dict]) -> dict:
@@ -203,7 +318,7 @@ def _build_tree(directory: Path, base: Path, depth: int, max_depth: int, *,
     return result
 
 
-def _build_tree_scoped(name: str, role: str, username: str, *,
+def _build_tree_scoped(name: str, role: FileRole, username: str, *,
                        full: bool = False) -> list[dict]:
     """The tree ``GET /v1/agents/{name}/files`` returns: the walk decides at
     depth 1 what the caller may see (`_filter_tree`'s rule) and never enters
@@ -213,7 +328,7 @@ def _build_tree_scoped(name: str, role: str, username: str, *,
     ``_filter_tree`` still runs last as the safety net."""
     from core.remote.file_sync import is_platform_only_tree
     agent_dir = config.get_agent_dir(name)
-    owner_tier = roles.can_manage(role)
+    owner_tier = _sees_config(role)
     own_users = layout.user_rel(username) if username else ""
 
     def keep(rel: str, depth: int, is_dir: bool) -> bool:
@@ -267,7 +382,7 @@ def _build_tree_scoped(name: str, role: str, username: str, *,
     return tree
 
 
-def _tree_json(name: str, role: str, username: str, full: bool) -> bytes:
+def _tree_json(name: str, role: FileRole, username: str, full: bool) -> bytes:
     tree = _build_tree_scoped(name, role, username, full=full)
     return json.dumps({"tree": tree}, ensure_ascii=False,
                       separators=(",", ":")).encode("utf-8")
@@ -297,15 +412,15 @@ async def _slot(name: str, n: int, wait_s: float, busy_detail: str):
     try:
         async with asyncio.timeout(wait_s):
             await sem.acquire()
-    except TimeoutError:
-        raise HTTPException(status_code=503, detail=busy_detail)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=503, detail=busy_detail) from exc
     try:
         yield
     finally:
         sem.release()
 
 
-def _filter_tree(nodes: list[dict], role: str, username: str = "") -> list[dict]:
+def _filter_tree(nodes: list[dict], role: FileRole, username: str = "") -> list[dict]:
     """Filter file tree based on role permissions (3-tier model).
 
     - Viewer: sees knowledge/, workspace/, own users/{username}/.
@@ -326,7 +441,7 @@ def _filter_tree(nodes: list[dict], role: str, username: str = "") -> list[dict]
     result = []
     # Owner-tier (manager + admin) sees config too. Editor + viewer
     # omit it entirely.
-    owner_tier = roles.can_manage(role)
+    owner_tier = _sees_config(role)
     for node in nodes:
         if node["type"] == "dir" and node["name"] == layout.USERS and node.get("children"):
             # Show users/ but filter to own username only
@@ -350,7 +465,9 @@ def _filter_tree(nodes: list[dict], role: str, username: str = "") -> list[dict]
 
 def _check_oauth_protected(*paths: str) -> None:
     """Refuse the request if ANY of the supplied paths references a
-    registered ``credentials_dir`` subpath.
+    registered ``credentials_dir`` subpath, or lies under a ``.credentials``
+    folder (``knowledge/.credentials``, ``users/<u>/.credentials``), which
+    every session's sandbox masks whatever is left in it.
 
     Manifest-driven (``mcp_registry.get_protected_credentials_subpaths``).
     Fires for EVERY role (even admin) because the OAuth connect/disconnect
@@ -367,12 +484,13 @@ def _check_oauth_protected(*paths: str) -> None:
     for p in paths:
         if not p:
             continue
-        if path_roles.is_protected_credentials_path(p):
+        if (layout.CREDENTIALS_DIR in p.split("/")
+                or path_roles.is_protected_credentials_path(p)):
             raise HTTPException(
                 status_code=403,
                 detail=(
                     "OAuth credentials are protected. "
-                    "Manage accounts via Settings → Integrations."
+                    "Manage accounts in User Settings, Integrations."
                 ),
             )
 
@@ -387,7 +505,7 @@ def _check_engine_state(path: str) -> None:
         raise HTTPException(status_code=403, detail="Access denied: engine state is not accessible")
 
 
-def _check_file_role(path: str, role: str, writing: bool = False, username: str = "") -> None:
+def _check_file_role(path: str, role: FileRole, writing: bool = False, username: str = "") -> None:
     """Enforce role-based file access restrictions (3-tier model).
 
     Read access:
@@ -412,6 +530,9 @@ def _check_file_role(path: str, role: str, writing: bool = False, username: str 
     _check_oauth_protected(path)
     _check_engine_state(path)
 
+    if isinstance(role, _SessionGrant):
+        role.check(path, writing=writing)
+        return
     if roles.is_admin(role):
         return
 
@@ -473,7 +594,7 @@ def _check_file_role(path: str, role: str, writing: bool = False, username: str 
 
 def safe_agent_path(
     agent_dir: Path, name: str, raw_path: str, user: UserContext, *, writing: bool = False,
-    username: str | None = None,
+    username: str | None = None, app_identity: bool = False,
 ) -> tuple[Path, str]:
     """Resolve a user-supplied agent-relative path to a safe absolute Path and
     authorize the RESOLVED location against the caller's role.
@@ -487,9 +608,11 @@ def safe_agent_path(
     dirs are denied for every principal.
 
     A real user (dashboard cookie / USER_SESSION) is gated by its per-agent
-    role; a SERVICE / AGENT_SESSION caller gets full access to the single agent
-    it acts on (file work is inherent to running that agent). Returns
-    ``(resolved_path, username)`` — username is "" for non-user principals.
+    role; a no-user session (AGENT_SESSION) by its grant (``_SessionGrant``:
+    the tree its sandbox mounts); the master key keeps full access, and so
+    does the app identity (``app_identity``, the catalog's own call: the
+    app's declared prefixes are its gate). Returns ``(resolved_path,
+    username)`` — username is "" for non-user principals.
     ``username`` skips the store lookup (a caller that fetched it on the DB
     lane, ``_username_of``, passes it).
 
@@ -505,8 +628,8 @@ def safe_agent_path(
     agent_root = Path(os.path.realpath(agent_dir))
     try:
         resolved = resolve_under(agent_root / norm, agent_root)
-    except PathOutsideRoot:
-        raise HTTPException(status_code=403, detail="Path traversal not allowed")
+    except PathOutsideRoot as exc:
+        raise HTTPException(status_code=403, detail=_OUTSIDE) from exc
     rel = resolved.relative_to(agent_root).as_posix()
     _check_oauth_protected(rel)  # OAuth token dirs are off-limits to EVERY principal
     _check_engine_state(rel)
@@ -525,6 +648,8 @@ def safe_agent_path(
     if user.acting_sub is not None:
         uname = (task_store.get_username_by_sub(user.sub) or "") if username is None else username
         _check_file_role(rel, user.acting_role(name), writing=writing, username=uname)
+    elif not app_identity and (grant := _session_grant(user)) is not None:
+        _check_file_role(rel, grant, writing=writing)
     return resolved, uname
 
 
@@ -567,9 +692,17 @@ def _dashboard_writer(u, username: str | None = None) -> str | None:
 
 def _acts_as_person(u: UserContext) -> bool:
     """Whether a file operation is judged at a person's role: a cookie, or a
-    session token that names a person. The master key and an agent's own
-    session keep the admin tier with no person."""
+    session token that names a person. The master key keeps the admin tier
+    with no person; a no-user session is judged by its grant."""
     return not u.is_api_key or u.kind == PrincipalKind.USER_SESSION
+
+
+def _op_role(u: UserContext, name: str) -> FileRole:
+    """The role a move, copy or zip is judged at: a person's role on the
+    agent, a no-user session's grant, the master key's admin tier."""
+    if _acts_as_person(u):
+        return u.acting_role(name)
+    return _session_grant(u) or roles.ADMIN
 
 
 async def _username_of(u: UserContext) -> str:
@@ -594,27 +727,26 @@ def _sub_of(name: str, agents_rel: str) -> str:
     return agents_rel[len(name) + 1:] if agents_rel != name else ""
 
 
-def _fs_refusal(exc: OSError, name: str) -> HTTPException:
-    """The HTTP answer for a filesystem step that failed beneath the root: a
-    refusal of the helpers (a link met on the way, an escape) is the same 403
-    the string check gives; a missing path 404; a name in use 409 (a file
-    standing where a directory of the path should be included); a full
-    bucket 507; anything else its errno text."""
+def _fs_refusal(exc: OSError, name: str, op: str) -> HTTPException:
+    """The HTTP answer for a filesystem step (``op``) that failed beneath the
+    root: a refusal of the helpers (a link met on the way, an escape) is the
+    same 403 the string check gives; a missing path 404; a name in use 409 (a
+    file standing where a directory of the path should be included); a full
+    folder or disk 507; anything else a 500 worded by its class, the cause
+    to the log."""
     if isinstance(exc, safe_fs.SafeFsError):
-        return HTTPException(status_code=403, detail="Path traversal not allowed")
+        return HTTPException(status_code=403, detail=_OUTSIDE)
     if isinstance(exc, FileNotFoundError):
-        return HTTPException(status_code=404, detail="Path not found")
+        return HTTPException(status_code=404, detail=_GONE)
     if isinstance(exc, FileExistsError):
-        return HTTPException(status_code=409, detail="Target path already exists")
+        return HTTPException(status_code=409, detail=_TAKEN)
     if isinstance(exc, NotADirectoryError):
-        return HTTPException(status_code=409, detail="A file is in the way of that path")
+        return HTTPException(status_code=409, detail="A file is in the way of that folder.")
     if isinstance(exc, IsADirectoryError):
-        return HTTPException(status_code=409, detail="A directory is in the way of that path")
+        return HTTPException(status_code=409, detail="A folder is in the way of that file.")
     if exc.errno in (errno.EDQUOT, errno.ENOSPC):
-        return HTTPException(
-            status_code=507,
-            detail=f"Not enough storage in '{name}'s bucket for this write.",
-        )
+        return HTTPException(status_code=507, detail=_fs_error_reason(exc))
+    logger.warning("%s in agent %s failed: %s", op, name, exc)
     return HTTPException(status_code=500, detail=_fs_error_reason(exc))
 
 
@@ -668,10 +800,10 @@ def _assert_no_symlink_escape(agents_rel: str, scope_rel: str) -> None:
     scope_real = os.path.realpath(os.path.join(agents_real, scope_rel))
     try:
         st = safe_fs.lstat_beneath(config.AGENTS_DIR, agents_rel)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Path not found")
-    except OSError:
-        raise HTTPException(status_code=403, detail="Path traversal not allowed")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=_GONE) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=403, detail=_OUTSIDE) from exc
     if not stat.S_ISDIR(st.st_mode):
         return
 
@@ -682,8 +814,8 @@ def _assert_no_symlink_escape(agents_rel: str, scope_rel: str) -> None:
         for lname in step.symlinks:
             try:
                 target = os.readlink(lname, dir_fd=step.dirfd)
-            except OSError:
-                raise HTTPException(status_code=400, detail="Cannot resolve a path in the subtree")
+            except OSError as exc:
+                raise HTTPException(status_code=400, detail="Cannot resolve a path in the subtree") from exc
             landed = os.path.realpath(os.path.join(agents_real, step.rel, target))
             if landed != scope_real and not landed.startswith(scope_real + os.sep):
                 raise HTTPException(
@@ -699,8 +831,8 @@ def _normalize_path(p: str) -> str:
         raise HTTPException(status_code=400, detail="Empty path")
     try:
         return normalize_rel_path(p)
-    except PathOutsideRoot:
-        raise HTTPException(status_code=400, detail=f"Invalid path: {p}")
+    except PathOutsideRoot as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid path: {p}") from exc
 
 
 def _resolve_user_session_info(u: UserContext, agent: str) -> tuple[str, str]:
@@ -711,7 +843,7 @@ def _resolve_user_session_info(u: UserContext, agent: str) -> tuple[str, str]:
     return role, username
 
 
-def _check_resolved_role(resolved: Path, agent_dir: Path, role: str, *, writing: bool,
+def _check_resolved_role(resolved: Path, agent_dir: Path, role: FileRole, *, writing: bool,
                          username: str) -> None:
     """``_check_file_role`` on the agent-relative form of a resolved path
     (the traversal check already confined it to the agent tree)."""
@@ -726,7 +858,7 @@ def _validate_op_paths(
     dest_dir: str,
     *,
     agent_dir: Path,
-    role: str,
+    role: FileRole,
     username: str,
     writing_on_source: bool,
 ) -> tuple[list[tuple[str, Path]], Path]:
@@ -837,9 +969,10 @@ def _zip_add_regular_file(zf: zipfile.ZipFile, dirfd: int, name: str, arcname: s
             fd = -1
             with zf.open(zi, "w", force_zip64=st.st_size >= 0x7FFFFFFF) as dst:
                 try:
-                    copied = safe_fs.copy_fd(src, dst, max_size=budget.left)
-                except safe_fs.FileTooLarge:
-                    raise budget.too_big()
+                    # A zip member's writer: copy_fd only writes to it.
+                    copied = safe_fs.copy_fd(src, cast("BinaryIO", dst), max_size=budget.left)
+                except safe_fs.FileTooLarge as exc:
+                    raise budget.too_big() from exc
         budget.add_bytes(copied)
         return True
     finally:
@@ -873,7 +1006,7 @@ def _zip_tmp_dir() -> Path:
     return d
 
 
-def _build_zip_file(name: str, sources: list[str], role: str, username: str,
+def _build_zip_file(name: str, sources: list[str], role: FileRole, username: str,
                     ) -> tuple[int, os.stat_result, str]:
     """Validate the sources and write the archive into an unnamed temp file,
     in one descriptor-based pass. Returns ``(fd, stat, zip name)``; the
@@ -885,15 +1018,15 @@ def _build_zip_file(name: str, sources: list[str], role: str, username: str,
         src_resolved = (agent_dir / norm).resolve()
         _check_path_traversal(src_resolved, agent_dir)
         if not src_resolved.exists():
-            raise HTTPException(status_code=404, detail=f"Path not found: {norm}")
+            raise HTTPException(status_code=404, detail=f"{norm} no longer exists.")
         # The walk opens the RESOLVED path, so the role is checked there too:
         # a link in workspace/ to another user's folder is judged as that
         # folder (as move and copy judge theirs).
         _check_resolved_role(src_resolved, agent_dir, role, writing=False, username=username)
         try:
             src_rel = safe_fs.rel_under(src_resolved, agent_dir)
-        except OSError:
-            raise HTTPException(status_code=403, detail="Path traversal not allowed")
+        except OSError as cause:
+            raise HTTPException(status_code=403, detail=_OUTSIDE) from cause
         if not src_rel:
             raise HTTPException(status_code=400, detail=f"Invalid scope for path: {norm}")
         resolved_sources.append((norm, src_rel, src_resolved))
@@ -956,7 +1089,7 @@ def _build_zip_file(name: str, sources: list[str], role: str, username: str,
         st = os.fstat(fd)
     except OSError as exc:
         if exc.errno in (errno.ENOSPC, errno.EDQUOT):
-            raise HTTPException(status_code=507, detail="not enough space to prepare the download")
+            raise HTTPException(status_code=507, detail="not enough space to prepare the download") from exc
         raise
     finally:
         tmp.close()
@@ -978,7 +1111,7 @@ _zip_inflight: set[str] = set()
 async def _build_zip_response(
     name: str,
     paths: list[str],
-    role: str,
+    role: FileRole,
     username: str,
     user_key: str,
 ) -> FileResponse:
@@ -1017,27 +1150,27 @@ def _create_zip_token(
     agent: str,
     paths: list[str],
     user_sub: str,
-    role: str,
+    role: FileRole,
     username: str,
 ) -> str:
     """Mint a short-lived JWT carrying the validated paths + user context.
     Used by the GET /zip-download endpoint to authorize a direct download
     without re-sending the path list in the URL (avoids URL-length limits).
+    A no-user session's token names the session: the download judges it by
+    its grant again.
     """
-    import jwt as _jwt
-    import time as _time
     payload = {
-        # Only a token minted here opens a download: other tokens signed
-        # with the same secret carry an ``agent`` claim too.
         "purpose": ZIP_TOKEN_PURPOSE,
         "agent": agent,
         "paths": paths,
         "user_sub": user_sub,
-        "role": role,
+        "role": "" if isinstance(role, _SessionGrant) else role,
         "username": username,
-        "exp": int(_time.time()) + 120,  # 2-minute TTL — plenty for click → fetch
     }
-    return _jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
+    if isinstance(role, _SessionGrant):
+        payload["session"] = role.session_id
+    # 2-minute TTL — plenty for click → fetch.
+    return tokens.mint(tokens.ZIP_DOWNLOAD, payload, ttl_s=120)
 
 
 # Minimal valid blank Office templates (zip-based, <2KB each)
@@ -1045,7 +1178,8 @@ _BLANK_TEMPLATES: dict[str, bytes] = {}
 
 
 def _init_blank_templates():
-    import io, zipfile
+    import io
+    import zipfile
     def _zip(files: dict[str, str]) -> bytes:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -1132,6 +1266,7 @@ async def list_agent_files(name: str, user: UserContext | None = Depends(get_cur
     # concern we should switch to lazy per-folder fetches instead of
     # eagerly shipping a tree this deep.
     username = ""
+    role: FileRole = _session_grant(u) or u.acting_role(name)
     if _acts_as_person(u):
         username = await run_db(task_store.get_username_by_sub, u.sub) or ""
     # The walk, the filter and the JSON encoding all run in one thread; at
@@ -1139,7 +1274,7 @@ async def list_agent_files(name: str, user: UserContext | None = Depends(get_cur
     # file_updated event, and a burst of them must not hold the executor).
     async with _slot("tree", 2, 30.0, "the server is busy listing files, try again in a moment"):
         body = await asyncio.to_thread(
-            _tree_json, name, u.acting_role(name), username, not _acts_as_person(u),
+            _tree_json, name, role, username, u.is_service,
         )
     return Response(body, media_type="application/json")
 
@@ -1167,11 +1302,11 @@ async def read_agent_file(
 def _read_agent_file_sync(rel: str, leaf: str, download: bool):
     try:
         fd, st = safe_fs.open_regular_for_read(config.AGENTS_DIR, rel)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="File not found")
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail="File not found") from err
     except OSError as exc:
         logger.warning("file read refused for %s: %s", rel, type(exc).__name__)
-        raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="File not found") from exc
     try:
         headers = {"X-Content-Type-Options": "nosniff"}
         # Binary download mode: any file type
@@ -1225,10 +1360,10 @@ def _read_agent_file_sync(rel: str, leaf: str, download: bool):
                 )
             try:
                 content = data.decode("utf-8")
-            except UnicodeDecodeError:
+            except UnicodeDecodeError as err:
                 raise HTTPException(
                     status_code=400, detail="File is not valid UTF-8 text"
-                )
+                ) from err
             body = json.dumps({"content": content, "encoding": "utf-8"},
                               ensure_ascii=False, separators=(",", ":"))
             return Response(body.encode("utf-8"), media_type="application/json")
@@ -1402,7 +1537,7 @@ def _restore_write_sync(name: str, sub: str, content: bytes) -> str:
             continue
         except OSError as exc:
             logger.warning("recover-bin restore write refused for %s: %s", cand, type(exc).__name__)
-            raise _fs_refusal(exc, name)
+            raise _fs_refusal(exc, name, "restore") from exc
     raise HTTPException(status_code=409, detail="Too many name conflicts in destination")
 
 
@@ -1451,11 +1586,11 @@ def _write_sync(name: str, agents_rel: str, content: bytes, *, exclusive: bool) 
             config.AGENTS_DIR, agents_rel, content, mkdirs=True, exclusive=exclusive,
             fsync=False,
         )
-    except FileExistsError:
-        raise HTTPException(status_code=409, detail="File already exists")
+    except FileExistsError as err:
+        raise HTTPException(status_code=409, detail=_TAKEN) from err
     except OSError as exc:
         logger.warning("file write refused for %s: %s", agents_rel, type(exc).__name__)
-        raise _fs_refusal(exc, name)
+        raise _fs_refusal(exc, name, "save") from exc
 
 
 @router.put("/v1/agents/{name}/files/{path:path}", dependencies=_BOUND)
@@ -1514,11 +1649,11 @@ async def create_agent_file(
 def _mkdir_sync(name: str, agents_rel: str) -> None:
     try:
         safe_fs.mkdirs_beneath(config.AGENTS_DIR, agents_rel)
-    except (FileExistsError, NotADirectoryError):
-        raise HTTPException(status_code=409, detail="A file is in the way of that directory")
+    except (FileExistsError, NotADirectoryError) as err:
+        raise HTTPException(status_code=409, detail="A file is in the way of that folder.") from err
     except OSError as exc:
         logger.warning("mkdir refused for %s: %s", agents_rel, type(exc).__name__)
-        raise _fs_refusal(exc, name)
+        raise _fs_refusal(exc, name, "new folder") from exc
 
 
 @router.post("/v1/agents/{name}/mkdir", dependencies=_BOUND)
@@ -1545,10 +1680,10 @@ def _delete_kind_sync(agents_rel: str) -> str:
     itself (never followed); a missing entry is the route's 404."""
     try:
         st = safe_fs.lstat_beneath(config.AGENTS_DIR, agents_rel)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Path not found")
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=_GONE) from err
     except OSError as exc:
-        raise _fs_refusal(exc, agents_rel.partition("/")[0])
+        raise _fs_refusal(exc, agents_rel.partition("/")[0], "delete") from exc
     if stat.S_ISREG(st.st_mode):
         return "file"
     if stat.S_ISDIR(st.st_mode):
@@ -1564,13 +1699,13 @@ def _rmdir_empty_sync(name: str, agents_rel: str) -> None:
     try:
         pfd = safe_fs.open_dir_beneath(config.AGENTS_DIR, parent_rel)
     except OSError as exc:
-        raise _fs_refusal(exc, name)
+        raise _fs_refusal(exc, name, "delete") from exc
     try:
         os.rmdir(leaf, dir_fd=pfd)
     except OSError as exc:
         if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
-            raise HTTPException(status_code=400, detail="Directory is not empty")
-        raise _fs_refusal(exc, name)
+            raise HTTPException(status_code=400, detail="The folder is not empty.") from exc
+        raise _fs_refusal(exc, name, "delete") from exc
     finally:
         os.close(pfd)
 
@@ -1612,7 +1747,7 @@ def _delete_tree_sync(name: str, agents_rel: str, scope_rel: str) -> tuple[int, 
         raise
     except OSError as exc:
         logger.warning("recursive delete refused for %s: %s", agents_rel, type(exc).__name__)
-        raise _fs_refusal(exc, name)
+        raise _fs_refusal(exc, name, "delete") from exc
     return skipped, tombstoned
 
 
@@ -1654,14 +1789,14 @@ async def delete_agent_path(
                     name, agent_dir, config.AGENTS_DIR / agents_rel,
                 )
             except OSError as exc:
-                raise _fs_refusal(exc, name)
+                raise _fs_refusal(exc, name, "delete") from exc
             return {
                 "status": "deleted", "path": req.path, "type": "file",
                 "recover_bin_skipped": bin_skipped,
             }
 
         if kind != "dir":
-            raise HTTPException(status_code=404, detail="Path not found")
+            raise HTTPException(status_code=404, detail=_GONE)
 
         if not req.recursive:
             await asyncio.to_thread(_rmdir_empty_sync, name, agents_rel)
@@ -1688,7 +1823,7 @@ async def delete_agent_path(
         # The escape walk, the recover-bin captures (best-effort; voluntary
         # delete → no notification), the per-file tombstones and the removal
         # run in one thread; the projections and the push follow on the loop.
-        bin_skipped, tombstoned = await asyncio.to_thread(
+        bin_skipped_count, tombstoned = await asyncio.to_thread(
             _delete_tree_sync, name, agents_rel, scope,
         )
     for crel in tombstoned:
@@ -1697,7 +1832,7 @@ async def delete_agent_path(
     await file_bookkeeping.push_file_delete(name, sub)
     return {
         "status": "deleted", "path": req.path, "type": "dir",
-        "recursive": True, "recover_bin_skipped": bin_skipped,
+        "recursive": True, "recover_bin_skipped": bin_skipped_count,
     }
 
 
@@ -1710,13 +1845,13 @@ def _rename_sync(name: str, old_rel: str, new_rel: str, scope_rel: str) -> list[
     tombstoned = file_bookkeeping.tombstone_subtree_sync(name, config.AGENTS_DIR / name, _sub_of(name, old_rel))
     try:
         safe_fs.rename_beneath(config.AGENTS_DIR, old_rel, new_rel)
-    except FileExistsError:
-        raise HTTPException(status_code=409, detail="Target path already exists")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Source path not found")
+    except FileExistsError as err:
+        raise HTTPException(status_code=409, detail=_TAKEN) from err
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=_GONE) from err
     except OSError as exc:
         logger.warning("rename refused for %s: %s", old_rel, type(exc).__name__)
-        raise _fs_refusal(exc, name)
+        raise _fs_refusal(exc, name, "rename") from exc
     return tombstoned
 
 
@@ -1817,12 +1952,9 @@ async def move_agent_paths(
     u = require_auth(user)
     require_agent_access(u, name)
     username = await _username_of(u)
-    if _acts_as_person(u):
-        # _validate_op_paths → _check_file_role enforces per-tier
-        # write rules on every source + dest path.
-        role = u.acting_role(name)
-    else:
-        role, username = "admin", ""
+    # _validate_op_paths → _check_file_role enforces per-tier write rules
+    # on every source + dest path.
+    role = _op_role(u, name)
 
     agent_dir = _get_agent_dir(name)
     sources, dest_resolved = await asyncio.to_thread(
@@ -1915,14 +2047,14 @@ def _copy_one_sync(name: str, src_rel: str, dest_rel: str, scope_rel: str,
                 return target
             except FileExistsError:
                 continue
-    except safe_fs.FileTooLarge:
+    except safe_fs.FileTooLarge as exc:
         raise HTTPException(
             status_code=413, detail=f"the copy is larger than {config.COPY_MAX_INPUT_MB} MB",
-        )
-    except safe_fs.TooManyEntries:
+        ) from exc
+    except safe_fs.TooManyEntries as exc:
         raise HTTPException(
             status_code=413, detail=f"the copy has more than {config.COPY_MAX_ENTRIES} entries",
-        )
+        ) from exc
     raise HTTPException(status_code=409, detail="Too many name conflicts in destination")
 
 
@@ -1946,12 +2078,9 @@ async def copy_agent_paths(
     u = require_auth(user)
     require_agent_access(u, name)
     username = await _username_of(u)
-    if _acts_as_person(u):
-        # _validate_op_paths → _check_file_role enforces per-tier
-        # write rules on the dest dir (sources need read perms only).
-        role = u.acting_role(name)
-    else:
-        role, username = "admin", ""
+    # _validate_op_paths → _check_file_role enforces per-tier write rules
+    # on the dest dir (sources need read perms only).
+    role = _op_role(u, name)
 
     agent_dir = _get_agent_dir(name)
     sources, dest_resolved = await asyncio.to_thread(
@@ -2028,7 +2157,7 @@ async def zip_agent_paths(
     if _acts_as_person(u):
         role, username = await run_db(_resolve_user_session_info, u, name)
     else:
-        role, username = "admin", ""
+        role, username = _op_role(u, name), ""
 
     return await _build_zip_response(name, req.paths, role, username, u.sub)
 
@@ -2052,7 +2181,7 @@ async def request_zip_url(
     if _acts_as_person(u):
         role, username = await run_db(_resolve_user_session_info, u, name)
     else:
-        role, username = "admin", ""
+        role, username = _op_role(u, name), ""
 
     if not req.paths:
         raise HTTPException(status_code=400, detail="paths cannot be empty")
@@ -2095,24 +2224,23 @@ async def zip_download(
     the agent name in the URL path AND in the token so a token minted for
     agent A can't be used against agent B.
     """
-    import jwt as _jwt
     try:
-        claims = _jwt.decode(t, config.JWT_SECRET, algorithms=["HS256"])
-    except _jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=410, detail="Download link expired")
-    except _jwt.InvalidTokenError:
-        raise HTTPException(status_code=403, detail="Invalid download token")
+        claims = tokens.decode(t, tokens.ZIP_DOWNLOAD)
+    except tokens.TokenExpired as exc:
+        raise HTTPException(status_code=410, detail="Download link expired") from exc
+    except tokens.TokenInvalid as exc:
+        raise HTTPException(status_code=403, detail="Invalid download token") from exc
 
-    if claims.get("purpose") != ZIP_TOKEN_PURPOSE:
-        raise HTTPException(status_code=403, detail="Invalid download token")
     if claims.get("agent") != name:
         raise HTTPException(status_code=403, detail="Token / agent mismatch")
 
     paths = claims.get("paths") or []
-    role = claims.get("role") or roles.VIEWER
+    session = claims.get("session")
+    role: FileRole = (_grant_of_session(session) if isinstance(session, str) and session
+                      else claims.get("role") or roles.VIEWER)
     username = claims.get("username") or ""
     # `fn` is informational for the client; the real filename comes from
     # _build_zip_response via Content-Disposition.
     _ = fn
-    user_key = claims.get("user_sub") or f"{role}:{username}"
+    user_key = claims.get("user_sub") or f"{claims.get('role') or roles.VIEWER}:{username}"
     return await _build_zip_response(name, paths, role, username, user_key)

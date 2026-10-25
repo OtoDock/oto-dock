@@ -25,6 +25,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { apiFetch } from '../api/auth'
+import { browserSttLang } from '../audio/lang'
 import { acquireMic, releaseMic } from '../audio/micCoordinator'
 import { setSpeaking } from '../audio/speechActivity'
 import { createPcmPlayer, type PcmPlayer } from '../audio/webaudioPlayer'
@@ -45,8 +46,9 @@ export interface DuplexVoiceController {
   phase: DuplexPhase
   /** The ACCUMULATING utterance while the user speaks: finalized pieces
    *  (interim_final frames) committed + the live partial (interim frames)
-   *  overlaid — the same accumulate/overlay pair dictation uses. Cleared
-   *  when the engine dispatches the turn. */
+   *  overlaid — the same accumulate/overlay pair dictation uses; a replace
+   *  frame (the language switched) sets the committed pieces to the new
+   *  stream's words. Cleared when the engine dispatches the turn. */
   caption: string
   /** Why the session ended, when phase === 'error' ('' otherwise). */
   endReason: string
@@ -326,7 +328,10 @@ export function useDuplexVoice(chatId: string | null | undefined): DuplexVoiceCo
         const ws = new WebSocket(wsUrl())
         ws.binaryType = 'arraybuffer'
         wsRef.current = ws
-        ws.onopen = () => ws.send(JSON.stringify({ type: 'init', token: ws_token }))
+        // On the Automatic pick the session starts in the browser's language
+        // when the install lists it (else the list's first) and reads the
+        // speaker's from the audio.
+        ws.onopen = () => ws.send(JSON.stringify({ type: 'init', token: ws_token, language: browserSttLang() }))
         ws.onclose = () => { if (wsRef.current === ws) teardown('connection lost', true) }
         ws.onerror = () => { if (wsRef.current === ws) teardown('connection error', true) }
         ws.onmessage = (ev) => {
@@ -412,6 +417,12 @@ export function useDuplexVoice(chatId: string | null | undefined): DuplexVoiceCo
               // A finalized piece of the still-accumulating utterance —
               // commit it; the provider's partial restarts after each one.
               accumRef.current = joinCaption(accumRef.current, String(frame.text || ''))
+              setCaption(accumRef.current)
+              break
+            case 'replace':
+              // The language switched under the person: the committed pieces
+              // are the new stream's words, the overlay restarts.
+              accumRef.current = String(frame.text || '')
               setCaption(accumRef.current)
               break
             case 'final':

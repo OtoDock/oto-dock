@@ -1,0 +1,49 @@
+<p class="muted">Fields. A label above each field, and a help line under it when the field needs one. A refused value is said in words next to the field. The kit already styles input, select and textarea, so the markup is plain. Use a real label for every field, never a placeholder alone. Row actions are small secondary buttons, and a Delete is the quiet red one.</p>
+
+<div class="card">
+  <div class="field-set">
+    <div>
+      <label class="label" for="name">Name</label>
+      <input id="name" placeholder="Your name" autocomplete="name">
+    </div>
+    <div>
+      <label class="label" for="email">Email</label>
+      <input id="email" type="email" value="not an address" aria-invalid="true" aria-describedby="email-error">
+      <p class="field-error" id="email-error" role="alert">Enter an address like name@example.com.</p>
+    </div>
+    <div>
+      <label class="label" for="plan">Plan</label>
+      <select id="plan"><option>Starter</option><option>Team</option><option>Company</option></select>
+      <p class="field-help">You can change this later.</p>
+    </div>
+    <div>
+      <label class="label" for="notes">Notes, optional</label>
+      <textarea id="notes" rows="3" placeholder="Anything we should know"></textarea>
+    </div>
+  </div>
+  <div class="row" style="margin-top: 16px; gap: 8px">
+    <button type="button" class="btn primary">Save</button>
+    <button type="button" class="btn">Cancel</button>
+  </div>
+</div>
+
+<div class="card" style="margin-top: 16px">
+  <h4>Row actions</h4>
+  <ul class="rows">
+    <li><span>Alice Papadopoulou</span><span class="row-actions"><button type="button" class="btn sm">Edit</button><button type="button" class="btn quiet-danger">Remove</button></span></li>
+    <li><span>Bob Lee</span><span class="row-actions"><button type="button" class="btn sm">Edit</button><button type="button" class="btn quiet-danger">Remove</button></span></li>
+  </ul>
+</div>
+
+<style>
+.field-set { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+input, select, textarea { width: 100%; }
+textarea { resize: vertical; }
+.field-help, .field-error { margin: 4px 0 0; font-size: var(--p-font-size-xs); }
+.field-help { color: var(--p-text-light); }
+.field-error { color: var(--p-status-danger-fg); }
+.rows { list-style: none; margin: 0; padding: 0; }
+.rows li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--p-border-light); font-size: var(--p-font-size-sm); }
+.rows li:last-child { border-bottom: 0; }
+.row-actions { display: flex; gap: 8px; }
+</style>

@@ -67,7 +67,7 @@ afterEach(() => {
 describe('VoiceControl — dictation language menu', () => {
   it('a hold opens the menu with every language and the stored one ticked', async () => {
     render(<VoiceControl {...baseProps} />, { wrapper })
-    expect(mic().getAttribute('title')).toBe('Dictate (hold for the language)')
+    expect(mic().getAttribute('title')).toBe('Dictate. Hold to pick the language.')
     down(mic())
     expect(menu()).toBeNull()
     hold()
@@ -76,11 +76,11 @@ describe('VoiceControl — dictation language menu', () => {
 
     const greek = await waitFor(() => {
       const row = screen.getByText('Greek').closest('button')!
-      expect(row.className).toContain('text-brand')
+      expect(row.className).toContain('text-link')
       return row
     })
     expect(greek.querySelector('svg')).toBeTruthy()
-    expect(screen.getByText('English (US)').closest('button')!.className).not.toContain('text-brand')
+    expect(screen.getByText('English, US').closest('button')!.className).not.toContain('text-link')
     // The trailing click of the hold is not a tap: dictation stays off.
     fireEvent.pointerUp(mic(), { pointerId: 1 })
     fireEvent.click(mic())

@@ -43,11 +43,12 @@ async def test_codex_reaper_reads_the_cached_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_remote_reaper_reads_the_cached_timeout(monkeypatch):
+    from types import SimpleNamespace
+
     import config as app_config
     from core.remote import remote_reaper as rr
     from core.session import session_manager, session_state
     from services.scheduler import run_recovery
-    from types import SimpleNamespace
     monkeypatch.setattr(session_state, "cached_idle_timeout", AsyncMock(return_value=7))
     _forbid_on_loop_read(monkeypatch, app_config)
     monkeypatch.setattr(run_recovery, "sweep_expired", AsyncMock())
@@ -61,8 +62,8 @@ async def test_remote_reaper_reads_the_cached_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_headless_app_sweep_reads_the_cached_timeout(monkeypatch):
-    from services.apps import headless_exec as hx
     from core.session import session_state
+    from services.apps import headless_exec as hx
     monkeypatch.setattr(session_state, "cached_idle_timeout", AsyncMock(return_value=7))
     _forbid_on_loop_read(monkeypatch, hx.config)
     monkeypatch.setattr(hx, "_pool", {})
@@ -72,10 +73,11 @@ async def test_headless_app_sweep_reads_the_cached_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_remote_eviction_reads_the_cached_timeout(monkeypatch):
+    from types import SimpleNamespace
+
     import config as app_config
     from core.remote import remote_session_start as rss
     from core.session import session_state
-    from types import SimpleNamespace
     monkeypatch.setattr(session_state, "cached_idle_timeout", AsyncMock(return_value=7))
     _forbid_on_loop_read(monkeypatch, app_config)
     layer = SimpleNamespace(
@@ -90,11 +92,12 @@ async def test_the_remote_reaper_spares_a_session_waiting_on_a_person(monkeypatc
     """A remote turn parked on a prompt past the CLI turn ceiling is not a
     wedge: the prompt's own wait (three days) bounds it."""
     import time
+    from types import SimpleNamespace
+
     import config as app_config
     from core.remote import remote_reaper as rr
     from core.session import session_manager, session_state
     from services.scheduler import run_recovery
-    from types import SimpleNamespace
     monkeypatch.setattr(session_state, "cached_idle_timeout", AsyncMock(return_value=7))
     monkeypatch.setattr(run_recovery, "sweep_expired", AsyncMock())
     closed: list[str] = []

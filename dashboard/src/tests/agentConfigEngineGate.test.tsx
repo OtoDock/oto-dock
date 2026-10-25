@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { act, render, screen } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useNavigate } from 'react-router-dom'
 
 // ─── AgentConfig — platform-configured gate on the engine cards ─────────────
 // A non-admin manager can only NEWLY enable an engine the platform has a
@@ -27,24 +27,29 @@ const h = vi.hoisted(() => ({
   },
 }))
 
+const updateAgent = vi.hoisted(() => ({ mutate: (...a: unknown[]) => h.updateMock(...a), mutateAsync: (v: unknown) => { h.updateMock(v); return Promise.resolve({}) } }))
 vi.mock('@/api/agents', () => ({
   useAgentInfo: () => ({ data: h.agentInfo, isLoading: false }),
-  useUpdateAgent: () => ({ mutate: h.updateMock, isPending: false }),
-  useDeleteAgent: () => ({ mutate: vi.fn(), isPending: false }),
+  // One function for every render, as TanStack's own: the page's save
+  // effects list it.
+  useUpdateAgent: () => ({ mutate: updateAgent.mutate, mutateAsync: updateAgent.mutateAsync, isPending: false }),
+  useDeleteAgent: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false }),
   useDelegationTargets: () => ({ data: undefined }),
-  useSetDelegationTargets: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetDelegationTargets: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
   useExecutionLayers: () => ({ data: h.layers }),
   useSetDefaultForNewUsers: () => ({ mutate: vi.fn() }),
   useAgentUsers: () => ({ data: [] }),
   AgentUpdateError: class AgentUpdateError extends Error {},
   useKnowledgeAttachments: () => ({ data: undefined }),
   useKnowledgeLibraries: () => ({ data: undefined }),
-  useSetKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
-  useAttachKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
-  useDetachKnowledgeLibrary: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
+  useAttachKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
+  useDetachKnowledgeLibrary: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
   useAgentFiles: () => ({ data: undefined }),
 }))
-vi.mock('@/api/remoteMachines', () => ({ useRemoteMachines: () => ({ data: [] }) }))
+vi.mock('@/api/remoteMachines', async (orig) => ({
+  ...(await orig<typeof import('@/api/remoteMachines')>()), useRemoteMachines: () => ({ data: [] }),
+}))
 vi.mock('@/api/departments', () => ({ useDepartments: () => ({ data: [] }) }))
 vi.mock('@/api/memory', () => ({
   useAgentMemorySettings: () => ({
@@ -54,8 +59,8 @@ vi.mock('@/api/memory', () => ({
       master: { user_memory_enabled: true, agent_memory_enabled: true },
     },
   }),
-  useSetAgentMemoryToggle: () => ({ mutate: vi.fn() }),
-  useClearAgentMemory: () => ({ mutate: vi.fn(), isPending: false }),
+  useSetAgentMemoryToggle: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})) }),
+  useClearAgentMemory: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve({})), isPending: false }),
 }))
 vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: h.user }),
@@ -111,7 +116,7 @@ describe('AgentConfig — engine enable gate', () => {
     expect(codex.textContent).toContain(
       'No Codex subscription is connected on this platform')
     // No admin tail on the manager's hint.
-    expect(codex.textContent).not.toContain('Platform → AI Engines')
+    expect(codex.textContent).not.toContain('Setup, AI Engines')
   })
 
   it('manager: configured engine stays toggleable', () => {
@@ -126,12 +131,12 @@ describe('AgentConfig — engine enable gate', () => {
     expect(engineCard('Codex').disabled).toBe(false)
   })
 
-  it('admin: unconfigured engine stays enabled, hint points at Platform → AI Engines', () => {
+  it('admin: unconfigured engine stays enabled, hint points at Setup, AI Engines', () => {
     h.user = { role: 'admin', sub: 'u1', agent_roles: {} }
     renderConfig()
     const codex = engineCard('Codex')
     expect(codex.disabled).toBe(false)
-    expect(codex.textContent).toContain('Platform → AI Engines')
+    expect(codex.textContent).toContain('Setup, AI Engines')
   })
 
   it('a loading catalog renders no engine card at all (nothing to flash locked)', () => {
@@ -157,5 +162,53 @@ describe('AgentConfig — engine enable gate', () => {
     expect(cards[0].textContent).toContain('Anthropic')
     expect(cards[1].textContent).toContain('OpenAI')
     expect(cards[1].textContent).toContain('Codex')
+  })
+})
+
+// ─── The stored interactive default's correction names its agent ──────────
+// The page stays mounted across a route from one agent's config to
+// another's (the layout renders a bare Outlet), so a correction saved for
+// the first agent must never be written again for the second.
+
+const nav = { go: (_path: string) => {} }
+function Grab() {
+  nav.go = useNavigate()
+  return null
+}
+
+function renderConfigRoutes() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={['/agents/demo/config']}>
+        <Routes>
+          <Route path="/agents/:name/config" element={<><Grab /><AgentConfig /></>} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  )
+}
+
+describe('AgentConfig — a stored interactive default the model no longer runs', () => {
+  it('is corrected for the agent it was read from and never for the next agent on the route', () => {
+    const info = h.agentInfo
+    h.updateMock.mockClear()
+    h.layers = { ...LAYERS }
+    h.user = { role: 'member', sub: 'u1', agent_roles: { demo: 'manager', other: 'manager' } }
+    h.agentInfo = {
+      ...info, execution_path: 'codex-cli', execution_paths: ['codex-cli'],
+      default_model: 'gpt-9', default_execution_mode: 'interactive',
+    } as typeof h.agentInfo
+    try {
+      renderConfigRoutes()
+      expect(h.updateMock).toHaveBeenCalledTimes(1)
+      expect(h.updateMock.mock.calls[0][0]).toEqual({ name: 'demo', default_execution_mode: '' })
+      act(() => nav.go('/agents/other/config'))
+      const forOther = h.updateMock.mock.calls.filter((call) => (call[0] as { name: string }).name === 'other')
+      expect(forOther).toHaveLength(0)
+      expect(h.updateMock).toHaveBeenCalledTimes(1)
+    } finally {
+      h.agentInfo = info
+    }
   })
 })

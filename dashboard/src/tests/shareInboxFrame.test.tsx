@@ -10,21 +10,7 @@ import { renderHook, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useDashboardWs } from '@/hooks/useDashboardWs'
 import { WIRE } from '@/api/wireEvents'
-
-class FakeWebSocket {
-  static OPEN = 1
-  static CONNECTING = 0
-  static instances: FakeWebSocket[] = []
-  readyState = FakeWebSocket.OPEN
-  sent: string[] = []
-  onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
-  onmessage: ((e: { data: string }) => void) | null = null
-  constructor(public url: string) { FakeWebSocket.instances.push(this) }
-  send(data: string) { this.sent.push(data) }
-  close() { /* keeps reconnect logic out of the test */ }
-}
+import { FakeWebSocket } from './fakeWebSocket'
 
 describe('the share_inbox frame', () => {
   let warn: ReturnType<typeof vi.spyOn>
@@ -88,7 +74,11 @@ describe('the notifications hook on a share_inbox frame', () => {
     expect(keys).toContain(JSON.stringify(['apps', 'lite']))
     // A share delivery refreshes the section too.
     invalidate.mockClear()
-    act(() => { hook.result.current.onNotificationSilent({ type: WIRE.NOTIFICATION_SILENT, delivery: { id: 'd', source: 'share', severity: 'info' } }) })
+    const delivery = {
+      id: 'd', notification_id: null, title: '', body: '', severity: 'info' as const, scope: 'user', source: 'share',
+      delivered_at: '', read: 0, dismissed: 0, read_at: null, dismissed_at: null, agent_slug: null, chat_id: null,
+    }
+    act(() => { hook.result.current.onNotificationSilent({ type: WIRE.NOTIFICATION_SILENT, delivery }) })
     expect(invalidate.mock.calls.map((c) => JSON.stringify(c[0]?.queryKey))).toContain(JSON.stringify(['shares', 'inbox']))
     vi.doUnmock('@/api/agents')
     vi.doUnmock('@/hooks/usePushSubscription')

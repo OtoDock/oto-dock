@@ -1,0 +1,2756 @@
+{
+ "chat": {
+  "cache_read": 0,
+  "cache_write": 0,
+  "codex_thread_id": null,
+  "context_max": 0,
+  "context_used": 0,
+  "engine_cost_session_id": "",
+  "engine_cost_total": 0.0,
+  "last_abort_graceful": false,
+  "last_response_at": false,
+  "last_turn_aborted": false,
+  "output_tokens": 0,
+  "permission_mode": "ask",
+  "thread_goal": null,
+  "title_generated": false,
+  "total_cost": 0.0
+ },
+ "events": [
+  [
+   "system",
+   {
+    "max_turns": 6,
+    "meeting_id": "m-1",
+    "moderator": "ceo",
+    "participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "subtype": "meeting_started",
+    "topic": "The launch plan"
+   }
+  ],
+  [
+   "system",
+   {
+    "agent": "ceo",
+    "agent_color": "#336699",
+    "agent_display_name": "CEO",
+    "meeting_id": "m-1",
+    "subtype": "meeting_turn_start"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "The launch is on Monday. "
+   }
+  ],
+  [
+   "tool_use",
+   {
+    "name": "WebSearch",
+    "tool_id": "toolu_mt_1"
+   }
+  ],
+  [
+   "tool_input",
+   {
+    "name": "WebSearch",
+    "summary": "launch dates",
+    "tool_input": {
+     "query": "launch dates"
+    }
+   }
+  ],
+  [
+   "tool_result",
+   {
+    "name": "WebSearch",
+    "tool_id": "toolu_mt_1"
+   }
+  ],
+  [
+   "system",
+   {
+    "agent": "ceo",
+    "cost_usd": 0,
+    "subtype": "meeting_turn_end"
+   }
+  ],
+  [
+   "metadata",
+   {
+    "_meeting_cost": true,
+    "cost_usd": 0.21,
+    "session_id": "sess-ceo"
+   }
+  ],
+  [
+   "system",
+   {
+    "agent": "marketing-manager",
+    "error": "no usable account",
+    "subtype": "meeting_agent_failed"
+   }
+  ],
+  [
+   "system",
+   {
+    "agent": "marketing-manager",
+    "agent_color": "#996633",
+    "agent_display_name": "Marketing Manager",
+    "subtype": "meeting_agent_left"
+   }
+  ],
+  [
+   "system",
+   {
+    "agent": "ceo",
+    "agent_color": "#336699",
+    "agent_display_name": "CEO",
+    "meeting_id": "m-1",
+    "subtype": "meeting_turn_start"
+   }
+  ],
+  [
+   "text",
+   {
+    "content": "Agreed."
+   }
+  ],
+  [
+   "system",
+   {
+    "agent": "ceo",
+    "cost_usd": 0,
+    "subtype": "meeting_turn_end"
+   }
+  ],
+  [
+   "system",
+   {
+    "cost_usd": 0.42,
+    "meeting_id": "m-1",
+    "subtype": "meeting_concluded",
+    "total_turns": 4
+   }
+  ],
+  [
+   "done",
+   {}
+  ]
+ ],
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "max_turns": 6,
+    "meeting_id": "m-1",
+    "moderator": "ceo",
+    "participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "subtype": "meeting_started",
+    "topic": "The launch plan",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "agent": "ceo",
+    "agent_color": "#336699",
+    "agent_display_name": "CEO",
+    "meeting_id": "m-1",
+    "subtype": "meeting_turn_start",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "The launch is on Monday. ",
+   "event_data": {
+    "agent_color": "",
+    "agent_display_name": "ceo",
+    "agent_slug": "ceo",
+    "badge": "meeting"
+   },
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "_meeting_agent": "ceo",
+    "active": false,
+    "name": "WebSearch",
+    "summary": "launch dates",
+    "tool_id": "toolu_mt_1",
+    "tool_input": {
+     "query": "launch dates"
+    },
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "agent": "ceo",
+    "cost_usd": 0,
+    "subtype": "meeting_turn_end",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cost_billed": true,
+    "cost_usd": 0.21,
+    "type": "metadata"
+   },
+   "event_type": "metadata",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "agent": "marketing-manager",
+    "error": "no usable account",
+    "subtype": "meeting_agent_failed",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "agent": "marketing-manager",
+    "agent_color": "#996633",
+    "agent_display_name": "Marketing Manager",
+    "subtype": "meeting_agent_left",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "agent": "ceo",
+    "agent_color": "#336699",
+    "agent_display_name": "CEO",
+    "meeting_id": "m-1",
+    "subtype": "meeting_turn_start",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "Agreed.",
+   "event_data": "",
+   "event_type": "",
+   "role": "assistant"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "agent": "ceo",
+    "cost_usd": 0,
+    "subtype": "meeting_turn_end",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "",
+   "event_data": {
+    "cost_usd": 0.42,
+    "meeting_id": "m-1",
+    "subtype": "meeting_concluded",
+    "total_turns": 4,
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  }
+ ],
+ "seams": {
+  "ephemeral": [],
+  "kept": [],
+  "reconciles": [],
+  "relocated": [],
+  "replays": [],
+  "rests": [],
+  "status": [],
+  "titles": [],
+  "tool_starts": []
+ },
+ "trace": [
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "max_turns": 6,
+      "meeting_id": "m-1",
+      "moderator": "ceo",
+      "participants": [
+       "ceo",
+       "marketing-manager"
+      ],
+      "subtype": "meeting_started",
+      "topic": "The launch plan",
+      "type": "system"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [],
+    "meeting_agent": null,
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:system/meeting_started"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "ceo",
+     "agent_color": "#336699",
+     "agent_display_name": "CEO",
+     "meeting_id": "m-1",
+     "subtype": "meeting_turn_start",
+     "type": "system"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     }
+    ],
+    "meeting_agent": "ceo",
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": "ceo",
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:system/meeting_turn_start"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "ceo",
+     "agent_color": "#336699",
+     "agent_display_name": "CEO",
+     "meeting_id": "m-1",
+     "subtype": "meeting_turn_start",
+     "type": "system"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": "ceo",
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": "ceo",
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "The launch is on Monday. "
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 0,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "ceo",
+     "agent_color": "#336699",
+     "agent_display_name": "CEO",
+     "meeting_id": "m-1",
+     "subtype": "meeting_turn_start",
+     "type": "system"
+    },
+    {
+     "_meeting_agent": "ceo",
+     "content": "The launch is on Monday. ",
+     "type": "text"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "WebSearch",
+      "tool_id": "toolu_mt_1",
+      "type": "tool_start"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 2,
+      "_meeting_agent": "ceo",
+      "active": true,
+      "name": "WebSearch",
+      "summary": "",
+      "tool_id": "toolu_mt_1",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_insert_idx": 2,
+      "_meeting_agent": "ceo",
+      "active": true,
+      "name": "WebSearch",
+      "summary": "",
+      "tool_id": "toolu_mt_1",
+      "tool_input": null,
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": "ceo",
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_mt_1"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": "ceo",
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_use/WebSearch"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "ceo",
+     "agent_color": "#336699",
+     "agent_display_name": "CEO",
+     "meeting_id": "m-1",
+     "subtype": "meeting_turn_start",
+     "type": "system"
+    },
+    {
+     "_meeting_agent": "ceo",
+     "content": "The launch is on Monday. ",
+     "type": "text"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool_info"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [
+     {
+      "_insert_idx": 2,
+      "_meeting_agent": "ceo",
+      "active": true,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     }
+    ],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_insert_idx": 2,
+      "_meeting_agent": "ceo",
+      "active": true,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": "ceo",
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [
+     "toolu_mt_1"
+    ],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": "ceo",
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_input/WebSearch"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "ceo",
+     "agent_color": "#336699",
+     "agent_display_name": "CEO",
+     "meeting_id": "m-1",
+     "subtype": "meeting_turn_start",
+     "type": "system"
+    },
+    {
+     "_meeting_agent": "ceo",
+     "content": "The launch is on Monday. ",
+     "type": "text"
+    },
+    {
+     "_meeting_agent": "ceo",
+     "active": false,
+     "name": "WebSearch",
+     "summary": "launch dates",
+     "tool_id": "toolu_mt_1",
+     "tool_input": {
+      "query": "launch dates"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "name": "WebSearch",
+      "tool_id": "toolu_mt_1",
+      "type": "tool_end"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": "ceo",
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": false,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": "ceo",
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:tool_result/WebSearch"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "ceo",
+     "agent_color": "#336699",
+     "agent_display_name": "CEO",
+     "meeting_id": "m-1",
+     "subtype": "meeting_turn_start",
+     "type": "system"
+    },
+    {
+     "_meeting_agent": "ceo",
+     "content": "The launch is on Monday. ",
+     "type": "text"
+    },
+    {
+     "_meeting_agent": "ceo",
+     "active": false,
+     "name": "WebSearch",
+     "summary": "launch dates",
+     "tool_id": "toolu_mt_1",
+     "tool_input": {
+      "query": "launch dates"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "meeting_agent": "ceo",
+     "perm_data": {
+      "event_type": "permission_prompt",
+      "meeting_agent": "ceo",
+      "request_id": "req-perm-0002",
+      "tool_input": {
+       "file_path": "/workspace/x.md"
+      },
+      "tool_name": "Write"
+     },
+     "pump_type": "perm_permission_prompt"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": "ceo",
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": {
+     "event_type": "permission_prompt",
+     "meeting_agent": "ceo",
+     "request_id": "req-perm-0002",
+     "tool_input": {
+      "file_path": "/workspace/x.md"
+     },
+     "tool_name": "Write"
+    },
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": "ceo",
+    "pending_permission": "req-perm-0002",
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": "req-perm-0002",
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:permission_prompt"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "ceo",
+     "agent_color": "#336699",
+     "agent_display_name": "CEO",
+     "meeting_id": "m-1",
+     "subtype": "meeting_turn_start",
+     "type": "system"
+    },
+    {
+     "_meeting_agent": "ceo",
+     "content": "The launch is on Monday. ",
+     "type": "text"
+    },
+    {
+     "_meeting_agent": "ceo",
+     "active": false,
+     "name": "WebSearch",
+     "summary": "launch dates",
+     "tool_id": "toolu_mt_1",
+     "tool_input": {
+      "query": "launch dates"
+     },
+     "type": "tool"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "request_id": "req-perm-0002",
+      "type": "prompt_retired"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     }
+    ],
+    "meeting_agent": "ceo",
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": "ceo",
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "perm:prompt_retired"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.0,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.0,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:system/meeting_turn_end"
+  },
+  {
+   "blocks": [
+    {
+     "cost_billed": true,
+     "cost_usd": 0.21,
+     "type": "metadata"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "cost_billed": true,
+      "cost_usd": 0.21,
+      "type": "metadata"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.21,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.21,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:metadata"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "agent": "marketing-manager",
+      "error": "no usable account",
+      "subtype": "meeting_agent_failed",
+      "type": "system"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "error": "no usable account",
+      "subtype": "meeting_agent_failed",
+      "type": "system"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.21,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.21,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:system/meeting_agent_failed"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "marketing-manager",
+     "agent_color": "#996633",
+     "agent_display_name": "Marketing Manager",
+     "subtype": "meeting_agent_left",
+     "type": "system"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "agent": "marketing-manager",
+      "agent_color": "#996633",
+      "agent_display_name": "Marketing Manager",
+      "subtype": "meeting_agent_left",
+      "type": "system"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "error": "no usable account",
+      "subtype": "meeting_agent_failed",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "agent_color": "#996633",
+      "agent_display_name": "Marketing Manager",
+      "subtype": "meeting_agent_left",
+      "type": "system"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.21,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.21,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:system/meeting_agent_left"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "marketing-manager",
+     "agent_color": "#996633",
+     "agent_display_name": "Marketing Manager",
+     "subtype": "meeting_agent_left",
+     "type": "system"
+    },
+    {
+     "agent": "ceo",
+     "agent_color": "#336699",
+     "agent_display_name": "CEO",
+     "meeting_id": "m-1",
+     "subtype": "meeting_turn_start",
+     "type": "system"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "error": "no usable account",
+      "subtype": "meeting_agent_failed",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "agent_color": "#996633",
+      "agent_display_name": "Marketing Manager",
+      "subtype": "meeting_agent_left",
+      "type": "system"
+     },
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     }
+    ],
+    "meeting_agent": "ceo",
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.21,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.21,
+    "mcp_cost_by_key": {},
+    "meeting_agent": "ceo",
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:system/meeting_turn_start"
+  },
+  {
+   "blocks": [
+    {
+     "agent": "marketing-manager",
+     "agent_color": "#996633",
+     "agent_display_name": "Marketing Manager",
+     "subtype": "meeting_agent_left",
+     "type": "system"
+    },
+    {
+     "agent": "ceo",
+     "agent_color": "#336699",
+     "agent_display_name": "CEO",
+     "meeting_id": "m-1",
+     "subtype": "meeting_turn_start",
+     "type": "system"
+    }
+   ],
+   "frames": [
+    {
+     "event": {
+      "content": "Agreed.",
+      "type": "text"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "error": "no usable account",
+      "subtype": "meeting_agent_failed",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "agent_color": "#996633",
+      "agent_display_name": "Marketing Manager",
+      "subtype": "meeting_agent_left",
+      "type": "system"
+     },
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "Agreed.",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": "ceo",
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.21,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.21,
+    "mcp_cost_by_key": {},
+    "meeting_agent": "ceo",
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [
+     "Agreed."
+    ],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:text"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "error": "no usable account",
+      "subtype": "meeting_agent_failed",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "agent_color": "#996633",
+      "agent_display_name": "Marketing Manager",
+      "subtype": "meeting_agent_left",
+      "type": "system"
+     },
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "Agreed.",
+      "type": "text"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [
+     "ceo",
+     "marketing-manager"
+    ],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.21,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.21,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:system/meeting_turn_end"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "event": {
+      "cost_usd": 0.42,
+      "meeting_id": "m-1",
+      "subtype": "meeting_concluded",
+      "total_turns": 4,
+      "type": "system"
+     },
+     "pump_type": "ws_event"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "error": "no usable account",
+      "subtype": "meeting_agent_failed",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "agent_color": "#996633",
+      "agent_display_name": "Marketing Manager",
+      "subtype": "meeting_agent_left",
+      "type": "system"
+     },
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "Agreed.",
+      "type": "text"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     },
+     {
+      "cost_usd": 0.42,
+      "meeting_id": "m-1",
+      "subtype": "meeting_concluded",
+      "total_turns": 4,
+      "type": "system"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.21,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.21,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:system/meeting_concluded"
+  },
+  {
+   "blocks": [],
+   "frames": [
+    {
+     "pump_type": "is_done"
+    }
+   ],
+   "live": {
+    "active_agents": [],
+    "active_commands": [],
+    "active_delegates": [],
+    "active_tools": [],
+    "goal": null,
+    "live_blocks": [
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "The launch is on Monday. ",
+      "type": "text"
+     },
+     {
+      "_meeting_agent": "ceo",
+      "active": false,
+      "name": "WebSearch",
+      "summary": "launch dates",
+      "tool_id": "toolu_mt_1",
+      "tool_input": {
+       "query": "launch dates"
+      },
+      "type": "tool"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "error": "no usable account",
+      "subtype": "meeting_agent_failed",
+      "type": "system"
+     },
+     {
+      "agent": "marketing-manager",
+      "agent_color": "#996633",
+      "agent_display_name": "Marketing Manager",
+      "subtype": "meeting_agent_left",
+      "type": "system"
+     },
+     {
+      "agent": "ceo",
+      "agent_color": "#336699",
+      "agent_display_name": "CEO",
+      "meeting_id": "m-1",
+      "subtype": "meeting_turn_start",
+      "type": "system"
+     },
+     {
+      "content": "Agreed.",
+      "type": "text"
+     },
+     {
+      "agent": "ceo",
+      "cost_usd": 0,
+      "subtype": "meeting_turn_end",
+      "type": "system"
+     },
+     {
+      "cost_usd": 0.42,
+      "meeting_id": "m-1",
+      "subtype": "meeting_concluded",
+      "total_turns": 4,
+      "type": "system"
+     },
+     {
+      "content": "\n\n",
+      "type": "text"
+     }
+    ],
+    "meeting_agent": null,
+    "meeting_participants": [],
+    "pending_permission": null,
+    "session_id": "sid-pc-meeting",
+    "streaming": true,
+    "thinking_active": false,
+    "thinking_text": "",
+    "thinking_tokens": 0,
+    "todos": [],
+    "workflows": {}
+   },
+   "state": {
+    "abort_requested": false,
+    "accepts_in_flight": 0,
+    "active_tools": [],
+    "cache": [
+     0,
+     0
+    ],
+    "completed": false,
+    "context": [
+     0,
+     0
+    ],
+    "cost_delta": 0.21,
+    "cumulative_cost": null,
+    "done": false,
+    "engine_prompts": [],
+    "gc_snapshots_pending": false,
+    "goal": null,
+    "has_pending_prompt": true,
+    "last_ending": null,
+    "last_error": "",
+    "last_session_cost": 0.0,
+    "leftover": [],
+    "llm_cost_delta": 0.21,
+    "mcp_cost_by_key": {},
+    "meeting_agent": null,
+    "pending_permission": null,
+    "pending_previews": [],
+    "pending_text": [],
+    "permission_active": null,
+    "permission_buffer": [],
+    "pinged": [],
+    "plan_filename": "",
+    "queue_closed": true,
+    "recovery_eligible": null,
+    "registry": {
+     "completed": [],
+     "has_pending": false,
+     "spawned": []
+    },
+    "retried": [],
+    "session_mode": "auto",
+    "steer_saved_ranges": [],
+    "thinking_text": "",
+    "title_armed": false,
+    "todos": [],
+    "tokens": [
+     0,
+     0
+    ],
+    "tool_seen": 1,
+    "viewers": [
+     [
+      true,
+      false,
+      0
+     ]
+    ],
+    "workflows_forwarded": []
+   },
+   "step": "event:done"
+  }
+ ]
+}

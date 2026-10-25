@@ -20,17 +20,18 @@ import asyncio
 import time
 import uuid
 
+import psycopg
 import pytest
 
 from core.layers.cli import session as cli_session
-from core.sandbox import pty_relay
 from core.layers.cli.session import (
+    _STARTUP_REAP_GRACE_S,
     PersistentSession,
     _persistent_sessions,
     _reap_idle_pass,
-    _STARTUP_REAP_GRACE_S,
     get_or_create_persistent_session,
 )
+from core.sandbox import pty_relay
 
 
 class _FakeStdin:
@@ -118,6 +119,7 @@ class TestReapPass:
         abandoned: the reaper spares it while the prompt waits (its own wait,
         three days, bounds it), and reaps it once the prompt is answered."""
         import asyncio as _aio
+
         from core.session import session_state
         monkeypatch.setattr(cli_session.config, "get_idle_timeout", lambda: 10)
         s = _mk_session(started=True, proc_alive=True, idle_s=3600)
@@ -337,13 +339,13 @@ class TestIdleTimeoutRead:
         def flaky(key):
             calls["n"] += 1
             if calls["n"] == 1:
-                raise RuntimeError("database down")
+                raise psycopg.OperationalError("database down")
             return "1234"
 
         monkeypatch.setattr(db, "get_platform_setting", flaky)
         assert await session_state.cached_idle_timeout() == cli_session.config.PERSISTENT_SESSION_TIMEOUT
         assert await session_state.cached_idle_timeout() == 1234   # read again, not cached
-        monkeypatch.setattr(db, "get_platform_setting", lambda key: (_ for _ in ()).throw(RuntimeError("down")))
+        monkeypatch.setattr(db, "get_platform_setting", lambda key: (_ for _ in ()).throw(psycopg.OperationalError("down")))
         assert await session_state.cached_idle_timeout() == 1234   # the cache serves it
 
     @pytest.mark.asyncio

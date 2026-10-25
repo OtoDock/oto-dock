@@ -15,8 +15,14 @@ import asyncio
 import contextlib
 import json
 
-from pipeline_fakes import FakeCall, FakeCallManager, FakeConn, FakeLLM, FakeTTS, make_route
-
+from pipeline_fakes import (
+    FakeCall,
+    FakeCallManager,
+    FakeConn,
+    FakeLLM,
+    FakeTTS,
+    make_route,
+)
 
 # ── Marker protocol (pure regex) ────────────────────────────────────────
 
@@ -424,6 +430,7 @@ def test_condition_clip_trims_fades_and_caps():
     """Cached filler clips get silence-trimmed, edge-faded, and peak-capped —
     abrupt TTS boundaries on short hums read as distortion on the line."""
     import numpy as np
+
     import config as phone_config
     from fillers import _condition_clip
 
@@ -556,7 +563,10 @@ def test_barge_in_mid_generation_aborts_and_folds_into_next_turn(make_pipeline):
 
     def _on_token(prompt, i, token):
         if len(llm.prompts) == 1 and i == 1:
-            p.state._utterance_cancelled = True  # barge-in confirmed
+            # The barge-in commit: _cancel_tts sets the flag and cancels
+            # the open context (the fake's receiver ends on the cancel).
+            p.state._utterance_cancelled = True
+            p.tts.cancel()
     llm.on_token = _on_token
 
     asyncio.run(p._process_utterance("what's the weather"))
@@ -582,6 +592,7 @@ def test_proxy_ws_barge_in_aborts_interrupt_style(make_pipeline):
     def _on_token(prompt, i, token):
         if i == 1:
             p.state._utterance_cancelled = True
+            p.tts.cancel()
     llm.on_token = _on_token
 
     asyncio.run(p._process_utterance("hi"))
@@ -764,6 +775,7 @@ def test_the_turn_classifier_loads_in_the_background_and_a_turn_waits_bounded(ma
     it at the call's start: a turn classifies by the heuristic while the
     model loads and by the classifier once it is there."""
     import time
+
     from pipeline import providers as plproviders, turn as plturn
 
     def slow_prewarm(cfg):
@@ -818,6 +830,7 @@ def test_the_debug_switch_saves_the_outgoing_audio_of_a_call(make_pipeline, monk
     """debug_outgoing_audio=on: the call's outgoing frames land in a WAV
     under debug-audio when it ends; absent, the call runs without a tap."""
     import wave
+
     from pipeline import core as plcore
 
     monkeypatch.setattr(plcore.config, "BASE_DIR", tmp_path)

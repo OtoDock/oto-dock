@@ -51,7 +51,7 @@ async def main() -> int:
             print(f"  WAV: {w.getframerate()} Hz, {w.getnframes()} frames, "
                   f"{w.getnframes() / w.getframerate():.2f}s")
         out = "/tmp/tts-smoke.wav"
-        with open(out, "wb") as f:
+        with open(out, "wb") as f:  # noqa: ASYNC230  # the smoke script's own output, after the call it measured
             f.write(resp.content)
         print(f"  saved: {out}")
     return 0

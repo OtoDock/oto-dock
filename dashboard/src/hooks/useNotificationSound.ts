@@ -1,8 +1,16 @@
 import { useRef, useCallback, useEffect } from 'react'
 import { Capacitor } from '@capacitor/core'
+import { isDictationActive, isSpeaking } from '../audio/speechActivity'
+import { isNativePlatform } from '../audio/types'
 
 type Severity = 'info' | 'success' | 'warning' | 'danger'
 
+// Each chime stays under five seconds on purpose: for a short file whose
+// length is known as it starts, the WebView asks other apps only to lower
+// their sound for its duration (Chromium's media session treats a known
+// duration of at most 5 s as transient, may duck); a longer one, or one
+// whose length is unknown as it starts, takes the audio focus outright and
+// stops the car's music. notificationSound.test.ts reads the headers.
 const SOUND_URLS: Record<string, string> = {
   success: '/sounds/success.wav',
   warning: '/sounds/warning.wav',
@@ -10,29 +18,17 @@ const SOUND_URLS: Record<string, string> = {
   ping: '/sounds/ping.wav',
 }
 
-/**
- * Android WebView (and modern browsers) block Audio.play() unless
- * preceded by a user gesture. This flag tracks whether we've "unlocked"
- * audio by playing a silent buffer on first touch/click.
- */
-let audioUnlocked = false
-let audioContext: AudioContext | null = null
+// Speech synthesis in a browser speaks on its own (the danger readout's web
+// fallback) only once a user gesture let it: warmed with an empty utterance
+// at the first tap or key. Inside an app shell the app speaks through its
+// native plugin and plays media without a gesture, so nothing is warmed
+// there, and the page opens no sound output until a sound plays.
+let speechWarmed = false
 
-function unlockAudio() {
-  if (audioUnlocked) return
-  audioUnlocked = true
-
-  // Create an AudioContext and play a silent buffer to unlock audio playback
-  try {
-    audioContext = new AudioContext()
-    const buffer = audioContext.createBuffer(1, 1, 22050)
-    const source = audioContext.createBufferSource()
-    source.buffer = buffer
-    source.connect(audioContext.destination)
-    source.start(0)
-  } catch { /* ignore */ }
-
-  // Also trigger speechSynthesis unlock
+function warmSpeechOnce() {
+  if (speechWarmed) return
+  speechWarmed = true
+  if (isNativePlatform()) return
   if ('speechSynthesis' in window) {
     const u = new SpeechSynthesisUtterance('')
     u.volume = 0
@@ -40,53 +36,56 @@ function unlockAudio() {
   }
 }
 
-// Listen for first user interaction to unlock audio (once, globally)
 if (typeof document !== 'undefined') {
   const events = ['touchstart', 'touchend', 'click', 'keydown']
   const handler = () => {
-    unlockAudio()
+    warmSpeechOnce()
     events.forEach(e => document.removeEventListener(e, handler, true))
   }
   events.forEach(e => document.addEventListener(e, handler, { capture: true, once: false }))
 }
 
-// One set of preloaded elements per page: the hook mounts at the auth root
-// (the wake word) and again on the chat page, and each mount used to fetch
-// the four files anew.
-let preloaded: Record<string, HTMLAudioElement> | null = null
+// The files, warmed into memory once per page when the page is idle: a chime
+// then plays from a Blob URL, with no network between the moment it is asked
+// for and the sound (the proxy serves the files with no-cache, so a media
+// element's own load would revalidate first) and with its length known as it
+// starts. Nothing is warmed on a media element: a preloaded element is a
+// media pipeline the page keeps open from every start. Before the warm
+// lands, or when it failed (offline, a sign-in redirect), the file's URL
+// plays instead.
+const warmed: Record<string, string> = {}
+let warmStarted = false
 
-function preloadSounds(): Record<string, HTMLAudioElement> {
-  if (!preloaded) {
-    preloaded = {}
+function warmSounds() {
+  if (warmStarted || typeof fetch !== 'function' || typeof URL.createObjectURL !== 'function') return
+  warmStarted = true
+  const run = () => {
     for (const [key, url] of Object.entries(SOUND_URLS)) {
-      const audio = new Audio(url)
-      audio.preload = 'auto'
-      preloaded[key] = audio
+      fetch(url)
+        .then(r => (r.ok && (r.headers.get('content-type') || '').startsWith('audio/')
+          ? r.blob()
+          : Promise.reject(new Error(`not a sound: ${r.status}`))))
+        .then(b => { warmed[key] = URL.createObjectURL(b) })
+        .catch(() => { /* the file's URL plays instead */ })
     }
   }
-  return preloaded
+  if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 5000 })
+  else setTimeout(run, 1000)
 }
 
 export function useNotificationSound() {
-  const audioCache = useRef<Record<string, HTMLAudioElement>>({})
   const dangerLoop = useRef<{ stop: () => void } | null>(null)
 
   useEffect(() => {
-    audioCache.current = preloadSounds()
+    warmSounds()
   }, [])
 
   const playSound = useCallback((key: string) => {
-    // Resume AudioContext if it was suspended (common after unlock)
-    if (audioContext?.state === 'suspended') {
-      audioContext.resume().catch(() => {})
-    }
-
-    const audio = audioCache.current[key]
-    if (audio) {
-      const clone = audio.cloneNode(true) as HTMLAudioElement
-      clone.volume = key === 'ping' ? 0.3 : 0.7
-      clone.play().catch(() => {})
-    }
+    const url = SOUND_URLS[key]
+    if (!url) return
+    const audio = new Audio(warmed[key] ?? url)
+    audio.volume = key === 'ping' ? 0.3 : 0.7
+    audio.play().catch(() => {})
   }, [])
 
   const speak = useCallback(async (text: string) => {
@@ -118,13 +117,17 @@ export function useNotificationSound() {
       dangerLoop.current = null
     }
 
+    // A chime while a spoken reply plays or a dictation records lands in
+    // the open mic (the turn-complete ping is held the same way); a danger
+    // alarm is never held.
+    const quiet = isSpeaking() || isDictationActive()
     switch (severity) {
       case 'info':
       case 'success':
-        playSound('success')
+        if (!quiet) playSound('success')
         break
       case 'warning':
-        playSound('warning')
+        if (!quiet) playSound('warning')
         break
       case 'danger': {
         // Loop alarm + TTS until stopped

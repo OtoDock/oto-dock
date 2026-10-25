@@ -479,6 +479,7 @@ def test_the_password_confirm_answers_503_past_the_hash_gate(monkeypatch):
     shares the login's bounded bcrypt gate: a full gate is a 503 with
     Retry-After, never a thread queued without bound or a hash on the loop."""
     import types
+
     from auth import confirm
 
     _slow_bcrypt(monkeypatch, 0.3)

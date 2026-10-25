@@ -14,11 +14,11 @@ HTTP is mocked via httpx.AsyncClient (patched inside oidc_provider).
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import config
 from app import app
@@ -209,9 +209,12 @@ def test_a_full_state_store_refuses_a_start_and_keeps_every_live_state(monkeypat
 
 # --- the SSO start count: a browser already signing in is not counted again --
 
-from urllib.parse import parse_qs as _parse_qs, urlparse as _urlparse  # noqa: E402
+from urllib.parse import (
+    parse_qs as _parse_qs,
+    urlparse as _urlparse,
+)
 
-from api.auth import identity as _identity  # noqa: E402
+from api.auth import identity as _identity
 
 _PATHS = ["/auth/oidc-url", "/auth/login"]
 
@@ -388,11 +391,11 @@ def test_a_ring_a_client_builds_gets_no_more_free_starts_than_a_browser(sso, res
 
 # --- F66: the ID token is verified before anything it says is trusted ---------
 
-import json as _json  # noqa: E402
-import time as _time  # noqa: E402
+import json as _json
+import time as _time
 
-import jwt as _jwt  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import rsa as _rsa  # noqa: E402
+import jwt as _jwt
+from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
 
 _ISS = "https://idp.example.com/application/o/app/"
 _KEY = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -584,6 +587,7 @@ def test_an_omitted_email_verified_is_not_vouched_for(idp):
 
 def test_the_login_url_carries_a_nonce_and_an_s256_challenge(idp):
     from urllib.parse import parse_qs, urlparse
+
     from auth import providers
     url = OIDCAuthProvider().get_login_url()
     q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}

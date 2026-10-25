@@ -9,47 +9,87 @@ import contextlib
 import json
 import logging
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, cast
 
-from core.events.common_events import (
-    CommonEvent,
-    TEXT, THINKING, TOOL_USE, TOOL_INPUT, TOOL_RESULT,
-    PERMISSION_REQUEST, SUBAGENT_START, SUBAGENT_END, DELEGATE_SPAWN,
-    BG_COMMAND_START, BG_COMMAND_END,
-    WORKFLOW_START, WORKFLOW_PROGRESS, WORKFLOW_END,
-    PLAN_MODE, SYSTEM, METADATA, DONE, ERROR,
-    TODO_UPDATE, CONTEXT_COMPACT,
-)
-from core import placement
-from core.execution_layer import (
-    AgentConfig, AuthProfile, BehaviourProfile, CredentialFileSpec, EngineIdentity,
-    ExecutionLayer, LayerCapabilities, ModelPolicy, OAuthRefresh, RuntimeProfile,
-    SubscriptionHandle, UsageProfile, WindowSpec, Windows,
-)
-from core.layers.cli import oauth as claude_oauth
-from core.layers.cli import usage as claude_usage
-from core.layers.cli.helpers import ClaudeStreamChunk
+import config as app_config
+from core import layout, placement
 from core.events import turn_ending
+from core.events.common_events import (
+    BG_COMMAND_END,
+    BG_COMMAND_START,
+    CONTEXT_COMPACT,
+    DELEGATE_SPAWN,
+    DONE,
+    ERROR,
+    METADATA,
+    PERMISSION_REQUEST,
+    PLAN_MODE,
+    SUBAGENT_END,
+    SUBAGENT_START,
+    SYSTEM,
+    TEXT,
+    THINKING,
+    TODO_UPDATE,
+    TOOL_INPUT,
+    TOOL_RESULT,
+    TOOL_USE,
+    WORKFLOW_END,
+    WORKFLOW_PROGRESS,
+    WORKFLOW_START,
+    CommonEvent,
+)
+from core.execution_layer import (
+    PERMISSION_MODES,
+    AgentConfig,
+    AuthProfile,
+    BehaviourProfile,
+    CredentialFileSpec,
+    EngineIdentity,
+    ExecutionLayer,
+    LayerCapabilities,
+    ModelPolicy,
+    OAuthRefresh,
+    ResumeVerdict,
+    RuntimeProfile,
+    SubscriptionHandle,
+    UsageProfile,
+    Windows,
+    WindowSpec,
+    cli_mode,
+)
+from core.layers.cli import oauth as claude_oauth, usage as claude_usage
+from core.layers.cli.helpers import ClaudeStreamChunk
 from core.layers.cli.session import (
     PersistentSession,
-    get_persistent_session, get_or_create_persistent_session,
+    _persistent_sessions,
     close_persistent_session,
-    interrupt_persistent_session, _persistent_sessions,
+    get_or_create_persistent_session,
+    get_persistent_session,
+    interrupt_persistent_session,
 )
-import config as app_config
+from core.permission_modes import ASK_MODE, AUTO_REVIEW_MODE, CLI_AUTO_WORD
 from core.session.external_identity import external_home_of, is_external_ctx
-from core import layout
 from core.session.session_state import (
+    START_MARK_TTL_S,
     _record_session_use,
-    cleanup_session_permission_state, register_session_state,
-    set_session_mode,
     _sessions,
+    cleanup_session_permission_state,
+    clear_starting,
+    get_session_mode,
+    mark_closing,
+    mark_starting,
+    register_session_state,
     resolve_permission,
     resolve_session_permissions,
-    mark_starting, clear_starting, mark_closing, session_is_held, START_MARK_TTL_S,
+    session_is_held,
+    set_session_mode,
 )
+
+if TYPE_CHECKING:
+    from auth.path_policy import SecurityContext
 
 logger = logging.getLogger("otodock")
 
@@ -85,8 +125,9 @@ async def _interrupt_watchdog(session: PersistentSession, armed_seq: int) -> Non
             or session._turn_seq != armed_seq):
         return
     logger.warning(
-        f"Session {session.session_id}: graceful interrupt did not close the "
-        f"turn within {_INTERRUPT_WATCHDOG_S:.0f}s — killing process group"
+        "Session %s: graceful interrupt did not close the "
+        "turn within %.0fs — killing process group",
+        session.session_id, _INTERRUPT_WATCHDOG_S
     )
     await interrupt_persistent_session(session.session_id)
     try:
@@ -96,7 +137,8 @@ async def _interrupt_watchdog(session: PersistentSession, armed_seq: int) -> Non
             task_store.update_chat(chat["id"], last_abort_graceful=False)
     except Exception:
         logger.exception(
-            f"Session {session.session_id}: watchdog graceful-flag reset failed"
+            "Session %s: watchdog graceful-flag reset failed",
+            session.session_id
         )
 
 
@@ -136,9 +178,11 @@ def cli_chunk_to_events(chunk: ClaudeStreamChunk) -> list[CommonEvent]:
     # the chat). Never user-facing content; drop it on BOTH paths.
     _ede_noise = bool(chunk.text) and chunk.text.lstrip().startswith("[ede_diagnostic]")
 
-    if et == "text" and chunk.text:
+    if et == "text" and (chunk.text or chunk.event_data.get("note")):
+        # A note chunk with no text is the note mark (the translator's).
         if not _ede_noise:
-            events.append(CommonEvent(type=TEXT, data={"content": chunk.text}))
+            events.append(CommonEvent(type=TEXT, data={"content": chunk.text, **(
+                {"note": True} if chunk.event_data.get("note") else {})}))
 
     elif et == "thinking":
         events.append(CommonEvent(type=THINKING, data=chunk.event_data))
@@ -221,7 +265,7 @@ def cli_chunk_to_events(chunk: ClaudeStreamChunk) -> list[CommonEvent]:
     # or a usage limit) rides its ERROR with no TEXT twin: the pump persists
     # its line once.
     if chunk.is_error and chunk.text and not _ede_noise:
-        data = {"message": chunk.text}
+        data: dict = {"message": chunk.text}
         if et == "turn_ending":
             data["ending"] = dict(chunk.event_data)
         events.append(CommonEvent(type=ERROR, data=data))
@@ -248,7 +292,7 @@ _CLI_CAPABILITIES = LayerCapabilities(
     supports_context_compression=True,
     supports_control_commands=True,
     supports_mcps=True,
-    permission_modes=["default", "acceptEdits", "plan", "dontAsk"],
+    permission_modes=list(PERMISSION_MODES),
     control_commands=["set_model", "set_permission_mode"],
     models=app_config.get_layer_models("claude-code-cli"),
     effort_levels=["low", "medium", "high", "xhigh", "max"],
@@ -413,26 +457,21 @@ class CLIExecutionLayer(ExecutionLayer):
         sandbox_builder = None
 
         from core.sandbox.sandbox import (
-            SandboxBuilder, SandboxMount, cli_install_ro_binds,
+            SandboxBuilder,
+            cli_install_ro_binds,
+            mcp_sandbox_mounts,
             resolve_sandbox_config,
         )
         from services.mcp import mcp_registry as mcp_reg
 
-        ctx = config.security_context
+        ctx = cast("SecurityContext | None", config.security_context)
 
         # Resolve MCP sandbox mounts from assigned MCP manifests.
         # is_remote=False (fail-closed default, explicit here): this is the
         # LOCAL bwrap mount path, so satellite_only device MCPs must never
         # appear — they run native on the satellite.
-        mcp_mounts: list[SandboxMount] = []
-        assigned_mcps = mcp_reg.get_agent_mcps(config.agent_name, placement=placement.LOCAL_PLACEMENT) or []
-        for manifest in assigned_mcps:
-            for m in getattr(manifest, "sandbox_mounts", []):
-                # Resolve the ${mcp_dir} template in the host path. The host
-                # is allowlisted to the agent / mcps tree in the sandbox
-                # builder, so a platform-root template is not offered here.
-                host = m.host.replace("${mcp_dir}", str(manifest.mcp_dir))
-                mcp_mounts.append(SandboxMount(host=host, sandbox=m.sandbox, mode=m.mode))
+        mcp_mounts = mcp_sandbox_mounts(
+            mcp_reg.get_agent_mcps(config.agent_name, placement=placement.LOCAL_PLACEMENT) or [])
 
         sandbox_cfg = resolve_sandbox_config(
             role=ctx.role if ctx else "viewer",
@@ -484,7 +523,7 @@ class CLIExecutionLayer(ExecutionLayer):
             from services.engines.token_fanout import write_credential_file
             write_credential_file(
                 Path(config.sandbox_host_claude_dir),
-                self.capabilities.auth.credential_file.filename, credentials,
+                cast("CredentialFileSpec", self.capabilities.auth.credential_file).filename, credentials,
             )
 
         # OAuth token files for the stdio MCPs that read one: delivered in
@@ -538,7 +577,7 @@ class CLIExecutionLayer(ExecutionLayer):
             # see build_spawn_command); the session is not pump-driven. All the
             # sandbox/MCP/broker prep above + the identity block below are shared.
             from core.session import interactive_session
-            ctx = config.security_context
+            ctx = cast("SecurityContext | None", config.security_context)
             _builder = PersistentSession(
                 session_id=session_id,
                 agent_prompt=config.system_prompt,
@@ -562,7 +601,9 @@ class CLIExecutionLayer(ExecutionLayer):
             # like headless. Local sessions have a sandbox
             # builder → CLAUDE_CONFIG_DIR maps to config.sandbox_host_claude_dir.
             if sandbox_builder and config.sandbox_host_claude_dir:
-                from services.engines.cli_settings_manager import seed_interactive_cli_config
+                from services.engines.cli_settings_manager import (
+                    seed_interactive_cli_config,
+                )
                 seed_interactive_cli_config(
                     config.sandbox_host_claude_dir,
                     sandbox_builder.get_cwd(),
@@ -614,7 +655,8 @@ class CLIExecutionLayer(ExecutionLayer):
         # Bind subscription to session for pool cleanup on close
         if config.subscription_id:
             from services.engines.subscription_pool import (
-                bind_session, credential_scope_key,
+                bind_session,
+                credential_scope_key,
             )
             await asyncio.wrap_future(bind_session(
                 session_id, config.subscription_id,
@@ -914,23 +956,55 @@ class CLIExecutionLayer(ExecutionLayer):
     async def change_mode(
         self, session_id: str, mode: str,
     ) -> None:
-        """Change permission mode via CLI control channel."""
+        """Change permission mode via CLI control channel (the CLI's own
+        word for it, ``cli_mode``)."""
         session = await get_persistent_session(session_id)
         if session:
             async with session.lock:
                 await session.send_control_request(
-                    "set_permission_mode", mode=mode,
+                    "set_permission_mode", mode=cli_mode(mode),
                 )
         set_session_mode(session_id, mode)
 
     async def send_control_request(
         self, session_id: str, subtype: str, **kwargs,
     ) -> dict:
-        """Send a control request to the CLI process."""
+        """Send a control request to the CLI process. A platform mode on
+        ``set_permission_mode`` (a change queued during a turn) goes as the
+        CLI's own word."""
         session = await get_persistent_session(session_id)
         if not session:
             return {}
+        if subtype == "set_permission_mode" and kwargs.get("mode"):
+            kwargs = {**kwargs, "mode": cli_mode(kwargs["mode"])}
         return await session.send_control_request(subtype, **kwargs)
+
+    async def reenter_review(self, session_id: str) -> bool:
+        """Leaving the CLI's auto mode and coming back clears its pause
+        (probed on 2.1.296). Sent under the session's lock (after the turn),
+        once the mode is read again there; the platform's mode is not
+        written, so a person's change made during the turn stands."""
+        session = await get_persistent_session(session_id)
+        if session is None:
+            return False
+        async with session.lock:
+            if get_session_mode(session_id) != AUTO_REVIEW_MODE:
+                return False
+            await session.send_control_request("set_permission_mode", mode=cli_mode(ASK_MODE))
+            await session.send_control_request("set_permission_mode", mode=cli_mode(AUTO_REVIEW_MODE))
+        return True
+
+    def terminal_reports_mode(self) -> bool:
+        return True
+
+    def hook_can_ask(self) -> bool:
+        return True
+
+    def engine_reviews(self, session_id: str, live_mode: str) -> bool:
+        """Claude Code's classifier judges a call the hook leaves undecided
+        exactly when the CLI reports its auto mode with the call (any
+        placement: the hook payload says what the CLI runs now)."""
+        return live_mode == CLI_AUTO_WORD
 
     # --- Capabilities ---
 
@@ -1017,7 +1091,7 @@ class CLIExecutionLayer(ExecutionLayer):
     async def can_resume_session(
         self, session_id: str, *, agent_name: str = "", username: str = "",
         external_home: str = "",
-    ) -> bool:
+    ) -> ResumeVerdict:
         """Check if session file has conversation data for --resume.
 
         CLI stores sessions at <CLAUDE_CONFIG_DIR>/projects/<project-hash>/<session_id>.jsonl.
@@ -1027,7 +1101,9 @@ class CLIExecutionLayer(ExecutionLayer):
         restart the in-memory mapping is lost, so *agent_name* + *username*
         (or an external caller's *external_home*) are used to derive the
         .claude/ path (same logic as ``config_dir.ensure_persistent_claude_dir``).
-        Falls back to ~/.claude/ for legacy pre-sandbox sessions.
+        Falls back to ~/.claude/ for legacy pre-sandbox sessions. A file
+        the disk could not read is ``UNKNOWN`` (the probe helper retries it
+        once); a missing or empty one is ``FRESH``.
         """
         from core.session.session_state import get_session_claude_dir
 
@@ -1049,15 +1125,15 @@ class CLIExecutionLayer(ExecutionLayer):
         if claude_dir:
             session_file = self._find_session_file(Path(claude_dir), session_id)
             if session_file:
-                return self._session_file_has_user_message(session_file)
+                return await asyncio.to_thread(self._session_file_has_user_message, session_file)
 
         # 3. Legacy fallback: ~/.claude/ path (pre-sandbox sessions)
         project_hash = str(app_config.AGENTS_DIR).replace("/", "-")
         session_file = Path.home() / ".claude" / "projects" / project_hash / f"{session_id}.jsonl"
         if session_file.exists():
-            return self._session_file_has_user_message(session_file)
+            return await asyncio.to_thread(self._session_file_has_user_message, session_file)
 
-        return False
+        return ResumeVerdict.FRESH
 
     @staticmethod
     def _find_session_file(claude_dir: Path, session_id: str) -> Path | None:
@@ -1079,10 +1155,20 @@ class CLIExecutionLayer(ExecutionLayer):
         return None
 
     @staticmethod
-    def _session_file_has_user_message(session_file: Path) -> bool:
-        """Check if a session JSONL file contains at least one user message."""
+    def _session_file_has_user_message(session_file: Path) -> ResumeVerdict:
+        """Whether a session JSONL file holds at least one user message, read
+        line by line (one message a line, a transcript can run to tens of
+        MB) and stopping at the first user line; a torn last line decodes
+        with replacement. A file that vanished or holds no user line is
+        ``FRESH``; one the disk could not read is ``UNKNOWN`` (a local disk
+        fault, retried once by the probe helper). Runs in a worker thread."""
         try:
-            content = session_file.read_text()
-            return '"type":"user"' in content or '"type": "user"' in content
-        except Exception:
-            return False
+            with session_file.open(encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '"type":"user"' in line or '"type": "user"' in line:
+                        return ResumeVerdict.RESUMABLE
+        except FileNotFoundError:
+            return ResumeVerdict.FRESH
+        except OSError:
+            return ResumeVerdict.UNKNOWN
+        return ResumeVerdict.FRESH

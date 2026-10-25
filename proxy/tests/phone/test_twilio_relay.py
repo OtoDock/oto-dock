@@ -11,7 +11,7 @@ import threading
 
 import pytest
 from aiohttp import web
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 import config
@@ -176,13 +176,13 @@ def test_media_ws_daemon_close_propagates(client, daemon):
         ws.receive_text()  # hello
         ws.send_text("close-now")
         # Daemon side closed → the relay must close Twilio's leg too.
-        with pytest.raises(Exception):
+        with pytest.raises(WebSocketDisconnect):
             ws.receive_text()
 
 
 def test_media_ws_daemon_refusal_closes_client(client, daemon):
     daemon.refuse_ws = True
     with client.websocket_connect("/v1/twilio/media/7") as ws:
-        with pytest.raises(Exception):
+        with pytest.raises(WebSocketDisconnect):
             ws.receive_text()
     assert daemon.ws_headers == []

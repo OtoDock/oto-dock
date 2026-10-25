@@ -21,16 +21,17 @@ Tools:
 The proxy routes display events to the appropriate client adapter (dashboard, phone, etc.).
 """
 
+import asyncio
 import base64
 import io
 import logging
 import os
 
 import httpx
-from PIL import Image, ImageOps
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import ImageContent, TextContent, Tool
+from mcp.types import ImageContent, TextContent, Tool, ToolAnnotations
+from PIL import Image, ImageOps
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("display-mcp")
@@ -53,13 +54,13 @@ PROXY_URL = os.environ.get("PROXY_URL", "")
 PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
 SESSION_ID = os.environ.get("OTO_SESSION_ID", "")
 
-from app_tools import (  # noqa: E402 — the app and Dock tools
+import app_tools
+from _tool_args import ToolArgs
+from app_tools import (
     MAX_UI_HTML_BYTES,
     _artifact_read_candidates,  # noqa: F401 — the tests reach it through this module
     _read_artifact_file,
 )
-import app_tools  # noqa: E402
-
 
 # Max image dimension (matches Claude's limit)
 MAX_IMAGE_DIM = 1568
@@ -76,6 +77,7 @@ MAX_PASSTHROUGH_BYTES = 10 * 1024 * 1024
 MAX_SOURCE_BYTES = 50 * 1024 * 1024
 
 server = Server("display")
+TOOL_ARGS = ToolArgs()
 
 
 def _is_svg(data: bytes) -> bool:
@@ -151,7 +153,7 @@ def _resize_and_encode(img_bytes: bytes) -> tuple[str, str]:
         w, h = img.size
         if max(w, h) > MAX_IMAGE_DIM:
             img.thumbnail((MAX_IMAGE_DIM, MAX_IMAGE_DIM), Image.LANCZOS)
-            logger.info(f"Resized image from {w}x{h} to {img.size[0]}x{img.size[1]}")
+            logger.info("Resized image from %sx%s to %sx%s", w, h, img.size[0], img.size[1])
 
         has_alpha = (
             img.mode in ("RGBA", "LA")
@@ -174,7 +176,7 @@ def _resize_and_encode(img_bytes: bytes) -> tuple[str, str]:
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="display_images",
             description=(
@@ -251,6 +253,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["images"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="send_file",
@@ -279,6 +282,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["path"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="send_url",
@@ -305,6 +309,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["url", "title"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="display_video",
@@ -346,6 +351,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["source"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="display_ui",
@@ -356,20 +362,27 @@ async def list_tools() -> list[Tool]:
                 "borderless in a sandboxed frame, auto-sized and theme-matched "
                 "(light/dark) to the dashboard. Write a BODY FRAGMENT (no "
                 "<html>/<head> wrapper — a full document keeps its own head and "
-                "loses only the token stylesheet; the platform runtime is "
-                "injected either way). A design-token stylesheet is auto-loaded: CSS vars "
-                "(--p-text, --p-primary, --p-surface, …) plus native-looking "
+                "gets no token stylesheet, so it links "
+                "/ui-kit/otodock-tokens.css itself, before /ui-kit/tailwind.js. "
+                "The platform runtime is injected either way). A design-token "
+                "stylesheet is auto-loaded: CSS vars "
+                "(--p-text, --p-link, --p-action, --p-surface, …) plus native-looking "
                 "primitives — .card, styled <table> (th/td, .num for right-aligned "
-                "numbers), .btn/.btn.primary, .stat (.value/.label), .badge "
-                "(.success/.warn/.error), .row, .grid, .muted. Self-hosted "
+                "numbers), .btn (secondary by default, .primary, .danger, .ghost, "
+                ".quiet-danger, .sm, .lg), .stat (.value/.label), .badge "
+                "(.success/.warn/.error/.info/.agent/.media/.action, grey when "
+                "none), .label above a field, plain input/select/textarea already "
+                "styled, .row, .grid, .muted. Self-hosted "
                 "libraries, added per artifact via script tag: "
                 '<script src="/ui-kit/echarts.min.js"></script> (charts), '
                 '<script src="/ui-kit/anime.min.js"></script> (animation — global '
                 "`anime`, v4 API: anime.animate(...)), "
                 '<script src="/ui-kit/tailwind.js"></script> (Tailwind v4 '
-                "utilities, runtime-compiled — RECOMMENDED for any rich/custom "
-                "layout; combine with the token vars via arbitrary values like "
-                "bg-[var(--p-surface)]; dark: variants follow the theme), "
+                "utilities, compiled in the page. RECOMMENDED for any rich or "
+                "custom layout. Combine them with the token vars through "
+                "arbitrary values like bg-[var(--p-surface)]. The vars already "
+                "follow the theme, so no dark: class is needed. A dark: class "
+                "follows the same theme), "
                 '<script src="/ui-kit/three.min.js"></script> (3D — global '
                 "`THREE` incl. addons: OrbitControls/MapControls, "
                 "EffectComposer/RenderPass/UnrealBloomPass/OutputPass/"
@@ -454,6 +467,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": [],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         ),
         Tool(
             name="display_audio",
@@ -482,13 +496,17 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["source"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         *app_tools.APP_TOOLS,
-    ]
+    ])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     if name == "display_images":
         return await _handle_display_images(arguments)
     elif name == "send_file":
@@ -506,6 +524,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageConte
         return await handler(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+
+def _read_local_image(source: str) -> bytes:
+    """A local image's bytes, refused when it is missing or past
+    ``MAX_SOURCE_BYTES``."""
+    if not os.path.isfile(source):
+        raise ValueError(f"file not found: {source}")
+    size = os.path.getsize(source)
+    if size > MAX_SOURCE_BYTES:
+        raise ValueError(
+            f"file too large to display "
+            f"({size // (1024 * 1024)}MB; "
+            f"limit {MAX_SOURCE_BYTES // (1024 * 1024)}MB)"
+        )
+    with open(source, "rb") as f:
+        return f.read()
 
 
 async def _prepare_image_item(item: dict) -> dict:
@@ -541,17 +575,7 @@ async def _prepare_image_item(item: dict) -> dict:
     # satellite-host form (on remote sessions the stdio interceptor
     # translates `tool_arg_paths` declarations) or host form (on local
     # sessions bwrap maps the sandbox transparently).
-    if not os.path.isfile(source):
-        raise ValueError(f"file not found: {source}")
-    size = os.path.getsize(source)
-    if size > MAX_SOURCE_BYTES:
-        raise ValueError(
-            f"file too large to display "
-            f"({size // (1024 * 1024)}MB; "
-            f"limit {MAX_SOURCE_BYTES // (1024 * 1024)}MB)"
-        )
-    with open(source, "rb") as f:
-        img_bytes = f.read()
+    img_bytes = await asyncio.to_thread(_read_local_image, source)
     b64_data, mime_type = _resize_and_encode(img_bytes)
     base["url"] = ""
     base["image_data"] = b64_data
@@ -580,7 +604,7 @@ async def _handle_display_images(arguments: dict) -> list[TextContent]:
             prepared.append(await _prepare_image_item(item))
         except ValueError as e:
             return [TextContent(type="text", text=f"Error: {e}")]
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
             return [TextContent(type="text", text=f"Error preparing images[{idx}]: {e}")]
 
     payload = {"session_id": SESSION_ID, "images": prepared}
@@ -602,7 +626,7 @@ async def _handle_display_images(arguments: dict) -> list[TextContent]:
             type="text",
             text=f"Error posting gallery: HTTP {e.response.status_code} — {e.response.text[:200]}",
         )]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error posting gallery: {e}")]
 
     return [TextContent(
@@ -628,7 +652,7 @@ async def _handle_send_file(arguments: dict) -> list[TextContent]:
     # Windows satellites (os.path.normpath flips `/` to `\` while the
     # ALLOWED_ROOTS env var stays forward-slash, so `startswith` always
     # missed). Just verify the file exists on disk and pass through.
-    if not os.path.isfile(path):
+    if not await asyncio.to_thread(os.path.isfile, path):
         return [TextContent(type="text", text=f"Error: file not found: {path}")]
 
     if not filename:
@@ -668,7 +692,7 @@ async def _handle_send_file(arguments: dict) -> list[TextContent]:
             type="text",
             text=f"Error sending file: HTTP {e.response.status_code} — {e.response.text[:200]}",
         )]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(
             type="text",
             text=f"Error sending file: {e}",
@@ -710,7 +734,7 @@ async def _handle_send_url(arguments: dict) -> list[TextContent]:
             text=f"Link sent to user: [{title}]({url})",
         )]
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(
             type="text",
             text=f"Error sending URL: {e}",
@@ -758,7 +782,7 @@ async def _handle_display_media(arguments: dict, media_kind: str) -> list[TextCo
             type="text",
             text=f"Error displaying {media_kind}: HTTP {e.response.status_code} — {e.response.text[:200]}",
         )]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error displaying {media_kind}: {e}")]
 
     return [TextContent(type="text", text=f"Displayed {media_kind} to user.")]
@@ -832,7 +856,7 @@ async def _handle_display_ui(arguments: dict) -> list[TextContent]:
             type="text",
             text=f"Error displaying UI artifact: HTTP {e.response.status_code} — {e.response.text[:200]}",
         )]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error displaying UI artifact: {e}")]
 
     if not display:

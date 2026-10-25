@@ -32,17 +32,15 @@ import asyncio
 import logging
 
 import config
-from storage.agents import agent_store
-from services.mcp import mcp_registry
-from services.mcp import dynamic_context
-from services.engines import subscription_pool
 from auth.path_policy import SecurityContext, build_permission_context
 from core.execution_layer import AgentConfig
 from core.sandbox.session_config_dir import ensure_persistent_agent_dir
-from core.session import external_identity
+from core.session import external_identity, session_kind
+from services.engines import subscription_pool
+from services.mcp import dynamic_context, mcp_registry
 from services.phone.phone_identity import EXTERNAL_ROUTE_ROLE, RouteIdentity
-from core.execution_layer import DEFAULT_EXECUTION_PATH
-from core.session import session_kind
+from storage.agents import agent_store
+from storage.agents.schema import DEFAULT_EXECUTION_PATH
 
 logger = logging.getLogger("otodock")
 
@@ -55,8 +53,8 @@ def resolve_phone_execution_target(
     session's role — viewer for external calls, the tied user's capped role
     for a user route (a viewer forces the local target on admin-paired
     machines, exactly like a viewer chat)."""
-    from storage import remote_store
-    return remote_store.resolve_execution_target(
+    from services.remote import remote_status
+    return remote_status.resolve_execution_target(
         agent_name, user_sub, role or EXTERNAL_ROUTE_ROLE,
     )[0]
 
@@ -121,12 +119,12 @@ async def build_phone_agent_config(
     )
 
 
-def _phone_tail(prompt: str, *, call_type: str, phone_context_override: str,
+def _phone_tail(prompt: str, *, call_context: str, phone_context_override: str,
                 tools_block: str = "") -> str:
-    """The call context (TTS-friendly rules) + the per-route override + the
-    call tools block when the session carries the tools."""
-    from adapters.phone import PhoneAdapter
-    prompt = (prompt or "") + "\n\n" + PhoneAdapter.get_phone_context(call_type=call_type)
+    """The call context (TTS-friendly rules, ``PhoneAdapter.get_phone_context``,
+    read off the loop by the caller) + the per-route override + the call
+    tools block when the session carries the tools."""
+    prompt = (prompt or "") + "\n\n" + call_context
     if phone_context_override:
         prompt += "\n" + phone_context_override
     if tools_block:
@@ -158,7 +156,11 @@ async def _build_user_route_config(
     """A route tied to a platform user: their own session, built by the
     dashboard builder, plus the call context."""
     from core.config.config_builder import build_agent_config
-    from services.phone.call_control import ASK_BACK_ENV, CALL_CONTROL_MCP, CALL_TOOLS_ENV
+    from services.phone.call_control import (
+        ASK_BACK_ENV,
+        CALL_CONTROL_MCP,
+        CALL_TOOLS_ENV,
+    )
     user = identity.user or {}
     cfg = await build_agent_config(
         agent_name, user, user.get("sub", ""), identity.user_role,
@@ -172,8 +174,10 @@ async def _build_user_route_config(
         extra_mcps=[CALL_CONTROL_MCP] if call_tools else None,
         call_ask_back=ask_back,
     )
+    from adapters.phone import PhoneAdapter
     cfg.system_prompt = _phone_tail(
-        cfg.system_prompt, call_type=call_type,
+        cfg.system_prompt,
+        call_context=await asyncio.to_thread(PhoneAdapter.get_phone_context, call_type),
         phone_context_override=phone_context_override,
         tools_block=_tools_block(
             call_tools=call_tools, attached=True, ask_back=ask_back,
@@ -201,14 +205,18 @@ async def _build_external_config(
 ) -> AgentConfig:
     """An EXTERNAL principal — the caller is not a platform user. Always a
     viewer of the shared space, whatever a legacy route row says."""
-    from services.phone.call_control import ASK_BACK_ENV, CALL_CONTROL_MCP, CALL_TOOLS_ENV
+    from services.phone.call_control import (
+        ASK_BACK_ENV,
+        CALL_CONTROL_MCP,
+        CALL_TOOLS_ENV,
+    )
     ident = (
         identity.external if identity is not None and identity.external is not None
         else external_identity.resolve(external_identity.PHONE, "", session_id="", shared=True)
     )
     role = EXTERNAL_ROUTE_ROLE
-    is_admin_only = agent_store.is_admin_only(agent_name)
-    agent_info = agent_store.get_agent(agent_name)
+    is_admin_only, agent_info = await asyncio.to_thread(
+        lambda: (agent_store.is_admin_only(agent_name), agent_store.get_agent(agent_name)))
     agent_dir = config.get_agent_dir(agent_name)
 
     # Resolve target metadata for the SecurityContext (drives the
@@ -240,10 +248,10 @@ async def _build_external_config(
     if ident.has_tree:
         if is_remote:
             logger.warning(
-                f"Phone call on agent {agent_name}: caller tree not mounted on "
-                f"remote target {target.label or phone_target_value} "
+                "Phone call on agent %s: caller tree not mounted on "
+                "remote target %s "
                 "(externals/ never syncs) — agent-scope mount, caller memory "
-                "stays proxy-side"
+                "stays proxy-side", agent_name, target.label or phone_target_value
             )
         else:
             home = external_identity.external_home(agent_dir, ident)
@@ -299,6 +307,15 @@ async def _build_external_config(
     # MCP config file) registers them as builtins.
     tools_attached = (mcp_format is None
                       or CALL_CONTROL_MCP not in (excluded_mcps or {}))
+    # The session token names nobody and carries the caller's claim, as the
+    # dashboard builder's does for a user route: credential_env carries it
+    # to the process and a Codex config's stdio MCPs. Its iat is the
+    # session's floor.
+    from auth.session_token import mint_session_env
+    credential_env = credential_env if credential_env is not None else {}
+    token_minted_at = mint_session_env(
+        credential_env, session_id, agent_name, "", external=ident.claim,
+    )
     # A Codex config gets the credential environment written in, as the
     # dashboard builder does; the bash-only git entries stay out of the file.
     mcp_config_path = await asyncio.to_thread(
@@ -312,7 +329,8 @@ async def _build_external_config(
     # the MCPs that actually attach contribute blocks (and scope nouns in the
     # permission context): an excluded MCP must not describe itself.
     assigned_mcp_names = [
-        m.name for m in (mcp_registry.get_agent_mcps(agent_name, placement=target) or [])
+        m.name for m in (await asyncio.to_thread(
+            mcp_registry.get_agent_mcps, agent_name, placement=target) or [])
         if m.name not in (excluded_mcps or {})
     ]
     dynamic_contexts = await dynamic_context.get_dynamic_contexts(
@@ -327,7 +345,10 @@ async def _build_external_config(
     #   + permission context (identity / scope / folders / permissions)
     #   + base call context (TTS-friendly response rules)
     #   + optional per-route override (extra instructions)
-    agent_prompt = config.build_agent_prompt(
+    # The base prompt is built in a worker thread (the files, the caller's
+    # memory and context, the tree walk), as the chat builder does.
+    agent_prompt = await asyncio.to_thread(
+        config.build_agent_prompt,
         agent_name,
         username=None,
         role=role,
@@ -354,8 +375,10 @@ async def _build_external_config(
         assigned_mcp_names=tuple(assigned_mcp_names),
         execution_path=execution_path or "",
     )
+    from adapters.phone import PhoneAdapter
     agent_prompt = _phone_tail(
-        agent_prompt, call_type=call_type,
+        agent_prompt,
+        call_context=await asyncio.to_thread(PhoneAdapter.get_phone_context, call_type),
         phone_context_override=phone_context_override,
         tools_block=_tools_block(
             call_tools=call_tools, attached=tools_attached, ask_back=ask_back,
@@ -375,7 +398,11 @@ async def _build_external_config(
         no_shell=True,
     )
 
-    resolved_model = config.get_cli_model(agent_name)
+    # The model and the effort (store reads; ``model`` MUST land on the
+    # AgentConfig or the CLI/Codex/Direct-LLM layer sends an empty
+    # ``--model``, which Anthropic 400s on).
+    resolved_model, resolved_effort = await asyncio.to_thread(
+        lambda: (config.get_cli_model(agent_name), config.get_cli_effort(agent_name)))
 
     # Subscription pool — an external call has no user identity, so the
     # platform pool answers. Surfaced via extra_env; provider-switching key
@@ -400,12 +427,8 @@ async def _build_external_config(
         # The pool refused the spawn (its subscription cap): the call must not
         # start on whatever credential file the agent dir still holds.
         raise
-    except Exception as e:
-        logger.warning(f"Phone subscription acquisition error: {e}")
-
-    # ``model`` MUST land on the AgentConfig or the CLI/Codex/Direct-LLM
-    # layer sends an empty ``--model`` (Anthropic 400s on it).
-    resolved_effort = config.get_cli_effort(agent_name)
+    except Exception as e:  # noqa: BLE001  # the pool spans db, relay and engine: the call starts without it
+        logger.warning("Phone subscription acquisition error: %s", e)
 
     return AgentConfig(
         agent_name=agent_name,
@@ -420,7 +443,8 @@ async def _build_external_config(
         extra_env=extra_env,
         subscription_id=subscription_id,
         subscription_user_sub="",
-        credential_env=credential_env or {},
+        credential_env=credential_env,
+        token_minted_at=token_minted_at,
         mcp_secret_bundles=secret_bundles or {},
         execution_target=phone_target_value,
         execution_path=execution_path,

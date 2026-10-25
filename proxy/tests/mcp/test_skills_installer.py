@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch, AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -28,8 +28,7 @@ def _pkg(tmp_path, name="pdf-skills", *, category="skill", runtime="none",
         f = root / sk["file"]
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(
-            "---\nname: %s\ndescription: d\nallowed-tools: Bash(*)\n---\n\nBody.\n"
-            % sk["id"],
+            f"---\nname: {sk['id']}\ndescription: d\nallowed-tools: Bash(*)\n---\n\nBody.\n",
         )
     for rel, content in (extra_files or {}).items():
         f = root / rel
@@ -132,6 +131,24 @@ async def test_install_lands_scrubbed_in_skills_dir(temp_db, tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_the_install_rescans_under_the_registrys_lock(temp_db, tmp_path, monkeypatch):
+    """A skill install rescans through ``mcp_registry.rescan`` (one scan at
+    a time per loop), never a bare scan another one could finish after."""
+    import config as app_config
+    monkeypatch.setattr(app_config, "MCPS_DIR", tmp_path / "mcps")
+    rescans = []
+
+    async def _rescan():
+        rescans.append("locked rescan")
+        return {}
+
+    monkeypatch.setattr(mcp_registry, "rescan", _rescan)
+    with patch.object(mcp_registry, "scan_manifests", side_effect=AssertionError("a bare scan")):
+        result = await si.install_skill_package_from_extracted(_pkg(tmp_path))
+    assert result["status"] == "installed" and rescans == ["locked rescan"]
+
+
+@pytest.mark.asyncio
 async def test_a_failed_install_over_a_leftover_folder_restores_it(temp_db, tmp_path, monkeypatch):
     """The shared file step strips an existing folder to its preserved items:
     a leftover skill folder is backed up first and restored when the install
@@ -183,6 +200,7 @@ async def test_a_failure_inside_the_file_step_restores_the_folder(temp_db, tmp_p
 @pytest.mark.asyncio
 async def test_install_rejects_name_collision_with_mcp(temp_db, tmp_path, monkeypatch):
     from fastapi import HTTPException
+
     import config as app_config
     monkeypatch.setattr(app_config, "MCPS_DIR", tmp_path / "mcps")
     root = _pkg(tmp_path, name="camoufox")   # pretend an MCP has this name
@@ -196,6 +214,7 @@ async def test_install_rejects_name_collision_with_mcp(temp_db, tmp_path, monkey
 @pytest.mark.asyncio
 async def test_install_rejects_skill_id_collision(temp_db, tmp_path, monkeypatch):
     from fastapi import HTTPException
+
     import config as app_config
     monkeypatch.setattr(app_config, "MCPS_DIR", tmp_path / "mcps")
     root = _pkg(tmp_path)
@@ -210,6 +229,7 @@ async def test_install_rejects_skill_id_collision(temp_db, tmp_path, monkeypatch
 def test_mcp_installer_rejects_cross_catalog_collisions():
     """The MCP-side mirror guards exist (plan §3: enforced in BOTH installers)."""
     import inspect
+
     from services.community import community_installer as ci
     src = inspect.getsource(ci.install_from_extracted_folder)
     assert "find_skill_provider" in src
@@ -343,3 +363,27 @@ async def test_bare_skill_folder_requires_description(tmp_path):
         await si.install_bare_skill_folder(bare)
     assert ei.value.status_code == 400
     assert "description" in str(ei.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_bare_skill_folder_holds_only_name_and_description_to_the_schema(temp_db, tmp_path, monkeypatch):
+    """The two rules the bare folder always had, now the skill schema's; the
+    other keys stay as lenient as the package path (PyYAML reads
+    ``license: 2.0`` as a number, and the folder still installs)."""
+    from fastapi import HTTPException
+
+    import config as app_config
+    monkeypatch.setattr(app_config, "MCPS_DIR", tmp_path / "mcps")
+    bare = tmp_path / "up3" / "folder"
+    bare.mkdir(parents=True)
+    (bare / "SKILL.md").write_text("---\nname: numbered\ndescription: Fine.\nlicense: 2.0\n---\n\nBody.\n")
+    with patch.object(mcp_registry, "scan_manifests"):
+        assert (await si.install_bare_skill_folder(bare))["name"] == "numbered"
+    for text, needle in (("No fence here.\n", "has no front matter"),
+                         ("---\nname: [x\n---\nBody\n", "front matter is not valid YAML"),
+                         ("---\nname: Two Words\ndescription: d\n---\n", "invalid skill name 'Two Words'"),
+                         ("---\nname: fine-name\ndescription: '  '\n---\n", "description must not be empty")):
+        (bare / "SKILL.md").write_text(text)
+        with pytest.raises(HTTPException) as ei:
+            await si.install_bare_skill_folder(bare)
+        assert ei.value.status_code == 400 and needle in str(ei.value.detail), ei.value.detail

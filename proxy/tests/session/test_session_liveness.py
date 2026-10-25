@@ -241,6 +241,7 @@ class TestStartMarks:
     @pytest.mark.asyncio
     async def test_a_remote_start_registers_before_the_payload_and_cleans_up_a_failure(self, monkeypatch):
         from unittest.mock import MagicMock
+
         from core.remote.remote_execution import RemoteExecutionLayer
         from tests.execution.test_session_permission_cleanup import _config
         cm = MagicMock()
@@ -279,7 +280,12 @@ class TestStartMarks:
     @pytest.mark.asyncio
     async def test_a_failed_re_warm_of_a_held_session_keeps_its_state(self, kind, registry, monkeypatch):
         import importlib
-        from tests.execution.test_session_permission_cleanup import _config, _ctx, _layer
+
+        from tests.execution.test_session_permission_cleanup import (
+            _config,
+            _ctx,
+            _layer,
+        )
         layer = _layer(kind)
         module_name, name = registry.rsplit(".", 1)
         table = getattr(importlib.import_module(module_name), name)
@@ -304,6 +310,7 @@ class TestStartMarks:
     @pytest.mark.asyncio
     async def test_a_remote_start_refused_before_it_registers_leaves_state_alone(self):
         from unittest.mock import MagicMock
+
         from core.remote.remote_execution import RemoteExecutionLayer
         from tests.execution.test_session_permission_cleanup import _config, _ctx
         cm = MagicMock()
@@ -324,6 +331,7 @@ class TestStartMarks:
     @pytest.mark.asyncio
     async def test_a_failed_remote_re_warm_of_a_held_session_keeps_its_state(self, monkeypatch):
         from unittest.mock import MagicMock
+
         from core.remote.remote_execution import RemoteExecutionLayer
         from core.session import session_manager
         from tests.execution.test_session_permission_cleanup import _config, _ctx
@@ -458,6 +466,7 @@ class TestClosingMarks:
     @pytest.mark.asyncio
     async def test_direct_close_and_the_reaper(self, monkeypatch):
         import time
+
         from core.layers.direct import session as direct
 
         sid = _sid()
@@ -483,6 +492,7 @@ class TestClosingMarks:
     @pytest.mark.asyncio
     async def test_remote_close_and_prepare_resume(self):
         from unittest.mock import AsyncMock, MagicMock
+
         from core.remote.remote_execution import RemoteExecutionLayer, RemoteSessionInfo
         cm = MagicMock()
         cm.send_command = AsyncMock()
@@ -533,8 +543,8 @@ class TestReadoptionMarks:
 
     def test_reported_sids_are_marked_by_context_and_engine(self):
         from auth.path_policy import SecurityContext
-        from services.scheduler.run_recovery import _mark_reported_starting
         from core import placement
+        from services.scheduler.run_recovery import _mark_reported_starting
         with_ctx, no_ctx, codex, direct = _sid(), _sid(), _sid(), _sid()
         ctx = SecurityContext(role="manager", username="", agent="pa", is_admin_agent=False,
                               placement=placement.PlacementCapabilities(
@@ -581,6 +591,7 @@ class TestReadoptionMarks:
         ``auto``) and its floor is the persisted one, so the running
         process's token still passes and an earlier life's does not."""
         from unittest.mock import MagicMock
+
         from core.remote.remote_execution import RemoteExecutionLayer
         from core.session import session_manager
         layer = RemoteExecutionLayer(MagicMock())
@@ -593,7 +604,7 @@ class TestReadoptionMarks:
                                        execution_path="claude-code-cli",
                                        mode="default", token_floor=minted)
         try:
-            assert session_state.get_session_mode(sid) == "default"
+            assert session_state.get_session_mode(sid) == "ask"
             assert layer._sessions[sid].mode == "default"
             assert session_state.session_token_refusal({"sid": sid, "iat": minted}) == ""
             assert session_state.session_token_refusal({"sid": sid, "iat": minted - 10}) == "stale"
@@ -604,6 +615,7 @@ class TestReadoptionMarks:
     @pytest.mark.asyncio
     async def test_the_adoption_clears_the_mark(self, monkeypatch):
         from unittest.mock import MagicMock
+
         from core.remote.remote_execution import RemoteExecutionLayer
         from core.session import session_manager
         layer = RemoteExecutionLayer(MagicMock())
@@ -651,7 +663,11 @@ class TestBuilderFloors:
     def test_the_chat_builder_records_its_mint(self, temp_db, monkeypatch, tmp_path):
         from auth.session_token import validate_session_token
         from storage.agents import agent_store
-        from tests.execution.test_direct_llm_target_local import _build, _mk_user, _stub_builder
+        from tests.execution.test_direct_llm_target_local import (
+            _build,
+            _mk_user,
+            _stub_builder,
+        )
         agent_store.create_agent("dl", "DL", execution_path="direct-llm")
         _mk_user("sub-ada", "Ada")
         _stub_builder(monkeypatch, tmp_path)
@@ -662,6 +678,7 @@ class TestBuilderFloors:
 
     def test_the_wake_respawn_records_its_mint(self, temp_db, monkeypatch):
         from types import SimpleNamespace
+
         from auth.session_token import validate_session_token
         from core import placement
         from services.mcp import mcp_registry

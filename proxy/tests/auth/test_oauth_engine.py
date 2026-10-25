@@ -164,8 +164,8 @@ class TestS2SPersistSite:
     async def test_s2s_route_injects_flow_and_account_id(self):
         """End-to-end through the s2s_exchange handler — verify the
         TokenSet handed to persist_oauth_account carries the markers."""
+        from api.auth.oauth import S2SExchangeRequest, s2s_exchange
         from auth.oauth_providers.base import TokenSet
-        from api.auth.oauth import s2s_exchange, S2SExchangeRequest
 
         # Mock provider returns a fresh TokenSet (no flow/account_id in raw).
         mock_provider = MagicMock()
@@ -226,8 +226,8 @@ class TestS2SPersistSite:
     async def test_s2s_email_falls_back_to_account_label_when_no_account_id(self):
         """Providers other than Zoom may not need account_id — fall
         back to account_label for the synthesized email."""
+        from api.auth.oauth import S2SExchangeRequest, s2s_exchange
         from auth.oauth_providers.base import TokenSet
-        from api.auth.oauth import s2s_exchange, S2SExchangeRequest
 
         mock_provider = MagicMock()
         mock_provider.token_url = "https://example.com/token"

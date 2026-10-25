@@ -14,15 +14,18 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services.scheduler import run_recovery
+from services.scheduler import cut_turns, run_recovery
 from storage import database as task_store
+from storage.chat import open_turns
 
 
 @pytest.fixture(autouse=True)
 def _clean_parked():
     run_recovery._parked.clear()
+    cut_turns._parked.clear()
     yield
     run_recovery._parked.clear()
+    cut_turns._parked.clear()
     # A recovery pump's end arms the chat's queue on the test's own loop; the
     # task set is module state, so a later test's gather over it must not
     # meet this loop's leftovers.
@@ -138,7 +141,7 @@ class _FakeLayer:
     async def adopt_session(self, *, machine_id, session_id, agent_name,
                             execution_path, command_id,
                             use_native_permissions=False, mode="", token_floor=0):
-        from core.events.common_events import CommonEvent, TEXT, DONE
+        from core.events.common_events import DONE, TEXT, CommonEvent
         self.adopted.append(session_id)
         self.modes[session_id] = (mode, token_floor)
         yield CommonEvent(type=TEXT, data={"content": "recovered answer"})
@@ -331,7 +334,7 @@ class TestOnSessionsAlive:
                 "session_id": sid, "turn_active": False,
             }])
             assert layer.modes[sid] == ("plan", 0)
-            assert run_recovery._readopt_state("machine-1", sid, {"permission_mode": ""}) == ("default", 0)
+            assert run_recovery._readopt_state("machine-1", sid, {"permission_mode": ""}) == ("ask", 0)
             session_state._sessions[sid] = {"client_type": "task"}
             assert run_recovery._readopt_state("machine-1", sid, {"permission_mode": "default"}) == ("auto", 0)
         finally:
@@ -560,8 +563,8 @@ class TestOtherSessions:
     async def test_the_chats_model_wins_when_it_is_the_engines(
             self, temp_db, layer, placed, monkeypatch, chat_model, expected):
         from storage.billing import subscription_store
-        monkeypatch.setattr(subscription_store, "list_models", lambda path: [
-            {"model_id": "gpt-6-astra"}, {"model_id": "gpt-5.6-terra"}] if path == "codex-cli" else [])
+        monkeypatch.setattr(subscription_store, "list_models", lambda layer=None: [
+            {"model_id": "gpt-6-astra"}, {"model_id": "gpt-5.6-terra"}] if layer == "codex-cli" else [])
         _, sid = _codex_chat(temp_db, model=chat_model)
         placed(sid)
         await run_recovery.on_sessions_alive("machine-1", [], [_other(sid, model="gpt-5.6-terra")])
@@ -727,6 +730,213 @@ class TestSweepExpired:
         assert sid not in run_recovery._parked
 
 
+def _closing_rows(chat_id: str) -> list[dict]:
+    import json
+    return [json.loads(r["event_data"]) for r in task_store.get_chat_messages(chat_id)
+            if r.get("event_type") == "system"
+            and json.loads(r["event_data"]).get("subtype") == "turn_ended"]
+
+
+async def _until(predicate, tries: int = 100) -> None:
+    for _ in range(tries):
+        if predicate():
+            return
+        await asyncio.sleep(0.02)
+
+
+class _ScriptedLayer(_FakeLayer):
+    """A fake whose adoption yields ``script``: the replay's own markers."""
+
+    def __init__(self, script):
+        super().__init__()
+        self.script = script
+
+    async def adopt_session(self, *, machine_id, session_id, agent_name,
+                            execution_path, command_id,
+                            use_native_permissions=False, mode="", token_floor=0):
+        self.adopted.append(session_id)
+        for event in self.script:
+            yield event
+
+
+def _early_rows(chat_id: str, token: str, sid: str) -> None:
+    """The cut turn's record with one row its checkpoint saved."""
+    from storage.pg import get_conn
+    open_turns.open_turn(chat_id, token, sid)
+    first = task_store.add_chat_messages_batch(chat_id, [("assistant", "saved early", "", "")])
+    with get_conn() as conn:
+        open_turns.note_range_in(conn, chat_id, token, first - 1, first)
+        conn.commit()
+
+
+def _assistant(chat_id: str) -> list[str]:
+    return [r["content"] for r in task_store.get_chat_messages(chat_id) if r["role"] == "assistant"]
+
+
+class TestCutTurns:
+    """The turns a restart cut: a closing row once, never for a replayed one."""
+
+    def test_boot_closes_a_local_turn_once_and_waits_for_a_remote_one(self, temp_db):
+        task_store.create_chat("cut-local", "user-1", "pa", "default")
+        open_turns.open_turn("cut-local", "tok-l", "sid-l")
+        _, remote_chat, sid = _mk_remote_run(temp_db)
+        open_turns.open_turn(remote_chat, "tok-r", sid)
+
+        assert cut_turns.defer_at_boot(180.0) == (1, 1)
+        closing = _closing_rows("cut-local")
+        assert [(c["reason"], c["message"]) for c in closing] == [
+            ("restarted", "⚠ The reply was cut short when the platform restarted. "
+                          "Send a message to continue.")]
+        chat = task_store.get_chat("cut-local")
+        assert chat["last_turn_aborted"] is True and chat["last_abort_graceful"] is True
+        assert _closing_rows(remote_chat) == [] and sid in cut_turns._parked
+        assert cut_turns.defer_at_boot(180.0) == (1, 0)
+        assert len(_closing_rows("cut-local")) == 1
+
+    def test_boot_drops_a_finished_engine_turn_and_a_meetings_record(self, temp_db):
+        """A turn whose engine had answered and a meeting's turn leave no
+        card: the first is complete, the failed meeting's own row is the
+        second's."""
+        task_store.create_chat("cut-idle", "user-1", "pa", "default")
+        open_turns.open_turn("cut-idle", "tok-i", "sid-i")
+        open_turns.engine_turn_done("cut-idle", "tok-i")
+        _, meeting_chat, _ = _mk_remote_run(temp_db)
+        open_turns.open_turn(meeting_chat, "tok-m", "")   # a meeting pump records no session
+        assert cut_turns.defer_at_boot(180.0) == (0, 0)
+        assert _closing_rows("cut-idle") == [] and _closing_rows(meeting_chat) == []
+        assert open_turns.list_open() == [] and cut_turns._parked == {}
+
+    @pytest.mark.asyncio
+    async def test_an_adopted_turn_is_replayed_once_and_gets_no_closing_row(
+            self, temp_db, monkeypatch, placed):
+        run_id, chat_id, sid = _mk_remote_run(temp_db)
+        placed(sid)
+        _early_rows(chat_id, "tok-cut", sid)
+        run_recovery.defer_orphaned_runs()
+        cut_turns.defer_at_boot(run_recovery.RECOVERY_DEADLINE_S)
+        layer = _FakeLayer()
+        import core.session.session_manager as sm
+        monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
+
+        await run_recovery.on_sessions_alive("machine-1", [{
+            "session_id": sid, "turn_active": True, "command_id": "c1",
+        }])
+        await _until(lambda: task_store.get_run(run_id)["status"] != "running")
+        assert _assistant(chat_id) == ["recovered answer"]
+        assert _closing_rows(chat_id) == []
+        assert cut_turns._parked == {}
+        await _until(lambda: not open_turns.list_open())
+        assert open_turns.list_open() == []
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_replay_keeps_the_rows_saved_early(self, temp_db, monkeypatch, placed):
+        from core.events.common_events import DONE, TEXT, CommonEvent
+        from core.remote.remote_resume import REPLAY_BEGIN
+        run_id, chat_id, sid = _mk_remote_run(temp_db)
+        placed(sid)
+        _early_rows(chat_id, "tok-cut", sid)
+        cut_turns.defer_at_boot(180.0)
+        run_recovery.defer_orphaned_runs()
+        layer = _ScriptedLayer([CommonEvent(type=REPLAY_BEGIN, data={"truncated": True}),
+                                CommonEvent(type=TEXT, data={"content": "the tail"}),
+                                CommonEvent(type=DONE, data={})])
+        import core.session.session_manager as sm
+        monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
+        await run_recovery.on_sessions_alive("machine-1", [{
+            "session_id": sid, "turn_active": True, "command_id": "c1"}])
+        await _until(lambda: task_store.get_run(run_id)["status"] != "running")
+        assert _assistant(chat_id) == ["saved early", "the tail"]
+        assert _closing_rows(chat_id) == []
+
+    @pytest.mark.asyncio
+    async def test_a_replay_that_never_begins_closes_the_turn_and_fails_its_run(
+            self, temp_db, monkeypatch, placed):
+        """No replay: the chat gets the closing row, and the run fails with
+        the same ending instead of completing with the early rows; its
+        delegator hears that the turn was cut short."""
+        from core.events import turn_ending
+        from core.events.common_events import DONE, CommonEvent
+        from services.scheduler import scheduler
+        run_id, chat_id, sid = _mk_remote_run(temp_db)
+        placed(sid)
+        _early_rows(chat_id, "tok-cut", sid)
+        cut_turns.defer_at_boot(180.0)
+        run_recovery.defer_orphaned_runs()
+        layer = _ScriptedLayer([CommonEvent(type=DONE, data={})])
+        import core.session.session_manager as sm
+        monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
+        delivered: list[tuple] = []
+
+        async def _deliver(task, final_status, output, **kw):
+            delivered.append((task, final_status, output, kw.get("ending")))
+        monkeypatch.setattr(task_store, "get_dynamic_task", lambda tid: {"id": tid} if tid else None)
+        monkeypatch.setattr(scheduler, "_row_to_task", lambda row: row["id"])
+        monkeypatch.setattr(scheduler, "_deliver_task_result", _deliver)
+        await run_recovery.on_sessions_alive("machine-1", [{
+            "session_id": sid, "turn_active": True, "command_id": "c1"}])
+        await _until(lambda: task_store.get_run(run_id)["status"] != "running")
+        assert _assistant(chat_id) == ["saved early"]
+        assert [c["reason"] for c in _closing_rows(chat_id)] == ["restarted"]
+        run = task_store.get_run(run_id)
+        assert run["status"] == "failed"
+        assert run["error_message"] == "Cut short when the platform restarted."
+        await _until(lambda: bool(delivered))
+        task, final_status, output, ending = delivered[0]
+        assert (task, final_status, output) == ("task-x", "failed", "saved early")
+        assert ending.reason == turn_ending.RESTARTED
+
+    @pytest.mark.asyncio
+    async def test_a_cut_turn_its_machine_holds_idle_is_replayed(self, temp_db, monkeypatch, placed):
+        """The turn finished on the satellite while the platform was down:
+        reported idle and unmarked, it is still replayed (the satellite kept
+        it), never closed."""
+        task_store.create_chat("cut-plain", "user-1", "pa", "default", model="m",
+                               execution_path="claude-code-cli")
+        sid = uuid.uuid4().hex
+        task_store.update_chat("cut-plain", session_id=sid, execution_target="machine-1")
+        placed(sid)
+        _early_rows("cut-plain", "tok-cut", sid)
+        cut_turns.defer_at_boot(180.0)
+        layer = _FakeLayer()
+        import core.session.session_manager as sm
+        monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
+        await run_recovery.on_sessions_alive("machine-1", [{
+            "session_id": sid, "turn_active": False, "command_id": "c1"}])
+        await _until(lambda: _assistant("cut-plain") == ["recovered answer"])
+        assert layer.adopted == [sid] and layer.idle_adopted == []
+        assert _closing_rows("cut-plain") == []
+
+    @pytest.mark.asyncio
+    async def test_a_turn_its_machine_does_not_report_is_closed(self, temp_db):
+        _, chat_id, sid = _mk_remote_run(temp_db)
+        open_turns.open_turn(chat_id, "tok-cut", sid)
+        cut_turns.defer_at_boot(180.0)
+        await run_recovery.on_sessions_alive("machine-1", [])
+        assert [c["reason"] for c in _closing_rows(chat_id)] == ["restarted"]
+        assert cut_turns._parked == {} and open_turns.list_open() == []
+
+    @pytest.mark.asyncio
+    async def test_a_turn_no_report_reaches_is_closed_at_the_deadline(self, temp_db):
+        _, chat_id, sid = _mk_remote_run(temp_db)
+        open_turns.open_turn(chat_id, "tok-cut", sid)
+        cut_turns.defer_at_boot(180.0)
+        await run_recovery.sweep_expired()
+        assert _closing_rows(chat_id) == []
+        cut_turns._parked[sid]["deadline"] = 0.0
+        await run_recovery.sweep_expired()
+        assert [c["reason"] for c in _closing_rows(chat_id)] == ["restarted"]
+
+    @pytest.mark.asyncio
+    async def test_a_turn_a_new_one_replaced_gets_no_closing_row(self, temp_db):
+        _, chat_id, sid = _mk_remote_run(temp_db)
+        open_turns.open_turn(chat_id, "tok-cut", sid)
+        cut_turns.defer_at_boot(180.0)
+        open_turns.open_turn(chat_id, "tok-new", sid)   # a person's turn started first
+        await run_recovery.on_sessions_alive("machine-1", [])
+        assert _closing_rows(chat_id) == []
+        assert [r["turn_token"] for r in open_turns.list_open()] == ["tok-new"]
+
+
 class TestEligibility:
     def test_remote_cli_eligible(self, temp_db):
         _, chat_id, _ = _mk_remote_run(temp_db)
@@ -757,8 +967,8 @@ class TestMachineResumePass:
 
     @pytest.fixture
     def recorded(self, monkeypatch):
-        from core.events import input_queue, pump_bg_monitors
         import core.session.session_manager as sm
+        from core.events import input_queue, pump_bg_monitors
         layer = _FakeLayer()
         monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
         armed_queues: list[str] = []
@@ -802,7 +1012,10 @@ class TestMachineResumePass:
     @pytest.mark.asyncio
     async def test_monitors_of_chats_reported_sessions_are_armed(
             self, temp_db, recorded):
-        from core.events.bg_command_state import _bg_command_registries, get_bg_command_registry
+        from core.events.bg_command_state import (
+            _bg_command_registries,
+            get_bg_command_registry,
+        )
         from services.scheduler import lanes
         sessions = {
             "s-chat": {},
@@ -838,9 +1051,9 @@ class TestMachineResumePass:
     @pytest.mark.asyncio
     async def test_a_deferred_queued_message_goes_out_after_the_reconnect(
             self, temp_db, monkeypatch):
+        import core.session.session_manager as sm
         from core.events import input_queue
         from core.events.common_events import TurnInput
-        import core.session.session_manager as sm
         layer = _FakeLayer()
         monkeypatch.setattr(sm, "_get_remote_layer", lambda: layer)
         monkeypatch.setattr(input_queue, "VIEWER_GRACE_S", 0.01)

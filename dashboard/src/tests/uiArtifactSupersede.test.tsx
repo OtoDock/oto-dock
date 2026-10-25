@@ -165,7 +165,7 @@ describe('useArtifactWindows ui replace-by-path', () => {
           return () => handlers.delete(type)
         },
       } as any,
-      emit: (event: any) => handlers.get('pty_artifact')?.({ chat_id: 'c1', event }),
+      emit: (event: any) => handlers.get('pty_artifact')?.({ type: 'pty_artifact', chat_id: 'c1', event }),
     }
   }
 

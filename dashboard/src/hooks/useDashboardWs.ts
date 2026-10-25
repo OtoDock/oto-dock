@@ -6,7 +6,7 @@
  * correctly as one closure. The frame TYPES + callback shape are split out
  * into useDashboardWs.types.
  */
-import { useRef, useState, useCallback, useEffect, useMemo } from 'react'
+import { useRef, useState, useCallback, useEffect, useMemo, useLayoutEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import type { ActiveChat, Chat } from '../api/chats'
 
@@ -20,12 +20,18 @@ import { CATALOG_RESYNC, emitAppLive, releaseCatalogSender, resendCatalogSubscri
 import { releaseFocusSender, resendFocus, setFocusSender } from '../lib/focus'
 import { noteServerBuild } from '../lib/buildId'
 import { noteServerVersion } from '../lib/session/serverInfo'
-import type { WsCallbacks } from './useDashboardWs.types'
+import type { RefusedSend, WsCallbacks } from './useDashboardWs.types'
 import { isTaskChatId } from '../lib/session/kind'
 import { CHAT_PHASE } from '../lib/status/chat'
 import { OUT, PER_CHAT_FRAMES, WIRE, isWireType, type WireFrame, type WireType } from '../api/wireEvents'
 import { callNative } from '../lib/nativeBridge'
 import { sessionStillValid } from '../api/auth'
+import { debugWarn, logError } from '../lib/debug/log'
+import { isRecord } from '../lib/json/guards'
+import { isNativePlatform } from '../audio/types'
+import { noteFold } from '../lib/nativeBridge'
+import { AUTO_REVIEW_MODE } from '../lib/engines/modes'
+import { chatTargetsKey, type ChatTargets } from '../api/remoteMachines'
 
 // The frames, their per-chat flag (PER_CHAT_FRAMES is derived from the
 // catalogue's table: a frame carrying a chat_id different from the viewed
@@ -49,7 +55,7 @@ function warnUnknownFrame(type: unknown): void {
   const key = String(type)
   if (warnedFrameTypes.has(key)) return
   warnedFrameTypes.add(key)
-  console.warn(`[ws] frame type not in the catalogue: ${key} (api/wireEvents.ts)`)
+  debugWarn(`[ws] frame type not in the catalogue: ${key} (api/wireEvents.ts)`)
 }
 export function _resetUnknownFrameWarningsForTests(): void { warnedFrameTypes.clear() }
 
@@ -72,10 +78,11 @@ export function mintQueueId(): string {
 /** A queued message handed back to its author: into the composer of the
  *  chat this view shows (the page's callback), or into the stored draft
  *  and pending attachments of the chat it was typed into when the author
- *  is elsewhere. */
+ *  is elsewhere. A photo comes back by its saved path, or, for a send
+ *  refused before anything was saved, as the data it was sent with. */
 function returnToComposer(
   chatId: string | null | undefined,
-  frame: { text?: string; images?: Array<{ name: string; path?: string }>;
+  frame: { text?: string; images?: Array<{ name: string; path?: string; base64?: string }>;
            files?: Array<{ path: string; name: string; folder?: boolean }>; chat_id?: string },
   cb: WsCallbacks,
 ): void {
@@ -90,9 +97,11 @@ function returnToComposer(
     const draft = st.byChat[chatId]?.draftInput ?? ''
     st.setDraftInput(chatId, draft ? `${draft}\n\n${frame.text}` : frame.text)
   }
-  const images = (frame.images ?? []).filter((i) => i.path)
+  const images = (frame.images ?? []).filter((i) => i.path || i.base64)
   if (images.length) {
-    st.addPendingImages(chatId, images.map((i) => ({ id: `img-${i.path}`, path: i.path, name: i.name })))
+    st.addPendingImages(chatId, images.map((i, n) => ({
+      id: i.path ? `img-${i.path}` : `img-returned-${n}-${i.name}`,
+      path: i.path, base64: i.base64, name: i.name })))
   }
   if (frame.files?.length) {
     st.addPendingFiles(chatId, frame.files.map((f) => ({
@@ -100,6 +109,9 @@ function returnToComposer(
       ...(f.folder ? { folder: true } : {}) })))
   }
 }
+
+// The idle clock: five minutes without input on the tab.
+const IDLE_MS = 5 * 60 * 1000
 
 export function useDashboardWs(callbacks: WsCallbacks) {
   const wsRef = useRef<WebSocket | null>(null)
@@ -111,7 +123,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // interactive terminal (pty_output/pty_exit/pty_permission). Dispatched after
   // the main switch, so per-chat gating still applies. Keeps interactive logic
   // out of the useChatStream monolith.
-  const frameSubsRef = useRef<Map<string, Set<(msg: any) => void>>>(new Map())
+  const frameSubsRef = useRef<Map<string, Set<(msg: WireFrame) => void>>>(new Map())
   const [connected, setConnected] = useState(false)
   const [_streaming, _setStreaming] = useState(false)
   // Latest-value ref so async handlers (ws.onclose lives inside a
@@ -119,7 +131,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // rather than the mount-time value — otherwise the mid-stream reload
   // recovery below never fires.
   const streamingRef = useRef(_streaming)
-  streamingRef.current = _streaming
+  useLayoutEffect(() => { streamingRef.current = _streaming })
   // One auto-attach per streaming episode of the viewed chat (chat_status
   // handler): set synchronously on send, cleared when the chat leaves
   // streaming — the backend echoes chat_status streaming straight to the
@@ -142,7 +154,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     callNative('setStreaming', value)
   }, [])
   const callbacksRef = useRef(callbacks)
-  callbacksRef.current = callbacks
+  useLayoutEffect(() => { callbacksRef.current = callbacks })
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reconnectDelay = useRef(1000)
   const intentionalClose = useRef(false)
@@ -152,6 +164,18 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   const missedPongs = useRef(0)
   // Track current chatId so we can re-resume on reconnect
   const currentChatId = useRef<string | null>(null)
+  // What each `chat` frame sent and to which chat, by its queue id, until
+  // its chip, its steer or its turn confirms it or that chat's turn ends: a
+  // refusal naming the id hands it back to the composer of the chat it was
+  // typed into. Small and bounded (the newest sends).
+  const sentRef = useRef<Map<string, { chatId: string; text: string; images?: WireImage[];
+                                        files?: Array<{ path: string; name: string; folder?: boolean }> }>>(new Map())
+  const SENT_MEMORY = 16
+  const forgetSent = (chatId: string) => {
+    for (const [id, sent] of sentRef.current) {
+      if (!chatId || sent.chatId === chatId) sentRef.current.delete(id)
+    }
+  }
   const reconnectedRef = useRef(false)
   // Minted chat ids whose warmup_started already moved the new-chat draft:
   // a reconnect replays a still-warming chat's frame (resume_chat) and the
@@ -185,7 +209,6 @@ export function useDashboardWs(callbacks: WsCallbacks) {
 
   // 5-minute idle threshold. Matches typical "away" timeouts (Slack/Discord) and is short
   // enough that an unattended laptop hands off to the user's phone within a coffee break.
-  const IDLE_MS = 5 * 60 * 1000
 
   // Compute (visible AND !idle) and send the corresponding user_active / user_idle to the
   // backend, deduped. `force=true` bypasses the dedup and is used on ws.onopen so the backend
@@ -221,7 +244,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
 
   const sendClientInfo = useCallback((ws: WebSocket) => {
     if (ws.readyState !== WebSocket.OPEN) return
-    const isNative = !!(window as any).Capacitor?.isNativePlatform?.()
+    const isNative = isNativePlatform()
     let tz: string | undefined
     try {
       tz = Intl.DateTimeFormat().resolvedOptions().timeZone
@@ -231,6 +254,9 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     try {
       ws.send(JSON.stringify({
         type: OUT.CLIENT_INFO,
+        // The proxy reads only "web or not" here (turn-complete routing): every
+        // app shell says android, the iPhone too. Its PUSH token registers as
+        // ios (useFcmPush), the one place the two platforms differ.
         platform: isNative ? 'android' : 'web',
         time_zone: tz,
         // A watched task chat's turn end arrives as the rows this tab lacks
@@ -242,7 +268,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   }, [])
 
   // Schedule next ping (setTimeout chain — more resilient than setInterval to browser throttling)
-  const schedulePing = useCallback((ws: WebSocket) => {
+  const schedulePing = useCallback(function schedulePing(ws: WebSocket) {
     if (pingTimer.current) clearTimeout(pingTimer.current)
     pingTimer.current = setTimeout(() => {
       if (ws.readyState !== WebSocket.OPEN) return
@@ -269,7 +295,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     }, 30000)
   }, [])
 
-  const connect = useCallback(() => {
+  const connect = useCallback(function connect() {
     // Guard against double-connect (OPEN or CONNECTING)
     const existing = wsRef.current
     if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) return
@@ -290,6 +316,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     }
 
     ws.onopen = () => {
+      noteFold('socket open')
       setConnected(true)
       reconnectDelay.current = 1000
       pongReceived.current = true
@@ -357,6 +384,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     }
 
     ws.onclose = (event?: CloseEvent) => {
+      noteFold(`socket closed code=${event?.code ?? '?'}`)
       if (event?.code === WS_CLOSE_SESSION) {
         void sessionStillValid().then((ok) => {
           if (!ok) window.location.href = '/'
@@ -431,26 +459,30 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     }
 
     ws.onmessage = (event) => {
-      let raw: any
+      let raw: unknown
       try {
         raw = JSON.parse(event.data)
       } catch {
         return  // non-JSON frame — ignore
       }
+      const frameType = isRecord(raw) ? raw.type : undefined
+      const frameChat = isRecord(raw) ? raw.chat_id : undefined
       try {
         const cb = callbacksRef.current
         // Per-chat stream frames for a chat this view is NOT showing are
         // dropped (cross-chat contamination guard). viewedChatId === null
         // means a brand-new chat with no id yet — every tagged stream frame
         // is foreign until warmup_started mints the id.
-        if (cb.viewedChatId !== undefined && raw.chat_id
-            && raw.chat_id !== cb.viewedChatId && PER_CHAT_FRAMES.has(raw.type)) {
+        if (cb.viewedChatId !== undefined && frameChat
+            && frameChat !== cb.viewedChatId && typeof frameType === 'string' && PER_CHAT_FRAMES.has(frameType)) {
           return
         }
+        // The parse boundary: a frame has the mirror's shape by its type
+        // (api/wireEvents.ts, lock-step with the proxy's catalogue).
         const msg = raw as WireFrame
         switch (msg.type) {
           case WIRE.TEXT:
-            cb.onText?.(msg.content)
+            cb.onText?.(msg.content, msg.note === true)
             break
           case WIRE.THINKING:
             cb.onThinking?.(msg)
@@ -506,6 +538,9 @@ export function useDashboardWs(callbacks: WsCallbacks) {
           case WIRE.PROMPT_RETIRED:
             cb.onPromptRetired?.(msg)
             break
+          case WIRE.PERMISSION_RESOLVED:
+            cb.onPermissionResolved?.(msg)
+            break
           case WIRE.LOCATION_REQUEST:
             cb.onLocationRequest?.(msg)
             break
@@ -537,19 +572,36 @@ export function useDashboardWs(callbacks: WsCallbacks) {
                 useChatStore.getState().setReady(doneChatId)
               }
             }
+            forgetSent(msg.chat_id || currentChatId.current || '')
             cb.onDone?.()
             break
-          case WIRE.ERROR:
+          case WIRE.ERROR: {
             // A pump's error carries the chat it ends: the turn is over, so
             // the composer goes back to Send and the next message starts a
             // new turn (a `done` follows once the rows landed). A bare error
-            // (one refused message, no chat_id) changes nothing.
+            // (one refused message, no chat_id) changes nothing; one naming
+            // a queue id refuses that send alone: what was sent goes back to
+            // the composer of the chat it was typed into, viewed or not,
+            // before the page sees the refusal.
             if (msg.chat_id && msg.chat_id === cb.viewedChatId) {
               setStreaming(false)
               useChatStore.getState().setReady(msg.chat_id)
             }
-            cb.onError?.(msg.message, msg.reason ? { reason: msg.reason, resets_at: msg.resets_at } : undefined)
+            if (msg.chat_id) forgetSent(msg.chat_id)
+            let refused: RefusedSend | undefined
+            if (msg.queue_id) {
+              const sent = sentRef.current.get(msg.queue_id)
+              sentRef.current.delete(msg.queue_id)
+              if (sent) {
+                returnToComposer(sent.chatId, { text: sent.text, images: sent.images, files: sent.files }, cb)
+              }
+              refused = { queueId: msg.queue_id, chatId: sent?.chatId, returned: !!sent }
+            }
+            const ending = msg.reason ? { reason: msg.reason, resets_at: msg.resets_at } : undefined
+            if (refused) cb.onError?.(msg.message, ending, refused)
+            else cb.onError?.(msg.message, ending)
             break
+          }
           case WIRE.IMAGES:
             cb.onImages?.(msg)
             break
@@ -678,11 +730,21 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             if (msg.chat_id) useChatStore.getState().failWarmup(msg.chat_id, msg.error || 'warmup failed')
             cb.onWarmupFailed?.(msg)
             break
+          case WIRE.CHAT_MOVE_PROGRESS:
+            // A running move's copy: into the chat's targets entry when one
+            // is cached (every chip that shows the chat draws the ring);
+            // chat_moved's refetch ends it.
+            queryClient.setQueryData<ChatTargets>(chatTargetsKey(msg.chat_id), (old) => (old
+              ? { ...old, moving: { to_label: old.moving?.to_label || msg.to_label,
+                                    progress: { done: msg.done, total: msg.total, phase: msg.phase } } }
+              : old))
+            break
           case WIRE.CHAT_MOVED:
-            // move_chat ack (the op acts on the connection's OPEN chat). The
-            // consumer re-resumes the chat so the fresh warmup runs on the
-            // new target and the "moved" history card arrives. Failures come
-            // as standard error frames instead.
+            // A move's outcome, broadcast to every tab that sees the chat (the
+            // mover's included): ok, memory, move_id, label, from_label and the
+            // message. The consumer re-resumes the chat so the fresh warmup runs
+            // where it went (or where it stayed). A refusal comes as a standard
+            // error frame instead.
             cb.onChatMoved?.(msg)
             break
           case WIRE.CHAT_VIEW_ONLY:
@@ -816,21 +878,34 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             break
           case WIRE.QUEUED: {
             // The chat's queue (any chat: the frame is chat-routed). A chip
-            // from a 1.7.0 proxy (no queue id) takes the page's own path.
+            // from a 1.7.0 proxy (no queue id) takes the page's own path. A
+            // chip of a task chat viewed through a sibling run is filed
+            // under the viewed chat and remembers the queue's own chat (the
+            // cancel names it).
             const qChat = msg.view_chat_id || msg.chat_id
             if (msg.queue_id && qChat) {
-              useChatStore.getState().addQueuedMessage(qChat, msg.index, toQueuedMessage(msg))
+              const chip = toQueuedMessage(msg)
+              if (msg.view_chat_id && msg.chat_id && msg.chat_id !== msg.view_chat_id) {
+                chip.queueChatId = msg.chat_id
+              }
+              useChatStore.getState().addQueuedMessage(qChat, msg.index, chip)
             }
+            if (msg.queue_id) sentRef.current.delete(msg.queue_id)
             if (!qChat || qChat === cb.viewedChatId) cb.onQueued?.(msg)
             break
           }
           case WIRE.STEERED:
             // Mid-turn steer accepted by the engine — the message is part of
             // the RUNNING turn (no queue entry, no new turn starts).
+            if (msg.queue_id) sentRef.current.delete(msg.queue_id)
             cb.onSteered?.(msg)
             break
           case WIRE.QUEUE_REMOVED: {
+            // The chip leaves whichever slice holds it (a task chat viewed
+            // through a sibling run files it under the viewed chat; the
+            // frame names the queue's chat).
             const rChat = msg.chat_id || currentChatId.current
+            const held = msg.queue_id ? useChatStore.getState().findQueuedChat(msg.queue_id) : null
             if (msg.queue_id && rChat) {
               useChatStore.getState().removeQueuedMessage(rChat, { queueId: msg.queue_id })
             }
@@ -839,15 +914,16 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             // sends them on every copy, with no `returned`.
             if ((msg.returned || !msg.queue_id)
                 && (msg.text || msg.images?.length || msg.files?.length)) {
-              returnToComposer(rChat, msg, cb)
+              returnToComposer(held ?? rChat, msg, cb)
             }
             cb.onQueueRemoved?.(msg)
             break
           }
           case WIRE.QUEUE_SENT: {
             // Key the slice by the FRAME's chat, not the viewed chat: its
-            // chips go and its turn runs; the socket's own turn state moves
-            // only for the chat this view shows.
+            // chips go (from whichever slice holds them) and its turn runs;
+            // the socket's own turn state moves only for the chat this view
+            // shows.
             const qsChatId = msg.chat_id || currentChatId.current
             if (qsChatId) {
               const st = useChatStore.getState()
@@ -856,6 +932,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
               if (msg.queue_ids?.length) st.clearQueuedMessages(qsChatId, msg.queue_ids)
               st.setStreaming(qsChatId)
             }
+            for (const id of msg.queue_ids ?? []) sentRef.current.delete(id)
             if ((!msg.chat_id || msg.chat_id === cb.viewedChatId)
                 && viewOnlyChatRef.current !== qsChatId) {
               // A call's turns emit this for the chat they drive; this
@@ -871,28 +948,47 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             // shows; the author's copy hands them back to its composer. An
             // untagged frame acknowledges a clear the page already applied.
             if (msg.chat_id) {
-              useChatStore.getState().clearQueuedMessages(msg.chat_id, msg.queue_ids)
+              const st = useChatStore.getState()
+              const held = msg.queue_ids?.length ? st.findQueuedChat(msg.queue_ids[0]) : null
+              st.clearQueuedMessages(msg.chat_id, msg.queue_ids)
               if (msg.returned && (msg.text || msg.images?.length || msg.files?.length)) {
-                returnToComposer(msg.chat_id, msg, cb)
+                returnToComposer(held ?? msg.chat_id, msg, cb)
               }
             }
             break
-          case WIRE.QUEUE_SNAPSHOT:
+          case WIRE.QUEUE_SNAPSHOT: {
             // Backend-authoritative reconciliation on resume_chat — replaces
             // any reload-persisted queuedMessages with the chat's queue as
-            // the proxy holds it. Strict replace, backend wins.
+            // the proxy holds it. Strict replace, backend wins. The resume's
+            // snapshot of a task chat viewed through a sibling run names the
+            // queue's chat (`queue_chat_id`); the audience's names it as
+            // `chat_id` and each entry the chat its author viewed: either
+            // way a chip is filed under the viewed chat and remembers the
+            // queue's.
             if (msg.chat_id) {
-              useChatStore.getState().setQueuedMessages(
-                msg.chat_id, Array.isArray(msg.messages) ? msg.messages.map(toQueuedMessage) : [])
+              const entries = Array.isArray(msg.messages) ? msg.messages : []
+              const groups = new Map<string, ReturnType<typeof toQueuedMessage>[]>([[msg.chat_id, []]])
+              for (const e of entries) {
+                const chip = toQueuedMessage(e)
+                const view = msg.queue_chat_id ? msg.chat_id : (e.view_chat_id || msg.chat_id)
+                const queueChat = msg.queue_chat_id || msg.chat_id
+                if (queueChat !== view) chip.queueChatId = queueChat
+                const list = groups.get(view) ?? []
+                list.push(chip)
+                groups.set(view, list)
+              }
+              const st = useChatStore.getState()
+              for (const [cid, list] of groups) st.setQueuedMessages(cid, list)
             }
             break
+          }
           case WIRE.SERVER_TURN_START:
             // A server-initiated turn (bg-nudge review / delegate-result
             // synthesis) is now streaming on this chat. No user-send flipped the
             // generating state, so do it here — the timer shows + Send becomes
             // Stop. The existing 'done'/'aborted' handlers clear it.
             setStreaming(true)
-            cb.onServerTurnStart?.()  // start the live turn timer (no user-send did)
+            cb.onServerTurnStart?.(msg)  // start the live turn timer (no user-send did)
             {
               const sChatId: string = msg.chat_id || currentChatId.current || ''
               if (sChatId) useChatStore.getState().setStreaming(sChatId)
@@ -1058,6 +1154,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
                 useChatStore.getState().setReady(abortChatId)
               }
             }
+            forgetSent(msg.chat_id || currentChatId.current || '')
             cb.onAborted?.(msg)
             break
           case WIRE.LIVE_STATE: {
@@ -1108,60 +1205,75 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             noteServerVersion(msg.version)
             break
           default:
-            if (!isWireType(raw.type)) warnUnknownFrame(raw.type)
+            if (!isWireType(frameType)) warnUnknownFrame(frameType)
         }
         // Generic subscribers (after the switch + per-chat gating). A handler
         // throw is isolated per-subscriber so one bad listener can't drop the
         // frame for others.
-        const subs = frameSubsRef.current.get(raw.type)
+        const subs = typeof frameType === 'string' ? frameSubsRef.current.get(frameType) : undefined
         if (subs) {
           for (const fn of Array.from(subs)) {
-            try { fn(raw) } catch (e2) { console.error('[ws] subscriber failed:', raw?.type, e2) }
+            try { fn(msg) } catch (e2) { logError('[ws] subscriber failed:', frameType, e2) }
           }
         }
       } catch (e) {
         // A handler throw must not be silently swallowed: the frame is lost
         // either way, but losing it INVISIBLY turns real bugs into "the chat
         // froze" mysteries. Per-frame isolation — later frames still process.
-        console.error('[ws] frame handler failed:', raw?.type, e)
+        logError('[ws] frame handler failed:', frameType, e)
       }
     }
 
     wsRef.current = ws
-  }, [])
+  }, [armIdleTimer, queryClient, schedulePing, sendActiveState, sendClientInfo, setStreaming])
 
-  const send = useCallback((data: object) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(data))
-    }
+  // Whether the frame went out: a socket that is not open drops it.
+  const send = useCallback((data: object): boolean => {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return false
+    wsRef.current.send(JSON.stringify(data))
+    return true
   }, [])
 
   const preWarmup = useCallback(
-    (agent: string, model?: string, permissionMode = 'default', executionPath?: string) => {
-      send({ type: OUT.PRE_WARMUP, agent, model, permission_mode: permissionMode, execution_path: executionPath })
+    (agent: string, model?: string, permissionMode = AUTO_REVIEW_MODE, executionPath?: string) => {
+      const target = callbacksRef.current.newChatTarget?.(agent)
+      send({ type: OUT.PRE_WARMUP, agent, model, permission_mode: permissionMode, execution_path: executionPath,
+             ...(target ? { target } : {}) })
     },
     [send],
   )
 
   const warmup = useCallback(
-    (agent: string, chatId?: string, permissionMode = 'default', model?: string, executionPath?: string,
+    (agent: string, chatId?: string, permissionMode = AUTO_REVIEW_MODE, model?: string, executionPath?: string,
      prompt?: { text: string; images?: WireImage[]; files?: Array<{ path: string; name: string }> },
-     executionMode?: string, theme?: string) => {
+     executionMode?: string, theme?: string, opts?: { place?: boolean }): string | undefined => {
       if (chatId) currentChatId.current = chatId
       // Carry the first prompt WITH warmup so the backend persists it
       // at send-time and server-kicks the turn on warmup_ready (survives
       // navigate-away / refresh during spawn — no client-side deferred send).
       // execution_mode is the per-chat interactive override — the backend
-      // resolver's chat_override.
+      // resolver's chat_override. The prompt carries a queue id too: a
+      // chat another page is warming queues it instead, and its chip
+      // names the id (the page's bubble becomes the chip).
       const msg: Record<string, unknown> = { type: OUT.WARMUP, agent, chat_id: chatId, permission_mode: permissionMode, model, execution_path: executionPath }
       if (executionMode) msg.execution_mode = executionMode
       if (theme) msg.theme = theme
+      // A new chat starts where its page picked (a voice start does not:
+      // a voice chat stays where it begins).
+      if (!chatId && opts?.place !== false) {
+        const target = callbacksRef.current.newChatTarget?.(agent)
+        if (target) msg.target = target
+      }
+      let id: string | undefined
       if (prompt?.text) {
         msg.text = prompt.text
         if (prompt.images?.length) msg.images = prompt.images.map(wireImage)
         if (prompt.files?.length) msg.files = prompt.files
+        id = mintQueueId()
+        msg.queue_id = id
       }
       send(msg)
+      return id
     },
     [send],
   )
@@ -1170,7 +1282,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // reconnect is answered once, a cancel names it) rides with it. Returns it.
   const sendChatFrame = useCallback(
     (text: string, chatId: string, images?: WireImage[],
-     files?: Array<{ path: string; name: string }>, queueId?: string,
+     files?: Array<{ path: string; name: string; folder?: boolean }>, queueId?: string,
      queueOnly = false): string => {
       const id = queueId || mintQueueId()
       const msg: Record<string, unknown> = { type: OUT.CHAT, text, chat_id: chatId, queue_id: id }
@@ -1180,6 +1292,13 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       }
       if (files?.length) {
         msg.files = files
+      }
+      const sent = sentRef.current
+      sent.set(id, { chatId, text, images, files })
+      while (sent.size > SENT_MEMORY) {
+        const oldest = sent.keys().next().value
+        if (oldest === undefined) break
+        sent.delete(oldest)
       }
       send(msg)
       return id
@@ -1193,7 +1312,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       useChatStore.getState().setStreaming(chatId)
       return sendChatFrame(text, chatId, images, files)
     },
-    [sendChatFrame],
+    [sendChatFrame, setStreaming],
   )
 
   // A message sent while its chat gets ready: the proxy queues it behind the
@@ -1256,7 +1375,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   )
 
   // Interactive CLI (PTY) — subscribe to raw frames + send keystrokes/resize.
-  const subscribe = useCallback((frameType: WireType, fn: (msg: any) => void) => {
+  const subscribe = useCallback((frameType: WireType, fn: (msg: WireFrame) => void) => {
     const m = frameSubsRef.current
     let set = m.get(frameType)
     if (!set) { set = new Set(); m.set(frameType, set) }
@@ -1287,9 +1406,8 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   )
 
   const sendPtyResize = useCallback(
-    (chatId: string, rows: number, cols: number) => {
-      send({ type: OUT.PTY_RESIZE, chat_id: chatId, rows, cols })
-    },
+    (chatId: string, rows: number, cols: number): boolean =>
+      send({ type: OUT.PTY_RESIZE, chat_id: chatId, rows, cols }),
     [send],
   )
 
@@ -1374,11 +1492,11 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     [send],
   )
 
-  // "Move this chat to the current target" — rebinds the connection's OPEN
-  // chat to the agent's currently-resolved execution target (the pin is
-  // cleared, a fresh session starts there, history reloads from DB). Acked
-  // with chat_moved; refusals (mid-turn, no mismatch) arrive as standard
-  // error frames.
+  // Move the OPEN chat to its run person's default (move_chat with no
+  // target; the frame also takes a `target` and the `from` place the page
+  // showed). The engine's session files travel when both places can take
+  // them, else the chat continues there from a summary. The outcome is the
+  // chat_moved broadcast; a refusal arrives as a standard error frame.
   const moveChat = useCallback(
     () => {
       send({ type: OUT.MOVE_CHAT })
@@ -1407,7 +1525,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   )
 
   const implementPlan = useCallback(
-    (planPath: string, mode = 'acceptEdits') => {
+    (planPath: string, mode = AUTO_REVIEW_MODE) => {
       send({ type: OUT.IMPLEMENT_PLAN, plan_path: planPath, mode })
     },
     [send],
@@ -1416,7 +1534,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   const resetStreaming = useCallback(() => {
     setStreaming(false)
     currentChatId.current = null
-  }, [])
+  }, [setStreaming])
 
   const resumeChat = useCallback(
     (chatId: string, opts?: { delta?: boolean }) => {
@@ -1428,7 +1546,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
         ? { type: OUT.RESUME_CHAT, chat_id: chatId, delta: true }
         : { type: OUT.RESUME_CHAT, chat_id: chatId })
     },
-    [send],
+    [send, setStreaming],
   )
 
   const sendChatRead = useCallback(
@@ -1478,7 +1596,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
     wsRef.current = null
     setConnected(false)
     setStreaming(false)
-  }, [send])
+  }, [send, setStreaming])
 
   // Visibility change + Android onResume bridge — verify the WS is actually
   // alive when the app returns to foreground. Browsers report readyState=OPEN
@@ -1487,7 +1605,8 @@ export function useDashboardWs(callbacks: WsCallbacks) {
   // always send a ping/pong roundtrip on return. ~50-100ms cost; catches dead
   // WS within 4s and triggers reconnect → resume_chat → backend self-heal.
   useEffect(() => {
-    const runHealthCheck = () => {
+    const runHealthCheck = (why: Event | string = 'visible') => {
+      noteFold(`health check (${typeof why === 'string' ? why : 'resume'})`)
       const ws = wsRef.current
       if (healthCheckTimer.current) return  // already in-flight
 
@@ -1506,6 +1625,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       healthCheckTimer.current = setTimeout(() => {
         healthCheckTimer.current = null
         if (!pongReceived.current) {
+          noteFold('socket closed: no pong within 4 s')
           ws.close()  // triggers onclose → auto-reconnect
         }
       }, 4000)
@@ -1535,7 +1655,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
             sendClientInfo(ws)
           }
         } catch { /* ignore */ }
-        runHealthCheck()
+        runHealthCheck('visible')
       }
     }
 
@@ -1550,7 +1670,7 @@ export function useDashboardWs(callbacks: WsCallbacks) {
       window.removeEventListener('otodock:force-health-check', runHealthCheck)
       if (healthCheckTimer.current) clearTimeout(healthCheckTimer.current)
     }
-  }, [connect, armIdleTimer, sendActiveState])
+  }, [connect, armIdleTimer, sendActiveState, sendClientInfo])
 
   // Idle detection — listen for any user input on the tab. Mouse / keyboard /
   // touch / scroll / focus all reset the 5-min idle clock. When the clock

@@ -24,8 +24,10 @@ HTTP is mocked via httpx.AsyncClient.
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
 
 from auth.oauth_providers import get_provider
 from auth.oauth_providers.facebook import FacebookOAuthProvider
@@ -342,7 +344,7 @@ class TestFacebookRevoke:
 
     async def test_revoke_exception_returns_false(self, provider):
         client = _client()
-        client.delete = AsyncMock(side_effect=OSError("net down"))
+        client.delete = AsyncMock(side_effect=httpx.ConnectError("net down"))
         with patch("auth.oauth_providers.facebook.httpx.AsyncClient",
                    return_value=client):
             ok = await provider.revoke(

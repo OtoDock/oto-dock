@@ -34,7 +34,7 @@ export default function ChatFilePreview({ resolved, onClose }: Props) {
     const downloadUrl = `/v1/agents/${encodeURIComponent(agent)}/files/${encodePathSegments(path)}?download=true&fn=${encodeURIComponent(filename)}`
     return (
       <FilePreviewPortal filename={filename} onClose={onClose} downloadUrl={downloadUrl}>
-        <div className="h-full flex items-center justify-center text-white/80 text-sm">
+        <div className="h-full flex items-center justify-center text-secondary text-sm">
           Preview unavailable for this file. Use the download button above.
         </div>
       </FilePreviewPortal>

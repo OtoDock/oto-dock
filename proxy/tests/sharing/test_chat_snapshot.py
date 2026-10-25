@@ -253,6 +253,7 @@ def test_the_daily_sweep_removes_a_revoked_chat_share_s_copy_then_its_row():
     """Thirty days after a revoke the sweep removes the copy (its own pass,
     which finds the folder through the row) and then the row."""
     from datetime import datetime, timedelta, timezone
+
     from services.infra import retention
     from services.infra.retention import LiveSnapshot
     from storage.pg import get_conn
@@ -266,6 +267,7 @@ def test_the_daily_sweep_removes_a_revoked_chat_share_s_copy_then_its_row():
         conn.execute("UPDATE shares SET revoked_at=%s WHERE id=%s", (old, share["id"]))
         conn.commit()
     from unittest.mock import patch
+
     from services.sharing import chat_snapshot
     # The orphan sweep would take the copy in either order: with it off,
     # only the revoked-row path, which needs the row, can remove it.

@@ -16,13 +16,13 @@ guard returns before anything touches the platform tree).
 import base64
 import sys
 from types import SimpleNamespace
-
-from core import placement
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from core import placement
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 

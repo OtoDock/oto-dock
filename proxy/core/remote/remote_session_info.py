@@ -32,7 +32,7 @@ class RemoteSessionInfo:
     # The engine's remote adapter's own per-session record
     # (``RemoteEngineAdapter.init_session`` / ``adopt_state`` create it,
     # ``close_state`` releases it). Read by that adapter only.
-    engine_state: object | None = None
+    engine_state: object | None = None  # the engine's own state; its adapter casts the reads
     # Permission-mode tracking (native vs hook-based permissions)
     use_native_permissions: bool = False
     # Machine pairing's full-filesystem grant — feeds Codex sandbox-mode

@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
 from core import placement
 
 
@@ -80,7 +81,7 @@ async def test_pull_through_writes_to_workspace(temp_db, reset_flow, tmp_path, m
                                 timeout=180.0):
         p = Path(dest_path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(b"hello-" + ref.value.encode())
+        p.write_bytes(b"hello-" + ref.value.encode())  # noqa: ASYNC240  # a test's own temporary files
         return True
 
     mock_cm.pull_file_to_path.side_effect = fake_pull_to_path
@@ -181,7 +182,7 @@ async def test_push_back_uses_workspace_file(
         from pathlib import Path as _P
         # push_back passes a PATH push_file streams from (the descriptor it
         # holds open for the push).
-        pushed.append((machine_id, agent_slug, ref.value, _P(content).read_bytes()))
+        pushed.append((machine_id, agent_slug, ref.value, _P(content).read_bytes()))  # noqa: ASYNC240  # a test's own temporary files
         return True
 
     mock_cm.push_file.side_effect = fake_push
@@ -339,7 +340,7 @@ async def test_push_back_fans_out_excluding_own_machine(
     assert fo.await_args.args[:2] == ("agent-1", "workspace/out.md")
     # Fan-out receives the platform PATH (streaming), not bytes.
     from pathlib import Path as _P
-    assert _P(fo.await_args.args[2]).read_bytes() == b"v2"
+    assert _P(fo.await_args.args[2]).read_bytes() == b"v2"  # noqa: ASYNC240  # a test's own temporary files
     assert fo.await_args.kwargs.get("exclude_machine_id") == "m-own"
 
 
@@ -396,7 +397,7 @@ async def test_write_barrier_blocks_reads_during_push(
                                 timeout=180.0):
         p = Path(dest_path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(b"fetched")
+        p.write_bytes(b"fetched")  # noqa: ASYNC240  # a test's own temporary files
         return True
 
     mock_cm = MagicMock()
@@ -623,7 +624,7 @@ async def test_pull_through_via_fallback_after_restart(
         assert agent_slug == "agent-1"
         p = Path(dest_path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(b"survivor")
+        p.write_bytes(b"survivor")  # noqa: ASYNC240  # a test's own temporary files
         return True
 
     mock_cm.pull_file_to_path.side_effect = fake_pull_to_path
@@ -654,7 +655,7 @@ def _mock_cm(*, supports_stat, stat=None, pulled=b"content-v1"):
                         timeout=180.0):
         p = Path(dest_path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(pulled)
+        p.write_bytes(pulled)  # noqa: ASYNC240  # a test's own temporary files
         return True
 
     cm.pull_file_to_path = MagicMock(side_effect=fake_pull)
@@ -883,6 +884,7 @@ def test_every_caller_enters_the_lock_it_was_handed_at_once():
     """The eviction rule leans on this shape: no await between receiving the
     lock and entering it, so an idle lock has no holder about to enter."""
     import re
+
     from tests._paths import PROXY_DIR
     files = [
         "core/remote/remote_file_flow.py", "core/remote/remote_workspace_sync.py",
@@ -1061,6 +1063,59 @@ async def test_a_failure_with_no_record_probes_the_machine_once_for_the_baseline
 
 
 @pytest.mark.asyncio
+async def test_a_save_the_machine_refused_as_stale_is_kept_when_its_copy_wins(
+    temp_db, reset_flow, tmp_path, monkeypatch,
+):
+    """The platform copy is a save the machine refused (it was changing the
+    file); the machine's copy then moved on. The read takes the machine's
+    copy, and the save goes to the recover bin first, as a conflict."""
+    from core.remote import remote_file_flow
+    from storage.files import recover_bin_store
+    cm, target = _ahead_rig(monkeypatch, tmp_path, push_ok=False)
+    st = target.stat()
+    remote_file_flow.note_platform_ahead("m-1", "agent-1", "workspace/r.docx",
+                                         st.st_size, st.st_mtime_ns,
+                                         machine=dict(_STAT_V1), stale=True)
+    assert remote_file_flow.stale_hold("m-1", "agent-1", "workspace/r.docx")
+    captured: list = []
+    monkeypatch.setattr(
+        recover_bin_store, "capture",
+        lambda agent, rp, data, reason: captured.append((agent, rp, data, reason)) or {"entry_id": "e1"})
+    cm.stat_file = AsyncMock(return_value=dict(_STAT_V2))   # the machine's copy moved on
+    with _as("m-1"), patch(
+        "core.remote.satellite_connection.get_connection_manager", return_value=cm,
+    ):
+        await remote_file_flow.pull_through("s1", "workspace/r.docx")
+    assert captured == [("agent-1", "workspace/r.docx", b"the agent's new bytes", "conflict")]
+    assert target.read_bytes() == b"the machine's old bytes"
+    assert not remote_file_flow.stale_hold("m-1", "agent-1", "workspace/r.docx")
+    assert ("m-1", "agent-1", "workspace/r.docx") not in remote_file_flow._platform_ahead
+
+
+@pytest.mark.asyncio
+async def test_a_copy_a_failed_push_left_behind_is_taken_without_a_capture(
+    temp_db, reset_flow, tmp_path, monkeypatch,
+):
+    """A push that did not reach the machine (no refusal) leaves the mark
+    without the stale flag: the later machine copy is taken as before."""
+    from core.remote import remote_file_flow
+    from storage.files import recover_bin_store
+    cm, target = _ahead_rig(monkeypatch, tmp_path, push_ok=False)
+    st = target.stat()
+    remote_file_flow.note_platform_ahead("m-1", "agent-1", "workspace/r.docx",
+                                         st.st_size, st.st_mtime_ns, machine=dict(_STAT_V1))
+    assert not remote_file_flow.stale_hold("m-1", "agent-1", "workspace/r.docx")
+    monkeypatch.setattr(recover_bin_store, "capture",
+                        lambda *a, **kw: pytest.fail("nothing is captured"))
+    cm.stat_file = AsyncMock(return_value=dict(_STAT_V2))
+    with _as("m-1"), patch(
+        "core.remote.satellite_connection.get_connection_manager", return_value=cm,
+    ):
+        await remote_file_flow.pull_through("s1", "workspace/r.docx")
+    assert target.read_bytes() == b"the machine's old bytes"
+
+
+@pytest.mark.asyncio
 async def test_a_push_in_flight_is_served_from_the_platform_without_a_probe(
     temp_db, reset_flow, tmp_path, monkeypatch,
 ):
@@ -1159,7 +1214,7 @@ async def test_a_read_never_waits_for_the_re_push(
         assert got == target.resolve()
         # The re-push now holds the path lock for as long as the link takes.
         lock = remote_file_flow._global_path_locks[("agent-1", "workspace/r.docx")]
-        while not lock.locked():
+        while not lock.locked():  # noqa: ASYNC110  # a lock's state: asyncio.Lock has no acquired event
             await asyncio.sleep(0)
         assert await asyncio.wait_for(remote_file_flow.pull_through("s1", "workspace/r.docx"), 2) == got
         assert cm.stat_file.await_count == probes + 1     # the second read is in flight
@@ -1233,6 +1288,7 @@ async def test_a_later_platform_write_or_push_drops_the_marker(
     temp_db, reset_flow, tmp_path, monkeypatch,
 ):
     import os
+
     from core.remote import remote_file_flow
     cm, target = _ahead_rig(monkeypatch, tmp_path, push_ok=False)
     key = ("m-1", "agent-1", "workspace/r.docx")
@@ -1390,6 +1446,7 @@ def test_every_fan_out_lock_holder_enters_it_at_once():
     """The fan-out lock map keeps the path lock's eviction rule: no await
     between receiving the lock and entering it."""
     import re
+
     from tests._paths import PROXY_DIR
     files = [
         "core/remote/remote_file_flow.py", "services/remote/workspace_fanout.py",
@@ -1544,7 +1601,7 @@ class TestWriteBackGate:
             except OSError:
                 return False
             os.close(rootfd)
-            Path(dest).write_bytes(b"machine bytes")
+            Path(dest).write_bytes(b"machine bytes")  # noqa: ASYNC240  # a test's own temporary files
             return True
 
         rig.cm.pull_file_to_path = MagicMock(side_effect=pull)
@@ -1613,7 +1670,7 @@ async def test_a_reads_re_push_sends_the_platform_copy_it_opened_never_a_link(
     class _CM:
         async def push_file(self, machine_id, ref, content, *, agent_slug="", **kw):
             from pathlib import Path as _P
-            pushed.append(_P(content).read_bytes())
+            pushed.append(_P(content).read_bytes())  # noqa: ASYNC240  # a test's own temporary files
             return True
 
     async def run():
@@ -1631,3 +1688,71 @@ async def test_a_reads_re_push_sends_the_platform_copy_it_opened_never_a_link(
     os.symlink(other, host)
     key = await run()
     assert pushed == [b"alice's"] and key not in remote_file_flow._platform_ahead
+
+
+@pytest.mark.asyncio
+async def test_a_push_back_expects_the_recorded_copy_and_a_stale_answer_marks_it_ahead(
+    temp_db, reset_flow, tmp_path, monkeypatch, caplog,
+):
+    """The push carries the machine's recorded stat (taken before the push);
+    a stale answer marks the platform copy ahead with the ack's stat as the
+    baseline, with no probe, and the record is gone until a pull or a push
+    lands."""
+    from core.remote import remote_file_flow
+    cm, target = _ahead_rig(monkeypatch, tmp_path, push_ok=False)
+    seen: dict = {}
+
+    async def _push(machine_id, ref, content, *, agent_slug="", expect=None, stale_out=None, **kw):
+        seen["expect"] = expect
+        seen["record_during"] = ("m-1", "agent-1", "workspace/r.docx") in remote_file_flow._pull_stat_records
+        stale_out.update(reason="changed", size=12, mtime_ns=222)
+        return False
+    cm.push_file = _push
+    with _as("m-1"), patch(
+        "core.remote.satellite_connection.get_connection_manager", return_value=cm,
+    ), caplog.at_level("INFO", logger="otodock"):
+        assert await remote_file_flow.push_back("s1", "workspace/r.docx") is False
+    assert seen == {"expect": {"size": 10, "mtime_ns": 111}, "record_during": False}
+    st = target.stat()
+    marker = remote_file_flow._platform_ahead[("m-1", "agent-1", "workspace/r.docx")]
+    assert (marker["size"], marker["mtime_ns"], marker["machine"]) == (st.st_size, st.st_mtime_ns, _STAT_V2)
+    assert "is being changed on machine m-1" in caplog.text
+    cm.stat_file.assert_not_awaited()
+    assert ("m-1", "agent-1", "workspace/r.docx") not in remote_file_flow._pull_stat_records
+
+
+@pytest.mark.asyncio
+async def test_a_push_back_with_no_record_expects_a_live_file(
+    temp_db, reset_flow, tmp_path, monkeypatch,
+):
+    from core.remote import remote_file_flow
+    cm, _target = _ahead_rig(monkeypatch, tmp_path, push_ok=True)
+    remote_file_flow._pull_stat_records.clear()
+    seen: dict = {}
+
+    async def _push(machine_id, ref, content, *, agent_slug="", expect=None, **kw):
+        seen["expect"] = expect
+        return True
+    cm.push_file = _push
+    with _as("m-1"), patch(
+        "core.remote.satellite_connection.get_connection_manager", return_value=cm,
+    ):
+        assert await remote_file_flow.push_back("s1", "workspace/r.docx") is True
+    assert seen == {"expect": "live"}
+
+
+def test_the_expectation_and_the_baseline_of_a_stat_record():
+    from core.remote import remote_file_flow
+    assert remote_file_flow.push_expectation_of(_STAT_V1) == {"size": 10, "mtime_ns": 111}
+    assert remote_file_flow.push_expectation_of(None) == "live"
+    assert remote_file_flow.push_expectation_of({"exists": False}) == "live"
+    assert remote_file_flow.stale_machine_stat({"reason": "live", "size": 3, "mtime_ns": 9}) == {
+        "exists": True, "size": 3, "mtime_ns": 9}
+    assert remote_file_flow.stale_machine_stat({"reason": "live", "size": None, "mtime_ns": None}) is None
+    remote_file_flow.record_pushed_stat("m-9", "agent-1", "workspace/p.txt", 5, 50)
+    try:
+        assert remote_file_flow.take_push_record("m-9", "agent-1", "workspace/p.txt") == {
+            "exists": True, "size": 5, "mtime_ns": 50}
+        assert remote_file_flow.take_push_record("m-9", "agent-1", "workspace/p.txt") is None
+    finally:
+        remote_file_flow._pull_stat_records.pop(("m-9", "agent-1", "workspace/p.txt"), None)

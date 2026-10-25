@@ -33,6 +33,7 @@ logger = logging.getLogger("otodock.account-api")
 router = APIRouter()
 
 _STATE_KEY = "_otodock_connect_state"        # single in-flight connect CSRF state
+_NOT_FINISHED = "OtoDock did not finish the connection. Try again."
 _RELAY_TOGGLE_KEY = "otodock_api_relay_enabled"
 
 
@@ -48,7 +49,7 @@ def _require_relay_settable() -> None:
     """Connect/disconnect require an online, operator-unmanaged install.
     Reads the license from the store: call it inside a ``run_db`` job."""
     if not relay_client.relay_offered():
-        raise HTTPException(409, "This install is air-gapped — hosted relay is unavailable.")
+        raise HTTPException(409, "This install works offline, so the hosted relay is not available.")
     if _RELAY_TOGGLE_KEY in config.forced_settings():
         raise HTTPException(409, "Hosted relay is managed by OtoDock for this install.")
 
@@ -56,7 +57,11 @@ def _require_relay_settable() -> None:
 def _callback_uri() -> str:
     base = config.DASHBOARD_PUBLIC_URL.rstrip("/") if config.DASHBOARD_PUBLIC_URL else ""
     if not base:
-        raise HTTPException(500, "DASHBOARD_PUBLIC_URL not configured")
+        raise HTTPException(
+            500,
+            "This install has no public address. Set DASHBOARD_PUBLIC_URL in config.env "
+            "(.env on a Docker install) and restart.",
+        )
     return f"{base}/v1/account/connect/callback"
 
 
@@ -148,9 +153,9 @@ async def connect_start(body: ConnectStartRequest, user: UserContext = Depends(g
             state=state, install_callback=_callback_uri(),
         )
     except relay_client.RelayNotConfigured as e:
-        raise HTTPException(503, str(e))
+        raise HTTPException(503, str(e)) from e
     except relay_client.RelayError as e:
-        raise HTTPException(403, relay_client.relay_error_message(e.code))
+        raise HTTPException(403, relay_client.relay_error_message(e.code)) from e
     return {"url": data.get("url", ""), "pairing_code": data.get("pairing_code", "")}
 
 
@@ -163,24 +168,24 @@ async def connect_callback(
 ):
     """Browser lands here after consent: redeem the handle → store token → enable."""
     if error:
-        return HTMLResponse(_error_html(f"OtoDock returned: {error}"))
+        logger.warning("account connect callback: OtoDock answered %r", error[:100])
+        return HTMLResponse(_error_html(_NOT_FINISHED))
     if not code or not state:
-        return HTMLResponse(_error_html("Missing code or state parameter"))
+        return HTMLResponse(_error_html("This link is not complete. Start the connection again."))
     valid, mobile = await run_db(_check_and_clear_state, state)
     if not valid:
-        return HTMLResponse(_error_html("Invalid or expired connect request"))
+        return HTMLResponse(_error_html("This connection request expired. Start it again."))
     try:
         token = await relay_client.account_connect_exchange(code=code)
-    except Exception as e:
+    except Exception:
         # Never reflect the exception text — it can carry relay response
         # bodies / internal URLs. Full detail goes to the server log only.
         logger.exception("account connect exchange failed")
         return HTMLResponse(_error_html(
-            f"Connect exchange failed ({type(e).__name__}). "
-            "Check the proxy logs for details."
+            "Could not finish the connection. The server log has the details."
         ))
     if not token:
-        return HTMLResponse(_error_html("OtoDock returned no account token"))
+        return HTMLResponse(_error_html(_NOT_FINISHED))
 
     def _job() -> str:
         _enable_and_reconcile()
@@ -211,7 +216,12 @@ async def relay_enable(user: UserContext = Depends(get_current_user)):
         return True
 
     if not await run_db(_job):
-        raise HTTPException(409, "not_connected")
+        # The code stays for a client that branches on it; the dashboard
+        # shows the message.
+        raise HTTPException(409, {
+            "error": "not_connected",
+            "message": "This install is not connected to an OtoDock account. Connect it first.",
+        })
     return {"status": "enabled"}
 
 

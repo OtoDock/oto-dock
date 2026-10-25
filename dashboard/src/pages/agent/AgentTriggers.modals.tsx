@@ -1,5 +1,5 @@
-import { useState, useMemo, useEffect } from 'react'
-import { Trigger, useCreateTrigger, useEditTrigger, useFireTrigger } from '../../api/triggers'
+import { useState, useMemo } from 'react'
+import { Trigger, useCreateTrigger, useEditTrigger, useFireTrigger, NOTIFY_SEVERITIES, type NotifySeverity } from '../../api/triggers'
 import { useTasks } from '../../api/tasks'
 import { useApps } from '../../api/apps'
 import { useAgentInfo } from '../../api/agents'
@@ -8,6 +8,12 @@ import { useAuth } from '../../contexts/AuthContext'
 import { availableScopes, modeOfAgent } from '../../lib/visibility'
 import { appKind } from '../../lib/kinds/app'
 import { TASK_KIND } from '../../lib/kinds/task'
+import { errorText } from '../../lib/http/apiJson'
+import Dialog, { type DialogDismiss } from '../../components/ui/Dialog'
+import Button from '../../components/ui/Button'
+import { Input, Label, Select } from '../../components/ui/Field'
+import InfoTip from '../../components/ui/InfoTip'
+import { DIALOG_PANEL, FIELD, FIELD_BORDER, FIELD_REGULAR } from '../../components/ui/classes'
 
 /** The "paste an id" choice of the subscription picker. */
 const PASTE_ID = '__paste__'
@@ -26,25 +32,17 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
   const { data: info } = useAgentInfo(agent)
   const scopes = info ? availableScopes(modeOfAgent(info)) : null
   const forcedScope = scopes && scopes.length === 1 ? scopes[0] : null
-  const [scope, setScope] = useState<'user' | 'agent'>('user')
+  const [pickedScope, setPickedScope] = useState<'user' | 'agent'>('user')
   const [scopeTouched, setScopeTouched] = useState(false)
-  useEffect(() => {
-    if (!info) return
-    const sc = availableScopes(modeOfAgent(info))
-    if (sc.length === 1) {
-      setScope(sc[0]) // single-scope mode — always force it
-      return
-    }
-    if (scopeTouched) return
-    if (canCreateAgentScope && info.default_scope === 'agent') setScope('agent')
-  }, [info, canCreateAgentScope, scopeTouched])
+  const scope: 'user' | 'agent' = forcedScope
+    ?? (!scopeTouched && canCreateAgentScope && info?.default_scope === 'agent' ? 'agent' : pickedScope)
   const [name, setName] = useState('')
   const [slug, setSlug] = useState('')
   const [taskId, setTaskId] = useState('')
   const [notifyEnabled, setNotifyEnabled] = useState(true)
   const [notifyTitle, setNotifyTitle] = useState('')
   const [notifyBody, setNotifyBody] = useState('')
-  const [notifySeverity, setNotifySeverity] = useState('info')
+  const [notifySeverity, setNotifySeverity] = useState<NotifySeverity>('info')
   const [debounce, setDebounce] = useState(0)
   // Optional vendor-subscription linkage. Empty = generic
   // webhook URL (otok_-authed). Non-empty = trigger fires from a
@@ -71,7 +69,7 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
   const { data: tasks = [] } = useTasks(agent)
   // Trigger-only tasks for this scope
   const eligibleTasks = useMemo(
-    () => tasks.filter((t: any) => t.task_type === TASK_KIND.TRIGGER && t.scope === scope),
+    () => tasks.filter((t) => t.task_type === TASK_KIND.TRIGGER && t.scope === scope),
     [tasks, scope],
   )
   // Apps with a server that declared on_trigger handlers, in this scope
@@ -80,12 +78,14 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
   // A subscription, an app handler and a task each belong to one scope:
   // a scope change drops the picks made for the other, which the select no
   // longer shows but the create would still send (and the server refuse).
-  useEffect(() => {
+  const [picksFor, setPicksFor] = useState(scope)
+  if (picksFor !== scope) {
+    setPicksFor(scope)
     setSubscriptionChoice('')
     setPastedSubscriptionId('')
     setAppTarget('')
     setTaskId('')
-  }, [scope])
+  }
   const { data: apps = [] } = useApps(agent)
   const eligibleApps = useMemo(
     () => apps.filter((a) => appKind(a).mayServe && (a.handlers?.on_trigger?.length ?? 0) > 0
@@ -93,32 +93,35 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
     [apps, scope],
   )
 
+  const [formError, setFormError] = useState('')
+
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    setFormError('')
     if (!name.trim()) {
-      alert('Name required')
+      setFormError('Give the trigger a name.')
       return
     }
     if (!taskId && !appTarget && !notifyEnabled) {
-      alert('Pick a task or an app handler, or enable notification (at least one action required).')
+      setFormError('Pick a task or an app to wake, or turn on the notification. A trigger needs at least one action.')
       return
     }
     if (notifyEnabled && (!notifyTitle.trim() || !notifyBody.trim())) {
-      alert('Notify title and body required when notify is enabled.')
+      setFormError('The notification needs a title and a body.')
       return
     }
     let parsedFilter: Record<string, unknown> | undefined
     if (sourceType === 'vendor') {
       if (!subscriptionId.trim()) {
-        alert(scope === 'agent'
-          ? "Vendor source needs one of this agent's subscriptions. Create one in Agent Settings → MCPs → Subscribe to events for this agent."
-          : 'Vendor source needs one of your subscriptions. Create one from Connected Accounts first.')
+        setFormError(scope === 'agent'
+          ? "A vendor source needs one of this agent's subscriptions. Add one in the agent's MCPs. On the MCP, click Subscribe to events for this agent."
+          : 'A vendor source needs one of your subscriptions. Add one in User Settings, Integrations, Connected Accounts.')
         return
       }
       try {
         parsedFilter = eventFilterText.trim() ? JSON.parse(eventFilterText) : {}
       } catch (e) {
-        alert(`event_filter must be valid JSON: ${(e as Error).message}`)
+        setFormError(`The event filter is not valid JSON: ${(e as Error).message}`)
         return
       }
     }
@@ -134,7 +137,7 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
         notify: notifyEnabled
           ? {
               enabled: true,
-              severity: notifySeverity as any,
+              severity: notifySeverity,
               title: notifyTitle,
               body: notifyBody,
             }
@@ -144,139 +147,133 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
         event_filter: sourceType === 'vendor' ? parsedFilter : undefined,
       })
       onClose()
-    } catch (e: any) {
-      alert(`Create failed: ${e?.message ?? e}`)
+    } catch (e) {
+      setFormError(errorText(e) || 'The trigger was not created.')
     }
   }
 
   return (
-    <Modal onClose={onClose} title="Create trigger">
+    <Modal onClose={onClose} title="Create trigger" busy={createM.isPending}>
       <form onSubmit={onSubmit} className="space-y-3">
         {!forcedScope && (
           <Field label="Scope">
-            <select
+            <Select
               value={scope}
               onChange={(e) => {
-                setScope(e.target.value as 'user' | 'agent')
+                setPickedScope(e.target.value as 'user' | 'agent')
                 setScopeTouched(true)
               }}
-              className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
             >
-              <option value="user">User (personal automation)</option>
-              {canCreateAgentScope && <option value="agent">Agent (manager-managed)</option>}
-            </select>
+              <option value="user">User: a personal automation</option>
+              {canCreateAgentScope && <option value="agent">Agent: managed by the agent's managers</option>}
+            </Select>
           </Field>
         )}
         <Field label="Name">
-          <input
+          <Input
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="e.g. GitHub PR opened"
-            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
           />
         </Field>
-        <Field label="Slug (optional)" hint="URL-safe id; auto-derived from name if blank">
-          <input
+        <Field label="ID, optional" info="Used in the webhook URL." hint="Made from the name if left blank.">
+          <Input
             value={slug}
             onChange={(e) => setSlug(e.target.value)}
             placeholder="e.g. github-pr-opened"
-            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm font-mono"
+            className="font-mono"
           />
         </Field>
-        <Field label="Source" hint="Generic = your code POSTs to a webhook URL with an OtoDock API key. Vendor = a connected Slack/GitHub/etc. subscription fires this trigger on matching events.">
-          <select
+        <Field label="Source" info="Generic: your code sends a POST to the webhook URL with an OtoDock API key. Vendor: a connected subscription, like Slack or GitHub, fires this trigger on matching events.">
+          <Select
             value={sourceType}
             onChange={(e) => setSourceType(e.target.value as 'generic' | 'vendor')}
-            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
           >
             <option value="generic">Generic webhook URL</option>
             <option value="vendor">Vendor subscription</option>
-          </select>
+          </Select>
         </Field>
         {sourceType === 'vendor' && (
           <>
             <Field
               label="Subscription"
-              hint={scope === 'agent'
-                ? "One of this agent's subscriptions (Agent Settings → MCPs → the MCP → Subscribe to events for this agent)."
-                : 'One of your personal subscriptions (User Settings → Integrations → Connected Accounts → expand the account → Subscribe to events).'}
+              info={scope === 'agent'
+                ? "One of this agent's subscriptions. Add one in the agent's MCPs. On the MCP, click Subscribe to events for this agent."
+                : 'One of your personal subscriptions. Add one in User Settings, Integrations, Connected Accounts. Expand the account and click Subscribe to events.'}
             >
-              <select
+              <Select
                 value={subscriptionChoice}
                 onChange={(e) => setSubscriptionChoice(e.target.value)}
-                className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
                 data-testid="trigger-subscription"
               >
-                <option value="">— Choose —</option>
+                <option value="">Choose…</option>
                 {linkableSubs.map((s) => (
                   <option key={s.id} value={s.id}>
                     {s.provider_id}/{s.vendor_target} · {s.selected_events.join(', ') || '—'}
                   </option>
                 ))}
                 <option value={PASTE_ID}>Paste a subscription id…</option>
-              </select>
+              </Select>
               {subscriptionChoice === PASTE_ID && (
-                <input
+                <Input
                   value={pastedSubscriptionId}
                   onChange={(e) => setPastedSubscriptionId(e.target.value)}
                   placeholder="e.g. 8f3a-...-uuid"
-                  className="mt-1 w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm font-mono"
+                  className="mt-1 font-mono"
                 />
               )}
               {!subsQuery.isLoading && linkableSubs.length === 0 && (
-                <p className="text-xs text-amber-600 mt-1">
+                <p className="text-xs text-status-warning-fg mt-1">
                   {scope === 'agent'
-                    ? 'No agent subscriptions yet: Agent Settings → MCPs → the MCP → Subscribe to events for this agent.'
-                    : 'No personal subscriptions yet: User Settings → Integrations → Connected Accounts → Subscribe to events.'}
+                    ? "No agent subscriptions yet. Add one in the agent's MCPs. On the MCP, click Subscribe to events for this agent."
+                    : 'No personal subscriptions yet. Add one in User Settings, Integrations, Connected Accounts. Expand the account and click Subscribe to events.'}
                 </p>
               )}
             </Field>
-            <Field label="Event filter (JSON, empty = match all)" hint='Match a specific event by its catalog key, e.g. {"event_type": "pull_request"}. Leave empty ({}) to fire on every event from this subscription.'>
+            <Field label="Event filter in JSON, empty matches all" hint='Match a specific event by its key, e.g. {"event_type": "pull_request"}. Leave empty ({}) to fire on every event from this subscription.'>
               <textarea
                 value={eventFilterText}
                 onChange={(e) => setEventFilterText(e.target.value)}
                 rows={3}
-                className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm font-mono"
+                className={`${FIELD} ${FIELD_BORDER} ${FIELD_REGULAR} font-mono`}
               />
             </Field>
           </>
         )}
-        <Field label="App handler to wake (optional)" hint="An app with a server declares handlers.on_trigger in its app.json; the fire wakes that handler instead of running a task. Approve the app first.">
-          <select
+        <Field label="App to wake, optional" info="An app with a server can take the trigger: its app.json lists handlers.on_trigger. A fire then wakes the app instead of running a task. Approve the app first.">
+          <Select
             value={appTarget}
             onChange={(e) => { setAppTarget(e.target.value); if (e.target.value) setTaskId('') }}
-            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
             data-testid="trigger-app-handler"
           >
-            <option value="">— None —</option>
+            <option value="">None</option>
             {eligibleApps.flatMap((a) => (a.handlers?.on_trigger ?? []).map((h) => (
               <option key={`${a.slug}|${h}`} value={`${a.slug}|${h}`} disabled={!a.actions_approved}>
-                {a.title || a.slug} → {h}{a.actions_approved ? '' : ' (approve the app first)'}
+                {a.title || a.slug} → {h}{a.actions_approved ? '' : ', approve the app first'}
               </option>
             )))}
-          </select>
+          </Select>
         </Field>
-        <Field label="Task to run (optional)">
-          <select
+        <Field label="Task to run, optional">
+          <Select
             value={taskId}
             onChange={(e) => { setTaskId(e.target.value); if (e.target.value) setAppTarget('') }}
-            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
           >
-            <option value="">— None —</option>
-            {eligibleTasks.map((t: any) => (
+            <option value="">None</option>
+            {eligibleTasks.map((t) => (
               <option key={t.id} value={t.id}>
                 {t.name} ({t.id.slice(0, 8)})
               </option>
             ))}
-          </select>
+          </Select>
           {eligibleTasks.length === 0 && (
-            <p className="text-xs text-amber-600 mt-1">
+            <p className="text-xs text-status-warning-fg mt-1">
               No trigger-only tasks for this scope. Ask an agent to "create a trigger-only
               task" via schedules-mcp first.
             </p>
           )}
         </Field>
-        <div className="space-y-3 border-t border-p-border-light pt-3">
+        <div className="space-y-3 border-t border-subtle pt-3">
           <label className="flex items-center gap-2 text-sm">
             <input
               type="checkbox"
@@ -288,23 +285,21 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
           {notifyEnabled && (
             <>
               <Field label="Severity">
-                <select
+                <Select
                   value={notifySeverity}
-                  onChange={(e) => setNotifySeverity(e.target.value)}
-                  className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
+                  onChange={(e) => setNotifySeverity(NOTIFY_SEVERITIES.find((s) => s === e.target.value) ?? 'info')}
                 >
-                  <option value="info">info</option>
-                  <option value="success">success</option>
-                  <option value="warning">warning</option>
-                  <option value="danger">danger (alarm)</option>
-                </select>
+                  <option value="info">Info</option>
+                  <option value="success">Success</option>
+                  <option value="warning">Warning</option>
+                  <option value="danger">Danger, with an alarm</option>
+                </Select>
               </Field>
-              <Field label="Notification title" hint="Use {{placeholder}} to substitute webhook payload values">
-                <input
+              <Field label="Notification title" hint="Use {{placeholder}} to fill in values from the webhook body">
+                <Input
                   value={notifyTitle}
                   onChange={(e) => setNotifyTitle(e.target.value)}
                   placeholder="e.g. PR merged: {{title}}"
-                  className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
                 />
               </Field>
               <Field label="Notification body">
@@ -313,36 +308,28 @@ export function CreateTriggerModal({ agent, onClose, canCreateAgentScope }: { ag
                   onChange={(e) => setNotifyBody(e.target.value)}
                   rows={2}
                   placeholder="e.g. {{author}} merged #{{number}}"
-                  className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
+                  className={`${FIELD} ${FIELD_BORDER} ${FIELD_REGULAR}`}
                 />
               </Field>
             </>
           )}
         </div>
-        <Field label="Debounce (seconds)" hint="Minimum seconds between consecutive fires (0 = no debounce)">
-          <input
+        <Field label="Debounce in seconds" info="The fewest seconds between two fires." hint="0 turns it off.">
+          <Input
             type="number"
             min={0}
             value={debounce}
             onChange={(e) => setDebounce(parseInt(e.target.value) || 0)}
-            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
           />
         </Field>
+        <FormError text={formError} />
         <div className="flex justify-end gap-2 pt-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-3 py-1.5 rounded-lg border border-p-border-light text-sm"
-          >
+          <Button type="button" onClick={onClose}>
             Cancel
-          </button>
-          <button
-            type="submit"
-            disabled={createM.isPending}
-            className="px-3 py-1.5 rounded-lg bg-brand text-white text-sm font-medium hover:bg-brand-hover disabled:opacity-50"
-          >
+          </Button>
+          <Button variant="primary" type="submit" disabled={createM.isPending}>
             {createM.isPending ? 'Creating…' : 'Create'}
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -373,9 +360,11 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
     [subsQuery.data, trigger.scope, trigger.agent, user?.sub],
   )
   const editM = useEditTrigger()
+  const [formError, setFormError] = useState('')
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    setFormError('')
     try {
       await editM.mutateAsync({
         id: trigger.id,
@@ -390,43 +379,42 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
         },
       })
       onClose()
-    } catch (e: any) {
-      alert(`Edit failed: ${e?.message ?? e}`)
+    } catch (e) {
+      setFormError(errorText(e) || 'The trigger was not saved.')
     }
   }
 
   return (
-    <Modal onClose={onClose} title="Edit trigger">
+    <Modal onClose={onClose} title="Edit trigger" busy={editM.isPending}>
       <form onSubmit={onSubmit} className="space-y-3">
         <Field label="Name">
-          <input
+          <Input
             value={name}
             onChange={(e) => setName(e.target.value)}
-            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
           />
         </Field>
         <Field
           label="Vendor subscription"
-          hint={trigger.scope === 'agent'
-            ? "The agent's subscription this trigger fires from (Agent Settings → MCPs → the MCP → Subscribe to events for this agent). None = only the generic webhook URL fires it."
-            : 'The personal subscription this trigger fires from (User Settings → Integrations → Connected Accounts → Subscribe to events). None = only the generic webhook URL fires it.'}
+          info={trigger.scope === 'agent'
+            ? "The agent's subscription this trigger fires from. Add one in the agent's MCPs. On the MCP, click Subscribe to events for this agent."
+            : 'The personal subscription this trigger fires from. Add one in User Settings, Integrations, Connected Accounts. Expand the account and click Subscribe to events.'}
+          hint="None means only the generic webhook URL fires it."
         >
-          <select
+          <Select
             value={subscriptionId}
             onChange={(e) => setSubscriptionId(e.target.value)}
-            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
             data-testid="edit-trigger-subscription"
           >
-            <option value="">— None —</option>
+            <option value="">None</option>
             {linkableSubs.map((s) => (
               <option key={s.id} value={s.id}>
                 {s.provider_id}/{s.vendor_target} · {s.selected_events.join(', ') || '—'}
               </option>
             ))}
             {subscriptionId && !linkableSubs.some((s) => s.id === subscriptionId) && (
-              <option value={subscriptionId}>{subscriptionId} (current)</option>
+              <option value={subscriptionId}>{subscriptionId}, current</option>
             )}
-          </select>
+          </Select>
         </Field>
         <label className="flex items-center gap-2 text-sm">
           <input
@@ -439,23 +427,21 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
         {notifyEnabled && (
           <>
             <Field label="Severity">
-              <select
+              <Select
                 value={notifySeverity}
                 onChange={(e) => setNotifySeverity(e.target.value)}
-                className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
               >
-                <option value="info">info</option>
-                <option value="success">success</option>
-                <option value="warning">warning</option>
-                <option value="danger">danger (alarm)</option>
-              </select>
+                <option value="info">Info</option>
+                <option value="success">Success</option>
+                <option value="warning">Warning</option>
+                <option value="danger">Danger, with an alarm</option>
+              </Select>
             </Field>
-            <Field label="Notification title" hint="Use {{placeholder}} to substitute webhook payload values">
-              <input
+            <Field label="Notification title" hint="Use {{placeholder}} to fill in values from the webhook body">
+              <Input
                 value={notifyTitle}
                 onChange={(e) => setNotifyTitle(e.target.value)}
                 placeholder="e.g. PR merged: {{title}}"
-                className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
               />
             </Field>
             <Field label="Notification body">
@@ -464,31 +450,27 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
                 onChange={(e) => setNotifyBody(e.target.value)}
                 rows={2}
                 placeholder="e.g. {{author}} merged #{{number}}"
-                className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
+                className={`${FIELD} ${FIELD_BORDER} ${FIELD_REGULAR}`}
               />
             </Field>
           </>
         )}
-        <Field label="Debounce (seconds)">
-          <input
+        <Field label="Debounce in seconds">
+          <Input
             type="number"
             min={0}
             value={debounce}
             onChange={(e) => setDebounce(parseInt(e.target.value) || 0)}
-            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm"
           />
         </Field>
+        <FormError text={formError} />
         <div className="flex justify-end gap-2 pt-2">
-          <button type="button" onClick={onClose} className="px-3 py-1.5 rounded-lg border border-p-border-light text-sm">
+          <Button type="button" onClick={onClose}>
             Cancel
-          </button>
-          <button
-            type="submit"
-            disabled={editM.isPending}
-            className="px-3 py-1.5 rounded-lg bg-brand text-white text-sm font-medium hover:bg-brand-hover disabled:opacity-50"
-          >
+          </Button>
+          <Button variant="primary" type="submit" disabled={editM.isPending}>
             {editM.isPending ? 'Saving…' : 'Save'}
-          </button>
+          </Button>
         </div>
       </form>
     </Modal>
@@ -498,52 +480,52 @@ export function EditTriggerModal({ trigger, onClose }: { trigger: Trigger; onClo
 
 export function FireTestModal({ trigger, onClose }: { trigger: Trigger; onClose: () => void }) {
   const [bodyJson, setBodyJson] = useState('{\n  "name": "test"\n}')
-  const [result, setResult] = useState<any>(null)
+  const [result, setResult] = useState<unknown>(null)
+  const [jsonError, setJsonError] = useState('')
   const fireM = useFireTrigger()
 
   const onFire = async () => {
-    let body: Record<string, unknown> = {}
+    let body: Record<string, unknown>
     try {
       body = bodyJson.trim() ? JSON.parse(bodyJson) : {}
     } catch {
-      alert('Invalid JSON')
+      setJsonError('The sample body is not valid JSON.')
       return
     }
+    setJsonError('')
     try {
       const r = await fireM.mutateAsync({ id: trigger.id, body })
       setResult(r)
-    } catch (e: any) {
-      setResult({ error: e?.message ?? String(e) })
+    } catch (e) {
+      setResult({ error: errorText(e) || String(e) })
     }
   }
 
   return (
-    <Modal onClose={onClose} title={`Test fire: ${trigger.name}`}>
+    <Modal onClose={onClose} title={`Test fire: ${trigger.name}`} busy={fireM.isPending}>
       <div className="space-y-3">
-        <Field label="Sample webhook body (JSON)" hint="Used for {{placeholder}} substitution">
+        <Field label="Sample webhook body in JSON" info="Used for {{placeholder}} substitution">
           <textarea
             value={bodyJson}
-            onChange={(e) => setBodyJson(e.target.value)}
+            onChange={(e) => { setBodyJson(e.target.value); setJsonError('') }}
             rows={5}
-            className="w-full px-3 py-1.5 rounded-lg border border-p-border-light bg-white dark:bg-p-surface text-sm font-mono"
+            aria-invalid={!!jsonError || undefined}
+            className={`${FIELD} ${FIELD_BORDER} ${FIELD_REGULAR} font-mono`}
           />
         </Field>
-        {result && (
-          <pre className="text-xs bg-p-bg rounded-sm p-2 overflow-auto max-h-60">
+        <FormError text={jsonError} />
+        {result ? (
+          <pre className="text-xs bg-surface-sunken rounded-sm p-2 overflow-auto max-h-60">
             {JSON.stringify(result, null, 2)}
           </pre>
-        )}
+        ) : null}
         <div className="flex justify-end gap-2">
-          <button onClick={onClose} className="px-3 py-1.5 rounded-lg border border-p-border-light text-sm">
+          <Button onClick={onClose}>
             Close
-          </button>
-          <button
-            onClick={onFire}
-            disabled={fireM.isPending}
-            className="px-3 py-1.5 rounded-lg bg-brand text-white text-sm font-medium hover:bg-brand-hover disabled:opacity-50"
-          >
+          </Button>
+          <Button variant="primary" onClick={onFire} disabled={fireM.isPending}>
             {fireM.isPending ? 'Firing…' : 'Fire'}
-          </button>
+          </Button>
         </div>
       </div>
     </Modal>
@@ -555,32 +537,47 @@ export function FireTestModal({ trigger, onClose }: { trigger: Trigger; onClose:
 // Reusable bits
 // =====================================================================
 
-export function Modal({ onClose, title, children }: { onClose: () => void; title: string; children: React.ReactNode }) {
+/** The trigger and key dialogs' shell: a title with Close, the body padded.
+ *  `dismissible="escape"` for a one-time secret a stray click must not lose. */
+export function Modal({ onClose, title, busy = false, dismissible = 'any', children }: {
+  onClose: () => void
+  title: string
+  busy?: boolean
+  dismissible?: DialogDismiss
+  children: React.ReactNode
+}) {
   return (
-    <div
-      className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
-      onClick={onClose}
+    <Dialog
+      onClose={onClose}
+      title={title}
+      busy={busy}
+      dismissible={dismissible}
+      panelClassName={`${DIALOG_PANEL} max-w-lg`}
     >
-      <div
-        className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light max-w-lg w-full max-h-[90vh] overflow-auto"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="px-4 py-3 border-b border-p-border-light flex items-center justify-between">
-          <h2 className="font-semibold text-p-text">{title}</h2>
-          <button onClick={onClose} className="text-p-text-secondary hover:text-p-text text-xl leading-none">&times;</button>
-        </div>
-        <div className="p-4">{children}</div>
-      </div>
-    </div>
+      <div className="p-4">{children}</div>
+    </Dialog>
   )
 }
 
-export function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+/** A form's refusal, read out when it appears. */
+export function FormError({ text }: { text: string }) {
+  if (!text) return null
+  return <p role="alert" className="text-xs text-status-danger-fg">{text}</p>
+}
+
+export function Field({ label, hint, info, children }: { label: string; hint?: string; info?: string; children: React.ReactNode }) {
   return (
     <div>
-      <label className="block text-xs font-medium text-p-text mb-1">{label}</label>
+      {info ? (
+        <div className="mb-1">
+          <label className="text-xs font-medium text-primary">{label}</label>
+          <InfoTip label={label}>{info}</InfoTip>
+        </div>
+      ) : (
+        <Label>{label}</Label>
+      )}
       {children}
-      {hint && <p className="text-xs text-p-text-secondary mt-1">{hint}</p>}
+      {hint && <p className="text-xs text-secondary mt-1">{hint}</p>}
     </div>
   )
 }

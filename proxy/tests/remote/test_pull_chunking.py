@@ -20,6 +20,28 @@ from core.remote.satellite_connection import SatelliteConnectionManager
 from services.path_policy_v2 import PathRef
 
 
+class _PinnedClock:
+    """The pull's stall clock, moved by the test alone: a worker slowed by
+    a loaded box never reads as a stalled connection."""
+
+    def __init__(self) -> None:
+        self.now = time.monotonic()
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+@pytest.fixture
+def pinned_clock(monkeypatch):
+    from core.remote import satellite_file_transfer
+    clock = _PinnedClock()
+    monkeypatch.setattr(satellite_file_transfer, "time", clock)
+    return clock
+
+
 def _partials(dest: Path) -> list[Path]:
     """The staging files a pull into ``dest`` left beside it."""
     return sorted(dest.parent.glob(f".{dest.name}.*.partial"))
@@ -92,6 +114,39 @@ async def test_multi_chunk_reassembles(tmp_path):
     assert dest.read_bytes() == data
     assert _partials(dest) == []
     assert rid not in mgr._pending_pulls
+
+
+@pytest.mark.asyncio
+async def test_the_progress_callback_hears_each_chunk_and_never_stops_the_pull(tmp_path):
+    """A move's ring follows a pull: the callback gets the bytes received
+    and the size the caller expects after each written chunk; one that
+    raises is dropped and the pull completes."""
+    mgr = SatelliteConnectionManager()
+    conn = _FakeConn()
+    mgr._connections["m1"] = conn
+    dest = tmp_path / "out.bin"
+    data = b"A" * 1000 + b"B" * 1000
+    seen: list[tuple[int, int]] = []
+
+    def progress(got, expected):
+        seen.append((got, expected))
+        raise RuntimeError("a broken listener")
+
+    task = asyncio.create_task(mgr.pull_file_to_path(
+        "m1", PathRef("agent_tree", "workspace/x.bin"), dest, agent_slug="agent-1",
+        stall_s=2.0, max_bytes=len(data), progress_cb=progress))
+    for _ in range(400):
+        if any(m.get("type") == "file_pull" for m in conn.sent):
+            break
+        await asyncio.sleep(0.005)
+    rid = conn.sent[-1]["request_id"]
+    st = mgr._pending_pulls[rid]
+    mgr._on_pull_chunk(st, _chunk(rid, 0, 2, data[:1000]))
+    mgr._on_pull_chunk(st, _chunk(rid, 1, 2, data[1000:],
+                                  last_hash=f"sha256:{hashlib.sha256(data).hexdigest()}"))
+    assert await asyncio.wait_for(task, timeout=5.0) is True
+    assert seen == [(1000, 2000), (2000, 2000)]
+    assert dest.read_bytes() == data
 
 
 @pytest.mark.asyncio
@@ -295,7 +350,7 @@ async def test_a_pull_waiting_behind_another_pull_is_not_stalled(tmp_path):
     second = asyncio.create_task(mgr.pull_file_to_path(
         "m1", PathRef("agent_tree", "workspace/y.bin"), tmp_path / "b.bin",
         agent_slug="agent-1", stall_s=0.5))
-    while len(conn.sent) < 2:
+    while len(conn.sent) < 2:  # noqa: ASYNC110  # a fake connection's sent list: the fake has no event
         await asyncio.sleep(0.005)
     rid2 = conn.sent[1]["request_id"]
     h = hashlib.sha256()
@@ -421,7 +476,7 @@ async def test_nothing_planted_beside_the_destination_is_written_into(tmp_path, 
     other = ws / "other.txt"
     other.write_bytes(b"theirs")
     dest = ws / "x.bin"
-    Path(str(dest) + ".partial").symlink_to(target)
+    Path(str(dest) + ".partial").symlink_to(target)  # noqa: ASYNC240  # a test's own temporary files
     os.link(other, ws / ".x.bin.partial")
     mgr = SatelliteConnectionManager()
     conn = _FakeConn()
@@ -548,6 +603,41 @@ async def test_commit_runs_off_the_loop_after_the_stream_is_popped(tmp_path, mon
     assert _partials(dest) == []
 
 
+@pytest.mark.asyncio
+async def test_a_caller_cancelled_during_the_commit_waits_for_the_job(tmp_path, monkeypatch):
+    """The commit job runs on after a cancel: the caller marks the stream
+    abandoned and waits for the job before the cancel propagates, so its
+    own cleanup (a template read removing its temp folder) never races a
+    rename into it; the job finds the mark and removes the staged bytes."""
+    import threading
+    mgr = SatelliteConnectionManager()
+    conn = _FakeConn()
+    mgr._connections["m1"] = conn
+    dest = tmp_path / "d" / "out.bin"
+    task, rid, st = await _start_pull(mgr, conn, dest)
+    release = threading.Event()
+    ran: list[bool] = []
+    real_commit = SatelliteConnectionManager._commit_pull_sync
+
+    def slow_commit(self, stream):
+        release.wait(5)
+        ok = real_commit(self, stream)
+        ran.append(ok)
+        return ok
+    monkeypatch.setattr(SatelliteConnectionManager, "_commit_pull_sync", slow_commit)
+    data = b"Q" * 100
+    mgr._on_pull_chunk(st, _chunk(rid, 0, 1, data, last_hash=f"sha256:{hashlib.sha256(data).hexdigest()}"))
+    await asyncio.sleep(0.05)       # the job is parked on the executor
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done() and st.abandoned      # waiting for the job, not gone
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5.0)
+    assert ran == [False]
+    assert not dest.exists() and _partials(dest) == []
+
+
 # ---------------------------------------------------------------------------
 # A pull the proxy gives up on is cancelled on a 0.5.137 satellite
 # ---------------------------------------------------------------------------
@@ -627,7 +717,7 @@ async def test_a_pull_whose_connection_was_replaced_sends_no_cancel(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_pull_has_no_ceiling_before_its_first_chunk(tmp_path):
+async def test_a_pull_has_no_ceiling_before_its_first_chunk(tmp_path, pinned_clock):
     """A pull an older satellite queues behind another one for more than
     ten minutes waits on the connection's progress alone."""
     mgr = SatelliteConnectionManager()
@@ -635,9 +725,8 @@ async def test_a_pull_has_no_ceiling_before_its_first_chunk(tmp_path):
     mgr._connections["m1"] = conn
     task, rid, st = await _start_pull(mgr, conn, tmp_path / "out.bin", stall_s=0.5)
     st.started -= 700                    # queued for 11+ minutes
-    for _ in range(4):
-        conn.last_transfer_at = time.monotonic()   # the connection moves
-        await asyncio.sleep(0.1)
+    conn.last_transfer_at = pinned_clock.now      # the connection moves
+    await asyncio.sleep(0.4)
     assert not task.done()
     h = hashlib.sha256(b"z")
     mgr._on_pull_chunk(st, _chunk(rid, 0, 1, b"z", last_hash=f"sha256:{h.hexdigest()}"))
@@ -645,7 +734,7 @@ async def test_a_pull_has_no_ceiling_before_its_first_chunk(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_pull_a_paced_satellite_never_starts_fails_at_its_floor(tmp_path):
+async def test_a_pull_a_paced_satellite_never_starts_fails_at_its_floor(tmp_path, pinned_clock):
     """A 0.5.137 satellite interleaves its pulls, so one that sends no
     chunk for ten minutes while the connection moves has failed."""
     mgr = SatelliteConnectionManager()
@@ -653,8 +742,8 @@ async def test_a_pull_a_paced_satellite_never_starts_fails_at_its_floor(tmp_path
     mgr._connections["m1"] = conn
     task, rid, st = await _start_pull(mgr, conn, tmp_path / "out.bin", stall_s=0.5)
     st.started -= 700
-    for _ in range(8):                    # the connection keeps moving
-        conn.last_transfer_at = time.monotonic()
+    conn.last_transfer_at = pinned_clock.now      # the connection keeps moving
+    for _ in range(8):
         await asyncio.sleep(0.2)
         if task.done():
             break
@@ -667,7 +756,7 @@ async def test_a_caller_that_leaves_during_the_commit_leaves_no_partial(tmp_path
     """The commit job runs whatever the caller does: cancelled while the
     job waits for a pool worker, the pull cleans up instead of renaming
     (the caller's path lock went with it), leaving no partial and no root
-    descriptor."""
+    descriptor, and the caller's cancel propagates once the job is done."""
     from core import file_commit
     gate = asyncio.Event()
     real_run = file_commit.run
@@ -685,13 +774,11 @@ async def test_a_caller_that_leaves_during_the_commit_leaves_no_partial(tmp_path
     mgr._on_pull_chunk(st, _chunk(rid, 0, 1, b"z", last_hash=f"sha256:{h.hexdigest()}"))
     await asyncio.sleep(0.05)              # the caller waits on the held commit
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    await asyncio.sleep(0.05)
+    assert not task.done() and st.abandoned   # waiting for the job, not gone
     gate.set()
-    for _ in range(100):
-        if st.rootfd == -1:
-            break
-        await asyncio.sleep(0.01)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5.0)
     assert st.rootfd == -1 and st.abandoned
     assert not dest.exists()
     assert _partials(dest) == []

@@ -431,7 +431,7 @@ def _process_inbound_line(
         return b"", _synthesize_error_response(msg, summary)
 
     denials: list[str] = []
-    for (parent, key, _decl), resolution in zip(triples, resolutions):
+    for (parent, key, _decl), resolution in zip(triples, resolutions, strict=True):
         if not resolution.get("allowed", False):
             denials.append(
                 f"{parent[key]!r}: {resolution.get('error', 'rejected')}"
@@ -469,7 +469,7 @@ def _pump_inbound(
             to_mcp, to_cli_err = _process_inbound_line(
                 line, declarations, session_id,
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001  # the MCP pipe must keep flowing: a bad line passes through unchanged
             _log(f"inbound exception, passing through: {e}")
             to_mcp, to_cli_err = line, b""
         if to_cli_err:
@@ -553,7 +553,7 @@ def main() -> int:
 
     _log(f"spawning {wrapped!r} (decls={len(declarations)})")
     try:
-        proc = subprocess.Popen(  # noqa: S603 — wrapping a trusted MCP cmd
+        proc = subprocess.Popen(
             wrapped,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

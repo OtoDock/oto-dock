@@ -38,10 +38,16 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
 
 from core.background import spawn
+from core.session import interactive_session
 from storage import database as task_store
 from ws import wire_events as wire
+
+if TYPE_CHECKING:
+    from core.events.stream_pump import ChatStreamPump
+    from core.execution_layer import ExecutionLayer
 
 logger = logging.getLogger("otodock")
 
@@ -61,16 +67,16 @@ class _AttachState:
     session_id: str = ""
     agent: str = ""
     execution_path: str = ""
-    layer: object = None
+    layer: ExecutionLayer | None = None
     context_injected: bool = False
     interrupted_last_turn: bool = False
     # The pump WE created for the current duplex turn (never a foreign one).
-    pump: object = None
+    pump: ChatStreamPump | None = None
     # A FOREIGN live pump the current duplex turn was queued onto (the
     # typed-turn-streaming branch). Recorded so abort_turn can route a
     # barge-in to it — but only while it is still the chat's live pump
     # (identity re-checked at abort time; a newer pump is never killed).
-    abort_target: object = None
+    abort_target: ChatStreamPump | None = None
     forward_task: asyncio.Task | None = None
     # Interactive (PTY) chats: no pump to tap — replies feed from the rows
     # the transcript tailer persists (see on_interactive_batch).
@@ -132,7 +138,7 @@ async def _engine_send(bridge, payload: dict) -> None:
         await ws.send_json(payload)
 
 
-async def _resolve(bridge) -> "_AttachState | str":
+async def _resolve(bridge) -> _AttachState | str:
     """Resolve the bridge's chat to (session, layer). Returns the state or a
     refusal reason. Resolution is row/registry-only — LIVENESS is the
     new-turn chokepoint's job (``_ensure_live_session``), which also heals a
@@ -155,7 +161,8 @@ async def _resolve(bridge) -> "_AttachState | str":
         # role at the first utterance, ahead of both the pump and the PTY path.
         from auth.providers import acting_role_of
         from core.sandbox.session_config_dir import (
-            AgentStateRefused, refuse_agent_state_below_editor,
+            AgentStateRefused,
+            refuse_agent_state_below_editor,
         )
         from core.session.visibility import is_shared_only
         from storage.pg import run_db
@@ -189,9 +196,9 @@ async def _resolve(bridge) -> "_AttachState | str":
         _interactive_feeds[bridge.chat_id] = bridge
         return st
 
+    from auth.providers import acting_role_of
     from core.session.session_manager import get_execution_layer
     from storage.pg import run_db
-    from auth.providers import acting_role_of
     role = await run_db(acting_role_of, bridge.sub, chat.get("agent") or "")
     try:
         layer = get_execution_layer(
@@ -252,7 +259,7 @@ async def _focus_for(bridge) -> str:
     from services.apps.focus_context import focus_line
     try:
         return await asyncio.to_thread(focus_line, bridge.sub or "")
-    except Exception:
+    except Exception:  # noqa: BLE001  # the focus line is optional, a failure must never hold the utterance
         logger.debug("focus line unavailable for duplex %s", bridge.duplex_id, exc_info=True)
         return ""
 
@@ -265,6 +272,14 @@ async def run_utterance(bridge, frame: dict, *, waited: bool = False) -> None:
     barge_in_chars = int(raw_chars) if raw_chars else None
     if not text:
         await _engine_send(bridge, {"type": wire.DONE, "turn": turn, "data": {}})
+        return
+
+    # The placement lock: a chat whose live session sits on another person's
+    # computer is read-only for this speaker, as it is for their typing.
+    from services.remote import chat_move
+    _chat = await asyncio.to_thread(task_store.get_chat, bridge.chat_id)
+    if _chat and (lock := await asyncio.to_thread(chat_move.lock_sentence, _chat, bridge.sub or "")):
+        await _engine_send(bridge, {"type": wire.ERROR, "turn": turn, "data": {"message": lock}})
         return
 
     st = await _resolve(bridge)
@@ -325,7 +340,7 @@ async def run_utterance(bridge, frame: dict, *, waited: bool = False) -> None:
     if claim is None:
         if not waited:
             deadline = asyncio.get_running_loop().time() + _CLAIM_WAIT_S
-            while q.claimed and asyncio.get_running_loop().time() < deadline:
+            while q.claimed and asyncio.get_running_loop().time() < deadline:  # noqa: ASYNC110  # the claim has no event: the queue's own claim wait polls it too
                 await asyncio.sleep(0.1)
             await run_utterance(bridge, frame, waited=True)
             return
@@ -344,9 +359,9 @@ async def run_utterance(bridge, frame: dict, *, waited: bool = False) -> None:
         try:
             await _ensure_live_session(bridge, st)
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "duplex %s: dead-session heal failed: %s",
-                bridge.duplex_id[:8], e, exc_info=True,
+                bridge.duplex_id[:8], e,
             )
             st.active_turn = None
             await _engine_send(bridge, {
@@ -374,14 +389,15 @@ async def _ensure_live_session(bridge, st: _AttachState) -> None:
     wrong "alive" just means this turn errors like today; a wrong "dead"
     would respawn under a recoverable blip. A satellite inside its reconnect
     grace window is "reconnecting", never healed."""
-    layer, sid = st.layer, st.session_id
+    # The first utterance's attach set the layer.
+    layer, sid = cast("ExecutionLayer", st.layer), st.session_id
     try:
         grace_held = getattr(layer, "is_session_grace_held", None)
         if grace_held is not None and grace_held(sid):
             return
         dead = (await layer.is_session_process_dead(sid)
                 or not await layer.is_session_alive(sid))
-    except Exception:
+    except Exception:  # noqa: BLE001  # a failed liveness probe dispatches the utterance anyway
         logger.debug(
             "duplex %s: liveness probe failed for %s — dispatching anyway",
             bridge.duplex_id[:8], sid[:8], exc_info=True,
@@ -407,7 +423,7 @@ async def _ensure_live_session(bridge, st: _AttachState) -> None:
             if (not await layer.is_session_process_dead(sid)
                     and await layer.is_session_alive(sid)):
                 return
-        except Exception:
+        except Exception:  # noqa: BLE001  # a failed liveness probe leaves the session to the turn
             return
     from ws.headless_resume import resume_dead_session_headless
     logger.info(
@@ -529,7 +545,12 @@ async def _run_new_turn(
     barge_in_chars: int | None,
 ) -> None:
     from core.events.common_events import (
-        ARTIFACT_TURN, ERROR, PRODUCER_DONE, QUEUE_TURN, CommonEvent, TurnInput,
+        ARTIFACT_TURN,
+        ERROR,
+        PRODUCER_DONE,
+        QUEUE_TURN,
+        CommonEvent,
+        TurnInput,
     )
     from core.events.stream_pump import ChatStreamPump, _active_pumps
     from core.session import visibility as _vis
@@ -540,7 +561,7 @@ async def _run_new_turn(
     # claim the chat's pending DB-history digest into this prompt. Same
     # chokepoint rule as the dashboard turn path; an engine that rebuilds
     # full history from the DB on its own is never seeded.
-    if not st.layer.capabilities_for(st.session_id).behaviour.rebuilds_history_from_db:
+    if not cast("ExecutionLayer", st.layer).capabilities_for(st.session_id).behaviour.rebuilds_history_from_db:
         from core.session.history_seed import consume_pending_seed
         prompt, _seed_notice = await asyncio.to_thread(
             consume_pending_seed, bridge.chat_id, prompt,
@@ -552,7 +573,8 @@ async def _run_new_turn(
         author_sub=bridge.sub,
     )
 
-    layer, sid = st.layer, st.session_id
+    # The first utterance's attach set the layer.
+    layer, sid = cast("ExecutionLayer", st.layer), st.session_id
     event_queue: asyncio.Queue = asyncio.Queue()
     msg_queue: list = []
     sys_queue: list = []
@@ -624,7 +646,7 @@ async def _run_new_turn(
                 # message queued after it waits for the pump's end, an utterance
                 # is refused.
                 pump.close_queue()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the producer turns any failure into an error event for the pump
             await event_queue.put(CommonEvent(type=ERROR, data={"message": str(e)}))
         finally:
             await event_queue.put(CommonEvent(type=PRODUCER_DONE, data={}))
@@ -739,7 +761,8 @@ async def _abort(bridge, st: _AttachState, pump=None) -> None:
     are NOT cleared — a barge-in interrupts the reply, not the queue.
     ``pump`` overrides the hard-abort target (the foreign-pump case);
     default is our own st.pump."""
-    layer, sid = st.layer, st.session_id
+    # The first utterance's attach set the layer.
+    layer, sid = cast("ExecutionLayer", st.layer), st.session_id
     graceful = False
     with contextlib.suppress(Exception):
         graceful = bool(await layer.abort(sid))
@@ -789,3 +812,13 @@ async def abort_turn(bridge, frame: dict) -> None:
             )
         return
     await _abort(bridge, st)
+
+
+def _feed_listener(chat_id: str, **kw) -> None:
+    on_interactive_batch(chat_id, **kw)
+
+
+# The interactive tailer reports every batch here; a call-time lookup, so a
+# patch of ``on_interactive_batch`` reaches the listener.
+interactive_session.add_batch_listener(_feed_listener)
+

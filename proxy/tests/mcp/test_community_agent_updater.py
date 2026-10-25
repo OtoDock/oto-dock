@@ -20,7 +20,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
-from tests.mcp.test_community_agent_installer import ADMIN_SUB, _make_user, _write_template
+from tests.mcp.test_community_agent_installer import (
+    ADMIN_SUB,
+    _make_user,
+    _write_template,
+)
 
 MEMBER_SUB = "user-viewer"
 AGENT = "up-agent"
@@ -46,8 +50,8 @@ def _clean():
     app_supervisor._instances.clear()
     upd._agent_locks.clear()
     upd._jobs.clear()
-    from api.apps import apps as apps_api
-    apps_api._deploy_locks.clear()
+    from services.apps import releases
+    releases._deploy_locks.clear()
 
 
 def _patches():
@@ -62,8 +66,8 @@ def _patches():
 def _template(root: Path, version: str, *, persona="# P v1", notes="notes v1", extra=None,
               setup="setup v1", user_setup="user setup v1", daily_prompt="p1", weekly=False,
               monthly_body="b1", home_html="<p>v1</p>", lint_rubric="Is it tidy?", style=False,
-              home_doc=None):
-    tasks = [dict(DAILY, prompt=daily_prompt)]
+              home_doc=None, daily_extra=None):
+    tasks = [dict(DAILY, prompt=daily_prompt, **(daily_extra or {}))]
     if weekly:
         tasks.append({"slug": "weekly", "description": "Weekly", "scope": "agent", "prompt": "w",
                       "schedule": {"type": "cron", "cron": "0 8 * * 1"}, "default_state": "paused"})
@@ -84,13 +88,18 @@ def _template(root: Path, version: str, *, persona="# P v1", notes="notes v1", e
 
 
 def _install_v1(tmp_path, **kw) -> None:
-    from storage.agents.community_agent_template_store import load_template_from_dir
-    from services.community.community_agent_installer import install_from_extracted_template
+    from services.community.community_agent_installer import (
+        install_from_extracted_template,
+    )
+    from services.community.community_agent_template_store import load_template_from_dir
     _make_user(ADMIN_SUB, "admin@test.com", "admin")
     _make_user(MEMBER_SUB, "viewer@test.com", "member")
     template = load_template_from_dir(_template(tmp_path / "v1", "1.0.0", **kw))
     p = _patches()
-    with p[0], p[1], p[2], p[3]:
+    # The engine the new agent gets: a template task's pins are judged against it.
+    engine = patch("services.engines.subscription_pool.default_execution_layer_for_creator",
+                   return_value="claude-code-cli")
+    with p[0], p[1], p[2], p[3], engine:
         out = asyncio.run(install_from_extracted_template(
             template=template, target_slug=AGENT, installer_user_sub=ADMIN_SUB, installer_role="admin",
             source_label="uptpl", app_consent={a.slug: a.sig for a in template.apps},
@@ -103,7 +112,7 @@ def _install_v1(tmp_path, **kw) -> None:
 
 
 def _v2(tmp_path, sub="v2", **kw):
-    from storage.agents.community_agent_template_store import load_template_from_dir
+    from services.community.community_agent_template_store import load_template_from_dir
     defaults = dict(persona="# P v2", notes="notes v2", extra="extra v2", setup="setup v2",
                     user_setup="user setup v2", daily_prompt="p2", weekly=True, monthly_body="b2",
                     home_html="<p>v2</p>", lint_rubric="Is it tidy now?", style=True)
@@ -127,9 +136,9 @@ def _agent_dir() -> Path:
 
 
 def test_an_untouched_install_takes_every_piece_and_gains_the_new_ones(tmp_path, temp_db):
+    from services.checks import documents
     from storage import database as db
     from storage.agents import agent_store
-    from services.checks import documents
     _install_v1(tmp_path)
     report = _apply(_v2(tmp_path))
     replaced = report["replaced"]
@@ -176,9 +185,9 @@ def test_an_untouched_install_takes_every_piece_and_gains_the_new_ones(tmp_path,
 
 
 def test_edited_pieces_are_kept_with_the_new_version_beside_and_taken_on_request(tmp_path, temp_db):
-    from storage import database as db
     from services.checks import documents
     from services.community import community_agent_updater as upd
+    from storage import database as db
     _install_v1(tmp_path)
     d = _agent_dir()
     (d / "config" / "agent.md").write_text("# mine")
@@ -246,8 +255,8 @@ def test_unconsented_apps_wait_only_when_their_manifest_changed_and_checks_stay_
     approved goes live under that approval (the tree is content, as on
     any deploy); one whose manifest changed parks on the card with the
     old release still live."""
-    from storage import database as db
     from services.checks import documents
+    from storage import database as db
     _install_v1(tmp_path)
     admin = db.get_username_by_sub(ADMIN_SUB)
     report = _apply(_v2(tmp_path), consent=False)
@@ -398,8 +407,8 @@ def test_a_second_press_during_the_download_is_refused(tmp_path, temp_db):
 
 
 def test_apply_refuses_a_moved_version_a_running_update_and_a_local_template(tmp_path, temp_db):
-    from storage.agents import agent_store
     from services.community import community_agent_updater as upd
+    from storage.agents import agent_store
     _install_v1(tmp_path)
     template = _v2(tmp_path)
 
@@ -439,6 +448,55 @@ def test_apply_refuses_a_moved_version_a_running_update_and_a_local_template(tmp
     asyncio.run(go())
 
 
+def test_a_catalog_that_cannot_be_read_names_the_host(caplog):
+    """The plan's 502 says which host this server must reach; the
+    network error itself goes to the log."""
+    import httpx
+
+    from services.community import community_agent_updater as upd
+    boom = AsyncMock(side_effect=httpx.ConnectError("[Errno 111] Connection refused"))
+    with patch("services.community.community_agents_catalog.fetch_registry", new=boom), \
+            caplog.at_level("WARNING", logger="otodock.community-agent-updater"), \
+            pytest.raises(HTTPException) as e:
+        asyncio.run(upd._fetch_new({"slug": "a", "community_template": "uptpl",
+                                     "community_template_version": "1.0.0"}))
+    assert e.value.status_code == 502
+    assert e.value.detail == ("Could not load the community agents. "
+                              "Check that this server can reach raw.githubusercontent.com.")
+    assert "Connection refused" in caplog.text
+
+
+def test_an_invalid_catalog_version_lists_its_problems(tmp_path, temp_db):
+    """The update's fetch refuses a catalog version that does not load with
+    the shape the dashboard's dialog lists (``message`` and ``problems``),
+    and drops what it extracted."""
+    from services.community import community_agent_updater as upd
+    from services.community.community_agent_template_store import (
+        TemplateValidationError,
+        load_template_from_dir,
+    )
+    tdir = tmp_path / "fetched" / "uptpl"
+    tdir.mkdir(parents=True)
+    with pytest.raises(TemplateValidationError) as loaded:
+        load_template_from_dir(tdir)
+
+    async def go():
+        with patch("services.community.community_agents_catalog.fetch_registry",
+                   new=AsyncMock(return_value={"agents": [{"slug": "uptpl", "version": "2.0.0"}]})), \
+                patch("services.community.community_agents_catalog.fetch_and_extract_template",
+                      new=AsyncMock(return_value=tdir)):
+            with pytest.raises(HTTPException) as e:
+                await upd._fetch_new({"community_template": "uptpl", "community_template_version": "1.0.0"})
+        return e.value
+
+    exc = asyncio.run(go())
+    assert exc.status_code == 400
+    assert exc.detail["error"] == "invalid_template"
+    assert exc.detail["message"] == f"Invalid catalog template: {loaded.value}"
+    assert exc.detail["problems"] == loaded.value.problems and exc.detail["problems"]
+    assert not tdir.parent.exists()
+
+
 def test_detect_and_the_listing_carry_the_installed_versions(tmp_path, temp_db):
     from services.community import community_agent_updater as upd
     assert upd.detect({"community_template": "x", "community_template_version": "1.0.0"},
@@ -450,6 +508,7 @@ def test_detect_and_the_listing_carry_the_installed_versions(tmp_path, temp_db):
     assert upd.detect({"community_template": "x", "community_template_version": "1.0.0"}, None)["update_available"] is False
     _install_v1(tmp_path)
     from fastapi.testclient import TestClient
+
     from app import app
     from auth.providers import UserContext, get_current_user
     app.dependency_overrides[get_current_user] = lambda: UserContext(
@@ -485,6 +544,7 @@ def test_the_first_sweep_after_a_reboot_runs_at_once(tmp_path, temp_db):
     # The sweep's clock is time.monotonic(), which counts from boot: a host
     # up five minutes must not wait a day for its first sweep.
     from types import SimpleNamespace
+
     from services.community import community_agent_updater as upd
     _install_v1(tmp_path)
     with patch("services.community.community_agents_catalog.fetch_registry",
@@ -503,9 +563,9 @@ def test_pieces_the_manager_removed_stay_removed(tmp_path, temp_db):
     version had and the manager deleted is not brought back by an update:
     it is reported as removed locally, and the new version's additions
     still land."""
-    from storage.automation import db_tasks, notification_store
     from services.checks import documents
     from services.community import community_agent_updater as upd
+    from storage.automation import db_tasks, notification_store
     _install_v1(tmp_path)
     d = _agent_dir()
     (d / "config" / "context" / "notes.md").unlink()
@@ -540,11 +600,13 @@ def test_an_mcp_the_manager_disabled_is_not_re_enabled(tmp_path, temp_db):
     """The installed version required an MCP; the manager disabled it; the
     update leaves it disabled and says so. An MCP the new version adds
     cascades like an install."""
-    from storage.agents.community_agent_template_store import load_template_from_dir
     from services.community import community_agent_updater as upd
+    from services.community.community_agent_template_store import load_template_from_dir
     from storage.mcp import mcp_store
     _make_user(ADMIN_SUB, "admin@test.com", "admin")
-    from services.community.community_agent_installer import install_from_extracted_template
+    from services.community.community_agent_installer import (
+        install_from_extracted_template,
+    )
     v1 = _write_template(tmp_path / "m1", slug="mtpl", mcps=[{"name": "alpha-mcp"}],
                          agent_json_extra={"version": "1.0.0"})
     template = load_template_from_dir(v1)
@@ -616,12 +678,18 @@ def test_the_app_copies_are_hashed_and_seeded_without_following_a_link(tmp_path,
     # refused, never read through (even one naming the same bytes), and a
     # seed destination re-created as a link is never written through.
     import shutil
+
     from services.apps import releases
-    from services.community import community_agent_updater as upd
-    from services.community import template_app_seeder as seeder
+    from services.community import (
+        community_agent_updater as upd,
+        template_app_seeder as seeder,
+    )
+    from services.community.community_agent_template_store import (
+        load_template_from_dict,
+        load_template_from_dir,
+    )
     from storage import database as db
     from storage.agents import agent_store
-    from storage.agents.community_agent_template_store import load_template_from_dict, load_template_from_dir
     _install_v1(tmp_path)
     item = load_template_from_dict(agent_store.get_community_template_data(AGENT)).apps[0]
     sources = [load_template_from_dir(_template(tmp_path / f"src{n}", "1.0.0")).apps[0] for n in (1, 2)]
@@ -687,9 +755,11 @@ def test_a_check_script_without_a_final_newline_is_untouched_after_install(tmp_p
     # the written one, so an update does not take the untouched check for
     # an edited one and keep it forever.
     from services.checks import documents
+    from services.community.community_agent_installer import (
+        install_from_extracted_template,
+    )
+    from services.community.community_agent_template_store import load_template_from_dir
     from storage.agents import agent_store
-    from storage.agents.community_agent_template_store import load_template_from_dir
-    from services.community.community_agent_installer import install_from_extracted_template
     _make_user(ADMIN_SUB, "admin@test.com", "admin")
     check = {"name": "run-it", "script": {"run": "check.sh"}, "_script": "#!/bin/sh\nexit 0"}
     template = load_template_from_dir(_write_template(tmp_path / "t", slug="nltpl", checks={"run-it": check}))
@@ -707,10 +777,12 @@ def test_auto_attach_an_admin_turned_off_stays_off(tmp_path, temp_db):
     # The installed version asked for auto-attach; an admin cleared it; an
     # update of a version that still asks for it does not turn it back on.
     # A version that newly asks for it is still offered to an admin.
-    from storage.agents import agent_store
-    from storage.agents.community_agent_template_store import load_template_from_dir
     from services.community import community_agent_updater as upd
-    from services.community.community_agent_installer import install_from_extracted_template
+    from services.community.community_agent_installer import (
+        install_from_extracted_template,
+    )
+    from services.community.community_agent_template_store import load_template_from_dir
+    from storage.agents import agent_store
     _make_user(ADMIN_SUB, "admin@test.com", "admin")
     auto = {"default_for_new_users": {"enabled": True, "role": "viewer"}}
     v1 = load_template_from_dir(_write_template(tmp_path / "a1", slug="atpl",
@@ -731,10 +803,12 @@ def test_auto_attach_an_admin_turned_off_stays_off(tmp_path, temp_db):
 
 
 def test_an_update_offers_no_below_editor_default_on_a_shared_only_agent(tmp_path, temp_db):
-    from storage.agents import agent_store
-    from storage.agents.community_agent_template_store import load_template_from_dir
     from services.community import community_agent_updater as upd
-    from services.community.community_agent_installer import install_from_extracted_template
+    from services.community.community_agent_installer import (
+        install_from_extracted_template,
+    )
+    from services.community.community_agent_template_store import load_template_from_dir
+    from storage.agents import agent_store
     _make_user(ADMIN_SUB, "admin@test.com", "admin")
     v1 = load_template_from_dir(_write_template(tmp_path / "s1", slug="stpl",
                                                 agent_json_extra={"version": "1.0.0"}))
@@ -796,8 +870,8 @@ def test_take_is_offered_only_on_the_pressers_own_copy(tmp_path, temp_db):
     # "Take the new version" acts on the presser's own copy, so another
     # member's kept copy is listed without it (it would replace the
     # presser's copy, not theirs).
-    from storage import database as db
     from services.community import template_app_seeder
+    from storage import database as db
     _install_v1(tmp_path)
     with patch("services.notifications.notification_manager.fire_notification", new=AsyncMock()):
         asyncio.run(template_app_seeder.seed_user_copy(AGENT, MEMBER_SUB, "home"))
@@ -817,6 +891,7 @@ def test_an_edited_manifest_of_an_app_with_task_buttons_is_kept(tmp_path, temp_d
     # compared without the targets: an untouched copy takes the new
     # version, one whose manifest was edited is kept.
     import json as _json
+
     from storage import database as db
     doc = dict(HOME, actions=[{"id": "go", "label": "Go", "type": "fire_task", "task": "brief"}],
                _blueprint={"tasks": [{"slug": "brief", "prompt": "Write the brief"}]})
@@ -874,6 +949,7 @@ def test_the_daily_sweep_never_undoes_a_record_saved_meanwhile(tmp_path, temp_db
 
 def _fake_running_scheduler(monkeypatch):
     from types import SimpleNamespace
+
     from services.community import community_agent_installer as inst
     from services.notifications import notification_manager
     from services.scheduler import scheduler
@@ -910,8 +986,10 @@ def test_seeded_and_replaced_rows_reach_the_running_scheduler(tmp_path, temp_db,
 
 
 def test_an_active_template_task_is_scheduled_at_install(tmp_path, temp_db, monkeypatch):
-    from storage.agents.community_agent_template_store import load_template_from_dir
-    from services.community.community_agent_installer import install_from_extracted_template
+    from services.community.community_agent_installer import (
+        install_from_extracted_template,
+    )
+    from services.community.community_agent_template_store import load_template_from_dir
     tasks, _notifs = _fake_running_scheduler(monkeypatch)
     _make_user(ADMIN_SUB, "admin@test.com", "admin")
     template = load_template_from_dir(_write_template(
@@ -923,3 +1001,72 @@ def test_an_active_template_task_is_scheduled_at_install(tmp_path, temp_db, monk
             template=template, target_slug=AGENT, installer_user_sub=ADMIN_SUB, installer_role="admin",
             source_label="acttpl"))
     assert [t.prompt for t in tasks] == ["p1"] and tasks[0].agent == AGENT
+
+
+# --- a task's own model, engine and notification mode -----------------------------
+
+def _models(*ids: str) -> None:
+    from storage.billing import subscription_store
+    for model_id in ids:
+        # Builtin rows: a retired builtin reads as its successor, a custom
+        # row an admin added keeps its id.
+        subscription_store.add_model("claude-code-cli", model_id, model_id, is_builtin=True)
+
+
+def _daily_rows() -> dict[str, dict]:
+    from storage.automation import db_tasks
+    return {sub: db_tasks.find_template_task(AGENT, "daily", sub) for sub in (ADMIN_SUB, MEMBER_SUB)}
+
+
+def _on_claude() -> None:
+    from storage.agents import agent_store
+    assert agent_store.get_agent(AGENT)["execution_path"] == "claude-code-cli"
+
+
+def test_a_members_own_notification_mode_never_stops_the_next_prompt(tmp_path, temp_db):
+    from storage.automation import db_tasks
+    _install_v1(tmp_path)
+    db_tasks.update_dynamic_task(_daily_rows()[MEMBER_SUB]["id"], {"notification_mode": "auto"})
+    report = _apply(_v2(tmp_path))
+    rows = _daily_rows()
+    assert rows[MEMBER_SUB]["prompt"] == "p2" and rows[MEMBER_SUB]["notification_mode"] == "auto"
+    assert rows[ADMIN_SUB]["prompt"] == "p2" and rows[ADMIN_SUB]["notification_mode"] == "manual"
+    assert any(k["what"] == "the task 'daily'" and k["reason"] == "edited locally" for k in report["kept"])
+
+
+def test_an_update_moves_an_untouched_pin_and_keeps_an_edited_one(tmp_path, temp_db):
+    from storage.automation import db_tasks
+    _models("pin-a", "pin-b", "pin-c")
+    _install_v1(tmp_path, daily_extra={"override_model": "pin-a", "notification_mode": "none"})
+    _on_claude()
+    assert {r["override_model"] for r in _daily_rows().values()} == {"pin-a"}
+    db_tasks.update_dynamic_task(_daily_rows()[MEMBER_SUB]["id"], {"override_model": "pin-b"})
+    report = _apply(_v2(tmp_path, daily_prompt="p1", daily_extra={"override_model": "pin-c",
+                                                                  "notification_mode": "none"}))
+    rows = _daily_rows()
+    assert rows[ADMIN_SUB]["override_model"] == "pin-c" and rows[MEMBER_SUB]["override_model"] == "pin-b"
+    assert report["task_pins_dropped"] == []
+
+
+def test_a_new_pin_the_agent_cannot_run_is_reported_and_left_out(tmp_path, temp_db):
+    _install_v1(tmp_path)
+    report = _apply(_v2(tmp_path, daily_extra={"override_model": "no-such-model"}))
+    assert len(report["task_pins_dropped"]) == 1 and "'daily'" in report["task_pins_dropped"][0]
+    assert {r["override_model"] for r in _daily_rows().values()} == {""}
+
+
+def test_a_retired_pin_the_boot_walk_moved_is_not_an_edit(tmp_path, temp_db, monkeypatch):
+    import config
+    from storage.automation import db_tasks
+    _models("pin-old", "pin-new")
+    _install_v1(tmp_path, daily_extra={"override_model": "pin-old"})
+    _on_claude()
+    # The model retires after the install: the boot walk rewrites the rows.
+    monkeypatch.setitem(config.MODEL_SUCCESSORS, "pin-old", "pin-new")
+    for row in _daily_rows().values():
+        db_tasks.update_dynamic_task(row["id"], {"override_model": "pin-new"})
+    report = _apply(_v2(tmp_path, daily_extra={"override_model": "pin-old"}))
+    assert not any(k["what"] == "the task 'daily'" for k in report["kept"]), report["kept"]
+    rows = _daily_rows()
+    assert {r["prompt"] for r in rows.values()} == {"p2"}
+    assert {r["override_model"] for r in rows.values()} == {"pin-new"}

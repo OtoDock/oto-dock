@@ -7,11 +7,12 @@ Mixin for :class:`pipeline.core.CallPipeline`; operates on ``self.state``
 import asyncio
 import contextlib
 import logging
-import time
 import re
+import time
 
-from telephony.audio_socket import AudioSocketError, TYPE_AUDIO, TYPE_HANGUP
 from proxy.client import TOOL_USE_SIGNAL
+from telephony.audio_socket import TYPE_AUDIO, TYPE_HANGUP, AudioSocketError
+
 from .markers import _CALL_COMPLETE_RE, _QUESTION_RE
 
 logger = logging.getLogger("pipeline")
@@ -88,13 +89,15 @@ class OutboundMixin:
             t0 = time.monotonic()
             if await self._wait_for_opening(call._opening_ready, timeout):
                 logger.info(
-                    f"[{self.conn.peer_addr}] Opening pre-gen finished after "
-                    f"{time.monotonic() - t0:.1f}s of waiting"
+                    "[%s] Opening pre-gen finished after "
+                    "%.1fs of waiting",
+                    self.conn.peer_addr, time.monotonic() - t0
                 )
             else:
                 logger.warning(
-                    f"[{self.conn.peer_addr}] Opening pre-gen still running after "
-                    f"{timeout:.0f}s — cancelling it, falling back to live LLM"
+                    "[%s] Opening pre-gen still running after "
+                    "%.0fs — cancelling it, falling back to live LLM",
+                    self.conn.peer_addr, timeout
                 )
                 task = getattr(call, "pregen_task", None)
                 if task is not None and not task.done():
@@ -111,8 +114,8 @@ class OutboundMixin:
         if (getattr(pw_client, "_ws_connected", False)
                 and getattr(pw_client, "llm_mode", "proxy") == self.route.llm_mode):
             logger.info(
-                f"[{self.conn.peer_addr}] Reusing pre-warmed connection "
-                f"(session={pw_client.session_id})"
+                "[%s] Reusing pre-warmed connection "
+                "(session=%s)", self.conn.peer_addr, pw_client.session_id
             )
             return pw_client
         with contextlib.suppress(Exception):
@@ -139,7 +142,7 @@ class OutboundMixin:
         """
         call = self._call_manager.get_call(self._outbound_call_id) if self._call_manager else None
         if not call:
-            logger.error(f"[{self.conn.peer_addr}] Outbound call not found: {self._outbound_call_id}")
+            logger.error("[%s] Outbound call not found: %s", self.conn.peer_addr, self._outbound_call_id)
             return
 
         if getattr(self.llm, "proxy_lost", False) or (
@@ -157,13 +160,14 @@ class OutboundMixin:
         try:
             await asyncio.wait_for(call._opening_ready.wait(), timeout=15.0)
         except asyncio.TimeoutError:
-            logger.warning(f"[{self.conn.peer_addr}] Opening pre-gen timed out — falling back to live LLM")
+            logger.warning("[%s] Opening pre-gen timed out — falling back to live LLM", self.conn.peer_addr)
 
         if call.opening_text:
             # Fast path: pre-generated text ready — straight to TTS
             logger.debug(
-                f"[{self.conn.peer_addr}] Using pre-generated opening "
-                f"({len(call.opening_text)} chars): {call.opening_text[:80]}..."
+                "[%s] Using pre-generated opening "
+                "(%s chars): %s...",
+                self.conn.peer_addr, len(call.opening_text), call.opening_text[:80]
             )
 
             # Record transcript
@@ -220,7 +224,8 @@ class OutboundMixin:
                 self.conn.send_hangup()
                 self.state._running = False
                 logger.info(
-                    f"[{self.conn.peer_addr}] [CALL_COMPLETE] in opening — hanging up"
+                    "[%s] [CALL_COMPLETE] in opening — hanging up",
+                    self.conn.peer_addr
                 )
                 return
 
@@ -244,8 +249,8 @@ class OutboundMixin:
             )
 
             logger.debug(
-                f"[{self.conn.peer_addr}] No pre-generated opening — "
-                f"falling back to live LLM for task: {task_desc}"
+                "[%s] No pre-generated opening — "
+                "falling back to live LLM for task: %s", self.conn.peer_addr, task_desc
             )
 
             # Discard incoming frames in parallel with LLM+TTS
@@ -312,13 +317,13 @@ class OutboundMixin:
 
         except AudioSocketError:
             raise
-        except Exception:
+        except Exception:  # noqa: BLE001  # the opening's frame drain runs beside the call, whatever it meets
             pass
         finally:
             if frames_read:
                 logger.info(
-                    f"[{self.conn.peer_addr}] Discarded {frames_read} frames "
-                    f"during opening"
+                    "[%s] Discarded %s frames "
+                    "during opening", self.conn.peer_addr, frames_read
                 )
 
     def _on_proxy_lost(self) -> None:
@@ -340,8 +345,8 @@ class OutboundMixin:
             return
         self.state._unreachable_ending = True
         logger.warning(
-            f"[{self.conn.peer_addr}] The proxy is not reachable for this call "
-            f"— ending it")
+            "[%s] The proxy is not reachable for this call "
+            "— ending it", self.conn.peer_addr)
         self.state.call_outcome = "error"
         with contextlib.suppress(Exception):
             await self._play_phrase("cannot_continue")
@@ -393,8 +398,9 @@ class OutboundMixin:
             error=f"ran in the chat, {how}" if failed else None,
         )
         logger.info(
-            f"[{self.conn.peer_addr}] In-session call finished: {how} "
-            f"(resume note {'sent' if sent else 'not sent'})")
+            "[%s] In-session call finished: %s "
+            "(resume note %s)",
+            self.conn.peer_addr, how, 'sent' if sent else 'not sent')
 
     async def _finalize_outbound_call(self) -> None:
         """Finalize the outbound call: get outcome summary and update status."""
@@ -423,8 +429,9 @@ class OutboundMixin:
                 self._outbound_call_id, CallStatus.FAILED,
                 error=PIN_COOLDOWN if call.pin_outcome == "pin_cooldown" else PIN_REFUSED)
             logger.warning(
-                f"[{self.conn.peer_addr}] Outbound call ended at the PIN gate "
-                f"({call.pin_outcome}, {self.state.pin_failures} wrong codes)")
+                "[%s] Outbound call ended at the PIN gate "
+                "(%s, %s wrong codes)",
+                self.conn.peer_addr, call.pin_outcome, self.state.pin_failures)
             return
         if self.state._transferred_to:
             call.transferred_to = self.state._transferred_to
@@ -432,7 +439,7 @@ class OutboundMixin:
                 self._outbound_call_id, CallStatus.COMPLETED,
                 outcome=f"Transferred to {self.state._transferred_to}",
             )
-            logger.info(f"[{self.conn.peer_addr}] Outbound call transferred to {self.state._transferred_to}")
+            logger.info("[%s] Outbound call transferred to %s", self.conn.peer_addr, self.state._transferred_to)
             return
         # An end the agent asked for counts, whoever hung up first.
         if self._control_pending_end():
@@ -455,8 +462,8 @@ class OutboundMixin:
                 outcome = "".join(summary_parts).strip()
                 # Clean any session markers from summary
                 outcome = re.sub(r"\[//\]: # \(session:[a-f0-9-]+\)", "", outcome).strip()
-            except Exception as e:
-                logger.error(f"[{self.conn.peer_addr}] Failed to get outcome summary: {e}")
+            except Exception as e:  # noqa: BLE001  # the outcome summary is best effort, the call already ended
+                logger.error("[%s] Failed to get outcome summary: %s", self.conn.peer_addr, e)
                 outcome = "Call completed (summary unavailable)"
 
             self._call_manager.update_status(
@@ -464,7 +471,7 @@ class OutboundMixin:
                 CallStatus.COMPLETED,
                 outcome=outcome,
             )
-            logger.info(f"[{self.conn.peer_addr}] Outbound call completed: {outcome}")
+            logger.info("[%s] Outbound call completed: %s", self.conn.peer_addr, outcome)
         else:
             if self.state.call_outcome == "hangup":
                 how = "the person hung up before the call was completed"
@@ -474,7 +481,7 @@ class OutboundMixin:
                 how = f"ended after {int(self.cfg.idle_timeout_s)} s of silence"
             self._call_manager.update_status(
                 self._outbound_call_id, CallStatus.FAILED, error=how)
-            logger.warning(f"[{self.conn.peer_addr}] Outbound call ended without completion: {how}")
+            logger.warning("[%s] Outbound call ended without completion: %s", self.conn.peer_addr, how)
 
     async def _handle_question(self, question_text: str) -> str | None:
         """Handle a [QUESTION:] marker from the caller agent.
@@ -547,8 +554,9 @@ class OutboundMixin:
                 await silence_task
 
         logger.debug(
-            f"[{self.conn.peer_addr}] Question answer: "
-            f"{answer[:80] if answer else 'TIMEOUT'}"
+            "[%s] Question answer: "
+            "%s",
+            self.conn.peer_addr, answer[:80] if answer else 'TIMEOUT'
         )
         return answer
 
@@ -572,7 +580,7 @@ class OutboundMixin:
                 if not self.state._tts_playing:
                     try:
                         self._send_frame(silence)
-                    except Exception:
+                    except Exception:  # noqa: BLE001  # a frame the closing line refuses ends the hold silence
                         break
                 await asyncio.sleep(0.02)
         except asyncio.CancelledError:
@@ -584,7 +592,7 @@ class OutboundMixin:
         Sends callee speech to the LLM with hold context, plays the
         short response via TTS, then returns so the answer poll continues.
         """
-        logger.debug(f"[{self.conn.peer_addr}] Callee spoke during hold: {speech}")
+        logger.debug("[%s] Callee spoke during hold: %s", self.conn.peer_addr, speech)
 
         # Record callee speech in transcript
         if self._call_manager:
@@ -616,8 +624,8 @@ class OutboundMixin:
                 if token is TOOL_USE_SIGNAL:
                     continue
                 response_text += token
-        except Exception as e:
-            logger.error(f"[{self.conn.peer_addr}] Hold response LLM error: {e}")
+        except Exception as e:  # noqa: BLE001  # the hold response is best effort, the hold goes on
+            logger.error("[%s] Hold response LLM error: %s", self.conn.peer_addr, e)
 
         # Clean markers and send to TTS
         tts_text = response_text.strip()
@@ -651,8 +659,9 @@ class OutboundMixin:
         self.state._stt_early_unmuted = False
 
         logger.debug(
-            f"[{self.conn.peer_addr}] Hold response: "
-            f"{clean[:80] if clean else '(empty)'}"
+            "[%s] Hold response: "
+            "%s",
+            self.conn.peer_addr, clean[:80] if clean else '(empty)'
         )
 
     async def _warmup_session(self) -> None:
@@ -666,10 +675,11 @@ class OutboundMixin:
         try:
             sid = await self.llm.warmup_session()
             logger.info(
-                f"[{self.conn.peer_addr}] Session warmup complete "
-                f"(session={sid}, {(time.monotonic() - t0) * 1000:.0f}ms)"
+                "[%s] Session warmup complete "
+                "(session=%s, %.0fms)",
+                self.conn.peer_addr, sid, (time.monotonic() - t0) * 1000
             )
-        except Exception as e:
-            logger.warning(f"[{self.conn.peer_addr}] Session warmup failed: {e}")
+        except Exception as e:  # noqa: BLE001  # the session warmup is best effort, the first turn warms it
+            logger.warning("[%s] Session warmup failed: %s", self.conn.peer_addr, e)
         finally:
             self.state._warmup_done.set()

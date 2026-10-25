@@ -9,17 +9,30 @@ Auth: OAuth2 session cookie (dashboard users).
 import asyncio
 import functools
 import logging
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
-from storage.identity import credential_store
-from storage.agents import agent_store
-from storage.mcp import mcp_store
-from storage import database as task_store
+from auth import github_reach
+from auth.oauth_providers import github_app
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_admin,
+    require_auth,
+    require_user,
+)
 from services.mcp import mcp_registry
-from services.oauth import credential_resolver, oauth_account_store
-from auth.providers import UserContext, get_current_user, require_admin, require_auth, require_user
+from services.oauth import credential_resolver, github_apps, oauth_account_store
+from storage import database as task_store
+from storage.agents import agent_store
+from storage.identity import credential_store, oauth_app_kinds
+from storage.mcp import mcp_store
+
+if TYPE_CHECKING:
+    from services.mcp.mcp_manifest_types import McpManifest
 
 logger = logging.getLogger("otodock.credential-api")
 router = APIRouter(dependencies=[Depends(require_user)])
@@ -50,6 +63,10 @@ class SetDefaultAccountRequest(BaseModel):
 class SetAgentBindingRequest(BaseModel):
     agent_name: str
     account_label: str
+    # The person's own GitHub reach for the agent with this account
+    # (``auth/github_reach``): absent = keep what the choice holds.
+    repositories: list[str] | None = Field(default=None, max_length=github_reach.MAX_REPOSITORIES)
+    read_only: bool | None = None
 
 
 class SetServiceBindingRequest(BaseModel):
@@ -62,6 +79,14 @@ class SetServiceBindingRequest(BaseModel):
     """
 
     account_label: str
+    # A GitHub App installation of that account as the identity; absent =
+    # keep what the binding holds, "" = the account itself.
+    installation_id: str | None = None
+    # The agent's GitHub reach (``auth/github_reach``): the repositories it may
+    # reach as ``owner/name`` ([] = every one) and whether it may only read;
+    # absent = keep what the binding holds.
+    repositories: list[str] | None = Field(default=None, max_length=github_reach.MAX_REPOSITORIES)
+    read_only: bool | None = None
 
 
 def _get_cred_schema(mcp_name: str) -> dict | None:
@@ -111,6 +136,15 @@ def _account_token_status(
         # Some legacy formats stored as space-separated string.
         return [s for s in raw.split() if s], reason
     return list(raw), reason
+
+
+def _app_in_use_quietly(mcp_name: str) -> github_apps.AppInUse:
+    """The app an MCP's accounts go through, the OAuth App when the relay
+    cannot say (the integrations page never fails on it)."""
+    try:
+        return github_apps.app_in_use(mcp_name)
+    except (*github_apps.UNREACHABLE, ValueError):
+        return github_apps.AppInUse(kind=oauth_app_kinds.KIND_OAUTH_APP, hosted=True)
 
 
 def _service_binding_summary(agent_name: str, user: UserContext) -> dict:
@@ -176,6 +210,7 @@ async def list_my_integrations(
 
     needed_mcps: set[str] = set()
     mcps_with_overridable_config: set[str] = set()
+    manifest: McpManifest | None
     # Only surface MCPs that are ACTIVELY ENABLED (manager-enabled + admin-
     # authorized + platform-enabled) on at least one of the user's agents.
     # An MCP that's merely visible-but-not-enabled doesn't need user creds
@@ -213,10 +248,14 @@ async def list_my_integrations(
         )
         # group bindings by account_label
         bindings_by_account: dict[str, list[str]] = {}
+        reaches_by_account: dict[str, list[dict]] = {}
         for b in agent_bindings:
             bindings_by_account.setdefault(b["account_label"], []).append(
                 b["agent_name"]
             )
+            reaches_by_account.setdefault(b["account_label"], []).append({
+                "agent": b["agent_name"], "repositories": b["repositories"], "read_only": b["read_only"],
+            })
         # Per-provider credential key names (workspace-mcp uses GOOGLE_*,
         # slack-mcp uses SLACK_*, etc.). Resolves via the manifest so adding
         # a new OAuth MCP doesn't need a code change here.
@@ -263,12 +302,19 @@ async def list_my_integrations(
                 )
                 missing_scopes = [s for s in required_scopes if s not in granted]
 
+            meta = acc.get("meta") or {}
             accounts.append({
                 "account_label": acc["account_label"],
                 "display_email": acc.get("display_email", "") or acc_creds.get(email_key, ""),
                 "is_default": acc["is_default"],
                 "created_at": acc["created_at"],
                 "configured_keys": list(acc_creds.keys()),
+                # A GitHub-App account: the kind and the installations the
+                # person can reach (the card lists them and offers the
+                # install page); absent on every other account.
+                **({"kind": oauth_app_kinds.KIND_GITHUB_APP,
+                    "installations": oauth_app_kinds.installations_of(meta)}
+                   if oauth_app_kinds.is_github_app_meta(meta) else {}),
                 # Required fields the saved account lacks (a field the
                 # manifest added later): the MCP stays out of its sessions.
                 "missing_required": (
@@ -279,6 +325,9 @@ async def list_my_integrations(
                 "agent_overrides": sorted(
                     bindings_by_account.get(acc["account_label"], [])
                 ),
+                # The person's own GitHub reach for each agent of
+                # ``agent_overrides`` (``[]`` and false: everything).
+                "agent_reaches": reaches_by_account.get(acc["account_label"], []),
                 "missing_scopes": missing_scopes,
                 "service_bindings": service_bindings,
                 # The card says "Reconnect needed" with the reason; the
@@ -317,7 +366,32 @@ async def list_my_integrations(
             if any(m.name == mcp_name for m in enabled):
                 candidate_agents.append(agent)
 
+        # A Shared-only agent's chats resolve as the agent (its own service
+        # binding and its reach): a person's choice for it never applies, so
+        # the card offers no repositories for it.
+        shared_only_agents: list[str] = []
+        if _reach_supported(mcp_name):
+            from core.session.visibility import is_shared_only
+            shared_only_agents = [a for a in candidate_agents if await asyncio.to_thread(is_shared_only, a)]
+
         oauth_meta = dict(cred_info.get("oauth_meta", {}) if cred_info else {})
+        if cred_info and cred_info.get("app_kinds"):
+            # The kind a connect goes through now, and whether the install
+            # page can be offered (a GitHub App with its slug known).
+            in_use = await asyncio.to_thread(_app_in_use_quietly, mcp_name)
+            oauth_meta["app_kind"] = in_use.kind
+            oauth_meta["app_install_available"] = (
+                in_use.kind == oauth_app_kinds.KIND_GITHUB_APP and bool(in_use.slug)
+            )
+            # The kinds a person may pick, the default first: OtoDock's
+            # relay keeps its OAuth App beside the GitHub App it offers, an
+            # admin registered one.
+            oauth_meta["app_hosted"] = in_use.hosted
+            oauth_meta["connect_kinds"] = (
+                [oauth_app_kinds.KIND_GITHUB_APP, oauth_app_kinds.KIND_OAUTH_APP]
+                if in_use.hosted and in_use.kind == oauth_app_kinds.KIND_GITHUB_APP
+                else [in_use.kind]
+            )
         if oauth_meta.get("authorization_server") and manifest is not None:
             # Whether a connect goes through the registered client right now
             # (hosted mode off, no app credentials): the form words itself by it.
@@ -345,6 +419,9 @@ async def list_my_integrations(
             "overridable_config": overridable_config,
             "accounts": accounts,
             "candidate_agents": candidate_agents,
+            # A choice of account for an agent may narrow its GitHub reach.
+            "reach_supported": _reach_supported(mcp_name),
+            "shared_only_agents": shared_only_agents,
         }
 
         result.append(entry)
@@ -496,15 +573,95 @@ async def set_agent_binding(
             400,
             f"MCP {mcp_name!r} is not enabled on agent {body.agent_name!r}",
         )
+    accounts = await asyncio.to_thread(credential_store.list_user_accounts, user.sub, mcp_name)
+    if not any(a["account_label"] == body.account_label for a in accounts):
+        raise HTTPException(
+            404, f"Account '{body.account_label}' not found for {mcp_name}",
+        )
+    await _check_own_reach(body, mcp_name, user)
     ok = await asyncio.to_thread(
-        credential_store.set_account_agent_binding,
-        user.sub, mcp_name, body.agent_name, body.account_label,
+        functools.partial(
+            credential_store.set_account_agent_binding,
+            user.sub, mcp_name, body.agent_name, body.account_label,
+            repositories=body.repositories, read_only=body.read_only,
+        ),
     )
     if not ok:
         raise HTTPException(
             404, f"Account '{body.account_label}' not found for {mcp_name}",
         )
-    return {"status": "ok"}
+    row = await asyncio.to_thread(
+        credential_store.get_account_agent_binding, user.sub, mcp_name, body.agent_name,
+    )
+    return {
+        "status": "ok",
+        "repositories": list(row.repositories) if row else [],
+        "read_only": row.read_only if row else False,
+    }
+
+
+_NO_OWN_LIST = (
+    "This account has no list of repositories to pick from. You can still make an "
+    "agent read only."
+)
+
+
+async def _check_own_reach(body: SetAgentBindingRequest, mcp_name: str, user: UserContext) -> None:
+    """The person's own reach for an agent, refused in plain words when it
+    cannot hold, as the service PUT refuses one: a narrowing on GitHub only,
+    a list only on a GitHub-App account, a name the account does not reach.
+    Only names the choice does not hold yet are looked up; a list kept onto
+    another account is looked up on it (a token account keeps it as it is:
+    it only narrows)."""
+    names = body.repositories or []
+    if not _reach_supported(mcp_name):
+        if names or body.read_only:
+            raise HTTPException(400, _ONLY_GITHUB)
+        return
+    _refuse_unreadable(names)
+    prior = await asyncio.to_thread(
+        credential_store.get_account_agent_binding, user.sub, mcp_name, body.agent_name,
+    )
+    same_account = prior is not None and prior.account_label == body.account_label
+    kept = body.repositories is None
+    if kept:
+        names = [] if prior is None or same_account else list(prior.repositories)
+    if not names:
+        return
+    meta = await asyncio.to_thread(credential_store.get_account_meta, user.sub, mcp_name, body.account_label)
+    if not oauth_app_kinds.is_github_app_meta(meta):
+        if kept:
+            return
+        raise HTTPException(400, _NO_OWN_LIST)
+    held = {github_reach.normalize(n) for n in prior.repositories} if prior is not None and same_account else set()
+    added = [n for n in names if github_reach.normalize(n) not in held]
+    if not added:
+        return
+    missing = await _unreached(user.sub, mcp_name, body.account_label, "", added, no_list=_NO_OWN_LIST)
+    if missing and kept:
+        raise HTTPException(400, f"{missing[0]} is one of the repositories you chose for this agent, and this "
+                                 "account does not reach it. Change the repositories first, then choose this "
+                                 "account again.")
+    if missing:
+        raise HTTPException(400, _NOT_REACHED.format(name=missing[0]))
+
+
+@router.get("/v1/users/me/integrations/{mcp_name}/repositories")
+async def get_my_account_repositories(
+    mcp_name: str,
+    account_label: str = Query(...),
+    user: UserContext = Depends(get_current_user),
+):
+    """The repositories one of the caller's own GitHub-App accounts reaches
+    (every installation of it), for the person's own choice of
+    repositories per agent: the service route's answer, ``{pickable,
+    installations, from_meta}``. A token or OAuth account has no list
+    (``pickable: false``)."""
+    if require_auth(user).is_api_key:
+        raise HTTPException(403, "Dashboard only")
+    if not _reach_supported(mcp_name):
+        raise HTTPException(400, _ONLY_GITHUB_LIST)
+    return await _repositories_answer(user.sub, mcp_name, account_label, "")
 
 
 @router.delete("/v1/users/me/integrations/{mcp_name}/agent-binding/{agent_name}")
@@ -598,7 +755,7 @@ async def get_agent_service_account_options(
     )
     current_binding = None
     if binding is not None:
-        bound_label, bound_owner = binding
+        bound_label, bound_owner = binding.account_label, binding.account_owner_sub
         owner_name = bound_owner
         owner_email = ""
         bound_display_email = ""
@@ -620,6 +777,8 @@ async def get_agent_service_account_options(
             None,
         )
         bound_display_email = (bound_row or {}).get("display_email", "")
+        bound_meta = (bound_row or {}).get("meta") or {}
+        installation = oauth_app_kinds.installation_in(bound_meta, binding.installation_id) or {}
         current_binding = {
             "label": bound_label,
             "owner_sub": bound_owner,
@@ -627,6 +786,18 @@ async def get_agent_service_account_options(
             "owner_email": owner_email or bound_display_email,
             "set_by": "",
             "set_at": "",
+            "installation_id": binding.installation_id,
+            "installation_account": str(installation.get("account") or ""),
+            "repositories": list(binding.repositories),
+            "read_only": binding.read_only,
+            # A hosted installation binding left from before: what the card says.
+            "problem": (
+                credential_resolver.reconnect_wording(oauth_app_kinds.INSTALLATION_HOSTED)
+                if binding.installation_id and (
+                    oauth_app_kinds.is_hosted_app_meta(bound_meta)
+                    or await asyncio.to_thread(github_apps.hosted, mcp_name))
+                else ""
+            ),
         }
         # Reach back into the full bindings list to surface set_by/set_at.
         agent_bindings = await asyncio.to_thread(
@@ -639,19 +810,153 @@ async def get_agent_service_account_options(
                 break
 
     def _shape(rows: list[dict]) -> list[dict]:
-        return [
-            {
+        out = []
+        for r in rows:
+            meta = r.get("meta") or {}
+            entry = {
                 "label": r["account_label"],
                 "display_email": r.get("display_email", ""),
                 "is_default": r.get("is_default", False),
             }
-            for r in rows
-        ]
+            if oauth_app_kinds.is_hosted_app_meta(meta) or (hosted and oauth_app_kinds.is_github_app_meta(meta)):
+                # Hosted sign-in has no app identity: the account itself only.
+                entry["kind"] = oauth_app_kinds.KIND_GITHUB_APP
+                entry["hosted"] = True
+            elif oauth_app_kinds.is_github_app_meta(meta):
+                entry["kind"] = oauth_app_kinds.KIND_GITHUB_APP
+                entry["installations"] = [
+                    {"id": i.get("id"), "account": i.get("account", ""),
+                     "target_type": i.get("target_type", ""),
+                     "repository_selection": i.get("repository_selection", ""),
+                     "repositories_count": len(i.get("repositories") or []),
+                     "repositories_truncated": bool(i.get("repositories_truncated")),
+                     "suspended": bool(i.get("suspended_at")), "admin": bool(i.get("admin"))}
+                    for i in oauth_app_kinds.installations_of(meta)
+                ]
+            out.append(entry)
+        return out
 
+    hosted = await asyncio.to_thread(github_apps.hosted, mcp_name)
     return {
         "my_accounts": _shape(my_accounts),
         "current_binding": current_binding,
+        # The binding may carry a GitHub reach (a repository list, read only).
+        "reach_supported": _reach_supported(mcp_name),
     }
+
+
+def _reach_supported(mcp_name: str) -> bool:
+    manifest = mcp_registry.get_manifest(mcp_name)
+    oauth = (manifest.credentials.oauth or {}) if manifest and manifest.credentials else {}
+    return str(oauth.get("provider_id") or "") == github_app.PROVIDER_ID
+
+
+_NO_LIST = (
+    "This account has no list of repositories to pick from. An agent bound to it "
+    "can still be made read only."
+)
+_ONLY_GITHUB = "Only GitHub can be narrowed to some repositories or to reading."
+_ONLY_GITHUB_LIST = "Only GitHub can be narrowed to some repositories."
+_NOT_REACHED = "{name} is not among the repositories this account reaches."
+
+
+def _refuse_unreadable(names: list[str]) -> None:
+    bad = [n for n in names if not github_reach.normalize(n)]
+    if bad:
+        raise HTTPException(400, f"{bad[0]} is not a repository name. Write it as owner/name.")
+
+
+async def _unreached(
+    user_sub: str, mcp_name: str, account_label: str, installation: str, added: list[str], *, no_list: str,
+) -> list[str]:
+    """The ``added`` names the account (or its installation) does not
+    reach, looked up live; 503 when GitHub cannot be asked and a name is
+    not in the list OtoDock saw last."""
+    try:
+        listed, from_meta = await asyncio.to_thread(
+            github_apps.reachable_repositories, user_sub, mcp_name, account_label, installation,
+        )
+    except LookupError as e:
+        raise HTTPException(400, no_list) from e
+    missing = github_apps.unreachable_names(listed, added)
+    if missing and from_meta:
+        raise HTTPException(503, "GitHub could not be reached to check the repositories. Try again in a minute.")
+    return missing
+
+
+async def _repositories_answer(user_sub: str, mcp_name: str, account_label: str, installation: str) -> dict:
+    try:
+        listed, from_meta = await asyncio.to_thread(
+            github_apps.reachable_repositories, user_sub, mcp_name, account_label, installation,
+        )
+    except LookupError:
+        return {"pickable": False, "installations": [], "from_meta": False}
+    return {"pickable": True, "installations": listed, "from_meta": from_meta}
+
+
+async def _check_reach(
+    body: SetServiceBindingRequest, mcp_name: str, agent_name: str, user: UserContext,
+) -> None:
+    """The reach a PUT asks for, refused in plain words when it cannot
+    hold: a narrowing reach on an MCP that is not GitHub, a list on an
+    account with none, a name the identity does not reach. Only names the
+    same identity does not hold yet are looked up (a narrowing change never
+    waits on GitHub); a new identity has the list it keeps looked up too
+    (GitHub narrows an installation's token to names of its own account)."""
+    names = body.repositories or []
+    if not _reach_supported(mcp_name):
+        if names or body.read_only:
+            raise HTTPException(400, _ONLY_GITHUB)
+        return
+    _refuse_unreadable(names)
+    prior = await asyncio.to_thread(credential_store.get_service_agent_binding, mcp_name, agent_name)
+    same_account = prior is not None and (prior.account_owner_sub, prior.account_label) == (
+        user.sub, body.account_label)
+    installation = body.installation_id if body.installation_id is not None else (
+        prior.installation_id if prior is not None and same_account else "")
+    same_identity = prior is not None and same_account and prior.installation_id == installation
+    kept = body.repositories is None
+    if kept:
+        names = [] if same_identity or prior is None else list(prior.repositories)
+    if not names:
+        return
+    meta = await asyncio.to_thread(credential_store.get_account_meta, user.sub, mcp_name, body.account_label)
+    if not oauth_app_kinds.is_github_app_meta(meta):
+        if kept:
+            return                          # a token account keeps the list as it is
+        raise HTTPException(400, _NO_LIST)
+    held = {github_reach.normalize(n) for n in prior.repositories} if prior and same_identity else set()
+    added = [n for n in names if github_reach.normalize(n) not in held]
+    if not added:
+        return
+    missing = await _unreached(user.sub, mcp_name, body.account_label, installation or "", added, no_list=_NO_LIST)
+    if missing and kept:
+        raise HTTPException(400, f"The agent's GitHub reach names {missing[0]}, which this choice does not "
+                                 "reach. Change the repositories first, then choose it again.")
+    if missing:
+        raise HTTPException(400, _NOT_REACHED.format(name=missing[0]))
+
+
+@router.get("/v1/agents/{agent_name}/mcps/{mcp_name}/service-account-repositories")
+async def get_agent_service_repositories(
+    agent_name: str,
+    mcp_name: str,
+    account_label: str = Query(...),
+    installation_id: str = Query(""),
+    user: UserContext = Depends(get_current_user),
+):
+    """The repositories the agent's GitHub reach may name, for one of the
+    caller's own GitHub-App accounts (an installation of it, or the account
+    itself): ``{pickable, installations: [{id, account, repositories,
+    truncated}], from_meta}``. A token or OAuth account has no list
+    (``pickable: false``). Manager of the agent only."""
+    if require_auth(user).is_api_key:
+        raise HTTPException(403, "Dashboard only")
+    if not user.can_manage_agent(agent_name):
+        raise HTTPException(403, f"Manager role on agent {agent_name!r} required")
+    if not _reach_supported(mcp_name):
+        raise HTTPException(400, _ONLY_GITHUB_LIST)
+    return await _repositories_answer(user.sub, mcp_name, account_label, installation_id)
 
 
 @router.put("/v1/agents/{agent_name}/mcps/{mcp_name}/service-binding")
@@ -692,6 +997,28 @@ async def set_agent_service_binding(
             400, f"MCP {mcp_name!r} is not visible to agent {agent_name!r}",
         )
 
+    if body.installation_id:
+        meta = await asyncio.to_thread(
+            credential_store.get_account_meta, user.sub, mcp_name, body.account_label,
+        )
+        # OtoDock's app through the relay serves user tokens only.
+        if oauth_app_kinds.is_hosted_app_meta(meta) or await asyncio.to_thread(github_apps.hosted, mcp_name):
+            raise HTTPException(400, "Hosted sign-in has no app identity. Bind the account itself.")
+        # An installation stands only while the caller owns its target.
+        standing = oauth_app_kinds.installation_standing(meta, body.installation_id)
+        if standing:
+            raise HTTPException(
+                404, f"Installation {body.installation_id} cannot be this agent's identity: "
+                f"{credential_resolver.bind_wording(standing)}",
+            )
+    await _check_reach(body, mcp_name, agent_name, user)
+    repositories, read_only = body.repositories, body.read_only
+    own = await asyncio.to_thread(_own_reach_to_copy, body, mcp_name, agent_name, user.sub)
+    if own is not None:
+        repositories, read_only = list(own.repositories), own.read_only
+    prior = await asyncio.to_thread(
+        credential_store.get_service_agent_binding, mcp_name, agent_name,
+    )
     ok = await asyncio.to_thread(
         functools.partial(
             credential_store.set_service_agent_binding,
@@ -699,6 +1026,9 @@ async def set_agent_service_binding(
             account_label=body.account_label,
             owner_sub=user.sub,
             set_by=user.sub,
+            installation_id=body.installation_id,
+            repositories=repositories,
+            read_only=read_only,
         ),
     )
     if not ok:
@@ -707,13 +1037,94 @@ async def set_agent_service_binding(
             f"Account '{body.account_label}' not found among your connected "
             f"{mcp_name} accounts",
         )
-    return {
+    binding = await asyncio.to_thread(
+        credential_store.get_service_agent_binding, mcp_name, agent_name,
+    )
+    answer = {
         "status": "ok",
         "agent_name": agent_name,
         "mcp_name": mcp_name,
         "account_label": body.account_label,
         "owner_sub": user.sub,
+        "installation_id": binding.installation_id if binding else "",
+        "repositories": list(binding.repositories) if binding else [],
+        "read_only": binding.read_only if binding else False,
+        # The binding started from the caller's own reach for the agent.
+        "reach_copied": own is not None,
     }
+    provider_id = str(((mcp_registry.get_manifest(mcp_name) or _NO_MANIFEST).credentials.oauth or {}).get("provider_id") or "")
+    if prior is not None and binding is not None and prior.installation_id != binding.installation_id:
+        # The agent's installation subscriptions followed the old identity.
+        await _drop_other_installation_subscriptions(
+            mcp_name, agent_name, keep=binding.installation_id,
+        )
+    if prior is not None and prior.installation_id and (
+            binding is None or (prior.installation_id, github_apps.binding_reach_of(prior).digest())
+            != (binding.installation_id, github_apps.binding_reach_of(binding).digest())):
+        # The file the old identity or reach was served from goes with it.
+        await asyncio.to_thread(github_apps.reap_if_orphan, provider_id, prior.installation_id)
+    if binding is not None and binding.installation_id:
+        # The first token now, so the first session does not wait on GitHub.
+        try:
+            reach = github_apps.binding_reach_of(binding)
+            await asyncio.to_thread(
+                functools.partial(
+                    github_apps.ensure_installation_token,
+                    mcp_name, user.sub, body.account_label, binding.installation_id,
+                    reach=reach if reach.narrows else None,
+                ),
+            )
+        except (credential_resolver.AccountNeedsReconnect, credential_resolver.CredentialUnavailable) as why:
+            answer["warning"] = (
+                credential_resolver.reconnect_wording(str(why))
+                if isinstance(why, credential_resolver.AccountNeedsReconnect) else str(why)
+            )
+    return answer
+
+
+_NO_MANIFEST = SimpleNamespace(credentials=SimpleNamespace(oauth={}))
+
+
+def _own_reach_to_copy(
+    body: SetServiceBindingRequest, mcp_name: str, agent_name: str, user_sub: str,
+) -> credential_store.AccountAgentBinding | None:
+    """The caller's own reach for the agent a NEW service binding starts
+    from: no binding row at all (a row whose owner stopped managing the
+    agent still holds a reach of its own), a PUT naming no reach, the
+    account itself (an installation is another identity, narrowed by GitHub
+    to its own account's repositories), and the caller's own choice for the
+    agent naming that account and narrowing. A copy, never a link: each
+    reach is changed where it lives. No lookup: the names are the same
+    account's, looked up when the person chose them."""
+    if body.repositories is not None or body.read_only is not None or body.installation_id:
+        return None
+    if not _reach_supported(mcp_name):
+        return None
+    if credential_store.service_agent_binding_row_exists(mcp_name, agent_name):
+        return None
+    own = credential_store.get_account_agent_binding(user_sub, mcp_name, agent_name)
+    if own is None or own.account_label != body.account_label:
+        return None
+    return own if github_reach.reach_of(own.repositories, own.read_only).narrows else None
+
+
+async def _drop_other_installation_subscriptions(mcp_name: str, agent_name: str, *, keep: str) -> None:
+    """The agent's service-scope subscriptions on another installation
+    than its identity go: they would keep firing for the old one."""
+    from services.webhooks import subscription_manager
+    from storage.automation import webhook_subscription_store
+    rows = await asyncio.to_thread(
+        webhook_subscription_store.list_subscriptions, scope="service", agent=agent_name, mcp_name=mcp_name,
+    )
+    for row in rows:
+        if row.get("target_kind") != oauth_app_kinds.INSTALLATION_TARGET_KIND:
+            continue
+        if keep and str(row.get("vendor_target") or "") == keep:
+            continue
+        try:
+            await subscription_manager.delete_subscription(subscription_id=row["id"])
+        except Exception:
+            logger.exception("the installation subscription %s of %s was not removed", row.get("id"), agent_name)
 
 
 @router.delete("/v1/agents/{agent_name}/mcps/{mcp_name}/service-binding")
@@ -741,7 +1152,7 @@ async def clear_agent_service_binding(
         credential_store.get_service_agent_binding, mcp_name, agent_name,
     )
     if binding is not None:
-        bound_label, bound_owner = binding
+        bound_label, bound_owner = binding.account_label, binding.account_owner_sub
         try:
             from services.webhooks import subscription_manager
             await subscription_manager.cleanup_account_subscriptions(
@@ -757,6 +1168,9 @@ async def clear_agent_service_binding(
         credential_store.remove_service_agent_binding,
         mcp_name, agent_name,
     )
+    if binding is not None and binding.installation_id:
+        provider_id = str(((mcp_registry.get_manifest(mcp_name) or _NO_MANIFEST).credentials.oauth or {}).get("provider_id") or "")
+        await asyncio.to_thread(github_apps.reap_if_orphan, provider_id, binding.installation_id)
     return {"status": "ok", "agent_name": agent_name, "mcp_name": mcp_name}
 
 
@@ -819,14 +1233,52 @@ async def set_infra_integration(
     if not is_infra and not _is_app_credential(mcp_name):
         raise HTTPException(400, f"'{mcp_name}' is not an infrastructure MCP")
 
+    credentials = dict(body.credentials)
+    github_app_provider = ""
+    if not is_infra:
+        credentials, github_app_provider = await asyncio.to_thread(_verified_app_bundle, mcp_name, credentials)
     await asyncio.to_thread(
-        credential_store.set_infra_credentials, mcp_name, body.credentials
+        credential_store.set_infra_credentials, mcp_name, credentials
     )
     # oauth_engine reads app credentials per-request via
     # credential_store.get_infra_credentials — no in-memory cache to
     # invalidate.
+    if github_app_provider:
+        # Only once the new key is stored: a worker tick between the mark
+        # and the save would re-mint with the old key.
+        from auth.oauth_providers import github_app
+        github_app.forget_jwts()
+        await asyncio.to_thread(github_apps.mark_installation_tokens_for_remint, github_app_provider)
 
     return {"status": "ok", "mcp_name": mcp_name}
+
+
+def _verified_app_bundle(bundle: str, posted: dict[str, str]) -> tuple[dict[str, str], str]:
+    """An admin's app bundle as it is about to be stored, and the provider
+    whose installation token files are to be marked for a re-mint after
+    the save (``""`` for another kind): when the merged bundle's kind is a
+    GitHub App, GitHub must answer the app's own request with the entered
+    App ID (the key normalized, the slug and the name filled; 400 with the
+    sentence otherwise)."""
+    from auth.oauth_providers import github_app
+    manifest = next(
+        (m for m in mcp_registry.get_all_manifests().values()
+         if (m.credentials.oauth or {}).get("app_credential") == bundle),
+        None,
+    )
+    oauth = (manifest.credentials.oauth or {}) if manifest else {}
+    merged = {**credential_store.get_infra_credentials(bundle), **posted}
+    kind = oauth_app_kinds.active_kind(oauth, merged)
+    if kind != oauth_app_kinds.KIND_GITHUB_APP:
+        return posted, ""
+    try:
+        verified = github_app.verify_app_credentials(merged, oauth_app_kinds.kind_fields(oauth, kind))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    out = {k: verified[k] for k in posted if k in verified}
+    out[github_app.APP_SLUG_KEY] = verified[github_app.APP_SLUG_KEY]
+    out[github_app.APP_NAME_KEY] = verified[github_app.APP_NAME_KEY]
+    return out, str(oauth.get("provider_id") or "")
 
 
 @router.delete("/v1/admin/integrations/infra/{mcp_name}")
@@ -958,6 +1410,7 @@ def _registration_mcps(issuer: str, resources: str = "") -> list[str]:
     manifest that declares none, by an issuer host equal to the MCP
     server's host."""
     from urllib.parse import urlsplit
+
     from services.oauth import mcp_authorization
 
     issuer_host = (urlsplit(issuer).hostname or "").lower()

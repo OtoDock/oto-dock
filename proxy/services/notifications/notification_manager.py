@@ -31,18 +31,21 @@ import time
 import zoneinfo
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import cast
 
-from storage.automation import notification_store
+import psycopg
+
 import config
-from core.session import session_kind
 from auth.providers import acting_role_of
+from core.session import session_kind
+
 # Imported with the manager: its libraries (pywebpush, google-auth,
 # requests) take about 0.3 s to load, which must never land on the loop at
 # the first alert of a process.
 from services.notifications import push_sender
-from ws import chat_phase
-from ws import wire_events as wire
+from storage.automation import notification_store
 from storage.pg import run_db
+from ws import chat_phase, wire_events as wire
 
 logger = logging.getLogger("otodock.notifications")
 
@@ -56,7 +59,7 @@ class ConnectionInfo:
     connection_id: str
     queue: asyncio.Queue
     active: bool = True  # overridden by frontend immediately on ws.onopen
-    platform: str = "web"  # "web" | "android"
+    platform: str = "web"  # the client_info word: "web", or "android" for every app
     # Visible-but-input-idle: the dashboard is open on a screen nobody has
     # touched for ~5 min (the FE's `user_idle {away: true}`). Distinct from a
     # plain-idle HIDDEN tab: an away connection's toast/sound plays to an
@@ -99,7 +102,7 @@ NOTIFY_QUEUE_MAX = 1024
 _NOTIFY_EVICT_ORDER = (
     wire.CHAT_STATUS, wire.CHAT_READ,
     wire.INSTALL_PROGRESS, wire.INSTALL_HEARTBEAT, wire.TRANSFER_PROGRESS,
-    wire.WARMUP_HEARTBEAT, wire.SATELLITE_UPDATE_SYNC,
+    wire.CHAT_MOVE_PROGRESS, wire.WARMUP_HEARTBEAT, wire.SATELLITE_UPDATE_SYNC,
     wire.FILE_UPDATED, wire.CHAT_ROWS, wire.GOAL_UPDATE,
 )
 # Never evicted: the internal kinds carry turns and prompts, a notification
@@ -113,7 +116,7 @@ _NOTIFY_KEEP = frozenset({
     wire.TURN_COMPLETE, wire.BG_AGENT_DONE,
     wire.INSTALL_DONE, wire.INSTALL_FAILED, wire.MCP_INSTALL_FAILED,
     wire.TRANSFER_DONE, wire.TRANSFER_STATE, wire.TRANSFER_MACHINE_STATE,
-    wire.SATELLITE_UPDATED, wire.SATELLITE_UPDATE_FAILED,
+    wire.SATELLITE_UPDATED, wire.SATELLITE_UPDATE_FAILED, wire.CHAT_MOVED,
 })
 # The broadcast copies the drain discards (the acting socket holds its own
 # copy, ws/dashboard_server_events._DIRECT_COPY_ONLY): never queued.
@@ -126,7 +129,8 @@ def _notify_coalesce_key(frame: dict) -> tuple | None:
     """The key under which a queued frame is replaced by a newer one of the
     same kind, or None for a frame that is never coalesced."""
     t = frame.get("type")
-    if t in _NOTIFY_STATUS or t == wire.WARMUP_HEARTBEAT:
+    if t in _NOTIFY_STATUS or t in (wire.WARMUP_HEARTBEAT, wire.CHAT_ROWS,
+                                    wire.CHAT_MOVE_PROGRESS):
         return (t, frame.get("chat_id"))
     if t in (wire.INSTALL_PROGRESS, wire.INSTALL_HEARTBEAT):
         return (t, frame.get("machine_id"), frame.get("agent"))
@@ -140,11 +144,12 @@ def _notify_coalesce_key(frame: dict) -> tuple | None:
 class NotifyQueue(asyncio.Queue):
     """The per-connection notify queue, bounded.
 
-    Drained only between the viewed chat's turns, so a long turn beside a
+    Drained between the viewed chat's turns (a streaming socket runs only
+    the turn-free frames mid-turn and holds the rest), so a long turn beside a
     chatty broadcast source could grow it without limit. Three rules keep
-    it small before anything is lost: a status, read-receipt, progress or
-    heartbeat frame replaces the queued one of its key (in place, so order
-    holds); the two broadcast copies the drain discards are refused; and
+    it small before anything is lost: a status, read-receipt, progress,
+    heartbeat or chat-rows frame replaces the queued one of its key (in
+    place, so order holds); the two broadcast copies the drain discards are refused; and
     past ``NOTIFY_QUEUE_MAX`` the oldest frame of the least valuable kind
     present is evicted (``_NOTIFY_EVICT_ORDER``), never one of
     ``_NOTIFY_KEEP``. When only kept frames wait, a new evictable frame is
@@ -153,6 +158,11 @@ class NotifyQueue(asyncio.Queue):
     connection's drain then purges the queued status frames and sends a
     fresh ``chat_status_snapshot`` so the client's dots converge.
     """
+
+    # asyncio.Queue's own state, which this subclass reorders in place
+    # (typeshed declares none of it).
+    _queue: collections.deque[dict]
+    _getters: collections.deque[asyncio.Future]
 
     def __init__(self, bound: int = NOTIFY_QUEUE_MAX) -> None:
         super().__init__()
@@ -218,6 +228,18 @@ class NotifyQueue(asyncio.Queue):
         self._queue.extend(kept)
         self.stale = False
         return gone
+
+    def unget(self, items: list[dict]) -> None:
+        """``items`` back at the FRONT, in their order: a stream loop read
+        them during a turn and may not run them there (a server turn, the
+        viewed chat's own status). Past the bound they stay (each was
+        counted when it was first queued; an evictable one at the front is
+        the next victim of its kind), and a getter waiting on an empty
+        queue is woken."""
+        for item in reversed(items):
+            self._queue.appendleft(item)
+        if items:
+            self._wakeup_next(self._getters)  # type: ignore[attr-defined]  # typeshed omits asyncio.Queue's private _wakeup_next
 
 
 class LiveQueue:
@@ -303,7 +325,7 @@ def register_user_connection(
     connection_id: str,
     queue: asyncio.Queue,
     platform: str = "web",
-    live_queue: asyncio.Queue | None = None,
+    live_queue: "LiveQueue | None" = None,
 ) -> None:
     """Track a new WS connection for this user.
 
@@ -384,7 +406,7 @@ def user_focus(user_sub: str) -> dict | None:
     for c in _user_connections.get(user_sub, []):
         if c.focus and (best is None or c.focus_at > best.focus_at):
             best = c
-    return dict(best.focus) if best else None
+    return dict(cast("dict", best.focus)) if best else None
 
 
 def push_live(user_sub: str, frame: dict, *, connection_id: str | None = None) -> int:
@@ -576,7 +598,7 @@ async def _refresh_audience_job(agent: str, generation: int, getter) -> None:
     from storage.pg import run_db
     try:
         subs = tuple(await run_db(getter, agent))
-    except Exception:
+    except psycopg.Error:
         logger.warning("audience refresh of %s failed; serving the last list",
                        agent, exc_info=True)
         entry = _audience.get(agent)
@@ -676,7 +698,7 @@ def _schedule_audience_warmup() -> None:
         from storage.pg import run_db
         try:
             lists = await run_db(_read_all_audiences)
-        except Exception:
+        except psycopg.Error:
             logger.warning("audience warm-up failed; entries fill on first use", exc_info=True)
             return
         now = time.monotonic()
@@ -708,7 +730,7 @@ def chat_status_targets(owner_sub: str, agent: str) -> list[str]:
     if is_shared_chat_owner(owner_sub) or is_task_chat_owner(owner_sub):
         try:
             return agent_audience(agent, fan_out=True) if agent else []
-        except Exception:
+        except psycopg.Error:
             return []
     return [owner_sub] if owner_sub else []
 
@@ -731,17 +753,14 @@ def broadcast_chat_status(owner_sub: str, chat_id: str, status: str, agent: str 
     targets = chat_status_targets(owner_sub, agent)
     for sub in targets:
         for c in _user_connections.get(sub, []):
-            try:
-                c.queue.put_nowait({"type": wire.CHAT_STATUS, "chat_id": chat_id, "status": status})
-            except Exception as e:
-                logger.debug("chat_status broadcast: %s", e)
+            c.queue.put_nowait({"type": wire.CHAT_STATUS, "chat_id": chat_id, "status": status})
     # The catalog's ``sessions`` feed rides the live queue (drained during a
     # turn), never the notify queue above (drained between turns); the same
     # targets, so the fan-out is computed once.
     try:
-        from api.apps import catalog
+        from services.apps import catalog
         catalog.chat_status_changed(targets, chat_id, status, agent)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the catalog delta is best effort, the broadcast already went out
         logger.debug("catalog sessions delta: %s", e)
 
 
@@ -754,10 +773,7 @@ def broadcast_chat_read(owner_sub: str, chat_id: str, agent: str = "") -> None:
         return
     for sub in chat_status_targets(owner_sub, agent):
         for c in _user_connections.get(sub, []):
-            try:
-                c.queue.put_nowait({"type": wire.CHAT_READ, "chat_id": chat_id})
-            except Exception as e:
-                logger.debug("chat_read broadcast: %s", e)
+            c.queue.put_nowait({"type": wire.CHAT_READ, "chat_id": chat_id})
 
 
 def broadcast_engine_switched(
@@ -774,13 +790,55 @@ def broadcast_engine_switched(
         return
     for sub in chat_status_targets(owner_sub, agent):
         for c in _user_connections.get(sub, []):
-            try:
-                c.queue.put_nowait({
-                    "type": wire.ENGINE_SWITCHED, "chat_id": chat_id,
-                    "execution_path": execution_path, "model": model,
-                })
-            except Exception as e:
-                logger.debug("engine_switched broadcast: %s", e)
+            c.queue.put_nowait({
+                "type": wire.ENGINE_SWITCHED, "chat_id": chat_id,
+                "execution_path": execution_path, "model": model,
+            })
+
+
+def chat_focused_subs(chat_id: str) -> set[str]:
+    """The people with a tab that says it shows ``chat_id`` (the focus a
+    client sets: a caller checks each one's read access before trusting it)."""
+    return {sub for sub, conns in list(_user_connections.items())
+            for c in list(conns) if c.focus and c.focus.get("chat_id") == chat_id}
+
+
+def _send_move_frame(owner_sub: str, agent: str, actor_sub: str, frame: dict,
+                     readers: frozenset[str] | set[str]) -> None:
+    """One move frame to the chat's audience (``chat_status_targets``), the
+    person who moved it, and a focused tab of a person in ``readers`` (one who
+    may read the chat, checked by the caller: an admin reading a colleague's
+    chat)."""
+    chat_id = frame.get("chat_id") or ""
+    if not chat_id:
+        return
+    subs = set(chat_status_targets(owner_sub, agent))
+    if actor_sub:
+        subs.add(actor_sub)
+    for sub, conns in list(_user_connections.items()):
+        for c in list(conns):
+            focused = bool(c.focus and c.focus.get("chat_id") == chat_id)
+            if sub in subs or (focused and sub in readers):
+                c.queue.put_nowait(frame)
+
+
+def broadcast_chat_moved(owner_sub: str, agent: str, actor_sub: str, frame: dict, *,
+                         readers: frozenset[str] | set[str] = frozenset()) -> None:
+    """Tell every dashboard connection that sees a chat that it moved to
+    another place, or that its move did not finish (``frame``: the
+    ``chat_moved`` fields; the audience and ``readers`` as
+    ``_send_move_frame``). A viewing tab opens the chat again where it went;
+    the move's own socket gets no other answer. Best-effort."""
+    _send_move_frame(owner_sub, agent, actor_sub, {"type": wire.CHAT_MOVED, **frame}, readers)
+
+
+def broadcast_chat_move_progress(owner_sub: str, agent: str, actor_sub: str, frame: dict, *,
+                                 readers: frozenset[str] | set[str] = frozenset()) -> None:
+    """A running move's progress (``frame``: the ``chat_move_progress``
+    fields) to the same connections as ``chat_moved``. Not kept in a full
+    notify queue: the next frame, or the move's outcome, supersedes it."""
+    _send_move_frame(owner_sub, agent, actor_sub,
+                     {"type": wire.CHAT_MOVE_PROGRESS, **frame}, readers)
 
 
 def broadcast_goal_update(user_sub: str, chat_id: str, goal: dict | None) -> None:
@@ -793,10 +851,7 @@ def broadcast_goal_update(user_sub: str, chat_id: str, goal: dict | None) -> Non
     if not chat_id or not user_sub:
         return
     for c in _user_connections.get(user_sub, []):
-        try:
-            c.queue.put_nowait({"type": wire.GOAL_UPDATE, "chat_id": chat_id, "goal": goal})
-        except Exception as e:
-            logger.debug("goal_update broadcast: %s", e)
+        c.queue.put_nowait({"type": wire.GOAL_UPDATE, "chat_id": chat_id, "goal": goal})
 
 
 def broadcast_chat_rows(user_sub: str, chat_id: str, agent: str = "") -> None:
@@ -809,11 +864,8 @@ def broadcast_chat_rows(user_sub: str, chat_id: str, agent: str = "") -> None:
     if not chat_id or not user_sub:
         return
     for c in _user_connections.get(user_sub, []):
-        try:
-            c.queue.put_nowait(
-                {"type": wire.CHAT_ROWS, "chat_id": chat_id, "agent": agent})
-        except Exception as e:
-            logger.debug("chat_rows broadcast: %s", e)
+        c.queue.put_nowait(
+            {"type": wire.CHAT_ROWS, "chat_id": chat_id, "agent": agent})
 
 
 def broadcast_chat_title(user_sub: str, chat_id: str, title: str, agent: str = "") -> None:
@@ -829,16 +881,15 @@ def broadcast_chat_title(user_sub: str, chat_id: str, title: str, agent: str = "
         return
     for sub in chat_status_targets(user_sub, agent):
         for c in _user_connections.get(sub, []):
-            try:
-                c.queue.put_nowait({"type": wire.TITLE_UPDATED, "chat_id": chat_id, "title": title})
-            except Exception as e:
-                logger.debug("title_updated broadcast: %s", e)
+            c.queue.put_nowait({"type": wire.TITLE_UPDATED, "chat_id": chat_id, "title": title})
     # The catalog's ``sessions`` feed carries the title too (a chat created
-    # untitled is filled in when the title lands).
+    # untitled is filled in when the title lands). The row's agent as the
+    # caller holds it, an empty one included: the catalog reads the chat
+    # row only for a caller that passes none.
     try:
-        from api.apps import catalog
-        catalog.chat_meta_changed(chat_id, {"title": title}, owner=user_sub, agent=agent or None)
-    except Exception as e:
+        from services.apps import catalog
+        catalog.chat_meta_changed(chat_id, {"title": title}, owner=user_sub, agent=agent)
+    except Exception as e:  # noqa: BLE001  # the catalog delta is best effort, the broadcast already went out
         logger.debug("catalog sessions title delta: %s", e)
 
 
@@ -903,13 +954,15 @@ def resolve_targets(scope: str, target: str | None) -> list[str]:
 def agent_label(agent_slug: str | None) -> str:
     """Human label for an agent in notification text: the display name when
     the slug resolves, else the slug itself (never empty for a truthy slug).
-    Cached-dict read (``agent_store.get_agent``), safe on any thread."""
+    Cached-dict read (``agent_store.get_agent``), safe on any thread; a cold
+    cache loads the agents table, so a caller on the loop runs it in a
+    worker thread."""
     if not agent_slug:
         return ""
     try:
         from storage.agents import agent_store
         row = agent_store.get_agent(agent_slug)
-    except Exception:
+    except psycopg.Error:
         row = None
     return (row or {}).get("display_name") or agent_slug
 
@@ -955,7 +1008,7 @@ async def fire_notification(
     user_subs = await run_db(resolve_targets, scope, target)
     if not user_subs:
         logger.warning(
-            f"No targets resolved for notification: scope={scope}, target={target}"
+            "No targets resolved for notification: scope=%s, target=%s", scope, target
         )
         return []
 
@@ -1006,13 +1059,14 @@ async def fire_notification(
             await asyncio.to_thread(
                 notification_store.delete_notification, notification_id
             )
-            logger.debug(f"Cleaned up fired one-time notification: {notification_id}")
+            logger.debug("Cleaned up fired one-time notification: %s", notification_id)
 
     # The title is user-facing content (a window alert names the account and
     # its email): the log keeps the row id, not the text.
     logger.info(
-        f"Notification fired: id={notification_id or 'ephemeral'}, severity={severity}, "
-        f"scope={scope}, targets={len(deliveries)}"
+        "Notification fired: id=%s, severity=%s, "
+        "scope=%s, targets=%s",
+        notification_id or 'ephemeral', severity, scope, len(deliveries)
     )
     return deliveries
 
@@ -1025,7 +1079,7 @@ def _install_id() -> str:
     try:
         from services.billing.relay_client import get_install_id
         return get_install_id()
-    except Exception:
+    except (ImportError, psycopg.Error):
         return ""
 
 
@@ -1178,7 +1232,7 @@ async def fire_ephemeral(
             for c in get_all_connections(user_sub):
                 if c.platform != "web":
                     continue
-                if origin_away and c.connection_id == origin[0]:
+                if origin_away and c.connection_id == cast("tuple[str, str]", origin)[0]:
                     continue
                 await _safe_put(c.queue, frame)
     elif (not origin or origin_away) and has_active_connection(user_sub):
@@ -1205,11 +1259,11 @@ async def fire_ephemeral(
                     click_url = (f"/chat/{_agent}/{chat_id}?tasks=1"
                                  if session_kind.is_task_chat_id(chat_id)
                                  else f"/chat/{_agent}/{chat_id}")
-            except Exception:
+            except psycopg.Error:
                 pass  # link is best-effort — the push itself still matters
         subscriptions = await run_db(ns.get_push_subscriptions, user_sub)
-        android = [s for s in subscriptions if s["platform"] == "android"]
-        _tokens = len(android)
+        native = [s for s in subscriptions if s["platform"] in push_sender.NATIVE_PUSH_PLATFORMS]
+        _tokens = len(native)
         payload = {
             "title": title,
             "body": body,
@@ -1222,14 +1276,14 @@ async def fire_ephemeral(
 
         async def _push(sub: dict) -> bool:
             async with slot:
-                return await push_sender.send_fcm(sub["subscription_data"], payload)
+                return await push_sender.send_fcm(sub["subscription_data"], payload, sub["platform"])
 
-        _ok = sum(1 for r in await asyncio.gather(*(_push(s) for s in android),
+        _ok = sum(1 for r in await asyncio.gather(*(_push(s) for s in native),
                                                    return_exceptions=True) if r is True)
-        _route(f"native push — android tokens={_tokens} sent={_ok}"
-               + ("" if _tokens else " (no Android push registration for this user)"))
-    except Exception as e:
-        logger.warning(f"Failed to send ephemeral push to {user_sub}: {e}")
+        _route(f"native push — app tokens={_tokens} sent={_ok}"
+               + ("" if _tokens else " (no app push registration for this user)"))
+    except Exception as e:  # noqa: BLE001  # the push is best effort, the in-app notification stands
+        logger.warning("Failed to send ephemeral push to %s: %s", user_sub, e)
 
 
 def _build_delivery_payload(delivery: dict) -> dict:
@@ -1255,8 +1309,8 @@ async def _safe_put(queue: asyncio.Queue, message: dict) -> bool:
     try:
         await queue.put(message)
         return True
-    except Exception as e:
-        logger.debug(f"WS queue put failed: {e}")
+    except RuntimeError as e:
+        logger.debug("WS queue put failed: %s", e)
         return False
 
 
@@ -1317,7 +1371,7 @@ async def broadcast_file_updated(
             entry["source"] = "disk" if "disk" in (entry["source"], source) else source
             entry["pin"] = entry["pin"] or bool(pin)
             entry["exclude"] &= excluded
-    except Exception:
+    except RuntimeError:
         logger.debug("broadcast_file_updated failed for %s/%s", agent_slug, rel_path, exc_info=True)
 
 
@@ -1381,7 +1435,7 @@ async def _send_file_updates(agent_slug: str, paths: dict[str, dict]) -> None:
             # file_id without a path round-trip.
             return base64.urlsafe_b64encode(f"{agent_slug}/{rel_path}".encode()).decode().rstrip("=")
 
-        from api.apps import catalog
+        from services.apps import catalog
         reached: set[str] = set()
         # The pins and the Collabora saves first (a pins list and an open
         # preview match their path; a tree view matches any frame), then
@@ -1423,7 +1477,7 @@ async def _send_file_updates(agent_slug: str, paths: dict[str, dict]) -> None:
                 catalog.file_changed(told, agent_slug, rel_path,
                                      file_id=msg["file_id"] if entry["source"] == "collabora" else "",
                                      source=entry["source"])
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # the catalog delta is best effort, the broadcast already went out
                 logger.debug("catalog file_changes delta: %s", e)
         if reached:
             summary = {"type": wire.FILE_UPDATED, "agent_slug": agent_slug,
@@ -1431,7 +1485,7 @@ async def _send_file_updates(agent_slug: str, paths: dict[str, dict]) -> None:
             for user_sub in reached:
                 for c in _user_connections.get(user_sub, []):
                     await _put_file_frame(c, summary)
-    except Exception:
+    except Exception:  # noqa: BLE001  # the batch flush runs as a timer's task: its error would vanish
         logger.debug("file_updated batch for %s failed", agent_slug, exc_info=True)
 
 
@@ -1451,9 +1505,9 @@ async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
     inactive_conns = [c for c in all_conns if not c.active]
     # The catalog's ``notifications`` feed (apps showing the viewer's inbox).
     try:
-        from api.apps import catalog
+        from services.apps import catalog
         catalog.notification_delivered(user_sub, delivery)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the catalog delta is best effort, the broadcast already went out
         logger.debug("catalog notifications delta: %s", e)
 
     if active_conns:
@@ -1462,8 +1516,9 @@ async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
             ok = await _safe_put(c.queue, {"type": wire.NOTIFICATION, "delivery": payload})
             if ok:
                 logger.debug(
-                    f"Notification delivered via WS (active) to {user_sub} "
-                    f"conn={c.connection_id[:8]} platform={c.platform}: {delivery['title']}"
+                    "Notification delivered via WS (active) to %s "
+                    "conn=%s platform=%s: %s",
+                    user_sub, c.connection_id[:8], c.platform, delivery['title']
                 )
         # Silent inbox update to any inactive WS so its badge stays in sync.
         for c in inactive_conns:
@@ -1492,8 +1547,9 @@ async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
             click_url = "/"
         await push_sender.send_to_user(user_sub, {
             # Native push has no agent header → the display name rides the
-            # title (in-app rows keep the raw title + a header, see push_title).
-            "title": push_title(delivery["title"], _agent),
+            # title (in-app rows keep the raw title + a header, see push_title);
+            # the agent's row on a cold cache is a store read.
+            "title": await run_db(push_title, delivery["title"], _agent),
             "body": delivery["body"],
             "delivery_id": delivery["id"],
             "severity": delivery["severity"],
@@ -1502,11 +1558,11 @@ async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
         })
         push_attempted = True
         logger.debug(
-            f"Notification delivered via native push to {user_sub} "
-            f"(no active connection): {delivery['title']}"
+            "Notification delivered via native push to %s "
+            "(no active connection): %s", user_sub, delivery['title']
         )
-    except Exception as e:
-        logger.warning(f"Push delivery failed to {user_sub}: {e}")
+    except Exception as e:  # noqa: BLE001  # the push is best effort, the delivery row stands
+        logger.warning("Push delivery failed to %s: %s", user_sub, e)
 
     # Silent inbox update to all connected-but-inactive WSes so the badge/inbox stay current
     # when the user returns to the dashboard.
@@ -1514,7 +1570,7 @@ async def _deliver_to_user(user_sub: str, delivery: dict) -> None:
         await _safe_put(c.queue, {"type": wire.NOTIFICATION_SILENT, "delivery": payload})
 
     if not all_conns and not push_attempted:
-        logger.debug(f"No delivery channel for {user_sub} — entry remains in DB inbox only")
+        logger.debug("No delivery channel for %s — entry remains in DB inbox only", user_sub)
 
 
 # --- Scheduling ---
@@ -1558,7 +1614,7 @@ def _schedule_all_notifications() -> None:
             scheduled += 1
 
     if scheduled:
-        logger.info(f"Scheduled {scheduled} notifications")
+        logger.info("Scheduled %s notifications", scheduled)
 
 
 def _register_notification(notif: dict) -> bool:
@@ -1578,8 +1634,8 @@ def _register_notification(notif: dict) -> bool:
     tz_name = notif.get("user_tz") or config.get_platform_timezone()
     try:
         notif_tz = zoneinfo.ZoneInfo(tz_name)
-    except Exception:
-        logger.warning(f"Invalid user_tz {tz_name!r} on notification {notif['id']}; using platform TZ")
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, TypeError):
+        logger.warning("Invalid user_tz %r on notification %s; using platform TZ", tz_name, notif['id'])
         notif_tz = config.get_platform_tz()
 
     try:
@@ -1602,7 +1658,7 @@ def _register_notification(notif: dict) -> bool:
                 # snapshot or platform fallback). Agents write local time.
                 run_date = run_date.replace(tzinfo=notif_tz)
             if run_date < datetime.now(run_date.tzinfo):
-                logger.debug(f"Skipping past notification: {notif['id']}")
+                logger.debug("Skipping past notification: %s", notif['id'])
                 return False
             trigger = DateTrigger(run_date=run_date)
         else:
@@ -1620,8 +1676,8 @@ def _register_notification(notif: dict) -> bool:
             replace_existing=True,
         )
         return True
-    except Exception as e:
-        logger.warning(f"Failed to schedule notification {notif['id']}: {e}")
+    except Exception as e:  # noqa: BLE001  # one notification's registration: a bad row must not stop the load
+        logger.warning("Failed to schedule notification %s: %s", notif['id'], e)
         return False
 
 
@@ -1743,14 +1799,16 @@ async def update_notification(notification_id: str, fields: dict) -> tuple[bool,
     if "user_tz" in payload and payload["user_tz"] is not None:
         try:
             zoneinfo.ZoneInfo(payload["user_tz"])
-        except Exception as e:
-            return False, f"Invalid user_tz: {e}"
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError, TypeError) as e:
+            logger.warning("Edit of notification %s refused, time zone %r: %s",
+                           notification_id, payload["user_tz"], e)
+            return False, "That time zone is not known. Use a name like Europe/Athens."
         edit_tz_name = payload["user_tz"]
     else:
         edit_tz_name = notif.get("user_tz") or config.get_platform_timezone()
     try:
         edit_tz = zoneinfo.ZoneInfo(edit_tz_name)
-    except Exception:
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, TypeError):
         edit_tz = config.get_platform_tz()
 
     # Validate cron string against the post-edit TZ (build_cron_trigger, so
@@ -1758,8 +1816,10 @@ async def update_notification(notification_id: str, fields: dict) -> tuple[bool,
     if "schedule" in payload and payload["schedule"] is not None:
         try:
             scheduler_triggers.build_cron_trigger(payload["schedule"], edit_tz)
-        except Exception as e:
-            return False, f"Invalid cron schedule: {e}"
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.warning("Edit of notification %s refused, cron %r: %s",
+                           notification_id, payload["schedule"], e)
+            return False, "That schedule is not a valid cron line. Example: 0 9 * * 1."
 
     # Validate ISO datetime — naive interpreted in post-edit TZ (user_tz or
     # platform fallback). Aligns with _register_notification's behaviour.
@@ -1768,8 +1828,10 @@ async def update_notification(notification_id: str, fields: dict) -> tuple[bool,
             run_date = datetime.fromisoformat(payload["run_at"])
             if run_date.tzinfo is None:
                 payload["run_at"] = run_date.replace(tzinfo=edit_tz).isoformat()
-        except Exception as e:
-            return False, f"Invalid run_at: {e}"
+        except (ValueError, TypeError) as e:
+            logger.warning("Edit of notification %s refused, run_at %r: %s",
+                           notification_id, payload["run_at"], e)
+            return False, "That time is not valid. Use a date and time like 2026-10-18T09:00."
 
     # Validate interval bounds when present (lazy import to keep this module
     # cheap to import for the standalone scheduler path).

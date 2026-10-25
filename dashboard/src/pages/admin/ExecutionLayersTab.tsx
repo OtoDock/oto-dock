@@ -8,7 +8,7 @@
  * - Models (builtin + custom) with enable/disable toggles
  */
 
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import {
   useAdminExecutionLayers,
   useDiscoverModels,
@@ -16,7 +16,7 @@ import {
   type Subscription,
   type DiscoveredModel,
 } from '../../api/executionLayers'
-import { Badge } from './ExecutionLayersTab.widgets'
+import { Badge } from '../../components/ui/SettingsControls'
 import { AddApiKeyForm, ConnectOAuth, DiscoverModelsPanel } from './ExecutionLayersTab.forms'
 import { LocalModelsSection } from './ExecutionLayersTab.local'
 import { SubscriptionRow, ModelsByProvider } from './ExecutionLayersTab.rows'
@@ -27,6 +27,7 @@ import {
   keyProviders, sortEngineRows, supportsOAuth, vendorBadge,
 } from '../../lib/engines'
 import { ENGINE_SUBSCRIPTION_STATUS } from '../../lib/status/engineSubscription'
+import { CARD } from '../../components/ui/classes'
 
 // ---------------------------------------------------------------------------
 // Layer Card
@@ -89,32 +90,32 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
     )
   }
 
-  // The discover panel (loading / error / results) renders under the list it
-  // was launched from: below the key rows for a key subscription, below the
-  // shared Local models section for a local endpoint — a panel ABOVE the
-  // section read as belonging to the key list (operator feedback 2026-09-06).
+  // The discover panel (loading / error / results) renders under the row it
+  // was launched from: a key row, or a local server's row in the shared Local
+  // models section. Under a whole list it would open out of sight, and above
+  // the local section it would read as the key list's.
   const isLocalDiscover = discoverState != null && isLocalProvider(engine, discoverState.provider)
   const discoverPanel = discoverState ? (
     <>
       {/* Discover models: loading state */}
       {!discoverState.models && (
-        <div className="mt-3 p-4 bg-p-bg rounded-xl border border-p-border-light">
+        <div className="mt-3 p-4 bg-surface-sunken rounded-card">
           {discoverMut.isPending ? (
             <div className="flex items-center gap-3">
-              <svg className="animate-spin h-4 w-4 text-brand" fill="none" viewBox="0 0 24 24">
+              <svg className="animate-spin h-4 w-4 text-secondary" fill="none" viewBox="0 0 24 24">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
               </svg>
-              <span className="text-sm text-p-text-secondary">
+              <span className="text-sm text-secondary">
                 Fetching models from {discoverState.provider}...
               </span>
             </div>
           ) : discoverMut.isError ? (
             <div className="space-y-2">
-              <p className="text-sm text-red-500">{(discoverMut.error as Error).message}</p>
+              <p className="text-sm text-status-danger-fg">{(discoverMut.error as Error).message}</p>
               <button
                 onClick={() => setDiscoverState(null)}
-                className="text-xs text-p-text-secondary hover:text-p-text transition-colors"
+                className="text-xs text-secondary hover:text-primary transition-colors"
               >
                 Dismiss
               </button>
@@ -138,32 +139,34 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
   ) : null
 
   return (
-    <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light overflow-hidden">
+    <div className={`${CARD} overflow-hidden`}>
       {/* Header */}
       <button
+        type="button"
+        aria-expanded={expanded}
         onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center justify-between px-4 sm:px-5 py-3 sm:py-4 text-left hover:bg-p-bg-hover/30 transition-colors"
+        className="w-full flex items-center justify-between px-4 sm:px-5 py-3 sm:py-4 text-left hover:bg-surface-hover transition-colors"
       >
         <div className="flex flex-wrap items-center gap-2 sm:gap-3 min-w-0">
           {vendor && (
-            <span className="shrink-0 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-p-bg text-p-text-secondary border border-p-border-light">
+            <span className="shrink-0 text-3xs font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-surface-muted text-secondary">
               {vendor}
             </span>
           )}
-          <h3 className="text-sm font-semibold text-p-text">{label}</h3>
-          <Badge variant={activeSubs > 0 ? 'green' : 'default'}>
+          <h3 className="text-sm font-semibold text-primary">{label}</h3>
+          <Badge variant={activeSubs > 0 ? 'success' : 'neutral'}>
             {[
               hostedCount > 0 && `${hostedCount} hosted`,
-              oauthCount > 0 && `${oauthCount} sub${oauthCount !== 1 ? 's' : ''}`,
+              oauthCount > 0 && `${oauthCount} subscription${oauthCount !== 1 ? 's' : ''}`,
               apiKeyCount > 0 && `${apiKeyCount} key${apiKeyCount !== 1 ? 's' : ''}`,
             ].filter(Boolean).join(', ') || 'No connections'}
           </Badge>
           {layer.subscriptions.user_count > 0 && (
-            <span className="text-xs text-p-text-light hidden sm:inline">{layer.subscriptions.user_count} user sub{layer.subscriptions.user_count !== 1 ? 's' : ''}</span>
+            <span className="text-xs text-tertiary hidden sm:inline">{layer.subscriptions.user_count} user subscription{layer.subscriptions.user_count !== 1 ? 's' : ''}</span>
           )}
         </div>
         <svg
-          className={`w-4 h-4 text-p-text-secondary transition-transform shrink-0 ${expanded ? 'rotate-180' : ''}`}
+          className={`w-4 h-4 text-secondary transition-transform shrink-0 ${expanded ? 'rotate-180' : ''}`}
           fill="none" viewBox="0 0 24 24" stroke="currentColor"
         >
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
@@ -172,32 +175,37 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
 
       {/* Body */}
       {expanded && (
-        <div className="px-4 sm:px-5 pb-4 sm:pb-5 space-y-5 border-t border-p-border-light pt-4">
+        <div className="px-4 sm:px-5 pb-4 sm:pb-5 space-y-5 border-t border-subtle pt-4">
 
           {/* Subscriptions Section — bring-your-own credentials */}
           <div>
             <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-              <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider">{relayCapable ? 'Bring your own key' : 'Subscriptions'}</h4>
+              <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider">{relayCapable ? 'Bring your own key' : 'Subscriptions'}</h4>
               <div className="flex flex-wrap gap-2">
                 {supportsOAuth(engine) && (
                   <button
                     onClick={() => { setShowOAuth(!showOAuth); setShowAddApiKey(false) }}
-                    className="text-xs text-brand hover:text-brand-hover transition-colors"
+                    className="text-xs text-link hover:text-link-hover transition-colors"
                   >
                     + Connect Account
                   </button>
                 )}
                 <button
                   onClick={() => { setShowAddApiKey(!showAddApiKey); setShowOAuth(false) }}
-                  className="text-xs text-brand hover:text-brand-hover transition-colors"
+                  className="text-xs text-link hover:text-link-hover transition-colors"
                 >
                   + API Key
                 </button>
               </div>
             </div>
 
+            {/* The key form opens under its button, above the rows. */}
+            {showAddApiKey && (
+              <AddApiKeyForm layer={layer.name} providers={providers} onDone={() => setShowAddApiKey(false)} />
+            )}
+
             {rowSubs.length === 0 && !showAddApiKey && !showOAuth && (
-              <p className="text-sm text-p-text-light py-2">
+              <p className="text-sm text-tertiary py-2">
                 {relayCapable
                   ? 'No API keys configured.'
                   : 'No platform subscriptions configured.'}
@@ -206,26 +214,23 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
 
             <div className="space-y-0.5">
               {rowSubs.map((sub) => (
-                <SubscriptionRow
-                  key={sub.id}
-                  sub={sub}
-                  layer={layer.name}
-                  vendorId={engine.identity.vendor_id}
-                  onDiscover={handleDiscover}
-                />
+                <Fragment key={sub.id}>
+                  <SubscriptionRow
+                    sub={sub}
+                    layer={layer.name}
+                    vendorId={engine.identity.vendor_id}
+                    onDiscover={handleDiscover}
+                  />
+                  {!isLocalDiscover && discoverState?.sub.id === sub.id && discoverPanel}
+                </Fragment>
               ))}
             </div>
             <BalanceHint oauthCount={rowSubs.filter((s) => s.auth_type === 'oauth' && s.status === ENGINE_SUBSCRIPTION_STATUS.ACTIVE).length} />
 
+            {/* A connect is several steps: it opens in a dialog. */}
             {showOAuth && (
               <ConnectOAuth engine={engine} ownerType="platform" onDone={() => setShowOAuth(false)} />
             )}
-            {showAddApiKey && (
-              <AddApiKeyForm layer={layer.name} providers={providers} onDone={() => setShowAddApiKey(false)} />
-            )}
-
-            {/* Discover panel for a key subscription — under the key rows */}
-            {!isLocalDiscover && discoverPanel}
           </div>
 
           {/* Local models — shared across the engines that dial OpenAI-compatible servers */}
@@ -236,16 +241,15 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
                 onDiscover={(t) => handleDiscover(
                   { id: t.id, provider: t.provider, layer: layer.name } as Subscription, t.layers,
                 )}
+                belowRow={(id) => (isLocalDiscover && discoverState?.sub.id === id ? discoverPanel : null)}
               />
-              {/* Discover panel for a local endpoint — under the section it came from */}
-              {isLocalDiscover && discoverPanel}
             </div>
           )}
 
           {/* Models Section */}
           <div>
             <div className="flex items-center justify-between mb-2">
-              <h4 className="text-xs font-semibold text-p-text-secondary uppercase tracking-wider">Models</h4>
+              <h4 className="text-xs font-semibold text-secondary uppercase tracking-wider">Models</h4>
             </div>
 
             <ModelsByProvider
@@ -271,9 +275,9 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
 export default function ExecutionLayersTab() {
   const { data: layers, isLoading, error } = useAdminExecutionLayers()
 
-  if (isLoading) return <p className="text-sm text-p-text-secondary">Loading execution layers...</p>
-  if (error) return <p className="text-sm text-red-500">Failed to load execution layers.</p>
-  if (!layers || layers.length === 0) return <p className="text-sm text-p-text-secondary">No execution layers found.</p>
+  if (isLoading) return <p className="text-sm text-secondary">Loading AI engines...</p>
+  if (error) return <p className="text-sm text-status-danger-fg">Could not load the AI engines. Try again in a minute.</p>
+  if (!layers || layers.length === 0) return <p className="text-sm text-secondary">No AI engines found.</p>
 
   // The engines in their declared order (`identity.sort_order`: the coding
   // engines first, the supporting one — title gen / phone classifier — last).
@@ -288,11 +292,11 @@ export default function ExecutionLayersTab() {
   return (
     <div className="space-y-4">
       {!codingReady && <SetupBanner engines={codingEngineNames(layers.map((l) => l.capabilities))} />}
-      <p className="text-sm text-p-text-light">
-        Configure the platform's Anthropic and OpenAI subscriptions (used for
-        agent-scoped tasks and chats) plus API keys and models for each AI engine.
-        Users connect their own subscriptions for their own chats in User Settings;
-        platform API keys are available to users you've granted platform auth.
+      <p className="text-sm text-tertiary">
+        Set up the shared Anthropic and OpenAI subscriptions your agents use for
+        tasks and chats. Add API keys and models for each AI engine. People connect
+        their own subscriptions for their own chats in User Settings, AI Engines.
+        In Admin, Users, the Platform API switch lets a person use these API keys.
       </p>
       {orderedLayers.map((layer) => (
         <LayerCard key={layer.name} layer={layer} />

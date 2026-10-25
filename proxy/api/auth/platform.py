@@ -4,22 +4,27 @@ Admin-only configuration surface plus the user-paired-disable cascade.
 Attaches to the shared core-auth router."""
 
 import asyncio
+import contextlib
 import logging
 
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 
 import config
-from core import placement
-from auth.license import get_current_license, get_license_key, set_license_key
+from api.auth._router import router
 from auth import lan_check
-from auth.providers import UserContext, get_current_user, mask_email, require_admin, require_auth
+from auth.license import get_current_license, get_license_key, set_license_key
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    mask_email,
+    require_admin,
+    require_auth,
+)
+from core import placement
+from core.background import spawn
 from storage import database as task_store
 from storage.pg import run_db
-
-from api.auth._router import router
-import contextlib
-from core.background import spawn
 
 logger = logging.getLogger("otodock")
 
@@ -532,7 +537,7 @@ async def set_platform_settings(
             task_store.set_platform_setting,
             "passkey_login_mode", req.passkey_login_mode,
         )
-    logger.info(f"Admin {mask_email(u.email)} updated platform settings")
+    logger.info("Admin %s updated platform settings", mask_email(u.email))
     return {"status": "updated"}
 
 
@@ -560,9 +565,9 @@ async def set_license(
         # Key changed/cleared → free the old binding + drop cached activation.
         try:
             await relay_client.deactivate_license(old_key)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # releasing the old key on the relay, the binding is cleared locally
             # Best-effort — relay may be unbuilt/unreachable; binding is cleared locally.
-            logger.debug(f"License deactivation for the old key failed: {exc}")
+            logger.debug("License deactivation for the old key failed: %s", exc)
         for k in ("license_activation_receipt", "license_check_status",
                   "license_last_ok_at", "license_last_check_at"):
             await asyncio.to_thread(task_store.set_platform_setting, k, "")
@@ -585,13 +590,13 @@ async def set_license(
             except relay_client.RelayError as e:
                 message = relay_client.relay_error_message(e.code)
             except relay_client.RelayNotConfigured:
-                message = "Saved — activation completes once the OtoDock relay is available."
+                message = "Saved. The license activates once OtoDock can be reached."
             except Exception:
                 logger.exception("License activation failed")
-                message = "Saved, but activation failed; it will retry automatically."
+                message = "Saved. Activation failed, and it will try again by itself."
 
     lic_now = await asyncio.to_thread(get_current_license)
-    logger.info(f"Admin {mask_email(u.email)} updated the platform license")
+    logger.info("Admin %s updated the platform license", mask_email(u.email))
     return {"message": message, "status": lic_now.status,
             "activation_state": lic_now.activation_state}
 
@@ -611,14 +616,14 @@ async def deactivate_license_binding(
     if key:
         try:
             await relay_client.deactivate_license(key)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # releasing the binding on the relay, the cached activation clears
             # Best-effort — the cached activation is cleared regardless.
-            logger.debug(f"License deactivation failed: {exc}")
+            logger.debug("License deactivation failed: %s", exc)
     for k in ("license_activation_receipt", "license_check_status",
               "license_last_ok_at", "license_last_check_at"):
         await asyncio.to_thread(task_store.set_platform_setting, k, "")
     lic_now = await asyncio.to_thread(get_current_license)
-    logger.info(f"Admin {mask_email(u.email)} deactivated the platform license binding")
+    logger.info("Admin %s deactivated the platform license binding", mask_email(u.email))
     return {"status": lic_now.status, "activation_state": lic_now.activation_state}
 
 

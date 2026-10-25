@@ -93,7 +93,7 @@ describe('AgentChecks', () => {
     expect(screen.getByTestId('check-agent:coding').textContent).toContain('mandatory')
     expect(screen.getByTestId('check-agent:coding').textContent).toContain('writes code; on a commit')
     expect(screen.getByTestId('check-agent:style').textContent).toContain('offered')
-    expect(screen.getByTestId('check-agent:style').textContent).toContain('needs a fix')
+    expect(screen.getByTestId('check-agent:style').textContent).toContain('Needs a fix')
     expect(screen.getByTestId('check-agent:style').textContent).toContain('reports only')
     expect(screen.getByTestId('check-user:review').textContent).toContain('mine')
     expect(screen.getByTestId('check-user:review').textContent).toContain('every turn')

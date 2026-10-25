@@ -15,8 +15,7 @@ import uuid
 
 import pytest
 
-from core.layers.cli import layer as cli_layer_mod
-from core.layers.cli import session as cli_session_mod
+from core.layers.cli import layer as cli_layer_mod, session as cli_session_mod
 from core.layers.cli.layer import CLIExecutionLayer
 from core.layers.cli.session import PersistentSession, _persistent_sessions
 

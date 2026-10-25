@@ -7,11 +7,17 @@ to the dashboard chat via _push_image_preview. Optionally saves to file.
 import io
 
 import matplotlib
+
 matplotlib.use("Agg")  # Non-interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
 
-from shared import _push_image_preview, _resolve_path, _to_agents_relative, safe_open_write
+from shared import (
+    _push_image_preview,
+    _resolve_path,
+    _to_agents_relative,
+    safe_open_write,
+)
 
 # ---------------------------------------------------------------------------
 # Default styling
@@ -451,7 +457,7 @@ async def handle_create_chart(args: dict) -> str:
 
         try:
             renderer()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # matplotlib on the caller's data raises anything from a renderer
             plt.close(fig)
             return f"Error rendering {chart_type} chart: {exc}"
 
@@ -486,7 +492,7 @@ async def handle_create_chart(args: dict) -> str:
             with safe_open_write(out) as fh:
                 fh.write(png_bytes)
             saved_msg = f" Saved to: {_to_agents_relative(out)}"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # a failed save is reported beside the chart, never a failed tool
             saved_msg = f" Save failed: {exc}"
 
     # Push inline to dashboard

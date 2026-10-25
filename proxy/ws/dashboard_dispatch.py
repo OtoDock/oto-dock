@@ -2,7 +2,8 @@
 walked by both socket loops — the between-turns loop in ``ws/dashboard.py``
 and the streaming loop in ``ws/dashboard_chat_stream.py``.
 
-Every inbound message name maps to one ``_on_<name>`` method here, called
+Every inbound message name maps to one ``_on_<name>`` method here (the
+four prompt answers on ``PromptController``, ws/dashboard_prompts.py), called
 as ``handler(msg)`` between turns and ``handler(msg, stream=StreamCtx)``
 while a turn streams; the table's ``mid_stream`` policy says which
 messages the streaming loop hands to the handler (``SAME``), which make it
@@ -17,36 +18,37 @@ with the connection's full attribute state; nothing here is standalone.
 """
 
 import asyncio
-import contextlib
 import base64
+import contextlib
 import functools
 import logging
-from typing import TYPE_CHECKING, NamedTuple
+import struct
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
+
+import psycopg
 
 import config
-from core import placement
-from storage import database as task_store
-from storage.pg import run_db
-from storage.automation import notification_store
-from services.notifications import notification_manager
+from auth import roles
 from core.events import chat_writer, input_queue
-from core.session.session_state import (
-    set_session_mode,
-    resolve_permission,
-    resolve_question,
-    resolve_location,
-    set_user_tz,
-    set_session_user_tz,
-    clear_session_liveness,
-)
-from core.session.session_manager import get_layer_capabilities, resolve_execution_path
 from core.events.common_events import TurnInput
 from core.events.stream_pump import _active_pumps, _pending_permissions
-from core.session import session_kind, visibility as _vis, interactive_session
-from auth import roles
-from ws import wire_events as wire
+from core.session import interactive_session, session_kind, visibility as _vis
+from core.session.session_manager import get_layer_capabilities, resolve_execution_path
+from core.session.session_state import (
+    clear_session_liveness,
+    set_session_user_tz,
+    set_user_tz,
+)
+from services.notifications import notification_manager
+from services.remote import chat_move
+from storage import database as task_store
+from storage.automation import notification_store
+from storage.pg import run_db
+from ws import dashboard_chat_move, wire_events as wire
 
 if TYPE_CHECKING:
+    from core.events.stream_pump import ChatStreamPump
+    from core.execution_layer import ExecutionLayer
     from ws.dashboard_host import DashboardHost as _Host
 else:
     _Host = object
@@ -59,7 +61,7 @@ class StreamCtx(NamedTuple):
     subscription queue on it, and the viewed-chat tag every frame the loop
     emits carries (``self.chat_id or pump.chat_id``, computed once)."""
 
-    pump: object
+    pump: "ChatStreamPump"
     queue: asyncio.Queue
     chat_id: str
 
@@ -86,6 +88,15 @@ class ClientMessageDispatcher(_Host):
     """The client-message handlers, one per inbound name, reached through
     ``wire.INBOUND`` by both socket loops."""
 
+    # The connection state this mixin assigns, declared where it assigns it:
+    # the type checker reads an attribute a mixin assigns from the mixin
+    # first. Annotations only (strings), no class attributes.
+    _pre_warmup_task: "asyncio.Task | None"
+    _warmup_abort_chat: "str | None"
+    implementing_plan: "str"
+    layer: "ExecutionLayer | None"
+    session_id: "str | None"
+
     async def _dispatch_client_message(self, msg: dict) -> str | None:
         """The between-turns walk: the table names the handler; an unknown
         name is refused with the same frame it always was."""
@@ -93,6 +104,11 @@ class ClientMessageDispatcher(_Host):
         spec = wire.INBOUND.get(msg_type)
         if spec is None:
             await self._send_error(f"Unknown message type: {msg_type}")
+            return None
+        if spec.drives and (sentence := await dashboard_chat_move.drive_refusal(
+                self, msg.get("chat_id") or self.chat_id)):
+            # The chat's live session sits on another person's computer.
+            await self._send_error(sentence)
             return None
         return await getattr(self, spec.handler)(msg)
 
@@ -112,6 +128,17 @@ class ClientMessageDispatcher(_Host):
 
     async def _on_warmup(self, msg: dict, *, stream: StreamCtx | None = None):
         prev_sid = self.session_id
+        cid = msg.get("chat_id") or ""
+        if cid and not await dashboard_chat_move.before_drive(self, cid):
+            return None
+        if cid and chat_move.moving(cid):
+            # A hand-over moves the chat first: its first message waits in
+            # the chat's queue behind the move, and the page opens the chat
+            # again where it went.
+            if msg.get("text") or msg.get("images") or msg.get("files"):
+                self.chat_id = cid
+                await self._handle_chat({**msg, "type": wire.IN_CHAT})
+            return None
         await self._handle_warmup(msg)
         self._view_only = bool(await self._deny_task_continue(self.chat_id, quiet=True))
         # Same-chat warm: a fresh sid supersedes the previous one.
@@ -138,7 +165,7 @@ class ClientMessageDispatcher(_Host):
         return None
 
     async def _on_close(self, msg: dict, *, stream: StreamCtx | None = None):
-        logger.info(f"WS dashboard close: session={self.session_id}, chat={self.chat_id}")
+        logger.info("WS dashboard close: session=%s, chat=%s", self.session_id, self.chat_id)
         return wire.HANDLED_CLOSE
 
     async def _on_ping(self, msg: dict, *, stream: StreamCtx | None = None):
@@ -163,6 +190,9 @@ class ClientMessageDispatcher(_Host):
                 return None
             if not (text or images or files):
                 return None
+            if input_queue.deleting(pump.chat_id):
+                await self._refuse_input("This chat was deleted.", str(msg.get("queue_id") or ""))
+                return None
             # The chat's queue (the pump's chat: the one its producer drains).
             # A re-send after a reconnect is answered once: a message still
             # waiting re-announces its chip, one a turn already took is done.
@@ -178,12 +208,12 @@ class ClientMessageDispatcher(_Host):
                 queue_id = input_queue.mint_queue_id()
             if queue_id in q.accepted:
                 return None
-            # Same task continue-gate the between-turns/warmup/
-            # permission paths enforce — WITHOUT it a viewer of a
-            # shared-only agent's task chat could steer/queue into a
-            # running task run they're not allowed to continue
-            # (Codex steer injects into the live turn). Applies only
-            # to task-{run} chats; a no-op for regular chats.
+            # Same drive gate the between-turns/warmup/permission paths
+            # enforce: WITHOUT it a viewer of a shared-only agent's task
+            # chat could steer/queue into a running task run they're not
+            # allowed to continue (Codex steer injects into the live
+            # turn), and a person could steer a chat whose live session
+            # sits on another person's computer (the placement lock).
             if await self._deny_task_continue(pump.chat_id):
                 return None
             # The busy send carries exactly what an idle send does: the
@@ -192,7 +222,7 @@ class ClientMessageDispatcher(_Host):
             # an attach viewer may hold a different session id than the
             # streaming turn).
             item = await self._prepare_turn_input(
-                text, images, files, session_id=pump.session_id,
+                text, images, files, session_id=pump.session_id, queue_id=queue_id,
             )
             if item is None:
                 return None
@@ -213,7 +243,9 @@ class ClientMessageDispatcher(_Host):
             steered = False
             if (not queue_only and self._steer_possible(pump)
                     and not q.of(self.user_sub or "")):
-                steered = bool(await self.layer.steer(self.session_id, item.cli_text))
+                # _steer_possible holds only with a session and a layer.
+                steered = bool(await cast("ExecutionLayer", self.layer).steer(
+                    cast("str", self.session_id), item.cli_text))
             # Queued behind the turn, the message cuts it: a check round that
             # started before it is cancelled and the turn is not continued
             # (CHECKS.md). A steered message is part of the running turn.
@@ -230,16 +262,16 @@ class ClientMessageDispatcher(_Host):
                 if not pump.record_steer(qi):
                     await input_queue.record_steer_late(pump.chat_id, qi)
                 return None
-            status, qi, idx = await q.add(
+            status, queued, idx = await q.add(
                 queue_id, qi.author_sub, item, origin_conn=qi.origin_conn, conn=self,
                 view_chat_id=qi.view_chat_id,
             )
             if status == input_queue.FULL:
-                await self._send_error("Too many queued messages. Wait for the "
-                                       "current turn to finish.")
+                await self._refuse_input("Too many queued messages. Wait for the "
+                                         "current turn to finish.", queue_id)
                 return None
-            if qi is not None:
-                input_queue.announce_queued(qi, idx)
+            if queued is not None:
+                input_queue.announce_queued(queued, idx)
             if pump.is_done:
                 input_queue.arm(pump.chat_id)
             elif status == input_queue.QUEUED and not queue_only:
@@ -259,28 +291,33 @@ class ClientMessageDispatcher(_Host):
                 await self._send_error("This message names no chat. Reopen the chat "
                                        "and send it again.")
             elif text or images or files:
-                item = await self._prepare_turn_input(text, images, files)
+                queue_id = str(msg.get("queue_id") or "")
+                item = await self._prepare_turn_input(text, images, files, queue_id=queue_id)
                 if item is None:
                     return None
-                await self._queue_for_next_turn(cid, item, msg.get("queue_id"))
+                await self._queue_for_next_turn(cid, item, queue_id, name_refusal=True)
         else:
+            if not await dashboard_chat_move.before_drive(self, msg.get("chat_id") or self.chat_id):
+                return None
             await self._handle_chat(msg)
         return None
 
     async def _queue_for_next_turn(self, cid: str, item: TurnInput, queue_id=None, *,
-                                   waiting: str = "") -> None:
+                                   waiting: str = "", name_refusal: bool = False) -> None:
         """A message that waits in ``cid``'s queue for the chat's next turn:
         queued, its chip announced, and the delivery armed when no pump is
         left to drain it. ``waiting`` says on the chip why it waits (its
-        chat's machine is reconnecting)."""
+        chat's machine is reconnecting); ``name_refusal`` makes a refusal
+        name the message (the page drew no bubble for it)."""
         q = await input_queue.loaded(cid)
+        queue_id = str(queue_id or "") or input_queue.mint_queue_id()
         status, qi, idx = await q.add(
-            str(queue_id or "") or input_queue.mint_queue_id(), self.user_sub or "", item,
+            queue_id, self.user_sub or "", item,
             origin_conn=self.notify_connection_id, conn=self, waiting=waiting,
         )
         if status == input_queue.FULL:
-            await self._send_error("Too many queued messages. Wait for the current "
-                                   "turn to finish.")
+            await self._refuse_input("Too many queued messages. Wait for the current "
+                                     "turn to finish.", queue_id if name_refusal else "")
             return
         if qi is not None:
             input_queue.announce_queued(qi, idx)
@@ -300,7 +337,7 @@ class ClientMessageDispatcher(_Host):
             return False
         try:
             return bool(self.layer.capabilities_for(self.session_id).behaviour.supports_steer)
-        except Exception:
+        except ValueError:
             return True
 
     async def _on_cancel_queued(self, msg: dict, *, stream: StreamCtx | None = None):
@@ -358,7 +395,7 @@ class ClientMessageDispatcher(_Host):
         chat read once, the REST rule asked."""
         if cid == self.chat_id:
             return True
-        from api.agents.chats import can_access_chat
+        from core.session.visibility import can_access_chat
         chat = await run_db(task_store.get_chat, cid)
         if chat and await run_db(can_access_chat, self._viewer_context(), chat):
             return True
@@ -372,7 +409,7 @@ class ClientMessageDispatcher(_Host):
             return None
         if stream is not None:
             pump = stream.pump
-            logger.info(f"WS dashboard: abort via pump, session={self.session_id}")
+            logger.info("WS dashboard: abort via pump, session=%s", self.session_id)
             # Layer abort FIRST: on the graceful path (Claude
             # control_request interrupt / Codex turn/interrupt) the
             # producer is the sole consumer of the closing turn's
@@ -458,13 +495,33 @@ class ClientMessageDispatcher(_Host):
         # the session + suppresses warmup_ready/kick (and the _server_kick
         # handler covers the race where the spawn already enqueued the kick).
         # Tell the client to drop "Getting ready" now.
-        if self._warmup_task and not self._warmup_task.done():
+        if (self._warmup_task and not self._warmup_task.done()
+                and self._warmup_chat_id == self.chat_id):
             self._warmup_abort_chat = self.chat_id
-            # Stop means stop: what this person sent while the chat got ready
-            # goes back to their composer instead of running later.
+            # Stop means stop: what was sent while the chat got ready goes
+            # back to its authors' composers instead of running later.
             if self.chat_id:
                 await self._return_warmup_sends(self.chat_id, "stopped")
             await self._send({"type": wire.ABORTED, "chat_id": self.chat_id or ""})
+            return None
+        # A chat getting ready with no pump yet (the spawn done, its kick
+        # still queued; or a chat another page warms, joined by this one): a
+        # Stop takes the waiting messages back and nothing else. The socket
+        # whose own warmup brought the chat up (``_warmup_chat_id``, kept
+        # until its kick is taken) also skips its kick (the kick's drain
+        # kills the session) and returns every author's sends; a joined
+        # socket, whatever it warmed before, returns its own and never
+        # touches the session.
+        _ready_cid = self.chat_id or ""
+        _ready_live = _active_pumps.get(_ready_cid) if _ready_cid else None
+        if (_ready_cid and input_queue.getting_ready(_ready_cid)
+                and (_ready_live is None or _ready_live.is_done)):
+            if self._warmup_chat_id == _ready_cid:
+                self._warmup_abort_chat = _ready_cid
+                await self._return_warmup_sends(_ready_cid, "stopped")
+            else:
+                await input_queue.cancel_own(_ready_cid, self.user_sub or "")
+            await self._send({"type": wire.ABORTED, "chat_id": _ready_cid})
             return None
         # Interactive PTY chat: the layer/pump machinery below is
         # headless-only (PTY sessions live in interactive_session._sessions,
@@ -489,25 +546,34 @@ class ClientMessageDispatcher(_Host):
         # the hard path cancels it as before (the streaming half above).
         self.implementing_plan = ""
         graceful = False
-        pump = _active_pumps.get(self.chat_id)
-        if pump and not pump.is_done:
-            pump.stopped = True
+        detached = _active_pumps.get(cast("str", self.chat_id))
+        turn_live = bool(detached and not detached.is_done)
+        if turn_live:
+            cast("ChatStreamPump", detached).stopped = True
         # last_turn_aborted feeds the scheduler's user_interrupted on every
         # abort path, written BEFORE the abort (a hard kill can end the
         # detached pump before this handler resumes); the graceful flag
         # follows and suppresses only the next turn's cancelled-context
-        # injection (engine history kept the partial turn).
-        if self.chat_id:
-            task_store.update_chat(self.chat_id, last_turn_aborted=True,
-                                   last_abort_graceful=False)
+        # injection (engine history kept the partial turn). Only a turn that
+        # ran is a cancelled turn: a Stop on an idle chat stamps nothing (a
+        # later background review would read the stamp as a refusal). The
+        # writes ride the chat's lane, as the streaming branch's do.
+        _idle_cid = self.chat_id or ""
+        if _idle_cid and turn_live:
+            await chat_writer.submit(
+                _idle_cid,
+                functools.partial(task_store.update_chat, _idle_cid,
+                                  last_turn_aborted=True, last_abort_graceful=False),
+                label="abort_flags",
+            )
         if self.session_id and self.layer:
             from core.session import session_events
             session_events.note_stop(self.session_id)
             graceful = bool(await self.layer.abort(self.session_id))
-        if pump and not pump.is_done:
-            pump.cancel_all_artifacts()
+        if detached and not detached.is_done:
+            detached.cancel_all_artifacts()
             if not graceful:
-                pump.abort()
+                detached.abort()
         # What waits in the chat's queue goes back to its authors, and the
         # interactions this connection queued for the chat go (never
         # delivered, never persisted).
@@ -516,16 +582,20 @@ class ClientMessageDispatcher(_Host):
             await input_queue.return_all(self.chat_id, "stopped")
         if self.session_id:
             _pending_permissions.pop(self.session_id, None)
-        if self.chat_id:
-            if graceful:
-                task_store.update_chat(self.chat_id, last_abort_graceful=True)
+        if _idle_cid:
+            def _idle_abort_job(_g=graceful, _live=turn_live) -> dict | None:
+                # The graceful flag then the row read, one lane job.
+                if _g and _live:
+                    task_store.update_chat(_idle_cid, last_abort_graceful=True)
+                return task_store.get_chat(_idle_cid)
+
+            _abort_chat = await chat_writer.submit(_idle_cid, _idle_abort_job, label="abort_flags")
             # A hard Claude CLI Stop kills the whole process group —
             # background agents/commands died with it and can never emit
             # their own clears. Graceful keeps the process alive; a Codex
             # abort keeps the daemon (and its bg sub-agent threads) either
             # way, so its supervisor still owns those badges.
             if self.session_id and not graceful:
-                _abort_chat = task_store.get_chat(self.chat_id)
                 _abort_path = resolve_execution_path(
                     self.agent_name, (_abort_chat or {}).get("execution_path", ""),
                 )
@@ -534,203 +604,6 @@ class ClientMessageDispatcher(_Host):
                     clear_session_liveness(self.session_id, reason="abort")
         await self._send({"type": wire.ABORTED, "chat_id": self.chat_id or ""})
         return None
-
-    # -- the prompts: permission, question, location, plan review -----------
-
-    @staticmethod
-    async def _advance_prompt_slot(pump, request_id: str, resolved: bool) -> None:
-        """The pump's one-prompt slot moves on for an answer that resolved a
-        wait or that names the prompt holding the slot. An answer to a card
-        already retired (its wait gone) leaves the retried call's prompt in
-        the slot, so a reconnect still re-presents it."""
-        active = pump._permission_active
-        if resolved or (active is not None and active.get("request_id") == request_id):
-            await pump.resolve_active_permission()
-
-    async def _on_permission_response(self, msg: dict, *, stream: StreamCtx | None = None):
-        # Resolve hook-based permission (unblocks the long-poll in hook endpoint).
-        if stream is not None:
-            if await self._may_resolve_permission(msg["request_id"]):
-                resolved = resolve_permission(msg["request_id"], msg.get("approved", True))
-                for sid, pd in list(_pending_permissions.items()):
-                    if pd.get("request_id") == msg["request_id"]:
-                        del _pending_permissions[sid]
-                        break
-                await self._advance_prompt_slot(stream.pump, msg["request_id"], resolved)
-            return None
-        # dual-control: while a local `otodock` terminal is the active
-        # controller, the human answers permissions in the native TUI — drop a
-        # (stale) dashboard response so it can't advance the agent out from
-        # under them.
-        _ds_isess = interactive_session.get(self.session_id) if self.session_id else None
-        if _ds_isess is not None and _ds_isess.otodock_attached:
-            pass
-        elif await self._may_resolve_permission(msg["request_id"]):
-            resolve_permission(msg["request_id"], msg.get("approved", True))
-        else:
-            return None
-        for sid, pd in list(_pending_permissions.items()):
-            if pd.get("request_id") == msg["request_id"]:
-                del _pending_permissions[sid]
-                break
-        return None
-
-    async def _on_question_response(self, msg: dict, *, stream: StreamCtx | None = None):
-        if stream is not None:
-            # Codex request_user_input answer — the held turn resumes.
-            # Validate the answerer drives this session, resolve the
-            # waiter with the answers map, then ADVANCE the pump's
-            # permission slot (else a later prompt in the same held turn
-            # buffers forever + a reconnect re-renders the answered card).
-            if await self._may_resolve_permission(msg["request_id"]):
-                resolved = resolve_question(msg["request_id"], msg.get("answers") or {})
-                for sid, pd in list(_pending_permissions.items()):
-                    if pd.get("request_id") == msg["request_id"]:
-                        del _pending_permissions[sid]
-                        break
-                await self._advance_prompt_slot(stream.pump, msg["request_id"], resolved)
-            return None
-        # Codex request_user_input answer arriving between turns (safety net;
-        # a held question normally resolves mid-stream).
-        if await self._may_resolve_permission(msg["request_id"]):
-            delivered = resolve_question(msg["request_id"], msg.get("answers") or {})
-            for sid, pd in list(_pending_permissions.items()):
-                if pd.get("request_id") == msg["request_id"]:
-                    del _pending_permissions[sid]
-                    break
-            if not delivered:
-                await self._question_answer_fallback(msg)
-        return None
-
-    async def _on_location_response(self, msg: dict, *, stream: StreamCtx | None = None):
-        # Only a connection that views a session and may drive its chat
-        # answers for it (a read-only viewer of a shared chat never does).
-        if not self.session_id or self._view_only or await self._deny_task_continue(
-                self.chat_id, quiet=True):
-            logger.info("WS dashboard: location answer dropped (not the driving connection)")
-            return None
-        if not resolve_location(msg["request_id"], {
-            "lat": msg.get("lat"),
-            "lng": msg.get("lng"),
-            "accuracy": msg.get("accuracy"),
-            "error": msg.get("error"),
-        }, session_id=self.session_id):
-            logger.info("WS dashboard: location answer dropped (not the asked session)")
-        return None
-
-    async def _on_plan_review_response(self, msg: dict, *, stream: StreamCtx | None = None):
-        if stream is None:
-            # Plan review between turns — can happen normally or after session death
-            # dual-control: ignore a dashboard plan-review response while a local
-            # `otodock` terminal controls the session (it reviews in the native TUI).
-            _ds_isess = interactive_session.get(self.session_id) if self.session_id else None
-            if _ds_isess is not None and _ds_isess.otodock_attached:
-                return None
-        if not await self._may_resolve_permission(msg["request_id"]):
-            return None
-        action = msg.get("action", "")
-        plan_fn = msg.get("filename", "")
-        # Approve ExitPlanMode for implement AND reject (cancel).
-        # For "edit", deny so Claude stays in plan mode for revisions.
-        approved = action != "edit"
-        # Set session mode BEFORE resolve_permission so the hook
-        # endpoint sees the correct mode when it wakes up (prevents
-        # race where hook checks stale "plan" mode).
-        if approved and self.session_id:
-            if action == "reject":
-                set_session_mode(self.session_id, self.pre_plan_mode_holder[0])
-            elif action == "implement_accept_edits":
-                set_session_mode(self.session_id, "acceptEdits")
-            elif action == "implement_default":
-                set_session_mode(self.session_id, "default")
-        resolved = resolve_permission(msg["request_id"], approved)
-        for sid, pd in list(_pending_permissions.items()):
-            if pd.get("request_id") == msg["request_id"]:
-                del _pending_permissions[sid]
-                break
-        if stream is not None:
-            pump = stream.pump
-            await self._advance_prompt_slot(pump, msg["request_id"], resolved)
-            # Save the user's action in the DB turn block
-            req_id = msg.get("request_id", "")
-            for tb in pump._turn_blocks:
-                if tb.get("type") == wire.PLAN_REVIEW and tb.get("request_id") == req_id:
-                    tb["action"] = action
-                    break
-            # Mode/plan-status writes ride the chat lane so they
-            # stay ordered with the pump's own plan-mode write. The
-            # mode_changed frames of this tail carry no chat tag.
-            if self.chat_id and plan_fn and action == "reject":
-                chat_writer.submit(
-                    self.chat_id,
-                    functools.partial(task_store.update_chat_plan_status,
-                                      self.chat_id, plan_fn, "rejected"),
-                    label="plan_rejected",
-                )
-                restored_mode = self.pre_plan_mode_holder[0]
-                chat_writer.submit(
-                    self.chat_id,
-                    functools.partial(task_store.update_chat, self.chat_id,
-                                      permission_mode=restored_mode),
-                    label="plan_mode_restore",
-                )
-                await self._send({"type": wire.MODE_CHANGED, "mode": restored_mode})
-            if action == "implement_accept_edits":
-                self.pending_control_requests.append(("set_permission_mode", {"mode": "acceptEdits"}))
-                chat_writer.submit(
-                    self.chat_id,
-                    functools.partial(task_store.update_chat, self.chat_id,
-                                      permission_mode="acceptEdits"),
-                    label="plan_implement_mode",
-                )
-                await self._send({"type": wire.MODE_CHANGED, "mode": "acceptEdits"})
-                self._queue_implement(stream, plan_fn)
-            elif action == "implement_default":
-                # Pinned asymmetry: no control request is queued here (the
-                # between-turns half changes the mode through the layer).
-                chat_writer.submit(
-                    self.chat_id,
-                    functools.partial(task_store.update_chat, self.chat_id,
-                                      permission_mode="default"),
-                    label="plan_implement_mode",
-                )
-                await self._send({"type": wire.MODE_CHANGED, "mode": "default"})
-                self._queue_implement(stream, plan_fn)
-            return None
-        if self.chat_id and plan_fn and action == "reject":
-            task_store.update_chat_plan_status(self.chat_id, plan_fn, "rejected")
-            # Restore pre-plan mode + notify frontend
-            restored_mode = self.pre_plan_mode_holder[0]
-            task_store.update_chat(self.chat_id, permission_mode=restored_mode)
-            await self._send({"type": wire.MODE_CHANGED, "mode": restored_mode})
-        if action == "implement_accept_edits":
-            await self._handle_mode_change({"mode": "acceptEdits", "chat_id": self.chat_id})
-            self.implementing_plan = plan_fn
-            # If session is dead (stale plan_review), queue implement for after warmup
-            if not self.session_id:
-                self.implement_queue.append(TurnInput("Please implement the plan now.",
-                                                      chat_id=self.chat_id or ""))
-                logger.info(f"WS dashboard: queued implement message for dead session, plan={plan_fn}")
-        elif action == "implement_default":
-            await self._handle_mode_change({"mode": "default", "chat_id": self.chat_id})
-            self.implementing_plan = plan_fn
-            if not self.session_id:
-                self.implement_queue.append(TurnInput("Please implement the plan now.",
-                                                      chat_id=self.chat_id or ""))
-                logger.info(f"WS dashboard: queued implement message for dead session, plan={plan_fn}")
-        return None
-
-    def _queue_implement(self, stream: StreamCtx, plan_fn: str) -> None:
-        """The plan's implement message behind the streaming turn: on the
-        pump's own list (never a person's queue row), or once that closed on
-        the connection's, whose drain turn then carries the plan
-        (``implementing_plan``)."""
-        item = TurnInput("Please implement the plan now.", chat_id=stream.chat_id)
-        if stream.pump.queue_message(item) == stream.pump.QUEUE_CLOSED:
-            self.implement_queue.append(item)
-            self.implementing_plan = plan_fn
-        else:
-            stream.pump.implementing_plan = plan_fn
 
     # -- the backchannel: artifacts and app actions --------------------------
 
@@ -853,7 +726,7 @@ class ClientMessageDispatcher(_Host):
                     sender_sub=self.user_sub,
                 ):
                     await self._send_pty_read_only(isess)
-            except Exception:
+            except (ValueError, TypeError, OSError):
                 logger.debug("pty_input decode/write failed", exc_info=True)
         return None
 
@@ -869,7 +742,7 @@ class ClientMessageDispatcher(_Host):
                 return None
             try:
                 isess.resize(int(msg.get("rows", 24)), int(msg.get("cols", 80)))
-            except Exception:
+            except (ValueError, TypeError, OverflowError, struct.error, OSError):
                 logger.debug("pty_resize failed", exc_info=True)
         return None
 
@@ -930,7 +803,7 @@ class ClientMessageDispatcher(_Host):
         return None
 
     async def _on_move_chat(self, msg: dict, *, stream: StreamCtx | None = None):
-        await self._handle_move_chat()
+        await dashboard_chat_move.handle_move_chat(self, msg)
         return None
 
     async def _on_switch_engine(self, msg: dict, *, stream: StreamCtx | None = None):
@@ -980,7 +853,8 @@ class ClientMessageDispatcher(_Host):
             if self.session_id and not self._view_only:
                 set_session_user_tz(self.session_id, time_zone)
         logger.info(
-            f"WS dashboard client_info: user={self.user_sub}, platform={platform}, tz={time_zone or '-'}"
+            "WS dashboard client_info: user=%s, platform=%s, tz=%s",
+            self.user_sub, platform, time_zone or '-'
         )
         return None
 
@@ -1009,7 +883,7 @@ class ClientMessageDispatcher(_Host):
         # deltas reach only subscribed connections (APPS.md
         # "Platform catalog"). Mid-turn too: an app opened mid-turn
         # subscribes now, not after the turn.
-        from api.apps import catalog
+        from services.apps import catalog
         catalog.handle_subscription(self.user_sub, self.notify_connection_id, msg)
         return None
 
@@ -1047,118 +921,6 @@ class ClientMessageDispatcher(_Host):
             return
         await self._handle_chat({"text": text, "chat_id": chat_id})
 
-    async def _handle_move_chat(self):
-        """Move the OPEN chat to the agent's CURRENT target — the locality
-        escape hatch.
-
-        Rebinds via the proven machine-removed shape: pin cleared, session
-        ids dropped, ``pending_history_seed='moved:<from>'`` — the next
-        warmup fresh-resolves, spawns on the current target and injects the
-        DB-history digest. The old session is closed here (headless
-        close_session releases slot + subscription; interactive PTYs are
-        closed for the chat) so a warm slot never leaks; its on-disk state
-        stays behind by design. Owner/admin only: shared-agent
-        editors/viewers can hold a connection to this chat, but a
-        non-owner's resolve is role-forced to 'local' and must never
-        relocate someone else's chat."""
-        from storage import remote_store
-        from auth.providers import acting_role_of
-
-        logger.info(
-            "WS dashboard: move_chat requested chat=%s session=%s streaming=%s",
-            self.chat_id or "?", (self.session_id or "?")[:8], self.streaming,
-        )
-        from storage.pg import run_db
-        chat = await run_db(task_store.get_chat, self.chat_id) if self.chat_id else None
-        if not chat:
-            await self._send({"type": wire.ERROR, "message": "Chat not found."})
-            return
-        agent = chat.get("agent") or ""
-        role = await run_db(acting_role_of, self.user_sub, agent)
-        if chat.get("user_sub") != self.user_sub and not roles.is_admin(role):
-            await self._send({"type": wire.ERROR,
-                              "message": "Only the chat owner can move it."})
-            return
-        if self._warmup_task and not self._warmup_task.done():
-            await self._send({"type": wire.ERROR,
-                              "message": "The chat is still getting ready — "
-                                         "try again in a moment."})
-            return
-        # A warmup from ANOTHER connection (second tab) registers globally but
-        # is invisible to the connection-scoped check above — its tail would
-        # stamp a session spawned for the OLD pin onto the moved row.
-        from core.session import warmup_registry as _wreg
-        if _wreg.get(self.chat_id) is not None:
-            await self._send({"type": wire.ERROR,
-                              "message": "The chat is still getting ready — "
-                                         "try again in a moment."})
-            return
-        pump = _active_pumps.get(self.chat_id) if self.chat_id else None
-        if self.streaming or (pump and not pump.is_done):
-            await self._send({"type": wire.ERROR,
-                              "message": "Finish or stop the current turn "
-                                         "before moving the chat."})
-            return
-        isess = (interactive_session.get(self.session_id)
-                 if self.session_id else None)
-        if isess is not None and isess.alive and isess.turn_open:
-            await self._send({"type": wire.ERROR,
-                              "message": "Finish or stop the current turn "
-                                         "before moving the chat."})
-            return
-
-        pin = chat.get("execution_target") or ""
-        resolved, _ = remote_store.resolve_execution_target(
-            agent, self.user_sub, role,
-        )
-        if not resolved or placement.is_offline_sentinel(resolved):
-            await self._send({"type": wire.ERROR,
-                              "message": "The agent's current machine is "
-                                         "offline — nowhere to move to."})
-            return
-        if not pin or pin == resolved:
-            await self._send({"type": wire.ERROR,
-                              "message": "This chat already runs on the "
-                                         "agent's current target."})
-            return
-
-        def _label(target: str) -> str:
-            if placement.is_local(target):
-                return "the local sandbox"
-            m = remote_store.get_remote_machine(target) or {}
-            return str(m.get("name") or "") or target[:8]
-
-        from_label = _label(pin)
-        # Close the old session FIRST (idle by the gates above): headless
-        # close releases the concurrency slot + subscription binding; the
-        # session file / satellite-side state stays behind by design.
-        if isess is not None and isess.alive:
-            with contextlib.suppress(Exception):
-                await interactive_session.close_for_chat(
-                    self.chat_id, reason="moved")
-        elif self.session_id and self.layer:
-            try:
-                await self.layer.close_session(self.session_id)
-            except Exception:
-                logger.warning("move_chat: close_session failed for %s",
-                               self.session_id, exc_info=True)
-
-        if not remote_store.rebind_chat_to_current_target(
-                self.chat_id, from_label):
-            await self._send({"type": wire.ERROR, "message": "Move failed."})
-            return
-        self.session_id = None
-        logger.info(
-            "WS dashboard: chat %s moved (%s -> %s) by %s",
-            self.chat_id, pin, resolved, self.user_sub,
-        )
-        await self._send({
-            "type": wire.CHAT_MOVED,
-            "chat_id": self.chat_id,
-            "new_target": resolved,
-            "resolved_label": _label(resolved).removeprefix("the "),
-        })
-
     async def _handle_switch_engine(self, msg: dict):
         """Cross-engine resume: flip the OPEN chat's execution engine + model
         so the next warmup fresh-spawns on the new engine with the DB-history
@@ -1182,21 +944,22 @@ class ClientMessageDispatcher(_Host):
         NULLs session_id and the continuation's oneshot delivery would
         starve (1.5 self-wake design round, W2-F5)."""
         import json as _json
-        from api.agents._common import _get_execution_paths
+
+        from auth.providers import acting_role_of
+        from core.session import history_seed, session_delivery, warmup_registry
+        from core.session.session_manager import get_execution_layer
         from services.engines import subscription_pool
         from services.notifications import notification_manager as _nm
         from storage.agents import agent_store
+        from storage.agents.agent_store import _get_execution_paths
         from storage.billing import subscription_store
-        from core.session import history_seed, session_delivery, warmup_registry
-        from core.session.session_manager import get_execution_layer
-        from auth.providers import acting_role_of
         from ws.dashboard import chat_process_alive
 
         new_path = (msg.get("execution_path") or "").strip()
         new_model = (msg.get("model") or "").strip()
 
         async def _deny(reason: str, *, alive: bool | None = None):
-            payload = {"type": wire.SWITCH_ENGINE_DENIED,
+            payload: dict[str, Any] = {"type": wire.SWITCH_ENGINE_DENIED,
                        "chat_id": self.chat_id or "", "message": reason}
             if alive is not None:
                 payload["process_alive"] = alive
@@ -1221,7 +984,8 @@ class ClientMessageDispatcher(_Host):
         is_task_chat = session_kind.is_task_chat_id(cid)
         task_run = None
         if is_task_chat:
-            from ws.dashboard import _task_continue_allowed, task_run_active_async
+            from core.session.visibility import _task_continue_allowed
+            from ws.dashboard import task_run_active_async
             if await task_run_active_async(cid):
                 await _deny("The task run is still active — switching "
                             "engines is possible once it has finished.",
@@ -1314,7 +1078,7 @@ class ClientMessageDispatcher(_Host):
         try:
             _models = await asyncio.to_thread(
                 subscription_store.list_models, new_path)
-        except Exception:
+        except psycopg.Error:
             _models = []
         if not new_model or not any(
             m.get("enabled") and (m.get("model_id") or "") == new_model
@@ -1378,6 +1142,14 @@ class ClientMessageDispatcher(_Host):
         ):
             await _deny("The chat changed underneath — try again.")
             return
+        # The old engine's session files go once the new engine has answered
+        # (services/remote/switch_leftovers.py).
+        try:
+            from services.remote import switch_leftovers
+            await run_db(switch_leftovers.record, chat, old_path, self.user_sub or "", role)
+        except Exception:  # noqa: BLE001  # the switch is done: a lost record only keeps the files
+            logger.warning("WS dashboard: chat %s: the old session's files were not recorded",
+                           cid, exc_info=True)
 
         if _rebuilds:
             # No seed will ever be consumed, so persist the switch card now.
@@ -1452,7 +1224,7 @@ class ClientMessageDispatcher(_Host):
                 result = await self.layer.compact(self.session_id)
         except Exception:
             logger.exception(
-                f"WS dashboard: compaction failed, session={self.session_id}"
+                "WS dashboard: compaction failed, session=%s", self.session_id
             )
         if result is None:
             await self._send({"type": wire.CONTEXT_COMPACT, "phase": "failed",

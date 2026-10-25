@@ -8,6 +8,9 @@ Mirrors ``services/notifications/smtp.py`` (config resolution + a save helper + 
 import logging
 from dataclasses import dataclass
 
+import httpx
+from cryptography.fernet import InvalidToken
+
 import config
 from storage import database as db
 from storage.identity.credential_store import _decrypt, _encrypt
@@ -48,7 +51,7 @@ def load_config(settings: dict | None = None) -> TurnstileConfig:
     if enc:
         try:
             secret = _decrypt(enc)
-        except Exception:
+        except InvalidToken:
             # A mismatched encryption key leaves the secret undecryptable → treat as
             # not configured (enabled=False) rather than crash; the admin GET reports
             # turnstile_secret_key_set=False so the state isn't falsely "configured".
@@ -84,7 +87,7 @@ async def verify_token(cfg: TurnstileConfig, token: str, remote_ip: str | None =
         return False
     try:
         result = await _post_siteverify({"secret": cfg.secret_key, "response": token})
-    except Exception:
+    except (httpx.HTTPError, ValueError):
         logger.warning("Turnstile siteverify unreachable/bad response — allowing login (fail-open)")
         return True
     if not isinstance(result, dict) or not result.get("success"):

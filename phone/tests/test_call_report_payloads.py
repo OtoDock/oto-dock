@@ -7,9 +7,10 @@ tools it ran onto the call-log row.
 
 import asyncio
 
+from pipeline_fakes import FakeConn, FakeLLM, make_route
+
 import main
 from calls.call_manager import CallManager, CallStatus
-from pipeline_fakes import FakeConn, FakeLLM, make_route
 
 
 def _inbound(**kw):
@@ -182,3 +183,36 @@ def test_a_standalone_calls_record_names_how_it_ended_without_the_marker(make_pi
 def test_pipeline_llm_session_id_is_what_the_report_reads():
     llm = FakeLLM(session_id="33333333-2222-4333-8444-555555555555")
     assert (getattr(llm, "session_id", "") or "") == "33333333-2222-4333-8444-555555555555"
+
+
+def test_a_call_cut_at_its_maximum_duration_ends_its_outbound_record(make_pipeline, monkeypatch):
+    """The cap cancels the pipeline before its own terminal edge: the
+    outbound record ends FAILED with the reason, so the call log gets its
+    row instead of a record left CONNECTED for the collector."""
+    from config_manager import ConfigManager
+    sent = []
+
+    async def _fake_report(payload):
+        sent.append(payload)
+    import proxy.client as proxy_client
+    monkeypatch.setattr(proxy_client, "report_call", _fake_report)
+
+    cfg = ConfigManager()
+    cfg.load({"settings": {"call_max_duration_s": "1"}, "routes": []})
+    cm = CallManager()
+    monkeypatch.setattr(main, "_call_manager", cm)
+    call = cm.register_call("+15559998888", "say hi")
+    call.route_id = "r1"
+
+    async def run():
+        import logging
+        await main._run_call(
+            FakeConn(hold_open=True), call.audio_uuid, make_route(direction="outbound"),
+            True, None, cfg, logging.getLogger("test"))
+        await asyncio.sleep(0)
+    asyncio.run(run())
+
+    assert call.status is CallStatus.FAILED
+    assert call.error == "ended at the call's maximum duration"
+    assert len(sent) == 1 and sent[0]["outcome"] == "failed"
+    assert sent[0]["duration_s"] is None or sent[0]["duration_s"] >= 1

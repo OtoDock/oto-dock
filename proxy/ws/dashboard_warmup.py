@@ -10,68 +10,80 @@ Behavior is pinned by tests/session/test_ws_dashboard_*.
 
 import asyncio
 import contextlib
+import functools
 import logging
 import time
 import uuid
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, cast
+
 import config
+from auth import roles
+from auth.providers import acting_role_of
 from core import placement
-from storage import database as task_store
-from storage.agents import agent_store
-from storage import remote_store
-from core.session.session_state import (
-    set_session_mode,
-    get_session_mode,
-    get_user_tz,
-    set_session_user_tz,
-    clear_session_liveness,
-)
-from core.execution_layer import ExecutionLayer
-from core.session.session_manager import (
-    get_execution_layer, get_layer_by_path, get_layer_capabilities,
-    resolve_execution_path,
-)
 from core.config.config_builder import (
     build_agent_config,
     release_config_seat,
 )
+from core.config.task_config_builder import rewarm_task_identity
+from core.events import chat_writer, input_queue
+from core.events.stream_pump import _active_pumps
+from core.execution_layer import ASK_MODE, ExecutionLayer, MachineReach, ResumeVerdict
+from core.sandbox.session_config_dir import (
+    AgentStateRefused,
+    refuse_agent_state_below_editor,
+)
+from core.session import (
+    interactive_session,
+    session_kind,
+    visibility as _vis,
+    warmup_registry,
+)
+from core.session.resume_probe import (
+    RESUME_PROBE_BUDGET_INLINE_S,
+    RESUME_PROBE_BUDGET_WARMUP_S as RESUME_PROBE_BUDGET_WARMUP_S,  # read by the spawn tail through this module
+    ResumeUndecided,
+    settle_resume,
+)
+from core.session.session_manager import (
+    get_execution_layer,
+    get_layer_by_path,
+    get_layer_capabilities,
+    resolve_execution_path,
+)
+from core.session.session_state import (
+    clear_session_liveness,
+    get_session_mode,
+    get_user_tz,
+    set_session_mode,
+    set_session_user_tz,
+)
 from services.engines import subscription_pool
 from services.engines.subscription_pool import NoSubscriptionError
-from core.sandbox.session_config_dir import AgentStateRefused, refuse_agent_state_below_editor
-from core.session.history_seed import consume_pending_seed_digest
-from core.config.task_config_builder import (
-    resolve_task_identity, run_allows_knowledge_rw,
-)
-from core.session import warmup_registry, visibility as _vis
-from core import execution_mode
-from core.session import interactive_session
-import functools
-from typing import TYPE_CHECKING
-from storage.pg import run_db
-from core.events import chat_writer, input_queue
-# Imported by ws/dashboard.py AFTER its helpers are defined —
-# safe intra-unit circularity (see the class assembly there).
-from ws.dashboard import (
-    _SpawnResult,
-    _model_allowed_for_path,
-    _resolve_session_interactive,
-    _resume_username_for_chat,
-    _rewarm_chat_allowed,
+from services.remote import remote_status
+from storage import database as task_store, remote_store
+from storage.agents import agent_store
+from storage.pg import run_db, run_db_fast
+from ws import wire_events as wire
+
+# ws/dashboard.py assembles the connection from the mixins at its end, so
+# its helpers are imported inside the functions that call them: this
+# module imports first too (tests/core/test_import_layers.py).
+from ws.dashboard_chat_support import chat_mode_for_path, coerce_chat_mode
+from ws.dashboard_chat_text import (
+    TurnDeferred,
+    grace_layer,
+    live_model,
 )
 from ws.dashboard_prewarm import (
     _model_foreign_to_engine,
     _pre_warmup_rollback,
     _schedule_pre_warmup_rollback,
 )
-from core.session import session_kind
-from ws.dashboard_chat_text import grace_layer, live_model
-from auth import roles
-from auth.providers import acting_role_of
-from ws import wire_events as wire
+from ws.dashboard_warmup_tail import WarmupTail, _persist_spawn, _TailArgs, _TailRun
 
 if TYPE_CHECKING:
-    from ws.dashboard_host import DashboardHost as _Host
-else:
-    _Host = object
+    from ws.dashboard import _SpawnResult
 
 logger = logging.getLogger("otodock")
 
@@ -85,10 +97,66 @@ def _engine_default_model(execution_path: str) -> str:
         return ""
 
 
-class WarmupController(_Host):
+@dataclass
+class _WarmupPlan:
+    """One warmup's request and what its phases settle before the tail is
+    snapshotted: the head's role and path, then the chat row's values (an
+    existing chat) or the minted chat's."""
+    agent: str
+    msg: dict
+    requested_model: str
+    requested_exec_mode: str
+    requested_theme: str
+    warmup_role: str
+    effective_exec_path: str
+    permission_mode: str
+    cid: str | None
+    pw_task: asyncio.Task | None  # the in-flight eager pre-warm, snapshotted before the chat is read
+    old_session_id: str | None = None
+    chat: dict | None = None  # the existing chat's row; None for a new chat
+    chat_model: str = ""  # loaded from the chat row, else the agent default
+    chat_exec_mode: str = ""  # per-chat interactive override (loaded/persisted by the phases)
+    # New-chat-only: the tail's pre-warm match key; "" on the existing-chat
+    # path, which skips the mint and still snapshots them.
+    target_model: str = ""
+    consume_effective_role: str = ""
+    # Whether THIS warmup minted the chat row: the dashboard moves the
+    # new-chat page's draft onto a chat id only when the frame says so
+    # (a resumed chat's frame must never take it). Derived from the mint
+    # branch, not the request: a denied or vanished chat_id falls through
+    # to a mint too.
+    minted: bool = False
+    # The checked place the page picked (``dashboard_chat_move.place_new_chat``:
+    # place, label, default; place "" for the default); when it was minted.
+    placed: tuple[str, str, str] = ("", "", "")
+    minted_at: float = 0.0
+
+
+class WarmupController(WarmupTail):
     """Session warmup + spawn: pre-warm, warmup (inline reuse or backgrounded
     spawn tail), deferred mode/model re-apply, and the single create/resume
     funnel every spawn path goes through."""
+
+    # The connection state this mixin assigns, declared where it assigns it:
+    # the type checker reads an attribute a mixin assigns from the mixin
+    # first. Annotations only (strings), no class attributes.
+    _pre_warmed_agent: "str | None"
+    _pre_warmed_at: "float"
+    _pre_warmed_exec_path: "str"
+    _pre_warmed_model: "str"
+    _pre_warmed_role: "str"
+    _pre_warmed_place: "str"
+    _pre_warmed_sid: "str | None"
+    _warmup_abort_chat: "str | None"
+    _warmup_chat_id: "str | None"
+    _warmup_task: "asyncio.Task | None"
+    agent_name: "str"
+    chat_id: "str | None"
+    deferred_for: "str"
+    deferred_mode: "str"
+    deferred_model: "str"
+    layer: "ExecutionLayer | None"
+    session_id: "str | None"
 
     def _target_mismatch_fields(self, chat_id: str) -> dict:
         """Locality-mismatch fields for warmup frames, or {}.
@@ -117,25 +185,20 @@ class WarmupController(_Host):
             role = acting_role_of(self.user_sub, agent)
             if chat.get("user_sub") != self.user_sub and not roles.is_admin(role):
                 return {}
-            resolved, _ = remote_store.resolve_execution_target(
+            resolved, _ = remote_status.resolve_execution_target(
                 agent, self.user_sub, role,
             )
             if not resolved or resolved == pin or placement.is_offline_sentinel(resolved):
                 return {}
 
-            def _label(target: str) -> str:
-                if placement.is_local(target):
-                    return "local sandbox"
-                m = remote_store.get_remote_machine(target) or {}
-                return str(m.get("name") or "") or target[:8]
-
+            from services.remote.chat_targets import place_phrase
             return {
                 "pinned_target": pin,
-                "pinned_label": _label(pin),
+                "pinned_label": place_phrase(pin),
                 "resolved_target": resolved,
-                "resolved_label": _label(resolved),
+                "resolved_label": place_phrase(resolved),
             }
-        except Exception:
+        except Exception:  # noqa: BLE001  # the target-mismatch banner is optional, the warmup goes on
             logger.debug("target-mismatch fields failed for %s", chat_id,
                          exc_info=True)
             return {}
@@ -147,6 +210,7 @@ class WarmupController(_Host):
         chat.  The session is stored in _pre_warmed_sid and reused by
         _handle_warmup when the user sends their first message.
         """
+        from ws.dashboard import _resolve_session_interactive
 
         agent = msg.get("agent", "")
         if not agent:
@@ -159,7 +223,7 @@ class WarmupController(_Host):
             await self._send_error(f"Agent '{agent}' no longer exists")
             return
 
-        permission_mode = msg.get("permission_mode", "default")
+        permission_mode = chat_mode_for_path(msg.get("permission_mode", ""), "")
         requested_model = await live_model(msg.get("model", ""))
         requested_exec_path = msg.get("execution_path", "")
 
@@ -173,62 +237,53 @@ class WarmupController(_Host):
             acting_role_of, self.user_sub, agent, fallback_user=self.user,
         )
 
-        # Already pre-warmed for same agent+model+role and alive -> reuse.
+        # Already pre-warmed for same agent+model+role+place and alive -> reuse.
         # Model is part of the match key because CLI sessions are spawned with
         # --model <name> and we can't swap models on a running process.
-        # Role is part because the session's SecurityContext is baked at start.
-        target_model = requested_model or config.get_cli_model(agent)
+        # Role is part because the session's SecurityContext is baked at start,
+        # and the new chat's picked place: a pick elsewhere closes it below.
+        from ws import dashboard_chat_move
+        place_key = dashboard_chat_move.picked_place(msg)
+        target_model = requested_model or await run_db(config.get_cli_model, agent)
         if (self._pre_warmed_sid and self._pre_warmed_agent == agent
                 and self._pre_warmed_model == target_model
-                and self._pre_warmed_role == pw_effective_role):
-            pw_layer = get_execution_layer(agent, user_sub=self.user_sub, role=pw_effective_role)
-            if await pw_layer.is_session_alive(self._pre_warmed_sid):
+                and self._pre_warmed_role == pw_effective_role
+                and self._pre_warmed_place == place_key):
+            # A pre-warm is local: asked on its engine's local layer, never the resolver's.
+            from core.session.session_manager import layer_for_prewarm
+            pw_layer = layer_for_prewarm(self._pre_warmed_sid, self._pre_warmed_exec_path)
+            if pw_layer is not None and await pw_layer.is_session_alive(self._pre_warmed_sid):
                 logger.info(
-                    f"WS dashboard pre_warmup: reusing existing "
-                    f"session={self._pre_warmed_sid[:8]}, agent={agent}, model={self._pre_warmed_model}, role={self._pre_warmed_role}"
+                    "WS dashboard pre_warmup: reusing existing "
+                    "session=%s, agent=%s, model=%s, role=%s",
+                    self._pre_warmed_sid[:8], agent, self._pre_warmed_model, self._pre_warmed_role
                 )
                 await self._send({"type": wire.PRE_WARMUP_READY, "session_id": self._pre_warmed_sid})
                 return
 
-        # Pre-warmed for different agent/model/role (or dead) -> close old
+        # Pre-warmed for a different agent/model/role/place (or dead) -> close old
         if self._pre_warmed_sid:
-            old_sid = self._pre_warmed_sid
-            self._pre_warmed_sid = None
-            old_exec_path = self._pre_warmed_exec_path
-            self._pre_warmed_agent = None
-            self._pre_warmed_exec_path = ""
-            self._pre_warmed_model = ""
-            self._pre_warmed_role = ""
-            self._pre_warmed_at = 0.0
-            # Ours to close only while the registry still holds it: another
-            # tab's warmup may have claimed it (claim_by_key) and be running
-            # its chat on it, or the reaper has it and closes it itself.
-            from core.session import prewarm_session_registry as _prewarm
-            if await _prewarm.claim(old_sid):
-                try:
-                    from core.session.session_manager import layer_for_prewarm
-                    old_layer = layer_for_prewarm(old_sid, old_exec_path)
-                    if old_layer:
-                        await old_layer.close_session(old_sid)
-                except Exception:
-                    pass
-                from core.concurrency import release_chat_slot
-                release_chat_slot(old_sid)
+            await self._release_prewarm()
 
         agent_cfg = None
         started = False
         build = None
         new_sid = str(uuid.uuid4())
         try:
-            resolved_exec_path = resolve_execution_path(agent, requested_exec_path)
+            def _prewarm_path() -> tuple[str, bool]:
+                path = resolve_execution_path(agent, requested_exec_path)
+                return path, _model_foreign_to_engine(requested_model, path)
+
+            resolved_exec_path, foreign_model = await run_db(_prewarm_path)
             # The frame's model belongs to the engine the page showed; when
             # that is not the engine this pre-warm resolved, building would
             # acquire (and refuse) credentials for the wrong provider. A
             # pre-warm is an optimisation — skip, the real warmup decides.
-            if _model_foreign_to_engine(requested_model, resolved_exec_path):
+            if foreign_model:
                 logger.info(
-                    f"WS dashboard pre_warmup: skipped (model {requested_model} "
-                    f"is not a {resolved_exec_path} model) agent={agent}"
+                    "WS dashboard pre_warmup: skipped (model %s "
+                    "is not a %s model) agent=%s",
+                    requested_model, resolved_exec_path, agent
                 )
                 return
             # A pre-warm needs room for itself and one more session, nobody
@@ -236,7 +291,12 @@ class WarmupController(_Host):
             # is skipped without a word (nothing was asked for yet).
             from core import concurrency
             if not concurrency.prewarm_allowed(resolved_exec_path, user_sub=self.user_sub):
-                logger.info(f"WS dashboard pre_warmup: skipped (no room for two) agent={agent}")
+                logger.info("WS dashboard pre_warmup: skipped (no room for two) agent=%s", agent)
+                return
+            # A refused place or a machine pre-warms nothing; the platform pins the build.
+            pinned = await dashboard_chat_move.prewarm_place(self, agent, place_key,
+                                                             resolved_exec_path)
+            if pinned is None:
                 return
 
             # Build the config FIRST so the resolved execution target + the
@@ -254,13 +314,14 @@ class WarmupController(_Host):
                 model=requested_model,
                 execution_path=resolved_exec_path,
                 session_id=new_sid,
+                pinned_target=pinned,
             ))
             agent_cfg = await asyncio.shield(build)
             # Skip pre-warm for a REMOTE target: it would spawn a real session on
             # the satellite (counting against THAT satellite's budget) for a chat
             # the user may never send. The first real send warms it on demand.
             if not placement.is_local(agent_cfg.execution_target):
-                logger.info(f"WS dashboard pre_warmup: skipped (remote target) agent={agent}")
+                logger.info("WS dashboard pre_warmup: skipped (remote target) agent=%s", agent)
                 release_config_seat(new_sid, agent_cfg)
                 return
             # Interactive agents are NOT eagerly pre-warmed: the interactive
@@ -268,8 +329,8 @@ class WarmupController(_Host):
             # pre-warm when interactive), so a -p pre-warm here is a throwaway
             # session that ALSO runs a redundant background MCP install. Skip it;
             # the first send warms interactively and waits for the install.
-            if _resolve_session_interactive(agent_cfg):
-                logger.info(f"WS dashboard pre_warmup: skipped (interactive) agent={agent}")
+            if await run_db_fast(_resolve_session_interactive, agent_cfg):
+                logger.info("WS dashboard pre_warmup: skipped (interactive) agent=%s", agent)
                 release_config_seat(new_sid, agent_cfg)
                 return
             # Local target → acquire a unit of the local ceiling G before
@@ -280,9 +341,9 @@ class WarmupController(_Host):
             if not adm:
                 release_config_seat(new_sid, agent_cfg)
                 if adm.reason == "speculative":
-                    logger.info(f"WS dashboard pre_warmup: skipped (no room) agent={agent}")
+                    logger.info("WS dashboard pre_warmup: skipped (no room) agent=%s", agent)
                     return
-                await self._send_error(adm.user_message)
+                await self._send_error(cast("str", adm.user_message))
                 return
             # pw_effective_role (resolved at the top) → the spawned session's
             # SecurityContext gets the per-agent role. Install progress is
@@ -308,21 +369,23 @@ class WarmupController(_Host):
 
             self._pre_warmed_sid = new_sid
             self._pre_warmed_agent = agent
-            self._pre_warmed_exec_path = resolve_execution_path(agent, requested_exec_path)
+            self._pre_warmed_exec_path = resolved_exec_path
             self._pre_warmed_model = agent_cfg.model
             self._pre_warmed_role = pw_effective_role
+            self._pre_warmed_place = place_key
             self._pre_warmed_at = time.monotonic()
             # Track as a reapable pre-warm: if the user never sends, the fast TTL
             # reaper frees its slot + subscription (vs. holding the full idle window).
             from core.session import prewarm_session_registry as _prewarm
             await _prewarm.register(new_sid, agent=agent, user_sub=self.user_sub,
                                     role=pw_effective_role, exec_path=self._pre_warmed_exec_path,
-                                    model=agent_cfg.model)
+                                    model=agent_cfg.model, place=place_key)
 
             await self._send({"type": wire.PRE_WARMUP_READY, "session_id": new_sid})
             logger.info(
-                f"WS dashboard pre_warmup: created session={new_sid[:8]}, "
-                f"agent={agent}, exec_path={self._pre_warmed_exec_path}, model={agent_cfg.model}"
+                "WS dashboard pre_warmup: created session=%s, "
+                "agent=%s, exec_path=%s, model=%s",
+                new_sid[:8], agent, self._pre_warmed_exec_path, agent_cfg.model
             )
         except asyncio.CancelledError:
             # A newer pre_warmup frame (the dispatcher) or the closing socket
@@ -339,13 +402,13 @@ class WarmupController(_Host):
             if isinstance(e, NoSubscriptionError):
                 # A configuration state (no usable account, a pool cap), not
                 # a crash: the first real send surfaces the reason to the user.
-                logger.info(f"WS dashboard pre_warmup skipped (reason={e.reason}): {e}")
+                logger.info("WS dashboard pre_warmup skipped (reason=%s): %s", e.reason, e)
             elif below_editor:
                 # A chat that runs as the agent, below the editor tier: the
                 # first send's warmup card explains it, once.
-                logger.info(f"WS dashboard pre_warmup skipped (below the editor tier) agent={agent}")
+                logger.info("WS dashboard pre_warmup skipped (below the editor tier) agent=%s", agent)
             else:
-                logger.error(f"WS dashboard pre_warmup failed: {e}", exc_info=True)
+                logger.exception("WS dashboard pre_warmup failed: %s", e)
             await _pre_warmup_rollback(
                 new_sid, None, agent_cfg, started, getattr(self, "layer", None))
             self._pre_warmed_sid = None
@@ -353,6 +416,7 @@ class WarmupController(_Host):
             self._pre_warmed_exec_path = ""
             self._pre_warmed_model = ""
             self._pre_warmed_role = ""
+            self._pre_warmed_place = ""
             if not below_editor:
                 await self._send_error(f"Pre-warmup failed: {e}")
 
@@ -383,7 +447,7 @@ class WarmupController(_Host):
                     focus_line, self.user_sub,
                     connection_id=getattr(self, "notify_connection_id", "") or None,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001  # the focus line is optional, a failure must never hold the warmup
                 msg["_focus_line"] = ""
 
         # For an EXISTING chat the chat row is the agent of record — the frame's
@@ -395,7 +459,7 @@ class WarmupController(_Host):
         # against it, fail-closed. New chats (no row yet) keep the frame agent.
         _rebind_cid = msg.get("chat_id")
         if _rebind_cid:
-            _chat_agent = ((await run_db(task_store.get_chat, _rebind_cid)) or {}).get("agent") or ""
+            _chat_agent = ((await run_db_fast(task_store.get_chat, _rebind_cid)) or {}).get("agent") or ""
             if _chat_agent and _chat_agent != agent:
                 if not self._can_access_agent(_chat_agent):
                     await self._send_error(f"Access denied for agent '{_chat_agent}'")
@@ -404,16 +468,40 @@ class WarmupController(_Host):
                     await self._send_error(f"Agent '{_chat_agent}' no longer exists")
                     return
                 logger.warning(
-                    f"WS dashboard warmup: agent mismatch for chat={_rebind_cid} — "
-                    f"frame='{agent}', chat row='{_chat_agent}'; using the chat's agent"
+                    "WS dashboard warmup: agent mismatch for chat=%s — "
+                    "frame='%s', chat row='%s'; using the chat's agent",
+                    _rebind_cid, agent, _chat_agent
                 )
                 agent = _chat_agent
+
+        # A cold send on a chat another page is warming, or whose turn runs:
+        # this page joins the chat and its text waits behind the turn in
+        # progress, never a second warmup or a second first prompt.
+        carries = bool(msg.get("text") or msg.get("images") or msg.get("files"))
+        if (_rebind_cid and carries and not input_queue.deleting(_rebind_cid)
+                and self._chat_in_progress(_rebind_cid)):
+            await self._join_chat_in_progress(_rebind_cid, msg)
+            return
 
         # The eager pre_warmup (if still in flight) is NOT awaited here anymore — a
         # slow remote pre-warm would block warmup_started (the chat row + sidebar +
         # URL) for its whole duration. The await + the pre-warmed-reuse-vs-fresh
         # decision moved INTO the backgrounded spawn (_do_warmup → _spawn_tail), so
         # the new chat appears in <1s and the reuse still happens.
+
+        # An existing chat with no warmup in flight is registered as warming
+        # before _do_warmup runs (the check and the register yield only
+        # while the registry's lock is held), so a second cold send
+        # meanwhile joins instead of spawning too; another page's in-flight
+        # entry is never taken over. The backgrounded tail owns the entry
+        # from then on; every other outcome (an inline reuse, a refusal, a
+        # mint of another chat) drops it below and arms the queue for what a
+        # joined page sent meanwhile.
+        early = ""
+        if (_rebind_cid and not input_queue.deleting(_rebind_cid)
+                and warmup_registry.get(_rebind_cid) is None):
+            await warmup_registry.register(_rebind_cid, self.user_sub, agent)
+            early = _rebind_cid
 
         # Tracks the warmup-in-progress window across ALL return paths
         # (alive-session reuse, pre-warmed-reuse, new-chat) so mode_change /
@@ -431,6 +519,15 @@ class WarmupController(_Host):
             outcome = await self._do_warmup(agent, msg)
         finally:
             self._warmup_in_flight = False
+            if early and (outcome != "bg" or self.chat_id != early):
+                if outcome == "inline" and msg.get("text") and self.chat_id == early:
+                    # The inline kick below registers its pump a few awaits
+                    # from here: the hold keeps a joined page's delivery
+                    # from starting its text first (the kick's end ends it).
+                    input_queue.hold_first_turn(early)
+                await warmup_registry.unregister(early)
+                if outcome != "inline":
+                    input_queue.first_turn_not_run(early)
             if outcome == "inline":
                 # Post-warmup re-apply of deferred mode/model: a mode/model
                 # change that raced the synchronous warmup is applied to the new
@@ -464,6 +561,53 @@ class WarmupController(_Host):
                 # The reuse above already waited out the machine's reconnect.
                 "_reconnect_waited": bool(holder and holder.is_session_grace_held(self.session_id)),
             })
+            input_queue.first_turn_not_run(self.chat_id)
+
+    @staticmethod
+    def _chat_in_progress(cid: str) -> bool:
+        """Whether a cold send on ``cid`` joins it instead of warming it: the
+        chat is getting ready (another page's warmup, its first turn still
+        enqueued), a pump is registered for it (done or not: its end hands
+        the queue on), or a starter holds its claim."""
+        return (input_queue.getting_ready(cid) or _active_pumps.get(cid) is not None
+                or input_queue.is_claimed(cid))
+
+    async def _join_chat_in_progress(self, cid: str, msg: dict) -> None:
+        """A cold send on a chat in progress: the connection joins the chat
+        the way a resume does (the access check, the in-flight warmup's
+        listener and history replay or the live pump's promised attach, or
+        ``warmup_ready`` with the live session), becomes the session's
+        notification sink as a resume does, then queues the text behind the
+        turn in progress as a ``chat`` frame would, attaches to a pump that
+        drives the chat, and arms the background monitors after it. A resume
+        that refused, or a view-only connection, ends the page's warmup with
+        a card and queues nothing."""
+        await self._handle_resume_chat({"chat_id": cid})
+        if self.chat_id != cid:
+            await self._send({"type": wire.WARMUP_FAILED, "chat_id": cid,
+                              "error": "This chat could not be opened.",
+                              "reason": "session_error"})
+            return
+        self._register_notify_queue()
+        refusal = ""
+        if self._view_only:
+            refusal = await self._deny_task_continue(cid, quiet=True) or (
+                "This chat is one you can read but not drive.")
+        if refusal:
+            await self._send({"type": wire.WARMUP_FAILED, "chat_id": cid,
+                              "error": refusal, "reason": wire.REASON_BELOW_EDITOR})
+            return
+        item = await self._prepare_turn_input(
+            msg.get("text", ""), msg.get("images") or [], msg.get("files") or [])
+        if item is None:
+            # The refusal went out bare: the page resets its warmup as it
+            # does for any cold send's refusal.
+            return
+        await self._queue_for_next_turn(cid, item, msg.get("queue_id"))
+        live = _active_pumps.get(cid)
+        if live is not None and not live.is_done:
+            await self._enter_pump_loop()
+        self._ensure_bg_monitor()
 
     async def _do_warmup(self, agent: str, msg: dict) -> str:
         self.agent_name = agent
@@ -475,18 +619,18 @@ class WarmupController(_Host):
         # Per-chat interactive override — the frontend's
         # interactive toggle. '' = unset (use stored/resolver default).
         requested_exec_mode = msg.get("execution_mode", "")
-        logger.info(f"WS dashboard warmup: agent={agent}, requested_exec_path='{requested_exec_path}', model='{requested_model}', execution_mode='{requested_exec_mode}'")
+        logger.info("WS dashboard warmup: agent=%s, requested_exec_path='%s', model='%s', execution_mode='%s'", agent, requested_exec_path, requested_model, requested_exec_mode)
         def _warm_role_layer():
-            # Role + layer in ONE executor job (the layer reads remote_store
-            # for a remote target).
+            # Role + layer + path in ONE executor job (the layer reads
+            # remote_store for a remote target; the path is the actual one for
+            # storage, never "remote").
             role = acting_role_of(self.user_sub, agent, fallback_user=self.user)
             return role, get_execution_layer(
                 agent, execution_path=requested_exec_path, user_sub=self.user_sub, role=role,
-            )
+            ), resolve_execution_path(agent, requested_exec_path)
 
-        warmup_role, self.layer = await run_db(_warm_role_layer)
-        effective_exec_path = resolve_execution_path(agent, requested_exec_path)  # actual path for storage (never "remote")
-        permission_mode = msg.get("permission_mode", "default")
+        warmup_role, self.layer, effective_exec_path = await run_db(_warm_role_layer)
+        permission_mode = chat_mode_for_path(msg.get("permission_mode", ""), effective_exec_path)
         requested_model = await live_model(msg.get("model", ""))  # frontend sends current selection
         # Dashboard light/dark mode → seeds Claude's TUI theme (interactive only).
         requested_theme = msg.get("theme", "")
@@ -495,269 +639,33 @@ class WarmupController(_Host):
         # (agent-scoped → editor+; user-scoped → creator/admin) before spawning.
         if await self._deny_task_continue(cid):
             return "skip"
-        old_session_id: str | None = None
-        chat: dict | None = None  # set below for an existing chat; None for new
-
-        chat_model = ""  # will be loaded from DB or left empty for new chats
-        chat_exec_mode = ""  # per-chat interactive override (loaded/persisted below)
-        # New-chat-only locals the backgrounded tail reuses for the pre-warm match;
-        # defaulted so the existing-chat path (which skips the block below) still
-        # leaves them defined for the snapshot.
-        target_model = ""
-        consume_effective_role = ""
-        pw_task = self._pre_warmup_task  # snapshot the in-flight eager pre-warm task
-
-        if cid:
-            # Reuse existing chat
-            chat = await run_db(task_store.get_chat, cid)
-            if chat and _rewarm_chat_allowed(
-                    chat, cid, self.user_sub, self.user_agents):
-                self.chat_id = cid
-                # Persist the prompt at send-time for an existing-chat cold send
-                # (resumed dead session): the frontend warmup carries the text
-                # when its session is cold, and the server-kick skips re-persist.
-                await self._persist_first_prompt(self.chat_id, msg.get("text", ""))
-                old_session_id = chat.get("session_id")
-                permission_mode = chat.get("permission_mode", permission_mode)
-                chat_model = chat.get("model", "")
-                # Per-chat execution mode: a fresh toggle in this warmup wins and
-                # is persisted; else the chat's stored mode (so resume re-spawns
-                # in the same mode).
-                chat_exec_mode = requested_exec_mode or chat.get("execution_mode", "") or ""
-                if requested_exec_mode and requested_exec_mode != (chat.get("execution_mode") or ""):
-                    await chat_writer.submit(
-                        cid,
-                        functools.partial(task_store.update_chat, cid,
-                                          execution_mode=requested_exec_mode),
-                        label="exec_mode",
-                    )
-                # Use chat's stored execution_path if available
-                if chat.get("execution_path"):
-                    effective_exec_path = chat["execution_path"]
-                # Resume affinity: the alive-check and the resume gate below
-                # must consult the layer of the chat's PINNED target, never the
-                # agent's current default — an agent retargeted between
-                # sessions would otherwise ask the wrong machine about the old
-                # session (a live local session reads dead, an on-disk resume
-                # is refused) and the chat loses its context to a fresh spawn.
-                chat_pin = chat.get("execution_target") or ""
-                if chat.get("execution_path") or chat_pin:
-                    self.layer = get_execution_layer(
-                        agent, execution_path=effective_exec_path,
-                        user_sub=self.user_sub, role=warmup_role,
-                        execution_target=chat_pin,
-                    )
-
-                # If the process is still alive, reuse directly
-                if old_session_id:
-                    # Live INTERACTIVE session (PTY) — re-attach the viewer rather
-                    # than re-spawn. The headless is_session_alive check below
-                    # never sees PTY sessions (they live in interactive_session,
-                    # not the layer's registry), so this must come first.
-                    isess = interactive_session.get(old_session_id)
-                    if isess is not None and isess.alive:
-                        from core.concurrency import acquire_chat_slot
-                        # Re-acquire with the live session's target so a REMOTE
-                        # interactive re-attach never takes a local-G slot.
-                        # A LIVE session is already tracked, so this is the
-                        # idempotent path today — but check the Admission
-                        # anyway: silently attaching an unadmitted session is
-                        # the failure mode a future reordering would hit. The
-                        # owner is recorded only for a connection that drives
-                        # the chat; a re-attach is never capped.
-                        adm = await acquire_chat_slot(
-                            old_session_id, target=isess.target,
-                            user_sub=None if self._view_only else self.user_sub,
-                            per_user_cap=False)
-                        if not adm:
-                            await self._send_error(adm.user_message)
-                            return "inline"
-                        self.session_id = old_session_id
-                        await self._send({
-                            "type": wire.WARMUP_READY,
-                            "session_id": self.session_id,
-                            "chat_id": self.chat_id,
-                            "mode": get_session_mode(old_session_id),
-                            "model": chat_model or config.get_cli_model(agent),
-                            "execution_path": effective_exec_path,
-                            "interactive": True,
-                            # Live turn state at attach: visiting a mid-turn
-                            # interactive chat re-fires warmup_started/ready,
-                            # and status broadcasts are transition-only — this
-                            # field is what keeps the sidebar dot truthful
-                            # (finishWarmup maps True → streaming).
-                            "turn_open": isess.turn_open,
-                        })
-                        # Client attaches via pty_attach (see _dispatch).
-                        return "inline"
-                    # A machine in its reconnect grace is coming back: its live
-                    # session is reused, never resumed over (still reconnecting
-                    # after the wait too: the turn then waits for it).
-                    holder = grace_layer(old_session_id, self.layer) if self.layer else None
-                    if holder and (
-                            await self.layer.is_session_alive(old_session_id)
-                            or await holder.wait_session_reconnect(old_session_id)
-                            or holder.is_session_grace_held(old_session_id)):
-                        # Confirm the concurrency slot (idempotent for a tracked
-                        # session), using the chat's pinned target so a REMOTE
-                        # session is a no-op (and a local-full proxy doesn't
-                        # reject reconnecting to a remote chat).
-                        from core.concurrency import acquire_chat_slot
-                        adm = await acquire_chat_slot(
-                            old_session_id, target=chat.get("execution_target") or placement.LOCAL,
-                            execution_path=chat.get("execution_path"),
-                            user_sub=None if self._view_only else self.user_sub,
-                            per_user_cap=False,
-                        )
-                        if not adm:
-                            await self._send_error(adm.user_message)
-                            return "skip"
-                        self.session_id = old_session_id
-                        await self._send({
-                            "type": wire.WARMUP_READY,
-                            "session_id": self.session_id,
-                            "chat_id": self.chat_id,
-                            "mode": get_session_mode(old_session_id),
-                            "model": chat_model or config.get_cli_model(agent),
-                            "execution_path": effective_exec_path,
-                            "interactive": False,
-                        })
-                        return "inline"
-            else:
-                # Invalid/denied chat_id — will create new. Also drop any
-                # chat this connection was viewing (resume_chat may have set
-                # it from the SAME denied/deleted row): keeping it would make
-                # the fresh spawn below adopt that chat id and overwrite its
-                # session binding instead of creating a genuinely new chat.
-                self.chat_id = None
-                self.session_id = None
-        else:
-            # No chat_id — new chat. Reset viewed connection state from any previous chat
-            # on this WebSocket connection.
-            self._detach_pty_viewer()  # leaving any interactive chat we were viewing
-            self.chat_id = None
-            self.session_id = None
-
-        # Whether THIS warmup minted the chat row: the dashboard moves the
-        # new-chat page's draft onto a chat id only when the frame says so
-        # (a resumed chat's frame must never take it). Derived from the mint
-        # branch, not the request: a denied or vanished chat_id falls through
-        # to a mint too.
-        minted = False
-        if not self.chat_id:
-            # A Shared-only agent's chats run as the agent, which takes the
-            # editor tier: a caller below it is refused before the chat is
-            # minted, so the agent's one history never holds their prompt
-            # (an existing pool chat is held by the drive gate above).
-            chat_owner = await run_db(_vis.chat_history_owner, agent, self.user_sub)
-            if _vis.is_shared_chat_owner(chat_owner) and not roles.can_edit(warmup_role):
-                refusal = ""
-                try:
-                    refuse_agent_state_below_editor(_vis.SCOPE_AGENT, warmup_role)
-                except AgentStateRefused as e:
-                    refusal = str(e)
-                logger.info(f"WS dashboard warmup refused before the mint (below the editor tier) agent={agent}")
-                await self._send({
-                    "type": wire.WARMUP_FAILED,
-                    "error": refusal,
-                    "reason": wire.REASON_BELOW_EDITOR,
-                })
-                return "skip"
-            # Resolve the model + role that form the pre-warm match key (the tail
-            # checks them after awaiting the eager pre-warm). Model precedence:
-            # deferred (user changed during warmup) > requested (sent with warmup
-            # msg) > agent default — it must match the session's spawned model
-            # because CLI processes bake --model at start and can't swap live.
-            # A deferral counts only when it is the new-chat page's (one made
-            # for another chat while its session was away stays that chat's).
-            new_chat_pick = "" if self.deferred_for else self.deferred_model
-            target_model = new_chat_pick or requested_model or config.get_cli_model(agent)
-            # A chat-switch race can leave the OTHER chat's model in the
-            # selector when a new chat spawns on a different engine, and a
-            # stale page can name a model the engine no longer serves — a
-            # foreign model would bake into the chat row and 400 every turn
-            # (see _model_allowed_for_path). Fall back to the engine's own
-            # default (the agent default may belong to the agent's PRIMARY
-            # layer, which is exactly what a cross-layer chat isn't on), never
-            # its first row: the catalog is tier-ordered, so that is the
-            # engine's most expensive model.
-            if not _model_allowed_for_path(target_model, effective_exec_path):
-                fallback_model = await run_db(_engine_default_model, effective_exec_path)
-                logger.warning(
-                    f"WS dashboard warmup: model={target_model} is not a "
-                    f"{effective_exec_path} model — using {fallback_model or 'the layer default'}"
-                )
-                target_model = fallback_model
-            # Per-agent effective role at consume time: if the user's role changed
-            # since the pre-warm spawned (e.g. manager→editor via admin UI/SQL), the
-            # pre-warm's SecurityContext is stale → the tail's match fails and it
-            # spawns a fresh session with the right role baked into its mounts/policy.
-            consume_effective_role = await run_db(
-                acting_role_of, self.user_sub, agent, fallback_user=self.user,
-            )
-
-            # The pre-warmed-reuse-vs-fresh decision moved into _spawn_tail: it must
-            # first await the eager pre-warm (no longer done on the WS loop), so the
-            # chat below is allocated + announced immediately and the reuse happens in
-            # the background.
-            self.chat_id = str(uuid.uuid4())
-            minted = True
-            chat_model = target_model
-            chat_exec_mode = requested_exec_mode
-            if not self.deferred_for:
-                self.deferred_model = ""  # consumed
-                if self.deferred_mode:
-                    permission_mode = self.deferred_mode
-                    self.deferred_mode = ""
-            # The chat row first, then the prompt — both on the chat's lane.
-            await chat_writer.submit(
-                self.chat_id,
-                functools.partial(
-                    task_store.create_chat, self.chat_id, chat_owner,
-                    self.agent_name, permission_mode, model=chat_model,
-                    execution_path=effective_exec_path, execution_mode=chat_exec_mode,
-                ),
-                label="create_chat",
-            )
-            await self._persist_first_prompt(self.chat_id, msg.get("text", ""))
-
-        # For existing chats with no model stored, fill from agent default
-        if not chat_model:
-            chat_model = config.get_cli_model(agent)
-
-        # Register an in-flight warmup so a reconnecting WS can re-attach via
-        # resume_chat and the eventual warmup_ready reaches whichever socket
-        # is currently attached. Also emit warmup_started right away so the
-        # dashboard learns the chat_id (load-bearing for reconnect recovery).
-        # This runs INLINE (fast) so the frontend navigates immediately; the
-        # slow session spawn is backgrounded below so the WS loop stays free
-        # to handle chat-switch / abort during the spawn.
-        await warmup_registry.register(self.chat_id, self.user_sub, self.agent_name)
-        await warmup_registry.attach_listener(self.chat_id, self._send)
-        self._attached_warmups.add(self.chat_id)
-        await warmup_registry.emit(self.chat_id, {
-            "type": wire.WARMUP_STARTED,
-            "chat_id": self.chat_id,
-            "agent": self.agent_name,
-            "execution_path": effective_exec_path,
-            "execution_target": self.session_execution_target,
-            "new_chat": minted,
-        })
+        p = _WarmupPlan(
+            agent=agent, msg=msg, requested_model=requested_model,
+            requested_exec_mode=requested_exec_mode, requested_theme=requested_theme,
+            warmup_role=warmup_role, effective_exec_path=effective_exec_path,
+            permission_mode=permission_mode, cid=cid,
+            pw_task=self._pre_warmup_task,  # snapshot the in-flight eager pre-warm task
+        )
+        if verdict := await self._warm_existing_chat(p):
+            return verdict
+        if verdict := await self._warm_mint_chat(p):
+            return verdict
+        await self._warm_announce(p)
 
         # Snapshot everything the backgrounded spawn needs as LOCALS — the
         # connection's chat_id/agent_name/layer attributes may change underneath
         # the spawn if the user switches chats during the (slow) start_session.
-        wcid = self.chat_id
+        wcid = cast("str", self.chat_id)  # the announce registered it
         w_agent = self.agent_name
         w_layer = self.layer
-        w_pinned = (chat.get("execution_target") if (old_session_id and chat) else "") or ""
-        w_thread = (chat.get("codex_thread_id", "") if (old_session_id and chat) else "")
+        w_pinned = (p.chat.get("execution_target") if (p.old_session_id and p.chat) else "") or ""
+        w_thread = (p.chat.get("codex_thread_id", "") if (p.old_session_id and p.chat) else "")
         # New-chat pre-warm match key (snapshotted — the attributes may change if the user
         # switches chats during the spawn). Empty/"" for existing-chat warmups.
-        w_role = consume_effective_role
-        w_target_model = target_model
-        w_exec_mode = chat_exec_mode  # per-chat interactive override (snapshot)
-        w_theme = requested_theme  # dashboard light/dark (snapshot)
+        w_role = p.consume_effective_role
+        w_target_model = p.target_model
+        w_exec_mode = p.chat_exec_mode  # per-chat interactive override (snapshot)
+        w_theme = p.requested_theme  # dashboard light/dark (snapshot)
 
         # Heartbeat fires every 15s of registry silence so reverse proxies +
         # the dashboard's 30s ping window don't time out the WS during slow
@@ -785,522 +693,358 @@ class WarmupController(_Host):
                 logger.exception("warmup heartbeat loop crashed")
 
         hb_task = asyncio.create_task(_heartbeat_loop())
-
-        async def _spawn_tail() -> None:
-            """Backgrounded session spawn. Runs the slow
-            start_session OFF the WS loop so the connection stays responsive
-            (chat-switch / abort during the spawn). Persists to the DB +
-            warmup_registry headless, adopts the connection's VIEWED attributes
-            ONLY if the user is still on the warmed chat (else it would clobber
-            the chat they switched to), then enqueues a _server_kick
-            so the MAIN loop drives the first turn — the tail never enters the
-            pump loop itself, preserving the single-socket-reader invariant."""
-            res: _SpawnResult | None = None
-            still_viewing = False
-            # An interactive chat must not adopt a headless pre-warmed session
-            # (wrong spawn mode), so skip the pre-warm reuse path when interactive
-            # is resolved-on. Layer/target gating happens in
-            # _create_or_resume_session (falls back to -p if unsupported).
-            wants_interactive = execution_mode.is_interactive(chat_override=w_exec_mode or None)
-            # DB-fallback resume: a chat whose pinned machine was removed, or
-            # whose on-disk session files were aged out by retention, lost its CLI
-            # context (chats.pending_history_seed set + session_id cleared → a FRESH
-            # spawn). For an INTERACTIVE chat, restore the conversation from the DB:
-            # claim the digest here and STASH it on the session below (set_pending_seed
-            # → prepended as a bracketed paste to the first prompt). Gate on
-            # wants_interactive only — the prompt does NOT ride msg.text for Claude
-            # (the frontend sends it as a pty_input paste after warmup_ready), so the
-            # stash is delivery-path-independent. The -p path reseeds in
-            # _start_new_stream; a -p FALLBACK (satellite without PTY) prepends the
-            # digest to its kick text below. consume_pending_seed_digest no-ops
-            # (returns '','') when nothing is pending.
-            seed_digest = ""
-            seed_notice = ""
-            # The reason we claimed, for restore-on-failure: the claim happens
-            # BEFORE the spawn try-block, so a failed spawn (offline satellite,
-            # missing CLI after an engine switch, config error) would otherwise
-            # BURN the seed — the eventual successful warmup then starts the
-            # fresh session with no history digest at all. Captured pre-claim
-            # (the claim clears the column and doesn't return the raw reason).
-            seed_reason_claimed = ""
-            if wants_interactive:
-                def _seed_claim_job():
-                    # Pre-claim read + the destructive claim, one lane job.
-                    reason = (task_store.get_chat(wcid) or {}).get("pending_history_seed") or ""
-                    # Smaller cap than the -p path (48k): the digest is
-                    # bracketed-pasted into the live TUI, so keep it light to
-                    # render fast (well under the Enter backstop) —
-                    # build_history_seed is newest-biased, so this keeps the
-                    # most recent context.
-                    digest, notice = consume_pending_seed_digest(wcid, max_chars=16_000)
-                    return reason, digest, notice
-
-                _pre_claim_reason, seed_digest, seed_notice = await chat_writer.submit(
-                    wcid, _seed_claim_job, label="seed_claim",
-                )
-                if seed_notice:
-                    seed_reason_claimed = _pre_claim_reason
-            # A reseeded prompt's digest is multi-line → keep it off Codex's launch
-            # argv (Windows cmdline limit + structure loss); it's pasted via the PTY.
-            argv_first_prompt = "" if seed_digest else msg.get("text", "")
-            try:
-                if old_session_id:
-                    # A one-shot delivery (--resume echo to this dead chat) may
-                    # still be writing the same JSONL: resuming NOW renders the
-                    # transcript as-of-open (the delivered turn stays invisible
-                    # until the next toggle) and dual-writes the file. Await it;
-                    # the heartbeat loop keeps the user informed meanwhile. Past
-                    # the cap, proceed — degrades to the pre-guard behavior.
-                    from core.session import session_delivery
-                    inflight = session_delivery.oneshot_inflight(wcid)
-                    if inflight is not None:
-                        logger.info(
-                            f"WS dashboard warmup: awaiting in-flight one-shot "
-                            f"delivery on chat={wcid} before resume"
-                        )
-                        try:
-                            await asyncio.wait_for(inflight.wait(), timeout=120)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                f"WS dashboard warmup: one-shot still running after "
-                                f"120s on chat={wcid} — resuming anyway"
-                            )
-                    # Does the CLI session file still have conversation data on
-                    # disk? If the proxy restarted / the session was reaped the
-                    # file may be gone — create a fresh session in that case.
-                    can_resume = w_layer and await w_layer.can_resume_session(
-                        old_session_id, agent_name=w_agent,
-                        username=_resume_username_for_chat(
-                            wcid, w_agent, self.user.get("username", ""),
-                        ),
-                    )
-                    if can_resume:
-                        res = await self._create_or_resume_session(
-                            old_session_id, w_agent, permission_mode, resume=True,
-                            model=chat_model, exec_path=effective_exec_path,
-                            resume_handle=w_thread, chat_id=wcid,
-                            pinned_target=w_pinned, adopt=False,
-                            chat_exec_mode=w_exec_mode, chat_theme=w_theme,
-                        )
-                        logger.info(
-                            f"WS dashboard warmup (resume): session={old_session_id}, "
-                            f"chat={wcid}, agent={w_agent}, model={chat_model}"
-                        )
-                    else:
-                        # The dead session's binding would outlive it: a
-                        # resume hands it over at bind time, a fresh id never
-                        # meets it, and nothing else releases a seat under an
-                        # id no session runs.
-                        subscription_pool.release_subscription(old_session_id)
-                        new_sid = str(uuid.uuid4())
-                        res = await self._create_or_resume_session(
-                            new_sid, w_agent, permission_mode, resume=False,
-                            model=chat_model, exec_path=effective_exec_path,
-                            resume_handle=w_thread, chat_id=wcid,
-                            pinned_target=w_pinned, adopt=False,
-                            chat_exec_mode=w_exec_mode, chat_theme=w_theme,
-                            first_prompt=argv_first_prompt,
-                            focus_line=msg.get("_focus_line", ""),
-                        )
-                        # The resume gate legitimately refused (missing JSONL,
-                        # RPC timeout, satellite mid-reconnect) — this fresh
-                        # session starts with no context, so flag the DB-digest
-                        # reseed; and the dead session's background work died
-                        # with it, so clear any stuck liveness badges.
-                        task_store.update_chat(
-                            wcid, session_id=new_sid,
-                            pending_history_seed="resume_failed",
-                        )
-                        clear_session_liveness(
-                            old_session_id, reason="resume_failed",
-                        )
-                        if wants_interactive and not seed_digest:
-                            # The interactive digest claim above ran BEFORE this
-                            # branch decided fresh — claim again so the digest
-                            # still rides the PTY paste (the -p path claims at
-                            # the _start_new_stream chokepoint).
-                            seed_digest, seed_notice = consume_pending_seed_digest(
-                                wcid, max_chars=16_000,
-                            )
-                        logger.info(
-                            f"WS dashboard warmup (fresh, old session gone): session={new_sid}, "
-                            f"chat={wcid}, agent={w_agent}, model={chat_model}"
-                        )
-                else:
-                    # NEW CHAT. Await the in-flight eager pre-warm HERE (off the WS
-                    # loop, so warmup_started already fired), then reuse it if it
-                    # still matches this chat's agent/path/model/role + is alive, else
-                    # spawn fresh. We never CLOSE a mismatched pre-warm from the tail
-                    # (a concurrent new-chat pre-warm may own _pre_warmed_sid by now);
-                    # the next pre_warm/warmup or the idle reaper reclaims a stale one.
-                    if pw_task is not None and not pw_task.done():
-                        with contextlib.suppress(asyncio.CancelledError, Exception):
-                            await pw_task
-                    pw_match = (
-                        self._pre_warmed_sid is not None
-                        and self._pre_warmed_agent == w_agent
-                        and self._pre_warmed_exec_path == effective_exec_path
-                        and self._pre_warmed_model == w_target_model
-                        and self._pre_warmed_role == w_role
-                    )
-                    # Claim the pre-warm out of the TTL reaper's reach as the FINAL
-                    # gate — if the reaper already took it (claim False), it's being
-                    # closed, so fall through to a fresh spawn.
-                    from core.session import prewarm_session_registry as _prewarm
-                    pw_reuse_ok = (
-                        pw_match and not wants_interactive and w_layer
-                        and await w_layer.is_session_alive(self._pre_warmed_sid)
-                        and await _prewarm.claim(self._pre_warmed_sid)
-                    )
-                    reuse_sid = None
-                    reuse_note = ""
-                    if pw_reuse_ok:
-                        reuse_sid = self._pre_warmed_sid
-                        if self._pre_warmed_at:
-                            reuse_note = (
-                                f", pre-warmed "
-                                f"{time.monotonic() - self._pre_warmed_at:.1f}s ago"
-                            )
-                        self._pre_warmed_sid = None
-                        self._pre_warmed_agent = None
-                        self._pre_warmed_exec_path = ""
-                        self._pre_warmed_model = ""
-                        self._pre_warmed_role = ""
-                        self._pre_warmed_at = 0.0
-                    elif not wants_interactive and w_layer is not None:
-                        # DETACHED pre-warm fallback: wake-word detection fires
-                        # an HTTP pre-warm with no WS connection to remember it
-                        # on — claim by full key from the global registry.
-                        claimed = await _prewarm.claim_by_key(
-                            user_sub=self.user_sub, agent=w_agent,
-                            model=w_target_model, role=w_role,
-                            exec_path=effective_exec_path,
-                        )
-                        if claimed is not None:
-                            c_sid, c_age = claimed
-                            if await w_layer.is_session_alive(c_sid):
-                                reuse_sid = c_sid
-                                reuse_note = f", detached pre-warm {c_age:.1f}s old"
-                            else:
-                                # Claimed a dead one — close through the layer
-                                # so its slot/subscription accounting frees.
-                                with contextlib.suppress(Exception):
-                                    await w_layer.close_session(c_sid)
-                    if reuse_sid is not None:
-                        # Fresh-resolve the target for the badge + pin (new
-                        # chat → no existing pin); fall back to local on any
-                        # error. The reason rides along: a session below
-                        # manager on an admin-targeted agent runs locally,
-                        # and the badge says so only when the frame carries it.
-                        try:
-                            reuse_target, reuse_reason = remote_store.resolve_execution_target(
-                                w_agent, self.user_sub, w_role,
-                            )
-                        except Exception:
-                            reuse_target, reuse_reason = placement.LOCAL, None
-                        reuse_target = reuse_target or placement.LOCAL
-                        res = _SpawnResult(
-                            session_id=reuse_sid, layer=w_layer,
-                            execution_target=reuse_target, fallback_reason=reuse_reason,
-                        )
-                        task_store.update_chat(
-                            wcid, session_id=reuse_sid, execution_target=reuse_target,
-                        )
-                        logger.info(
-                            f"WS dashboard warmup (pre-warmed reuse): session={reuse_sid[:8]}, "
-                            f"chat={wcid}, agent={w_agent}, model={chat_model}"
-                            f"{reuse_note}"
-                        )
-                        if not (self.deferred_mode and self.deferred_for in ("", wcid)):
-                            await self._give_reused_session_the_chats_mode(
-                                w_layer, reuse_sid, permission_mode,
-                            )
-                    else:
-                        new_sid = str(uuid.uuid4())
-                        res = await self._create_or_resume_session(
-                            new_sid, w_agent, permission_mode, resume=False,
-                            model=chat_model, exec_path=effective_exec_path,
-                            chat_id=wcid, adopt=False,
-                            chat_exec_mode=w_exec_mode, chat_theme=w_theme,
-                            first_prompt=argv_first_prompt,
-                            focus_line=msg.get("_focus_line", ""),
-                        )
-                        await chat_writer.submit(
-                            wcid,
-                            functools.partial(task_store.update_chat, wcid, session_id=new_sid),
-                            label="session_bind",
-                        )
-                        logger.info(
-                            f"WS dashboard warmup (new): session={new_sid}, "
-                            f"chat={wcid}, agent={w_agent}, model={chat_model}"
-                        )
-
-                # Abort-during-spawn: the user hit Stop while this chat was
-                # warming. Cancelling the spawn task can't reliably stop a
-                # half-started CLI/satellite process, so we let the spawn finish
-                # then tear it down here: kill the just-spawned session (kept
-                # resumable) and suppress BOTH warmup_ready and the first-turn
-                # kick — the client already received `aborted`. The `finally`
-                # below still unregisters the warmup.
-                if self._warmup_abort_chat == wcid and res is not None:
-                    self._warmup_abort_chat = None
-                    try:
-                        await res.layer.abort(res.session_id)
-                    except Exception:
-                        logger.warning(f"abort-during-spawn teardown failed for chat={wcid}")
-                    # Deliberately NOT stamping last_abort_graceful: this abort
-                    # loses no turn (the first-turn kick was suppressed), so the
-                    # flag-pair keeps describing the PREVIOUS abort — a graceful
-                    # one kept its partial turn in the CLI history and must
-                    # still skip the cancelled-context injection.
-                    task_store.update_chat(wcid, last_turn_aborted=True)
-                    return
-
-                # stash the restored-history digest on the interactive session
-                # BEFORE its readiness flush (this runs synchronously, ahead of the
-                # ≥0.8s settle), so the first prompt is prepended with the prior
-                # conversation (set_pending_seed → _emit_to_pty bracketed paste). A
-                # -p FALLBACK (not res.interactive) prepends to its kick text below.
-                if res.interactive and seed_digest:
-                    isess = interactive_session.get(res.session_id)
-                    if isess is not None:
-                        isess.set_pending_seed(seed_digest)
-
-                # Adopt into the connection's VIEWED state ONLY if the socket is
-                # still on the warmed chat. A chat-switch during the spawn means
-                # the attributes now describe a DIFFERENT chat — adopting would
-                # clobber it. The DB + registry already hold the truth either way.
-                still_viewing = (self.chat_id == wcid)
-                if still_viewing:
-                    prev_sid = self.session_id
-                    self.session_id = res.session_id
-                    self.layer = res.layer
-                    self.session_execution_target = res.execution_target
-                    self.session_fallback_reason = res.fallback_reason
-                    # Register the dashboard notify queue under the NOW-adopted
-                    # session id. The dispatch's `_register_notify_queue()` ran
-                    # BEFORE this backgrounded spawn adopted `session_id`, so a
-                    # freshly-spawned session (an interactive session, or a `-p`
-                    # rewarm after a mode switch) would otherwise never land in
-                    # `_dashboard_notify_queues` — which breaks location-mcp's
-                    # "find the active dashboard session" lookup (api/hooks/hooks.py
-                    # request_user_location → "No active dashboard session").
-                    # Same chat, fresh sid — the replaced sid's entry goes too.
-                    self._register_notify_queue(replaces=prev_sid)
-
-                # Reconcile chat row + warmup_ready mode with the spawned
-                # session's actual mode (a mode_change may have raced the spawn).
-                eff_mode = get_session_mode(res.session_id) or permission_mode
-                if eff_mode != permission_mode:
-                    task_store.update_chat(wcid, permission_mode=eff_mode)
-
-                # When a user per-agent override is offline and we soft-fell-back,
-                # surface the offline machine's name for the "machine X offline —
-                # using default" banner.
-                offline_machine_name = ""
-                if res.fallback_reason == "user-override-offline":
-                    ut = remote_store.get_user_remote_target(self.user_sub, w_agent)
-                    if ut:
-                        om = remote_store.get_remote_machine(ut["machine_id"]) or {}
-                        offline_machine_name = str(om.get("name") or "")
-                _mismatch = await run_db(self._target_mismatch_fields, wcid)
-                await warmup_registry.emit(wcid, {
-                    "type": wire.WARMUP_READY,
-                    "session_id": res.session_id,
-                    "chat_id": wcid,
-                    "mode": eff_mode,
-                    "model": chat_model,
-                    "execution_path": effective_exec_path,
-                    "execution_target": res.execution_target,
-                    "fallback_reason": res.fallback_reason,
-                    "offline_machine_name": offline_machine_name,
-                    "interactive": res.interactive,
-                    **_mismatch,
-                })
-                # surface the "restored from history" card live (also persisted
-                # to chat_messages by the digest claim, so it renders on reload).
-                if seed_notice and still_viewing:
-                    await self._send({
-                        "type": wire.SYSTEM,
-                        "subtype": wire.SUBTYPE_SESSION_RESEEDED,
-                        "message": seed_notice,
-                        "chat_id": wcid,
-                    })
-                # Interactive: the CLIENT attaches the PTY viewer itself via a
-                # `pty_attach` frame once its terminal has mounted + subscribed —
-                # so the scrollback replay can't race the subscribe (blank-terminal
-                # bug). warmup_ready{interactive:true} above is the signal; the
-                # connection's session_id is already adopted. No server-kick (the
-                # human drives the PTY) — handled below.
-            except NoSubscriptionError as e:
-                # Expected + actionable: this user has no usable credentials for the
-                # layer (no own sub, and either Platform Auth off or only un-borrowable
-                # admin OAuth in the pool). Surface the friendly message + a
-                # machine-readable reason — it's a configuration state, not a crash.
-                logger.info(f"WS dashboard warmup blocked (no subscription, reason={e.reason}) chat={wcid}")
-                if seed_reason_claimed:
-                    task_store.update_chat(
-                        wcid, pending_history_seed=seed_reason_claimed)
-                await warmup_registry.emit(wcid, {
-                    "type": wire.WARMUP_FAILED,
-                    "chat_id": wcid,
-                    "error": str(e),
-                    "reason": e.reason,
-                })
-            except Exception as e:
-                if isinstance(e, AgentStateRefused):
-                    # A person below the editor tier on a chat that runs as the
-                    # agent: the card below carries the refusal, no crash.
-                    logger.info(f"WS dashboard warmup refused (below the editor tier) chat={wcid}")
-                else:
-                    logger.error(f"WS dashboard warmup failed: {e}", exc_info=True)
-                # Failed spawn — un-burn the claimed history seed so the next
-                # (successful) warmup still restores context. The claim already
-                # persisted its "Continued with a fresh session" card; a rare
-                # second card on the retry is accepted (two restart attempts).
-                if seed_reason_claimed:
-                    with contextlib.suppress(Exception):
-                        task_store.update_chat(
-                            wcid, pending_history_seed=seed_reason_claimed)
-                # Classify so the UI distinguishes a genuinely-offline/unreachable
-                # remote target ("Remote machine unavailable") from a session that
-                # FAILED TO START on a reachable machine (a config/spawn error,
-                # e.g. a bad config.toml) — the latter is not an availability
-                # problem, so the "machine unavailable" title misled. The
-                # connection layer raises "...not connected" / "...command timeout"
-                # for true unavailability; a satellite that ran the command and
-                # returned an error surfaces as "Satellite command error: ...".
-                emsg = str(e)
-                if isinstance(e, AgentStateRefused):
-                    fail_reason = wire.REASON_BELOW_EDITOR
-                else:
-                    fail_reason = (
-                        "target_unavailable"
-                        if ("not connected" in emsg or "command timeout" in emsg)
-                        else "session_error"
-                    )
-                await warmup_registry.emit(wcid, {
-                    "type": wire.WARMUP_FAILED,
-                    "chat_id": wcid,
-                    "error": emsg,
-                    "reason": fail_reason,
-                })
-            finally:
-                heartbeat_stop.set()
-                try:
-                    await asyncio.wait_for(hb_task, timeout=1.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    hb_task.cancel()
-                # A -p first turn is about to be kicked: what is sent before it
-                # starts keeps waiting behind it (core/events/input_queue.py).
-                if res is not None and not res.interactive and msg.get("text"):
-                    input_queue.hold_first_turn(wcid)
-                # Terminal event emitted; drop the registry entry so the next
-                # chat reusing this WS doesn't see stale state.
-                await warmup_registry.unregister(wcid)
-                self._attached_warmups.discard(wcid)
-
-            if res is None:
-                # Spawn failed — warmup_failed already emitted, no kick: what
-                # this person sent while it got ready goes back to them.
-                await self._return_warmup_sends(wcid, "turn_failed")
-                return
-            # Re-apply any deferred mode/model the user set during the spawn —
-            # only if they're still on this chat (else the deferred value
-            # belongs to the chat they switched to, handled by that chat's flow).
-            if still_viewing:
-                await self._reapply_deferred_after_warmup(self.chat_id or "", from_warmup=True)
-            # Interactive: there is NO server-kicked pump turn — the human drives
-            # the PTY. A cold send's text rides the warmup and is delivered HERE,
-            # server-side (submit_prompt buffers until the TUI is ready and arms
-            # the deferred Enter), so the prompt survives the client switching
-            # chats / reloading mid-warmup. Codex fresh spawns delivered it via
-            # the launch argv instead (auto-runs) — skip those (double-send).
-            if res.interactive:
-                first_text = msg.get("text", "")
-                if first_text and not res.first_prompt_in_argv:
-                    isess = interactive_session.get(res.session_id)
-                    if isess is not None and isess.alive:
-                        # Stamp the time and the viewer-focus line at delivery
-                        # (parity with the -p pump's injection; the client
-                        # sends the text RAW so a declined-to-headless kick
-                        # can't double-stamp).
-                        stamped = self._interactive_prelude(
-                            first_text, session_id=res.session_id,
-                            focus_line=msg.get("_focus_line", ""),
-                        )
-                        # Re-note the STAMPED bytes (replaces the raw note from
-                        # _persist_first_prompt): the tailer's duplicate-skip
-                        # matches the journaled user line and the CLI journals
-                        # what the PTY received — without this the first user
-                        # row lands twice. Any reseed digest rides the
-                        # session's stashed seed (set_pending_seed above),
-                        # prepended at the first submission — NOT here.
-                        from core.session.transcript_tool_events import (
-                            note_sent_prompt,
-                        )
-                        note_sent_prompt(wcid, stamped)
-                        logger.info(
-                            f"WS dashboard: server-side first prompt submit "
-                            f"chat={wcid[:8]} session={res.session_id[:8]}"
-                        )
-                        isess.submit_prompt(stamped)
-                # What was sent while it got ready is typed after it.
-                if input_queue.peek(wcid):
-                    input_queue.arm(wcid)
-                return
-            # Server-owned first turn. If the WS is gone (refresh/navigate during
-            # the spawn), there is no main loop to drive the kick — run it
-            # HEADLESS right here so the turn still lands in wcid's DB (preserves
-            # refresh-during-spawn durability). Otherwise hand the kick to
-            # the MAIN loop via the notify queue (the tail must NOT enter the pump
-            # loop itself — that would be a 2nd socket reader); the main loop
-            # routes it through _run_server_turn → streams if still viewing wcid,
-            # else headless. Auto-warmup callers carry no text → no kick.
-            # a wants-interactive chat that fell back to -p (no PTY on the
-            # satellite) AND was reseeded carries the digest into the kick too, so
-            # the -p turn restores context (_start_new_stream's own consume then
-            # no-ops — the flag is already cleared). A genuine -p chat reseeds in
-            # _start_new_stream (seed_digest is '' here).
-            kick_text = msg.get("text", "")
-            if seed_digest and kick_text:
-                kick_text = f"{seed_digest}\n\n{kick_text}"
-            if not kick_text and input_queue.peek(wcid):
-                # No first turn: what was sent while it got ready goes now.
-                input_queue.arm(wcid)
-            if kick_text:
-                if self._ws_gone:
-                    await self._run_kick_headless(
-                        wcid, res.session_id, kick_text,
-                        msg.get("images", []), msg.get("files", []),
-                        force_headless=True,
-                    )
-                else:
-                    # Breadcrumb: pairs with "server kick drained" /
-                    # "close-rescue" so a lost first turn is diagnosable.
-                    logger.info(
-                        f"WS dashboard: server kick enqueued for chat={wcid[:8]}"
-                    )
-                    self.notify_queue.put_nowait({
-                        "type": wire.NOTIFY_SERVER_KICK,
-                        "session_id": res.session_id,
-                        "chat_id": wcid,
-                        "text": kick_text,
-                        "images": msg.get("images", []),
-                        "files": msg.get("files", []),
-                        "focus_line": msg.get("_focus_line", ""),
-                    })
-
-        self._warmup_task = asyncio.create_task(_spawn_tail())
+        w = _TailArgs(
+            wcid=wcid, w_agent=w_agent, w_layer=w_layer, w_pinned=w_pinned, w_thread=w_thread,
+            w_role=w_role, w_target_model=w_target_model, w_exec_mode=w_exec_mode, w_theme=w_theme,
+            msg=msg, permission_mode=p.permission_mode, chat_model=p.chat_model,
+            effective_exec_path=p.effective_exec_path, old_session_id=p.old_session_id,
+            pw_task=p.pw_task, heartbeat_stop=heartbeat_stop, hb_task=hb_task,
+            w_place=p.placed[0], w_minted_at=p.minted_at,
+        )
+        self._warmup_chat_id = wcid
+        self._warmup_task = asyncio.create_task(self._spawn_tail(w, _TailRun()))
         return "bg"
 
+    async def _warm_existing_chat(self, p: _WarmupPlan) -> str | None:
+        """A chat_id in the request: its row's mode, model, path and pin; a
+        live interactive or a grace-held session is re-attached here ("inline"),
+        a deleted chat or a refused slot ends the warmup ("skip"); None when a
+        spawn follows (a denied chat_id falls through to a mint)."""
+        from ws.dashboard import _rewarm_chat_allowed
+        if p.cid:
+            # Reuse existing chat
+            p.chat = await run_db_fast(task_store.get_chat, p.cid)
+            if p.chat and input_queue.deleting(p.cid):
+                await self._send({"type": wire.WARMUP_FAILED, "chat_id": p.cid,
+                                  "error": "This chat was deleted.",
+                                  "reason": "session_error"})
+                return "skip"
+            if p.chat and _rewarm_chat_allowed(
+                    p.chat, p.cid, self.user_sub, self.user_agents):
+                self.chat_id = p.cid
+                # Persist the prompt at send-time for an existing-chat cold send
+                # (resumed dead session): the frontend warmup carries the text
+                # when its session is cold, and the server-kick skips re-persist.
+                await self._persist_first_prompt(self.chat_id, p.msg.get("text", ""))
+                p.old_session_id = p.chat.get("session_id")
+                p.permission_mode = p.chat.get("permission_mode", p.permission_mode)
+                p.chat_model = p.chat.get("model", "")
+                # Per-chat execution mode: a fresh toggle in this warmup wins and
+                # is persisted; else the chat's stored mode (so resume re-spawns
+                # in the same mode).
+                p.chat_exec_mode = p.requested_exec_mode or p.chat.get("execution_mode", "") or ""
+                if p.requested_exec_mode and p.requested_exec_mode != (p.chat.get("execution_mode") or ""):
+                    await chat_writer.submit(
+                        p.cid,
+                        functools.partial(task_store.update_chat, p.cid,
+                                          execution_mode=p.requested_exec_mode),
+                        label="exec_mode",
+                    )
+                # Use chat's stored execution_path if available
+                if p.chat.get("execution_path"):
+                    p.effective_exec_path = p.chat["execution_path"]
+                p.permission_mode = await coerce_chat_mode(p.cid, p.permission_mode, p.effective_exec_path)
+                # Resume affinity: the alive-check and the resume gate below
+                # must consult the layer of the chat's PINNED target, never the
+                # agent's current default — an agent retargeted between
+                # sessions would otherwise ask the wrong machine about the old
+                # session (a live local session reads dead, an on-disk resume
+                # is refused) and the chat loses its context to a fresh spawn.
+                chat_pin = p.chat.get("execution_target") or ""
+                if p.chat.get("execution_path") or chat_pin:
+                    self.layer = await run_db(functools.partial(
+                        get_execution_layer, p.agent, execution_path=p.effective_exec_path,
+                        user_sub=self.user_sub, role=p.warmup_role,
+                        execution_target=chat_pin,
+                    ))
+
+                # If the process is still alive, reuse directly
+                if p.old_session_id:
+                    # Live INTERACTIVE session (PTY) — re-attach the viewer rather
+                    # than re-spawn. The headless is_session_alive check below
+                    # never sees PTY sessions (they live in interactive_session,
+                    # not the layer's registry), so this must come first.
+                    isess = interactive_session.get(p.old_session_id)
+                    if isess is not None and isess.alive:
+                        from core.concurrency import acquire_chat_slot
+                        # Re-acquire with the live session's target so a REMOTE
+                        # interactive re-attach never takes a local-G slot.
+                        # A LIVE session is already tracked, so this is the
+                        # idempotent path today — but check the Admission
+                        # anyway: silently attaching an unadmitted session is
+                        # the failure mode a future reordering would hit. The
+                        # owner is recorded only for a connection that drives
+                        # the chat; a re-attach is never capped.
+                        adm = await acquire_chat_slot(
+                            p.old_session_id, target=isess.target,
+                            user_sub=None if self._view_only else self.user_sub,
+                            per_user_cap=False)
+                        if not adm:
+                            await self._send_error(cast("str", adm.user_message))
+                            return "inline"
+                        self.session_id = p.old_session_id
+                        await self._send({
+                            "type": wire.WARMUP_READY,
+                            "session_id": self.session_id,
+                            "chat_id": self.chat_id,
+                            "mode": get_session_mode(p.old_session_id),
+                            "model": p.chat_model or await run_db(config.get_cli_model, p.agent),
+                            "execution_path": p.effective_exec_path,
+                            "interactive": True,
+                            # Live turn state at attach: visiting a mid-turn
+                            # interactive chat re-fires warmup_started/ready,
+                            # and status broadcasts are transition-only — this
+                            # field is what keeps the sidebar dot truthful
+                            # (finishWarmup maps True → streaming).
+                            "turn_open": isess.turn_open,
+                        })
+                        # Client attaches via pty_attach (see _dispatch).
+                        return "inline"
+                    # A machine in its reconnect grace is coming back: its live
+                    # session is reused, never resumed over (still reconnecting
+                    # after the wait too: the turn then waits for it).
+                    holder = grace_layer(p.old_session_id, self.layer) if self.layer else None
+                    if holder and (
+                            await cast("ExecutionLayer", self.layer).is_session_alive(p.old_session_id)
+                            or await holder.wait_session_reconnect(p.old_session_id)
+                            or holder.is_session_grace_held(p.old_session_id)):
+                        # Confirm the concurrency slot (idempotent for a tracked
+                        # session), using the chat's pinned target so a REMOTE
+                        # session is a no-op (and a local-full proxy doesn't
+                        # reject reconnecting to a remote chat).
+                        from core.concurrency import acquire_chat_slot
+                        adm = await acquire_chat_slot(
+                            p.old_session_id, target=p.chat.get("execution_target") or placement.LOCAL,
+                            execution_path=p.chat.get("execution_path"),
+                            user_sub=None if self._view_only else self.user_sub,
+                            per_user_cap=False,
+                        )
+                        if not adm:
+                            await self._send_error(cast("str", adm.user_message))
+                            return "skip"
+                        self.session_id = p.old_session_id
+                        await self._send({
+                            "type": wire.WARMUP_READY,
+                            "session_id": self.session_id,
+                            "chat_id": self.chat_id,
+                            "mode": get_session_mode(p.old_session_id),
+                            "model": p.chat_model or await run_db(config.get_cli_model, p.agent),
+                            "execution_path": p.effective_exec_path,
+                            "interactive": False,
+                        })
+                        return "inline"
+            else:
+                # Invalid/denied chat_id — will create new. Also drop any
+                # chat this connection was viewing (resume_chat may have set
+                # it from the SAME denied/deleted row): keeping it would make
+                # the fresh spawn below adopt that chat id and overwrite its
+                # session binding instead of creating a genuinely new chat.
+                self.chat_id = None
+                self.session_id = None
+        else:
+            # No chat_id — new chat. Reset viewed connection state from any previous chat
+            # on this WebSocket connection.
+            self._detach_pty_viewer()  # leaving any interactive chat we were viewing
+            self.chat_id = None
+            self.session_id = None
+        return None
+
+    async def _warm_mint_chat(self, p: _WarmupPlan) -> str | None:
+        """No chat to reuse: the chat row minted with its model, role and mode
+        settled (the tail's pre-warm match key) and the first prompt persisted;
+        "skip" when the caller is below the editor tier of a Shared-only agent."""
+        from ws.dashboard import _model_allowed_for_path
+        if not self.chat_id:
+            # A Shared-only agent's chats run as the agent, which takes the
+            # editor tier: a caller below it is refused before the chat is
+            # minted, so the agent's one history never holds their prompt
+            # (an existing pool chat is held by the drive gate above).
+            chat_owner = await run_db(_vis.chat_history_owner, p.agent, self.user_sub)
+            if _vis.is_shared_chat_owner(chat_owner) and not roles.can_edit(p.warmup_role):
+                refusal = ""
+                try:
+                    refuse_agent_state_below_editor(_vis.SCOPE_AGENT, p.warmup_role)
+                except AgentStateRefused as e:
+                    refusal = str(e)
+                logger.info("WS dashboard warmup refused before the mint (below the editor tier) agent=%s", p.agent)
+                await self._send({
+                    "type": wire.WARMUP_FAILED,
+                    "error": refusal,
+                    "reason": wire.REASON_BELOW_EDITOR,
+                })
+                return "skip"
+            # The place the page picked: a refusal mints nothing.
+            from ws import dashboard_chat_move
+            placed = await dashboard_chat_move.place_new_chat(self, p.agent, p.msg,
+                                                             p.effective_exec_path, p.warmup_role)
+            if placed is None:
+                return "skip"
+            p.placed = placed
+            # Resolve the model + role that form the pre-warm match key (the tail
+            # checks them after awaiting the eager pre-warm). Model precedence:
+            # deferred (user changed during warmup) > requested (sent with warmup
+            # msg) > agent default — it must match the session's spawned model
+            # because CLI processes bake --model at start and can't swap live.
+            # A deferral counts only when it is the new-chat page's (one made
+            # for another chat while its session was away stays that chat's).
+            new_chat_pick = "" if self.deferred_for else self.deferred_model
+
+            def _pick_model(candidate: str, agent: str, path: str) -> tuple[str, bool]:
+                model = candidate or config.get_cli_model(agent)
+                return model, _model_allowed_for_path(model, path)
+
+            p.target_model, model_allowed = await run_db(
+                _pick_model, new_chat_pick or p.requested_model, p.agent, p.effective_exec_path)
+            # A chat-switch race can leave the OTHER chat's model in the
+            # selector when a new chat spawns on a different engine, and a
+            # stale page can name a model the engine no longer serves — a
+            # foreign model would bake into the chat row and 400 every turn
+            # (see _model_allowed_for_path). Fall back to the engine's own
+            # default (the agent default may belong to the agent's PRIMARY
+            # layer, which is exactly what a cross-layer chat isn't on), never
+            # its first row: the catalog is tier-ordered, so that is the
+            # engine's most expensive model.
+            if not model_allowed:
+                fallback_model = await run_db(_engine_default_model, p.effective_exec_path)
+                logger.warning(
+                    "WS dashboard warmup: model=%s is not a "
+                    "%s model — using %s",
+                    p.target_model, p.effective_exec_path, fallback_model or 'the layer default'
+                )
+                p.target_model = fallback_model
+            # Per-agent effective role at consume time: if the user's role changed
+            # since the pre-warm spawned (e.g. manager→editor via admin UI/SQL), the
+            # pre-warm's SecurityContext is stale → the tail's match fails and it
+            # spawns a fresh session with the right role baked into its mounts/policy.
+            p.consume_effective_role = await run_db(
+                acting_role_of, self.user_sub, p.agent, fallback_user=self.user,
+            )
+
+            # The pre-warmed-reuse-vs-fresh decision moved into _spawn_tail: it must
+            # first await the eager pre-warm (no longer done on the WS loop), so the
+            # chat below is allocated + announced immediately and the reuse happens in
+            # the background.
+            self.chat_id = str(uuid.uuid4())
+            p.minted = True
+            p.chat_model = p.target_model
+            p.chat_exec_mode = p.requested_exec_mode
+            if not self.deferred_for:
+                self.deferred_model = ""  # consumed
+                if self.deferred_mode:
+                    p.permission_mode = self.deferred_mode
+                    self.deferred_mode = ""
+            # The chat row (pinned where placed) first, then the prompt — both on the chat's lane.
+            p.minted_at = time.monotonic()
+            await chat_writer.submit(self.chat_id, functools.partial(
+                dashboard_chat_move.mint_new_chat, self.chat_id, chat_owner, self.agent_name,
+                p.permission_mode, model=p.chat_model, execution_path=p.effective_exec_path,
+                execution_mode=p.chat_exec_mode, placed=p.placed, actor=self.user_sub or "",
+            ), label="create_chat")
+            await self._persist_first_prompt(self.chat_id, p.msg.get("text", ""))
+        return None
+
+    async def _warm_announce(self, p: _WarmupPlan) -> None:
+        """The in-flight warmup registered and ``warmup_started`` emitted inline,
+        so the dashboard learns the chat id before the slow spawn."""
+        # For existing chats with no model stored, fill from agent default
+        if not p.chat_model:
+            p.chat_model = await run_db(config.get_cli_model, p.agent)
+
+        # Register an in-flight warmup so a reconnecting WS can re-attach via
+        # resume_chat and the eventual warmup_ready reaches whichever socket
+        # is currently attached. Also emit warmup_started right away so the
+        # dashboard learns the chat_id (load-bearing for reconnect recovery).
+        # This runs INLINE (fast) so the frontend navigates immediately; the
+        # slow session spawn is backgrounded below so the WS loop stays free
+        # to handle chat-switch / abort during the spawn.
+        # The plan settled the chat (existing or minted) before the announce.
+        await warmup_registry.register(cast("str", self.chat_id), self.user_sub, self.agent_name)
+        await warmup_registry.attach_listener(cast("str", self.chat_id), self._send)
+        self._attached_warmups.add(cast("str", self.chat_id))
+        await warmup_registry.emit(cast("str", self.chat_id), {
+            "type": wire.WARMUP_STARTED,
+            "chat_id": self.chat_id,
+            "agent": self.agent_name,
+            "execution_path": p.effective_exec_path,
+            "execution_target": self.session_execution_target,
+            "new_chat": p.minted,
+        })
+
+    async def _spawn_tail(self, w: _TailArgs, run: _TailRun) -> None:
+        """Backgrounded session spawn. Runs the slow
+        start_session OFF the WS loop so the connection stays responsive
+        (chat-switch / abort during the spawn). Persists to the DB +
+        warmup_registry headless, adopts the connection's VIEWED attributes
+        ONLY if the user is still on the warmed chat (else it would clobber
+        the chat they switched to), then enqueues a _server_kick
+        so the MAIN loop drives the first turn — the tail never enters the
+        pump loop itself, preserving the single-socket-reader invariant."""
+        try:
+            # The seed claim inside the try: a failed claim is a failed
+            # warmup, and the finally below still stops the heartbeat and
+            # unregisters it.
+            await self._tail_claim_seed(w, run)
+            await self._tail_start(w, run)
+            await self._tail_abort_check(w, run)
+            if run.aborted:
+                return
+            await self._tail_adopt(w, run)
+        except NoSubscriptionError as e:
+            await self._tail_failed(w, run, "subscription", e)
+        except ResumeUndecided as e:
+            await self._tail_failed(w, run, "undecided", e)
+        except Exception as e:
+            if isinstance(e, AgentStateRefused):
+                # A person below the editor tier on a chat that runs as the
+                # agent: the card below carries the refusal, no crash.
+                logger.info("WS dashboard warmup refused (below the editor tier) chat=%s", w.wcid)
+            else:
+                logger.exception("WS dashboard warmup failed: %s", e)
+            await self._tail_failed(w, run, "spawn", e)
+        finally:
+            w.heartbeat_stop.set()
+            try:
+                await asyncio.wait_for(w.hb_task, timeout=1.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                w.hb_task.cancel()
+            # A -p first turn is about to be kicked: what is sent before it
+            # starts keeps waiting behind it (core/events/input_queue.py).
+            # A stopped spawn kicks nothing and holds nothing.
+            if run.res is not None and not run.res.interactive and w.msg.get("text") and not run.aborted:
+                input_queue.hold_first_turn(w.wcid)
+            # Terminal event emitted; drop the registry entry so the next
+            # chat reusing this WS doesn't see stale state.
+            await warmup_registry.unregister(w.wcid)
+            self._attached_warmups.discard(w.wcid)
+
+        if run.res is None:
+            # Spawn failed — warmup_failed already emitted, no kick: what
+            # was sent while it got ready goes back to its authors.
+            self._drop_warmup_mark(w.wcid)
+            await self._return_warmup_sends(w.wcid, "turn_failed")
+            return
+        if run.aborted:
+            # Stopped during the spawn: whatever failed after the Stop, the
+            # stopped turn is never kicked, and what a teammate sent while it
+            # warmed is released (idempotent: the abort check may have).
+            input_queue.first_turn_not_run(w.wcid)
+            return
+        await self._tail_first_turn(w, run)
+
+    def _drop_warmup_mark(self, chat_id: str) -> None:
+        """A spawn of ``chat_id`` ends with no kick to take: the socket's own
+        warmup mark goes only when it is this spawn's (a later spawn of the
+        same socket holds the mark for its chat)."""
+        if self._warmup_chat_id == chat_id:
+            self._warmup_chat_id = None
+
     async def _return_warmup_sends(self, chat_id: str, reason: str) -> None:
-        """A warmup that ends with no first turn (failed, stopped): the
-        messages this person queued while it got ready go back to their
-        composer with the card; a teammate's stay."""
+        """A warmup that ends with no first turn (failed, stopped): every
+        author's messages queued while it got ready go back to their
+        composers with the card (the turn that would have drained them is
+        not coming)."""
         input_queue.first_turn_started(chat_id)
-        q = await input_queue.loaded(chat_id)
-        await input_queue.return_items(chat_id, q.take(self.user_sub or ""), reason)
+        await input_queue.return_all(chat_id, reason)
 
     async def _give_reused_session_the_chats_mode(self, layer, sid: str, mode: str) -> None:
         """A pre-warm spawned with the page's mode of that moment; a pick made
@@ -1310,7 +1054,7 @@ class WarmupController(_Host):
         and the engine's own control command where it has one. The caller
         skips this while a later pick waits (``deferred_mode``): that one
         lands after ``warmup_ready`` and wins."""
-        old = get_session_mode(sid) or "default"
+        old = get_session_mode(sid) or ASK_MODE
         if old == mode:
             return
         set_session_mode(sid, mode)
@@ -1318,11 +1062,11 @@ class WarmupController(_Host):
         if "set_permission_mode" in (caps.control_commands if caps.supports_control_commands else []):
             try:
                 await layer.change_mode(sid, mode)
-            except Exception as e:
-                logger.warning(f"WS dashboard warmup: mode change on the reused session failed: {e}")
+            except Exception as e:  # noqa: BLE001  # a change the engine refuses is logged, the chat keeps its session
+                logger.warning("WS dashboard warmup: mode change on the reused session failed: %s", e)
         logger.info(
-            f"WS dashboard warmup: reused session={sid[:8]} takes the chat's mode={mode} "
-            f"(pre-warmed as {old})"
+            "WS dashboard warmup: reused session=%s takes the chat's mode=%s "
+            "(pre-warmed as %s)", sid[:8], mode, old
         )
 
     async def _reapply_deferred_after_warmup(self, chat_id: str, *,
@@ -1334,13 +1078,14 @@ class WarmupController(_Host):
         pick or the new-chat page's, a turn start on a live session only a
         pick made for that chat, so a new-chat pick never reaches the chat
         the socket is still bound to."""
+        from ws.dashboard import _model_allowed_for_path
         if not self.session_id or not self.layer or chat_id != (self.chat_id or ""):
             return
         if self.deferred_for != chat_id and not (from_warmup and not self.deferred_for):
             return
         try:
             alive = await self.layer.is_session_alive(self.session_id)
-        except Exception:
+        except Exception:  # noqa: BLE001  # a failed liveness probe reads as not alive
             alive = False
         if not alive:
             return
@@ -1348,6 +1093,8 @@ class WarmupController(_Host):
         if self.deferred_mode:
             pending = self.deferred_mode
             self.deferred_mode = ""
+            from ws.dashboard_chat_support import take_owed_engine_mode
+            take_owed_engine_mode(self.session_id)  # this deferral is that pick
             set_session_mode(self.session_id, pending)
             if self.chat_id:
                 await chat_writer.submit(
@@ -1357,12 +1104,12 @@ class WarmupController(_Host):
                 )
             try:
                 await self.layer.change_mode(self.session_id, pending)
-            except Exception as e:
-                logger.warning(f"Post-warmup mode re-apply failed: {e}")
+            except Exception as e:  # noqa: BLE001  # a change the engine refuses is logged, the chat keeps its session
+                logger.warning("Post-warmup mode re-apply failed: %s", e)
             await self._send({"type": wire.MODE_CHANGED, "mode": pending})
             logger.info(
-                f"WS dashboard post-warmup re-applied deferred mode={pending} "
-                f"to session={self.session_id[:8]}"
+                "WS dashboard post-warmup re-applied deferred mode=%s "
+                "to session=%s", pending, self.session_id[:8]
             )
         if self.deferred_model:
             pending = self.deferred_model
@@ -1370,12 +1117,15 @@ class WarmupController(_Host):
             # The deferral may predate the chat binding (no path known at
             # _handle_model_change time) — validate against the layer that
             # actually spawned before applying (see _model_allowed_for_path).
-            chat_path = ((await run_db(task_store.get_chat, self.chat_id) or {}).get("execution_path", "")
-                         if self.chat_id else "")
-            if not _model_allowed_for_path(pending, chat_path):
+            def _deferred_check(cid: str, model: str) -> tuple[str, bool]:
+                path = (task_store.get_chat(cid) or {}).get("execution_path", "") if cid else ""
+                return path, _model_allowed_for_path(model, path)
+
+            chat_path, model_allowed = await run_db(_deferred_check, self.chat_id or "", pending)
+            if not model_allowed:
                 logger.warning(
-                    f"WS dashboard deferred model DROPPED: model={pending} is not a "
-                    f"{chat_path} model (chat={self.chat_id})"
+                    "WS dashboard deferred model DROPPED: model=%s is not a "
+                    "%s model (chat=%s)", pending, chat_path, self.chat_id
                 )
                 return
             if self.chat_id:
@@ -1386,12 +1136,12 @@ class WarmupController(_Host):
                 )
             try:
                 await self.layer.change_model(self.session_id, pending)
-            except Exception as e:
-                logger.warning(f"Post-warmup model re-apply failed: {e}")
+            except Exception as e:  # noqa: BLE001  # a change the engine refuses is logged, the chat keeps its session
+                logger.warning("Post-warmup model re-apply failed: %s", e)
             await self._send({"type": wire.MODEL_CHANGED, "model": pending})
             logger.info(
-                f"WS dashboard post-warmup re-applied deferred model={pending} "
-                f"to session={self.session_id[:8]}"
+                "WS dashboard post-warmup re-applied deferred model=%s "
+                "to session=%s", pending, self.session_id[:8]
             )
 
     async def _create_or_resume_session(self,
@@ -1400,7 +1150,7 @@ class WarmupController(_Host):
         chat_id: str = "", pinned_target: str = "", adopt: bool = True,
         chat_exec_mode: str = "", chat_theme: str = "", first_prompt: str = "",
         focus_line: str = "",
-    ) -> _SpawnResult:
+    ) -> "_SpawnResult":
         """Create a session via the execution layer.
 
         When resume=True, reuses the old session_id with --resume so CLI
@@ -1419,6 +1169,7 @@ class WarmupController(_Host):
         ``_SpawnResult`` itself only if the user is still viewing the warmed
         chat. Always returns the ``_SpawnResult``.
         """
+        from ws.dashboard import _resolve_session_interactive, _SpawnResult
 
         # NB: the concurrency slot is acquired AFTER build_agent_config below,
         # once the execution target is known — a REMOTE (satellite) session must
@@ -1446,7 +1197,7 @@ class WarmupController(_Host):
         live_isess = interactive_session.get(sid)
         if live_isess is not None and live_isess.alive:
             logger.warning(
-                f"refusing headless spawn: live interactive session exists for {sid}"
+                "refusing headless spawn: live interactive session exists for %s", sid
             )
             reuse_layer = get_execution_layer(
                 agent, execution_path=exec_path, user_sub=self.user_sub,
@@ -1468,17 +1219,8 @@ class WarmupController(_Host):
         # so EVERY (re)build path that funnels through this helper is covered.
         # The continue-gate (_deny_task_continue) is enforced separately at the
         # warmup / chat entry points.
-        task_identity = None
-        if session_kind.is_task_chat_id(chat_id):
-            run = task_store.get_run(session_kind.run_id_of_chat(chat_id))
-            if run:
-                # The re-warm rebuilds the SAME task fire, so the
-                # knowledge-RW opt-in follows the run row's kind
-                # (task_kinds.RUN_KINDS: scheduled and delegate opt in).
-                task_identity = resolve_task_identity(
-                    agent, run.get("scope") or "agent", run.get("created_by"),
-                    allow_knowledge_rw=run_allows_knowledge_rw(run.get("task_type")),
-                )
+        task_identity = (await run_db(rewarm_task_identity, chat_id, agent)
+                         if session_kind.is_task_chat_id(chat_id) else None)
         agent_cfg = await build_agent_config(
             agent_name=agent, user=self.user, user_sub=self.user_sub,
             user_role=effective_role, permission_mode=perm_mode,
@@ -1500,7 +1242,7 @@ class WarmupController(_Host):
             # the spawn.
             release_config_seat(sid, agent_cfg)
             offline_machine_id = placement.offline_machine_of(agent_cfg.execution_target)
-            machine = remote_store.get_remote_machine(offline_machine_id)
+            machine = await run_db_fast(remote_store.get_remote_machine, offline_machine_id)
             if not machine:
                 # Deleted mid-flight: this warmup read the pin before the
                 # delete's bulk chat transition cleared it. The row is fixed
@@ -1522,8 +1264,8 @@ class WarmupController(_Host):
             else:
                 # User-paired target — only this user is affected.
                 msg = (
-                    f"Your remote machine '{machine_label}' is offline. "
-                    f"Reconnect it from User Settings → Remote Machines, or remove the per-agent override to fall back to the default target."
+                    f"Your computer '{machine_label}' is offline. Reconnect it, or pick "
+                    "another place from the Runs on menu."
                 )
             raise RuntimeError(msg)
 
@@ -1558,7 +1300,7 @@ class WarmupController(_Host):
         # else it falls back to headless -p instead of hanging on a pty_open the
         # satellite never answers. Any other remote layer is -p. Local interactive
         # (Claude + Codex) is unchanged.
-        agent_cfg.interactive = _resolve_session_interactive(agent_cfg, chat_exec_mode)
+        agent_cfg.interactive = await run_db_fast(_resolve_session_interactive, agent_cfg, chat_exec_mode)
         # Dashboard light/dark at spawn → seeds Claude's TUI theme to match.
         # Server-side re-warms (dead-session auto-resume, headless server turns)
         # carry no dashboard snapshot (chat_theme='') — fall back to the chat's
@@ -1567,7 +1309,7 @@ class WarmupController(_Host):
         # sessions seed dark by design).
         chat_baked_theme = ""
         if not chat_theme and chat_id:
-            chat_baked_theme = (task_store.get_chat(chat_id) or {}).get("tui_theme") or ""
+            chat_baked_theme = ((await run_db_fast(task_store.get_chat, chat_id)) or {}).get("tui_theme") or ""
         agent_cfg.interactive_theme = chat_theme or chat_baked_theme or "dark"
         # Whether an interactive spawn resumes is the ENGINE's answer: the
         # warmup's `resume` flag is keyed on the just-closed -p session (False
@@ -1636,18 +1378,17 @@ class WarmupController(_Host):
         # this site covers them too when their session is re-warmed here.
         # Keyed by the chat PARAM (not the viewed attribute) so it's correct even
         # for a backgrounded spawn on a non-viewed chat.
-        if chat_id and not pinned_target and not placement.is_offline_sentinel(agent_cfg.execution_target):
-            task_store.update_chat(chat_id, execution_target=agent_cfg.execution_target)
         # Remember the baked TUI theme for future server-side re-warms (see the
         # resolution above). Only when a REAL dashboard snapshot arrived — a
         # fallback-resolved re-warm must never overwrite the baked value with
         # 'dark'. Best-effort: a pre-migration DB lacks the column (one-time
         # manual ALTER) and a cosmetic write must not fail the spawn.
-        if chat_id and chat_theme and agent_cfg.interactive:
-            try:
-                task_store.update_chat(chat_id, tui_theme=agent_cfg.interactive_theme)
-            except Exception:
-                logger.debug("tui_theme persist failed", exc_info=True)
+        pin = (agent_cfg.execution_target if chat_id and not pinned_target
+               and not placement.is_offline_sentinel(agent_cfg.execution_target) else "")
+        theme = agent_cfg.interactive_theme if chat_id and chat_theme and agent_cfg.interactive else ""
+        if pin or theme:
+            await chat_writer.submit(chat_id, functools.partial(_persist_spawn, chat_id, pin, theme),
+                                     label="spawn_pin")
         # Adopt into the connection's VIEWED state only when asked (the common
         # inline path). A backgrounded spawn passes adopt=False and adopts the
         # returned result itself, guarded by "still viewing the warmed chat".
@@ -1667,7 +1408,7 @@ class WarmupController(_Host):
     async def _resume_dead_session_for_chat(self,
         dead_sid: str, t_chat_id: str, layer_for_chat: ExecutionLayer, *,
         adopt: bool,
-    ) -> _SpawnResult:
+    ) -> "_SpawnResult":
         """Re-warm a dead session for ``t_chat_id``, resolving its agent / model /
         exec-path / pinned target from the CHAT ROW (never the viewed attributes).
 
@@ -1677,8 +1418,9 @@ class WarmupController(_Host):
         originating chat was reaped while the user views a DIFFERENT chat — warm
         it WITHOUT clobbering the viewed attributes and run headless on the
         returned ``_SpawnResult``. Raises on spawn failure (the caller handles)."""
-        chat_rec = await run_db(task_store.get_chat, t_chat_id) if t_chat_id else None
-        chat_perm_mode = (chat_rec or {}).get("permission_mode", "default")
+        from ws.dashboard import _resume_username_for_chat
+        chat_rec = await run_db_fast(task_store.get_chat, t_chat_id) if t_chat_id else None
+        chat_perm_mode = (chat_rec or {}).get("permission_mode", ASK_MODE)
         chat_model = (chat_rec or {}).get("model", "")
         chat_agent = (chat_rec or {}).get("agent") or self.agent_name
         chat_exec_path = (chat_rec or {}).get("execution_path", "")
@@ -1688,14 +1430,38 @@ class WarmupController(_Host):
         # prepare_resume pops; once popped the check returns False unconditionally
         # (forcing a fresh session + dropping chat memory). Local derives its path
         # from agent+username, so it's order-independent — this order keeps both.
-        can_resume = await layer_for_chat.can_resume_session(
-            dead_sid, agent_name=chat_agent,
-            username=_resume_username_for_chat(
-                t_chat_id or "", chat_agent, self.user.get("username", ""),
-            ),
+        # This runs on the socket's own dispatch, so the probe waits the
+        # inline budget only; a machine that did not answer defers the turn
+        # (every caller of _start_new_stream handles TurnDeferred) with the
+        # record and the grace queue untouched. A connected machine's probe
+        # stays out and a watcher arms the chat again when it answers
+        # (ws/resume_wait); an away machine's turn waits for the reconnect
+        # pass, as a grace-held one does.
+        resume_username = await run_db(
+            _resume_username_for_chat, t_chat_id or "", chat_agent, self.user.get("username", ""),
         )
+        verdict = await settle_resume(
+            layer_for_chat, dead_sid, agent_name=chat_agent, username=resume_username,
+            budget_s=RESUME_PROBE_BUDGET_INLINE_S, keep_probe=True,
+        )
+        if verdict is ResumeVerdict.UNKNOWN:
+            reach = layer_for_chat.resume_machine_reach(
+                dead_sid, agent_name=chat_agent, username=resume_username)
+            if reach is MachineReach.LOCAL:
+                # This server's disk could not read the files twice: no
+                # machine to wait for, the start fails as any other failure.
+                raise ResumeUndecided(dead_sid, local=True)
+            connected = reach is MachineReach.CONNECTED
+            if connected:
+                from ws import resume_wait
+                resume_wait.watch(layer_for_chat, dead_sid, t_chat_id or "", chat_pinned,
+                                  agent_name=chat_agent, username=resume_username)
+            logger.info("WS dashboard: the turn on session %s waits — its machine %s",
+                        dead_sid[:8], "did not answer the resume probe" if connected
+                        else "is away")
+            raise TurnDeferred(dead_sid, unanswered=connected)
         await layer_for_chat.prepare_resume(dead_sid)
-        if can_resume:
+        if verdict is ResumeVerdict.RESUMABLE:
             return await self._create_or_resume_session(
                 dead_sid, chat_agent, chat_perm_mode, resume=True, model=chat_model,
                 exec_path=chat_exec_path, chat_id=t_chat_id, pinned_target=chat_pinned,

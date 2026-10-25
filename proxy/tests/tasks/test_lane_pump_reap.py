@@ -14,7 +14,7 @@ import asyncio
 
 import pytest
 
-from core.events.common_events import CommonEvent, PRODUCER_DONE
+from core.events.common_events import PRODUCER_DONE, CommonEvent
 from core.events.stream_pump import ChatStreamPump, _active_pumps
 from services.scheduler.scheduler import _reap_prior_lane_pump
 from storage import database as task_store

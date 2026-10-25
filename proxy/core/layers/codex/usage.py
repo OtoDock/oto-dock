@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from core.execution_layer import Window, WindowSpec, Windows
+from core.execution_layer import Window, Windows, WindowSpec
 
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
@@ -22,12 +22,15 @@ def usage_request(stored: dict) -> tuple[str, dict] | None:
     """The URL and headers for one account's usage read (the poller adds the
     platform's ``User-Agent``), or None when the stored credential has no
     access token. ``ChatGPT-Account-Id`` comes from the login blob."""
-    oauth = stored.get("oauth_token") if isinstance(stored.get("oauth_token"), dict) else {}
+    stored_oauth = stored.get("oauth_token")
+    oauth = stored_oauth if isinstance(stored_oauth, dict) else {}
     token = str(oauth.get("accessToken") or "")
     if not token:
         return None
-    blob = stored.get("codex_auth_blob") if isinstance(stored.get("codex_auth_blob"), dict) else {}
-    tokens = blob.get("tokens") if isinstance(blob.get("tokens"), dict) else {}
+    stored_blob = stored.get("codex_auth_blob")
+    blob = stored_blob if isinstance(stored_blob, dict) else {}
+    blob_tokens = blob.get("tokens")
+    tokens = blob_tokens if isinstance(blob_tokens, dict) else {}
     headers = {"Authorization": f"Bearer {token}"}
     account_id = str(tokens.get("account_id") or "")
     if account_id:

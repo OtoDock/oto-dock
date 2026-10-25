@@ -33,7 +33,7 @@ resolved, but nothing is recorded.
 import asyncio
 import logging
 import time
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 from core.events.common_events import PRODUCER_DONE, SYSTEM, CommonEvent
 from core.session import session_kind
@@ -94,12 +94,13 @@ async def capture_wake_turn(
     recorded to a chat (False: no chat row, or the bracket never closed —
     partial content is still flushed in that case).
     """
-    from storage import database as task_store
+    from core.events.stream_pump import ChatStreamPump, _active_pumps
+
     # Lazy: core.layers.cli.layer imports the session module, which calls us.
     from core.layers.cli.layer import cli_chunk_to_events
     from core.layers.cli.translator import ClaudeCLIEventTranslator
-    from core.events.stream_pump import ChatStreamPump, _active_pumps
     from core.session.session_state import get_session_client_type
+    from storage import database as task_store
 
     chat = None
     try:

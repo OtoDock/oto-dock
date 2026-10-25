@@ -50,13 +50,12 @@ describe('AgentMcps — category filter and icons', () => {
     const { container } = renderPage()
     await screen.findByText('Memory')
     expect(screen.getByText('GitHub')).toBeTruthy()
-    // Bundled rows load their icon.png; the community row tries the image too
-    // (the proxy falls back to the catalog's icon).
+    // Rows the proxy says have an icon load it; the community row without
+    // one draws its letter and requests nothing (no 404 in the console).
     const sources = Array.from(container.querySelectorAll('img')).map(i => i.getAttribute('src'))
     expect(sources).toEqual([
       '/v1/mcps/memory-mcp/icon.png',
       '/v1/mcps/ssh-hosts/icon.png',
-      '/v1/mcps/github-mcp/icon.png',
     ])
 
     fireEvent.click(screen.getByLabelText('Filter MCPs by category'))

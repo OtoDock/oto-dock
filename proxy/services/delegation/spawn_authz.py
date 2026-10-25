@@ -14,13 +14,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import psycopg
 from fastapi import HTTPException
 
 from auth.providers import UserContext
 from core.session.visibility import SHARED_CHAT_OWNER_PREFIX, available_scopes_for
+from storage import database as task_store
 from storage.agents import agent_store
 from storage.mcp import mcp_store
-from storage import database as task_store
 
 logger = logging.getLogger("otodock.delegation")
 
@@ -54,6 +55,8 @@ def _max_parallel_spawns() -> int:
     ``mcp_state`` switch is what turns the MCP off); an empty, negative or
     unreadable value is the default."""
     raw = mcp_store.get_mcp_config_values("delegation-mcp").get("MAX_PARALLEL_SPAWNS")
+    if raw is None:
+        return DEFAULT_MAX_PARALLEL_SPAWNS
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -63,6 +66,8 @@ def _max_parallel_spawns() -> int:
 
 def _max_delegation_depth() -> int:
     raw = mcp_store.get_mcp_config_values("delegation-mcp").get("MAX_DELEGATION_DEPTH")
+    if raw is None:
+        return DEFAULT_MAX_DELEGATION_DEPTH
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -276,10 +281,12 @@ def validate_spawn_overrides(
     target_agent: str, layer: str | None, model: str | None,
 ) -> None:
     """Reject a spawn override outside the target agent's configured
-    envelope — a clear 400, never a silent downgrade. The implied execution
-    TARGET is untouched by design: overrides pick the layer/model/mode ON
-    the agent's configured target; they can never reroute a worker onto a
-    machine the delegating context couldn't use."""
+    envelope — a clear 400, never a silent downgrade. The layer, model and
+    mode overrides pick how the worker runs, never where. A machine for the
+    worker's runs is allowed only when the delegating person may run there
+    (one of their own machines, or an admin machine for a platform admin),
+    validated by ``chat_targets.resolve_work_machine`` after the scope clamp
+    (``api/tasks/delegation.spawn_delegate``)."""
     if not (layer or model):
         return
     info = agent_store.get_agent(target_agent) or {}
@@ -287,7 +294,7 @@ def validate_spawn_overrides(
         # Same parse as the agents API: primary execution_path + the
         # execution_paths JSON-string extras — never treat the raw column
         # string as a sequence (`in` would degrade to substring matching).
-        from api.agents._common import _get_execution_paths
+        from storage.agents.agent_store import _get_execution_paths
         allowed = _get_execution_paths(info)
         if layer not in allowed:
             raise HTTPException(
@@ -309,7 +316,7 @@ def validate_spawn_overrides(
                 (m.get("model_id") or "") == model and m.get("enabled")
                 for m in subscription_store.list_models(exec_path)
             )
-        except Exception:
+        except (ImportError, psycopg.Error):
             ok = True
         if not ok:
             raise HTTPException(

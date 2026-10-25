@@ -226,7 +226,7 @@ export async function uploadCollected(
   if (stopped === 'cancelled') {
     emitAppToast({
       title: 'Upload cancelled',
-      body: body(`Uploaded ${uploaded} of ${plural(total, 'file')}; the rest were not sent.`),
+      body: body(`Uploaded ${uploaded} of ${plural(total, 'file')}. The rest were not sent.`),
       severity: 'info',
     })
   } else if (failed || emptyFailed) {

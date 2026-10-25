@@ -538,3 +538,224 @@ def test_ping_stream_event_yields_nothing():
     non-streaming fallback with partial messages on: liveness, not content."""
     t = ClaudeCLIEventTranslator("s1")
     assert t.feed({"type": "stream_event", "event": {"type": "ping"}, "session_id": "s1"}) == []
+
+
+# --- narration: the server's summary of the prose between tool calls ---------
+
+def _se(event: dict) -> dict:
+    return {"type": "stream_event", "event": event}
+
+
+def _thinking_frame(text: str, *, indexes=(0,), parent=None) -> dict:
+    frame = {"type": "assistant", "parent_tool_use_id": parent,
+             "message": {"content": [{"type": "thinking", "thinking": text, "signature": "s"}]}}
+    if indexes is not None:
+        frame["narration_block_indexes"] = list(indexes)
+    return frame
+
+
+def _narration_block(t, idx: int, text: str, **frame_kw) -> list:
+    """The shape the CLI streams (2.1.296, partial messages): the block's
+    start and delta, its own assistant frame, then its stop."""
+    out = t.feed(_se({"type": "content_block_start", "index": idx,
+                      "content_block": {"type": "thinking", "thinking": ""}}))
+    out += t.feed(_se({"type": "content_block_delta", "index": idx,
+                       "delta": {"type": "thinking_delta", "thinking": text}}))
+    out += t.feed(_thinking_frame(text, **frame_kw))
+    out += t.feed(_se({"type": "content_block_stop", "index": idx}))
+    return out
+
+
+def test_a_narration_block_ends_as_a_note_and_its_words_follow_as_note_text():
+    t = ClaudeCLIEventTranslator("s-narr")
+    t.feed(_se({"type": "message_start", "message": {}}))
+    # The empty reasoning block first (index 0), then the narration (index 1):
+    # the frame's own index is 0 for both.
+    empty = t.feed(_se({"type": "content_block_start", "index": 0,
+                        "content_block": {"type": "thinking", "thinking": ""}}))
+    empty += t.feed(_thinking_frame("", indexes=None))
+    empty += t.feed(_se({"type": "content_block_stop", "index": 0}))
+    assert _summarize(empty)[-1] == ("thinking", "data", {"phase": "end"})
+    out = _narration_block(t, 1, "Read the file. Next I'll run it.")
+    assert _summarize(out) == [
+        ("thinking", "data", {"phase": "start"}),
+        ("thinking", "data", {"text": "Read the file. Next I'll run it."}),
+        ("thinking", "data", {"phase": "end", "note": True}),
+        ("text", "text", "Read the file. Next I'll run it."),
+    ]
+    assert out[-1].event_data == {"note": True}
+    # A note is not the answer: the next text block gets no separator.
+    assert t.has_emitted_text is False
+
+
+def test_the_note_text_reaches_the_event_as_text_with_note():
+    from core.events.common_events import TEXT, THINKING
+    from core.layers.cli.layer import cli_chunk_to_events
+    t = ClaudeCLIEventTranslator("s-narr2")
+    events = [e for c in _narration_block(t, 0, "Checked it.") for e in cli_chunk_to_events(c)]
+    assert [(e.type, e.data) for e in events][-2:] == [
+        (THINKING, {"phase": "end", "note": True}),
+        (TEXT, {"content": "Checked it.", "note": True}),
+    ]
+
+
+def test_an_empty_listed_block_a_sub_agent_frame_and_a_frame_without_the_field_stay_thinking():
+    t = ClaudeCLIEventTranslator("s-narr3")
+    for kw in ({"indexes": (0,), "parent": "toolu_sub"}, {"indexes": None}, {"indexes": (1,)}):
+        out = _narration_block(t, 0, "words", **kw)
+        assert _summarize(out)[-1] == ("thinking", "data", {"phase": "end"}), kw
+    out = _narration_block(t, 0, "", indexes=(0,))
+    assert _summarize(out)[-1] == ("thinking", "data", {"phase": "end"})
+
+
+def test_a_narration_frame_after_the_stop_changes_nothing():
+    t = ClaudeCLIEventTranslator("s-narr4")
+    t.feed(_se({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}}))
+    t.feed(_se({"type": "content_block_stop", "index": 0}))
+    assert t.feed(_thinking_frame("late")) == []
+    out = t.feed(_se({"type": "content_block_start", "index": 0,
+                      "content_block": {"type": "text", "text": ""}}))
+    out += t.feed(_se({"type": "content_block_stop", "index": 0}))
+    assert all(not (c.event_data or {}).get("note") for c in out)
+
+
+def test_a_reset_drops_an_open_mark():
+    for reset in ("reset_for_new_turn", "reset_for_settle", "reset_for_foreign_skip"):
+        t = ClaudeCLIEventTranslator("s-narr5")
+        t.feed(_se({"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""}}))
+        t.feed(_thinking_frame("marked"))
+        getattr(t, reset)()
+        out = t.feed(_se({"type": "content_block_start", "index": 0,
+                          "content_block": {"type": "thinking", "thinking": ""}}))
+        out += t.feed(_se({"type": "content_block_stop", "index": 0}))
+        assert _summarize(out)[-1] == ("thinking", "data", {"phase": "end"}), reset
+
+
+def test_narration_reads_a_paragraph_apart_for_every_reader_that_joins_text():
+    """The meeting turn, a task's result, the task stream and voice join the
+    TEXT events: a note keeps its paragraph break from the text on either
+    side, while has_emitted_text stays the answer's."""
+    from core.events.common_events import TEXT
+    from core.layers.cli.layer import cli_chunk_to_events
+    t = ClaudeCLIEventTranslator("s-narr6")
+    out = t.feed(_se({"type": "message_start", "message": {}}))
+    out += t.feed(_se({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}))
+    out += t.feed(_se({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "text_delta", "text": "I'll check the config."}}))
+    out += t.feed(_se({"type": "content_block_stop", "index": 0}))
+    out += _narration_block(t, 1, "Reading the settings file.")
+    out += t.feed(_se({"type": "content_block_start", "index": 2,
+                       "content_block": {"type": "tool_use", "id": "tu1", "name": "Read"}}))
+    out += t.feed(_se({"type": "content_block_stop", "index": 2}))
+    out += t.feed(_se({"type": "message_start", "message": {}}))
+    out += _narration_block(t, 0, "Found the key.")
+    out += t.feed(_se({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}))
+    out += t.feed(_se({"type": "content_block_delta", "index": 1,
+                       "delta": {"type": "text_delta", "text": "Here is the answer."}}))
+    joined = "".join(e.data["content"] for c in out for e in cli_chunk_to_events(c) if e.type == TEXT)
+    assert joined == ("I'll check the config.\n\nReading the settings file.\n\nFound the key."
+                      "\n\nHere is the answer.")
+    # A note alone never counts as the answer's text.
+    t2 = ClaudeCLIEventTranslator("s-narr7")
+    _narration_block(t2, 0, "Only a note.")
+    assert t2.has_emitted_text is False
+    t2.reset_for_new_turn()
+    first = t2.feed(_se({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}))
+    assert first == []
+
+
+# --- the note mark: the text right before a tool call in its message --------
+
+def _text_block(t, idx: int, text: str) -> list:
+    out = t.feed(_se({"type": "content_block_start", "index": idx, "content_block": {"type": "text", "text": ""}}))
+    if text:
+        out += t.feed(_se({"type": "content_block_delta", "index": idx,
+                           "delta": {"type": "text_delta", "text": text}}))
+    return out + t.feed(_se({"type": "content_block_stop", "index": idx}))
+
+
+def _tool_block(t, idx: int, tool_id: str) -> list:
+    out = t.feed(_se({"type": "content_block_start", "index": idx,
+                      "content_block": {"type": "tool_use", "id": tool_id, "name": "Bash"}}))
+    out += t.feed(_se({"type": "content_block_delta", "index": idx,
+                       "delta": {"type": "input_json_delta", "partial_json": '{"command": "ls"}'}}))
+    return out + t.feed(_se({"type": "content_block_stop", "index": idx}))
+
+
+def _marks(chunks: list) -> list[int]:
+    """The positions of the note mark among the chunks' events."""
+    from core.events.common_events import is_note_mark
+    from core.layers.cli.layer import cli_chunk_to_events
+    events = [e for c in chunks for e in cli_chunk_to_events(c)]
+    return [i for i, e in enumerate(events) if e.type == "text" and is_note_mark(e.data)]
+
+
+def test_the_text_right_before_a_tool_call_is_marked_a_note_at_the_tool_start():
+    from core.events.common_events import NOTE_MARK, TEXT, TOOL_USE
+    from core.layers.cli.layer import cli_chunk_to_events
+    t = ClaudeCLIEventTranslator("s-mark1")
+    out = t.feed(_se({"type": "message_start", "message": {}}))
+    out += _text_block(t, 0, "I'll list the folder.")
+    out += _tool_block(t, 1, "tu1")
+    events = [(e.type, e.data) for c in out for e in cli_chunk_to_events(c)]
+    assert events[:3] == [(TEXT, {"content": "I'll list the folder."}), (TEXT, NOTE_MARK),
+                          (TOOL_USE, {"name": "Bash", "tool_id": "tu1"})]
+    # The real 5.5 shape of a later message: an empty thinking block, the
+    # text (with its separator), then the call.
+    out = t.feed({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tu1"}]}})
+    out += t.feed(_se({"type": "message_start", "message": {}}))
+    out += t.feed(_se({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}))
+    out += t.feed(_se({"type": "content_block_stop", "index": 0}))
+    out += _text_block(t, 1, "Now the count.")
+    out += _tool_block(t, 2, "tu2")
+    events = [(e.type, e.data) for c in out for e in cli_chunk_to_events(c)]
+    at = events.index((TOOL_USE, {"name": "Bash", "tool_id": "tu2"}))
+    assert events[at - 1] == (TEXT, NOTE_MARK)
+    assert [d["content"] for k, d in events[:at - 1] if k == TEXT] == ["\n\n", "Now the count."]
+
+
+def test_text_that_ends_its_message_stays_text_even_when_the_next_message_opens_with_a_tool():
+    t = ClaudeCLIEventTranslator("s-mark2")
+    out = t.feed(_se({"type": "message_start", "message": {}}))
+    out += _text_block(t, 0, "Done, unless a check asks for more.")
+    out += t.feed(_se({"type": "message_start", "message": {}}))
+    out += _tool_block(t, 0, "tu1")
+    assert _marks(out) == []
+
+
+def test_a_final_answer_an_empty_text_block_and_an_ending_after_text_get_no_mark():
+    t = ClaudeCLIEventTranslator("s-mark3")
+    out = t.feed(_se({"type": "message_start", "message": {}}))
+    out += _text_block(t, 0, "Here is the answer.")
+    assert _marks(out) == []
+    t.reset_for_new_turn()
+    out = t.feed(_se({"type": "message_start", "message": {}}))
+    out += _text_block(t, 0, "")
+    out += _tool_block(t, 1, "tu1")
+    assert _marks(out) == []
+    t.reset_for_new_turn()
+    out = t.feed(_se({"type": "message_start", "message": {}}))
+    out += _text_block(t, 0, "\n")
+    out += _tool_block(t, 1, "tu2")
+    assert _marks(out) == []  # whitespace is not words
+    t.reset_for_new_turn()
+    out = t.feed(_se({"type": "message_start", "message": {}}))
+    out += _text_block(t, 0, "Let me look.")
+    out += t.feed(_se({"type": "message_delta", "delta": {"stop_reason": "refusal",
+                                                          "stop_details": {"category": "cyber"}}}))
+    assert _marks(out) == []
+
+
+def test_parallel_calls_and_a_narration_before_a_call_mark_only_the_text():
+    t = ClaudeCLIEventTranslator("s-mark4")
+    out = t.feed(_se({"type": "message_start", "message": {}}))
+    out += _text_block(t, 0, "Two checks at once.")
+    out += _tool_block(t, 1, "tu1")
+    out += _tool_block(t, 2, "tu2")
+    assert len(_marks(out)) == 1
+    out = t.feed(_se({"type": "message_start", "message": {}}))
+    out += _narration_block(t, 0, "Read both. Next the run.")
+    out += _tool_block(t, 1, "tu3")
+    assert _marks(out) == []  # the narration is a note already

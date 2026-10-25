@@ -9,11 +9,23 @@ import asyncio
 
 import pytest
 
-from core.events.common_events import DONE, ERROR, PRODUCER_DONE, QUEUE_TURN, CommonEvent
+from core.events.common_events import (
+    DONE,
+    ERROR,
+    PRODUCER_DONE,
+    QUEUE_TURN,
+    CommonEvent,
+)
 from services.phone import call_control, in_session_calls, phone_config
 from tests.conftest import live_session_token
 from tests.phone.test_phone_relay import (  # noqa: F401
-    AGENT, _FakeResponse, _post, _route, _user, fake_daemon, relay_app,
+    AGENT,
+    _FakeResponse,
+    _post,
+    _route,
+    _user,
+    fake_daemon,
+    relay_app,
 )
 from tests.phone.test_ws_phone_turns import _run_handler, phone_ws_env  # noqa: F401
 from ws import phone_attach
@@ -285,7 +297,7 @@ def attach_env(phone_ws_env, monkeypatch):  # noqa: F811
         return layer.alive
     layer.is_session_alive = _alive
 
-    from core.events import stream_pump, chat_writer
+    from core.events import chat_writer, stream_pump
     FakeCallPump.instances = []
     stream_pump._active_pumps.clear()
     monkeypatch.setattr(stream_pump, "ChatStreamPump", FakeCallPump)
@@ -628,8 +640,9 @@ def test_the_socket_keeps_reading_while_the_first_claim_waits(attach_env, monkey
 
 
 def test_a_cap_refusal_holds_no_grant_and_a_race_answers_409(relay_app, fake_daemon, daemon_in_session, monkeypatch):  # noqa: F811
-    from api.phone import phone_relay
     from fastapi import HTTPException
+
+    from api.phone import phone_relay
     tied = _user("tied-c", "editor")
     _tie_route_to(tied)
     _chat(CHAT, tied, session_id="sid-1")
@@ -653,6 +666,7 @@ def test_the_dashboard_builder_adds_the_call_tools_for_a_phone_agent(monkeypatch
     """A dashboard session of an agent with phone-mcp carries the call-control
     MCP: an in-session call needs its tools in that very session."""
     import inspect
+
     from core.config import config_builder
     src = inspect.getsource(config_builder.build_agent_config)
     assert "CALL_CONTROL_MCP" in src and "PHONE_MCP in _names" in src
@@ -667,3 +681,17 @@ def test_the_in_session_context_cancels_the_question_rule():
     assert "ask_initiating_agent" in text
     assert "does not apply on this call" in text
     assert text.rstrip().endswith("Decide from what you know.")
+
+
+@pytest.mark.parametrize("body", [b"[1, 2]", b'"queued"', b"not json", b"{}"])
+def test_a_daemon_body_that_is_no_object_releases_the_grant(monkeypatch, body):
+    """The daemon's answer is read as an object or not at all: a list or a
+    string never raises after the call was placed."""
+    from fastapi import Response
+
+    from api.phone import phone_relay
+    released, remembered = [], []
+    monkeypatch.setattr(in_session_calls, "release", released.append)
+    monkeypatch.setattr(in_session_calls, "remember_call", lambda cid, grant: remembered.append(cid))
+    phone_relay._remember_in_session(Response(content=body), "grant-1")
+    assert released == ["grant-1"] and remembered == []

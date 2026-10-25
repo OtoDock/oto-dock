@@ -10,11 +10,10 @@ import contextlib
 import time
 
 import numpy as np
+from pipeline_fakes import make_route
 
 import config
 from ambience import AmbienceSource, load_ambience
-from pipeline_fakes import make_route
-
 
 SAMPLES_PER_FRAME = config.FRAME_SIZE // config.SAMPLE_WIDTH
 

@@ -13,8 +13,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from satellite.sessions import mcp_install_support as mis
 from satellite._vendored.mcp_installer import InstallResult
+from satellite.sessions import mcp_install_support as mis
 
 
 def _make_mcp(root: Path, category: str, name: str, manifest: dict) -> Path:

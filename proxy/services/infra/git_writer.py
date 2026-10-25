@@ -18,7 +18,10 @@ import logging
 import re
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 logger = logging.getLogger("otodock.git-writer")
 
@@ -104,11 +107,11 @@ def is_tracked(repo_dir: Path, rel_path: str) -> bool:
             cwd=repo_dir, capture_output=True, timeout=_SUBPROC_TIMEOUT,
         )
         return result.returncode == 0
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
-def commit_paths(repo_dir: Path, paths: list[Path | str], message: str) -> str | None:
+def commit_paths(repo_dir: Path, paths: Sequence[Path | str], message: str) -> str | None:
     """Stage + commit several paths as ONE commit. Used by memory ops where a
     single logical write touches multiple files (topic + regenerated index,
     or a rename's old + new path — ``git add`` stages deletions too).
@@ -281,5 +284,5 @@ def _head_sha(repo_dir: Path) -> str | None:
             check=True, timeout=_SUBPROC_TIMEOUT, text=True,
         )
         return result.stdout.strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return None

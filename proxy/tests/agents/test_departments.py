@@ -43,9 +43,9 @@ def _cookie(sub: str, email: str, role: str) -> dict[str, str]:
     return {"Cookie": f"session={create_session_jwt(sub, email, 'T User', role)}"}
 
 
-ADMIN_H = lambda: _cookie(ADMIN, "admin@test.com", "admin")  # noqa: E731
-CREATOR_H = lambda: _cookie(CREATOR, "manager@test.com", "creator")  # noqa: E731
-MEMBER_H = lambda: _cookie(MEMBER, "viewer@test.com", "member")  # noqa: E731
+ADMIN_H = lambda: _cookie(ADMIN, "admin@test.com", "admin")
+CREATOR_H = lambda: _cookie(CREATOR, "manager@test.com", "creator")
+MEMBER_H = lambda: _cookie(MEMBER, "viewer@test.com", "member")
 
 
 def _mk_agent(slug: str) -> str:
@@ -712,8 +712,7 @@ class TestModeMigration:
 
     @staticmethod
     def _migrate_twice() -> None:
-        from storage import pg
-        from storage import schema as pg_schema
+        from storage import pg, schema as pg_schema
         from storage.pg import get_conn
         # Fresh pool: a pooled connection may hold a prepared ``SELECT *``
         # plan whose result type the DDL changes.

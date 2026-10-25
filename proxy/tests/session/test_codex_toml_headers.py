@@ -95,6 +95,55 @@ def test_remote_mcp_without_headers_skips_block():
     assert "[mcp_servers.empty-headers.http_headers]" not in toml
 
 
+def test_tool_timeout_sec_follows_the_startup_line_and_precedes_the_headers():
+    """A manifest's ``tool_timeout_sec`` lands in the server's own table after
+    ``startup_timeout_sec`` and before any ``http_headers`` sub-table (a key
+    after that header would belong to the sub-table); a server without one
+    gets no line, so Codex keeps its default."""
+    servers = {
+        "video-gen-mcp": {"type": "stdio", "command": "venv/bin/python", "args": ["server.py"],
+                          "tool_timeout_sec": 600},
+        "vendor": {"type": "streamable-http", "url": "https://mcp.example.com/mcp",
+                   "headers": {"Authorization": "Bearer t"}, "tool_timeout_sec": 120},
+        "task-mcp": {"type": "stdio", "command": "python3"},
+    }
+    toml = _servers_to_toml(servers)
+    video = toml.split("[mcp_servers.video-gen-mcp]")[1].split("[mcp_servers.vendor]")[0]
+    assert video.index("startup_timeout_sec = 10") < video.index("tool_timeout_sec = 600")
+    vendor = toml.split("[mcp_servers.vendor]")[1].split("[mcp_servers.task-mcp]")[0]
+    assert vendor.index("tool_timeout_sec = 120") < vendor.index("[mcp_servers.vendor.http_headers]")
+    assert "tool_timeout_sec" not in toml.split("[mcp_servers.task-mcp]")[1]
+    cfg = tomllib.loads(toml)
+    assert cfg["mcp_servers"]["video-gen-mcp"]["tool_timeout_sec"] == 600
+    assert cfg["mcp_servers"]["vendor"]["tool_timeout_sec"] == 120
+    assert cfg["mcp_servers"]["vendor"]["http_headers"] == {"Authorization": "Bearer t"}
+    assert "tool_timeout_sec" not in cfg["mcp_servers"]["task-mcp"]
+
+
+def test_the_proxy_vars_land_after_an_env_value_with_braces():
+    """The local layer appends PROXY_URL and PROXY_API_KEY to each env
+    table; a value with braces (the path marker, a JSON credential blob)
+    must not end the table early, and a key already there is not doubled."""
+    import tomllib
+
+    from core.layers.codex.layer import _inject_proxy_vars_toml
+    marker = '[{\\"tool\\": \\"edit_image\\", \\"json_path\\": \\"p\\"}]'
+    toml = (
+        '[mcp_servers.image-gen-mcp]\ncommand = "python3"\n'
+        f'env = {{ "OTO_TOOL_ARG_PATHS" = "{marker}", "PROXY_API_KEY" = "already" }}\n\n'
+        '[mcp_servers.task-mcp]\ncommand = "python3"\nenv = { "A" = "b" }\n'
+    )
+    out = _inject_proxy_vars_toml(toml, {"PROXY_URL": "http://localhost:8400",
+                                         "PROXY_API_KEY": "tok}en"})
+    cfg = tomllib.loads(out)
+    image = cfg["mcp_servers"]["image-gen-mcp"]["env"]
+    assert image["OTO_TOOL_ARG_PATHS"] == '[{"tool": "edit_image", "json_path": "p"}]'
+    assert image["PROXY_URL"] == "http://localhost:8400"
+    assert image["PROXY_API_KEY"] == "already"          # not doubled
+    task = cfg["mcp_servers"]["task-mcp"]["env"]
+    assert task == {"A": "b", "PROXY_URL": "http://localhost:8400", "PROXY_API_KEY": "tok}en"}
+
+
 # ---------------------------------------------------------------------------
 # _write_config_toml — generated per-session config.toml keys
 # ---------------------------------------------------------------------------
@@ -189,6 +238,7 @@ def test_config_toml_local_endpoint_raises_the_stream_idle_timeout(tmp_path):
 
 def test_config_toml_local_catalog_written_with_the_sandbox_path(tmp_path):
     import json
+
     from core.layers.codex.local_model_catalog import local_model_catalog_json
     catalog = local_model_catalog_json("qwen3.6-35b-a3b", "ollama", [("qwen3.6-35b-a3b", 131_072)])
     text_cfg = _written_config(
@@ -277,7 +327,9 @@ def test_agents_md_note_follows_the_provider(tmp_path):
     # blames an older server when they are missing. Unknown provider → the
     # generic note.
     from core.layers.codex.helpers import (
-        LOCAL_PROVIDER_TOOL_NOTE, OLLAMA_PROVIDER_TOOL_NOTE, local_provider_note,
+        LOCAL_PROVIDER_TOOL_NOTE,
+        OLLAMA_PROVIDER_TOOL_NOTE,
+        local_provider_note,
     )
     _Layer._write_config_toml(
         tmp_path, "You are X.", local_endpoint="http://127.0.0.1:11434/v1",
@@ -295,7 +347,9 @@ def test_agents_md_note_follows_the_provider(tmp_path):
 
 def test_with_local_provider_note_is_idempotent_and_handles_empty():
     from core.layers.codex.helpers import (
-        LOCAL_PROVIDER_TOOL_NOTE, OLLAMA_PROVIDER_TOOL_NOTE, with_local_provider_note,
+        LOCAL_PROVIDER_TOOL_NOTE,
+        OLLAMA_PROVIDER_TOOL_NOTE,
+        with_local_provider_note,
     )
     once = with_local_provider_note("Persona.")
     assert once == "Persona.\n\n" + LOCAL_PROVIDER_TOOL_NOTE + "\n"
@@ -327,3 +381,31 @@ def test_session_without_oauth_drops_a_stale_auth_json(tmp_path):
     assert not (tmp_path / "auth.json").exists()
     _Layer._drop_stale_auth_json(tmp_path)              # already gone → no error
     _Layer._drop_stale_auth_json(tmp_path / "absent")   # no dir → no error
+
+
+def test_config_toml_headless_carries_the_tools_approval_tables(tmp_path, monkeypatch):
+    # Where the platform's tier and Codex's own MCP rule disagree, a headless
+    # session's config names the tool: approve (the hook's card or the
+    # platform's allow decides) or prompt (Codex's own review). A terminal
+    # keeps its own prompt.
+    from services.mcp import mcp_permissions
+    monkeypatch.setattr(mcp_permissions, "codex_tool_approvals", lambda server: (
+        {"share_knowledge_folder": "approve", 'odd"name': "prompt"}
+        if server == "agent-config-mcp" else {}))
+    # A server whose globbed sensitive tools are not known by name yet.
+    monkeypatch.setattr(mcp_permissions, "codex_server_default",
+                        lambda server: "prompt" if server == "other-mcp" else None)
+    mcp = ('[mcp_servers.agent-config-mcp]\ncommand = "python3"\n\n'
+           '[mcp_servers.other-mcp]\ncommand = "node"\n')
+    cfg = _written_config(tmp_path, mcp_toml=mcp, client_type="dashboard")
+    assert cfg["mcp_servers"]["agent-config-mcp"]["tools"] == {
+        "share_knowledge_folder": {"approval_mode": "approve"},
+        'odd"name': {"approval_mode": "prompt"},
+    }
+    assert "tools" not in cfg["mcp_servers"]["other-mcp"]
+    assert cfg["mcp_servers"]["other-mcp"]["default_tools_approval_mode"] == "prompt"
+    assert cfg["mcp_servers"]["other-mcp"]["command"] == "node"
+    assert "default_tools_approval_mode" not in cfg["mcp_servers"]["agent-config-mcp"]
+    terminal = _written_config(tmp_path, mcp_toml=mcp, interactive=True)
+    assert "tools" not in terminal["mcp_servers"]["agent-config-mcp"]
+    assert "default_tools_approval_mode" not in terminal["mcp_servers"]["other-mcp"]

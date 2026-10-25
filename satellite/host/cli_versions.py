@@ -31,6 +31,7 @@ unparseable, install non-zero) is logged and swallowed — it must NEVER block
 the WS connection or the session loop.
 """
 import asyncio
+import errno
 import logging
 import os
 import re
@@ -39,9 +40,10 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
-from ..engines import ENGINES
 from .. import config
+from ..engines import ENGINES
 
 logger = logging.getLogger("satellite")
 
@@ -136,18 +138,53 @@ def _is_windows() -> bool:
     return not config.HOST.posix
 
 
-def _probe_version_at(path: str) -> str:
-    """Return the bare x.y.z reported by an explicit binary path, or ""."""
+class _Probe(NamedTuple):
+    """What ``--version`` said at a path: the bare x.y.z (``""`` when it
+    printed none), and whether the probe RAN to a verdict. A probe that did
+    not run (the machine's moment: no memory, a kill, a stall past the
+    timeout) says nothing about the binary and must never read as "absent"."""
+
+    version: str
+    ran: bool
+
+
+# An ``OSError`` starting the probe that is the machine's, not the binary's.
+_PROBE_DID_NOT_RUN_ERRNOS = frozenset({errno.ENOMEM, errno.EAGAIN})
+# Windows error codes of the same moment: not enough storage (8), out of
+# memory (14), the commitment limit (1455, a paging file too small); the
+# errno they map to (``EINVAL``) says nothing.
+_PROBE_DID_NOT_RUN_WINERRORS = frozenset({8, 14, 1455})
+# Exit codes of a process ended from outside: a node abort under memory
+# pressure (134), a kill (137). A negative return code is a signal; a code
+# at or above this is an NTSTATUS (an access violation, a stack overflow,
+# a heap corruption: 0xC0000005, 0xC00000FD, 0xC0000374), a crash on Windows.
+_PROBE_KILLED_EXITS = frozenset({134, 137})
+_NTSTATUS_FLOOR = 0xC0000000
+
+
+def _probe_version_at(path: str) -> _Probe:
+    """Probe ``--version`` at an explicit binary path."""
     if not path:
-        return ""
+        return _Probe("", True)
     try:
-        out = subprocess.run(
+        done = subprocess.run(
             [path, "--version"], capture_output=True, text=True, timeout=15,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    m = _VER_RE.search(out or "")
-    return m.group(1) if m else ""
+        )
+    except subprocess.TimeoutExpired:
+        return _Probe("", False)
+    except OSError as e:
+        # A missing binary, a denied or unrunnable file ran to a verdict:
+        # the install path heals those. Only a resource failure did not.
+        ran = (e.errno not in _PROBE_DID_NOT_RUN_ERRNOS
+               and getattr(e, "winerror", None) not in _PROBE_DID_NOT_RUN_WINERRORS)
+        return _Probe("", ran)
+    except subprocess.SubprocessError:
+        return _Probe("", True)
+    if (done.returncode < 0 or done.returncode in _PROBE_KILLED_EXITS
+            or done.returncode >= _NTSTATUS_FLOOR):
+        return _Probe("", False)
+    m = _VER_RE.search(done.stdout or "")
+    return _Probe(m.group(1) if m else "", True)
 
 
 def _npm_global_bin_dirs() -> list[str]:
@@ -239,15 +276,19 @@ def _candidates(bin_name: str, configured: str) -> list[str]:
 
 def _scan_for_pin(
     bin_name: str, configured: str, want: str,
-) -> tuple[str, list[tuple[str, str]]]:
-    """Probe candidates in authority order; return (first match, all probed)."""
+) -> tuple[str, list[tuple[str, str]], list[str]]:
+    """Probe candidates in authority order; return (first match, all probed,
+    the candidates whose probe did not run)."""
     probed: list[tuple[str, str]] = []
+    not_run: list[str] = []
     for path in _candidates(bin_name, configured):
-        have = _probe_version_at(path)
-        probed.append((path, have))
-        if have == want:
-            return path, probed
-    return "", probed
+        probe = _probe_version_at(path)
+        probed.append((path, probe.version))
+        if not probe.ran:
+            not_run.append(path)
+        elif probe.version == want:
+            return path, probed, not_run
+    return "", probed, not_run
 
 
 def _record(bin_name: str, path: str, version: str) -> None:
@@ -289,7 +330,7 @@ def _fast_verify_and_record(bin_name: str, configured: str) -> str:
     want = _pins.get(bin_name, "")
     if not want:
         return ""
-    path, _probed = _scan_for_pin(bin_name, configured, want)
+    path, _probed, _not_run = _scan_for_pin(bin_name, configured, want)
     if path:
         _record(bin_name, path, want)
         logger.info(
@@ -350,7 +391,7 @@ async def resolve_spawn_bin_async(
             _fast_verify_attempted[bin_name] = now
             try:
                 await asyncio.to_thread(_fast_verify_and_record, bin_name, configured)
-            except Exception:
+            except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
                 logger.debug("spawn-time CLI verify failed", exc_info=True)
     return resolve_spawn_bin(bin_name, configured, for_pty)
 
@@ -448,22 +489,27 @@ def reconcile_cli_versions(cli_pins: dict, on_status=None) -> None:
         if cli_pins == _last_reconciled:
             # Fast path — but re-probe the recorded paths first: an in-place
             # replacement (manual npm install) must not keep spawning
-            # unnoticed behind the short-circuit.
+            # unnoticed behind the short-circuit. A probe that did not run
+            # is not drift: the binary is whatever it was.
             drifted = False
             for bin_name, want in pins.items():
                 entry = _verified.get(bin_name)
-                if not entry or _probe_version_at(entry.get("path", "")) != want:
+                if not entry:
+                    drifted = True
+                    break
+                probe = _probe_version_at(entry.get("path", ""))
+                if probe.ran and probe.version != want:
                     drifted = True
                     break
             if not drifted:
                 return
         all_ok = True
-        for key, (pkg, bin_name) in _PACKAGES.items():
+        for _key, (pkg, bin_name) in _PACKAGES.items():
             want = pins.get(bin_name, "")
             if not want:
                 continue  # platform didn't pin this CLI → config keeps authority
             configured = _config_bins.get(bin_name, "")
-            path, probed = _scan_for_pin(bin_name, configured, want)
+            path, probed, not_run = _scan_for_pin(bin_name, configured, want)
             if path:
                 _record(bin_name, path, want)
                 logger.info(
@@ -471,13 +517,24 @@ def reconcile_cli_versions(cli_pins: dict, on_status=None) -> None:
                     bin_name, want, path,
                 )
                 continue
+            if not_run:
+                # The machine could not run the probe (no memory, a kill, a
+                # stall): nothing is known about the binary, so nothing is
+                # installed over it. The recorded path keeps spawning; the
+                # next reconnect tries again (the pass is not recorded).
+                logger.warning(
+                    "CLI reconcile: the %s probe at %s did not run; nothing "
+                    "installed this pass", bin_name, not_run[0],
+                )
+                all_ok = False
+                continue
             have = probed[0][1] if probed else "absent"
             logger.info(
                 "CLI reconcile: %s %s → %s (pinning to platform version)",
                 bin_name, have or "absent", want,
             )
             if _npm_install(pkg, want):
-                path2, probed2 = _scan_for_pin(bin_name, configured, want)
+                path2, probed2, _not_run2 = _scan_for_pin(bin_name, configured, want)
                 if path2:
                     _record(bin_name, path2, want)
                     logger.info(
@@ -503,6 +560,6 @@ def reconcile_cli_versions(cli_pins: dict, on_status=None) -> None:
         if on_status is not None:
             try:
                 on_status(_build_status_report())
-            except Exception:
+            except Exception:  # noqa: BLE001  # the status callback must not skip releasing the reconcile lock
                 logger.debug("cli_status report failed", exc_info=True)
         _reconcile_lock.release()

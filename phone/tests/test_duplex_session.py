@@ -629,10 +629,11 @@ def test_capabilities_frame_shape():
 
 
 def test_duplex_session_wiring(monkeypatch):
+    from pipeline_fakes import FakeSTT, FakeTTS, FakeVAD
+
+    from config_manager import ConfigManager
     from duplex import session as dsession
     from pipeline import providers as plproviders
-    from config_manager import ConfigManager
-    from pipeline_fakes import FakeSTT, FakeTTS, FakeVAD
 
     monkeypatch.setattr(dsession, "SileroVad", FakeVAD)
     monkeypatch.setattr(
@@ -926,19 +927,36 @@ async def test_release_queues_draft_behind_busy_typed_turn_without_abort():
 
 
 def test_duplex_session_detects_the_language_when_the_pick_is_automatic(monkeypatch):
-    """The Automatic dictation pick reaches the session as ``language_detect``:
-    the session starts in English and locks on the first utterance, as a
-    route that detects does; a picked language is locked from the start."""
+    """The Automatic dictation pick reaches the session as ``language_detect``
+    with the browser's language: the session starts in it on the language
+    streams and reads the speaker's from the audio; a picked language is
+    locked from the start on a plain provider."""
+    import math
+
+    import numpy as np
+    from audio.providers.lid import rule as R
+    from audio.providers.stt.streams import LanguageStreams
+    from pipeline_fakes import FakeSTT, FakeTTS, FakeVAD
+
     from config_manager import ConfigManager
     from duplex import session as dsession
-    from pipeline import providers as plproviders
-    from pipeline_fakes import FakeSTT, FakeTTS, FakeVAD
+    from pipeline import language as pl, providers as plproviders
+
+    class Scripted:
+        labels = ["en", "el", "de", "es", "fr", "it"]
+        probs = {"en": 0.05, "el": 0.9, "de": 0.05}
+
+        def scores(self, pcm_16k):
+            return np.array([math.log(self.probs.get(lang, 1e-6)) for lang in self.labels])
 
     monkeypatch.setattr(dsession, "SileroVad", FakeVAD)
     monkeypatch.setattr(
         plproviders, "get_provider_class",
         lambda kind, name: FakeSTT if kind == "stt" else FakeTTS,
     )
+    monkeypatch.setattr(pl, "identifier_available", lambda: True)
+    monkeypatch.setattr(pl, "loaded_model", lambda num_threads=1: object())
+    monkeypatch.setattr(pl, "EcapaIdentifier", lambda **kw: Scripted())
 
     class FakeDuplexConn:
         call_uuid = "dx-lang-test"
@@ -947,16 +965,94 @@ def test_duplex_session_detects_the_language_when_the_pick_is_automatic(monkeypa
         sample_rate_out = 24000
         frame_bytes_out = 960
         is_closed = False
+        is_muted = False
         on_barge_in = None
 
+        def __init__(self):
+            self.events = []
+
         def send_event(self, payload):
-            pass
+            self.events.append(payload)
+
+        async def close(self):
+            self.is_closed = True
 
     base = {"stt": {"provider_name": "deepgram"}, "tts": {"provider_name": "cartesia"},
             "chat_endpointing_ms": 1500}
-    auto = dsession.DuplexSession(FakeDuplexConn(), ConfigManager(),
-                                  {**base, "language": "", "language_detect": True})
+    conn = FakeDuplexConn()
+    auto = dsession.DuplexSession(conn, ConfigManager(), {**base, "language": "en", "language_detect": True})
     assert auto._locked_language == "en" and auto.state._language_locked is False
+    assert isinstance(auto.stt, LanguageStreams)
+    rule = auto._language_tracker.rule
+    assert rule.switch_at == R.LEAN and rule.lean_at_take is False     # live voice leans, no take rule
+    auto.tts.voices = {"en": "v-en", "el": "v-el"}
+    auto.tts.select_voice("en")
+
+    async def run():
+        await auto.stt.start(language="en", sample_rate=16000, interim_results=True)
+        auto.state._stt_active = True
+        half = b"\x10\x00" * 8000
+        for _ in range(3):                                   # 1.5 s of voice: a lean, a switch pending
+            await auto._stt_feed(half, voiced=True)
+            task = auto._language_tracker._task
+            if task is not None:
+                await task
+            auto._language_poll()
+        await auto.state._language_open_task
+        el = auto.stt._streams["el"].provider
+        el._transcripts.append("Γεια σας")
+        import time
+        el.last_result_monotonic = time.monotonic()
+        auto._language_poll()
+        assert auto.stt.active == "el"
+        # The shown text switched (a replace frame); what is heard and the
+        # language the turn is classified in did not yet: a lean may flip back.
+        assert {"type": "replace", "text": "Γεια σας"} in conn.events
+        assert auto.tts.voice_id == "v-en" and auto._locked_language == "en"
+        auto._note_turn_taken()                              # the turn's take: the voice follows
+        assert auto.tts.voice_id == "v-el" and auto._locked_language == "el"
+        await auto._cleanup()
+    asyncio.run(run())
+
+    # The hold fences the language streams: the words before it are the
+    # composer's, a later switch never brings them back into the turn.
+    held_conn = FakeDuplexConn()
+    held = dsession.DuplexSession(held_conn, ConfigManager(), {**base, "language": "en", "language_detect": True})
+    held.tts.voices = {"en": "v-en", "el": "v-el"}
+
+    async def hold_run():
+        await held.stt.start(language="en", sample_rate=16000, interim_results=True)
+        held.state._stt_active = True
+        half = b"\x10\x00" * 8000
+        for _ in range(3):                                   # a lean, a switch pending
+            await held._stt_feed(half, voiced=True)
+            task = held._language_tracker._task
+            if task is not None:
+                await task
+            held._language_poll()
+        await held.state._language_open_task
+        held.stt._streams["el"].provider._transcripts.append("πριν")   # words before the hold
+        held.stt.drain_transcript()
+        await held._on_hold()
+        assert held.stt.languages == ["en"]                  # the candidate went with the held words
+        for _ in range(3):                                   # after the hold: a new lean, a new candidate
+            await held._stt_feed(half, voiced=True)
+            task = held._language_tracker._task
+            if task is not None:
+                await task
+            held._language_poll()
+        await held.state._language_open_task
+        el = held.stt._streams["el"].provider
+        el._transcripts.append("μετά")
+        import time
+        el.last_result_monotonic = time.monotonic()
+        held._language_poll()
+        assert {"type": "replace", "text": "μετά"} in held_conn.events
+        assert all(e.get("text") != "πριν μετά" for e in held_conn.events)
+        await held._cleanup()
+    asyncio.run(hold_run())
+
     picked = dsession.DuplexSession(FakeDuplexConn(), ConfigManager(),
                                     {**base, "language": "el", "language_detect": False})
     assert picked._locked_language == "el" and picked.state._language_locked is True
+    assert not isinstance(picked.stt, LanguageStreams)

@@ -33,7 +33,7 @@ describe('TaskMetadata cost block', () => {
   it('is shown on an API-key / relay chat and when the flag is unknown', () => {
     open(true)
     expect(screen.getByText(/\$1\.2000/)).toBeInTheDocument()
-    expect(screen.getByText(/this turn: \$0\.5000/)).toBeInTheDocument()
+    expect(screen.getByText(/This turn: \$0\.5000/)).toBeInTheDocument()
   })
 
   it('is shown when the flag is unknown', () => {

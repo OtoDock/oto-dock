@@ -27,13 +27,23 @@ import httpx
 import pytest
 
 import config
-from auth.oauth_providers.base import TokenSet, UserInfo
+from auth.oauth_providers.base import OAuthTokenError, TokenSet, UserInfo
 from core.credentials import credential_locks
 from services.mcp import mcp_manifest_parse, mcp_registry
-from services.oauth import mcp_authorization as ma, oauth_account_store, oauth_refresh_worker as w
+from services.oauth import (
+    mcp_authorization as ma,
+    oauth_account_store,
+    oauth_refresh_worker as w,
+)
 from storage.identity import oauth_client_registrations as regs
 from storage.pg import get_conn
-from tests.auth.test_mcp_authorization_discovery import AS_META, ISSUER, PRM_PATH, RESOURCE, Vendor
+from tests.auth.test_mcp_authorization_discovery import (
+    AS_META,
+    ISSUER,
+    PRM_PATH,
+    RESOURCE,
+    Vendor,
+)
 
 MCP = "notion-hosted-mcp"
 PROVIDER = "notion-hosted"
@@ -260,7 +270,7 @@ class TestRegisteredClientArm:
     @pytest.mark.asyncio
     async def test_a_passing_error_backs_off_without_a_mark(self, registered):
         registered.vendor.routes[("POST", TOKEN)] = (503, "down", {})
-        with pytest.raises(Exception):
+        with pytest.raises(OAuthTokenError):
             await _refresh(registered)
         assert "refresh_failed" not in _raw(registered.file)["extra"]
 

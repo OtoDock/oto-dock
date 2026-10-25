@@ -27,17 +27,21 @@ import asyncio
 import functools
 import json
 import logging
+import math
 import time
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.events import chat_writer
 from core.events.common_events import TurnInput
 from storage import database as task_store
 from storage.pg import run_db
 from ws import wire_events as wire
+
+if TYPE_CHECKING:
+    from ws.dashboard import DashboardConnection
 
 logger = logging.getLogger("otodock")
 
@@ -67,6 +71,11 @@ DELIVERY_DEFERRED = "deferred"
 #: ``waiting``, FROZEN wire): held in memory on the item, cleared when the
 #: machine is back.
 WAITING_RECONNECT = "reconnect"
+#: A message waits for its chat's machine, connected but silent, to answer
+#: the resume probe (the ``queued`` chip's ``waiting``, FROZEN wire): cleared,
+#: and the queue armed, when the probe answers or its watcher's wait ends
+#: (``ws/resume_wait``).
+WAITING_MACHINE = "machine"
 #: A message waits for a teammate's live terminal on its chat to close (its
 #: author may not drive that terminal): cleared, and the queue armed, when the
 #: terminal closes.
@@ -77,6 +86,14 @@ WAITING_TERMINAL = "terminal"
 #: re-send after a reconnect, which comes within seconds).
 REGISTRY_CAP = 4096
 IDLE_EVICT_S = 600.0
+
+#: Chats being deleted or just deleted (``mark_deleting``), each with the
+#: time its mark lapses: never while the route runs, a short while after
+#: the row delete landed (a slow viewer's loop still asks after its
+#: ``done``; the id is never reused). No starter claims them, no delivery
+#: runs on them.
+_deleting: dict[str, float] = {}
+DELETED_LINGER_S = 60.0
 
 #: The return reasons the server decides: the author also gets the card,
 #: since the live frame that restores the composer can be lost.
@@ -150,7 +167,7 @@ class ChatInputQueue:
     _claim: object | None = None
     _seq: int = 0
     _loaded: bool = False
-    _loading: "asyncio.Future | None" = None
+    _loading: asyncio.Future | None = None
     # Queue ids ``drop_where`` removed: a batch a delivery took before the
     # drop and puts back after a deferral leaves them out.
     _dropped: set = field(default_factory=set)
@@ -183,8 +200,8 @@ class ChatInputQueue:
                 self.agent = chat.get("agent") or ""
             self._loaded = True
             if restored:
-                logger.info(f"chat={cid[:8]}: {len(restored)} queued message(s) loaded "
-                            f"from the table")
+                logger.info("chat=%s: %s queued message(s) loaded "
+                            "from the table", cid[:8], len(restored))
         finally:
             fut, self._loading = self._loading, None
             if not fut.done():
@@ -233,9 +250,14 @@ class ChatInputQueue:
 
     def try_claim(self) -> object | None:
         """The chat for one turn starter: its token when no pump drives the
-        chat and no other starter holds it, else None. A check and a set
-        with no await between."""
+        chat, no other starter holds it and it is not being deleted, else
+        None. A check and a set with no await between. A chat getting ready
+        is not refused here: its own first turn takes the claim (the kick,
+        headless when the person left during the spawn); the delivery and
+        the viewer's drain ask the hold themselves."""
         from core.events.stream_pump import _active_pumps
+        if deleting(self.chat_id):
+            return None
         live = _active_pumps.get(self.chat_id)
         # A failed pump keeps the chat until it leaves the registry: its end
         # returns the messages queued before the failure first, so a starter
@@ -372,7 +394,7 @@ class ChatInputQueue:
         return chat_writer.submit(cid, _job, label="queue_drop")
 
 
-_registry: "OrderedDict[str, ChatInputQueue]" = OrderedDict()
+_registry: OrderedDict[str, ChatInputQueue] = OrderedDict()
 _tasks: set[asyncio.Task] = set()
 
 #: A warmup's server-kicked first turn, enqueued and not yet started, per chat
@@ -404,6 +426,43 @@ def first_turn_not_run(chat_id: str) -> None:
     live = _active_pumps.get(chat_id)
     if peek(chat_id) and (live is None or live.is_done):
         arm(chat_id)
+
+
+def mark_deleting(chat_id: str) -> None:
+    """The chat's delete began: nothing starts on it from here, and what
+    waits in its queue goes with it (the rows cascade with the row; the
+    entries here are dropped, nothing returned, no card)."""
+    _deleting[chat_id] = math.inf
+    q = _registry.get(chat_id)
+    if q is not None:
+        q.items.clear()
+
+
+def unmark_deleting(chat_id: str, *, landed: bool) -> None:
+    """The delete route ended. A landed delete keeps the mark a while; a
+    failed one lifts it and forgets the chat's queue object, so the next
+    touch reloads what the rows still hold, and delivers it."""
+    if landed:
+        now = time.monotonic()
+        for cid, until in list(_deleting.items()):
+            if until <= now:
+                del _deleting[cid]   # nothing asks about a deleted chat again
+        _deleting[chat_id] = now + DELETED_LINGER_S
+        return
+    _deleting.pop(chat_id, None)
+    _registry.pop(chat_id, None)
+    arm(chat_id)
+
+
+def deleting(chat_id: str) -> bool:
+    """Whether the chat's delete is in progress or landed lately."""
+    until = _deleting.get(chat_id)
+    if until is None:
+        return False
+    if until <= time.monotonic():
+        _deleting.pop(chat_id, None)
+        return False
+    return True
 
 
 def getting_ready(chat_id: str) -> bool:
@@ -469,6 +528,8 @@ async def claim_when_free(chat_id: str, *, timeout: float, supersede: bool = Fal
     own pump, as a phone call's next turn does) no pump drives the chat, or
     ``timeout`` passes (None)."""
     from core.events.stream_pump import _active_pumps
+    if deleting(chat_id):
+        return None
     q = get(chat_id)
     deadline = time.monotonic() + timeout
     while True:
@@ -482,9 +543,11 @@ async def claim_when_free(chat_id: str, *, timeout: float, supersede: bool = Fal
                 return claim
         if time.monotonic() >= deadline:
             live = _active_pumps.get(chat_id)
-            logger.info(f"chat={chat_id[:8]}: no claim after {timeout:.0f}s "
-                        f"({'a starter holds it' if q.claimed else 'a turn runs'}"
-                        f"{'' if live is None else ', pump ' + str(live.source_type)})")
+            logger.info("chat=%s: no claim after %.0fs "
+                        "(%s"
+                        "%s)",
+                        chat_id[:8], timeout, 'a starter holds it' if q.claimed else 'a turn runs',
+                        '' if live is None else ', pump ' + str(live.source_type))
             return None
         await asyncio.sleep(0.1)
 
@@ -626,7 +689,7 @@ async def return_items(chat_id: str, taken: list[QueuedInput], reason: str) -> N
         elif reason in ("stopped", "revoked") and (not sub or sub in unreached):
             shelve_undelivered(chat_id, [qi.item for qi in items],
                                reason=wire.UNDELIVERED_STOPPED)
-    logger.info(f"chat={chat_id[:8]}: {len(taken)} queued message(s) returned ({reason})")
+    logger.info("chat=%s: %s queued message(s) returned (%s)", chat_id[:8], len(taken), reason)
 
 
 async def return_all(chat_id: str, reason: str, *, upto_seq: int | None = None,
@@ -679,9 +742,9 @@ async def drop_where(*, conn_id: str = "", author_sub: str = "", chat_id: str = 
             q.items[:] = [qi for qi in q.items if id(qi) not in ids]
             known = by_chat.setdefault(q.chat_id, [])
             known.extend(qi.queue_id for qi in gone if qi.queue_id not in known)
-    for cid, ids in by_chat.items():
+    for cid, queue_ids in by_chat.items():
         await loaded(cid)   # the chat's audience
-        fan_out(cid, {"type": wire.QUEUE_CLEARED, "queue_ids": ids, "reason": "revoked"},
+        fan_out(cid, {"type": wire.QUEUE_CLEARED, "queue_ids": queue_ids, "reason": "revoked"},
                 authors=(author_sub,))
 
 
@@ -702,6 +765,8 @@ def on_pump_end(chat_id: str, *, return_upto: int | None, viewers: bool) -> None
 
 async def _after_pump_end(chat_id: str, *, return_upto: int | None, viewers: bool) -> None:
     try:
+        if deleting(chat_id):
+            return
         q = await loaded(chat_id)
         if return_upto is not None:
             await return_items(chat_id, q.take(None, upto_seq=return_upto), "turn_failed")
@@ -711,7 +776,7 @@ async def _after_pump_end(chat_id: str, *, return_upto: int | None, viewers: boo
             await asyncio.sleep(VIEWER_GRACE_S)
         await deliver(chat_id)
     except Exception:
-        logger.exception(f"chat={chat_id[:8]}: the queue's delivery after the turn failed")
+        logger.exception("chat=%s: the queue's delivery after the turn failed", chat_id[:8])
 
 
 def arm(chat_id: str) -> None:
@@ -725,8 +790,12 @@ def arm(chat_id: str) -> None:
             await asyncio.sleep(VIEWER_GRACE_S)
             await deliver(chat_id)
         except Exception:
-            logger.exception(f"chat={chat_id[:8]}: the queue's delivery failed")
+            logger.exception("chat=%s: the queue's delivery failed", chat_id[:8])
     _spawn(_later())
+
+
+# The open connections per person, for a re-check on demand.
+_connections_by_user: dict[str, set[DashboardConnection]] = {}
 
 
 def _driver_for(author_sub: str, items: list[QueuedInput]):
@@ -736,7 +805,6 @@ def _driver_for(author_sub: str, items: list[QueuedInput]):
     closed socket runs its kicked first turn headless), else None."""
     if not author_sub:
         return None
-    from ws.dashboard import _connections_by_user
     origin = items[0].origin_conn if items else ""
     live = [c for c in _connections_by_user.get(author_sub, ())
             if not c._ended.is_set() and not c._closed_by_revalidation]
@@ -761,7 +829,7 @@ async def deliver(chat_id: str) -> bool:
     connection object waits for their next touch. True when a turn went
     out."""
     from core.events.stream_pump import _active_pumps
-    if _frozen():
+    if _frozen() or deleting(chat_id):
         return False
     q = await loaded(chat_id)
     if getting_ready(chat_id):
@@ -784,7 +852,7 @@ async def deliver(chat_id: str) -> bool:
         try:
             outcome, why = await conn._deliver_queued(chat_id, taken)
         except Exception:
-            logger.exception(f"chat={chat_id[:8]}: the queued message's turn failed to start")
+            logger.exception("chat=%s: the queued message's turn failed to start", chat_id[:8])
         finally:
             if outcome == DELIVERY_DEFERRED:
                 q.put_back(taken)   # a cancellation mid-start included
@@ -797,10 +865,11 @@ async def deliver(chat_id: str) -> bool:
         if outcome == DELIVERY_SENT:
             return True
         if outcome == DELIVERY_GATED:
-            logger.info(f"chat={chat_id[:8]}: queued message(s) not sent: {why}")
+            logger.info("chat=%s: queued message(s) not sent: %s", chat_id[:8], why)
             await return_items(chat_id, taken, "drive_refused")
             continue
-        logger.info(f"chat={chat_id[:8]}: queued message(s) wait for the next turn "
-                    f"({why or 'the turn could not start'})")
+        logger.info("chat=%s: queued message(s) wait for the next turn "
+                    "(%s)",
+                    chat_id[:8], why or 'the turn could not start')
         return False
     return False

@@ -16,10 +16,11 @@ requires-python = ">=3.13"
 #     the old private `cartesia._types.OutputFormat` import is gone; hold <4.
 #   - Silero VAD is the vendored models/silero_vad.onnx on onnxruntime (no
 #     package): swapping the model file is a tuning change, see models/README.md.
-# CORE — cloud STT/TTS providers. Used by BOTH the proxy (cloud chat audio:
-# /v1/audio/*) and the phone server. Kept deliberately lean so the proxy image
-# does NOT carry the on-box model stack (ONNX/transformers, ~250 MB) it never
-# imports — that's the phone-only ``localmodels`` extra below.
+# CORE — cloud STT/TTS providers and onnxruntime. Used by BOTH the proxy
+# (cloud chat audio: /v1/audio/*, and the dictation's language identifier)
+# and the phone server. The proxy image does NOT carry transformers (~250 MB
+# with its stack), which it never imports — that's the phone-only
+# ``localmodels`` extra below.
 dependencies = [
     "deepgram-sdk>=3.11,<4.0",  # Deepgram streaming + prerecorded STT
     "cartesia>=3.2,<4.0",       # Cartesia Sonic TTS (3.x context/push API; dict output_format)
@@ -30,14 +31,16 @@ dependencies = [
     "numpy>=2.2,<3.0",          # Smart Turn audio buffers + mel features
     "httpx[http2]>=0.28,<1.0",  # Groq turn-classifier client
     "pydantic>=2.0",            # capability descriptors
+    "onnxruntime>=1.23,<2.0",   # the spoken-language identifier (models/lang-id-ecapa-voxlingua107.onnx), run by the proxy's dictation relay and the phone daemon alike; Silero VAD and Smart Turn ride the same runtime
 ]
 
 [project.optional-dependencies]
-# Local-model engines — Silero VAD + Smart Turn run on-box (the phone pipeline).
-# The proxy's chat-audio path is cloud-only and does NOT need these, so the proxy
-# installs the lean core and the phone installs ``oto-audio[localmodels]``.
+# Local-model engines — Smart Turn's mel features for the phone pipeline
+# (Silero VAD and Smart Turn themselves run on the core's onnxruntime).
+# The proxy does not need these (its one local model, the language identifier,
+# runs on the onnxruntime the core already carries), so the proxy installs the
+# core and the phone installs ``oto-audio[localmodels]``.
 localmodels = [
-    "onnxruntime>=1.23,<2.0",   # Silero VAD (vendored models/silero_vad.onnx) + Smart Turn ONNX inference
     "transformers>=5.5,<6.0",   # Smart Turn mel features (WhisperFeatureExtractor; its config is vendored at models/whisper_feature_extractor/ — offline, HF Hub only as fallback). >=5.5 clears the model-loading RCE CVEs; our path is numpy-only (no torch) and yields bit-identical mel features on the vendored config across 4.57→5.x.
 ]
 # Heavy local PROVIDER engines ship as importable stubs in the core install;
@@ -59,6 +62,7 @@ packages = [
     "audio.providers.tts",
     "audio.providers.vad",
     "audio.providers.turn",
+    "audio.providers.lid",
     "audio.streaming",
 ]
 

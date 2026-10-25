@@ -6,24 +6,14 @@
  */
 
 import type { SubscriptionWindows as Windows } from '../../api/executionLayers'
+import { formatReset } from './SubscriptionWindows.helpers'
 
 function fillClass(pct: number): string {
-  return pct >= 100 ? 'bg-p-error' : pct >= 80 ? 'bg-p-accent-yellow' : 'bg-brand'
+  return pct >= 100 ? 'bg-status-danger-solid' : pct >= 80 ? 'bg-status-warning-solid' : 'bg-status-info-solid'
 }
 
 function textClass(pct: number): string {
-  return pct >= 100 ? 'text-p-error' : pct >= 80 ? 'text-p-accent-yellow' : 'text-p-text-light'
-}
-
-/** "14:00" for today, "Wed 09:00" otherwise, in the viewer's clock. */
-export function formatReset(iso: string | null): string {
-  if (!iso) return ''
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return ''
-  const now = new Date()
-  const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
-  if (d.toDateString() === now.toDateString()) return time
-  return `${d.toLocaleDateString(undefined, { weekday: 'short' })} ${time}`
+  return pct >= 100 ? 'text-status-danger-fg' : pct >= 80 ? 'text-status-warning-fg' : 'text-tertiary'
 }
 
 function formatAge(iso: string): string {
@@ -64,14 +54,14 @@ function WindowBar({ name, pct, resetsAt, active }: {
   // under the bar, on a phone — a truncated "resets W…" said nothing.
   return (
     <div className="flex flex-wrap items-center gap-x-2 text-xs" data-testid="window-bar">
-      <span className="w-14 shrink-0 text-p-text-light">{name}</span>
-      <div className="h-1.5 w-24 shrink-0 rounded-full bg-p-surface overflow-hidden">
+      <span className="w-14 shrink-0 text-tertiary">{name}</span>
+      <div className="h-1.5 w-24 shrink-0 rounded-full bg-surface-muted overflow-hidden">
         <div className={`h-full rounded-full ${fillClass(pct)}`} style={{ width: `${shown}%` }} />
       </div>
       <span className={`font-medium ${textClass(pct)}`}>{Math.round(pct)}%</span>
       {when && (
         <span
-          className="text-p-text-light basis-full pl-16 sm:basis-auto sm:pl-0"
+          className="text-tertiary basis-full pl-16 sm:basis-auto sm:pl-0"
           title={formatResetLong(resetsAt)}
         >
           {full ? `until ${when}` : `resets ${when}`}
@@ -84,7 +74,7 @@ function WindowBar({ name, pct, resetsAt, active }: {
 export function SubscriptionWindowBars({ windows }: { windows: Windows | null | undefined }) {
   if (windows === undefined) return null
   if (windows === null) {
-    return <p className="mt-1 text-xs text-p-text-light/70">Usage not read yet.</p>
+    return <p className="mt-1 text-xs text-tertiary">Usage not read yet.</p>
   }
   const hasAny = windows.five_hour || windows.seven_day || windows.scoped.length > 0
   if (!hasAny) return null
@@ -99,7 +89,7 @@ export function SubscriptionWindowBars({ windows }: { windows: Windows | null | 
       {windows.scoped.map((s) => (
         <WindowBar key={s.key} name={s.label} pct={s.pct} resetsAt={s.resets_at} active={s.active} />
       ))}
-      <p className="text-[11px] text-p-text-light/70">as of {formatAge(windows.observed_at)}</p>
+      <p className="text-2xs text-tertiary">As of {formatAge(windows.observed_at)}</p>
     </div>
   )
 }
@@ -110,7 +100,7 @@ export function SubscriptionWindowBars({ windows }: { windows: Windows | null | 
 export function BalanceHint({ oauthCount }: { oauthCount: number }) {
   if (oauthCount < 2) return null
   return (
-    <p className="text-xs text-p-text-light" data-testid="balance-hint">
+    <p className="text-xs text-tertiary" data-testid="balance-hint">
       Enable all your subscriptions to balance the load automatically.
     </p>
   )

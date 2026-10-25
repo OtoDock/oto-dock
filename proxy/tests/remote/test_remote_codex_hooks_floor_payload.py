@@ -158,6 +158,7 @@ class TestCodexAttendedFloorPayload:
     async def test_a_mode_change_carries_the_platform_mode_from_0_5_143(self, supported):
         import asyncio
         from unittest.mock import AsyncMock
+
         from core.layers.codex.remote import CodexRemoteAdapter
         from core.remote.remote_session_info import RemoteSessionInfo
         cm = MagicMock()

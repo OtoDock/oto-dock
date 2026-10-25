@@ -23,7 +23,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.events.common_events import CommonEvent, DONE, TEXT
+from core.events.common_events import DONE, TEXT, CommonEvent
+from core.execution_layer import ResumeVerdict
 from services.scheduler import interactive, runner, scheduler, shared
 from storage import database as task_store
 from storage.automation import run_status
@@ -325,7 +326,7 @@ class _Layer:
         pass
 
     async def can_resume_session(self, *a, **k):
-        return False
+        return ResumeVerdict.FRESH
 
 
 @asynccontextmanager
@@ -338,11 +339,10 @@ def _drive(monkeypatch, layer: _Layer, task: shared.TaskDefinition, run_id: str,
     """``_run_task`` the way ``_execute_task`` launches it: the run row, the
     dedup reservation and the running-tasks registry set; the builders and
     the slot patched; a snapshotting subscriber registered up front."""
-    import config
     from core import concurrency
     from core.config import task_config_builder
     from core.session import session_manager, session_state
-    from storage import remote_store
+    from services.remote import remote_status
 
     async def _cfg(agent, task_def, sid, **kw):
         return SimpleNamespace(execution_target="local", execution_path="claude-code-cli",
@@ -352,9 +352,9 @@ def _drive(monkeypatch, layer: _Layer, task: shared.TaskDefinition, run_id: str,
     monkeypatch.setattr(task_config_builder, "resolve_task_identity",
                         lambda *a, **k: task_config_builder.TaskIdentity("", "manager", "agent", None))
     monkeypatch.setattr(session_manager, "get_execution_layer", lambda *a, **k: layer)
-    monkeypatch.setattr(remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
+    monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
     monkeypatch.setattr(concurrency, "task_slot", _instant_slot)
-    monkeypatch.setattr(config, "get_cli_model", lambda agent, layer=None: "test-model")
+    monkeypatch.setattr("configuration.models.get_cli_model", lambda agent, layer=None: "test-model")
     monkeypatch.setattr(session_state, "_save_sessions", lambda: None)
 
     task_store.create_run(run_id, task.id, task.agent, "manual", None, task.prompt,
@@ -544,12 +544,12 @@ async def test_a_cancel_in_the_pre_slot_window_ends_the_row(temp_db, monkeypatch
     the instant the run id is returned; a cancel there used to leave the
     row ``pending`` forever with the registries reserved."""
     from core.config import task_config_builder
-    from storage import remote_store
+    from services.remote import remote_status
     run_id, task_id = "run-pre1", "t-pre1"
     task = _task(task_id)
     monkeypatch.setattr(task_config_builder, "resolve_task_identity",
                         lambda *a, **k: task_config_builder.TaskIdentity("", "manager", "agent", None))
-    monkeypatch.setattr(remote_store, "resolve_execution_target",
+    monkeypatch.setattr(remote_status, "resolve_execution_target",
                         lambda *a, **k: time.sleep(0.4) or ("local", None))
     task_store.create_run(run_id, task_id, task.agent, "manual", None, task.prompt,
                           "one-time", task.scope, None)

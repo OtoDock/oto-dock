@@ -575,6 +575,7 @@ def test_concurrent_tails_do_not_duplicate_rows(tmp_path, _capture, monkeypatch)
     # Twin of the transcript_tailer race test: the per-session tail lock keeps
     # overlapping worker-thread tails from persisting the same slice twice.
     import threading
+
     import storage.database as db
 
     entered = threading.Event()
@@ -744,10 +745,10 @@ def _usage_env(monkeypatch):
     """Pin every external the usage path touches — captured rows instead of DB
     writes, a fixed pool binding, deterministic pricing, no agent-config reads."""
     rows: list[dict] = []
+    import config
+    from core.session import visibility
     from services.billing import usage_service
     from services.engines import subscription_pool
-    from core.session import visibility
-    import config
 
     def _record(batch):
         rows.extend(batch)
@@ -757,7 +758,7 @@ def _usage_env(monkeypatch):
     monkeypatch.setattr(subscription_pool, "get_session_subscription",
                         lambda sid: "sub-codex")
     monkeypatch.setattr(visibility, "is_shared_only", lambda agent: False)
-    monkeypatch.setattr(config, "get_model_pricing",
+    monkeypatch.setattr("configuration.models.get_model_pricing",
                         lambda m, p="": (10.0, 50.0, 12.5, 1.0))
     monkeypatch.setattr(config, "get_model_provider", lambda m: "openai")
     return rows

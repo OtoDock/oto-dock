@@ -77,6 +77,12 @@ describe('a chip waiting for its machine', () => {
       'The machine running this chat is reconnecting. Your message goes out when it is back.')
   })
 
+  it('says the message goes out when a silent machine answers', () => {
+    renderWaiting(QUEUE_WAITING.MACHINE)
+    expect(screen.getByTestId('queued-waiting').textContent).toBe(
+      'The machine running this chat is not answering. Your message goes out when it does.')
+  })
+
   it("says the message waits for a teammate's terminal to close", () => {
     renderWaiting(QUEUE_WAITING.TERMINAL)
     expect(screen.getByTestId('queued-waiting').textContent).toBe(
@@ -91,9 +97,14 @@ describe('a chip waiting for its machine', () => {
 })
 
 describe('the turn-ended card in the list', () => {
-  const ended = [{ id: 'a1', role: 'assistant', blocks: [
-    { type: 'system', subtype: 'turn_ended', reason: 'exited', message: 'gone' },
-  ] }] as unknown as Parameters<typeof ChatMessages>[0]['messages']
+  // A message that met an exit before any step: nothing ran, so the card
+  // offers the message again (a card with nothing to send offers nothing).
+  const ended = [
+    { id: 'u1', role: 'user', blocks: [{ type: 'text', content: 'go' }] },
+    { id: 'a1', role: 'assistant', blocks: [
+      { type: 'system', subtype: 'turn_ended', reason: 'exited', message: 'gone' },
+    ] },
+  ] as unknown as Parameters<typeof ChatMessages>[0]['messages']
 
   function renderCard(streaming: boolean) {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -113,5 +124,21 @@ describe('the turn-ended card in the list', () => {
   it('offers Send again once the chat is idle', () => {
     renderCard(false)
     expect(screen.getByRole('button', { name: 'Send again' })).toBeTruthy()
+  })
+
+  it('offers Resume once the turn had started', () => {
+    const started = [{ id: 'a1', role: 'assistant', blocks: [
+      { type: 'text', content: 'half an answer' },
+      { type: 'system', subtype: 'turn_ended', reason: 'lost', message: 'gone' },
+    ] }] as unknown as Parameters<typeof ChatMessages>[0]['messages']
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}><ChatMessages
+        messages={started} agentName="a" streaming={false}
+        onPermissionRespond={vi.fn()} onSendAgain={vi.fn()}
+      /></QueryClientProvider>,
+    )
+    expect(screen.getByRole('button', { name: 'Resume' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Send again' })).toBeNull()
   })
 })

@@ -6,6 +6,7 @@ import {
 } from '../../../store/documentPaneStore'
 import DocumentFrame, { type DocumentFrameHandle } from './DocumentFrame'
 import DocumentVersionsMenu from './DocumentVersionsMenu'
+import { useElementBox } from '../../../hooks/useElementBox'
 import { extensionBadge, useDocumentTabs } from './documentTabs'
 
 interface Props {
@@ -54,7 +55,6 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
   const frameRef = useRef<DocumentFrameHandle | null>(null)
   const [fullscreen, setFullscreen] = useState(false)
   const [dirty, setDirty] = useState(false)
-  const [note, setNote] = useState('')
   const [liveGone, setLiveGone] = useState(false)
   // What the live file's token allows, per file: the Live row's words.
   const [allowed, setAllowed] = useState<{ fileId: string; permissions: 'edit' | 'view' | null } | null>(null)
@@ -71,25 +71,18 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
   // Fullscreen presents the pane's own frame over the portal's body (one
   // view of the document per device, the frame never reloads): the box is
   // sized to the slot and goes to the top layer. A pane put away leaves it.
-  useEffect(() => { if (!shown) setFullscreen(false) }, [shown])
+  const [lastShown, setLastShown] = useState(shown)
+  if (lastShown !== shown) {
+    setLastShown(shown)
+    if (!shown) setFullscreen(false)
+  }
   const boxRef = useRef<HTMLDivElement | null>(null)
   const [slot, setSlot] = useState<HTMLDivElement | null>(null)
-  const [slotRect, setSlotRect] = useState<Rect | null>(null)
-  useLayoutEffect(() => {
-    if (!fullscreen || !slot) { setSlotRect(null); return }
-    const measure = () => {
-      const r = slot.getBoundingClientRect()
-      setSlotRect({ top: r.top, left: r.left, width: r.width, height: r.height })
-    }
-    measure()
-    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
-    ro?.observe(slot)
-    window.addEventListener('resize', measure)
-    return () => {
-      ro?.disconnect()
-      window.removeEventListener('resize', measure)
-    }
-  }, [fullscreen, slot])
+  const getSlot = useCallback(() => slot, [slot])
+  const slotBox = useElementBox(getSlot, fullscreen && !!slot)
+  const slotRect: Rect | null = slotBox
+    ? { top: slotBox.top, left: slotBox.left, width: slotBox.width, height: slotBox.height }
+    : null
   const presented = fullscreen && !!slotRect
   useLayoutEffect(() => {
     const box = boxRef.current
@@ -106,15 +99,21 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
 
   // The frames of a pane restored as minimized mount on its first show.
   const [everShown, setEverShown] = useState(shown)
-  useEffect(() => { if (shown) setEverShown(true) }, [shown])
+  if (shown && !everShown) setEverShown(true)
 
-  // A note handed over by the change it explains (a version gone).
-  const nextNote = useRef('')
-  useEffect(() => {
+  // A note handed over by the change it explains (a version gone): stored
+  // for the document it navigates to, shown while that document is on show.
+  const docKey = `${fileId ?? ''}:${snapshotId ?? 'live'}`
+  const [handover, setHandover] = useState<{ key: string; note: string } | null>(null)
+  const note = handover?.key === docKey ? handover.note : ''
+  const [seenKey, setSeenKey] = useState(docKey)
+  if (seenKey !== docKey) {
+    setSeenKey(docKey)
     setLiveGone(false)
-    setNote(nextNote.current)
-    nextNote.current = ''
-  }, [fileId, snapshotId])
+    // The next change of document takes the note away: a version gone is
+    // explained once, on the live file it fell back to.
+    if (handover && handover.key !== docKey) setHandover(null)
+  }
 
   const filename = active?.filename ?? ''
   const onDirtyChange = useCallback((d: boolean) => {
@@ -170,16 +169,16 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
     : ''
   const notLive = !!snapshotId
   const version = notLive ? versions.find((v) => v.snapshot_id === snapshotId) : undefined
-  const iconBtn = 'p-1.5 rounded-sm text-p-text-secondary transition-colors hover:bg-p-surface disabled:opacity-40'
+  const iconBtn = 'p-1.5 rounded-control text-secondary transition-colors hover:bg-surface-hover hover:text-primary disabled:opacity-40'
 
   return (
     <div
       data-document-pane=""
-      className={`flex h-full min-h-0 flex-col overflow-hidden bg-white dark:bg-p-surface ${placement === 'docked'
-        ? 'rounded-xl border border-p-border-light shadow-xs'
-        : 'rounded-xl border border-p-border-light shadow-2xl'}`}
+      className={`flex h-full min-h-0 flex-col overflow-hidden bg-surface-card ${placement === 'docked'
+        ? 'rounded-card border border-subtle'
+        : 'rounded-dialog shadow-elevation-4'}`}
     >
-      <div className="flex items-center gap-1 border-b border-p-border-light bg-p-surface/50 px-2 py-1.5">
+      <div className="flex items-center gap-1 border-b border-subtle bg-surface-sunken px-2 py-1.5">
         <div role="tablist" aria-label="Documents" className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
           {tabs.map((t) => {
             const on = t.fileId === fileId
@@ -187,9 +186,9 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
             return (
               <div
                 key={t.fileId}
-                className={`group flex max-w-[14rem] shrink-0 items-center gap-1 rounded-md border pl-2 pr-0.5 py-0.5 text-xs ${on
-                  ? 'border-brand/40 bg-brand/10 text-p-text'
-                  : 'border-transparent text-p-text-secondary hover:bg-p-surface'}`}
+                className={`group flex max-w-[14rem] shrink-0 items-center gap-1 rounded-control border pl-2 pr-0.5 py-0.5 text-xs ${on
+                  ? 'border-action/40 bg-action/10 text-primary'
+                  : 'border-transparent text-secondary hover:bg-surface-muted'}`}
               >
                 <button
                   type="button"
@@ -199,9 +198,9 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
                   title={t.filename}
                   className="flex min-w-0 items-center gap-1.5"
                 >
-                  {fresh && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand" aria-label="new" />}
+                  {fresh && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-action" aria-label="new" />}
                   <span className="truncate">{t.filename || 'Document'}</span>
-                  <span className="shrink-0 rounded-sm bg-brand/10 px-1 text-[9px] font-semibold text-brand">
+                  <span className="shrink-0 rounded-sm bg-surface-muted px-1 text-3xs font-semibold text-secondary">
                     {extensionBadge(t.filename)}
                   </span>
                 </button>
@@ -210,7 +209,7 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
                   onClick={() => closeTab(t.fileId)}
                   aria-label={`Close ${t.filename}`}
                   title="Close this document"
-                  className="rounded-sm p-0.5 text-p-text-light hover:bg-black/10 hover:text-p-text dark:hover:bg-white/10"
+                  className="rounded-sm p-0.5 text-tertiary hover:bg-surface-hover hover:text-primary"
                 >
                   <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
@@ -261,23 +260,23 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
 
       <div className="relative min-h-0 flex-1">
         {notLive && (
-          <span className="pointer-events-none absolute bottom-2 right-2 z-30 rounded-full bg-amber-500/90 px-2 py-0.5 text-[10px] font-semibold text-white shadow-xs">
+          <span className="pointer-events-none absolute bottom-2 right-2 z-30 rounded-full bg-status-warning-bg border border-status-warning-border px-2 py-0.5 text-3xs font-semibold text-status-warning-fg">
             Not live{version ? ` · version ${version.version}` : ''}
           </span>
         )}
         {(note || liveGone) && (
-          <div className="absolute inset-x-0 top-0 z-30 flex items-center justify-between gap-2 bg-amber-500/95 px-3 py-1.5 text-xs text-white">
+          <div className="absolute inset-x-0 top-0 z-30 flex items-center justify-between gap-2 bg-status-warning-solid/95 px-3 py-1.5 text-xs text-on-solid">
             <span>{note || 'This file is no longer there.'}</span>
             {liveGone && newestAvailable && fileId && (
               <button type="button" onClick={() => store().showVersion(chatId, fileId, newestAvailable.snapshot_id)}
-                className="shrink-0 rounded-sm bg-white/20 px-2 py-0.5 font-medium hover:bg-white/30">
+                className="shrink-0 rounded-sm bg-surface-card/20 px-2 py-0.5 font-medium hover:bg-surface-card/30">
                 Open the newest version
               </button>
             )}
           </div>
         )}
         {!fileId && (
-          <div className="flex h-full items-center justify-center p-6 text-sm text-p-text-secondary">
+          <div className="flex h-full items-center justify-center p-6 text-sm text-secondary">
             No document is open in this chat.
           </div>
         )}
@@ -296,7 +295,7 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
               onLiveGone={() => setLiveGone(true)}
               onPermissions={onPermissions}
               onVersionGone={() => {
-                nextNote.current = 'That version is no longer available: showing the live file.'
+                setHandover({ key: `${fileId}:live`, note: 'That version is no longer available: showing the live file.' })
                 store().showVersion(chatId, fileId, null)
               }}
               className="h-full"
@@ -311,7 +310,7 @@ export default function DocumentPane({ chatId, placement, shown }: Props) {
           onClose={() => setFullscreen(false)}
           downloadUrl={notLive ? undefined : downloadUrl || undefined}
           headerExtra={notLive ? (
-            <span className="rounded-full bg-amber-500/90 px-2 py-0.5 text-[10px] font-semibold text-white">
+            <span className="rounded-full bg-status-warning-solid/90 px-2 py-0.5 text-3xs font-semibold text-on-solid">
               Not live{version ? ` · version ${version.version}` : ''}
             </span>
           ) : undefined}

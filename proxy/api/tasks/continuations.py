@@ -26,9 +26,9 @@ from pydantic import BaseModel
 from api.tasks import task_quota
 from auth.providers import UserContext, get_current_user, require_auth, require_user
 from core.session.session_state import get_user_tz
+from core.session.visibility import is_synthetic_owner
 from services.scheduler import scheduler, task_kinds
 from storage import database as task_store
-from core.session.visibility import is_synthetic_owner
 
 logger = logging.getLogger("otodock.continuations")
 # No route here takes an anonymous caller (auth.providers.require_user).
@@ -72,8 +72,8 @@ async def create_continuation(
     if req.at is not None:
         try:
             datetime.fromisoformat(req.at)
-        except ValueError:
-            raise HTTPException(400, f"Invalid ISO datetime for at: {req.at!r}")
+        except ValueError as exc:
+            raise HTTPException(400, f"Invalid ISO datetime for at: {req.at!r}") from exc
     if req.in_seconds is not None and not (
             _IN_SECONDS_MIN <= req.in_seconds <= scheduler.INTERVAL_MAX_SECONDS):
         raise HTTPException(
@@ -86,8 +86,8 @@ async def create_continuation(
     if req.until is not None:
         try:
             datetime.fromisoformat(req.until)
-        except ValueError:
-            raise HTTPException(400, f"Invalid ISO datetime for until: {req.until!r}")
+        except ValueError as exc:
+            raise HTTPException(400, f"Invalid ISO datetime for until: {req.until!r}") from exc
 
     max_runs = req.max_runs
     if max_runs is not None and not (1 <= max_runs <= _MAX_RUNS_CAP):
@@ -155,8 +155,9 @@ async def create_continuation(
         "repeat_interval_seconds": f"every {req.repeat_interval_seconds}s",
     }[timing[0]]
     logger.info(
-        f"Continuation created: {task_id} chat={chat['id'][:8]} {fires} "
-        f"max_runs={max_runs or '-'} until={req.until or '-'} by={created_by}"
+        "Continuation created: %s chat=%s %s "
+        "max_runs=%s until=%s by=%s",
+        task_id, chat['id'][:8], fires, max_runs or '-', req.until or '-', created_by
     )
     return {
         "task_id": task_id,

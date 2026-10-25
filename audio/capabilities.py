@@ -28,6 +28,10 @@ class STTCapabilities:
     supports_endpointing: bool = True        # tunable endpointing delay (ms)
     supports_word_timestamps: bool = False   # per-word start/end (needed for SRT)
     is_local: bool = False                   # runs on-box; no network / credential
+    # Each live result carries a word confidence on one scale (the
+    # ``heard`` ledger): automatic language detection compares two streams'
+    # words only when both report it, else the acoustic rule decides alone.
+    reports_confidence: bool = False
 
 
 @dataclass(frozen=True)

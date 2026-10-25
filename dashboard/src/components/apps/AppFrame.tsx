@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { useTheme } from '../../contexts/ThemeContext'
+
 import { onFileUpdate } from '../../lib/fileUpdates'
 import { onAppDeployed, onAppPush, onAppState, onCatalog, subscribeCatalog, unsubscribeCatalog } from '../../lib/appLive'
 import { appMounted, appUnmounted } from '../../lib/focus'
@@ -14,6 +14,11 @@ import { appKind } from '../../lib/kinds/app'
 import { useActiveChats } from '../../hooks/useActiveChats'
 import { onIdle as speechIdle } from '../../audio/speechActivity'
 import { APP_SERVER_STATE, FRAME_STATE, type AppServerState, type FrameState } from '../../lib/status/appServer'
+import { claimKey, heldClaim, holdClaim } from './appFrameClaims'
+import { useTheme } from '../../contexts/useTheme'
+import { isRecord } from '../../lib/json/guards'
+import Button from '../ui/Button'
+import { CARD, POPOVER } from '../ui/classes'
 
 /**
  * Sandboxed pinned app frame — agent-authored HTML served cookie-authed
@@ -77,18 +82,6 @@ const VIEWER_TOKEN_REFRESH_MS = 8 * 60 * 1000
 // with a widening wait before the frame says the app cannot be reached.
 const MINT_RETRIES = 6
 
-// The viewer claims in hand, per app id and instance, shared by every frame
-// instance: a remount (a keyed tab switch and back) reuses the claim
-// instead of minting again inside the route's 2 s pace, and a claim is only
-// ever posted into the frame of the app it was minted for (a claim carries
-// the viewer's identity and role, so one app's page must never receive
-// another's). The claim also names the server the page's calls reach: the
-// working copy's page must never hold the live release's claim, nor the
-// live page the preview's.
-const viewerClaims = new Map<string, { token: string; exp: number; at: number }>()
-const claimKey = (appId: string, preview: boolean) => `${appId}|${preview ? 'preview' : 'live'}`
-export function _resetViewerClaimsForTests(): void { viewerClaims.clear() }
-
 // autoHeight clamp: a hostile/broken page can post any number — keep the
 // frame tall enough to be usable and short enough to never trap the page.
 const AUTO_HEIGHT_MIN = 120
@@ -143,10 +136,32 @@ interface QueuedCall {
   isTool: boolean
 }
 
+const CLIENT_FEEDS = ['active_chats', 'project_lanes']
+
+function postTo(win: Window, msg: Record<string, unknown>) {
+  try { win.postMessage({ source: 'otodock-host', ...msg }, '*') } catch { /* frame gone */ }
+}
+
+function openAckTo(win: Window, status: string, reason?: string, callId?: string) {
+  postTo(win, { type: 'open_url_ack', status, ...(reason ? { reason } : {}), ...(callId ? { call_id: callId } : {}) })
+}
+
+function openTargetAckTo(win: Window, status: string, reason?: string) {
+  postTo(win, { type: 'open_ack', status, ...(reason ? { reason } : {}) })
+}
+
+function deliverOpen(win: Window, url: string, callId?: string) {
+  void openExternalUrl(url).then((r) => {
+    if (r === 'opened') openAckTo(win, 'opened', undefined, callId)
+    else openAckTo(win, 'blocked', 'popup blocked, try again', callId)
+  })
+}
+
 export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoHeight = false, readOnly = false, preview = false, renderSha = '' }: Props) {
   const { resolvedTheme } = useTheme()
   const navigate = useNavigate()
-  const initialThemeRef = useRef(resolvedTheme)
+  const qc = useQueryClient()
+  const [initialTheme] = useState(resolvedTheme)
   // Nonce bumps on file_updated → full reload (the served content is
   // no-store; re-setting src re-runs the app's scripts on fresh HTML).
   const [nonce, setNonce] = useState(0)
@@ -158,10 +173,9 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   const showPreview = folder && preview && !!app.preview_sha && !renderSha
   const docSha = renderSha || (showPreview ? app.preview_sha : app.release_sha)
   const src = folder && docSha
-    ? `/v1/apps/${app.id}/client/${docSha}/?theme=${initialThemeRef.current}&v=${nonce}${showPreview ? '&preview=1' : ''}${renderSha ? '&render=1' : ''}`
-    : `/v1/apps/${app.id}/html?theme=${initialThemeRef.current}&v=${nonce}${folder && preview ? '&preview=1' : ''}`
+    ? `/v1/apps/${app.id}/client/${docSha}/?theme=${initialTheme}&v=${nonce}${showPreview ? '&preview=1' : ''}${renderSha ? '&render=1' : ''}`
+    : `/v1/apps/${app.id}/html?theme=${initialTheme}&v=${nonce}${folder && preview ? '&preview=1' : ''}`
   const showPreviewRef = useRef(showPreview)
-  showPreviewRef.current = showPreview
   const iframeRef = useRef<HTMLIFrameElement | null>(null)
   // Loads the host caused: the iframe is remounted per src (keyed below),
   // so each element owes exactly one; a load nobody asked for is a page
@@ -175,7 +189,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   useEffect(() => { expectedLoadsRef.current = 1 }, [src])
   // The viewer token a folder app's page sends with its own API calls: the
   // reloads a deploy or an approval causes each say `ready` again and reuse
-  // the claim in hand (`viewerClaims`) instead of minting (the route paces).
+  // the claim in hand (`appFrameClaims`) instead of minting (the route paces).
   const tokenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const mintFailuresRef = useRef(0)
   // The runtime shim's server_status word (the supervisor's states plus its
@@ -184,19 +198,29 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   const lastSendAtRef = useRef(0)
   const lastActionAtRef = useRef<Map<string, number>>(new Map())
   const onSendPromptRef = useRef(onSendPrompt)
-  onSendPromptRef.current = onSendPrompt
   const navigateRef = useRef(navigate)
-  navigateRef.current = navigate
   const readOnlyRef = useRef(readOnly)
-  readOnlyRef.current = readOnly
   // The platform's own rendered check (APPS.md "The rendered check"): a
   // synthetic viewer that must never press a real button.
   const renderRef = useRef(!!renderSha)
-  renderRef.current = !!renderSha
   const appRef = useRef(app)
-  appRef.current = app
   const agentRef = useRef(agent)
-  agentRef.current = agent
+  useLayoutEffect(() => {
+    showPreviewRef.current = showPreview
+    onSendPromptRef.current = onSendPrompt
+    navigateRef.current = navigate
+    readOnlyRef.current = readOnly
+    renderRef.current = !!renderSha
+    appRef.current = app
+    agentRef.current = agent
+  })
+  // The server feeds this document asked for: the socket carries deltas
+  // for them only (`catalog_subscribe`), dropped with the document.
+  const serverSubsRef = useRef<Set<string>>(new Set())
+  const dropServerSubs = useCallback(() => {
+    for (const feed of serverSubsRef.current) unsubscribeCatalog(agentRef.current, feed)
+    serverSubsRef.current.clear()
+  }, [])
 
   // Task-driven refresh: pin_app broadcasts file_updated for the app's
   // workspace file — reload the frame live (same matching rule as
@@ -211,7 +235,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   // nonce bump stay ONE unit inside the deferred callback (see above —
   // splitting them strands the live document unsubscribed).
   const reloadAtRef = useRef(0)
-  const requestReload = () => {
+  const requestReload = useCallback(() => {
     const now = Date.now()
     if (now - reloadAtRef.current < RELOAD_DEDUPE_MS) return
     reloadAtRef.current = now
@@ -220,11 +244,10 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
       dropServerSubs()
       setNonce((n) => n + 1)
     })
-  }
+  }, [dropServerSubs])
   useEffect(() => onFileUpdate((u) => {
     if (u.agent_slug === agent && u.rel_path === app.rel_path) requestReload()
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [agent, app.rel_path])
+  }), [agent, app.rel_path, requestReload])
   // A deploy (a pin or a rollback) names the manifest it ships with: the
   // row is refetched first, and the frame reloads once the row in hand
   // carries that signature, so a newly declared feed is never refused by
@@ -245,15 +268,13 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     } else {
       pendingSigRef.current = f.actions_sig
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [app.id])
+  }), [app.id, qc, requestReload])
   useEffect(() => {
     if (pendingSigRef.current && app.actions_sig === pendingSigRef.current) {
       pendingSigRef.current = null
       requestReload()
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [app.actions_sig])
+  }, [app.actions_sig, requestReload])
   // An approval that lands while the document is open: the page subscribed
   // its feeds at parse time and was refused, so it reloads once to ask again.
   const approvedRef = useRef(app.actions_approved)
@@ -266,8 +287,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     const newRelease = folder && app.release_sha !== prevReleaseRef.current
     if (app.actions_approved && !approvedRef.current && !newRelease) requestReload()
     approvedRef.current = app.actions_approved
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [app.actions_approved])
+  }, [app.actions_approved, app.release_sha, folder, requestReload])
   // After the effect above: it reads the previous render's hash.
   useEffect(() => { prevReleaseRef.current = app.release_sha })
 
@@ -293,11 +313,13 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   const activeChats = useActiveChats(wantsActiveChats)
   const feedSubsRef = useRef<Set<string>>(new Set())
   const activeChatsRef = useRef(activeChats)
-  activeChatsRef.current = activeChats
   const projectLanesRef = useRef(projectLanes)
-  projectLanesRef.current = projectLanes
+  useLayoutEffect(() => {
+    activeChatsRef.current = activeChats
+    projectLanesRef.current = projectLanes
+  })
 
-  const postFeed = (feed: string, rows: unknown[] | null, error?: string) => {
+  const postFeed = useCallback((feed: string, rows: unknown[] | null, error?: string) => {
     try {
       iframeRef.current?.contentWindow?.postMessage(
         { source: 'otodock-host', type: 'feed_update', feed,
@@ -305,8 +327,8 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         '*',
       )
     } catch { /* frame gone */ }
-  }
-  const feedRows = (feed: string): { rows?: unknown[]; error?: string } => {
+  }, [])
+  const feedRows = useCallback((feed: string): { rows?: unknown[]; error?: string } => {
     if (feed === 'active_chats') return { rows: activeChatsRef.current }
     if (feed === 'project_lanes') {
       return projectLanesRef.current
@@ -314,21 +336,13 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         : { error: 'project_lanes only flows on a project dock' }
     }
     return { error: 'unknown feed' }
-  }
+  }, [])
   // Platform-answered feeds (APPS.md "Platform catalog"): the snapshot
   // comes over REST as the viewer, deltas as `catalog` frames with a
   // per-feed sequence; a gap, or a reopened socket, re-requests the snapshot.
-  const CLIENT_FEEDS = ['active_chats', 'project_lanes']
   const catalogRowsRef = useRef<Map<string, Record<string, unknown>[]>>(new Map())
   const catalogSeqRef = useRef<Map<string, number>>(new Map())
-  // The server feeds this document asked for: the socket carries deltas
-  // for them only (`catalog_subscribe`), dropped with the document.
-  const serverSubsRef = useRef<Set<string>>(new Set())
-  const dropServerSubs = () => {
-    for (const feed of serverSubsRef.current) unsubscribeCatalog(agentRef.current, feed)
-    serverSubsRef.current.clear()
-  }
-  useEffect(() => () => dropServerSubs(), [])
+  useEffect(() => () => dropServerSubs(), [dropServerSubs])
   // A folder app reloads through its hash (a deploy, an approval, a
   // rollback, a fresh preview copy): the outgoing document's subscriptions
   // die here, as requestReload drops them before a nonce bump.
@@ -339,8 +353,8 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
       dropServerSubs()
     }
     docShaRef.current = docSha
-  }, [docSha])
-  const loadCatalogFeed = async (feed: string) => {
+  }, [docSha, dropServerSubs])
+  const loadCatalogFeed = useCallback(async (feed: string) => {
     try {
       const snap = await fetchCatalogFeed(appRef.current.id, feed)
       catalogRowsRef.current.set(feed, snap.rows)
@@ -349,7 +363,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     } catch (e) {
       if (feedSubsRef.current.has(feed)) postFeed(feed, null, e instanceof Error ? e.message : 'unavailable')
     }
-  }
+  }, [postFeed])
   useEffect(() => onCatalog((f) => {
     if (f.type === 'catalog_resync') {
       for (const feed of feedSubsRef.current) {
@@ -385,8 +399,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     }
     catalogRowsRef.current.set(f.feed, rows)
     postFeed(f.feed, rows)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [])
+  }), [loadCatalogFeed, postFeed])
   // Push on change to every live subscription. active_chats churns exactly
   // at turn end (finish + linger-drop) — while speech is live, defer the
   // push and let the trailing flush read the freshest rows from the ref
@@ -399,12 +412,12 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         postFeed('active_chats', activeChatsRef.current)
       }
     })
-  }, [activeChats])
+  }, [activeChats, postFeed])
   useEffect(() => {
     if (projectLanes && feedSubsRef.current.has('project_lanes')) {
       postFeed('project_lanes', projectLanes)
     }
-  }, [projectLanes])
+  }, [postFeed, projectLanes])
 
   // Content height reported by the shim (autoHeight mode only).
   const [contentHeight, setContentHeight] = useState<number | null>(null)
@@ -420,14 +433,6 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   const batchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastBatchAtRef = useRef(0)
 
-  const postTo = (win: Window, msg: Record<string, unknown>) => {
-    try { win.postMessage({ source: 'otodock-host', ...msg }, '*') } catch { /* frame gone */ }
-  }
-  const openAckTo = (win: Window, status: string, reason?: string, callId?: string) =>
-    postTo(win, { type: 'open_url_ack', status, ...(reason ? { reason } : {}), ...(callId ? { call_id: callId } : {}) })
-  const openTargetAckTo = (win: Window, status: string, reason?: string) =>
-    postTo(win, { type: 'open_ack', status, ...(reason ? { reason } : {}) })
-
   // ── Live apps (APPS.md "Live apps") ──────────────────────────────
   // Focus: a mounted frame is what the viewer sees; a read-only view is not.
   useEffect(() => {
@@ -438,17 +443,16 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   // The state document: fetched once, kept current by app_state frames (the
   // higher rev always wins), posted to the page on load and on change. The
   // page reads it through the otodock:state event, never a host request.
-  const qc = useQueryClient()
   const { data: appState } = useAppState(app.id)
   const appStateRef = useRef<AppState | undefined>(appState)
-  appStateRef.current = appState
-  const postState = () => {
+  useLayoutEffect(() => { appStateRef.current = appState })
+  const postState = useCallback(() => {
     const s = appStateRef.current
     const win = iframeRef.current?.contentWindow
     if (!s || !win) return
     postTo(win, { type: 'state', doc: s.doc, rev: s.rev })
-  }
-  useEffect(() => { postState() }, [appState]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [])
+  useEffect(() => { postState() }, [appState, postState])
   useEffect(() => onAppState((f) => {
     if (f.app_id !== app.id) return
     qc.setQueryData<AppState>(['app-state', app.id], (old) =>
@@ -465,7 +469,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   // the keyboard when a folder app's page says `ready`, posted into the
   // frame, re-minted before it expires. A read-only host and a file app
   // never mint one; the page keeps waiting and its API calls never leave.
-  const postViewerToken = (win: Window, fresh = false) => {
+  const postViewerToken = useCallback(function postViewerToken(win: Window, fresh = false) {
     // Read the app at call time: the message handler that calls this was
     // registered once, at mount, and the app prop may have changed since.
     const current = appRef.current
@@ -480,7 +484,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         if (live && appRef.current.id === appId) postViewerToken(live, true)
       }, ms)
     }
-    const held = viewerClaims.get(key)
+    const held = heldClaim(key)
     const age = held ? Date.now() - held.at : Infinity
     if (!fresh && held && age < VIEWER_TOKEN_REFRESH_MS) {
       postTo(win, { type: 'viewer_token', token: held.token, exp: held.exp })
@@ -490,7 +494,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     void mintViewerToken(appId, { preview }).then((t) => {
       if (navigatedAwayRef.current) return
       mintFailuresRef.current = 0
-      viewerClaims.set(key, { token: t.token, exp: t.exp, at: Date.now() })
+      holdClaim(key, { token: t.token, exp: t.exp, at: Date.now() })
       // The frame may show another app, or the other copy of this one, by
       // the time the mint lands: the claim is kept for what it was minted
       // for and never posted into this frame.
@@ -508,21 +512,15 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
       setServerStatus({ state: FRAME_STATE.CONNECTING, retry: 0 })
       later(Math.min(30_000, 2_000 * 2 ** (mintFailuresRef.current - 1)))
     })
-  }
+  }, [])
   useEffect(() => () => {
     if (tokenTimerRef.current) clearTimeout(tokenTimerRef.current)
   }, [])
 
-  const deliverOpen = (win: Window, url: string, callId?: string) => {
-    void openExternalUrl(url).then((r) => {
-      if (r === 'opened') openAckTo(win, 'opened', undefined, callId)
-      else openAckTo(win, 'blocked', 'popup blocked — try again', callId)
-    })
-  }
-  const deliverOpenTarget = (win: Window, path: string) => {
+  const deliverOpenTarget = useCallback((win: Window, path: string) => {
     navigateRef.current(path)
     openTargetAckTo(win, 'opened')
-  }
+  }, [])
 
   const resolveOpenConsent = (allow: boolean) => {
     const consent: OpenConsent = allow ? 'allowed' : 'blocked'
@@ -547,7 +545,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   // Send the queued calls as one batch; the per-call results flow back to
   // the frame as they land. Reschedules itself while the queue overflows
   // the batch cap.
-  const flushBatch = () => {
+  const flushBatch = useCallback(function flushBatch() {
     batchTimerRef.current = null
     const queue = batchQueueRef.current
     if (!queue.length) return
@@ -574,11 +572,11 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
       }
     })
     if (queue.length) batchTimerRef.current = setTimeout(flushBatch, BATCH_MIN_INTERVAL_MS)
-  }
-  const enqueue = (q: QueuedCall) => {
+  }, [])
+  const enqueue = useCallback((q: QueuedCall) => {
     batchQueueRef.current.push(q)
     if (!batchTimerRef.current) batchTimerRef.current = setTimeout(flushBatch, 0)
-  }
+  }, [flushBatch])
   useEffect(() => () => {
     if (batchTimerRef.current) clearTimeout(batchTimerRef.current)
   }, [])
@@ -587,8 +585,8 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     const onMsg = (e: MessageEvent) => {
       const win = e.source as Window | null
       if (!win || win !== iframeRef.current?.contentWindow) return
-      const d: any = e.data
-      if (!d || d.source !== 'otodock-artifact') return
+      const d: unknown = e.data
+      if (!isRecord(d) || d.source !== 'otodock-artifact') return
       if (navigatedAwayRef.current) return
       if (d.type === 'ready') {
         // The runtime is installed: a folder app's page gets its viewer
@@ -701,7 +699,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         const current = appRef.current
         const declared = current.actions.find((a) => a.type === 'data_feed' && a.feed === feed)
         if (!declared) {
-          return postFeed(feed, null, 'feed not declared in this app\'s manifest')
+          return postFeed(feed, null, 'feed not declared by this app')
         }
         if (!current.actions_approved) {
           return postFeed(feed, null, 'actions not approved')
@@ -738,7 +736,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         const reply = (ok: boolean, result?: unknown, reason?: string) =>
           postTo(win, { type: 'platform_result', call_id: callId, ok, ...(ok ? { result } : { reason }) })
         const declared = current.actions.find((a) => a.type === 'platform' && a.method === method)
-        if (!declared) return reply(false, undefined, 'not declared in this app\'s manifest')
+        if (!declared) return reply(false, undefined, 'not declared by this app')
         if (!current.actions_approved) return reply(false, undefined, 'actions not approved')
         if (readOnlyRef.current) return reply(false, undefined, 'not available in this view')
         if (!meetsFloor(declared, current.viewer_role)) return reply(false, undefined, `needs the ${declared.min_role} role`)
@@ -750,7 +748,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
       }
       // `app_actions` carries one macrotask's calls; a lone `app_action`
       // (a page authored against the older runtime) is a batch of one.
-      let calls: { call_id: string; id: string; args: unknown }[]
+      let calls: unknown[]
       if (d.type === 'app_actions') {
         calls = Array.isArray(d.calls) ? d.calls.slice(0, 64) : []
       } else if (d.type === 'app_action') {
@@ -759,12 +757,13 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         return
       }
       const current = appRef.current
-      for (const raw of calls) {
-        const callId = typeof raw?.call_id === 'string' ? raw.call_id.slice(0, 64) : ''
-        const action = current.actions.find((a) => a.id === String(raw?.id || ''))
+      for (const item of calls) {
+        const raw = isRecord(item) ? item : {}
+        const callId = typeof raw.call_id === 'string' ? raw.call_id.slice(0, 64) : ''
+        const action = current.actions.find((a) => a.id === String(raw.id || ''))
         if (!action) { ack('denied', 'unknown action', callId); continue }
         if (action.type === 'data_feed') {
-          ack('denied', 'feeds are subscriptions — use otodock.feed(name, cb)', callId)
+          ack('denied', 'feeds are subscriptions: use otodock.feed(name, cb)', callId)
           continue
         }
         // mcp_tool pages await `otodock:action-result` to re-enable controls
@@ -814,7 +813,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
         const last = lastActionAtRef.current.get(key) || 0
         if (now - last < 400) {
           ack('denied', 'rate limited', callId)
-          postResult(false, 'Rate limited — slow down')
+          postResult(false, 'Too many clicks. Wait a moment and try again.')
           continue
         }
         lastActionAtRef.current.set(key, now)
@@ -832,42 +831,36 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
     }
     window.addEventListener('message', onMsg)
     return () => window.removeEventListener('message', onMsg)
-  }, [])
+  }, [deliverOpenTarget, enqueue, feedRows, loadCatalogFeed, postFeed, postViewerToken])
 
   // Live theme switch → child (payload carries only the theme string).
   const themeRef = useRef(resolvedTheme)
-  themeRef.current = resolvedTheme
+  useLayoutEffect(() => { themeRef.current = resolvedTheme })
   useEffect(() => {
-    if (resolvedTheme === initialThemeRef.current) return
+    if (resolvedTheme === initialTheme) return
     iframeRef.current?.contentWindow?.postMessage(
       { source: 'otodock-host', type: 'theme', theme: resolvedTheme },
       '*',
     )
-  }, [resolvedTheme])
+  }, [initialTheme, resolvedTheme])
 
   const openChip = openPrompt ? (
     <div className="absolute inset-x-2 top-2 z-10" data-testid="app-openurl-chip">
-      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-p-border-light/60 bg-white/95 px-3 py-2 text-xs shadow-md backdrop-blur-sm dark:bg-p-surface/95">
-        <span className="text-p-text-secondary">
+      <div className={`flex flex-wrap items-center gap-2 px-3 py-2 text-xs ${POPOVER}`}>
+        <span className="text-secondary">
           {openPrompt.kind === 'url' ? (
-            <>This app wants to open <span className="font-medium text-p-text">{openPrompt.origin}</span> in a new tab.</>
+            <>This app wants to open <span className="font-medium text-primary">{openPrompt.origin}</span> in a new tab.</>
           ) : (
-            <>This app wants to open <span className="font-medium text-p-text">{openPrompt.label}</span>.</>
+            <>This app wants to open <span className="font-medium text-primary">{openPrompt.label}</span>.</>
           )}
         </span>
         <span className="ml-auto flex gap-1.5">
-          <button
-            onClick={() => resolveOpenConsent(true)}
-            className="rounded-md bg-blue-500 px-2.5 py-1 font-medium text-white transition-colors hover:bg-blue-600"
-          >
+          <Button variant="primary" size="xs" onClick={() => resolveOpenConsent(true)}>
             Allow
-          </button>
-          <button
-            onClick={() => resolveOpenConsent(false)}
-            className="rounded-md border border-p-border-light px-2.5 py-1 font-medium text-p-text-secondary transition-colors hover:bg-p-surface"
-          >
+          </Button>
+          <Button size="xs" onClick={() => resolveOpenConsent(false)}>
             Block
-          </button>
+          </Button>
         </span>
       </div>
     </div>
@@ -876,32 +869,33 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
   const title = app.title || app.slug
   const serverBanner = serverStatus && !navigatedAway ? (
     <div className="absolute inset-x-2 top-2 z-10" data-testid="app-server-banner">
-      <div className="rounded-lg border border-p-border-light/60 bg-white/95 px-3 py-2 text-xs text-p-text-secondary shadow-md backdrop-blur-sm dark:bg-p-surface/95">
+      <div className="rounded-popover bg-surface-overlay px-3 py-2 text-xs text-secondary shadow-elevation-3">
         {serverStatus.state === FRAME_STATE.CONNECTING
-          ? <>Connecting <span className="font-medium text-p-text">{title}</span>…</>
+          ? <>Connecting <span className="font-medium text-primary">{title}</span>…</>
           : serverStatus.state === FRAME_STATE.UNREACHABLE
-            ? <><span className="font-medium text-p-text">{title}</span> could not be reached — reload the app.</>
+            ? <><span className="font-medium text-primary">{title}</span> could not be reached. Reload the app.</>
           : serverStatus.state === APP_SERVER_STATE.STARTING || serverStatus.state === APP_SERVER_STATE.STOPPED
-          ? <>Starting <span className="font-medium text-p-text">{title}</span>…</>
+          ? <>Starting <span className="font-medium text-primary">{title}</span>…</>
           : serverStatus.state === APP_SERVER_STATE.UNAPPROVED
-            ? <><span className="font-medium text-p-text">{title}</span> is waiting for approval.</>
+            ? <><span className="font-medium text-primary">{title}</span> is waiting for approval.</>
             : serverStatus.state === APP_SERVER_STATE.SECRETS
-              ? <><span className="font-medium text-p-text">{title}</span> is waiting for a secret to be set{app.can_manage ? ' — Settings in the menu.' : '.'}</>
+              ? <><span className="font-medium text-primary">{title}</span> is waiting for a secret to be set{app.can_manage ? '. Open Settings in the menu.' : '.'}</>
             : serverStatus.state === APP_SERVER_STATE.QUOTA_FULL
-              ? <><span className="font-medium text-p-text">{title}</span> stopped: its storage quota is full.</>
+              ? <><span className="font-medium text-primary">{title}</span> stopped: its storage quota is full.</>
             : app.can_manage
-              ? <><span className="font-medium text-p-text">{title}</span> failed to start — see Logs in the menu.</>
-              : <><span className="font-medium text-p-text">{title}</span> is not available right now.</>}
+              ? <><span className="font-medium text-primary">{title}</span> failed to start. See Logs in the menu.</>
+              : <><span className="font-medium text-primary">{title}</span> is not available right now.</>}
       </div>
     </div>
   ) : null
   const awayNotice = navigatedAway ? (
-    <div className="absolute inset-0 z-10 flex items-center justify-center bg-p-bg/90" data-testid="app-navigated-away">
-      <div className="max-w-sm rounded-lg border border-p-border-light bg-p-surface px-4 py-3 text-center text-xs text-p-text-secondary shadow-md">
+    <div className="absolute inset-0 z-10 flex items-center justify-center bg-surface-page" data-testid="app-navigated-away">
+      <div className={`max-w-sm px-4 py-3 text-center text-xs text-secondary ${CARD}`}>
         <p>This app navigated away from its page, so it was stopped.</p>
-        <button
-          type="button"
-          className="mt-2 rounded-md bg-blue-500 px-2.5 py-1 font-medium text-white transition-colors hover:bg-blue-600"
+        <Button
+          variant="primary"
+          size="xs"
+          className="mt-2"
           onClick={() => {
             navigatedAwayRef.current = false
             setNavigatedAway(false)
@@ -910,7 +904,7 @@ export default function AppFrame({ app, agent, onSendPrompt, projectLanes, autoH
           }}
         >
           Reload the app
-        </button>
+        </Button>
       </div>
     </div>
   ) : null

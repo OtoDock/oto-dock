@@ -50,11 +50,11 @@ async def _cancel_parked(run_id: str, task_id: str, monkeypatch, *, user_stop: b
                          reason: str | None = None) -> _Subscriber:
     from core import concurrency
     from core.config import task_config_builder
-    from storage import remote_store
+    from services.remote import remote_status
     monkeypatch.setattr(concurrency, "task_slot", _parked_slot)
     monkeypatch.setattr(task_config_builder, "resolve_task_identity",
                         lambda *a, **k: task_config_builder.TaskIdentity("", "manager", "agent", None))
-    monkeypatch.setattr(remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
+    monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
     task = _task(task_id)
     task_store.create_run(run_id, task_id, task.agent, "schedule", None, task.prompt,
                           "scheduled", task.scope, None)
@@ -140,11 +140,10 @@ async def test_a_cancel_between_the_config_build_and_the_session_start_gives_the
     # failure path does.
     from types import SimpleNamespace
 
-    import config
     from core import concurrency
     from core.config import config_builder, task_config_builder
     from core.session import session_manager, session_state
-    from storage import remote_store
+    from services.remote import remote_status
 
     cfg = SimpleNamespace(execution_target="local", execution_path="claude-code-cli",
                           interactive=False, resume=False, extra_env={}, chat_id="",
@@ -174,8 +173,8 @@ async def test_a_cancel_between_the_config_build_and_the_session_start_gives_the
     monkeypatch.setattr(task_config_builder, "resolve_task_identity",
                         lambda *a, **k: task_config_builder.TaskIdentity("", "manager", "agent", None))
     monkeypatch.setattr(session_manager, "get_execution_layer", lambda *a, **k: _Layer())
-    monkeypatch.setattr(remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
-    monkeypatch.setattr(config, "get_cli_model", lambda agent, layer=None: "test-model")
+    monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
+    monkeypatch.setattr("configuration.models.get_cli_model", lambda agent, layer=None: "test-model")
     monkeypatch.setattr(session_state, "_save_sessions", lambda: None)
     monkeypatch.setattr(config_builder, "release_config_seat",
                         lambda sid, c, **kw: released.append((sid, c, kw)))

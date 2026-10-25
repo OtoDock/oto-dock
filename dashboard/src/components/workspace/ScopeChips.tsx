@@ -11,8 +11,8 @@ interface Props {
  * Top-row scope picker. Single horizontally-scrollable row of chips,
  * color-coded by ownership:
  *
- *   My Workspace / My Context           → brand blue
- *   Shared Workspace / Knowledge / Cfg  → accent purple
+ *   My Workspace / My Context           → the action blue
+ *   Shared Workspace / Knowledge / Cfg  → the agent accent
  *
  * Backend already filters scopes by role, so internal agents see only the
  * agent chips and viewers only see "My" chips.
@@ -78,7 +78,7 @@ export default function ScopeChips({ sections, activeKey, onSelect }: Props) {
 
   if (sections.length === 0) {
     return (
-      <div className="text-xs text-p-text-light px-3 py-2">
+      <div className="text-xs text-tertiary px-3 py-2">
         No workspace scopes available.
       </div>
     )
@@ -103,11 +103,11 @@ export default function ScopeChips({ sections, activeKey, onSelect }: Props) {
           )
           const className = purple
             ? active
-              ? 'bg-p-accent-purple text-white border-p-accent-purple'
-              : 'bg-p-accent-purple/10 text-p-accent-purple border-p-accent-purple/30 hover:bg-p-accent-purple/20'
+              ? 'bg-accent-agent-fill text-on-solid border-accent-agent-fill'
+              : 'bg-accent-agent-bg text-accent-agent-fg border-accent-agent-border hover:text-primary'
             : active
-              ? 'bg-brand text-white border-brand'
-              : 'bg-brand/10 text-brand border-brand/30 hover:bg-brand/20'
+              ? 'bg-action text-action-fg border-action'
+              : 'bg-action-subtle text-link border-transparent hover:bg-action-subtle-hover hover:text-primary'
           return (
             <button
               key={s.key}
@@ -121,12 +121,12 @@ export default function ScopeChips({ sections, activeKey, onSelect }: Props) {
         })}
       </div>
       {/* Fade gradients — only render the side that has overflow. Match
-          the parent's bg-p-bg so the fade blends seamlessly. */}
+          the parent's page surface so the fade blends seamlessly. */}
       {fadeLeft && (
-        <div className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 bg-linear-to-r from-p-bg to-transparent" />
+        <div className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 bg-linear-to-r from-surface-page to-transparent" />
       )}
       {fadeRight && (
-        <div className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 bg-linear-to-l from-p-bg to-transparent" />
+        <div className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 bg-linear-to-l from-surface-page to-transparent" />
       )}
     </div>
   )

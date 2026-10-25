@@ -47,8 +47,7 @@ from typing import Any
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
-
+from mcp.types import TextContent, Tool, ToolAnnotations
 
 AGENT = os.environ.get("MEMORY_MCP_AGENT", "")
 PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
@@ -232,6 +231,7 @@ def _memory_tool() -> Tool:
             },
             "required": ["command"],
         },
+        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False),
     )
 
 
@@ -457,7 +457,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             type="text",
             text=f"API error {e.response.status_code}: {text}",
         )]
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the tool answers with the error text whatever failed
         return [TextContent(type="text", text=f"Error: {e}")]
 
 

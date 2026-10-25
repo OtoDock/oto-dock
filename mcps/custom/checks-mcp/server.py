@@ -23,7 +23,9 @@ from typing import Any
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+
+from _tool_args import ToolArgs
 
 AGENT = os.environ.get("CHECKS_MCP_AGENT", "") or os.environ.get("OTO_AGENT_NAME", "")
 # The owner-tier question, answered by the proxy in the env
@@ -36,6 +38,7 @@ PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8400").rstrip("/")
 API_KEY = os.environ.get("PROXY_API_KEY", "")
 
 server = Server("checks-mcp")
+TOOL_ARGS = ToolArgs()
 
 _EVERYONE = {"list_checks", "attach_check", "detach_check", "run_check"}
 _PRIVATE = {"create_private_check", "delete_private_check"}
@@ -69,7 +72,7 @@ async def _request(method: str, path: str, **kwargs) -> Any:
         if resp.status_code >= 400:
             try:
                 detail = resp.json().get("detail")
-            except Exception:  # noqa: BLE001
+            except (ValueError, AttributeError):
                 detail = resp.text[:300]
             raise RuntimeError(str(detail or f"HTTP {resp.status_code}"))
         return resp.json() if resp.content else {}
@@ -182,18 +185,21 @@ _TOOL_SCHEMAS: dict[str, dict] = {
             "agent its findings for another round when it fails."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
     "attach_check": {
         "description": "Attach an offered check (or one of your own) to this chat: it runs at the end of every turn its condition matches.",
         "inputSchema": {"type": "object", "properties": {
             "name": {"type": "string", "description": "The check's name, or its ref (agent:<name> | user:<name>)"}},
             "required": ["name"], "additionalProperties": False},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     },
     "detach_check": {
         "description": "Detach a check from this chat. A mandatory check cannot be detached here — a manager removes it in the agent's Checks page.",
         "inputSchema": {"type": "object", "properties": {
             "name": {"type": "string", "description": "The check's name or ref"}},
             "required": ["name"], "additionalProperties": False},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
     },
     "run_check": {
         "description": (
@@ -203,6 +209,7 @@ _TOOL_SCHEMAS: dict[str, dict] = {
         "inputSchema": {"type": "object", "properties": {
             "name": {"type": "string", "description": "The check's name or ref"}},
             "required": ["name"], "additionalProperties": False},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
     },
     "create_private_check": {
         "description": (
@@ -214,11 +221,13 @@ _TOOL_SCHEMAS: dict[str, dict] = {
             "doc": _DOC_SCHEMA,
             "script": {"type": "string", "description": "The script's text for a script section (a #! line names the interpreter)"}},
             "required": ["name", "doc"], "additionalProperties": False},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     "delete_private_check": {
         "description": "Remove one of your checks.",
         "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}},
                         "required": ["name"], "additionalProperties": False},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     },
     "set_check": {
         "description": (
@@ -231,11 +240,13 @@ _TOOL_SCHEMAS: dict[str, dict] = {
             "doc": _DOC_SCHEMA,
             "script": {"type": "string", "description": "The script's text for a script section"}},
             "required": ["name", "doc"], "additionalProperties": False},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
     "delete_check": {
         "description": "Managers: remove one of the agent's checks (a mandatory one included).",
         "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}},
                         "required": ["name"], "additionalProperties": False},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     },
 }
 
@@ -253,12 +264,16 @@ _TOOL_HANDLERS = {
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [Tool(name=name, description=spec["description"], inputSchema=spec["inputSchema"])
-            for name, spec in _TOOL_SCHEMAS.items() if name in ENABLED_TOOLS]
+    return TOOL_ARGS.listed([Tool(name=name, description=spec["description"], inputSchema=spec["inputSchema"],
+                                  annotations=ToolAnnotations(**spec["annotations"]))
+            for name, spec in _TOOL_SCHEMAS.items() if name in ENABLED_TOOLS])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     if name not in ENABLED_TOOLS or name not in _TOOL_HANDLERS:
         return _text(f"❌ {name} is not available in this session.")
     try:

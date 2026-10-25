@@ -7,6 +7,20 @@ from dataclasses import dataclass, field
 from pipeline.audio_tap import OutgoingAudioTap
 
 
+class SilenceEvent(asyncio.Event):
+    """The caller's silence: set while silent, cleared at each speech start.
+    ``speech_started_at`` is when the current or last speech began; a call
+    tool's completion point reads it to tell speech that began after the
+    tool's acceptance from speech already under way."""
+
+    speech_started_at: float = 0.0
+
+    def clear(self) -> None:
+        if self.is_set():
+            self.speech_started_at = time.monotonic()
+        super().clear()
+
+
 @dataclass
 class CallState:
     """All mutable per-call runtime state for a :class:`CallPipeline`.
@@ -26,6 +40,12 @@ class CallState:
     _tts_playing: bool = False
     _tts_task: asyncio.Task | None = None
     _tts_ever_played: bool = False
+    # Text with the TTS was flushed mid-utterance and nothing was sent since:
+    # the segment may go idle once that audio drains (``_tts_idle``: the
+    # segment's task is alive, the context open, nothing playing; a tap, a
+    # queued utterance and the cleanup treat it as playback).
+    _tts_flushed_open: bool = False
+    _tts_idle: bool = False
     _utterance_cancelled: bool = False
     _audio_out_buf: bytearray = field(default_factory=bytearray)
 
@@ -64,7 +84,7 @@ class CallState:
     _queued_speech: list[str] = field(default_factory=list)
     _speech_audio_buf: bytearray = field(default_factory=bytearray)
     _turn_timer: asyncio.Task | None = None
-    _user_silent: asyncio.Event = field(default_factory=asyncio.Event)
+    _user_silent: SilenceEvent = field(default_factory=SilenceEvent)
 
     # Barge-in pause/confirm/commit: VAD speech during playback PAUSES the
     # sender (reversible — the engine turn and TTS synthesis keep running);
@@ -159,6 +179,15 @@ class CallState:
     _control_args: dict = field(default_factory=dict)
     _control_cut: bool = False
     _control_boundary_seen: bool = False
+    # An end or transfer accepted while a turn streams: the token loop
+    # races the engine's next token against this event and acts at once.
+    # ``_control_accepted_at`` is the acceptance's time, for the farewell
+    # check (speech from before it is not a caller still engaged).
+    _control_wake: asyncio.Event = field(default_factory=asyncio.Event)
+    _control_accepted_at: float = 0.0
+    # When a typed or released message was queued (the duplex session):
+    # the farewell check reads it beside the voice stamp.
+    _typed_input_at: float = 0.0
     _transfer_target: dict | None = None
     _transferred_to: str = ""
     _control_note: str = ""
@@ -174,23 +203,21 @@ class CallState:
     _transfer_settled: bool = False
 
     # The caller's language (pipeline/language.py): locked at construction
-    # unless the route identifies it; one identification task at a time;
-    # the identification's text replaces the first turn's when the language
-    # changed; the stream's frames are kept while it reopens.
+    # unless the surface detects it (final after a few seconds of speech);
+    # the candidate stream's open task; the seconds after the first words
+    # the candidate opened, the switch resolved; a candidate's failures; a
+    # final waiting for a pending switch; a switch that resolved inside this
+    # turn (the dispatch then waits for the new stream's final); the turn's
+    # typed segments (a release seed), kept through a rewrite.
     _language_locked: bool = True
-    _language_attempts: int = 0
-    _language_task: asyncio.Task | None = None
-    _language_first_text: str = ""
-    # The turn generation: bumped when a turn's segments are dispatched or
-    # queued; an identification carries the generation of the turn whose
-    # audio it heard, and its text applies to that turn alone.
-    _language_turn_gen: int = 0
-    _language_identify_gen: int = -1
-    # The speech buffer lost its head to the window cap: an identification
-    # of it heard the turn's tail only.
-    _speech_audio_truncated: bool = False
-    _stt_restarting: bool = False
-    _stt_restart_buffer: bytearray = field(default_factory=bytearray)
+    _language_open_task: asyncio.Task | None = None
+    _language_onset: float = 0.0
+    _language_opened_at: float = 0.0
+    _language_switched_at: float = 0.0
+    _language_failures: dict = field(default_factory=dict)
+    _language_final_pending: bool = False
+    _language_turn_switched: bool = False
+    _turn_typed: list = field(default_factory=list)
     # The proxy is gone (the call's socket never opened or closed; an
     # in-session call's chat attach with it, pipeline/outbound.py): the call
     # ends with the cannot_continue phrase, once.

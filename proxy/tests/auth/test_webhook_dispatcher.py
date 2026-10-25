@@ -18,18 +18,21 @@ import sys
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from auth import webhook_providers  # noqa: E402
-from auth.webhook_providers.generic import GenericWebhookProvider  # noqa: E402
-from api.events import webhook_body  # noqa: E402
-from services.webhooks import webhook_dispatcher  # noqa: E402
-from services.webhooks.event_normalizer import resolve_catalog_keys  # noqa: E402
-from storage.identity import credential_store # noqa: E402
-from storage.automation import trigger_store # noqa: E402
-from storage.automation import webhook_subscription_store # noqa: E402
+from api.events import webhook_body
+from auth import webhook_providers
+from auth.webhook_providers.generic import GenericWebhookProvider
+from services.webhooks import webhook_dispatcher
+from services.webhooks.event_normalizer import resolve_catalog_keys
+from storage.automation import (
+    trigger_store,
+    webhook_subscription_store,
+)
+from storage.identity import credential_store
 
 _CATALOG = [
     {
@@ -753,9 +756,9 @@ def test_zoom_handshake_signs_nothing_the_dispatcher_fires(monkeypatch):
 
 # --- the receive path off the loop ------------------------------------------
 
-import uuid  # noqa: E402
+import uuid
 
-from auth.webhook_providers.base import NormalizedEvent  # noqa: E402
+from auth.webhook_providers.base import NormalizedEvent
 
 _L5_PROVIDER = "l5vendor"
 _L5_SECRET = "l5-signing-secret"

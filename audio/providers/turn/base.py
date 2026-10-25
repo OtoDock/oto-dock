@@ -6,18 +6,16 @@ Two backends with intentionally different inputs:
 
 They are NOT unified behind a single ``classify`` signature (audio vs text);
 :class:`audio.providers.turn.dispatcher.TurnClassifierDispatcher` routes per
-language and is the surface the pipeline uses. This ABC captures only the
+language and is the surface the pipeline uses. This base captures only the
 shared lifecycle.
 """
 
 from __future__ import annotations
 
-from abc import ABC
-
 __all__ = ["TurnClassifier"]
 
 
-class TurnClassifier(ABC):
+class TurnClassifier:
     """Common base for turn-taking classifiers (shared lifecycle only)."""
 
     async def close(self) -> None:

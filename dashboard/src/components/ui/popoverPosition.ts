@@ -1,4 +1,5 @@
-import { useLayoutEffect, useState, type RefObject } from 'react'
+import { type RefObject, useCallback, useMemo } from 'react'
+import { useElementBox } from '../../hooks/useElementBox'
 
 /**
  * Where a fixed-position popover goes so that it stays on screen.
@@ -10,7 +11,7 @@ import { useLayoutEffect, useState, type RefObject } from 'react'
  * screen, so in practice the phone bug this fixes ("ll screen" instead of
  * "Full screen" on a chip at the left edge) is the horizontal clamp; the
  * flip covers menus opened near the bottom (a context menu on the last
- * file tile). `ui/TitleTooltip.tsx` clamps its bubble the same way.
+ * file tile). `ui/Tooltip.tsx` clamps its bubble the same way.
  */
 
 export interface AnchorBox {
@@ -82,20 +83,18 @@ export function usePopoverPlacement(
   panelRef: RefObject<HTMLElement | null>,
   opts: ClampOptions = {},
 ): Placement | null {
-  const [placement, setPlacement] = useState<Placement | null>(null)
   const { margin, gap, align } = opts
-  useLayoutEffect(() => {
-    if (!anchor) { setPlacement(null); return }
-    const el = panelRef.current
-    if (!el) return
-    setPlacement(clampPopover(
+  const getPanel = useCallback(() => panelRef.current, [panelRef])
+  const box = useElementBox(getPanel, anchor !== null)
+  return useMemo(() => {
+    if (!anchor || !box) return null
+    return clampPopover(
       anchor,
-      { width: el.offsetWidth, height: el.offsetHeight },
-      { width: window.innerWidth, height: window.innerHeight },
+      { width: box.width, height: box.height },
+      { width: box.viewportWidth, height: box.viewportHeight },
       { margin, gap, align },
-    ))
-  }, [anchor, panelRef, margin, gap, align])
-  return placement
+    )
+  }, [anchor, box, margin, gap, align])
 }
 
 /** The four numbers a `DOMRect` contributes, as a plain object React can

@@ -49,8 +49,8 @@ import sys
 import termios
 import threading
 from collections import deque
+from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import Awaitable, Callable, Optional, Sequence
 
 import config
 from core.background import spawn
@@ -96,8 +96,8 @@ _READ_CHUNK = 65536
 
 # on_output(rendered_bytes) / on_exit(exit_code|None) — either may be sync or
 # return a coroutine (it's scheduled on the loop).
-OutputCb = Callable[[bytes], "Optional[Awaitable[None]]"]
-ExitCb = Callable[["Optional[int]"], "Optional[Awaitable[None]]"]
+OutputCb = Callable[[bytes], "Awaitable[None] | None"]
+ExitCb = Callable[["int | None"], "Awaitable[None] | None"]
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -122,7 +122,7 @@ class PtyProcess:
         rows: int,
         cols: int,
         on_output: OutputCb,
-        on_exit: Optional[ExitCb],
+        on_exit: ExitCb | None,
         scrollback_limit: int,
     ) -> None:
         self._popen = popen
@@ -133,7 +133,7 @@ class PtyProcess:
         self._on_output = on_output
         self._on_exit = on_exit
         self._scrollback_limit = scrollback_limit
-        self._scrollback: "deque[bytes]" = deque()
+        self._scrollback: deque[bytes] = deque()
         self._scrollback_len = 0
         self._paste_mode = PasteModeTracker()
         self._loop = asyncio.get_running_loop()
@@ -286,7 +286,7 @@ class PtyProcess:
             os.close(self.master_fd)
         spawn(self._reap_and_notify(), name="reap_and_notify", owner="pty_relay")
 
-    def _signal_group(self, sig: "signal.Signals") -> None:
+    def _signal_group(self, sig: signal.Signals) -> None:
         # The child is its own session/group leader (start_new_session), so
         # its pgid == pid; signal the whole group to take down the TUI and
         # anything it spawned. bwrap's --die-with-parent is the backstop.
@@ -298,7 +298,7 @@ class PtyProcess:
             logger.debug("pty %s: killpg(%s) failed: %s", self.pid, sig, exc)
 
     async def _reap_and_notify(self) -> None:
-        code: Optional[int] = None
+        code: int | None = None
         try:
             code = await self._loop.run_in_executor(None, self._wait_child)
         except Exception:
@@ -311,7 +311,7 @@ class PtyProcess:
             except Exception:
                 logger.exception("pty %s: on_exit callback failed", self.pid)
 
-    def _wait_child(self) -> Optional[int]:
+    def _wait_child(self) -> int | None:
         # Runs in a threadpool. SIGTERM was already sent in close() (or the
         # child exited on its own); escalate to SIGKILL if it lingers.
         try:
@@ -330,11 +330,11 @@ def spawn_pty(
     argv: Sequence[str],
     *,
     env: dict,
-    cwd: Optional[str] = None,
+    cwd: str | None = None,
     rows: int = DEFAULT_ROWS,
     cols: int = DEFAULT_COLS,
     on_output: OutputCb,
-    on_exit: Optional[ExitCb] = None,
+    on_exit: ExitCb | None = None,
     scrollback_limit: int = DEFAULT_SCROLLBACK_BYTES,
 ) -> PtyProcess:
     """Spawn ``argv`` on a fresh PTY and return a loop-integrated handle.
@@ -494,7 +494,7 @@ def _executor() -> ThreadPoolExecutor:
         return _spawn_executor
 
 
-def _popen_piped(argv: list[str], cwd: Optional[str], env: dict):
+def _popen_piped(argv: list[str], cwd: str | None, env: dict):
     popen = subprocess.Popen(
         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, cwd=cwd, env=env, start_new_session=True,
@@ -510,7 +510,7 @@ def _popen_piped(argv: list[str], cwd: Optional[str], env: dict):
     return popen, pidfd
 
 
-def _discard_child(popen: subprocess.Popen, pidfd: Optional[int]) -> None:
+def _discard_child(popen: subprocess.Popen, pidfd: int | None) -> None:
     """Kill a child nobody will own (a cancelled or failed spawn) and reap it
     on a daemon thread."""
     with contextlib.suppress(OSError):
@@ -533,17 +533,17 @@ class PipedProcess:
 
     def __init__(self, popen: subprocess.Popen, stdin: asyncio.StreamWriter,
                  stdout: asyncio.StreamReader, stderr: asyncio.StreamReader,
-                 pidfd: Optional[int]) -> None:
+                 pidfd: int | None) -> None:
         self._popen = popen
         self.pid = popen.pid
         self.stdin = stdin
         self.stdout = stdout
         self.stderr = stderr
         self._pidfd = pidfd
-        self._exited: Optional[asyncio.Future] = None
+        self._exited: asyncio.Future | None = None
 
     @property
-    def returncode(self) -> Optional[int]:
+    def returncode(self) -> int | None:
         rc = self._popen.poll()
         if rc is not None:
             self._close_pidfd()
@@ -579,7 +579,7 @@ class PipedProcess:
 
                 loop.add_reader(fd, _readable)
             await asyncio.shield(self._exited)
-        while (rc := self.returncode) is None:
+        while (rc := self.returncode) is None:  # noqa: ASYNC110  # the reap after the pidfd fired, or no pidfd: nothing else to await
             await asyncio.sleep(_WAIT_POLL_S)
         return rc
 
@@ -593,7 +593,7 @@ class PipedProcess:
         self._popen.kill()
 
 
-async def spawn_piped(argv: Sequence[str], *, cwd: Optional[str], env: dict,
+async def spawn_piped(argv: Sequence[str], *, cwd: str | None, env: dict,
                       limit: int) -> PipedProcess:
     """Start ``argv`` (a new session, pipes on 0/1/2) from the spawn thread
     and wire its pipes to the running loop. A cancellation or a failure after

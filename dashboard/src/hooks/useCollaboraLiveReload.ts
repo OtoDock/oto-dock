@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { onFileUpdate, type FileUpdate } from '../lib/fileUpdates'
+import { isRecord } from '../lib/json/guards'
 
 interface Args {
   // Identity of the document this iframe renders — used to match incoming
@@ -57,18 +58,18 @@ export function useCollaboraLiveReload({ fileId, agentSlug, relPath, reload }: A
       // but source-window matching blocks any other frame/window from spoofing
       // Doc_ModifiedStatus (to suppress reloads) or App_LoadingStatus.
       if (e.source !== iframeRef.current?.contentWindow) return
-      let data: any
+      let data: unknown
       try {
         data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data
       } catch {
         return
       }
-      if (!data || typeof data.MessageId !== 'string') return
+      if (!isRecord(data) || typeof data.MessageId !== 'string') return
       if (data.MessageId === 'App_LoadingStatus') {
         // COOL is up — (re)enable the integration API so Doc_ModifiedStatus flows.
         postReady()
       } else if (data.MessageId === 'Doc_ModifiedStatus') {
-        modifiedRef.current = !!data?.Values?.Modified
+        modifiedRef.current = isRecord(data.Values) && !!data.Values.Modified
       }
     }
     window.addEventListener('message', onMsg)

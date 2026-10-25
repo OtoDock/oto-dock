@@ -7,6 +7,7 @@ import { useActiveChats, FINISHED_LINGER_MS, _reseedAttempts } from '@/hooks/use
 import { useDashboardWs } from '@/hooks/useDashboardWs'
 import { useChatStore } from '@/store/chatStore'
 import * as chatsApi from '@/api/chats'
+import { FakeWebSocket } from './fakeWebSocket'
 
 // ─── useActiveChats (derive logic; real store + mocked seed fetch) ───────────
 
@@ -199,23 +200,6 @@ describe('useActiveChats', () => {
 })
 
 // ─── useDashboardWs title_updated fallback invalidation (per-id bounds) ──────
-
-class FakeWebSocket {
-  static OPEN = 1
-  static CONNECTING = 0
-  static instances: FakeWebSocket[] = []
-  readyState = FakeWebSocket.OPEN
-  sent: string[] = []
-  onopen: (() => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
-  onmessage: ((e: { data: string }) => void) | null = null
-  constructor(public url: string) {
-    FakeWebSocket.instances.push(this)
-  }
-  send(data: string) { this.sent.push(data) }
-  close() { /* keep reconnect logic out of the test */ }
-}
 
 describe('useDashboardWs title_updated seed invalidation', () => {
   beforeEach(() => {

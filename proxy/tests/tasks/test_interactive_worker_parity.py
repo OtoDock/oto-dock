@@ -259,11 +259,12 @@ def test_a_continue_round_borrows_the_live_terminal(temp_db, monkeypatch):
     output, the report lands, the terminal is neither closed nor stamped a
     task session, and the chat's hold is released."""
     from contextlib import asynccontextmanager
+
     from core import concurrency
     from core.config import task_config_builder
     from core.session import session_manager, session_state
+    from services.remote import remote_status
     from services.scheduler import interactive, runner, shared
-    from storage import remote_store
 
     chat_id = "worker-borrow"
     sid = "22222222-2222-4222-8222-222222222222"
@@ -286,7 +287,7 @@ def test_a_continue_round_borrows_the_live_terminal(temp_db, monkeypatch):
                         lambda *a, **k: task_config_builder.TaskIdentity("", "manager", "agent", None))
     monkeypatch.setattr(session_manager, "get_execution_layer",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("no layer")))
-    monkeypatch.setattr(remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
+    monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
 
     @asynccontextmanager
     async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):
@@ -342,11 +343,12 @@ def test_a_continue_round_never_drives_another_persons_terminal(temp_db, monkeyp
     else fails with a clear reason, types nothing into it, spawns nothing
     beside it and leaves it open."""
     from contextlib import asynccontextmanager
+
     from core import concurrency
     from core.config import task_config_builder
     from core.session import session_manager, session_state
+    from services.remote import remote_status
     from services.scheduler import interactive, runner, shared
-    from storage import remote_store
 
     chat_id = "worker-foreign"
     sid = "33333333-3333-4333-8333-333333333333"
@@ -370,7 +372,7 @@ def test_a_continue_round_never_drives_another_persons_terminal(temp_db, monkeyp
                             "alice", "editor", "user", "user-alice"))
     monkeypatch.setattr(session_manager, "get_execution_layer",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("no layer")))
-    monkeypatch.setattr(remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
+    monkeypatch.setattr(remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
 
     @asynccontextmanager
     async def _instant_slot(session_id, target="", execution_path=None, ring_key=""):

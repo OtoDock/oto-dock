@@ -18,8 +18,8 @@ from __future__ import annotations
 
 from core.config.task_config_builder import resolve_task_identity
 from core.session.visibility import resolve_visibility
-from storage.agents import agent_store
 from storage import database as task_store
+from storage.agents import agent_store
 
 
 def _mk_user(sub: str, name: str, role: str = "member") -> str:

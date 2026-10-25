@@ -16,10 +16,9 @@ from fastapi.testclient import TestClient
 
 from auth.providers import UserContext, get_current_user
 from services.media import wake_keywords
-from storage.agents import agent_store
 from storage import database as task_store
+from storage.agents import agent_store
 from storage.prefs import user_audio_prefs_store
-
 
 # ---------------------------------------------------------------------------
 # Encoder unit tests (real committed bpe.model/tokens.txt — no DB needed)

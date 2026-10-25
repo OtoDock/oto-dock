@@ -202,7 +202,10 @@ def test_direct_end_call_marks_the_session_closing_only_when_accepted():
 # The phone socket: binding at warmup, the result frame, the builder flag
 # ---------------------------------------------------------------------------
 
-from tests.phone.test_ws_phone_turns import phone_ws_env, _run_handler  # noqa: E402,F401
+from tests.phone.test_ws_phone_turns import (  # noqa: F401
+    _run_handler,
+    phone_ws_env,
+)
 
 
 def test_phone_socket_binds_a_tool_daemon_and_routes_its_results(phone_ws_env, monkeypatch):  # noqa: F811

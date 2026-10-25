@@ -17,16 +17,32 @@ import json
 import logging
 from pathlib import Path
 
-from ..sessions.cli_session import _write_cli_hooks, _write_hook_scripts
 from ..config import otodock_dir, session_tools_env, write_command_wrappers
+from ..sessions.cli_session import _write_cli_hooks, _write_hook_scripts
 from .pty_session_base import BasePtySession
 
 logger = logging.getLogger("satellite")
 
-# Claude Code's valid --permission-mode values. Anything else from the proxy
-# (e.g. the platform's "dontAsk"/"auto") maps to "default" — the PreToolUse hook
-# still enforces the floor + auto-allows, so the TUI never blocks.
+# Claude Code's --permission-mode values a proxy before 1.9 could send as
+# the platform mode. Anything else (its "dontAsk"/"auto") maps to "default":
+# the PreToolUse hook still enforces the floor + auto-allows, so the TUI
+# never blocks.
 _CLAUDE_PERMISSION_MODES = {"default", "acceptEdits", "plan", "bypassPermissions"}
+# The CLI words a 1.9 proxy's ``cli_permission_mode`` starts a terminal in
+# by themselves: Auto (the CLI's classifier) and Plan; every other mode starts
+# in "default", the hook deciding above it.
+_TERMINAL_OWN_MODES = {"auto", "plan"}
+
+
+def terminal_permission_mode(config: dict) -> str:
+    """The ``--permission-mode`` the terminal starts in: the CLI's own word a
+    1.9 proxy ships when it is Auto or Plan, else ``default``; an older
+    proxy's platform word when the CLI knows it."""
+    cli_word = config.get("cli_permission_mode") or ""
+    if cli_word:
+        return cli_word if cli_word in _TERMINAL_OWN_MODES else "default"
+    mode = config.get("permission_mode", "default")
+    return mode if mode in _CLAUDE_PERMISSION_MODES else "default"
 
 
 def _seed_interactive_cli_config(claude_dir: Path, cwd: str, theme: str = "dark") -> None:
@@ -43,7 +59,7 @@ def _seed_interactive_cli_config(claude_dir: Path, cwd: str, theme: str = "dark"
     cfg = claude_dir / ".claude.json"
     try:
         data = json.loads(cfg.read_text()) if cfg.exists() else {}
-    except Exception:
+    except (OSError, ValueError):
         data = {}
     if not isinstance(data, dict):
         data = {}
@@ -78,7 +94,7 @@ def _seed_interactive_cli_config(claude_dir: Path, cwd: str, theme: str = "dark"
     try:
         cfg.parent.mkdir(parents=True, exist_ok=True)
         cfg.write_text(json.dumps(data, indent=2) + "\n")
-    except Exception:
+    except OSError:
         logger.warning("pty seed: could not write %s", cfg, exc_info=True)
 
 
@@ -195,10 +211,7 @@ class PtySession(BasePtySession):
         # Interactive ALWAYS uses a real --permission-mode (never skip — that
         # shows the bypass screen a no-viewer can't accept). The PreToolUse hook
         # still enforces the floor + auto-allows in auto modes.
-        _pm = self.config.get("permission_mode", "default")
-        if _pm not in _CLAUDE_PERMISSION_MODES:
-            _pm = "default"
-        cmd += ["--permission-mode", _pm]
+        cmd += ["--permission-mode", terminal_permission_mode(self.config)]
         if mcp_config is not None:
             cmd += ["--mcp-config", str(mcp_file)]
         _is_resume = bool(
@@ -229,7 +242,7 @@ class PtySession(BasePtySession):
         await self._wire_and_spawn(cmd, env, str(self._cwd))
 
     # --- transcript forwarding (Claude: <id>.jsonl by name) ------------------
-    def _locate_transcript_file(self) -> "Path | None":
+    def _locate_transcript_file(self) -> Path | None:
         """Find ``<claude_dir>/projects/<hash>/<target_id>.jsonl``. The project
         hash derives from the cwd, so search every project dir. Created by Claude
         shortly after spawn (resume: already present)."""

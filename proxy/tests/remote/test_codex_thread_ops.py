@@ -12,10 +12,9 @@ through ``codex_steer`` (satellite ≥ 0.5.98), the Claude CLI through
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-
-import time
 
 import pytest
 
@@ -159,7 +158,8 @@ class TestRemoteClaudeSteer:
 
     def test_the_gate_is_the_version(self):
         from core.remote.satellite_connection import (
-            SatelliteConnection, SatelliteConnectionManager,
+            SatelliteConnection,
+            SatelliteConnectionManager,
         )
         cm = SatelliteConnectionManager()
         for mid, ver in [("new", "0.5.128"), ("old", "0.5.127"), ("future", "0.6.0")]:
@@ -179,10 +179,12 @@ class TestRemoteClaudeSteer:
         keeps the ERROR there instead of ending the turn silently."""
         import asyncio
         from unittest.mock import MagicMock
+
         from core.layers.codex.remote import CodexRemoteAdapter
         from core.remote.remote_session_info import RemoteSessionInfo
         from core.remote.satellite_connection import (
-            SatelliteConnection, SatelliteConnectionManager,
+            SatelliteConnection,
+            SatelliteConnectionManager,
         )
         cm = SatelliteConnectionManager()
         for mid, ver in [("new", "0.5.131"), ("old", "0.5.130")]:

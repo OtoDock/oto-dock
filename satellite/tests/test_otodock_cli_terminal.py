@@ -20,17 +20,16 @@ import asyncio
 
 import pytest
 
+from satellite._vendored.terminal_queries import (
+    TERMINAL_MODE_RESET,
+    split_trailing_partial,
+)
 from satellite.terminal import otodock_cli
 from satellite.terminal.otodock_cli import (
     _feed_stdin,
     _PosixTerminal,
     _relay,
 )
-from satellite._vendored.terminal_queries import (
-    TERMINAL_MODE_RESET,
-    split_trailing_partial,
-)
-
 
 # ---------------------------------------------------------------------------
 # TERMINAL_MODE_RESET vocabulary
@@ -198,7 +197,7 @@ class TestPosixRestore:
 class _FakeTerm:
     """Stands in for _PosixTerminal inside _relay."""
 
-    instances: "list[_FakeTerm]" = []
+    instances: list[_FakeTerm] = []
 
     def __init__(self, loop, writer, escape_armed, finish, exit_code):
         self.finish = finish

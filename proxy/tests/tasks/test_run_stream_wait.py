@@ -14,12 +14,11 @@ import json
 
 import httpx
 import pytest
-
-from auth.providers import UserContext
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import config
+from auth.providers import UserContext
 from storage import database as task_store
 
 
@@ -107,8 +106,8 @@ class TestQueuedRunVisibility:
 
     def test_chat_row_exists_while_run_still_pending(self, temp_db, monkeypatch):
         import asyncio
-        from services.scheduler import scheduler
-        from services.scheduler import runner
+
+        from services.scheduler import runner, scheduler
 
         started = asyncio.Event()
         release = asyncio.Event()
@@ -118,7 +117,7 @@ class TestQueuedRunVisibility:
             await release.wait()
 
         monkeypatch.setattr(runner, "_run_task", _parked_run_task)
-        monkeypatch.setattr(config, "get_cli_model",
+        monkeypatch.setattr("configuration.models.get_cli_model",
                             lambda agent, layer=None: "test-model")
 
         async def _drive():

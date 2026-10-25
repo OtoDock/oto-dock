@@ -11,11 +11,11 @@ Covers:
 import base64
 import hashlib
 from types import SimpleNamespace
-
-from core import placement
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from core import placement
 
 
 def _h(b: bytes) -> str:
@@ -182,7 +182,7 @@ def test_fanout_includes_remote_interactive_sessions(temp_db, monkeypatch):
         "i3": NS(agent_name="agent-1", alive=False, target="mDead",
                  username="alice", role="manager"),
     })
-    from services.remote.workspace_fanout import fanout_targets, _active_machine_ids
+    from services.remote.workspace_fanout import _active_machine_ids, fanout_targets
     assert fanout_targets("agent-1", "config/p.md") == ["mI"]  # owner-tier
     assert _active_machine_ids("agent-1") == {"mI"}
 
@@ -197,7 +197,7 @@ def test_fanout_interactive_isolation_and_active(temp_db, monkeypatch):
         "i1": NS(agent_name="agent-1", alive=True, target="mI",
                  username="vic", role="viewer"),
     })
-    from services.remote.workspace_fanout import fanout_targets, _active_machine_ids
+    from services.remote.workspace_fanout import _active_machine_ids, fanout_targets
     assert fanout_targets("agent-1", "config/p.md") == []
     assert fanout_targets("agent-1", "workspace/p.md") == ["mI"]
     assert _active_machine_ids("agent-1") == {"mI"}
@@ -207,7 +207,7 @@ def test_fanout_no_layer(temp_db, monkeypatch):
     import core.session.session_manager as sm
 
     def _raise():
-        raise RuntimeError("layer not registered")
+        raise ImportError("the remote layer cannot load")
 
     monkeypatch.setattr(sm, "_get_remote_layer", _raise)
     from services.remote.workspace_fanout import fanout_targets
@@ -474,9 +474,9 @@ async def test_propagate_write_creates_parent_dirs(temp_db, tmp_path, monkeypatc
 def _patch_apply_deps(monkeypatch, *, sec, loser_sub_for, notifs):
     import config
     import core.session.session_state as ss
-    from services.remote import workspace_fanout as wf
-    import storage.database as db
     import services.notifications.notification_manager as nm
+    import storage.database as db
+    from services.remote import workspace_fanout as wf
     monkeypatch.setattr(ss, "get_session_security", lambda sid: sec)
     monkeypatch.setattr(
         wf, "fanout_targets", lambda a, r, *, exclude_machine_id=None, shared_only=None: [])
@@ -510,9 +510,7 @@ async def test_apply_captures_conflict_on_cross_user_clobber(temp_db, tmp_path, 
     # the recover-bin (reason conflict) + notify the loser; advance base + author.
     import config
     from core.remote.satellite_connection import SatelliteConnectionManager
-    from storage.files import file_author_store
-    from storage.files import sync_state_store
-    from storage.files import recover_bin_store
+    from storage.files import file_author_store, recover_bin_store, sync_state_store
 
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     agent, rel = "agent-1", "workspace/shared.md"
@@ -557,6 +555,7 @@ async def test_pre_overwrite_capture_never_reads_through_a_link(tmp_path, monkey
     beneath the agents root, never by the checked name: a link swapped in
     after the check is refused, not followed."""
     from pathlib import Path
+
     from core.remote.satellite_connection import SatelliteConnectionManager
 
     agents = tmp_path / "agents"
@@ -599,8 +598,7 @@ def test_the_merge_loser_read_never_reads_through_a_link(tmp_path):
 async def test_apply_same_user_no_conflict(temp_db, tmp_path, monkeypatch):
     import config
     from core.remote.satellite_connection import SatelliteConnectionManager
-    from storage.files import file_author_store
-    from storage.files import recover_bin_store
+    from storage.files import file_author_store, recover_bin_store
 
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     agent, rel = "agent-1", "workspace/shared.md"
@@ -670,9 +668,7 @@ async def test_apply_no_conflict_when_base_matches(temp_db, tmp_path, monkeypatc
     sequential edit (the machine SAW this version) → no conflict, even cross-user."""
     import config
     from core.remote.satellite_connection import SatelliteConnectionManager
-    from storage.files import file_author_store
-    from storage.files import sync_state_store
-    from storage.files import recover_bin_store
+    from storage.files import file_author_store, recover_bin_store, sync_state_store
 
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     agent, rel = "agent-1", "workspace/shared.md"
@@ -706,10 +702,12 @@ async def test_apply_delete_writes_tombstone_and_captures(temp_db, tmp_path, mon
     # pre-delete bytes, and clear this machine's base + the author.
     import config
     from core.remote.satellite_connection import SatelliteConnectionManager
-    from storage.files import file_author_store
-    from storage.files import sync_state_store
-    from storage.files import file_tombstones_store
-    from storage.files import recover_bin_store
+    from storage.files import (
+        file_author_store,
+        file_tombstones_store,
+        recover_bin_store,
+        sync_state_store,
+    )
 
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path)
     agent, rel = "agent-1", "workspace/doomed.md"
@@ -768,9 +766,8 @@ async def test_apply_agent_mismatch_rejected(temp_db, tmp_path, monkeypatch):
 
 
 def _tracked_setup(monkeypatch, machines=("m1", "m2")):
+    from core.remote import satellite_connection as sc, transfer_registry as tr
     from services.remote import workspace_fanout
-    from core.remote import satellite_connection as sc
-    from core.remote import transfer_registry as tr
     monkeypatch.setattr(
         workspace_fanout, "fanout_targets",
         lambda a, r, *, exclude_machine_id=None: list(machines),
@@ -846,6 +843,7 @@ async def test_fan_out_failed_push_marks_row_failed(temp_db, monkeypatch):
 @pytest.mark.asyncio
 async def test_fan_out_gate_is_per_machine(temp_db, monkeypatch):
     import asyncio
+
     import config
     from core.remote import transfer_gate
     monkeypatch.setattr(config, "SYNC_FANOUT_CONCURRENCY", 1, raising=False)
@@ -878,6 +876,7 @@ async def test_fan_out_gate_is_per_machine(temp_db, monkeypatch):
 @pytest.mark.asyncio
 async def test_gate_queued_state_reaches_registry(temp_db, monkeypatch):
     import asyncio
+
     import config
     from core.remote import transfer_gate
     monkeypatch.setattr(config, "SYNC_FANOUT_CONCURRENCY", 1, raising=False)
@@ -912,7 +911,7 @@ async def test_gate_queued_state_reaches_registry(temp_db, monkeypatch):
     await held.wait()
     fan_out = asyncio.create_task(
         workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", big))
-    while ("m2", "done") not in seen_states:
+    while ("m2", "done") not in seen_states:  # noqa: ASYNC110  # the recorded states list: the gate's callback has no event
         await asyncio.sleep(0.01)
     release.set()
     await asyncio.gather(holder, fan_out)
@@ -935,6 +934,7 @@ def _swap_component_on_open(monkeypatch, agent_dir, victim):
     after every earlier check: the strict open must refuse it."""
     import contextlib
     import os
+
     from services.infra import safe_fs
     real = safe_fs.open_root
     state = {"done": False}
@@ -1075,6 +1075,7 @@ async def test_a_save_answers_while_a_target_never_answers(temp_db, tmp_path, mo
     """A machine that stalls (its socket drops only after 30 s) no longer
     holds the save: propagate_write returns while the push still waits."""
     import asyncio
+
     import config
     from core.remote import satellite_connection as sc
     from services.remote import workspace_fanout as wf
@@ -1085,7 +1086,7 @@ async def test_a_save_answers_while_a_target_never_answers(temp_db, tmp_path, mo
     pushed = []
 
     async def _push(machine_id, ref, source, **kw):
-        pushed.append(open(source, "rb").read())
+        pushed.append(open(source, "rb").read())  # noqa: ASYNC230  # a fake push reads its own tmp_path source
         stalled.set()
         await release.wait()
         return False
@@ -1113,6 +1114,7 @@ async def test_a_save_after_the_fan_out_started_schedules_its_own(temp_db, tmp_p
     """The queued mark is dropped as the fan-out takes its lock, before it
     opens the platform copy: a save after that point is pushed again."""
     import asyncio
+
     import config
     from services.remote import workspace_fanout as wf
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
@@ -1190,6 +1192,7 @@ async def test_bookkeeping_and_marks_never_fail_a_landed_save(temp_db, tmp_path,
 @pytest.mark.asyncio
 async def test_a_save_whose_marks_failed_unbinds_the_queued_fan_out(temp_db, tmp_path, monkeypatch):
     import asyncio
+
     import config
     from core.remote import upload_inflight
     from services.remote import workspace_fanout as wf
@@ -1286,3 +1289,57 @@ async def test_a_tracked_push_moves_its_row_at_most_twice_a_second(temp_db, monk
     await workspace_fanout.fan_out_write("agent-1", "workspace/big.bin", b"x" * (600 * 1024))
     assert len(calls) <= 4
     assert calls[-1][0] == calls[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_a_fan_out_target_changing_the_file_is_marked_ahead_with_its_own_stat(
+    temp_db, tmp_path, monkeypatch, caplog,
+):
+    """Each push expects the copy last pulled or pushed there (taken before
+    the push); a target that refuses as stale is marked with the stat its
+    ack reported, no probe, and the others are probed as before."""
+    import config
+    from core.remote import remote_file_flow
+    from services.remote import workspace_fanout
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path, raising=False)
+    target = tmp_path / "agent-1" / "workspace" / "x.md"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"data")
+    monkeypatch.setattr(
+        workspace_fanout, "fanout_targets",
+        lambda a, r, *, exclude_machine_id=None: ["m1", "m2", "m3"],
+    )
+    remote_file_flow._pull_stat_records.clear()
+    remote_file_flow._record_agent_stat(
+        ("m1", "agent-1", "workspace/x.md"), {"exists": True, "size": 1, "mtime_ns": 5})
+    seen: dict[str, object] = {}
+
+    async def push(mid, ref, content, *, agent_slug="", expect=None, stale_out=None, **kw):
+        seen[mid] = expect
+        if mid == "m1":
+            stale_out.update(reason="live", size=3, mtime_ns=9)
+            return False
+        return mid == "m2"
+    fake_cm = AsyncMock()
+    fake_cm.push_file.side_effect = push
+    fake_cm.satellite_supports_file_stat = MagicMock(return_value=True)
+    fake_cm.stat_file = AsyncMock(return_value={"exists": True, "size": 1, "mtime_ns": 6})
+    from core.remote import satellite_connection as sc
+    monkeypatch.setattr(sc, "get_connection_manager", lambda: fake_cm)
+    try:
+        with caplog.at_level("INFO", logger="otodock"):
+            await workspace_fanout.fan_out_write("agent-1", "workspace/x.md", b"data")
+        assert seen == {"m1": {"size": 1, "mtime_ns": 5}, "m2": "live", "m3": "live"}
+        assert ("m1", "agent-1", "workspace/x.md") not in remote_file_flow._pull_stat_records
+        st = target.stat()
+        marks = remote_file_flow._platform_ahead
+        assert set(marks) == {("m1", "agent-1", "workspace/x.md"), ("m3", "agent-1", "workspace/x.md")}
+        assert marks[("m1", "agent-1", "workspace/x.md")]["machine"] == {"exists": True, "size": 3, "mtime_ns": 9}
+        assert marks[("m3", "agent-1", "workspace/x.md")]["machine"] == {"exists": True, "size": 1, "mtime_ns": 6}
+        assert all((m["size"], m["mtime_ns"], m["in_flight_until"]) == (st.st_size, st.st_mtime_ns, 0.0)
+                   for m in marks.values())
+        # One probe, m3's: m1 told its stat in the ack.
+        assert fake_cm.stat_file.await_count == 1
+        assert "held: the file is being changed there" in caplog.text
+    finally:
+        remote_file_flow._pull_stat_records.clear()

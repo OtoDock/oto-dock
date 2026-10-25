@@ -24,15 +24,20 @@ import pytest
 from fastapi.testclient import TestClient
 
 import config
-from api.apps import app_egress, app_proxy
-from api.apps import apps as apps_api
+from api.apps import app_egress, app_proxy, apps as apps_api
 from app import app
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
 from core.session import session_state
-from services.apps import app_deploy, app_sandbox, app_secrets, app_supervisor, app_tokens, releases
-from storage import database as task_store
-from storage import db_app_secrets
+from services.apps import (
+    app_deploy,
+    app_sandbox,
+    app_secrets,
+    app_supervisor,
+    app_tokens,
+    releases,
+)
+from storage import database as task_store, db_app_secrets
 from storage.identity.credential_store import decrypt_secret
 
 client = TestClient(app)
@@ -147,7 +152,7 @@ def _approve(row: dict) -> dict:
 
 
 def test_the_secrets_block_is_validated_signed_and_carried(agent_tree):
-    v = lambda doc: app_deploy.validate_app_json(doc, AGENT, False)  # noqa: E731
+    v = lambda doc: app_deploy.validate_app_json(doc, AGENT, False)
     m = v({"title": "Shop", "egress": EGRESS, "secrets": SECRETS})
     got = json.loads(m.secrets_json)
     assert [s["name"] for s in got] == ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "SMTP_PASSWORD"]
@@ -167,6 +172,7 @@ def test_the_secrets_block_is_validated_signed_and_carried(agent_tree):
         {"secrets": [{"name": "LD_PRELOAD", "env": True}]},          # the host-side launcher's
         {"secrets": [{"name": "PYTHONPATH", "env": True}]},
         {"secrets": [{"name": "BASH_ENV", "env": True}]},
+        {"secrets": [{"name": "NODE_ENV", "env": True}]},            # the server's mode
         {"secrets": [{"name": "A_KEY"}, {"name": "A_KEY"}]},          # twice
         {"secrets": [{"name": "A_KEY", "required": "yes"}]},
         {"secrets": [{"name": "A_KEY", "description": "x" * 201}]},
@@ -194,7 +200,7 @@ def test_the_secrets_block_is_validated_signed_and_carried(agent_tree):
     assert body["status"] == "pending approval", body
     row = task_store.get_app(body["app_id"])
     assert [s["name"] for s in json.loads(row["secrets"])] == ["STRIPE_WEBHOOK_SECRET"]
-    from api.apps import manifest as _mf
+    from services.apps import manifest as _mf
     assert _mf.parse_secrets(row)[0]["required"] is True
     sig_one = task_store.manifest_sig(row)
     row = task_store.upsert_app(AGENT, "alice", "alice-sub", "shop",

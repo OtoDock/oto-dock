@@ -93,8 +93,8 @@ def _make_app(tmp_path, monkeypatch, *, sub: str, role: str,
     """
     import config
     from api.mcp import local_templates
-    from auth.providers import UserContext, get_current_user
     from auth.path_policy import SecurityContext
+    from auth.providers import UserContext, get_current_user
     from core.session import session_state
 
     agents_dir = tmp_path / "agents"
@@ -232,8 +232,10 @@ class TestSnapshotGuards:
         # name checked as a regular file and then swapped for a symlink is
         # judged by what was opened, never copied as the link's target.
         import os
+
         import pytest
         from fastapi import HTTPException
+
         from api.mcp import local_templates as lt
         src = tmp_path / "tpl"
         (src / "context").mkdir(parents=True)
@@ -255,6 +257,7 @@ class TestSnapshotGuards:
 
     def test_a_directory_swapped_for_a_symlink_mid_walk_is_not_followed(self, tmp_path, monkeypatch):
         import os
+
         from api.mcp import local_templates as lt
         src = tmp_path / "tpl"
         (src / "context").mkdir(parents=True)
@@ -445,6 +448,47 @@ class TestValidate:
         assert body["slug_available"] is False
         assert body["suggested_slug"] == "demo-template-2"
 
+    def test_a_reserved_slug_reads_as_taken(self, tmp_path, monkeypatch, temp_db):
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(_agent_root(agents_dir), slug="setup")
+        body = TestClient(app).post(
+            "/v1/agents/local-template/validate",
+            json={"path": "/users/alice/workspace/setup"},
+        ).json()
+        assert body["slug_available"] is False
+        assert body["suggested_slug"] == "setup-2"
+
+
+class TestBuildingBlocks:
+    def _blocks(self, tmp_path, monkeypatch, *, skills_registry):
+        from services.community import community_catalog
+
+        async def _mcps():
+            return {"mcps": []}
+
+        async def _skills():
+            return skills_registry
+
+        monkeypatch.setattr(community_catalog, "fetch_registry", _mcps)
+        monkeypatch.setattr(community_catalog, "fetch_skills_registry", _skills)
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        resp = TestClient(app).get("/v1/agents/local-template/building-blocks")
+        assert resp.status_code == 200
+        return resp.json()
+
+    def test_the_taken_slugs_include_the_reserved_ones(self, tmp_path, monkeypatch, temp_db):
+        from storage.agents import agent_store
+        body = self._blocks(tmp_path, monkeypatch, skills_registry={"skills": []})
+        assert set(agent_store.RESERVED_AGENT_SLUGS) <= set(body["agent_slugs"])
+        assert body["catalog_error"] == ""
+
+    def test_an_unreachable_skills_catalog_is_named(self, tmp_path, monkeypatch, temp_db):
+        """The skills fetch never raises: it answers an empty catalog flagged
+        unreachable, which the route reads."""
+        body = self._blocks(tmp_path, monkeypatch,
+                            skills_registry={"skills": [], "catalog_unreachable": True})
+        assert body["catalog_error"] == "community skills catalog unreachable"
+
 
 # ---------------------------------------------------------------------------
 # Install
@@ -488,6 +532,7 @@ class TestInstall:
         create-agent path) is the ONLY core-assignment mechanism — there is
         no boot backfill — so it must happen here."""
         from types import SimpleNamespace
+
         from services.mcp import mcp_registry
 
         def _stub(category, assignment_mode, skills=()):
@@ -524,6 +569,7 @@ class TestInstall:
         persona) gets ONLY what mcps.json lists. With no boot backfill the
         opt-out sticks across restarts, which is the whole point."""
         from types import SimpleNamespace
+
         from services.mcp import mcp_registry
 
         monkeypatch.setattr(mcp_registry, "_manifests", {
@@ -654,6 +700,33 @@ class TestInstall:
         check = documents.load_check("demo-template", "", "coding")
         assert check is not None and check.doc["mandatory"] is False
 
+    def test_an_app_folder_waits_for_the_apps_approval(self, tmp_path, monkeypatch, temp_db):
+        """The agent-creator path installs with no consent: an app that
+        declares a folder to create lands pending and makes nothing; the
+        person's approval makes the folder in the new agent's workspace."""
+        import asyncio
+
+        from services.apps import app_deploy
+        from storage import database as task_store
+        task_store.upsert_user(ADMIN_SUB, "admin@test.com", "admin", "admin")
+        app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        _write_template(
+            _agent_root(agents_dir),
+            apps={"timeline": {"title": "Timeline", "files": {
+                "read": ["workspace/videos/"], "create": ["workspace/videos/projects/"]}}},
+        )
+        resp = TestClient(app).post(
+            "/v1/agents/install-from-local-template",
+            json={"path": "/users/alice/workspace/demo-template"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert [p["slug"] for p in resp.json()["seeded_apps"]["pending"]] == ["timeline"]
+        folder = agents_dir / "demo-template" / "workspace" / "videos" / "projects"
+        assert not folder.exists()
+        row = task_store.get_app_by_slug("demo-template", "", "timeline")
+        out = asyncio.run(app_deploy.approve_pending(row, ADMIN_SUB))
+        assert out["folders"]["created"] == ["workspace/videos/projects"] and folder.is_dir()
+
     def test_shared_workspace_path_is_accepted(self, tmp_path, monkeypatch, temp_db):
         app, agents_dir = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
         _write_template(agents_dir / "host-agent" / "workspace")
@@ -679,6 +752,7 @@ class TestProvenance:
             json={"path": "/users/alice/workspace/personal-assistant"},
         )
         import asyncio
+
         from services.community import community_agents_catalog
         state = asyncio.run(community_agents_catalog.collect_local_state())
         assert "personal-assistant" not in state
@@ -791,6 +865,7 @@ TEMPLATE_REL = "users/alice/workspace/demo-template"
 @pytest.fixture
 def machine(tmp_path, monkeypatch):
     import tempfile
+
     from core.remote import remote_file_flow
     from services.delegation import file_transfer
 
@@ -1080,6 +1155,7 @@ class TestRemoteMachine:
         it; the pulls still running are cancelled and awaited before the
         snapshot goes, and nothing writes it back afterwards."""
         from fastapi import HTTPException
+
         from api.mcp import local_templates as lt
         from auth.providers import UserContext
         _write_template(machine.alice)
@@ -1106,7 +1182,7 @@ class TestRemoteMachine:
         err = asyncio.run(_read())
         assert err.status_code == 400
         assert err.detail.startswith("a" * 100) and err.detail.endswith(
-            "... cannot be stored here: File name too long")
+            "... cannot be stored here. The name is too long.")
         assert len(machine.pulled) == 3 and machine.landed == []
         assert list((tmp_path / "tmp").iterdir()) == []
 
@@ -1118,3 +1194,14 @@ class TestRemoteMachine:
         assert body["ok"] is False
         assert body["errors"][0].startswith("Missing required file: agent.md"), body
         assert "oto-local-template" not in body["errors"][0]
+
+    def test_every_template_problem_is_its_own_error(self, tmp_path, monkeypatch, temp_db, machine):
+        app, _ = _make_app(tmp_path, monkeypatch, sub=ADMIN_SUB, role="admin")
+        d = _write_template(machine.alice, agent_json_extra={"color": "blue"})
+        (d / "agent.md").unlink()
+        body = _validate(app).json()
+        assert body["ok"] is False
+        assert len(body["errors"]) >= 2, body
+        assert any(e.startswith("Missing required file: agent.md") for e in body["errors"]), body
+        assert any("color" in e for e in body["errors"]), body
+        assert all("oto-local-template" not in e for e in body["errors"])

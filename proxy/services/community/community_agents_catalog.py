@@ -27,11 +27,16 @@ import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
-from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path, resolve_under
+from services.community import community_catalog
+from services.infra.path_confinement import (
+    PathOutsideRoot,
+    normalize_rel_path,
+    resolve_under,
+)
 
 logger = logging.getLogger("otodock.community-agents-catalog")
 
@@ -80,7 +85,7 @@ async def _http_get_json(url: str, etag: str | None) -> tuple[Any | None, str | 
     headers = {"Accept": "application/json"}
     if etag:
         headers["If-None-Match"] = etag
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+    async with community_catalog.http_client(timeout=HTTP_TIMEOUT_SECONDS) as client:
         resp = await client.get(url, headers=headers)
     if resp.status_code == 304:
         return None, etag, 304
@@ -92,7 +97,7 @@ async def _http_get_text(url: str, etag: str | None) -> tuple[str | None, str | 
     headers: dict[str, str] = {}
     if etag:
         headers["If-None-Match"] = etag
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+    async with community_catalog.http_client(timeout=HTTP_TIMEOUT_SECONDS) as client:
         resp = await client.get(url, headers=headers)
     if resp.status_code == 304:
         return None, etag, 304
@@ -148,12 +153,13 @@ async def fetch_manifest(template_slug: str) -> dict[str, Any]:
         if cached and cached.value and now - cached.fetched_at < MANIFEST_CACHE_TTL_SECONDS:
             return cached.value
         body, etag, status = await _http_get_json(url, cached.etag if cached else None)
-        if status == 304 and cached and cached.value:
+        if status == 304 and cached and cached.value is not None:
             cached.fetched_at = now
             return cached.value
         entry = _CacheEntry(value=body, fetched_at=now, etag=etag)
         _manifest_cache[template_slug] = entry
-        return body
+        # A 304 was answered from the cache above: this is the fetched document.
+        return cast("dict[str, Any]", body)
 
 
 async def fetch_readme(template_slug: str) -> str:
@@ -195,14 +201,14 @@ async def fetch_and_extract_template(template_slug: str) -> Path:
 async def _fetch_tarball() -> bytes:
     """Fetch the repo tarball. Tries codeload first (CDN), then archive
     fallback. Both follow redirects automatically."""
-    async with httpx.AsyncClient(
+    async with community_catalog.http_client(
         timeout=TARBALL_TIMEOUT_SECONDS, follow_redirects=True,
     ) as client:
         try:
             resp = await client.get(TARBALL_URL)
             resp.raise_for_status()
             return resp.content
-        except Exception:
+        except httpx.HTTPError:
             logger.warning("codeload fetch failed; trying archive URL")
             resp = await client.get(TARBALL_FALLBACK_URL)
             resp.raise_for_status()
@@ -289,7 +295,7 @@ def augment_entry(
     name = entry.get("slug") or entry.get("name")
     return {
         **entry,
-        "installed_as": sorted(installed_as.get(name, [])),
+        "installed_as": sorted(installed_as.get(name, [])),  # type: ignore[arg-type]  # typeshed types dict.get's key as the key type; an entry with no slug or name looks up None and gets the default
         "platform_compat_ok": community_catalog.platform_version_ok(
             entry.get("platform_min_version"),
         ),

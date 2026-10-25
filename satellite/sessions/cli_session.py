@@ -5,6 +5,7 @@ PersistentSession but runs directly on the remote host filesystem.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -13,8 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..host import env_hygiene, path_translator
-from ..transport import file_sync
+from .. import config
+from .._vendored import layout
 from ..config import (
     hook_command,
     kill_process_tree,
@@ -25,9 +26,8 @@ from ..config import (
     write_command_wrappers,
     write_if_changed,
 )
-import contextlib
-from .. import config
-from .._vendored import layout
+from ..host import env_hygiene, path_translator
+from ..transport import file_sync
 
 if TYPE_CHECKING:
     from ..config import SatelliteConfig
@@ -219,7 +219,7 @@ class CLISession:
         # post-turn) reaches the proxy. Cancelled when the next turn starts (it
         # reclaims stdout — single reader).
         self._drain_bg: bool = False
-        self._bg_drain_task: "asyncio.Task | None" = None
+        self._bg_drain_task: asyncio.Task | None = None
         # True from the prompt's stdin write until the turn's read loop
         # exits: the window a steer may write into (a user frame between
         # turns would start a turn nobody reads).
@@ -333,20 +333,27 @@ class CLISession:
             cmd += ["--effort", effort]
         cmd += ["--max-thinking-tokens", str(self.config.get("max_thinking_tokens", 100000))]
         # Permission mode mirrors the local CLI layer (proxy ships both fields).
-        permission_mode = self.config.get("permission_mode", "default")
+        # A 1.9 proxy ships Claude Code's own word for the mode
+        # (``cli_permission_mode``): its auto mode for Auto, where a call the
+        # hook leaves undecided goes to the CLI's classifier. An older proxy
+        # ships the platform word alone.
+        permission_mode = self.config.get("permission_mode", "")
+        cli_word = self.config.get("cli_permission_mode") or ""
         if self.config.get("use_native_permissions"):
-            cmd += ["--permission-mode", permission_mode]
+            cmd += ["--permission-mode", cli_word or permission_mode]
         elif permission_mode == "plan":
             cmd += ["--permission-mode", "plan"]
         else:
-            cmd += ["--dangerously-skip-permissions"]
+            cmd += (["--permission-mode", "auto"] if cli_word == "auto"
+                    else ["--dangerously-skip-permissions"])
             # Mirrors the local CLI layer: the prompt-tool's PRESENCE makes
             # the CLI expose AskUserQuestion headless (absent from every -p
             # roster since at least 2.1.193). The PreToolUse hook
             # denies-and-surfaces the question before the tool runs; the CLI
             # still asks over this channel for some calls under bypass (a
-            # heredoc writing a file, a wide ``rm -rf``), which the proxy
-            # answers like a card (core/session/engine_prompts). Not added to
+            # heredoc writing a file, a wide ``rm -rf``) and, in auto, after
+            # its reviewer's decline limit, which the proxy answers like a
+            # card or refuses (core/session/engine_prompts). Not added to
             # the plan/native branches (a real prompt could route to stdio,
             # which nothing answers).
             cmd += ["--permission-prompt-tool", "stdio"]
@@ -458,7 +465,7 @@ class CLISession:
             limit=200 * 1024 * 1024,
         )
         self.pid = self.proc.pid
-        logger.info(f"CLI session started: pid={self.pid}, session={self.session_id}")
+        logger.info("CLI session started: pid=%s, session=%s", self.pid, self.session_id)
 
         # Drain stderr in the background so a crashed CLI's error is
         # surfaced to the satellite log instead of vanishing into a
@@ -631,7 +638,7 @@ class CLISession:
                 if sum(len(c) for c in self._stderr_buf) > 65536:
                     joined = b"".join(self._stderr_buf)[-65536:]
                     self._stderr_buf = [joined]
-        except (asyncio.CancelledError, Exception):
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001  # the stderr drain task's top: nobody awaits it
             return
 
     async def _read_stdout_until_stop(self):
@@ -740,7 +747,7 @@ class CLISession:
             await asyncio.to_thread(kill_process_tree, pid, 5.0)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.proc.wait(), timeout=5)
-        logger.info(f"CLI session aborted: {self.session_id}")
+        logger.info("CLI session aborted: %s", self.session_id)
 
     async def close(self) -> None:
         """Close stdin, let the CLI exit cleanly, then reap leaked MCP children.
@@ -764,7 +771,7 @@ class CLISession:
                 self.proc.kill()
                 await self.proc.wait()
             await asyncio.to_thread(reap_descendants, children, 5.0)
-            logger.info(f"CLI session closed: {self.session_id}")
+            logger.info("CLI session closed: %s", self.session_id)
         # Per-session secret files (SSH keys) die with the session.
         from . import session_files
         session_files.wipe(self.session_id)

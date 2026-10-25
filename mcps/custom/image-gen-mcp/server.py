@@ -6,17 +6,21 @@ manifest's `costs` block and evaluated by the proxy at TOOL_RESULT time —
 this server no longer reports cost.
 """
 
+import asyncio
 import base64
 import contextlib
 import io
 import logging
 import os
 import uuid
+from pathlib import Path
 
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+
+from _tool_args import ToolArgs
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -127,6 +131,7 @@ OPENAI_SIZE_MAP = {
 # ---------------------------------------------------------------------------
 
 server = Server("image-gen")
+TOOL_ARGS = ToolArgs()
 
 
 @server.list_tools()
@@ -197,6 +202,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["prompt"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
         ),
         Tool(
             name="edit_image_ai",
@@ -247,13 +253,17 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["image_path", "prompt"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
         ),
     ]
-    return tools
+    return TOOL_ARGS.listed(tools)
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     if name == "generate_image":
         return await _handle_generate(arguments)
     elif name == "edit_image_ai":
@@ -286,7 +296,7 @@ async def _hook_post(endpoint: str, payload: dict, *, read_timeout: float = 30.0
                 )
                 resp.raise_for_status()
                 return True
-        except Exception as e:
+        except httpx.HTTPError as e:
             last_err = e
             logger.warning(
                 "Hook %s attempt %d/%d failed: %s",
@@ -492,8 +502,7 @@ async def _generate_nano_banana(prompt: str, aspect_ratio: str, quality: str, nu
 
 async def _edit_nano_banana(image_path: str, prompt: str) -> bytes:
     """Edit an image using Nano Banana Pro (Gemini REST via httpx)."""
-    with open(image_path, "rb") as f:
-        image_data = f.read()
+    image_data = await asyncio.to_thread(Path(image_path).read_bytes)
 
     mime = "image/png"
     if image_path.lower().endswith((".jpg", ".jpeg")):
@@ -566,11 +575,11 @@ async def _edit_openai(image_path: str, prompt: str, mask_path: str | None,
     with contextlib.ExitStack() as stack:
         files = {
             "image": (os.path.basename(image_path),
-                      stack.enter_context(open(image_path, "rb"))),
+                      stack.enter_context(open(image_path, "rb"))),  # noqa: ASYNC230  # httpx reads the open file as it uploads it
         }
-        if mask_path and os.path.isfile(mask_path):
+        if mask_path and await asyncio.to_thread(os.path.isfile, mask_path):
             files["mask"] = (os.path.basename(mask_path),
-                             stack.enter_context(open(mask_path, "rb")))
+                             stack.enter_context(open(mask_path, "rb")))  # noqa: ASYNC230  # httpx reads the open file as it uploads it
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             resp = await client.post(
                 url, params=params, headers=headers, data=form, files=files,
@@ -636,8 +645,7 @@ async def _handle_generate(args: dict) -> list[TextContent]:
                 else:
                     path = _get_save_path(None)
 
-            with open(path, "wb") as f:
-                f.write(img_bytes)
+            await asyncio.to_thread(Path(path).write_bytes, img_bytes)
             saved_paths.append(path)
 
             caption = f"{model_label}: {prompt[:80]}"
@@ -664,7 +672,7 @@ async def _handle_generate(args: dict) -> list[TextContent]:
 
     except Exception as e:
         await _push_failed()
-        logger.exception(f"Image generation failed: {e}")
+        logger.exception("Image generation failed: %s", e)
         return [TextContent(type="text", text=f"Error generating image: {e}")]
 
 
@@ -673,7 +681,7 @@ async def _handle_edit(args: dict) -> list[TextContent]:
     prompt = args.get("prompt", "").strip()
     if not image_path or not prompt:
         return [TextContent(type="text", text="Error: image_path and prompt are required.")]
-    if not os.path.isfile(image_path):
+    if not await asyncio.to_thread(os.path.isfile, image_path):
         return [TextContent(type="text", text=f"Error: file not found: {image_path}")]
 
     model = args.get("model", "nano-banana")
@@ -697,8 +705,7 @@ async def _handle_edit(args: dict) -> list[TextContent]:
             img_bytes = await _edit_openai(image_path, prompt, mask_path, quality)
 
         path = _get_save_path(save_path)
-        with open(path, "wb") as f:
-            f.write(img_bytes)
+        await asyncio.to_thread(Path(path).write_bytes, img_bytes)
 
         caption = f"{model_label} edit: {prompt[:80]}"
         preview_ok = await _push_image_preview(img_bytes, "image/png", caption)
@@ -717,7 +724,7 @@ async def _handle_edit(args: dict) -> list[TextContent]:
 
     except Exception as e:
         await _push_failed()
-        logger.exception(f"Image edit failed: {e}")
+        logger.exception("Image edit failed: %s", e)
         return [TextContent(type="text", text=f"Error editing image: {e}")]
 
 

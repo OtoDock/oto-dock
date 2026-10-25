@@ -1,5 +1,8 @@
 import React from 'react'
 import { pageBuildId } from '../lib/buildId'
+import { crashReport, copyText } from '../lib/crash/crashReport'
+import Button from './ui/Button'
+import { FIELD, FIELD_REGULAR, FIELD_BORDER, CARD } from './ui/classes'
 
 interface Props {
   children: React.ReactNode
@@ -26,63 +29,6 @@ interface State {
   shownFor: string | undefined
 }
 
-interface CrashFacts {
-  error: unknown
-  componentStack: string
-  at: string
-  path: string
-  build: string
-  userAgent: string
-}
-
-/** The text "Copy crash report" puts on the clipboard: enough to find the
- * line that threw without a screenshot or a console. */
-export function crashReport(f: CrashFacts): string {
-  const err = f.error instanceof Error ? f.error : null
-  return [
-    'OtoDock dashboard crash report',
-    `Time: ${f.at}`,
-    `Page: ${f.path}`,
-    `Build: ${f.build || 'unknown'}`,
-    `Browser: ${f.userAgent}`,
-    `Error: ${err ? `${err.name}: ${err.message}` : String(f.error)}`,
-    '',
-    'Stack:',
-    (err?.stack || '(none)').trim(),
-    '',
-    'Component stack:',
-    (f.componentStack || '(none)').trim(),
-  ].join('\n')
-}
-
-/** The clipboard where the browser offers it (a secure origin), else a
- * selected textarea and the copy command (a plain-http install). */
-export async function copyText(text: string): Promise<boolean> {
-  try {
-    if (window.isSecureContext && navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text)
-      return true
-    }
-  } catch {
-    // Refused (no focus, no permission): the fallback below.
-  }
-  const ta = document.createElement('textarea')
-  ta.value = text
-  ta.setAttribute('readonly', '')
-  ta.style.position = 'fixed'
-  ta.style.opacity = '0'
-  document.body.appendChild(ta)
-  ta.select()
-  let ok = false
-  try {
-    ok = document.execCommand('copy')
-  } catch {
-    ok = false
-  }
-  ta.remove()
-  return ok
-}
-
 /**
  * Render-crash containment. React unmounts the ENTIRE tree when a render
  * throws and no boundary catches it — the user sees a blank page with only
@@ -105,7 +51,6 @@ export default class ErrorBoundary extends React.Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
-    console.error('ErrorBoundary caught render crash:', error, info.componentStack)
     this.setState({ componentStack: info.componentStack || '' })
   }
 
@@ -133,47 +78,44 @@ export default class ErrorBoundary extends React.Component<Props, State> {
       const report = this.report()
       return (
         <div role="alert" className="mx-auto my-8 max-w-xl px-4" data-testid="route-crash">
-          <div className="rounded-xl border border-p-border-light bg-white dark:bg-p-surface p-5 shadow-sm">
-            <h2 className="text-base font-semibold text-p-text">This page hit an error</h2>
-            <p className="mt-1.5 text-sm text-p-text-secondary">
+          <div className={`${CARD} p-5`}>
+            <h2 className="text-base font-semibold text-primary">This page hit an error</h2>
+            <p className="mt-1.5 text-sm text-secondary">
               The rest of the dashboard still works. Copy the crash report for whoever looks
               after this install, then try again or reload.
             </p>
-            <pre className="mt-3 p-3 rounded-lg bg-p-bg text-xs text-red-600 dark:text-red-400 overflow-x-auto whitespace-pre-wrap break-all">
+            <pre className="mt-3 p-3 rounded-card bg-status-danger-bg text-xs text-status-danger-fg overflow-x-auto whitespace-pre-wrap break-all">
               {String(error?.message || error)}
             </pre>
             <div className="mt-4 flex flex-wrap items-center gap-2">
-              <button
+              <Button variant="primary" size="sm"
                 onClick={() => void this.copy()}
-                className="px-3 py-1.5 rounded-lg bg-brand text-white text-sm font-medium hover:bg-brand-hover"
               >
                 Copy crash report
-              </button>
-              <button
+              </Button>
+              <Button variant="secondary" size="sm"
                 onClick={this.reset}
-                className="px-3 py-1.5 rounded-lg border border-p-border-light text-sm text-p-text-secondary hover:bg-p-surface-hover"
               >
                 Try again
-              </button>
-              <button
+              </Button>
+              <Button variant="secondary" size="sm"
                 onClick={() => window.location.reload()}
-                className="px-3 py-1.5 rounded-lg border border-p-border-light text-sm text-p-text-secondary hover:bg-p-surface-hover"
               >
                 Reload
-              </button>
-              {this.state.copied === 'copied' && <span className="text-xs text-p-success">Copied</span>}
+              </Button>
+              {this.state.copied === 'copied' && <span className="text-xs text-status-success-fg">Copied</span>}
               {this.state.copied === 'failed' && (
-                <span className="text-xs text-p-text-light">Copy refused here: select the report below.</span>
+                <span className="text-xs text-tertiary">Copy refused here: select the report below.</span>
               )}
             </div>
             <details className="mt-3" open={this.state.copied === 'failed'}>
-              <summary className="cursor-pointer text-xs text-p-text-light">Crash report</summary>
+              <summary className="cursor-pointer text-xs text-tertiary">Crash report</summary>
               <textarea
                 readOnly
                 value={report}
                 aria-label="Crash report"
                 onFocus={(e) => e.currentTarget.select()}
-                className="mt-2 h-40 w-full rounded-lg border border-p-border-light bg-p-bg p-2 font-mono text-[11px] text-p-text-secondary"
+                className={`${FIELD} ${FIELD_REGULAR} ${FIELD_BORDER} mt-2 h-40 font-mono`}
               />
             </details>
           </div>
@@ -183,7 +125,7 @@ export default class ErrorBoundary extends React.Component<Props, State> {
 
     if (this.props.variant === 'inline') {
       return (
-        <div className="my-2 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-900/40 text-sm text-red-800 dark:text-red-300">
+        <div className="my-2 px-3 py-2 rounded-card bg-status-danger-bg border border-status-danger-border text-sm text-status-danger-fg">
           <div className="font-medium">
             {this.props.label || 'This content'} failed to render
           </div>
@@ -201,29 +143,27 @@ export default class ErrorBoundary extends React.Component<Props, State> {
     }
 
     return (
-      <div className="min-h-screen flex items-center justify-center bg-p-bg p-6">
-        <div className="max-w-lg w-full rounded-xl border border-p-border-light bg-white dark:bg-p-surface p-6 shadow-sm">
-          <h1 className="text-lg font-semibold text-p-text">Something went wrong</h1>
-          <p className="mt-2 text-sm text-p-text-secondary">
-            The dashboard hit an unexpected error while rendering. Your data is
-            safe — reloading usually fixes it.
+      <div className="min-h-screen flex items-center justify-center bg-surface-page p-6">
+        <div className={`${CARD} max-w-lg w-full p-6`}>
+          <h1 className="font-display text-lg font-semibold text-primary">Something went wrong</h1>
+          <p className="mt-2 text-sm text-secondary">
+            The dashboard hit an unexpected error. Your data is safe.
+            Reloading usually fixes it.
           </p>
-          <pre className="mt-3 p-3 rounded-lg bg-p-bg text-xs text-red-600 dark:text-red-400 overflow-x-auto whitespace-pre-wrap break-all">
+          <pre className="mt-3 p-3 rounded-card bg-status-danger-bg text-xs text-status-danger-fg overflow-x-auto whitespace-pre-wrap break-all">
             {String(error?.message || error)}
           </pre>
           <div className="mt-4 flex gap-2">
-            <button
+            <Button variant="primary" size="md"
               onClick={() => window.location.reload()}
-              className="px-4 py-2 rounded-lg bg-brand text-white text-sm font-medium hover:opacity-90"
             >
               Reload
-            </button>
-            <button
+            </Button>
+            <Button variant="secondary" size="md"
               onClick={this.reset}
-              className="px-4 py-2 rounded-lg border border-p-border-light text-sm text-p-text-secondary hover:bg-p-bg"
             >
               Dismiss
-            </button>
+            </Button>
           </div>
         </div>
       </div>

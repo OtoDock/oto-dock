@@ -26,8 +26,9 @@ Contract for new adapters (see ``manual_asterisk.py`` for the reference impl):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, ClassVar, Literal
+from typing import ClassVar, Literal
 
 # The one-time AudioSocket dialplan both Asterisk adapters install (one paste,
 # both call directions). Three placeholders are substituted per server:

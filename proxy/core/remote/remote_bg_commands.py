@@ -15,7 +15,9 @@ import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from core.remote.remote_session_info import RemoteSessionInfo  # noqa: F401 (quoted annotations)
+    from core.remote.remote_session_info import (
+        RemoteSessionInfo,
+    )
 
 logger = logging.getLogger("remote-layer")
 
@@ -41,7 +43,13 @@ def queue_frame_reader(info: "RemoteSessionInfo"):
     return _read
 
 
-class RemoteBgCommandsMixin:
+if TYPE_CHECKING:
+    from core.remote.remote_host import RemoteLayerHost as _Host
+else:
+    _Host = object
+
+
+class RemoteBgCommandsMixin(_Host):
     # --- Background commands between turns ---
 
     async def drain_bg_commands(self, session_id: str, *, budget: float = 2.0) -> bool:

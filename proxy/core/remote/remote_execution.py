@@ -29,12 +29,15 @@ from contextlib import asynccontextmanager
 
 from core import placement
 from core.execution_layer import ExecutionLayer, LayerCapabilities
+from core.permission_modes import AUTO_REVIEW_MODE
 from core.remote.satellite_connection import SatelliteConnectionManager
 from core.session.session_state import (
-    set_session_mode,
-    resolve_permission,
     cleanup_session_permission_state,
-    mark_closing, clear_starting,
+    clear_starting,
+    get_session_mode,
+    mark_closing,
+    resolve_permission,
+    set_session_mode,
 )
 
 logger = logging.getLogger("remote-layer")
@@ -49,25 +52,25 @@ def get_remote_layer():
     return _get_remote_layer()
 
 
-from core.remote.remote_session_info import RemoteSessionInfo  # noqa: E402,F401
-from core.remote.remote_session_start import (  # noqa: E402,F401
+from core.remote.remote_abort import RemoteAbortMixin
+from core.remote.remote_bg_commands import RemoteBgCommandsMixin
+from core.remote.remote_reaper import (  # noqa: F401
+    _idle_session_has_pending_work,
+    reap_idle_remote_sessions,
+)
+from core.remote.remote_resume import RemoteResumeMixin
+from core.remote.remote_session_info import RemoteSessionInfo
+from core.remote.remote_session_start import (  # noqa: F401
     RemoteSessionStartMixin,
     _collect_session_files,
     _machine_sync_role,
 )
-from core.remote.remote_start_payload import RemoteStartPayloadMixin  # noqa: E402
-from core.remote.remote_turn import RemoteTurnMixin  # noqa: E402
-from core.remote.remote_abort import RemoteAbortMixin  # noqa: E402
-from core.remote.remote_resume import RemoteResumeMixin  # noqa: E402
-from core.remote.remote_bg_commands import RemoteBgCommandsMixin  # noqa: E402
-from core.remote.remote_workspace_sync import (  # noqa: E402,F401
+from core.remote.remote_start_payload import RemoteStartPayloadMixin
+from core.remote.remote_turn import RemoteTurnMixin
+from core.remote.remote_workspace_sync import (  # noqa: F401
+    _DEFER_PULL_MIN_BYTES,
     RemoteWorkspaceSyncMixin,
     _partition_deferred_pulls,
-    _DEFER_PULL_MIN_BYTES,
-)
-from core.remote.remote_reaper import (  # noqa: E402,F401
-    _idle_session_has_pending_work,
-    reap_idle_remote_sessions,
 )
 
 
@@ -140,7 +143,7 @@ class RemoteExecutionLayer(
             frame["incarnation"] = incarnation
         try:
             await self._cm.send_command(machine_id, frame, timeout=15.0)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # closing an unadopted process on a satellite that may be gone
             logger.warning("Remote close of unadopted %s failed: %s", session_id[:8], e)
 
     async def close_session(self, session_id: str) -> None:
@@ -160,7 +163,7 @@ class RemoteExecutionLayer(
                 "type": "close_session",
                 "session_id": session_id,
             }, timeout=15.0)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the satellite close must not skip the slot release below
             logger.warning("Remote close failed: %s", e)
         # Keep the cached heartbeat count roughly honest between heartbeats —
         # the capacity pre-check + eviction loop read it (see
@@ -175,7 +178,7 @@ class RemoteExecutionLayer(
         try:
             from core.remote import remote_file_flow
             remote_file_flow.cleanup_session(session_id)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # the host cache purge must not skip the slot release below
             logger.warning("remote_file_flow cleanup failed: %s", e)
 
         # Purge any per-session `outputs` subdirectories (e.g. camoufox
@@ -188,7 +191,7 @@ class RemoteExecutionLayer(
                 mcp_output_relocation.cleanup_session(
                     session_id, ctx.agent, ctx.username,
                 )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # output cleanup must not skip the subscription and slot release
             logger.warning("mcp_output_relocation cleanup failed: %s", e)
 
         # Release subscription + concurrency slot
@@ -217,18 +220,12 @@ class RemoteExecutionLayer(
         # Native-permission path: forward control_response to satellite stdin.
         info = self._sessions.get(session_id)
         if info and info.use_native_permissions:
-            try:
-                await self._cm.send_fire_and_forget(info.machine_id, {
-                    "type": "control_response",
-                    "session_id": session_id,
-                    "request_id": request_id,
-                    "approved": approved,
-                })
-            except Exception as e:
-                logger.warning(
-                    "Remote native permission forward failed for session %s: %s",
-                    session_id[:8], e,
-                )
+            await self._cm.send_fire_and_forget(info.machine_id, {
+                "type": "control_response",
+                "session_id": session_id,
+                "request_id": request_id,
+                "approved": approved,
+            })
 
     async def answer_engine_prompt(
         self, session_id: str, request_id: str, approved: bool, tool_input: dict,
@@ -240,17 +237,13 @@ class RemoteExecutionLayer(
         if info is None:
             return
         from core.session.engine_prompts import answer_frame
-        try:
-            await self._cm.send_fire_and_forget(info.machine_id, {
-                "type": "control_response",
-                "session_id": session_id,
-                "request_id": request_id,
-                "approved": approved,
-                "response": answer_frame(request_id, approved, tool_input)["response"],
-            })
-        except Exception as e:
-            logger.warning("Remote engine prompt answer failed for session %s: %s",
-                           session_id[:8], e)
+        await self._cm.send_fire_and_forget(info.machine_id, {
+            "type": "control_response",
+            "session_id": session_id,
+            "request_id": request_id,
+            "approved": approved,
+            "response": answer_frame(request_id, approved, tool_input)["response"],
+        })
 
     async def change_model(self, session_id: str, model: str) -> None:
         """The model change reaches the satellite in the engine's shape
@@ -278,6 +271,15 @@ class RemoteExecutionLayer(
         await self._adapter(info).control_request(
             info, self._cm, "set_permission_mode", mode=mode,
         )
+
+    async def reenter_review(self, session_id: str) -> bool:
+        """The engine's review re-entered on the satellite while the session
+        is still in Auto; the platform's mode and the session record are not
+        written (a person's change made meanwhile stands)."""
+        info = self._sessions.get(session_id)
+        if not info or get_session_mode(session_id) != AUTO_REVIEW_MODE:
+            return False
+        return await self._adapter(info).reenter_review(info, self._cm)
 
     async def send_control_request(
         self, session_id: str, subtype: str, **kwargs,
@@ -410,10 +412,10 @@ class RemoteExecutionLayer(
 from core.remote.remote_mcp_rewrite import (  # noqa: F401
     _REMOTE_MCP_STARTUP_FLOOR,
     _REMOTE_MCP_STARTUP_OVERRIDES,
-    _strip_toml_mcp_sections,
     _resolve_satellite_mcp_path_info,
+    _rewrite_env_for_remote,
     _rewrite_mcp_json_for_remote,
     _rewrite_mcp_toml_for_remote,
     _rewrite_stdio_paths,
-    _rewrite_env_for_remote,
+    _strip_toml_mcp_sections,
 )

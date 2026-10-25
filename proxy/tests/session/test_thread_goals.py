@@ -13,10 +13,9 @@ import json
 import pytest
 
 from core.events import stream_pump
-from core.events.common_events import CommonEvent, GOAL_UPDATE
+from core.events.common_events import GOAL_UPDATE, CommonEvent
 from core.events.stream_pump import ChatStreamPump
 from storage import database as task_store
-
 
 GOAL_EVENT = {
     "objective": "Ship the release",
@@ -154,8 +153,9 @@ def test_goal_straggler_applies_out_of_band(temp_db, monkeypatch):
     such stragglers to apply_goal_events_oob: chats.thread_goal updates and
     the owner's connections get a goal_update broadcast."""
     import json as _json
+
+    from core.layers.codex import CodexEvent, CodexEventTranslator
     from core.layers.codex.goals import apply_goal_events_oob
-    from core.layers.codex import CodexEventTranslator, CodexEvent
     from services.notifications import notification_manager
 
     temp_db.create_chat("gc5", "user-admin", "a1")

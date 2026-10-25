@@ -23,10 +23,12 @@ Every edge-affecting write ends with a global edge-compiler recompile.
 
 import asyncio
 import logging
+from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from auth import roles
 from auth.providers import (
     UserContext,
     get_current_user,
@@ -35,9 +37,7 @@ from auth.providers import (
     require_user,
 )
 from services.departments import edge_compiler
-from storage.agents import agent_store
-from storage.agents import db_departments
-from auth import roles
+from storage.agents import agent_store, db_departments
 
 logger = logging.getLogger("otodock.departments")
 
@@ -161,7 +161,7 @@ async def create_department(
             level_names=req.levels,
         )
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     logger.info("department created: %s (%s) by %s", dept["id"], name, u.sub)
     return _serialize(u, dept, [])
 
@@ -195,14 +195,14 @@ async def update_department(
             position_hint=req.position_hint,
         )
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     # mode / reach change what the department compiles to.
     if req.mode is not None or req.reach is not None:
         await asyncio.to_thread(edge_compiler.recompile)
     members = (await asyncio.to_thread(_members_by_department)).get(
         department_id, []
     )
-    return _serialize(u, updated, members)
+    return _serialize(u, cast("dict", updated), members)
 
 
 @router.delete("/v1/departments/{department_id}")
@@ -249,6 +249,6 @@ async def set_department_levels(
             [item.model_dump() for item in req.levels],
         )
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     await asyncio.to_thread(edge_compiler.recompile)
     return {"levels": levels, "unassigned_agents": unassigned}

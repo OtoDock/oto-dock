@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from services.mcp.mcp_manifest_types import _ENV_VAR_NAME_RE, _HTTP_TRANSPORTS
-
+from storage.identity import oauth_app_kinds
 
 # Google scope URL pattern. The per-provider map below applies this
 # regex only for `provider_id == "google"`; other providers accept any
@@ -99,6 +99,11 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
             f"credentials.oauth must be an object, got {type(raw).__name__}"
         )
 
+    for rule in _OAUTH_RULES:
+        rule(raw, server_raw)
+
+
+def _check_oauth_provider_id(raw: dict, server_raw: Any) -> None:
     # Reject the older `provider` field name — manifests must use
     # `provider_id` (matches OAuthProvider.provider_id).
     if "provider" in raw and "provider_id" not in raw:
@@ -113,6 +118,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
             "credentials.oauth.provider_id must be a non-empty string"
         )
 
+
+def _check_oauth_flows(raw: dict, server_raw: Any) -> None:
     # `flows` is a non-empty list of valid grant types the user can pick
     # at connect time. Single-flow MCPs declare a one-element list. The
     # first element is the default the engine uses for the
@@ -135,6 +142,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                 f"valid: {sorted(_OAUTH_FLOWS)}"
             )
 
+
+def _check_oauth_userinfo_request(raw: dict, server_raw: Any) -> None:
     # Identity-probe request shape: vendors without a REST userinfo endpoint
     # (Linear is GraphQL-only) declare POST + a static JSON body.
     um = raw.get("userinfo_method")
@@ -148,6 +157,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
             "credentials.oauth.userinfo_body must be an object when declared"
         )
 
+
+def _check_oauth_string_maps(raw: dict, server_raw: Any) -> None:
     # Static string→string maps: extra authorize-URL query params (Notion's
     # mandatory `owner=user`) and extra userinfo request headers (Notion's
     # mandatory `Notion-Version`). Both optional; consumed by oauth_start /
@@ -165,6 +176,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                 "non-empty string keys to string values"
             )
 
+
+def _check_oauth_url_fields(raw: dict, server_raw: Any) -> None:
     # URL fields — required for non-hardcoded providers but optional for
     # hardcoded ones (their Python class supplies the URLs). The
     # GenericOAuthProvider builder will refuse to build if these are
@@ -187,6 +200,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                 f"credentials.oauth.{url_field} must be a string when declared"
             )
 
+
+def _check_oauth_token_format(raw: dict, server_raw: Any) -> None:
     # token_format — optional; if declared must have a schema string and
     # filename_pattern string. `aliases` is the legacy-key map for MCPs
     # that read tokens via library-specific shapes (workspace-mcp's
@@ -230,6 +245,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                         f"non-empty string (the canonical key name)"
                     )
 
+
+def _check_oauth_app_credential_variants(raw: dict, server_raw: Any) -> None:
     # app_credential_variants — optional map of {flow_name: credential_bundle_name}
     # for providers (Zoom) where OAuth and S2S need DIFFERENT app credential
     # rows. When set, the engine reads variants[flow] instead of `app_credential`.
@@ -252,6 +269,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                     f"non-empty credential bundle name"
                 )
 
+
+def _check_oauth_account_credential_keys(raw: dict, server_raw: Any) -> None:
     # account_credential_keys — optional override for the DB credential
     # key names where (email, services) get stored. Defaults to
     # {PROVIDER_ID}_EMAIL / {PROVIDER_ID}_SERVICES; legacy workspace-mcp
@@ -270,6 +289,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                     f"be a non-empty string when declared"
                 )
 
+
+def _check_oauth_refresh(raw: dict, server_raw: Any) -> None:
     # refresh — optional; if declared must have a strategy string + integer threshold
     refresh = raw.get("refresh")
     if refresh is not None:
@@ -288,6 +309,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                 "credentials.oauth.refresh.min_remaining_seconds must be a positive integer"
             )
 
+
+def _check_oauth_bool_flags(raw: dict, server_raw: Any) -> None:
     # Boolean flags — type-check only.
     for bool_field in ("supports_multi_account", "registered_app_required", "bearer_required"):
         val = raw.get(bool_field, False)
@@ -296,6 +319,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                 f"credentials.oauth.{bool_field} must be a boolean when declared"
             )
 
+
+def _check_oauth_env_injection(raw: dict, server_raw: Any) -> None:
     # env_injection / mcp_env_injection — optional lists of env-var names
     # the resolver fills with the bound account's canonical access_token at
     # session start. `env_injection` lands in the agent's BASH env so CLIs
@@ -330,6 +355,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                 )
             seen_env_names.add(ev)
 
+
+def _check_oauth_git_credential_helper(raw: dict, server_raw: Any) -> None:
     # git_credential_helper — optional; when set the resolver wires git's
     # credential helper (via GIT_CONFIG_*) so `git push`/`clone` authenticate
     # without the proxy-host system helper (e.g. on satellites). Shape:
@@ -349,6 +376,8 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                     f"non-empty string"
                 )
 
+
+def _check_oauth_bearer(raw: dict, server_raw: Any) -> None:
     # bearer_required additional validation: when set, the manifest MUST
     # declare proposed_hosts (allowed vendor hosts), and the MCP's
     # transport MUST be HTTP-class. Cross-check `server.transport`.
@@ -389,8 +418,13 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                     f"declared path, which an SSE endpoint escapes; got {transport!r}"
                 )
 
-    _validate_authorization_server(raw, server_raw)
 
+def _check_oauth_app_kinds(raw: dict, server_raw: Any) -> None:
+    _validate_app_kinds(raw)
+
+
+def _check_oauth_base_scopes(raw: dict, server_raw: Any) -> None:
+    provider_id = raw.get("provider_id", "")
     # Per-provider scope regex. Unknown providers skip the URL pattern
     # check; only the "non-empty string" rule applies.
     scope_pattern = _PROVIDER_SCOPE_PATTERNS.get(provider_id)
@@ -413,6 +447,10 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
                     f"{provider_id} scope"
                 )
 
+
+def _check_oauth_services(raw: dict, server_raw: Any) -> None:
+    provider_id = raw.get("provider_id", "")
+    scope_pattern = _PROVIDER_SCOPE_PATTERNS.get(provider_id)
     # services — optional; if present must be a non-empty list of well-formed entries
     services = raw.get("services")
     if services is None:
@@ -424,75 +462,166 @@ def _validate_oauth_services(raw: Any, mcp_name: str, server_raw: Any = None) ->
 
     seen_keys: set[str] = set()
     for idx, svc in enumerate(services):
-        if not isinstance(svc, dict):
-            raise ValueError(
-                f"credentials.oauth.services[{idx}] must be an object, "
-                f"got {type(svc).__name__}"
-            )
-        key = svc.get("key")
-        if not isinstance(key, str) or not key.strip():
-            raise ValueError(
-                f"credentials.oauth.services[{idx}].key must be a non-empty string"
-            )
-        if key in seen_keys:
-            raise ValueError(
-                f"credentials.oauth.services[{idx}] duplicates an earlier key={key!r}"
-            )
-        seen_keys.add(key)
+        _check_oauth_service(idx, svc, seen_keys, scope_pattern, provider_id)
 
-        for field_name in ("label", "description"):
-            v = svc.get(field_name)
-            if not isinstance(v, str) or not v.strip():
-                raise ValueError(
-                    f"credentials.oauth.services[{idx}].{field_name} must be a "
-                    f"non-empty string (service key={key!r})"
-                )
 
-        scopes = svc.get("scopes")
-        if not isinstance(scopes, list):
+def _check_oauth_service(idx: int, svc: Any, seen_keys: set[str],
+                         scope_pattern: "re.Pattern[str] | None", provider_id: str) -> None:
+    """One ``services`` entry; ``seen_keys`` collects the keys."""
+    if not isinstance(svc, dict):
+        raise ValueError(
+            f"credentials.oauth.services[{idx}] must be an object, "
+            f"got {type(svc).__name__}"
+        )
+    key = svc.get("key")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError(
+            f"credentials.oauth.services[{idx}].key must be a non-empty string"
+        )
+    if key in seen_keys:
+        raise ValueError(
+            f"credentials.oauth.services[{idx}] duplicates an earlier key={key!r}"
+        )
+    seen_keys.add(key)
+
+    for field_name in ("label", "description"):
+        v = svc.get(field_name)
+        if not isinstance(v, str) or not v.strip():
             raise ValueError(
-                f"credentials.oauth.services[{idx}].scopes must be a list "
+                f"credentials.oauth.services[{idx}].{field_name} must be a "
+                f"non-empty string (service key={key!r})"
+            )
+
+    scopes = svc.get("scopes")
+    if not isinstance(scopes, list):
+        raise ValueError(
+            f"credentials.oauth.services[{idx}].scopes must be a list "
+            f"(service key={key!r})"
+        )
+    # Empty scopes allowed (future: OAuth-login-only services); per-string
+    # validation still applies if any are declared.
+    for sidx, s in enumerate(scopes):
+        if not isinstance(s, str) or not s.strip():
+            raise ValueError(
+                f"credentials.oauth.services[{idx}].scopes[{sidx}] must be a "
+                f"non-empty string (service key={key!r})"
+            )
+        if scope_pattern is not None and s != "openid" and not scope_pattern.match(s):
+            raise ValueError(
+                f"credentials.oauth.services[{idx}].scopes[{sidx}]={s!r} is not "
+                f"a valid {provider_id} scope (service key={key!r})"
+            )
+
+    # Optional capabilities list — surfaced as red-bordered consent
+    # warnings in the User Settings UI ("posts as you in any channel"
+    # for Slack `chat:write`, etc.).
+    caps = svc.get("capabilities")
+    if caps is not None:
+        if not isinstance(caps, list):
+            raise ValueError(
+                f"credentials.oauth.services[{idx}].capabilities must be a list "
                 f"(service key={key!r})"
             )
-        # Empty scopes allowed (future: OAuth-login-only services); per-string
-        # validation still applies if any are declared.
-        for sidx, s in enumerate(scopes):
-            if not isinstance(s, str) or not s.strip():
+        for cidx, cap in enumerate(caps):
+            if not isinstance(cap, str) or not cap.strip():
                 raise ValueError(
-                    f"credentials.oauth.services[{idx}].scopes[{sidx}] must be a "
-                    f"non-empty string (service key={key!r})"
-                )
-            if scope_pattern is not None and s != "openid" and not scope_pattern.match(s):
-                raise ValueError(
-                    f"credentials.oauth.services[{idx}].scopes[{sidx}]={s!r} is not "
-                    f"a valid {provider_id} scope (service key={key!r})"
+                    f"credentials.oauth.services[{idx}].capabilities[{cidx}] must "
+                    f"be a non-empty string (service key={key!r})"
                 )
 
-        # Optional capabilities list — surfaced as red-bordered consent
-        # warnings in the User Settings UI ("posts as you in any channel"
-        # for Slack `chat:write`, etc.).
-        caps = svc.get("capabilities")
-        if caps is not None:
-            if not isinstance(caps, list):
-                raise ValueError(
-                    f"credentials.oauth.services[{idx}].capabilities must be a list "
-                    f"(service key={key!r})"
-                )
-            for cidx, cap in enumerate(caps):
-                if not isinstance(cap, str) or not cap.strip():
-                    raise ValueError(
-                        f"credentials.oauth.services[{idx}].capabilities[{cidx}] must "
-                        f"be a non-empty string (service key={key!r})"
-                    )
+    # Optional per-service booleans (Microsoft admin consent /
+    # Zoom S2S-vs-user-OAuth gating).
+    for bf in ("requires_admin_consent", "requires_user_oauth"):
+        if bf in svc and not isinstance(svc[bf], bool):
+            raise ValueError(
+                f"credentials.oauth.services[{idx}].{bf} must be a boolean "
+                f"(service key={key!r})"
+            )
 
-        # Optional per-service booleans (Microsoft admin consent /
-        # Zoom S2S-vs-user-OAuth gating).
-        for bf in ("requires_admin_consent", "requires_user_oauth"):
-            if bf in svc and not isinstance(svc[bf], bool):
+
+def _validate_admin_fields(fields: Any, where: str) -> list[dict]:
+    """The shape of an admin form's field list (``app_credential_fields``
+    and a kind's ``fields``): objects with a POSIX env-name ``key`` (unique),
+    a ``label`` and an ``input_type`` of the known three."""
+    if not isinstance(fields, list) or not fields:
+        raise ValueError(f"{where} must be a non-empty list of field objects")
+    seen: set[str] = set()
+    for idx, f in enumerate(fields):
+        if not isinstance(f, dict):
+            raise ValueError(f"{where}[{idx}] must be an object")
+        key = f.get("key")
+        if not isinstance(key, str) or not _ENV_VAR_NAME_RE.match(key):
+            raise ValueError(f"{where}[{idx}].key must be a POSIX env-var name")
+        if key in seen:
+            raise ValueError(f"{where}[{idx}].key={key!r} is a duplicate")
+        seen.add(key)
+        label = f.get("label")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"{where}[{idx}].label must be a non-empty string")
+        input_type = f.get("input_type", oauth_app_kinds.INPUT_TEXT)
+        if input_type not in oauth_app_kinds.INPUT_TYPES:
+            raise ValueError(
+                f"{where}[{idx}].input_type={input_type!r} is not one of "
+                f"{sorted(oauth_app_kinds.INPUT_TYPES)}"
+            )
+    return fields
+
+
+def _validate_app_kinds(raw: dict) -> None:
+    """``credentials.oauth.app_kinds``: the kinds of vendor application an
+    admin may register (``storage/identity/oauth_app_kinds.py``), each with
+    its own admin fields; the bundle key that records the kind in use. The
+    first kind's fields must equal ``app_credential_fields`` (an older
+    dashboard reads that list as the only form); a GitHub-App kind's fields
+    must cover the app id, the client id, the client secret and the private
+    key, and may name which token the MCP server gets."""
+    block = raw.get("app_kinds")
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ValueError("credentials.oauth.app_kinds must be an object when declared")
+    key = block.get("key")
+    if not isinstance(key, str) or not _ENV_VAR_NAME_RE.match(key):
+        raise ValueError("credentials.oauth.app_kinds.key must be a POSIX env-var name")
+    kinds = block.get("kinds")
+    if not isinstance(kinds, list) or not kinds:
+        raise ValueError("credentials.oauth.app_kinds.kinds must be a non-empty list")
+    seen: set[str] = set()
+    for idx, entry in enumerate(kinds):
+        where = f"credentials.oauth.app_kinds.kinds[{idx}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{where} must be an object")
+        kind = entry.get("kind")
+        if kind not in oauth_app_kinds.KINDS:
+            raise ValueError(f"{where}.kind={kind!r} is not one of {sorted(oauth_app_kinds.KINDS)}")
+        if kind in seen:
+            raise ValueError(f"{where}.kind={kind!r} is a duplicate")
+        seen.add(kind)
+        label = entry.get("label")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"{where}.label must be a non-empty string")
+        fields = _validate_admin_fields(entry.get("fields"), f"{where}.fields")
+        mcp_token = entry.get("mcp_token")
+        if mcp_token is not None and mcp_token not in oauth_app_kinds.MCP_TOKENS:
+            raise ValueError(
+                f"{where}.mcp_token={mcp_token!r} is not one of {sorted(oauth_app_kinds.MCP_TOKENS)}"
+            )
+        if any(f.get("key") == key for f in fields):
+            raise ValueError(f"{where}.fields must not name the kind key {key!r}")
+        if kind == oauth_app_kinds.KIND_GITHUB_APP:
+            roles = {oauth_app_kinds.app_field_role(str(f.get("key") or "")) for f in fields}
+            missing = oauth_app_kinds.GITHUB_APP_REQUIRED_FIELDS - roles
+            if missing:
                 raise ValueError(
-                    f"credentials.oauth.services[{idx}].{bf} must be a boolean "
-                    f"(service key={key!r})"
+                    f"{where}.fields must cover the GitHub App's {sorted(missing)} "
+                    "(a key containing APP_ID, CLIENT_ID, CLIENT_SECRET, PRIVATE_KEY)"
                 )
+    first = kinds[0].get("fields")
+    if first != raw.get("app_credential_fields"):
+        raise ValueError(
+            "credentials.oauth.app_kinds.kinds[0].fields must equal app_credential_fields "
+            "(the first kind is what an older dashboard shows)"
+        )
 
 
 def _validate_authorization_server(raw: dict, server_raw: Any = None) -> None:
@@ -627,3 +756,25 @@ def _validate_authorization_server(raw: dict, server_raw: Any = None) -> None:
                 f"host {host!r} when authorization_server is declared"
             )
 
+
+# The block's rules in the order they run: each raises on its first defect,
+# so the first rule that fails ends the validation.
+_OAUTH_RULES = (
+    _check_oauth_provider_id,
+    _check_oauth_flows,
+    _check_oauth_userinfo_request,
+    _check_oauth_string_maps,
+    _check_oauth_url_fields,
+    _check_oauth_token_format,
+    _check_oauth_app_credential_variants,
+    _check_oauth_account_credential_keys,
+    _check_oauth_refresh,
+    _check_oauth_bool_flags,
+    _check_oauth_env_injection,
+    _check_oauth_git_credential_helper,
+    _check_oauth_bearer,
+    _validate_authorization_server,
+    _check_oauth_app_kinds,
+    _check_oauth_base_scopes,
+    _check_oauth_services,
+)

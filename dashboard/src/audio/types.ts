@@ -54,6 +54,16 @@ export interface STTSession {
   // Fires when the recognizer stops on its own (silence / single-utterance end)
   // so the UI can leave the "recording" state without a manual stop.
   onEnd(handler: () => void): void
+  // The platform engine moved the dictation to another language: the words
+  // it placed for this session are `text` now (empty when nothing was heard
+  // in the new language yet). A backend that never switches leaves it out.
+  onReplace?(handler: (text: string) => void): void
+  // A sentence for the person while the session runs (the link is slow),
+  // null when it no longer applies. A backend without one leaves it out.
+  onNotice?(handler: (text: string | null) => void): void
+  // The session is finishing on its own (the server ended it and still
+  // sends its last words): the host leaves "recording" for "finishing".
+  onFinishing?(handler: () => void): void
 }
 
 export interface STTCreateOptions {

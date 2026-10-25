@@ -90,7 +90,7 @@ describe('McpRequestsPage — needs-instance flow', () => {
 
     // Selector defaults to Automatic and lists both instances.
     const select = await screen.findByRole('combobox')
-    expect(screen.getByText('Automatic (catch-all or first instance)')).toBeInTheDocument()
+    expect(screen.getByText('Automatic: the catch-all or the first instance')).toBeInTheDocument()
     fireEvent.change(select, { target: { value: '12' } })
 
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))

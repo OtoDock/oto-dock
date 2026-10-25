@@ -26,11 +26,9 @@ import re
 import secrets
 import time
 
-import jwt
-
 import config
+from auth import roles, tokens
 from auth.request_path import has_traversal
-from auth import roles
 
 logger = logging.getLogger("otodock.auth")
 
@@ -79,7 +77,7 @@ def mint(app_id: str, sub: str, agent: str) -> tuple[str, str]:
                "jti": jti, "iat": now, "exp": now + TTL_S}
     _live[jti] = (app_id, float(now + TTL_S))
     _sweep(now)
-    return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256"), jti
+    return tokens.mint(tokens.RENDER, payload), jti
 
 
 def release(jti: str) -> None:
@@ -95,11 +93,8 @@ def verify(token: str) -> dict | None:
     """The claims iff the token is a live render token; None otherwise."""
     if not token:
         return None
-    try:
-        payload = jwt.decode(token, config.JWT_SECRET, algorithms=["HS256"])
-    except jwt.InvalidTokenError:
-        return None
-    if payload.get("purpose") != PURPOSE:
+    payload = tokens.verify(token, tokens.RENDER)
+    if payload is None:
         return None
     jti = str(payload.get("jti") or "")
     live = _live.get(jti)

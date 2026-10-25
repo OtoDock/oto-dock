@@ -37,6 +37,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import cast
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request, Response
@@ -265,8 +266,8 @@ def _take_cap_slots(caller: _Caller) -> None:
 def _remember_owner(resp: Response, caller: _Caller) -> None:
     """Bind the call id the daemon answered to the principal that placed it."""
     try:
-        call_id = json.loads(resp.body).get("call_id")
-    except Exception:
+        call_id = json.loads(cast("bytes", resp.body)).get("call_id")
+    except (ValueError, AttributeError):
         return
     if not isinstance(call_id, str) or not call_id:
         return
@@ -302,21 +303,18 @@ async def _relay(method: str, path: str, *, params: dict | None = None,
         raise HTTPException(status_code=502, detail=f"Phone daemon not contacted: {refused}")
     url = f"{config.PHONE_SERVER_URL}{path}"
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=read_timeout, write=10.0, pool=10.0),
+        async with daemon_url.client(
+            url, timeout=httpx.Timeout(connect=10.0, read=read_timeout, write=10.0, pool=10.0),
         ) as client:
             resp = await client.request(
                 method, url, params=params, json=json_body,
                 headers=_daemon_headers(),
             )
     except httpx.HTTPError as e:
+        logger.warning("The phone service at %s did not answer: %s", config.PHONE_SERVER_URL, e)
         raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Phone daemon unreachable from the proxy "
-                f"({config.PHONE_SERVER_URL}): {e}"
-            ),
-        )
+            status_code=502, detail="The phone service is not answering. Check that it is running.",
+        ) from e
     return Response(
         content=resp.content,
         status_code=resp.status_code,
@@ -338,8 +336,8 @@ async def relay_make_call(
             detail="Placing calls needs the editor role or above on this agent")
     try:
         body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid JSON")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
     fields, named_route = _validate_body(body)
     _check_destination(fields["phone_number"])
     route_id = await _pinned_route(caller, named_route)
@@ -361,11 +359,11 @@ async def relay_make_call(
             grant = in_session_calls.mint(
                 session_id=caller.sid, chat_id=chat_id, agent=caller.agent,
                 user_sub=caller.user_sub, phone_number=fields["phone_number"])
-        except ValueError:
+        except ValueError as exc:
             # Two make_calls of one chat raced past the eligibility: the
             # second finds the first's grant.
             _audit(caller, route_id, "refused: a call already runs in the chat")
-            raise HTTPException(status_code=409, detail=in_session_calls.BUSY_LINE)
+            raise HTTPException(status_code=409, detail=in_session_calls.BUSY_LINE) from exc
     try:
         _take_cap_slots(caller)
     except HTTPException:
@@ -395,8 +393,10 @@ def _remember_in_session(resp: Response, grant: str) -> None:
     refuses it from here on. A daemon that ignored the field ran the call
     as its own session, and the grant goes."""
     try:
-        data = json.loads(resp.body)
-    except Exception:
+        data = json.loads(cast("bytes", resp.body))
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
         data = {}
     call_id = data.get("call_id")
     if data.get("in_session") is True and isinstance(call_id, str) and call_id:
@@ -446,8 +446,8 @@ async def relay_answer_question(
     _require_call_owner(call_id, caller)
     try:
         body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid JSON")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
     answer = body.get("answer") if isinstance(body, dict) else None
     if not isinstance(answer, str) or not answer.strip():
         raise HTTPException(status_code=400, detail="answer must be a non-empty string")

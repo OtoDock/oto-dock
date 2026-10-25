@@ -11,10 +11,10 @@
 // capability resolve simply waits the extra round-trip once.
 
 import { useQuery } from '@tanstack/react-query'
-import { apiFetch } from '../api/auth'
 import { type ChatAudioCapability } from '../audio/types'
 import { probeNativeTtsAvailable } from '../audio/backends/nativeTts'
 import { probeNativeSttAvailable } from '../audio/backends/nativeStt'
+import { apiJson, withMessage } from '../lib/http/apiJson'
 
 export function useChatAudioCapability(enabled = true) {
   // `enabled=false` for pre-auth mounts (useWakeWord under RequireAuth) —
@@ -28,13 +28,11 @@ export function useChatAudioCapability(enabled = true) {
         probeNativeTtsAvailable().catch(() => false),
         probeNativeSttAvailable().catch(() => false),
       ])
-      const res = await apiFetch(
-        `/v1/audio/capability?has_native_tts=${hasNativeTts}&has_native_stt=${hasNativeStt}`,
-      )
       // Throw (not null) so a failed resolve retries and reads as an ERROR —
       // it must never render as "turned off by the administrator".
-      if (!res.ok) throw new Error(`audio capability failed: HTTP ${res.status}`)
-      return res.json()
+      return apiJson<ChatAudioCapability>(
+        `/v1/audio/capability?has_native_tts=${hasNativeTts}&has_native_stt=${hasNativeStt}`,
+      ).catch(withMessage(() => 'Could not check the voice features on this device'))
     },
     staleTime: 30_000,
   })

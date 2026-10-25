@@ -15,13 +15,21 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+import psycopg
 
 import config as app_config
 from auth import roles
 from core import layout
+
+if TYPE_CHECKING:
+    from services.mcp.mcp_manifest_types import McpManifest
 
 logger = logging.getLogger("otodock.sandbox")
 
@@ -309,6 +317,8 @@ def tmpfs_cap_preflight() -> None:
 # How long a killed probe child gets to be reaped before the boot goes on
 # without it (a child uninterruptible inside the kernel never is).
 _PROBE_REAP_S = 5
+# The bound on each probe of the sandbox shape (one level, nested).
+_SHAPE_PROBE_S = 20
 
 
 def _run_probe(argv: list[str], timeout: float) -> subprocess.CompletedProcess[bytes]:
@@ -353,23 +363,170 @@ def _nested_sandbox_probe() -> str | None:
     bwrap = shutil.which("bwrap")
     if not bwrap:  # unreachable after the missing-tools gate; belt-and-braces
         return "bwrap not on PATH"
-    argv = [str(_NETNS_LAUNCHER), "--block-private", "--",
-            bwrap, "--unshare-pid", "--die-with-parent", "--share-net"]
-    if os.getuid() != 0:
-        argv += ["--unshare-user", "--uid", str(os.getuid()),
-                 "--gid", str(os.getgid())]
-    argv += ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--",
-             bwrap, "--ro-bind", "/", "/", "--", "/bin/true"]
     try:
-        probe = _run_probe(argv, timeout=20)
+        probe = _run_probe(_sandbox_shape(bwrap, [bwrap, "--ro-bind", "/", "/", "--", "/bin/true"]),
+                           timeout=_SHAPE_PROBE_S)
     except subprocess.TimeoutExpired:
-        return "nested probe timed out after 20s"
-    except Exception as e:  # noqa: BLE001 — diagnostic-only path
+        return f"nested probe timed out after {_SHAPE_PROBE_S}s"
+    except Exception as e:  # noqa: BLE001  # diagnostic-only path
         return f"nested probe failed to run: {e}"
-    if probe.returncode == 0:
-        return None
+    return _probe_detail(probe)
+
+
+def _sandbox_shape(bwrap: str, inner: list[str]) -> list[str]:
+    """The shape every local session runs: the network launcher wrapping one
+    bwrap level with our namespace flags and a fresh /proc, running ``inner``."""
+    argv = [str(_NETNS_LAUNCHER), "--block-private", "--",
+            bwrap, "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent", "--share-net"]
+    if os.getuid() != 0:
+        argv += ["--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid())]
+    return argv + ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--", *inner]
+
+
+def _probe_detail(probe: subprocess.CompletedProcess[bytes]) -> str | None:
+    """None for a probe that exited 0, else the tail of what it printed."""
     detail = (probe.stderr or b"").decode(errors="replace").strip()
-    return detail[-400:] or f"exit {probe.returncode}"
+    return None if probe.returncode == 0 else (detail[-400:] or f"exit {probe.returncode}")
+
+
+def pasta_build_date(version_line: str) -> str:
+    """`YYYY_MM_DD` of a passt version line: an upstream tag
+    (`2026_10_02.cba3570`), a git build (`2026_06_11.a9c61ff-31-g…`) or a
+    Debian version (`0.0~git20230309.7c7625d-1`); "" when it names none."""
+    m = (re.search(r"(\d{4})_(\d{2})_(\d{2})", version_line)
+         or re.search(r"git(\d{4})(\d{2})(\d{2})", version_line))
+    return "_".join(m.groups()) if m else ""
+
+
+def _first_line(argv: list[str]) -> str:
+    """The first line a quick command prints, "" when it cannot run."""
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    lines = (out or "").strip().splitlines()
+    return lines[0] if lines else ""
+
+
+def _pasta_version() -> tuple[str, str]:
+    """(the version to name, its build date) of the pasta on PATH.
+
+    Debian's package prints "pasta unknown version" (built outside git), so a
+    binary under /usr/bin with no date in its line falls back to the
+    package's own version."""
+    exe = shutil.which("pasta")
+    if not exe:
+        return "", ""
+    line = _first_line([exe, "--version"])
+    date = pasta_build_date(line)
+    if not date and os.path.realpath(exe).startswith("/usr/bin/"):
+        package = _first_line(["dpkg-query", "-W", "-f=${Version}", "passt"])
+        if pasta_build_date(package):
+            return f"pasta (package passt {package})", pasta_build_date(package)
+    return line, date
+
+
+def _warn_pasta_below_floor() -> None:
+    """Warn, never refuse, when pasta is older than PASST_MIN_VERSION.
+
+    The floor names the build the launcher's options are written against, but
+    an older pasta still runs it (every 1.8.x image shipped bookworm's
+    2023_03_09), so refusing would stop hosts that work today. The warning
+    names the gap and the fix for this kind of install.
+    """
+    floor = app_config._read_pinned_version("PASST_MIN_VERSION")
+    line, have = _pasta_version()
+    if not floor or not have:
+        logger.info("netns preflight: pasta %r not compared with the floor %r", line, floor)
+        return
+    if have >= floor:
+        return
+    fix = ("take this release's proxy image, which carries the pinned build"
+           if app_config.RUNNING_IN_DOCKER else
+           "re-run scripts/install-baseline-tools.sh, which builds the pinned release")
+    logger.warning(
+        "netns preflight: %s is older than PASST_MIN_VERSION %s (the pasta the sandbox's "
+        "launcher options are written against); agents still run, but %s.",
+        line, floor, fix,
+    )
+
+
+# pasta opens the sandbox's tap through this device; a container has it only
+# when the compose file maps it in (``devices: /dev/net/tun``).
+_TUN_DEVICE = "/dev/net/tun"
+_TUN_WORDS = re.compile(r"\btun\b|\btap\b", re.IGNORECASE)
+
+
+def _tun_device_problem() -> str | None:
+    """Why this host has no ``/dev/net/tun`` character device, or None."""
+    try:
+        if not stat.S_ISCHR(os.stat(_TUN_DEVICE).st_mode):
+            return f"{_TUN_DEVICE} is not a character device"
+    except OSError:
+        return f"{_TUN_DEVICE} is missing"
+    return None
+
+
+def _tun_unavailable(detail: str) -> str | None:
+    """Why the network launcher cannot open its tap, or None: no tun device,
+    or a probe's error (a probe runs the launcher) names the tun or tap."""
+    return _tun_device_problem() or (detail if _TUN_WORDS.search(detail) else None)
+
+
+def _tun_sentence(why: str) -> str:
+    """What the boot refusal and the nested probe's error both say."""
+    return (f"Sandbox network launcher cannot open its tap device ({why}): no session can start in "
+            "this server's sandbox (sessions on paired machines do not use it). Map the device into the "
+            "proxy container (docker-compose.yml: devices: /dev/net/tun) or, on a host, load the tun "
+            "module (sudo modprobe tun), then restart.")
+
+
+def _sandbox_shape_gate() -> None:
+    """The hard gate's last step, the shape every local session runs: any
+    failure of it refuses the boot (every local session would fail at spawn), the
+    tun device's with the tun sentence; a probe that does not answer only
+    logs an error (a loaded host at boot is no reason to refuse)."""
+    problem = _tun_device_problem()
+    if problem is not None:
+        raise RuntimeError(_tun_sentence(problem))
+    try:
+        detail = _probe_detail(_run_probe(_sandbox_shape("bwrap", ["true"]), timeout=_SHAPE_PROBE_S))
+    except OSError as e:
+        detail = f"failed to run: {e}"
+    except subprocess.TimeoutExpired:
+        logger.error("netns preflight: the sandbox shape (the network launcher wrapping "
+                     "bwrap) did not answer within %ss; agent sessions may fail to start. "
+                     "Run scripts/sandbox-doctor.sh on this host.", _SHAPE_PROBE_S)
+        return
+    if detail is None:
+        return
+    if _TUN_WORDS.search(detail):
+        raise RuntimeError(_tun_sentence(detail))
+    raise RuntimeError(
+        f"Sandbox network isolation is mandatory but the sandbox does not start on this host (the network "
+        f"launcher wrapping bwrap failed: {detail}). Run scripts/sandbox-doctor.sh to pinpoint the denial. "
+        "Refusing to start: every session in this server's sandbox would fail the same way.")
+
+
+def _warn_nested_probe(nested_detail: str) -> None:
+    """The nested probe failed: when the launcher itself could not open its
+    tap no session in this server's sandbox can start, so that is an error naming
+    the device; otherwise the outer sandbox works and only the engine's
+    inner sandbox is lost. Never fatal: a boot refusal would stop hosts the
+    probe misjudges."""
+    tun = _tun_unavailable(nested_detail)
+    if tun is not None:
+        logger.error("%s", _tun_sentence(tun))
+        return
+    logger.warning(
+        "Sandbox nested-namespace probe FAILED — the agent sandbox itself "
+        "works, but a bwrap nested inside it cannot start (%s). Local "
+        "Codex sessions lose their engine-side inner sandbox: shell "
+        "commands degrade to unsandboxed retries behind permission "
+        "prompts (Claude sessions are unaffected). Run "
+        "scripts/sandbox-doctor.sh on this host to pinpoint the denial.",
+        nested_detail,
+    )
 
 
 def netns_preflight() -> None:
@@ -380,7 +537,9 @@ def netns_preflight() -> None:
     un-isolated mode). Verifies the tools exist AND that an unprivileged
     user+net namespace can actually be created (a binary may be present yet
     namespace creation blocked by the container's seccomp/userns profile — that
-    would otherwise pass and fail every session at spawn). Also materializes the
+    would otherwise pass and fail every session at spawn), then runs the
+    sandbox shape itself (`_sandbox_shape_gate`, the tun device included). A
+    pasta older than PASST_MIN_VERSION only warns (`_warn_pasta_below_floor`). Also materializes the
     stub-resolver resolv.conf swap file so every later build_command_prefix()
     call is a pure argv transform.
     """
@@ -391,10 +550,12 @@ def netns_preflight() -> None:
     if missing:
         raise RuntimeError(
             "Sandbox network isolation is mandatory but the host is missing: "
-            f"{', '.join(missing)}. Install the `passt` package (provides "
-            "pasta; see VERSIONS.md for the pin) and `iproute2`. Refusing to "
-            "start: agents would otherwise run without network isolation."
+            f"{', '.join(missing)}. Run scripts/install-baseline-tools.sh "
+            "(it installs passt, which provides pasta, and `iproute2`; see "
+            "VERSIONS.md for the pin). Refusing to start: agents would "
+            "otherwise run without network isolation."
         )
+    _warn_pasta_below_floor()
 
     # Capability probe: can we actually create an unprivileged user+net
     # namespace? `unshare -Urn true` exercises exactly the namespaces the
@@ -421,12 +582,12 @@ def netns_preflight() -> None:
             raise RuntimeError(
                 f"Sandbox netns capability probe failed to run: {e}. The host "
                 "must allow unprivileged user+network namespaces."
-            )
+            ) from e
     except Exception as e:
         raise RuntimeError(
             f"Sandbox netns capability probe failed to run: {e}. The host must "
             "allow unprivileged user+network namespaces."
-        )
+        ) from e
     if probe is not None and probe.returncode != 0:
         detail = (probe.stderr or b"").decode(errors="replace").strip()
         if _apparmor_userns_restricted():
@@ -466,6 +627,8 @@ def netns_preflight() -> None:
             "seccomp/userns profile)."
         )
 
+    _sandbox_shape_gate()
+
     # Nested-level probe (diagnostic, never boot-fatal): the Codex engine ships
     # its own bubblewrap and nests it INSIDE our sandbox for every shell
     # command (its "fs sandbox helper"). A host can pass the one-level gate
@@ -479,16 +642,8 @@ def netns_preflight() -> None:
     _nested_sandbox_ok = nested_detail is None
     if nested_detail is None:
         logger.info("netns: nested-namespace probe OK (engine inner sandboxes can start)")
-    if nested_detail is not None:
-        logger.warning(
-            "Sandbox nested-namespace probe FAILED — the agent sandbox itself "
-            "works, but a bwrap nested inside it cannot start (%s). Local "
-            "Codex sessions lose their engine-side inner sandbox: shell "
-            "commands degrade to unsandboxed retries behind permission "
-            "prompts (Claude sessions are unaffected). Run "
-            "scripts/sandbox-doctor.sh on this host to pinpoint the denial.",
-            nested_detail,
-        )
+    else:
+        _warn_nested_probe(nested_detail)
 
     resolv = netns_resolv_path()
     if _host_resolv_has_loopback_ns():
@@ -501,7 +656,8 @@ def netns_preflight() -> None:
         )
         logger.info(
             "netns: host uses a loopback stub resolver — sessions get a "
-            f"generated resolv.conf via pasta --dns-forward {_NETNS_DNS_FORWARD_ADDR}"
+            "generated resolv.conf via pasta --dns-forward %s",
+            _NETNS_DNS_FORWARD_ADDR
         )
     elif resolv.exists():
         resolv.unlink()
@@ -518,6 +674,7 @@ def cli_version_preflight() -> None:
     """
     import re
     import subprocess
+
     from core.session.session_manager import get_all_layers
 
     # Every registered engine with a CLI: its display name, the binary this
@@ -606,6 +763,18 @@ class SandboxMount:
     host: str       # resolved host path
     sandbox: str    # mount point inside sandbox
     mode: str       # "ro" or "rw"
+
+
+def mcp_sandbox_mounts(manifests: Iterable[McpManifest]) -> list[SandboxMount]:
+    """The mounts the given MCP manifests declare, each host's ``${mcp_dir}``
+    template resolved. The host is allowlisted to the agent / mcps tree in
+    the sandbox builder, so a platform-root template is not offered here."""
+    mounts: list[SandboxMount] = []
+    for manifest in manifests:
+        for m in getattr(manifest, "sandbox_mounts", []):
+            host = m.host.replace("${mcp_dir}", str(manifest.mcp_dir))
+            mounts.append(SandboxMount(host=host, sandbox=m.sandbox, mode=m.mode))
+    return mounts
 
 
 @dataclass(frozen=True)
@@ -871,15 +1040,21 @@ class SandboxBuilder:
         # Config dir lives inside the caller / user / workspace dir (no
         # separate mount)
         if self.cfg.external_home:
-            cfg_dir = f"{EXTERNAL_SANDBOX_HOME}/{config_dir_name}"
+            scope_root = EXTERNAL_SANDBOX_HOME
         elif self.cfg.username:
-            cfg_dir = f"{layout.virtual_user_root(self.cfg.username)}/{config_dir_name}"
+            scope_root = layout.virtual_user_root(self.cfg.username)
         else:
-            cfg_dir = f"{layout.V_WORKSPACE}/{config_dir_name}"
+            scope_root = layout.V_WORKSPACE
+        cfg_dir = f"{scope_root}/{config_dir_name}"
 
         from core.sandbox import session_config_dir as scd
         env = {
             config_env_var: cfg_dir,
+            # pnpm 12 refuses an offline install without its metadata cache,
+            # which it keeps under HOME (a fresh /tmp every run): the cache
+            # lives beside the store in the scope's tree (`.cache` is a
+            # workspace-sync skip dir).
+            "PNPM_CONFIG_CACHE_DIR": f"{scope_root}/.cache/pnpm",
             # The command wrappers (bound read-only, so nothing a session
             # writes can precede the system dirs), then the system dirs only
             # (a user home isn't mounted).
@@ -1064,7 +1239,10 @@ class SandboxBuilder:
         build (``session_config_dir.write_if_changed``). Satellites run no
         bwrap."""
         from core.sandbox.session_config_dir import (
-            _INTERCEPTOR_SRC, HOOK_FILE_OF_STATE_DIR, HOOK_SCRIPTS, WRAPPER_DIR,
+            _INTERCEPTOR_SRC,
+            HOOK_FILE_OF_STATE_DIR,
+            HOOK_SCRIPTS,
+            WRAPPER_DIR,
         )
 
         def cover(path: str) -> Mount | None:
@@ -1188,7 +1366,7 @@ class SandboxBuilder:
                 # Caller trees are metered as their own per-agent bucket so a
                 # caller cannot fill the agent's shared one.
                 storage_quota.ensure_scope(self.cfg.agent_name, "external")
-        except Exception:
+        except (ImportError, psycopg.Error, RuntimeError):
             pass  # never block a sandbox build on quota assignment
 
         lib_attachments = self.cfg.knowledge_libraries
@@ -1298,15 +1476,15 @@ class SandboxBuilder:
         # (auth/path_policy.py::_USER_DIR_WRITABLE_SUBDIRS).
         user_dir = layout.user_dir(agent_root_real, username)
         # Codex's own Linux sandbox (a nested bwrap) mounts read-only tmpfs
-        # over <writable-root>/{.git,.agents,.codex} for every writable root,
-        # cwd included — and bwrap must CREATE a missing mountpoint, which
-        # this deliberately read-only root refuses ("Can't mkdir
-        # /users/<u>/.git: Read-only file system"; the helper dies and codex
-        # surfaces tool failures like view_image's "unable to locate image").
-        # Pre-create the two codex doesn't make itself as EMPTY dirs — git
-        # treats a bare .git dir as "not a git repository" and walks past;
-        # .codex is session_config_dir's job and is RW-bound below.
-        for sub in (".git", ".agents"):
+        # over <writable-root>/{.git,.agents,.codex,.aws} (.aws since 0.160)
+        # for every writable root, cwd included — and bwrap must CREATE a
+        # missing mountpoint, which this deliberately read-only root refuses
+        # ("Can't mkdir /users/<u>/.aws: Read-only file system": the helper
+        # dies, codex runs the command without its own layer). Re-read the
+        # list on every Codex bump. Pre-create the ones codex doesn't make
+        # itself as EMPTY dirs — git treats a bare .git dir as "not a git
+        # repository"; .codex is session_config_dir's job, RW-bound below.
+        for sub in (".git", ".agents", ".aws"):
             _mkdirs_held(agent_root_real, layout.USERS, username, sub)
         v_user = layout.virtual_user_root(username)
         mounts.append(Mount(str(user_dir), v_user, False))
@@ -1557,7 +1735,6 @@ from core.sandbox.session_config_dir import (  # noqa: F401
     ensure_persistent_agent_dir,
     prepare_mcp_config_for_sandbox,
 )
-
 
 # ---------------------------------------------------------------------------
 # Resolve helpers

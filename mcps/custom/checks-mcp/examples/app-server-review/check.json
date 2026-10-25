@@ -1,0 +1,17 @@
+{
+  "name": "app-server-review",
+  "description": "Reviews an app server's routes for role checks, body checks, SQL, secrets and error answers when its code changes",
+  "mandatory": true,
+  "applies": ["chats", "tasks", "delegations"],
+  "condition": {"globs": ["**/apps/*/server/**", "**/user-apps/*/server/**"]},
+  "rounds": 1,
+  "judge": {
+    "rubric": "Judge the app server code written this turn. Read each changed file under apps/<slug>/server/ in full, and the app's app.json. The server runs on Bun behind the OtoDock proxy. The proxy already caps a body at 1 MB, drops cookies, sets CORS and refuses paths that start with _ from viewers. It signs a claim for every caller: X-OtoDock-Viewer for a person, a link visitor, an agent's session and a handler wake, X-OtoDock-Caller for another app over a binding. The server's calls to its own API carry none. Pass only when all of these hold. 1. Every route that changes data, other than a /_handler/ route, ranks the role in the claim before it writes. The order is viewer, contributor, editor, manager, admin. Any other word ranks below viewer. An exported method called over a binding ranks the role in X-OtoDock-Caller. A route meant for every viewer, for link visitors or for the agent's own session with no person says so in a comment. 2. A link visitor (claim.external true) reaches only the routes meant for the public. 3. Writes are attributed from the claim, never from a body field. 4. Every body is checked before use. A body that is not an object gets a 400. Each field is checked for type and length. Numbers are bounded. Choices come from a fixed list. 5. SQL uses ? placeholders. No request value is joined into SQL text, a file path or a program's arguments. 6. There is no eval and no new Function. 7. An error answer is a plain message. err.message, String(err) and stacks go to console.log only. Bun.serve has an error handler and no development key. 8. No key, token or password is written in the code. A key is a declared secret in app.json. 9. A route under /_handler/ checks that the claim's principal is platform and that its handler and delivery match the request. Judge only what this turn changed and the code it touches. Give one finding per problem, located as path:line, with the fix in one sentence.",
+    "engine": "",
+    "model": "",
+    "threshold": null,
+    "mcps": [],
+    "judge_on": "auto",
+    "timeout": 600
+  }
+}

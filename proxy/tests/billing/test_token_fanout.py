@@ -274,6 +274,7 @@ class TestWorkerTick:
         whose write couldn't land."""
         import asyncio
         from unittest.mock import patch
+
         from services.engines import subscription_pool as pool
 
         calls = []
@@ -297,6 +298,7 @@ class TestWorkerTick:
     def test_tick_survives_rebind_failure(self):
         import asyncio
         from unittest.mock import AsyncMock, patch
+
         from services.engines import subscription_pool as pool
 
         with patch("services.engines.subscription_windows.poll_due",
@@ -309,6 +311,7 @@ class TestWorkerTick:
     def _run_unbound_tick(self, *, boot_grace, rows, persisted, bound=frozenset()):
         import asyncio
         from unittest.mock import patch
+
         from services.engines import subscription_pool as pool
 
         freshened = []

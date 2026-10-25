@@ -2,14 +2,15 @@
   "name": "mcps-mcp",
   "label": "MCPs Manager",
   "description": "Lets agents browse the community MCP and skills catalogs, see what is installed/enabled for the current agent, request the admin to install or enable an MCP or skill package, and check an MCP package an agent authored (editors and above). Permission-aware: viewers see zero tools. Also ships the platform's built-in skills (otodock-platform, skill-creator) — on-demand only, available to every agent regardless of role — and the MCP-authoring skill with its package check tool for editors and above.",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "category": "core",
 
   "server": {
     "runtime": "python",
     "transport": "stdio",
     "command": "venv/bin/python",
-    "args": ["server.py"]
+    "args": ["server.py"],
+    "tool_timeout_sec": 600
   },
 
   "credentials": {
@@ -28,7 +29,7 @@
       "id": "otodock-platform",
       "loading": "on_demand",
       "file": "skills/otodock-platform/SKILL.md",
-      "description": "How the OtoDock platform itself works and where every setting lives — installing and first-run setup, agents, AI engines, sessions, apps and sharing, checks, departments and delegation, shared knowledge libraries, tasks/triggers/notifications, remote machines, voice, and the role-labeled settings map. Use when helping a user set up, configure, administer, troubleshoot, or navigate OtoDock.",
+      "description": "How the OtoDock platform itself works and where every setting lives: installing and first-run setup, agents, AI engines, permission modes, sessions and where a chat runs, apps and sharing, checks, departments and delegation, shared knowledge libraries, tasks, triggers and notifications, remote machines, the Android app, voice, and the role-labeled settings map. Use when helping a user set up, configure, administer, troubleshoot, or navigate OtoDock.",
       "default_exclude_from": []
     },
     {

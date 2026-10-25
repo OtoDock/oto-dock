@@ -43,7 +43,12 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
 from core import layout
+
+if TYPE_CHECKING:
+    from core.placement import PlacementCapabilities
 
 logger = logging.getLogger("otodock.mcp-output-relocation")
 
@@ -116,7 +121,7 @@ def session_workspace_shown(ctx) -> str:
     virtual = layout.virtual_workspace(ctx.mount_username)
     placement = getattr(ctx, "placement", None)
     agents_dir = getattr(placement, "agents_dir", "") if placement is not None else ""
-    if agents_dir and placement.is_remote:
+    if agents_dir and cast("PlacementCapabilities", placement).is_remote:
         agent_dir = agents_dir.replace("\\", "/").rstrip("/") + "/" + ctx.agent
         return layout.host_of_virtual(virtual, agent_dir, ctx.mount_username)
     return virtual

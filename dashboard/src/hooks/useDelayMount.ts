@@ -7,16 +7,19 @@ import { useEffect, useState } from 'react'
 // Returns true once condition has been true for at least delayMs continuously.
 // Resets immediately when condition flips false.
 export function useDelayMount(condition: boolean, delayMs: number): boolean {
-  const [mounted, setMounted] = useState(false)
+  const [elapsed, setElapsed] = useState(false)
+  // The condition dropping starts the wait over (in render, on the change).
+  const [seen, setSeen] = useState(condition)
+  if (seen !== condition) {
+    setSeen(condition)
+    if (!condition) setElapsed(false)
+  }
 
   useEffect(() => {
-    if (!condition) {
-      setMounted(false)
-      return
-    }
-    const t = setTimeout(() => setMounted(true), delayMs)
+    if (!condition) return
+    const t = setTimeout(() => setElapsed(true), delayMs)
     return () => clearTimeout(t)
   }, [condition, delayMs])
 
-  return mounted
+  return condition && elapsed
 }

@@ -50,3 +50,23 @@ def test_result_stays_valid_toml(monkeypatch):
     from satellite.tests._toml import toml_loads
     monkeypatch.setenv("DISPLAY", ":99")
     toml_loads(_inject_display_env_toml(TOML))
+
+
+def test_a_value_with_braces_keeps_the_table_whole(monkeypatch):
+    # The path marker is a JSON list of objects: its '}' are inside the
+    # string, and DISPLAY belongs after the table's last pair, not inside
+    # the value (a media MCP's session died at the config check before).
+    import json
+
+    from satellite.tests._toml import toml_loads
+    monkeypatch.setenv("DISPLAY", ":99")
+    monkeypatch.delenv("XAUTHORITY", raising=False)
+    marker = json.dumps([{"tool": "edit_image", "json_path": "image_path", "mode": "read"}])
+    escaped = marker.replace("\\", "\\\\").replace('"', '\\"')
+    toml = (
+        '[mcp_servers.image-gen-mcp]\ncommand = "python3"\n'
+        f'env = {{ "OTO_TOOL_ARG_PATHS" = "{escaped}", "A" = "b" }}\n'
+    )
+    env = toml_loads(_inject_display_env_toml(toml))["mcp_servers"]["image-gen-mcp"]["env"]
+    assert json.loads(env["OTO_TOOL_ARG_PATHS"]) == json.loads(marker)
+    assert env["A"] == "b" and env["DISPLAY"] == ":99"

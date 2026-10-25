@@ -25,6 +25,9 @@ export interface SetBindingVars {
   mcpName: string
   agentName: string
   accountLabel: string
+  /** The person's own GitHub reach for the agent; absent keeps it. */
+  repositories?: string[]
+  readOnly?: boolean
 }
 export interface RemoveBindingVars {
   mcpName: string

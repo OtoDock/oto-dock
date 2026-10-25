@@ -10,8 +10,7 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from storage import db_apps
-from storage import database as task_store
+from storage import database as task_store, db_apps
 
 
 def test_the_facade_carries_the_kind_names():

@@ -8,8 +8,7 @@ is a contract guarantee for community MCP authors.
 
 import pytest
 
-from services.mcp.mcp_registry import _parse_costs_block, CostsBlock
-
+from services.mcp.mcp_registry import CostsBlock, _parse_costs_block
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Happy path

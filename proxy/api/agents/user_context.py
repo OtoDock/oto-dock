@@ -9,13 +9,16 @@ from pathlib import Path
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 
-from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
-
 from api.agents._common import _get_agent_dir
 from api.agents._router import router
-from services.infra.path_confinement import PathOutsideRoot, resolve_under
+from auth.providers import (
+    UserContext,
+    get_current_user,
+    require_agent_access,
+    require_auth,
+)
 from core import layout
-
+from services.infra.path_confinement import PathOutsideRoot, resolve_under
 
 CONTEXT_ALLOWED_EXTENSIONS = {".md", ".txt"}
 
@@ -34,8 +37,8 @@ def _get_user_context_dir(agent_name: str, user: UserContext) -> Path:
     agent_dir = _get_agent_dir(agent_name)
     try:
         ctx_dir = resolve_under(layout.context_dir(agent_dir, username), agent_dir)
-    except PathOutsideRoot:
-        raise HTTPException(403, "Path traversal not allowed")
+    except PathOutsideRoot as exc:
+        raise HTTPException(403, "That path is outside your files.") from exc
     ctx_dir.mkdir(parents=True, exist_ok=True)
     return ctx_dir
 
@@ -45,8 +48,8 @@ def _context_file(ctx_dir: Path, filename: str) -> Path:
     can still spell ``..`` or name a symlink that points out."""
     try:
         return resolve_under(ctx_dir / filename, ctx_dir)
-    except PathOutsideRoot:
-        raise HTTPException(403, "Path traversal not allowed")
+    except PathOutsideRoot as exc:
+        raise HTTPException(403, "That path is outside your files.") from exc
 
 
 class UserContextFileRequest(BaseModel):

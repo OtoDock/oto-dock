@@ -6,6 +6,7 @@ import { useEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { useCreateDepartment } from '../../api/departments'
 import { pushEscHandler } from '../../lib/escStack'
+import { POPOVER } from '../ui/classes'
 
 /** The mode banner (link / move): the app's glass idiom — dark panel,
  * classic border, the source agent as a color-tinted chip (initials +
@@ -19,25 +20,25 @@ export function ModeBanner({ icon, name, color, hint, onCancel }: {
 }) {
   const initials = name.trim().slice(0, 2).toUpperCase()
   return (
-    <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 pl-3 pr-1.5 py-1.5 rounded-xl bg-[#171b30]/90 border border-white/12 backdrop-blur-md shadow-2xl">
-      <span className="text-brand-light shrink-0">{icon}</span>
+    <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 pl-3 pr-1.5 py-1.5 rounded-popover bg-hero-surface border border-hero-border shadow-elevation-3">
+      <span className="text-hero-text shrink-0">{icon}</span>
       <span
-        className="flex items-center gap-1.5 pl-1 pr-2 py-0.5 rounded-lg border shrink min-w-0"
+        className="flex items-center gap-1.5 pl-1 pr-2 py-0.5 rounded-control border shrink min-w-0"
         style={{ background: `${color}1f`, borderColor: `${color}55` }}
       >
         <span
-          className="flex items-center justify-center w-[18px] h-[18px] rounded-md text-[8px] font-bold shrink-0"
+          className="flex items-center justify-center w-5 h-5 rounded-sm text-3xs font-bold shrink-0"
           style={{ background: `${color}33`, color }}
         >
           {initials}
         </span>
-        <span className="text-xs font-medium text-slate-100 max-w-36 truncate">{name}</span>
+        <span className="text-xs font-medium text-hero-text max-w-36 truncate">{name}</span>
       </span>
-      <span className="text-xs text-slate-400 whitespace-nowrap">{hint}</span>
+      <span className="text-xs text-hero-text-muted whitespace-nowrap">{hint}</span>
       <button
         onClick={onCancel}
         aria-label="Cancel"
-        className="p-1 rounded-md text-slate-400 hover:text-slate-200 hover:bg-white/8 shrink-0"
+        className="p-1 rounded-control text-hero-text-muted hover:text-hero-text hover:bg-hero-border shrink-0"
       >
         <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -94,13 +95,13 @@ export function MapMenu({ x, y, header, actions, onClose }: {
     <div
       ref={ref}
       style={{ position: 'fixed', top: clampedY, left: clampedX, zIndex: 60 }}
-      className="min-w-[190px] max-w-[250px] bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg py-1"
+      className={`min-w-[190px] max-w-[250px] ${POPOVER} py-1`}
     >
       {header && (
-        <div className={`px-3 pt-1.5 pb-2 ${actions.length ? 'mb-1 border-b border-p-border-light' : ''}`}>
-          <div className="text-sm font-medium text-p-text truncate">{header.title}</div>
+        <div className={`px-3 pt-1.5 pb-2 ${actions.length ? 'mb-1 border-b border-subtle' : ''}`}>
+          <div className="text-sm font-medium text-primary truncate">{header.title}</div>
           {header.subtitle && (
-            <div className="text-[11px] text-p-text-secondary mt-0.5">{header.subtitle}</div>
+            <div className="text-2xs text-secondary mt-0.5">{header.subtitle}</div>
           )}
         </div>
       )}
@@ -111,10 +112,10 @@ export function MapMenu({ x, y, header, actions, onClose }: {
             a.onClick()
             onClose()
           }}
-          className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs ${
+          className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors duration-fast ${
             a.tone === 'danger'
-              ? 'text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20'
-              : 'text-p-text hover:bg-p-surface-hover'
+              ? 'text-status-danger-fg hover:bg-status-danger-bg'
+              : 'text-primary hover:bg-surface-hover'
           }`}
         >
           {a.icon}
@@ -133,18 +134,18 @@ export function NewDepartmentInline({ name, onName, onClose, onCreated }: {
 }) {
   const create = useCreateDepartment()
   return (
-    <div className="absolute z-30 top-14 left-1/2 -translate-x-1/2 rounded-xl bg-[#171b30]/95 border border-white/10 shadow-2xl backdrop-blur-md p-3 flex items-center gap-2">
+    <div className="absolute z-30 top-14 left-1/2 -translate-x-1/2 rounded-popover bg-hero-surface border border-hero-border shadow-elevation-4 p-3 flex items-center gap-2">
       <input
         autoFocus
         value={name}
         onChange={(e) => onName(e.target.value)}
         placeholder="Department name"
-        className="px-2 py-1 text-sm rounded-md bg-transparent border border-white/12 text-slate-200 outline-none focus:border-brand"
+        className="px-2 py-1 text-sm rounded-control bg-hero-bg border border-hero-text-muted text-hero-text placeholder:text-hero-text-muted outline-none focus:border-hero-text"
         onKeyDown={(e) => { if (e.key === 'Escape') onClose() }}
       />
       <button
         disabled={!name.trim() || create.isPending}
-        className="px-2.5 py-1 text-xs rounded-md bg-brand text-white hover:bg-brand-hover disabled:opacity-50"
+        className="px-2.5 py-1 text-xs rounded-control bg-action text-action-fg hover:bg-action-hover disabled:opacity-50"
         onClick={() =>
           create.mutate({ name: name.trim() }, {
             onSuccess: (d) => onCreated(d.id),
@@ -152,9 +153,12 @@ export function NewDepartmentInline({ name, onName, onClose, onCreated }: {
       >
         Create
       </button>
-      <button onClick={onClose} className="text-slate-500 hover:text-slate-300 text-xs">✕</button>
+      <button onClick={onClose} className="text-hero-text-muted hover:text-hero-text text-xs">✕</button>
       {create.isError && (
-        <span className="text-xs text-p-error">{(create.error as Error).message}</span>
+        <span role="alert" className="flex items-center gap-1 text-xs text-hero-text">
+          <span aria-hidden className="text-status-danger-solid">⚠</span>
+          {(create.error as Error).message}
+        </span>
       )}
     </div>
   )

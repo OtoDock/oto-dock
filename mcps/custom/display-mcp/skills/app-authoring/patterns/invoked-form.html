@@ -1,0 +1,76 @@
+<p class="muted">A form that opens where it is invoked. Add opens the form right under its button, above the list. Escape and Cancel close it and give the focus back to the button. A save that is refused keeps the form open and says why next to it. Use it for every new-item and edit form instead of a dialog. On a phone nothing is focused by code, so the keyboard does not cover the form.</p>
+
+<div class="invoked">
+  <div class="invoked-bar">
+    <h3 style="margin: 0">Services</h3>
+    <button type="button" class="btn primary sm" id="add-service">Add a service</button>
+  </div>
+  <div class="card invoked-form" id="service-form" hidden>
+    <div class="form-fields">
+      <div><label class="label" for="svc-name">Name</label><input id="svc-name" placeholder="Haircut"></div>
+      <div><label class="label" for="svc-price">Price in euros</label><input id="svc-price" inputmode="decimal" placeholder="25"></div>
+    </div>
+    <p class="invoked-error" id="svc-error" role="alert"></p>
+    <div class="row" style="margin-top: 12px; gap: 8px">
+      <button type="button" class="btn primary sm" id="svc-save">Save</button>
+      <button type="button" class="btn ghost sm" id="svc-cancel">Cancel</button>
+    </div>
+  </div>
+  <ul class="invoked-list card" id="service-list">
+    <li>Haircut <span class="muted">25.00</span></li>
+    <li>Colour <span class="muted">60.00</span></li>
+  </ul>
+</div>
+
+<style>
+.form-fields { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+.invoked-bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.invoked-form { margin-bottom: 12px; background: var(--p-surface-raised); box-shadow: var(--p-elevation-2); }
+.invoked-error { margin: 8px 0 0; min-height: 1.2em; font-size: var(--p-font-size-xs); color: var(--p-status-danger-fg); }
+.invoked-list { list-style: none; margin: 0; padding: 0; }
+.invoked-list li { display: flex; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid var(--p-border-light); font-size: var(--p-font-size-sm); }
+.invoked-list li:last-child { border-bottom: 0; }
+</style>
+
+<script>
+(function () {
+  var opener = document.getElementById('add-service')
+  var form = document.getElementById('service-form')
+  var error = document.getElementById('svc-error')
+  var list = document.getElementById('service-list')
+  var coarse = matchMedia('(pointer: coarse)').matches
+  function open() {
+    form.hidden = false
+    error.textContent = ''
+    form.scrollIntoView({ block: 'nearest' })
+    if (!coarse) document.getElementById('svc-name').focus()
+  }
+  function close() {
+    form.hidden = true
+    opener.focus()
+  }
+  function save() {
+    var name = document.getElementById('svc-name').value.trim()
+    var price = document.getElementById('svc-price').value.trim()
+    if (!name) { error.textContent = 'Give the service a name.'; return }
+    if (!/^\d+(\.\d{1,2})?$/.test(price)) { error.textContent = 'The price is a number, like 25 or 12.50.'; return }
+    var li = document.createElement('li')
+    li.textContent = name + ' '
+    var p = document.createElement('span')
+    p.className = 'muted'
+    p.textContent = Number(price).toFixed(2)
+    li.appendChild(p)
+    list.appendChild(li)
+    document.getElementById('svc-name').value = ''
+    document.getElementById('svc-price').value = ''
+    close()
+  }
+  opener.addEventListener('click', open)
+  document.getElementById('svc-cancel').addEventListener('click', close)
+  document.getElementById('svc-save').addEventListener('click', save)
+  form.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); close() }
+    if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); save() }
+  })
+})()
+</script>

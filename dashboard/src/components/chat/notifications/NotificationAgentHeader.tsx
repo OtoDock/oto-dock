@@ -1,13 +1,9 @@
 import type { AgentSummary } from '../../../api/agents'
+import { titleCaseSlug } from './NotificationAgentHeader.helpers'
 
 interface Props {
   agentSlug?: string | null
   agents?: AgentSummary[]
-}
-
-/** "personal-assistant-lite" → "Personal Assistant Lite" (chat-header fallback). */
-export function titleCaseSlug(slug: string): string {
-  return slug.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
 /**
@@ -15,7 +11,7 @@ export function titleCaseSlug(slug: string): string {
  * avatar (colored circle + initial) and display name, at panel scale.
  *
  * Resolves `agentSlug` against the cached agents list (`useAgents`); an
- * unresolvable slug falls back to a title-cased slug on the brand color so
+ * unresolvable slug falls back to a title-cased slug on the agent fill so
  * rows from agents the viewer can't open — and rows that predate the list —
  * still render. Without a slug (platform / system notifications) it renders
  * a neutral "OtoDock" header, so every card has the same first row.
@@ -28,7 +24,7 @@ export default function NotificationAgentHeader({ agentSlug, agents }: Props) {
         data-testid="notification-agent-header"
         data-agent=""
       >
-        <span className="flex items-center justify-center w-4 h-4 rounded-full bg-p-text-light/70 text-white shrink-0">
+        <span className="flex items-center justify-center w-4 h-4 rounded-full bg-surface-muted text-secondary shrink-0">
           <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
             <path
               strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5}
@@ -36,7 +32,7 @@ export default function NotificationAgentHeader({ agentSlug, agents }: Props) {
             />
           </svg>
         </span>
-        <span className="text-[11px] font-medium text-p-text-secondary truncate">OtoDock</span>
+        <span className="text-2xs font-medium text-secondary truncate">OtoDock</span>
       </div>
     )
   }
@@ -53,12 +49,12 @@ export default function NotificationAgentHeader({ agentSlug, agents }: Props) {
       data-agent={agentSlug}
     >
       <span
-        className={`flex items-center justify-center w-4 h-4 rounded-full text-white text-[10px] font-semibold leading-none shrink-0 ${color ? '' : 'bg-brand'}`}
+        className={`flex items-center justify-center w-4 h-4 rounded-full text-on-solid text-3xs font-semibold leading-none shrink-0 ${color ? '' : 'bg-accent-agent-fill'}`}
         style={color ? { backgroundColor: color } : undefined}
       >
         {initial}
       </span>
-      <span className="text-[11px] font-medium text-p-text-secondary truncate">{displayName}</span>
+      <span className="text-2xs font-medium text-secondary truncate">{displayName}</span>
     </div>
   )
 }

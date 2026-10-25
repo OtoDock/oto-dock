@@ -20,6 +20,7 @@ import type { useChatStream } from '../../../hooks/useChatStream'
 import type { AgentSummary, LayerCapabilities } from '../../../api/agents'
 import { useUserExecutionLayers } from '../../../api/executionLayers'
 import { computeModelGroups, pickSeedModel, visibleAgentPaths } from '../../../lib/modelGroups'
+import { currentMode, seedMode } from '../../../lib/engines/modes'
 import { useAgentPrefsStore } from '../../../store/agentPrefsStore'
 
 type Stream = ReturnType<typeof useChatStream>
@@ -151,7 +152,7 @@ export function useModelEngineReconcile({
     setPendingEngineSwitch(null)
     setEngineSwitchBusy(false)
     setEngineSwitchError(null)
-  }, [chatId, agentName])
+  }, [chatId, agentName, setPendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError])
   // A second tab / server-initiated turn revived the chat under an open
   // banner — the dropdown collapses back to the active engine; drop the
   // provisional pick instead of deadlocking send against a hidden group.
@@ -161,9 +162,9 @@ export function useModelEngineReconcile({
       setEngineSwitchBusy(false)
       setEngineSwitchError(null)
     }
-  }, [viewedStreaming, warming])
+  }, [viewedStreaming, warming, setPendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError])
   // warmup_ready adopted a session — the process is alive again.
-  useEffect(() => { if (sessionId) setProcessAlive(true) }, [sessionId])
+  useEffect(() => { if (sessionId) setProcessAlive(true) }, [sessionId, setProcessAlive])
 
   // Seed model + mode on initial render / new chat.
   // For NEW chats (no urlChatId), the user's per-agent sticky preference
@@ -183,7 +184,7 @@ export function useModelEngineReconcile({
     // explicit picks (handleModeChange/handleModelChange save every change),
     // so re-seeding never loses a real choice.
     setModel(stickyModel || agentDefaultModel)
-    setMode(stickyMode || 'default')
+    setMode(seedMode(stickyMode))
     // (The interactive toggle's sticky seed lives in the dedicated effect
     // below — it must also re-fire when the ui-prefs hydration lands.)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -243,7 +244,7 @@ export function useModelEngineReconcile({
     if (!seed) return
     setModel(seed.model)
     setSelectedLayer(seed.layer)
-  }, [urlChatId, chatActiveLayer, selectedLayer, modelGroups, model, agentName, agentDefaultModel, currentAgent, layers])
+  }, [urlChatId, chatActiveLayer, selectedLayer, modelGroups, model, agentName, agentDefaultModel, currentAgent, layers, setModel, setSelectedLayer])
 
   return { modelGroups }
 }
@@ -253,16 +254,20 @@ export function useModelEngineReconcile({
 const STORED_ONLY_MODES: ReadonlySet<string> = new Set(['auto', 'judge'])
 
 /** Never leave the permission mode on one the engine does not declare (a
- *  stale per-agent sticky "plan" restored onto Codex / Direct LLM, a model
- *  switch across engines): the first declared mode wins. A stored-only mode
- *  is the chat's own fact and stays. */
+ *  stale per-agent sticky "plan" restored onto Codex / Direct LLM, Auto on
+ *  an engine with no reviewer, a model switch across engines): the first
+ *  declared mode wins. A word from before 1.9 reads as its current one
+ *  first. A stored-only mode is the chat's own fact and stays. */
 export function usePermissionModeInvariant(
   mode: string, permissionModes: string[] | undefined, setMode: (m: string) => void,
 ) {
   useEffect(() => {
     if (STORED_ONLY_MODES.has(mode)) return
-    if (permissionModes && permissionModes.length > 0 && !permissionModes.includes(mode)) {
+    const current = currentMode(mode)
+    if (permissionModes && permissionModes.length > 0 && !permissionModes.includes(current)) {
       setMode(permissionModes[0])
+    } else if (current !== mode) {
+      setMode(current)
     }
   }, [mode, permissionModes, setMode])
 }
@@ -316,7 +321,8 @@ export function useModelEngineHandlers({
     if (!ws.streaming) {
       setSelectedLayer(layer)
     }
-  }, [ws, parseModelValue, agentName, chatId, chatActiveLayer, viewedStreaming, warming, isTaskChat])
+  }, [ws, parseModelValue, agentName, chatId, chatActiveLayer, viewedStreaming, warming, isTaskChat,
+    setEngineSwitchBusy, setEngineSwitchError, setPendingEngineSwitch, setModel, setSelectedLayer])
 
   // Cross-engine switch confirm/cancel (EngineSwitchBanner + its dialog).
   const handleEngineSwitchConfirm = useCallback(() => {
@@ -324,12 +330,12 @@ export function useModelEngineHandlers({
     setEngineSwitchBusy(true)
     setEngineSwitchError(null)
     ws.switchEngine(pendingEngineSwitch.layer, pendingEngineSwitch.model)
-  }, [ws, pendingEngineSwitch])
+  }, [ws, pendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError])
   const handleEngineSwitchCancel = useCallback(() => {
     setPendingEngineSwitch(null)
     setEngineSwitchBusy(false)
     setEngineSwitchError(null)
-  }, [])
+  }, [setPendingEngineSwitch, setEngineSwitchBusy, setEngineSwitchError])
 
   return { handleModelChange, handleEngineSwitchConfirm, handleEngineSwitchCancel }
 }

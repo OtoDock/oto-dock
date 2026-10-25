@@ -10,14 +10,14 @@ the phone daemon, and the telephony secret stays on the platform.
 """
 
 import contextlib
-import os
 import logging
+import os
 import re
 
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("make-call-mcp")
@@ -118,6 +118,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["phone_number", "task_description"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
         ),
         Tool(
             name="wait_for_call",
@@ -149,6 +150,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["call_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
         Tool(
             name="answer_call_question",
@@ -176,6 +178,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["call_id", "answer"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
         ),
         Tool(
             name="get_call_status",
@@ -193,6 +196,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["call_id"],
             },
+            annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
         ),
     ]
 
@@ -223,7 +227,7 @@ async def _handle_make_call(arguments: dict) -> list[TextContent]:
             text="Error: phone_number and task_description are required.",
         )]
 
-    logger.debug(f"Making call: {task_description}")
+    logger.debug("Making call: %s", task_description)
 
     try:
         async with httpx.AsyncClient(

@@ -174,29 +174,22 @@ export function useWorkspaceState(agentName: string, lastAssistantMessageId: str
   const open = searchParams.get('ws') === '1'
   const previewPath = searchParams.get('ws_preview') || null
 
-  // Exit selection mode whenever the overlay closes.
-  useEffect(() => {
+  // The overlay opening snapshots the assistant message id (the dot stays
+  // lit while the live id diverges; updates while open never reset the
+  // baseline); closing clears it and leaves selection mode. Both happen in
+  // render, on the toggle.
+  const [wasOpen, setWasOpen] = useState(open)
+  const [seen, setSeen] = useState<string | null>(open ? lastAssistantMessageId : null)
+  if (wasOpen !== open) {
+    setWasOpen(open)
+    setSeen(open ? lastAssistantMessageId : null)
     if (!open) setSelectionMode(false)
-  }, [open])
-
-  // Snapshot the assistant message id at the moment the overlay opens; the
-  // dot stays lit while the live id diverges. Cleared when the overlay closes.
-  const seenRef = useRef<string | null>(null)
-  useEffect(() => {
-    if (open) {
-      seenRef.current = lastAssistantMessageId
-    } else {
-      seenRef.current = null
-    }
-  // We intentionally only run on `open` toggles; updates to the message id
-  // while the overlay is open must NOT reset the seen baseline.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
+  }
   const hasNewMessage =
     open &&
-    seenRef.current !== null &&
+    seen !== null &&
     lastAssistantMessageId !== null &&
-    seenRef.current !== lastAssistantMessageId
+    seen !== lastAssistantMessageId
 
   // ---- URL helpers (preserve all other params) ----
 

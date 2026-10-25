@@ -13,10 +13,11 @@ delete still leaves the tree non-empty, so it IS attributed — no volume heuris
 import sys
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
-from core.remote.file_sync import FileEntry, diff_manifests  # noqa: E402
+from core.remote.file_sync import FileEntry, diff_manifests
 
 
 def _act(plan, path):

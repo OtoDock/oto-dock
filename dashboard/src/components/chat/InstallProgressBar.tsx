@@ -26,7 +26,9 @@ interface Props {
 // Render precedence (top-down, first match wins):
 //  1. install.status === 'failed' → red banner with retry button
 //  2. install.status === 'installing' → progress strip with elapsed-time hint
-//  3. install.status === 'done' && elapsedSinceDone < 1500ms → grace "Install complete"
+//  3. install.status === 'done' && elapsedSinceDone < 1500ms → grace "Install complete",
+//     unless the session started with tools still installing (the chat's
+//     line names them): the bar then goes with the session start
 //  4. else → nothing
 //
 // Warmup failures (offline machine, session-start error) are NOT rendered
@@ -46,6 +48,9 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
     !fromChat && !fromKey ? agent : null,
   )
   const install = fromChat ?? fromKey ?? fromAgent
+  // The clock the elapsed hint and the done-grace window read, advanced by
+  // the tick below while the bar shows.
+  const [now, setNow] = useState(() => Date.now())
 
   // Render gating — anything we may want to show; final decision happens
   // after delay-mount + per-status checks below.
@@ -55,17 +60,16 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
     install?.status === 'failed'
   const installedMcps = !!install?.mcps.some((m) => m !== WORKSPACE_ROW)
   const installDoneRecent =
-    install?.status === 'done' && installedMcps &&
-    install.doneAt && Date.now() - install.doneAt < 1500
+    install?.status === 'done' && installedMcps && !install.stillInstalling?.length &&
+    install.doneAt && now - install.doneAt < 1500
   const anyShowing = installShowing || installDoneRecent
   const visible = useDelayMount(!!anyShowing, 500)
 
   // Tick once per second so the elapsed-time hint refreshes without
   // requiring more events from the backend.
-  const [, setTick] = useState(0)
   useEffect(() => {
     if (!visible) return
-    const t = setInterval(() => setTick((n) => n + 1), 1000)
+    const t = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(t)
   }, [visible])
 
@@ -77,7 +81,7 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
   if (install?.status === 'failed') {
     return (
       <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs">
-        <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-sm border border-red-500/40 bg-red-500/10 text-red-600">
+        <div className="flex items-center justify-between gap-3 px-3 py-2 rounded-sm border border-status-danger-solid bg-status-danger-bg text-status-danger-fg">
           <span className="truncate min-w-0">
             <strong>Install failed:</strong> {install.error ?? 'Unknown error.'}
           </span>
@@ -85,7 +89,7 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
             <button
               type="button"
               onClick={onRetry}
-              className="shrink-0 px-2 py-1 rounded-sm border border-red-500/40 hover:bg-red-500/20"
+              className="shrink-0 px-2 py-1 rounded-sm border border-status-danger-solid hover:bg-status-danger-bg"
             >
               Retry
             </button>
@@ -99,14 +103,14 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
   if (install?.status === 'installing') {
     const totalPct = computeAggregatePct(install)
     const currentMcp = pickActiveMcp(install)
-    const elapsedS = Math.floor((Date.now() - install.startedAt) / 1000)
+    const elapsedS = Math.max(0, Math.floor((now - install.startedAt) / 1000))
     const showLongHint = elapsedS >= 30
     return (
-      <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs text-p-text-light">
+      <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs text-tertiary">
         <div className="flex flex-col gap-1">
-          <div className="h-1 w-full bg-p-text-light/10 rounded-sm overflow-hidden">
+          <div className="h-1 w-full bg-surface-muted rounded-sm overflow-hidden">
             <div
-              className="h-full bg-p-text-light/60 transition-[width] duration-300 ease-out"
+              className="h-full bg-status-info-solid transition-[width] duration-300 ease-out"
               style={{ width: `${totalPct}%` }}
             />
           </div>
@@ -119,16 +123,16 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
           {install.failures.length > 0 && (
             <div className="flex flex-col gap-0.5 mt-1">
               {install.failures.map((f) => (
-                <span key={f.mcp} className="text-red-500/80">
-                  <span className="line-through">{f.mcp}</span>: install failed — session
-                  will start without it
+                <span key={f.mcp} className="text-status-danger-fg">
+                  <span className="line-through">{f.mcp}</span>: install failed. The chat
+                  will start without it.
                 </span>
               ))}
             </div>
           )}
           {showLongHint && (
             <div className="opacity-60 mt-1">
-              First-time install on a fresh machine can take ~90s.
+              The first install on a new machine can take about 90 seconds.
             </div>
           )}
         </div>
@@ -139,10 +143,10 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
   // ── 2b. post-install pre-warm boot check ──
   if (install?.status === 'verifying') {
     return (
-      <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs text-p-text-light">
+      <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs text-tertiary">
         <div className="flex flex-col gap-1">
-          <div className="h-1 w-full bg-p-text-light/10 rounded-sm overflow-hidden">
-            <div className="h-full w-full bg-p-text-light/60 animate-pulse" />
+          <div className="h-1 w-full bg-surface-muted rounded-sm overflow-hidden">
+            <div className="h-full w-full bg-status-info-solid animate-pulse" />
           </div>
           <span className="truncate min-w-0">Checking MCPs…</span>
         </div>
@@ -153,14 +157,15 @@ export default function InstallProgressBar({ chatId, machineId, agent, onRetry }
   // ── 3. done grace window (only when MCPs were actually involved — an
   //       empty/no-op sync emits no lifecycle, and a workspace sync alone
   //       is not an install, so it never flashes "100%") ──
-  if (install?.status === 'done' && installedMcps && install.doneAt && Date.now() - install.doneAt < 1500) {
+  if (install?.status === 'done' && installedMcps && !install.stillInstalling?.length &&
+      install.doneAt && now - install.doneAt < 1500) {
     const warnCount = install.warmupFailures?.length ?? 0
     return (
-      <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs text-p-text-light">
+      <div className="w-full px-4 py-2 mx-auto max-w-4xl text-xs text-tertiary">
         <div className="flex items-center justify-between gap-3">
           <span className="truncate opacity-80">
             {warnCount > 0
-              ? `Install complete — ${warnCount} MCP(s) need attention.`
+              ? `Install complete. ${warnCount} MCP(s) need attention.`
               : 'Install complete.'}
           </span>
           <span className="shrink-0 tabular-nums opacity-60">100%</span>

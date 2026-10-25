@@ -29,4 +29,11 @@ regexes = [
     # dashboard/src/tests/browserModeControls.test.tsx — the own-browser
     # extension-token field exercised with an obviously synthetic value.
     '''tok-123456789012345''',
+    # proxy/tests/fixtures/characterization/claude-*.jsonl — the Anthropic
+    # message ids the CLI prints in its recorded frames (identifiers, not
+    # keys; the recordings' real tokens were scrubbed before they were kept).
+    '''api_message_id": "msg_01[A-Za-z0-9]{22}(?:"|$)''',
+    # A test fixture's project rows: a slug whose words look like a secret's
+    # name, followed by the row's id (a UUID, not a key).
+    '''(?:credential-broker-1-7-2|oauth-verification)', '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'''',
 ]

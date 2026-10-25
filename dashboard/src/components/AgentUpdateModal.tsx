@@ -15,10 +15,16 @@ import {
   useTakeNewVersion,
   useTemplateUpdatePlan,
   useTemplateUpdateStatus,
+  taskPinNotes,
+  TASK_PINS_HEADING,
   type TemplateUpdateKept,
   type TemplateUpdateReport,
 } from '../api/communityAgents'
+import { refusalProblems } from '../lib/http/apiJson'
 import { DetailsToggle, ManifestBlocks, ManifestSummary } from './apps/AppApprovalCard'
+import Dialog from './ui/Dialog'
+import Button from './ui/Button'
+import { DIALOG_PANEL } from './ui/classes'
 
 interface Props {
   open: boolean
@@ -102,8 +108,8 @@ export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
   const list = (title: string, items: string[]) =>
     items.length > 0 ? (
       <div className="mb-3">
-        <div className="font-medium text-p-text mb-1">{title}</div>
-        <ul className="list-disc pl-5 space-y-0.5 text-p-text-secondary">
+        <div className="font-medium text-primary mb-1">{title}</div>
+        <ul className="list-disc pl-5 space-y-0.5 text-secondary">
           {items.map((it, i) => <li key={i}>{it}</li>)}
         </ul>
       </div>
@@ -115,35 +121,30 @@ export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
     return (<>
     {removed.length > 0 && (
       <div className="mb-3" data-testid="removed-list">
-        <div className="font-medium text-p-text mb-1">Left out, because you removed them</div>
-        <ul className="list-disc pl-5 space-y-0.5 text-p-text-secondary">
+        <div className="font-medium text-primary mb-1">Left out, because you removed them</div>
+        <ul className="list-disc pl-5 space-y-0.5 text-secondary">
           {removed.map((k, i) => <li key={i}>{k.what}</li>)}
         </ul>
       </div>
     )}
     {items.length > 0 ? (
       <div className="mb-3">
-        <div className="font-medium text-p-text mb-1">
-          Kept as you have them{withTake ? ' (the new version is stored beside each)' : ' (the new version will be stored beside each)'}
+        <div className="font-medium text-primary mb-1">
+          Kept as you have them{withTake ? ', with the new version stored beside each' : ', with the new version to be stored beside each'}
         </div>
-        <ul className="space-y-1 text-p-text-secondary">
+        <ul className="space-y-1 text-secondary">
           {items.map((k, i) => (
             <li key={i} className="flex flex-wrap items-center gap-x-2 gap-y-1" data-testid="kept-row">
               <span>{k.what}</span>
-              <span className="text-p-text-light">· {k.reason}</span>
-              {k.path && <code className="text-[11px] text-p-text-light">{k.path}</code>}
+              <span className="text-tertiary">· {k.reason}</span>
+              {k.path && <code className="text-2xs text-tertiary">{k.path}</code>}
               {withTake && k.new_path && (
                 taken[k.new_path]
-                  ? <span className="text-[11px] text-p-text-light">{taken[k.new_path]}</span>
+                  ? <span className="text-2xs text-tertiary">{taken[k.new_path]}</span>
                   : (
-                    <button
-                      type="button"
-                      onClick={() => take(k)}
-                      disabled={takeNew.isPending}
-                      className="text-[11px] px-2 py-0.5 rounded-sm border border-p-border-light text-p-text-secondary hover:bg-p-surface-hover transition-colors disabled:opacity-50"
-                    >
+                    <Button type="button" onClick={() => take(k)} disabled={takeNew.isPending}>
                       Take the new version
-                    </button>
+                    </Button>
                   )
               )}
             </li>
@@ -158,7 +159,7 @@ export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
     if (report) {
       return (
         <div className="text-xs" data-testid="update-report">
-          <p className="text-sm text-p-text mb-3">
+          <p className="text-sm text-primary mb-3">
             Updated to <strong>{report.to_version}</strong>.
             {report.unchanged ? ` ${report.unchanged} piece(s) were already current.` : ''}
           </p>
@@ -169,8 +170,9 @@ export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
           {list('Checks offered, not mandatory', report.offered_checks)}
           {report.mcps?.requested?.length ? list('MCPs waiting for an admin', report.mcps.requested) : null}
           {report.notes?.length ? list('Notes', report.notes) : null}
+          {list(TASK_PINS_HEADING, taskPinNotes(report))}
           {(report.members?.user_setup_kept ?? 0) > 0 && (
-            <p className="text-p-text-light">
+            <p className="text-tertiary">
               {report.members!.user_setup_kept} member(s) keep their own onboarding guide, edited since it was seeded.
             </p>
           )}
@@ -179,46 +181,60 @@ export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
     }
     if (failed) {
       return (
-        <p className="text-xs text-red-500">
-          The update failed: {status.data?.error || (lost ? 'the platform restarted while it ran' : 'unknown error')}. What was applied stands; press Update again to resume.
+        <p className="text-xs text-status-danger-fg">
+          The update failed: {status.data?.error || (lost ? 'the platform restarted while it ran' : 'unknown error')}. What was applied stays. Press Update again to resume.
         </p>
       )
     }
     if (started) {
-      return <p className="text-xs text-p-text-secondary">Updating… the report lands here and in your notifications.</p>
+      return <p className="text-xs text-secondary">Updating… The report lands here and in your notifications.</p>
     }
-    if (plan.isLoading) return <p className="text-xs text-p-text-secondary">Reading the catalog and comparing…</p>
-    if (plan.isError) return <p className="text-xs text-red-500">{(plan.error as Error)?.message || 'The plan could not be read.'}</p>
+    if (plan.isLoading) return <p className="text-xs text-secondary">Reading the community list and comparing…</p>
+    if (plan.isError) {
+      const problems = refusalProblems(plan.error)
+      if (problems.length > 0) {
+        return (
+          <div className="text-xs text-status-danger-fg" data-testid="plan-problems">
+            <p className="mb-1">The new version cannot be used:</p>
+            <ul className="list-disc pl-5 space-y-0.5">
+              {problems.map((it, i) => <li key={i}>{it}</li>)}
+            </ul>
+          </div>
+        )
+      }
+      return <p className="text-xs text-status-danger-fg">{(plan.error as Error)?.message || 'The plan could not be read.'}</p>
+    }
     const p = plan.data
     if (!p) return null
     return (
       <div className="text-xs">
-        <p className="text-sm text-p-text mb-3">
+        <p className="text-sm text-primary mb-3">
           <strong>{p.display_name}</strong> {p.from_version || 'unknown'} → <strong>{p.to_version}</strong>
           {!p.has_baseline && (
-            <span className="block text-p-text-light mt-1">
-              This agent was installed before updates existed, so nothing it has is replaced: every piece is kept and the new versions are stored beside them; what the new version adds is added.
+            <span className="block text-tertiary mt-1">
+              This agent was installed before updates existed, so nothing is replaced. Every piece is kept, with the new version stored beside it. What the new version adds is added.
             </span>
           )}
         </p>
-        {list('Will be replaced (unchanged since the install)', p.replaced)}
+        {list('Will be replaced, unchanged since the install', p.replaced)}
         {list('Will be added', p.added)}
         {keptList(p.kept, false)}
-        {p.unchanged > 0 && <p className="text-p-text-light mb-3">{p.unchanged} piece(s) are already current.</p>}
+        {p.unchanged > 0 && <p className="text-tertiary mb-3">{p.unchanged} piece(s) are already current.</p>}
         {p.mcps?.new?.length ? list('MCPs the new version needs', p.mcps.new) : null}
+        {list(TASK_PINS_HEADING, taskPinNotes(p))}
 
         {hasConsentItems && (
-          <div className="rounded-lg border border-p-border-light bg-p-bg p-3" data-testid="update-consent">
+          <div className="rounded-card border border-subtle p-3" data-testid="update-consent">
             {consentApps.length > 0 && (
-              <div className="font-medium text-p-text mb-2">
+              <div className="font-medium text-primary mb-2">
                 {consentApps.length === 1 ? 'An app the new version brings or changes' : `${consentApps.length} apps the new version brings or changes`}
               </div>
             )}
             {consentApps.map(a => (
               <div key={a.slug} className="mb-3" data-testid={`consent-app-${a.slug}`}>
                 <div className="flex flex-wrap items-baseline gap-x-1.5">
-                  <span className="font-medium text-p-text">{a.title}</span>
-                  <span className="text-p-text-secondary">
+                  <span className="font-medium text-primary">{a.title}</span>
+                  <span className="text-secondary">
                     {a.change === 'new' ? 'new · ' : 'changed · '}
                     {a.visibility === 'user' ? 'one copy for each member' : 'shared by the agent'}
                     {a.owner_approval ? ' · each member approves their own copy' : ''}
@@ -236,16 +252,16 @@ export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
             ))}
             {consentChecks.length > 0 && (
               <div className="mb-2">
-                <div className="font-medium text-p-text mb-1">
+                <div className="font-medium text-primary mb-1">
                   {consentChecks.length === 1 ? 'A check the new version brings or changes' : `${consentChecks.length} checks the new version brings or changes`}
                 </div>
-                <ul className="space-y-1 text-p-text-secondary">
+                <ul className="space-y-1 text-secondary">
                   {consentChecks.map(c => (
                     <li key={c.name} data-testid={`consent-check-${c.name}`}>
-                      <span className="font-mono text-[11px] text-p-text">{c.name}</span>
-                      {c.mandatory ? <span> (mandatory)</span> : null}
+                      <span className="font-mono text-2xs text-primary">{c.name}</span>
+                      {c.mandatory ? <span>, mandatory</span> : null}
                       {c.description ? <span>: {c.description}</span> : null}
-                      {c.words ? <span> — {c.words}</span> : null}
+                      {c.words ? <span> · {c.words}</span> : null}
                     </li>
                   ))}
                 </ul>
@@ -256,17 +272,17 @@ export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
                 type="checkbox"
                 checked={approveAll}
                 onChange={e => setApproveAll(e.target.checked)}
-                className="mt-0.5 rounded-sm border-p-border-light text-brand focus:ring-brand/40"
+                className="mt-0.5 accent-action"
                 data-testid="update-consent-checkbox"
               />
-              <span className="text-p-text">
+              <span className="text-primary">
                 {p.consent_scope === 'everyone'
                   ? 'Approve these apps and checks for everyone who gets a copy'
-                  : 'Approve these apps and checks (the shared ones and your own copy; members approve theirs)'}
+                  : 'Approve these apps and checks: the shared ones and your own copy. Members approve theirs.'}
               </span>
             </label>
-            <p className="mt-1 text-p-text-light">
-              Unticked, each new app release waits for approval on its card and each check stays offered, not mandatory.
+            <p className="mt-1 text-tertiary">
+              Unticked, each new app release waits for approval on its card. Each check stays offered, not mandatory.
             </p>
           </div>
         )}
@@ -280,39 +296,38 @@ export default function AgentUpdateModal({ open, agentSlug, onClose }: Props) {
     // (min-h-0, or a flex child grows to its content and pushes the footer
     // out of the clipped panel — the 2026-09-19 phone pass: the buttons cut
     // in half below the screen, unreachable by scrolling).
-    <div className="fixed inset-0 z-[60] flex items-start justify-center bg-black/40 p-3 sm:px-4 sm:py-8" onClick={onClose}>
-      <div
-        className="bg-white dark:bg-gray-800 rounded-xl shadow-xl border border-p-border-light w-full max-w-2xl max-h-[calc(100vh-1.5rem)] supports-[height:100dvh]:max-h-[calc(100dvh-1.5rem)] sm:max-h-[calc(100vh-4rem)] sm:supports-[height:100dvh]:max-h-[calc(100dvh-4rem)] flex flex-col overflow-hidden"
-        onClick={e => e.stopPropagation()}
-        data-testid="update-modal-panel"
-      >
-        <div className="shrink-0 flex items-center justify-between px-5 py-4 border-b border-p-border-light">
-          <h3 className="text-base font-semibold text-p-text">Update from the template</h3>
-          <button onClick={onClose} className="text-p-text-light hover:text-p-text text-lg leading-none">&times;</button>
+    <Dialog
+      onClose={onClose}
+      busy={applyUpdate.isPending}
+      aria-labelledby="agent-update-title"
+      panelClassName={`${DIALOG_PANEL} max-w-2xl max-h-[calc(100vh-1.5rem)] supports-[height:100dvh]:max-h-[calc(100dvh-1.5rem)] sm:max-h-[calc(100vh-4rem)] sm:supports-[height:100dvh]:max-h-[calc(100dvh-4rem)] flex flex-col overflow-hidden`}
+    >
+      <div className="contents" data-testid="update-modal-panel">
+        <div className="shrink-0 flex items-center justify-between px-5 py-4 border-b border-subtle">
+          <h3 id="agent-update-title" className="text-base font-semibold text-primary">Update from the template</h3>
+          <button type="button" aria-label="Close" onClick={onClose} className="text-tertiary hover:text-primary text-lg leading-none">&times;</button>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">
           {body()}
-          {error && <p className="text-xs text-red-500 mt-3">{error}</p>}
+          {error && <p className="text-xs text-status-danger-fg mt-3">{error}</p>}
         </div>
-        <div className="shrink-0 flex justify-end gap-2 px-5 py-3 border-t border-p-border-light">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 rounded-lg text-sm font-medium text-p-text-secondary bg-p-surface hover:bg-p-surface-hover transition-colors"
-          >
+        <div className="shrink-0 flex justify-end gap-2 px-5 py-3 border-t border-subtle">
+          <Button size="md" onClick={onClose}>
             {report || failed ? 'Close' : 'Cancel'}
-          </button>
+          </Button>
           {(!started || failed) && (
-            <button
+            <Button
+              variant="primary"
+              size="md"
               onClick={submit}
               disabled={!plan.data || applyUpdate.isPending}
-              className="px-4 py-2 rounded-lg text-sm font-medium text-white bg-brand hover:bg-brand-hover transition-colors disabled:opacity-50"
               data-testid="update-submit"
             >
               {applyUpdate.isPending ? 'Starting…' : approveAll && hasConsentItems ? 'Update and approve' : 'Update'}
-            </button>
+            </Button>
           )}
         </div>
       </div>
-    </div>
+    </Dialog>
   )
 }

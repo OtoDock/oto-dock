@@ -225,11 +225,11 @@ export const usePatchShare = () => {
   return useMutation({
     mutationFn: ({ id, ...body }: PatchShareInput): Promise<Share> =>
       shareWrite(`/v1/shares/${id}`, 'PATCH', body, 'Could not change the share'),
-    onSettled: () => {
-      qc.invalidateQueries({ queryKey: ['shares'] })
-      qc.invalidateQueries({ queryKey: ['apps'] })
-      qc.invalidateQueries({ queryKey: ['app'] })
-    },
+    onSettled: () => Promise.all([
+      qc.invalidateQueries({ queryKey: ['shares'] }),
+      qc.invalidateQueries({ queryKey: ['apps'] }),
+      qc.invalidateQueries({ queryKey: ['app'] }),
+    ]),
   })
 }
 

@@ -26,16 +26,16 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-import config  # noqa: E402
-from api.mcp import icons as icons_api  # noqa: E402
-from auth.providers import UserContext, get_current_user  # noqa: E402
-from services.community import community_catalog, community_icons  # noqa: E402
-from services.mcp import mcp_manifest_parse  # noqa: E402
-
+import config
+from api.mcp import icons as icons_api
+from auth.providers import UserContext, get_current_user
+from services.community import community_catalog, community_icons
+from services.mcp import mcp_manifest_parse
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -380,6 +380,96 @@ def test_route_404s_when_the_catalog_has_no_icon(no_installed, monkeypatch):
     assert r.status_code == 404
     # A miss is short-lived: the MCP may get installed in the meantime.
     assert r.headers["cache-control"] == "private, max-age=300"
+
+
+# ---------------------------------------------------------------------------
+# The lists' icon flag: what the route will answer, by the caches alone
+# ---------------------------------------------------------------------------
+
+def test_catalog_icon_known_reads_the_caches_only(resolver, monkeypatch):
+    monkeypatch.setattr(community_catalog._registry_cache, "value", None)
+    assert community_icons.catalog_icon_known("github-mcp") is False
+    monkeypatch.setattr(community_catalog._registry_cache, "value", REGISTRY)
+    assert community_icons.catalog_icon_known("github-mcp") is True
+    assert community_icons.catalog_icon_known("home-assistant") is True
+    assert community_icons.catalog_icon_known("email-server") is False
+    assert community_icons.catalog_icon_known("not-in-the-catalog") is False
+    # A fresh answer of the icon cache wins over the registry's entry.
+    community_icons._cache["github-mcp"] = community_icons._IconEntry(None, None, time.monotonic())
+    assert community_icons.catalog_icon_known("github-mcp") is False
+    community_icons._cache["email-server"] = community_icons._IconEntry(PNG, None, time.monotonic())
+    assert community_icons.catalog_icon_known("email-server") is True
+    resolver.assert_not_awaited()
+
+
+def test_the_list_flag_is_the_routes_answer(tmp_path, monkeypatch, resolver):
+    from api.mcp import mcps as mcps_api
+    from services.mcp import mcp_registry
+    dirs = {}
+    for name in ("good-mcp", "bad-mcp", "github-mcp", "custom-mcp"):
+        d = tmp_path / name
+        d.mkdir()
+        dirs[name] = d
+    (dirs["good-mcp"] / "icon.png").write_bytes(PNG)
+    (dirs["bad-mcp"] / "icon.png").write_bytes(_png(64, 64))
+    monkeypatch.setattr(mcp_registry, "get_manifest",
+                        lambda name: SimpleNamespace(mcp_dir=str(dirs[name])) if name in dirs else None)
+    monkeypatch.setattr(community_catalog._registry_cache, "value",
+                        {"mcps": [{"name": "github-mcp", "icon_url": "./github-mcp/icon.png"},
+                                  {"name": "custom-mcp", "icon_url": "./custom-mcp/icon.png"}]})
+    rows = [SimpleNamespace(name="good-mcp", category="core"),
+            SimpleNamespace(name="bad-mcp", category="community"),
+            SimpleNamespace(name="github-mcp", category="community"),
+            SimpleNamespace(name="custom-mcp", category="custom"),
+            SimpleNamespace(name="../x", category="community")]
+    flags = mcps_api._icon_flags(rows, catalog=True)
+    assert flags == {"good-mcp": True, "bad-mcp": False, "github-mcp": True,
+                     "custom-mcp": False, "../x": False}
+    # A viewer the route never serves the catalog's icon to gets the folder's only.
+    assert mcps_api._icon_flags(rows, catalog=False)["github-mcp"] is False
+
+
+def test_a_list_without_the_registry_reads_it_once_for_the_next(monkeypatch, resolver):
+    from api.mcp import mcps as mcps_api
+    monkeypatch.setattr(community_catalog._registry_cache, "value", None)
+    rows = [SimpleNamespace(name="github-mcp", category="community")]
+
+    async def _go():
+        mcps_api._warm_catalog_icons(rows, {"github-mcp": False}, catalog=True)
+        mcps_api._warm_catalog_icons(rows, {"github-mcp": False}, catalog=True)
+        await community_icons._warming
+    asyncio.run(_go())
+    assert resolver.await_count == 1
+
+    # Nothing to learn, or nobody the route serves the catalog to: no read.
+    community_icons.clear_cache()
+
+    async def _quiet():
+        mcps_api._warm_catalog_icons(rows, {"github-mcp": True}, catalog=True)
+        mcps_api._warm_catalog_icons(rows, {"github-mcp": False}, catalog=False)
+        mcps_api._warm_catalog_icons([SimpleNamespace(name="x", category="custom")], {"x": False},
+                                     catalog=True)
+    asyncio.run(_quiet())
+    assert resolver.await_count == 1 and community_icons._warming is None
+
+
+def test_the_registry_warm_up_respects_air_gap_and_the_retry_window(monkeypatch, resolver):
+    monkeypatch.setattr(community_catalog._registry_cache, "value", None)
+    monkeypatch.setattr(config, "OTODOCK_AIR_GAPPED", True)
+
+    async def _warm_once():
+        community_icons.warm_registry()
+        if community_icons._warming is not None:
+            await community_icons._warming
+    asyncio.run(_warm_once())
+    resolver.assert_not_awaited()
+    monkeypatch.setattr(config, "OTODOCK_AIR_GAPPED", False)
+    resolver.side_effect = RuntimeError("no network")
+    asyncio.run(_warm_once())
+    assert resolver.await_count == 1
+    community_icons._warming = None
+    asyncio.run(_warm_once())  # inside the retry window: no second try
+    assert resolver.await_count == 1
 
 
 # ---------------------------------------------------------------------------

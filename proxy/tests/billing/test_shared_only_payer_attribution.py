@@ -18,8 +18,8 @@ import pytest
 
 from core.events.stream_pump import ChatStreamPump, _record_usage
 from services.engines import subscription_pool as sp
-from storage.agents import agent_store
 from storage import database as task_store
+from storage.agents import agent_store
 
 _AGENT = "shared-dev"
 _PAYER = "local:alice"

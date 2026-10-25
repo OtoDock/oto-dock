@@ -4,7 +4,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import { type PinnedApp } from '@/api/apps'
 import { meetsFloor } from '@/lib/permissions'
-import AppApprovalCard, { appNeedsApproval } from '@/components/apps/AppApprovalCard'
+import AppApprovalCard, { CREATES_FOLDER } from '@/components/apps/AppApprovalCard'
+import { appNeedsApproval } from '@/components/apps/AppApprovalCard.helpers'
 
 // The per-action role floor (APPS.md "min_role"): the card names it in
 // words, and the host judges a feed's floor the way the server judges a
@@ -36,16 +37,24 @@ function openDetails() {
 const summaryText = () => screen.getByTestId('manifest-summary').textContent || ''
 
 describe('AppApprovalCard — role floors', () => {
-  it('names an action floor in words and says nothing for the default', () => {
+  it('names an action floor in words, and everyone for a button with none', () => {
     renderCard(mkApp({ actions: [
       { id: 'restart', label: 'Restart', type: 'send_prompt', prompt: 'restart it', min_role: 'editor' },
       { id: 'wipe', label: 'Wipe', type: 'send_prompt', prompt: 'wipe it', min_role: 'manager' },
       { id: 'stats', label: 'Stats', type: 'send_prompt', prompt: 'stats' },
+      { id: 'me', label: 'Me', type: 'platform', method: 'viewer.me' },
+      { id: 'feed', label: 'Feed', type: 'data_feed', feed: 'sessions' },
     ] }))
     openDetails()
     expect(screen.getByText('editors and up')).toBeTruthy()
     expect(screen.getByText('managers only')).toBeTruthy()
     expect(screen.getAllByText(/editors and up|managers only/)).toHaveLength(2)
+    // A button that acts for the agent with no floor says who may press it;
+    // platform data never does.
+    const everyone = screen.getAllByText('everyone who opens the app')
+    expect(everyone).toHaveLength(1)
+    expect(everyone[0].closest('li')?.textContent).toContain('Stats')
+    expect(everyone[0].getAttribute('title')).toBe('Anyone who opens the app can press it')
   })
 
   it('names the contributor floor: the workspace tier, below editors', () => {
@@ -102,14 +111,14 @@ describe('AppApprovalCard — the plain list', () => {
       'Its page may open checkout.stripe.com',
       'Bot check before /register',
       'Keeps a visitor’s login for 7 days',
-      'Wakes every 30 minutes, when the step snapshot finishes, when the check note-style asks it to judge a turn and on Stripe-signed events',
+      'Wakes every 30 minutes, when the snapshot step finishes, when the note-style check asks it to judge a turn and on Stripe-signed events',
       'Runs the script scripts/snapshot.sh where this agent runs',
-      'Its scripts receive the github account of the agent — a manager must approve',
-      'Needs the secrets STRIPE_SECRET_KEY (not set) and STRIPE_WEBHOOK_SECRET (set)Set',
-      'Offers other apps the snapshot board',
-      'Uses the app leads of agent sales',
-      'Needs the MCP github-mcp (assigned)',
-      'Needs a github account — the agent’s',
+      'Its scripts receive the github account of the agent, so approval needs a manager',
+      'Needs the secrets STRIPE_SECRET_KEY, not set and STRIPE_WEBHOOK_SECRET, setSet',
+      'Offers other apps the board snapshot',
+      'Uses the leads app of agent sales',
+      'Needs the MCP github-mcp, assigned',
+      'Needs a github account, the agent’s own',
     ])
     // Nothing of the groups until the fold opens; the toggles sit in the footer.
     expect(screen.queryByTestId('manifest-blocks')).toBeNull()
@@ -122,13 +131,13 @@ describe('AppApprovalCard — the plain list', () => {
     const body = screen.getByTestId('app-card-body')
     expect(body.contains(screen.getByTestId('manifest-blocks'))).toBe(true)
     expect(screen.getByTestId('details-toggle').textContent).toBe('Hide details')
-    expect(body.textContent).toContain('wakes on the schedule */30 * * * * as snapshot')
+    expect(body.textContent).toContain('Wakes on the schedule */30 * * * * as snapshot')
     fireEvent.click(screen.getByTestId('exact-manifest-toggle'))
     expect(body.contains(screen.getByTestId('exact-manifest'))).toBe(true)
-    expect(screen.getByTestId('exact-manifest-toggle').textContent).toBe('Hide manifest')
+    expect(screen.getByTestId('exact-manifest-toggle').textContent).toBe('Hide declaration')
   })
 
-  it('counts the buttons and names a few, warns in amber, and offers one Set button', () => {
+  it('counts the buttons and names a few, warns in the warning colour, and offers one Set button', () => {
     const many = Array.from({ length: 7 }, (_, i) => ({
       id: `b${i}`, label: `Button ${i}`, type: 'fire_task' as const, task_id: `t${i}`, task_name: `Task ${i}`,
     }))
@@ -139,14 +148,14 @@ describe('AppApprovalCard — the plain list', () => {
       requires_status: { mcps: [{ name: 'slack-mcp', assigned: false }], providers: [] },
     }))
     expect(screen.getByTestId('summary-buttons').textContent).toBe('7 buttons: Button 0, Button 1, Button 2, Button 3 and 3 more')
-    expect(screen.getByTestId('summary-wakes').textContent).toBe('Wakes on the trigger github')
+    expect(screen.getByTestId('summary-wakes').textContent).toBe('Wakes on a github trigger')
     const warn = screen.getByText('Its wakes may press its buttons unattended')
-    expect(warn.parentElement?.className).toContain('text-amber-600')
-    expect(screen.getByTestId('summary-secrets').textContent).toBe('Needs the secret API_KEY (optional, not set)Set')
-    expect(screen.getByTestId('summary-secrets').className).not.toContain('text-amber-600')
+    expect(warn.parentElement?.className).toContain('text-status-warning-fg')
+    expect(screen.getByTestId('summary-secrets').textContent).toBe('Needs the secret API_KEY, optional, not setSet')
+    expect(screen.getByTestId('summary-secrets').className).not.toContain('text-status-warning-fg')
     const mcp = screen.getByTestId('summary-mcp-slack-mcp')
-    expect(mcp.textContent).toBe('Needs the MCP slack-mcp — not assigned to this agent')
-    expect(mcp.className).toContain('text-amber-600')
+    expect(mcp.textContent).toBe('Needs the MCP slack-mcp, not assigned to this agent')
+    expect(mcp.className).toContain('text-status-warning-fg')
     fireEvent.click(screen.getByTestId('summary-secret-set'))
     expect(screen.getByTestId('app-settings-panel')).toBeTruthy()
   })
@@ -156,7 +165,7 @@ describe('AppApprovalCard — the plain list', () => {
       manifest_empty: false, kind: 'folder', can_manage: false,
       secrets: [{ name: 'API_KEY', required: true, declared: true, set: false }],
     }))
-    expect(screen.getByTestId('summary-secrets').textContent).toBe('Needs the secret API_KEY (not set)')
+    expect(screen.getByTestId('summary-secrets').textContent).toBe('Needs the secret API_KEY, not set')
     expect(screen.queryByTestId('summary-secret-set')).toBeNull()
   })
 })
@@ -165,6 +174,35 @@ describe('AppApprovalCard — the plain list', () => {
 // card"): a manifest with no buttons still needs approval when it declares
 // files, hosts, wakes, exports, bindings or needs, and each block is said
 // in words behind the Details fold.
+describe('AppApprovalCard — the folders an app needs', () => {
+  it('says each folder it creates in the summary and the details', () => {
+    const app = mkApp({
+      manifest_empty: false,
+      files: { read: ['workspace/videos/'], write: [], create: ['workspace/videos/projects'] },
+    })
+    renderCard(app)
+    expect(CREATES_FOLDER).toBe('Creates the folder')
+    expect(screen.getByTestId('summary-creates').textContent).toBe(`${CREATES_FOLDER} workspace/videos/projects`)
+    openDetails()
+    const text = screen.getByTestId('manifest-blocks').textContent || ''
+    expect(text).toContain('Reads files under workspace/videos/')
+    expect(text).toContain(`${CREATES_FOLDER} workspace/videos/projects`)
+    fireEvent.click(screen.getByTestId('exact-manifest-toggle'))
+    const exact = JSON.parse(screen.getByTestId('exact-manifest').textContent || '{}')
+    expect(exact.files).toEqual({ read: ['workspace/videos/'], write: [], create: ['workspace/videos/projects'] })
+  })
+
+  it('leaves out an empty list of folders, as the manifest declares it', () => {
+    renderCard(mkApp({ manifest_empty: false, files: { read: ['workspace/notes'], write: [], create: [] } }))
+    expect(screen.queryByTestId('summary-creates')).toBeNull()
+    openDetails()
+    expect(screen.getByTestId('manifest-blocks').textContent).not.toContain(CREATES_FOLDER)
+    fireEvent.click(screen.getByTestId('exact-manifest-toggle'))
+    const exact = JSON.parse(screen.getByTestId('exact-manifest').textContent || '{}')
+    expect(exact.files).toEqual({ read: ['workspace/notes'], write: [] })
+  })
+})
+
 describe('AppApprovalCard — every block in words', () => {
   it('needs approval for a manifest with blocks and no buttons, and says each block', () => {
     const app = mkApp({
@@ -189,21 +227,21 @@ describe('AppApprovalCard — every block in words', () => {
     expect(appNeedsApproval(mkApp())).toBe(false)   // an older proxy: the actions decide
     renderCard(app)
     expect(document.body.textContent).toContain('declares what it may do')
-    expect(summaryText()).toContain('Wakes on the schedule 0 7 * * 1-5, on the trigger github, when a task finishes and when the app behind crm emits lead-created')
-    expect(summaryText()).toContain('Needs a github account — not connected for you')
+    expect(summaryText()).toContain('Wakes on a 0 7 * * 1-5 schedule, on a github trigger, when a task finishes and when lead-created comes from the app behind crm')
+    expect(summaryText()).toContain('Needs a github account, not connected for you')
     openDetails()
     const text = screen.getByTestId('manifest-blocks').textContent || ''
-    expect(text).toContain('reads files under workspace/notes')
+    expect(text).toContain('Reads files under workspace/notes')
     expect(text).toContain('may reach api.example.com')
     // The carve opens an address: the line says what else answers there.
     expect(text).toContain('other sites that share their address')
-    expect(text).toContain('never your local network or the platform')
+    expect(text).toContain('never reach your local network or the platform')
     expect(text).not.toContain('and nothing else')
-    expect(text).toContain('wakes on the schedule 0 7 * * 1-5 as digest')
+    expect(text).toContain('Wakes on the schedule 0 7 * * 1-5 as digest')
     expect(text).toContain('a trigger aimed at github')
-    expect(text).toContain('a task finishes or the app behind crm emits lead-created')
-    expect(text).toContain('publishes the snapshot board — the board as JSON')
-    expect(text).toContain('calls the app leads of agent sales as crm')
+    expect(text).toContain('a task finishes or lead-created comes from the app behind crm')
+    expect(text).toContain('Publishes the snapshot board: the board as JSON')
+    expect(text).toContain('Calls the app leads of agent sales as crm')
     expect(text).toContain('assigned to this agent')
     expect(text).toContain('not connected for you')
     expect(screen.queryByText(/press the app’s buttons unattended/)).toBeNull()
@@ -223,12 +261,12 @@ describe('AppApprovalCard — every block in words', () => {
         ],
       },
     }))
-    expect(summaryText()).toContain('Needs a github account — the agent’s')
-    expect(summaryText()).toContain('Needs a google account — none bound to this agent')
+    expect(summaryText()).toContain('Needs a github account, the agent’s own')
+    expect(summaryText()).toContain('Needs a google account, but none is set for this agent')
     openDetails()
     const text = screen.getByTestId('manifest-blocks').textContent || ''
     expect(text).toContain("the agent's account dimitris")
-    expect(text).toContain('no account is bound to this agent (Agent Settings → MCPs')
+    expect(text).toContain('none is set for this agent. Choose a service account on the agent’s MCPs page')
     expect(text).not.toContain('not connected for you')
     document.body.innerHTML = ''
     renderCard(mkApp({
@@ -238,7 +276,7 @@ describe('AppApprovalCard — every block in words', () => {
         { provider: 'google', mcp: 'google-workspace', connected: true, account: 'me@example.com', identity: 'you' },
       ] },
     }))
-    expect(summaryText()).toContain('Needs a google account — yours')
+    expect(summaryText()).toContain('Needs a google account, connected for you')
     openDetails()
     expect(document.body.textContent).toContain('connected as me@example.com')
   })
@@ -251,11 +289,11 @@ describe('AppApprovalCard — every block in words', () => {
     }))
     expect(screen.getByText('Its wakes may press its buttons unattended')).toBeTruthy()
     openDetails()
-    expect(screen.getByText(/wakes may press the app’s buttons unattended/)).toBeTruthy()
+    expect(screen.getByText(/Wakes may press the app’s buttons unattended/)).toBeTruthy()
     expect(document.body.textContent).toContain('declares what it may do')
     document.body.innerHTML = ''
     renderCard(mkApp({ actions: [{ id: 's', label: 'Stats', type: 'send_prompt', prompt: 'stats' }] }))
-    expect(document.body.textContent).toContain('declares 1 action button — review before they work')
+    expect(document.body.textContent).toContain('declares 1 action button. Review it before use')
     expect(screen.getByTestId('summary-buttons').textContent).toBe('1 button: Stats')
   })
 })
@@ -281,18 +319,18 @@ describe('AppApprovalCard — secrets', () => {
   it('says each secret, its use and whether it is set, and keeps values and flags out of the exact manifest', () => {
     renderCard(secretive())
     expect(screen.getByTestId('summary-secrets').textContent)
-      .toBe('Needs the secrets STRIPE_SECRET_KEY (not set), STRIPE_WEBHOOK_SECRET (set) and SMTP_PASSWORD (optional, not set)Set')
-    expect(screen.getByTestId('summary-secrets').className).toContain('text-amber-600')
+      .toBe('Needs the secrets STRIPE_SECRET_KEY, not set, STRIPE_WEBHOOK_SECRET, set and SMTP_PASSWORD, optional, not setSet')
+    expect(screen.getByTestId('summary-secrets').className).toContain('text-status-warning-fg')
     openDetails()
     const lines = screen.getAllByTestId('secret-line').map((n) => n.textContent || '')
     expect(lines).toHaveLength(3)
-    expect(lines[0]).toContain('needs the secret STRIPE_SECRET_KEY (a restricted key)')
-    expect(lines[0]).toContain('sent by the platform to api.example.test as Authorization, never seen by the server')
-    expect(lines[0]).toContain('not set — required before the release goes live')
-    expect(lines[1]).toContain('set')
-    expect(lines[1]).not.toContain('not set')
-    expect(lines[2]).toContain('read by the server itself')
-    expect(lines[2]).toContain('not set (optional)')
+    expect(lines[0]).toContain('Needs the secret STRIPE_SECRET_KEY, a restricted key.')
+    expect(lines[0]).toContain('The platform sends it to api.example.test as Authorization. The server never sees it.')
+    expect(lines[0]).toContain('Not set, required before the release goes live')
+    expect(lines[1]).toContain('Set')
+    expect(lines[1]).not.toContain('Not set')
+    expect(lines[2]).toContain('The server reads it itself')
+    expect(lines[2]).toContain('Not set, optional')
     expect(screen.getByTestId('secret-set-STRIPE_SECRET_KEY').textContent).toBe('Set')
     expect(screen.getByTestId('secret-set-STRIPE_WEBHOOK_SECRET').textContent).toBe('Change')
     fireEvent.click(screen.getByTestId('exact-manifest-toggle'))
@@ -331,7 +369,7 @@ describe('AppApprovalCard — what a link may do', () => {
       external: { links: ['checkout.stripe.com'], challenge: ['/register'], session_days: 7 },
     }))
     openDetails()
-    expect(screen.getByTestId('external-links-line').textContent).toContain('its page may open checkout.stripe.com in a new tab')
+    expect(screen.getByTestId('external-links-line').textContent).toContain('Its page may open checkout.stripe.com in a new tab')
     expect(screen.getByTestId('external-challenge-line').textContent).toContain('pass a bot check before /register')
     expect(screen.getByTestId('external-session-line').textContent).toContain('login for 7 days')
     expect(document.body.textContent).toContain('On a link')
@@ -363,16 +401,16 @@ describe('AppApprovalCard — inbound hooks', () => {
       },
     }))
     expect(screen.getByTestId('summary-wakes').textContent)
-      .toBe('Wakes on Stripe-signed events, on GitHub-signed events, on HMAC-signed events (the X-Signature header) and on bearer-authenticated events')
+      .toBe('Wakes on Stripe-signed events, on GitHub-signed events, on HMAC-signed events with the X-Signature header and on bearer-authenticated events')
     expect(screen.queryByText(/press its buttons unattended/)).toBeNull()
     openDetails()
     const lines = screen.getAllByTestId('inbound-line').map((n) => n.textContent || '')
     expect(lines).toHaveLength(4)
-    expect(lines[0]).toContain('receives Stripe-signed events at /v1/apps/id-a/inbound/stripe as payment, verified with the secret STRIPE_WEBHOOK_SECRET')
+    expect(lines[0]).toContain('Receives Stripe-signed events at /v1/apps/id-a/inbound/stripe as payment, verified with the secret STRIPE_WEBHOOK_SECRET')
     expect(lines[1]).toContain('GitHub-signed events')
-    expect(lines[2]).toContain('HMAC-signed events (the X-Signature header)')
+    expect(lines[2]).toContain('HMAC-signed events with the X-Signature header')
     expect(lines[3]).toContain('bearer-authenticated events')
-    expect(screen.getByTestId('inbound-note').textContent).toContain('never files, buttons or a chat')
+    expect(screen.getByTestId('inbound-note').textContent).toContain('never reaches files, buttons or a chat')
     expect(document.body.textContent).toContain('Wakes (4)')
     expect(screen.queryByText(/press the app’s buttons unattended/)).toBeNull()
     fireEvent.click(screen.getByTestId('exact-manifest-toggle'))
@@ -396,13 +434,13 @@ describe('AppApprovalCard — steps', () => {
 
   it('says the script, its hash, its bound and where it runs, and counts the lines', () => {
     renderCard(stepped({ step_target: { kind: 'machine', name: 'OtoDock-dev-server' } }))
-    expect(screen.getByTestId('summary-wakes').textContent).toBe('Wakes every hour and when the step docs-sync finishes')
+    expect(screen.getByTestId('summary-wakes').textContent).toBe('Wakes every hour and when the docs-sync step finishes')
     expect(screen.getByTestId('summary-steps').textContent).toBe('Runs the script scripts/sync-docs.sh on OtoDock-dev-server')
     openDetails()
     const text = document.body.textContent || ''
-    expect(text).toContain('runs the script scripts/sync-docs.sh on OtoDock-dev-server when docs-sync wakes')
+    expect(text).toContain('Runs the script scripts/sync-docs.sh on OtoDock-dev-server when docs-sync wakes')
     expect(text).toContain('up to 5 minutes, sha256 3f9a1b2c3d4e')
-    expect(text).toContain('wakes when the step docs-sync finishes (docs-synced)')
+    expect(text).toContain('Wakes when the docs-sync step finishes, as docs-synced')
     expect(screen.queryByTestId('step-link-warning')).toBeNull()
     expect(screen.queryByTestId('step-accounts')).toBeNull()
     // The exact manifest carries the block with the full hash.
@@ -410,9 +448,9 @@ describe('AppApprovalCard — steps', () => {
     expect(screen.getByTestId('exact-manifest').textContent).toContain('3f9a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4')
     document.body.innerHTML = ''
     renderCard(stepped({ step_target: { kind: 'local' } }))
-    expect(screen.getByTestId('summary-steps').textContent).toBe('Runs the script scripts/sync-docs.sh in this agent’s sandbox')
+    expect(screen.getByTestId('summary-steps').textContent).toBe('Runs the script scripts/sync-docs.sh on the OtoDock platform')
     openDetails()
-    expect(document.body.textContent).toContain('in this agent’s sandbox when docs-sync wakes')
+    expect(document.body.textContent).toContain('on the OtoDock platform when docs-sync wakes')
   })
 
   it('names the accounts the scripts receive, the manager-only approval and the link warning', () => {
@@ -423,12 +461,12 @@ describe('AppApprovalCard — steps', () => {
       ] },
       has_live_link: true, steps_need_manager: true, can_approve: false,
     }))
-    expect(screen.getByTestId('summary-step-accounts').textContent).toBe('Its scripts receive the github account of the agent — a manager must approve')
-    expect(screen.getByTestId('summary-step-accounts').className).toContain('text-amber-600')
+    expect(screen.getByTestId('summary-step-accounts').textContent).toBe('Its scripts receive the github account of the agent, so approval needs a manager')
+    expect(screen.getByTestId('summary-step-accounts').className).toContain('text-status-warning-fg')
     expect(screen.getByTestId('summary-step-link').textContent).toContain('reachable by a link')
     openDetails()
     const text = document.body.textContent || ''
-    expect(screen.getByTestId('step-accounts').textContent).toContain('the scripts receive the github account of the agent')
+    expect(screen.getByTestId('step-accounts').textContent).toContain('The scripts receive the github account of the agent')
     expect(text).toContain('a manager of this agent must approve this')
     expect(screen.getByTestId('step-link-warning').textContent).toContain('reachable by a link')
     expect(text).toContain('Approval needs a manager of this agent: its scripts receive the agent’s accounts.')
@@ -441,7 +479,7 @@ describe('AppApprovalCard — steps', () => {
       ] },
     }))
     expect(screen.getByTestId('summary-step-accounts').textContent).toBe('Its scripts receive the github account of the owner')
-    expect(screen.getByTestId('summary-step-accounts').className).not.toContain('text-amber-600')
+    expect(screen.getByTestId('summary-step-accounts').className).not.toContain('text-status-warning-fg')
     openDetails()
     expect(screen.getByTestId('step-accounts').textContent).toContain('of the owner')
     expect(document.body.textContent).not.toContain('a manager of this agent must approve this')
@@ -459,12 +497,12 @@ describe('AppApprovalCard — checks', () => {
       handlers: { on_event: { lint: ['check:coding'], tally: ['turn_finished', 'check_verdict'] } },
     }))
     expect(screen.getByTestId('summary-wakes').textContent)
-      .toBe('Wakes when the check coding asks it to judge a turn, when a chat turn ends and when a check gives a verdict')
+      .toBe('Wakes when the coding check asks it to judge a turn, when a chat turn ends and when a check gives a verdict')
     openDetails()
     const text = document.body.textContent || ''
-    expect(text).toContain('runs the task “Release”')
-    expect(text).toContain('and the checks coding, style on its result')
-    expect(text).toContain('the check coding asks it to judge a turn')
+    expect(text).toContain('Runs the task “Release”.')
+    expect(text).toContain('It also runs the checks coding, style on its result')
+    expect(text).toContain('the coding check asks it to judge a turn')
     expect(text).toContain('a chat turn ends or a check gives a verdict')
   })
 })
@@ -532,8 +570,8 @@ describe('meetsFloor', () => {
       },
     }))
     const line = screen.getByTestId('summary-mcps')
-    expect(line.textContent).toBe('Needs the MCPs schedules-mcp, notifications-mcp, file-tools, memory-mcp and 1 more — file-tools not assigned to this agent')
-    expect(line.className).toContain('text-amber-600')
+    expect(line.textContent).toBe('Needs the MCPs schedules-mcp, notifications-mcp, file-tools, memory-mcp and 1 more. Not assigned to this agent: file-tools')
+    expect(line.className).toContain('text-status-warning-fg')
     expect(screen.queryByTestId('summary-mcp-file-tools')).toBeNull()
   })
 
@@ -542,7 +580,7 @@ describe('meetsFloor', () => {
       requires: { mcps: ['a-mcp', 'b-mcp'] },
       requires_status: { mcps: [{ name: 'a-mcp', assigned: true }, { name: 'b-mcp', assigned: true }], providers: [] },
     }))
-    expect(screen.getByTestId('summary-mcps').textContent).toBe('Needs the MCPs a-mcp and b-mcp (all assigned)')
+    expect(screen.getByTestId('summary-mcps').textContent).toBe('Needs the MCPs a-mcp and b-mcp, all assigned')
   })
 })
 
@@ -563,13 +601,13 @@ describe('AppApprovalCard — placed apps and the audience (SHARING.md)', () => 
       exports,
     }))
     expect(screen.getByTestId('summary-data').textContent).toBe('Uses the platform for who uses it, your saved data and saving your data')
-    expect(screen.getByTestId('summary-placed-calls').textContent).toBe('Answers the agents it is placed in with the call status and the call update-project')
+    expect(screen.getByTestId('summary-placed-calls').textContent).toBe('Answers the agents it is placed in with the status call and the update-project call')
     openDetails()
     const body = screen.getByTestId('manifest-blocks').textContent || ''
-    expect(body).toContain('asks the platform for app.audience (who uses this app: its members, the agents it is placed in')
-    expect(body).toContain('asks the platform for viewer.data.write (to save your own data in this app')
+    expect(body).toContain('Asks the platform for app.audience: who uses this app and with what role. That is its members and the people it is shared with. It also lists the agents it is placed in')
+    expect(body).toContain('Asks the platform for viewer.data.write: to save your own data in this app')
     expect(body).toContain('Offers to other apps and to the agents it is placed in')
-    expect(screen.getByTestId('offers-placed-note').textContent).toContain('also answer the chats and tasks of agents a share places this app in')
+    expect(screen.getByTestId('offers-placed-note').textContent).toContain('also answer chats and tasks in agents a share places this app in')
     expect(screen.getAllByText('editors and up').length).toBeGreaterThanOrEqual(2)
   })
 

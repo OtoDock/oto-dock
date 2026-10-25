@@ -82,6 +82,7 @@ class TestManifest:
             "transport": "stdio",
             "command": "venv/bin/python",
             "args": ["server.py"],
+            "tool_timeout_sec": 600,   # a generation past Codex's 60 s default
         }
 
     def test_keys_delivered_via_secret_instance_fields(self, manifest):
@@ -313,7 +314,7 @@ class TestGeneration:
         async def fake_veo(model_key, prompt, duration, aspect_ratio, resolution,
                            target_path, first_frame=None, last_frame=None):
             calls["veo"] = (model_key, duration)
-            Path(target_path).write_bytes(b"MP4DATA")
+            Path(target_path).write_bytes(b"MP4DATA")  # noqa: ASYNC240  # a test's own temporary files
 
         monkeypatch.setattr(mod, "_veo_generate", fake_veo)
         _stub_player(monkeypatch, mod)
@@ -328,7 +329,7 @@ class TestGeneration:
 
         async def fake_omni(prompt, aspect_ratio, target_path, image=None):
             calls["omni"] = (prompt, aspect_ratio, image)
-            Path(target_path).write_bytes(b"MP4DATA")
+            Path(target_path).write_bytes(b"MP4DATA")  # noqa: ASYNC240  # a test's own temporary files
 
         monkeypatch.setattr(mod, "_omni_generate", fake_omni)
         player = _stub_player(monkeypatch, mod)
@@ -354,7 +355,7 @@ class TestGeneration:
                            target_path, first_frame=None, last_frame=None):
             calls["veo"] = (model_key, prompt, duration, aspect_ratio, resolution,
                             first_frame, last_frame)
-            Path(target_path).write_bytes(b"VEODATA")
+            Path(target_path).write_bytes(b"VEODATA")  # noqa: ASYNC240  # a test's own temporary files
 
         monkeypatch.setattr(mod, "_veo_generate", fake_veo)
         _stub_player(monkeypatch, mod)
@@ -382,7 +383,7 @@ class TestGeneration:
         async def fake_flf(model, video_a, video_b, style, duration, aspect_ratio,
                            target_path):
             calls["flf"] = (model, video_a, video_b, style, duration, aspect_ratio)
-            Path(target_path).write_bytes(b"BRIDGE")
+            Path(target_path).write_bytes(b"BRIDGE")  # noqa: ASYNC240  # a test's own temporary files
 
         monkeypatch.setattr(mod, "_fal_veo_flf_transition", fake_flf)
         _stub_player(monkeypatch, mod)
@@ -414,7 +415,7 @@ class TestGeneration:
                            target_path, first_frame=None, last_frame=None):
             calls["veo"] = (model_key, prompt, duration, aspect_ratio, resolution,
                             first_frame, last_frame)
-            Path(target_path).write_bytes(b"BRIDGE")
+            Path(target_path).write_bytes(b"BRIDGE")  # noqa: ASYNC240  # a test's own temporary files
 
         monkeypatch.setattr(mod, "_extract_frame", fake_extract)
         monkeypatch.setattr(mod, "_veo_generate", fake_veo)
@@ -451,7 +452,7 @@ class TestGeneration:
 
         async def fake_seedance(video_a, video_b, style, duration, aspect_ratio, target_path):
             calls["seed"] = (video_a, video_b, style, duration, aspect_ratio)
-            Path(target_path).write_bytes(b"SEED")
+            Path(target_path).write_bytes(b"SEED")  # noqa: ASYNC240  # a test's own temporary files
 
         monkeypatch.setattr(mod, "_seedance_transition", fake_seedance)
         _stub_player(monkeypatch, mod)
@@ -471,7 +472,7 @@ class TestGeneration:
 
         async def fake_edit(video_path, prompt, target_path):
             calls["edit"] = (video_path, prompt)
-            Path(target_path).write_bytes(b"EDITED")
+            Path(target_path).write_bytes(b"EDITED")  # noqa: ASYNC240  # a test's own temporary files
 
         monkeypatch.setattr(mod, "_runway_edit", fake_edit)
         player = _stub_player(monkeypatch, mod)
@@ -486,7 +487,7 @@ class TestGeneration:
     def test_hook_failure_still_returns_saved_path(self, mod, monkeypatch):
         async def fake_veo(model_key, prompt, duration, aspect_ratio, resolution,
                            target_path, first_frame=None, last_frame=None):
-            Path(target_path).write_bytes(b"MP4")
+            Path(target_path).write_bytes(b"MP4")  # noqa: ASYNC240  # a test's own temporary files
 
         monkeypatch.setattr(mod, "_veo_generate", fake_veo)
         _stub_player(monkeypatch, mod, ok=False)
@@ -912,7 +913,7 @@ class TestFrameExtraction:
             # First (windowed) attempt yields nothing; the full-decode
             # fallback produces the frame.
             if len(calls) == 2:
-                Path(args[-1]).write_bytes(b"PNGDATA")
+                Path(args[-1]).write_bytes(b"PNGDATA")  # noqa: ASYNC240  # a test's own temporary files
             return 0
 
         monkeypatch.setattr(mod, "_run_ffmpeg", fake_ffmpeg)

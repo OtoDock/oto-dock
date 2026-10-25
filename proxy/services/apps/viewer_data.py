@@ -54,7 +54,7 @@ def viewers_dir(row: dict) -> Path:
 
 
 def file_for(row: dict, sub: str) -> Path:
-    digest = hashlib.sha256(f"{row['slug']}:{sub}".encode("utf-8")).hexdigest()[:32]
+    digest = hashlib.sha256(f"{row['slug']}:{sub}".encode()).hexdigest()[:32]
     return viewers_dir(row) / f"{digest}.json"
 
 
@@ -71,12 +71,12 @@ def _load(path: Path) -> dict:
         raw = safe_fs.read_bytes_beneath(root, rel, max_size=_READ_MAX)
     except FileNotFoundError:
         return {"rev": 0, "doc": {}}
-    except OSError:
-        raise PermissionError("your saved data is not a regular file")
+    except OSError as exc:
+        raise PermissionError("your saved data is not a regular file") from exc
     try:
         stored = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        raise ValueError("your saved data is damaged; save a whole document to start over")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("your saved data is damaged; save a whole document to start over") from exc
     if not isinstance(stored, dict) or not isinstance(stored.get("doc"), dict):
         raise ValueError("your saved data is damaged; save a whole document to start over")
     return {"rev": int(stored.get("rev") or 0), "doc": stored["doc"]}
@@ -112,8 +112,8 @@ def write(row: dict, sub: str, *, doc=None, patch=None) -> dict:
         try:
             text = json.dumps({"rev": current["rev"] + 1, "doc": new}, separators=(",", ":"),
                               ensure_ascii=False, sort_keys=True, allow_nan=False)
-        except ValueError:
-            raise ValueError("the document holds a number JSON cannot carry")
+        except ValueError as exc:
+            raise ValueError("the document holds a number JSON cannot carry") from exc
         try:
             if current["rev"] == 0 and not path.exists():
                 folder = viewers_dir(row)
@@ -121,6 +121,6 @@ def write(row: dict, sub: str, *, doc=None, patch=None) -> dict:
                 if count >= VIEWER_FILES_MAX:
                     raise ValueError(f"this app keeps data for {VIEWER_FILES_MAX} viewers already")
             releases.write_atomic(path, text)
-        except OSError:
-            raise PermissionError("your saved data cannot be written (a link in the way, or no room)")
+        except OSError as exc:
+            raise PermissionError("your saved data cannot be written (a link in the way, or no room)") from exc
     return {"doc": new, "rev": current["rev"] + 1}

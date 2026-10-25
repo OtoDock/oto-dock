@@ -1,0 +1,333 @@
+{
+ "delegate_spawn": {
+  "type": "delegate_spawn",
+  "data": {
+   "type": "delegate_spawn",
+   "task_id": "dyn-c9p1-0001",
+   "task_name": "count-files",
+   "agent": "personal-assistant-lite",
+   "surface": "task",
+   "chat_id": "task-run-c9p1-0001",
+   "prompt_preview": "Count the files in the workspace folder and report the number.",
+   "prompt": "Count the files in the workspace folder and report the number."
+  }
+ },
+ "check_verdict": {
+  "type": "check_verdict",
+  "data": {
+   "type": "check_verdict",
+   "check": "style",
+   "ref": "chk-1",
+   "section": "",
+   "status": "fail",
+   "pass": false,
+   "score": 0.4,
+   "summary": "Two sentences run long.",
+   "findings": [
+    {
+     "severity": "error",
+     "text": "Sentence 3 runs 41 words."
+    }
+   ],
+   "findings_total": 1,
+   "round": 1,
+   "rounds": 2,
+   "ran_on": "claude-sonnet-5-5",
+   "cost_usd": 0.0123,
+   "duration_ms": 8120,
+   "verdict_id": "v-1"
+  }
+ },
+ "permission_request": {
+  "type": "permission_request",
+  "data": {
+   "request_id": "engine-req-0001",
+   "tool_name": "Bash",
+   "tool_input": {
+    "command": "git push"
+   },
+   "tool_use_id": "toolu_engine_0001",
+   "description": "Push the branch",
+   "session_id": ""
+  }
+ },
+ "meeting_started": {
+  "type": "system",
+  "data": {
+   "subtype": "meeting_started",
+   "meeting_id": "m-1",
+   "topic": "The launch plan",
+   "participants": [
+    "ceo",
+    "marketing-manager"
+   ],
+   "moderator": "ceo",
+   "max_turns": 6
+  }
+ },
+ "meeting_turn_start": {
+  "type": "system",
+  "data": {
+   "subtype": "meeting_turn_start",
+   "meeting_id": "m-1",
+   "agent": "ceo",
+   "agent_display_name": "CEO",
+   "agent_color": "#336699"
+  }
+ },
+ "meeting_turn_end": {
+  "type": "system",
+  "data": {
+   "subtype": "meeting_turn_end",
+   "agent": "ceo",
+   "cost_usd": 0
+  }
+ },
+ "meeting_agent_failed": {
+  "type": "system",
+  "data": {
+   "subtype": "meeting_agent_failed",
+   "agent": "marketing-manager",
+   "error": "no usable account"
+  }
+ },
+ "meeting_agent_left": {
+  "type": "system",
+  "data": {
+   "subtype": "meeting_agent_left",
+   "agent": "marketing-manager",
+   "agent_display_name": "Marketing Manager",
+   "agent_color": "#996633"
+  }
+ },
+ "meeting_concluded": {
+  "type": "system",
+  "data": {
+   "subtype": "meeting_concluded",
+   "meeting_id": "m-1",
+   "total_turns": 4,
+   "cost_usd": 0.42
+  }
+ },
+ "meeting_failed": {
+  "type": "system",
+  "data": {
+   "subtype": "meeting_failed",
+   "meeting_id": "m-2",
+   "message": "the box is full"
+  }
+ },
+ "meeting_cost": {
+  "type": "metadata",
+  "data": {
+   "cost_usd": 0.21,
+   "_meeting_cost": true,
+   "session_id": "sess-ceo"
+  }
+ },
+ "system_transient": {
+  "type": "system",
+  "data": {
+   "subtype": "task_started",
+   "task_type": "local_bash"
+  }
+ },
+ "system_other": {
+  "type": "system",
+  "data": {
+   "subtype": "undelivered_input",
+   "text": "lost words",
+   "reason": "queued"
+  }
+ },
+ "goal_update": {
+  "type": "goal_update",
+  "data": {
+   "objective": "Ship the note",
+   "status": "active",
+   "token_budget": 50000,
+   "tokens_used": 1200,
+   "time_used_seconds": 40,
+   "cleared": false
+  }
+ },
+ "goal_cleared": {
+  "type": "goal_update",
+  "data": {
+   "cleared": true
+  }
+ },
+ "context_compact_started": {
+  "type": "context_compact",
+  "data": {
+   "phase": "started",
+   "trigger": "auto"
+  }
+ },
+ "context_compact_completed": {
+  "type": "context_compact",
+  "data": {
+   "phase": "completed",
+   "trigger": "manual",
+   "pre_tokens": 120000,
+   "post_tokens": null
+  }
+ },
+ "context_compact_usage": {
+  "type": "context_compact",
+  "data": {
+   "phase": "usage",
+   "post_tokens": 8123,
+   "context_max": 258400
+  }
+ },
+ "metadata_codex_thread": {
+  "type": "metadata",
+  "data": {
+   "codex_thread_id": "01a146c3-2376-7940-8aac-dfb3c9d4e4dd"
+  }
+ },
+ "metadata_cli_1": {
+  "type": "metadata",
+  "data": {
+   "cost_usd": 0.0412,
+   "duration_ms": 9112,
+   "context_used": 24000,
+   "context_max": 200000,
+   "cache_read": 20000,
+   "cache_write": 1200,
+   "input_tokens": 1800,
+   "output_tokens": 400
+  }
+ },
+ "metadata_cli_2": {
+  "type": "metadata",
+  "data": {
+   "cost_usd": 0.0633,
+   "duration_ms": 4120,
+   "context_used": 26500,
+   "context_max": 200000,
+   "cache_read": 24000,
+   "cache_write": 800,
+   "input_tokens": 900,
+   "output_tokens": 310
+  }
+ },
+ "metadata_cli_reset": {
+  "type": "metadata",
+  "data": {
+   "cost_usd": 0.01,
+   "duration_ms": 2000,
+   "cache_read": 0,
+   "cache_write": 0,
+   "input_tokens": 100,
+   "output_tokens": 50
+  }
+ },
+ "metadata_delta": {
+  "type": "metadata",
+  "data": {
+   "cost_usd": 0.0071,
+   "cost_is_delta": true,
+   "duration_ms": 3300,
+   "context_used": 9000,
+   "context_max": 258400,
+   "cache_read": 7000,
+   "cache_write": 0,
+   "input_tokens": 2000,
+   "output_tokens": 300
+  }
+ },
+ "todo_update_cli": {
+  "type": "todo_update",
+  "data": {
+   "todos": [
+    {
+     "content": "alpha",
+     "status": "completed"
+    },
+    {
+     "content": "beta",
+     "status": "pending"
+    }
+   ],
+   "persist_block": true,
+   "panel_only": true
+  }
+ },
+ "todo_update_live": {
+  "type": "todo_update",
+  "data": {
+   "todos": [
+    {
+     "content": "alpha",
+     "status": "completed"
+    },
+    {
+     "content": "beta",
+     "status": "in_progress"
+    }
+   ]
+  }
+ },
+ "workflow_start": {
+  "type": "workflow_start",
+  "data": {
+   "tool_use_id": "toolu_wf_0001",
+   "workflow_name": "review-changes"
+  }
+ },
+ "workflow_progress": {
+  "type": "workflow_progress",
+  "data": {
+   "tool_use_id": "toolu_wf_0001",
+   "workflow_progress": [
+    {
+     "phase": "Review",
+     "agents": [
+      {
+       "label": "review:bugs",
+       "status": "running"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "workflow_end": {
+  "type": "workflow_end",
+  "data": {
+   "tool_use_id": "toolu_wf_0001"
+  }
+ },
+ "plan_mode_enter": {
+  "type": "plan_mode",
+  "data": {
+   "action": "enter"
+  }
+ },
+ "plan_mode_exit": {
+  "type": "plan_mode",
+  "data": {
+   "action": "exit"
+  }
+ },
+ "error_typed": {
+  "type": "error",
+  "data": {
+   "message": "You're out of usage credits.",
+   "ending": {
+    "reason": "limit",
+    "detail": "You're out of usage credits.",
+    "resets_at": "2026-10-17T06:00:00+00:00",
+    "window": "weekly"
+   }
+  }
+ },
+ "error_untyped": {
+  "type": "error",
+  "data": {
+   "message": "the session is gone"
+  }
+ }
+}

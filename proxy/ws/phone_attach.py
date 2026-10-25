@@ -39,9 +39,16 @@ import functools
 import logging
 from collections import deque
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from storage import database as task_store
 from ws import wire_events as wire
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from core.events.stream_pump import ChatStreamPump
+    from core.execution_layer import ExecutionLayer
 
 logger = logging.getLogger("otodock")
 
@@ -83,13 +90,13 @@ class CallAttach:
     agent: str
     sub: str
     number: str
-    layer: object
-    send: object                      # async callable: a frame to the daemon
-    close: object = None              # async callable: end the daemon's socket
+    layer: ExecutionLayer
+    send: Callable[[dict], Awaitable[None]]           # a frame to the daemon
+    close: Callable[[], Awaitable[None]] | None = None  # end the daemon's socket
     context_text: str = ""
     utterances: asyncio.Queue = field(default_factory=asyncio.Queue)
     turns: deque = field(default_factory=deque)   # turn ids in engine order
-    pump: object = None
+    pump: ChatStreamPump | None = None
     producer: asyncio.Task | None = None
     forward_task: asyncio.Task | None = None
     start_task: asyncio.Task | None = None
@@ -139,7 +146,7 @@ async def begin(msg: dict, send, close=None) -> CallAttach | str:
         return DEAD_LINE
     try:
         alive = await layer.is_session_alive(session_id)
-    except Exception:
+    except Exception:  # noqa: BLE001  # a failed liveness probe reads as not alive
         alive = False
     if not alive:
         in_session_calls.release(grant)
@@ -155,8 +162,8 @@ async def begin(msg: dict, send, close=None) -> CallAttach | str:
     _attaches[g.chat_id] = attach
     call_control.bind(session_id, send, ask_back=False)
     logger.info(
-        f"phone attach: call in chat={g.chat_id[:8]} session={session_id[:8]} "
-        f"agent={agent}")
+        "phone attach: call in chat=%s session=%s "
+        "agent=%s", g.chat_id[:8], session_id[:8], agent)
     return attach
 
 
@@ -220,7 +227,7 @@ async def _start_or_terminate(attach: CallAttach) -> None:
     try:
         ok = await _start(attach)
     except Exception as e:
-        logger.error(f"phone attach start error: {e}", exc_info=True)
+        logger.exception("phone attach start error: %s", e)
         ok = False
     if not ok:
         await _terminate(attach, "the chat stayed busy with its own turn")
@@ -229,10 +236,9 @@ async def _start_or_terminate(attach: CallAttach) -> None:
 async def _start(attach: CallAttach) -> bool:
     """Claim the chat once its current turn ends and start the one pump."""
     from core.events import input_queue
-    from core.events.common_events import CommonEvent, ERROR, PRODUCER_DONE
+    from core.events.common_events import ERROR, PRODUCER_DONE, CommonEvent
     from core.events.stream_pump import ChatStreamPump, _active_pumps
-    from core.session import session_kind
-    from core.session import visibility as _vis
+    from core.session import session_kind, visibility as _vis
     from core.session.session_state import get_permission_queue
 
     queue = input_queue.get(attach.chat_id)
@@ -250,7 +256,7 @@ async def _start(attach: CallAttach) -> bool:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"phone attach producer error: {e}", exc_info=True)
+            logger.exception("phone attach producer error: %s", e)
             await event_queue.put(CommonEvent(type=ERROR, data={"message": str(e)}))
         finally:
             with contextlib.suppress(Exception):
@@ -279,7 +285,7 @@ async def _start(attach: CallAttach) -> bool:
 async def _run_call(attach: CallAttach, event_queue: asyncio.Queue) -> None:
     """The producer: every utterance an engine turn on the chat's session,
     under its lock for the whole call."""
-    from core.events.common_events import CommonEvent, DONE, QUEUE_TURN
+    from core.events.common_events import DONE, QUEUE_TURN, CommonEvent
     from services.phone import call_control
     layer, sid = attach.layer, attach.session_id
     async with layer.session_lock(sid):
@@ -327,7 +333,7 @@ async def _run_call(attach: CallAttach, event_queue: asyncio.Queue) -> None:
                 # Nothing would answer the next utterance: the attach ends
                 # (the forward's end terminates it) rather than the person
                 # hearing an error on every turn.
-                logger.warning(f"phone attach: session {sid[:8]} died under the call")
+                logger.warning("phone attach: session %s died under the call", sid[:8])
                 attach.terminate_reason = "the chat's session stopped running"
                 break
             if resume:
@@ -339,7 +345,7 @@ async def _run_call(attach: CallAttach, event_queue: asyncio.Queue) -> None:
 async def _session_alive(layer, sid: str) -> bool:
     try:
         return bool(await layer.is_session_alive(sid))
-    except Exception:
+    except Exception:  # noqa: BLE001  # a failed liveness probe reads as not alive
         return False
 
 
@@ -358,7 +364,7 @@ async def _engine_turn(layer, sid: str, prompt: str, barge_in_chars, event_queue
             outcome.saw_done = outcome.saw_done or event.type == DONE
     except asyncio.CancelledError:
         raise
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the engine's failure becomes the call's error, never a dead call
         outcome.error = str(e) or "engine error"
     return outcome
 
@@ -418,8 +424,9 @@ async def abort(attach: CallAttach, frame: dict) -> None:
     if not graceful and not task.done():
         task.cancel()
     attach.interrupted_last_turn = True
-    logger.info(f"phone attach: turn {turn} aborted "
-                f"({'graceful' if graceful else 'cancelled'}) chat={attach.chat_id[:8]}")
+    logger.info("phone attach: turn %s aborted "
+                "(%s) chat=%s",
+                turn, 'graceful' if graceful else 'cancelled', attach.chat_id[:8])
 
 
 async def _terminate(attach: CallAttach, why: str) -> None:
@@ -431,7 +438,7 @@ async def _terminate(attach: CallAttach, why: str) -> None:
     attach.dead = True
     from services.phone import call_control
     call_control.unbind(attach.session_id, attach.send)
-    logger.warning(f"phone attach: chat={attach.chat_id[:8]} ended under the call: {why}")
+    logger.warning("phone attach: chat=%s ended under the call: %s", attach.chat_id[:8], why)
     if not attach.resume_seen:
         _store_note(attach, TERMINATED_NOTE.format(why=why))
     if attach.close is not None and not attach.ended:
@@ -451,8 +458,8 @@ def _store_note(attach: CallAttach, text: str) -> None:
             functools.partial(store_chat_wake, attach.chat_id, text, attach.sub),
             label="phone_attach_note",
         )
-    except Exception as e:
-        logger.warning(f"phone attach: the chat's note was not stored: {e}")
+    except RuntimeError as e:
+        logger.warning("phone attach: the chat's note was not stored: %s", e)
 
 
 def end(attach: CallAttach) -> None:

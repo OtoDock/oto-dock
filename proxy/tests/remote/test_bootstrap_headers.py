@@ -41,3 +41,27 @@ def test_powershell_header_sets_env_pins(monkeypatch):
     hdr = _build_powershell_header("m", "s", "https://x", "BB", "TT")
     assert "$env:CLAUDE_CODE_VERSION = '9.9.9'" in hdr
     assert "CODEX_VERSION" not in hdr
+
+
+def _passt_mode(hdr: str, preset: str | None) -> str:
+    """The value the baseline script (a child bash) reads after the header."""
+    import os
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if k != "OTODOCK_PASST_BUILD"}
+    if preset is not None:
+        env["OTODOCK_PASST_BUILD"] = preset
+    script = hdr + '\nbash -c \'printf %s "$OTODOCK_PASST_BUILD"\'\n'
+    return subprocess.run(["bash", "-c", script], env=env, capture_output=True,
+                          text=True, timeout=30, check=True).stdout
+
+
+def test_pairing_never_compiles_passt(monkeypatch):
+    """A paired machine runs no pasta: the baseline script takes the host's
+    or the distro's passt instead of building the pinned one."""
+    hdr = _build_bash_header("m", "s", "https://x", "BB", "TT")
+    assert _passt_mode(hdr, None) == "distro"
+    assert _passt_mode(hdr, "auto") == "auto"     # a value set before the bootstrap stays
+
+
+def test_the_powershell_header_has_no_passt_mode():
+    assert "OTODOCK_PASST_BUILD" not in _build_powershell_header("m", "s", "https://x", "BB", "TT")

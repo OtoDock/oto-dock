@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
+import ws.dashboard  # noqa: F401  (resolves the dashboard and dashboard_chat cycle)
 from core.session.visibility import shared_chat_owner
 from storage import database as task_store
 from tests.fixtures.ws_dashboard_harness import (
@@ -26,8 +27,6 @@ from tests.fixtures.ws_dashboard_harness import (
     session_cookie,
     stub_dashboard_seams,
 )
-
-import ws.dashboard  # noqa: F401  (resolves the dashboard and dashboard_chat cycle)
 
 
 def _pool_chat_with_live_session(layer: FakeExecutionLayer, role: str) -> tuple[str, str]:

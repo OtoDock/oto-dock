@@ -9,8 +9,9 @@ import { act, fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter, Outlet, Route, Routes, useNavigate } from 'react-router-dom'
 import { useEffect } from 'react'
 
-import ErrorBoundary, { copyText, crashReport } from '@/components/ErrorBoundary'
+import ErrorBoundary from '@/components/ErrorBoundary'
 import RouteBoundary, { PageBoundary } from '@/components/RouteBoundary'
+import { copyText, crashReport } from '@/lib/crash/crashReport'
 
 const mounts = vi.hoisted(() => ({ count: 0 }))
 

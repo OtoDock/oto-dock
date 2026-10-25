@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { apiFetch } from '../../api/auth'
 import {
   useBearerAllowlist,
@@ -6,10 +6,17 @@ import {
   useRemoveBearerAllowlist,
   useRestoreBearerAllowlist,
 } from '../../api/oauth'
+import { toastError } from '../../lib/http/apiJson'
 import { usePlatformSettings, useSavePlatformSettings } from './PlatformPage.hooks'
-import { SavedBadge } from './PlatformPage.shared'
+import { SaveState, SettingRow } from '../../components/ui/SettingsControls'
+import { useSaveState } from '../../hooks/useSaveState'
+import InfoTip from '../../components/ui/InfoTip'
+import Switch from '../../components/ui/Switch'
 import { FORWARDING_CONSEQUENCE, forwardingAdvice, forwardingSeen } from '../../components/admin/forwardingAdvice'
 import type { ForwardingWarning } from '../../components/admin/forwardingAdvice'
+import Button from '../../components/ui/Button'
+import { Input, Select } from '../../components/ui/Field'
+import { CARD } from '../../components/ui/classes'
 
 // ---------------------------------------------------------------------------
 // Security tab
@@ -31,7 +38,7 @@ function BearerAllowlistSection() {
   const handleAdd = async () => {
     setError('')
     if (!provider.trim() || !host.trim()) {
-      setError('Provider and host required')
+      setError('Enter a provider and a host.')
       return
     }
     try {
@@ -42,78 +49,74 @@ function BearerAllowlistSection() {
       setProvider('')
       setHost('')
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Failed to add')
+      setError(e instanceof Error ? e.message : 'The entry was not added.')
     }
   }
 
   return (
-    <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4">
+    <div className={`${CARD} p-4`}>
       <div className="flex items-center justify-between mb-1">
-        <h3 className="text-sm font-semibold text-p-text">OAuth Bearer Allowlist</h3>
-        <button
-          onClick={() => restoreDefaults.mutate()}
+        <h3 className="text-sm font-semibold text-primary">OAuth Bearer Allowlist</h3>
+        <Button variant="secondary" size="xs"
+          onClick={() => { void restoreDefaults.mutateAsync().catch(toastError('The defaults were not restored')) }}
           disabled={restoreDefaults.isPending}
-          className="text-xs px-3 py-1.5 border border-p-border-light rounded-lg text-p-text-secondary hover:bg-p-bg disabled:opacity-50"
         >
           {restoreDefaults.isPending ? 'Restoring…' : 'Restore defaults'}
-        </button>
+        </Button>
       </div>
-      <p className="text-xs text-p-text-light mb-4">
-        Controls which MCPs may receive a user's OAuth token, so OAuth-based
-        MCPs can authenticate.
+      <p className="text-xs text-tertiary mb-4">
+        Controls which MCPs may receive a user's OAuth token. MCPs that use
+        OAuth need it to sign in.
       </p>
 
       <div className="flex gap-2 mb-4 items-end">
         <div className="flex-1">
-          <label className="block text-xs text-p-text-secondary mb-1">Provider ID</label>
-          <input
+          <label className="block text-xs text-secondary mb-1">Provider ID</label>
+          <Input
             type="text"
             value={provider}
             onChange={(e) => setProvider(e.target.value)}
             placeholder="slack"
-            className="w-full px-3 py-2 border border-p-border-light rounded-lg text-sm bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
           />
         </div>
         <div className="flex-1">
-          <label className="block text-xs text-p-text-secondary mb-1">Host pattern</label>
-          <input
+          <label className="block text-xs text-secondary mb-1">Host pattern</label>
+          <Input
             type="text"
             value={host}
             onChange={(e) => setHost(e.target.value)}
             placeholder="mcp.slack.com or *.slack.com"
-            className="w-full px-3 py-2 border border-p-border-light rounded-lg text-sm bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
           />
         </div>
-        <button
+        <Button variant="primary" size="md"
           onClick={handleAdd}
           disabled={addEntry.isPending}
-          className="px-4 py-2 bg-brand hover:bg-brand-hover text-white rounded-lg text-sm disabled:opacity-50"
         >
           {addEntry.isPending ? 'Adding…' : 'Add'}
-        </button>
+        </Button>
       </div>
-      {error && <div className="text-sm text-p-accent-red mb-3">{error}</div>}
+      {error && <div className="text-sm text-status-danger-fg mb-3">{error}</div>}
 
       {isLoading ? (
-        <div className="text-sm text-p-text-light">Loading…</div>
+        <div className="text-sm text-tertiary">Loading…</div>
       ) : entries && entries.length > 0 ? (
-        <div className="space-y-1">
+        <div className="divide-y divide-subtle">
           {entries.map((e) => (
             <div
               key={e.id}
-              className="flex items-center justify-between px-3 py-2 border border-p-border-light rounded-lg text-sm"
+              className="flex items-center justify-between py-2 text-sm"
             >
-              <div className="font-mono text-p-text">
+              <div className="font-mono text-primary">
                 <span className="font-medium">{e.provider_id}</span>
-                <span className="mx-2 text-p-text-light">→</span>
+                <span className="mx-2 text-tertiary">→</span>
                 <span>{e.host_pattern}</span>
               </div>
               <div className="flex items-center gap-3">
-                <span className="text-xs text-p-text-light">{e.added_by}</span>
+                <span className="text-xs text-tertiary">{e.added_by}</span>
                 <button
-                  onClick={() => removeEntry.mutate(e.id)}
+                  onClick={() => { void removeEntry.mutateAsync(e.id).catch(toastError('The entry was not removed')) }}
                   disabled={removeEntry.isPending}
-                  className="text-sm text-p-accent-red hover:underline"
+                  className="text-sm text-status-danger-fg hover:underline"
                 >
                   Remove
                 </button>
@@ -122,7 +125,7 @@ function BearerAllowlistSection() {
           ))}
         </div>
       ) : (
-        <div className="text-sm text-p-text-light">No entries.</div>
+        <div className="text-sm text-tertiary">No entries.</div>
       )}
     </div>
   )
@@ -132,8 +135,7 @@ function BearerAllowlistSection() {
 export default function SecurityTab() {
   const { data, isLoading } = usePlatformSettings()
   const saveMutation = useSavePlatformSettings()
-  const [savedField, setSavedField] = useState('')
-  const [saveError, setSaveError] = useState('')
+  const { stateOf, run } = useSaveState()
 
   // SMTP
   const [smtpHost, setSmtpHost] = useState('')
@@ -157,8 +159,11 @@ export default function SecurityTab() {
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null)
   const [testing, setTesting] = useState(false)
 
-  useEffect(() => {
-    if (data) {
+  // The saved settings fill the form when they arrive or change (in render).
+  const [filledFrom, setFilledFrom] = useState(data)
+  if (data && filledFrom !== data) {
+    setFilledFrom(data)
+    {
       setSmtpHost(data.smtp_host || '')
       setSmtpPort(data.smtp_port || '587')
       setSmtpUser(data.smtp_user || '')
@@ -168,25 +173,21 @@ export default function SecurityTab() {
       setPwMinScore(data.password_min_score || '3')
       setPwMinLength(data.password_min_length || '8')
     }
-  }, [data])
+  }
 
-  const save = (field: string, value: string | boolean) => {
-    setSaveError('')
-    saveMutation.mutate(
-      { [field]: value },
-      {
-        onSuccess: () => { setSavedField(field); setTimeout(() => setSavedField(''), 2000) },
-        onError: (e: unknown) => setSaveError(e instanceof Error ? e.message : 'Failed to save'),
-      }
-    )
+  // A refusal toasts the server's reason (turning the second-factor
+  // requirement on is refused while the admin has none).
+  const save = (field: string, value: string | boolean, revert?: () => void) => {
+    void run(field, () => saveMutation.mutateAsync({ [field]: value }),
+      { failTitle: 'The security setting was not saved', revert })
   }
 
   const saveSmtp = () => {
-    saveMutation.mutate({
+    void run('smtp', () => saveMutation.mutateAsync({
       smtp_host: smtpHost, smtp_port: smtpPort, smtp_user: smtpUser,
-      smtp_password: smtpPassword || undefined as any,
+      smtp_password: smtpPassword || undefined,
       smtp_from: smtpFrom, smtp_tls: smtpTls ? 'true' : 'false',
-    }, { onSuccess: () => { setSavedField('smtp'); setTimeout(() => setSavedField(''), 2000); setSmtpPassword('') } })
+    }).then(() => setSmtpPassword('')), { failTitle: 'The email settings were not saved' })
   }
 
   const testSmtp = async () => {
@@ -202,18 +203,18 @@ export default function SecurityTab() {
       })
       const d = await res.json()
       setTestResult(d)
-    } catch { setTestResult({ success: false, message: 'Request failed' }) }
+    } catch { setTestResult({ success: false, message: 'The test did not run. Try again.' }) }
     finally { setTesting(false) }
   }
 
-  if (isLoading) return <p className="text-sm text-p-text-secondary">Loading...</p>
+  if (isLoading) return <p className="text-sm text-secondary">Loading...</p>
 
   const warnings: ForwardingWarning[] = data?.forwarding_warnings || []
 
   return (
     <div className="space-y-6">
       {warnings.length > 0 && (
-        <div role="alert" className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-800 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
+        <div role="alert" className="rounded-card border border-status-warning-border bg-status-warning-bg p-4 text-sm text-status-warning-fg">
           <div className="font-semibold">Client addresses are not being resolved</div>
           <ul className="mt-1 list-disc pl-5 space-y-0.5">
             {warnings.map((w) => (
@@ -226,141 +227,133 @@ export default function SecurityTab() {
           <p className="mt-1 text-xs">{FORWARDING_CONSEQUENCE}</p>
         </div>
       )}
-      {saveError && <div role="alert" className="text-sm text-p-accent-red">{saveError}</div>}
       {/* On the OtoDock cloud these are operator-managed (values come from
           config.env via OTODOCK_FORCED_SETTINGS; writes are rejected
           server-side) — hide them from the customer-admin. */}
       {!data?.cloud && <>
       {/* Two-Factor Authentication policy */}
-      <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4">
+      <div className={`${CARD} p-4`}>
         <div className="flex items-center justify-between gap-3">
           <div>
-            <div className="flex items-center gap-2">
-              <h3 className="text-sm font-semibold text-p-text">Require Two-Factor Authentication</h3>
-              <SavedBadge show={savedField === 'require_2fa'} />
+            <div>
+              <h3 className="inline text-sm font-semibold text-primary">Require Two-Factor Authentication</h3>
+              <InfoTip label="Require Two-Factor Authentication">
+                Accounts with a local password must set up a second factor at their next sign-in.
+                It can be an authenticator app or a passkey.
+              </InfoTip>
+              <SaveState state={stateOf('require_2fa')} />
             </div>
-            <p className="text-xs text-p-text-light mt-1">
-              Local-password accounts must set up a second factor (authenticator app or passkey)
-              at their next sign-in. SSO accounts are exempt — their identity provider owns MFA.
+            <p className="text-xs text-tertiary mt-1">
+              SSO accounts are exempt, because their
+              identity provider handles MFA.
             </p>
           </div>
-          <button type="button" role="switch" aria-checked={!!data?.require_2fa}
+          <Switch
+            aria-label="Require Two-Factor Authentication"
+            checked={!!data?.require_2fa}
             disabled={(data?.forced_keys || []).includes('require_2fa')}
             title={(data?.forced_keys || []).includes('require_2fa') ? 'Managed by the operator' : undefined}
-            onClick={() => save('require_2fa', !data?.require_2fa)}
-            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors disabled:opacity-50 ${data?.require_2fa ? 'bg-brand' : 'bg-gray-300 dark:bg-gray-600'}`}>
-            <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition ${data?.require_2fa ? 'translate-x-4' : 'translate-x-0'}`} />
-          </button>
+            onChange={(on) => save('require_2fa', on)}
+          />
         </div>
-        <div className="mt-4 pt-4 border-t border-p-border-light grid grid-cols-1 sm:grid-cols-2 gap-4 items-start">
+        <div className="mt-4 pt-4 border-t border-subtle grid grid-cols-1 sm:grid-cols-2 gap-4 items-start">
           <div>
-            <label className="block text-xs text-p-text-secondary mb-1">Passkey Sign-In</label>
-            <select value={data?.passkey_login_mode || 'passwordless'}
+            <div className="mb-1">
+              <label className="text-xs text-secondary">Passkey Sign-In</label>
+              <InfoTip label="Passkey Sign-In">
+                A passkey always asks for a fingerprint, face or PIN on the device. So
+                passwordless sign-in is already multi-factor and resists phishing.
+              </InfoTip>
+              <SaveState state={stateOf('passkey_login_mode')} />
+            </div>
+            <Select value={data?.passkey_login_mode || 'passwordless'}
               disabled={(data?.forced_keys || []).includes('passkey_login_mode')}
-              onChange={e => save('passkey_login_mode', e.target.value)}
-              className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 disabled:opacity-50">
-              <option value="passwordless">Passwordless — passkey is a primary sign-in method</option>
-              <option value="second_factor">Second factor only — passkeys after a correct password</option>
-            </select>
-            <SavedBadge show={savedField === 'passkey_login_mode'} />
+              onChange={e => save('passkey_login_mode', e.target.value)}>
+              <option value="passwordless">Passwordless: a passkey signs in on its own</option>
+              <option value="second_factor">Second factor only: a passkey after the password</option>
+            </Select>
+            <p className="text-2xs text-tertiary mt-1">
+              Passkeys work only with a public dashboard URL that starts with https.
+            </p>
           </div>
-          <p className="text-[11px] text-p-text-light sm:pt-5">
-            Passkey sign-in always requires on-device verification (biometric or PIN), so
-            passwordless is itself multi-factor and phishing-resistant. Applies only when
-            passkeys are enabled (HTTPS public dashboard URL).
-          </p>
         </div>
       </div>
 
       {/* Password Policy */}
-      <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4">
-        <h3 className="text-sm font-semibold text-p-text mb-1">Password Policy</h3>
-        <p className="text-xs text-p-text-light mb-4">Configure password strength requirements for local accounts.</p>
+      <div className={`${CARD} p-4`}>
+        <h3 className="text-sm font-semibold text-primary mb-1">Password Policy</h3>
+        <p className="text-xs text-tertiary mb-4">Configure password strength requirements for local accounts.</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
-            <label className="block text-xs text-p-text-secondary mb-1">Minimum Strength</label>
-            <select value={pwMinScore} onChange={e => setPwMinScore(e.target.value)}
-              onBlur={() => save('password_min_score', pwMinScore)}
-              className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30">
-              <option value="0">Very weak (0) — no restriction</option>
-              <option value="1">Weak (1) — basic</option>
-              <option value="2">Fair (2) — moderate</option>
-              <option value="3">Strong (3) — recommended</option>
-              <option value="4">Very strong (4) — strictest</option>
-            </select>
-            <SavedBadge show={savedField === 'password_min_score'} />
+            <p className="text-xs text-secondary mb-1"><label>Minimum Strength</label><SaveState state={stateOf('password_min_score')} /></p>
+            <Select value={pwMinScore} onChange={e => setPwMinScore(e.target.value)}
+              onBlur={() => save('password_min_score', pwMinScore, () => setPwMinScore(data?.password_min_score || '3'))}>
+              <option value="0">Very weak (0): no restriction</option>
+              <option value="1">Weak (1): basic</option>
+              <option value="2">Fair (2): moderate</option>
+              <option value="3">Strong (3): recommended</option>
+              <option value="4">Very strong (4): strictest</option>
+            </Select>
           </div>
           <div>
-            <label className="block text-xs text-p-text-secondary mb-1">Minimum Length</label>
-            <input type="number" value={pwMinLength} min={4} max={128}
+            <p className="text-xs text-secondary mb-1"><label>Minimum Length</label><SaveState state={stateOf('password_min_length')} /></p>
+            <Input type="number" value={pwMinLength} min={4} max={128}
               onChange={e => setPwMinLength(e.target.value)}
               onBlur={() => save('password_min_length', pwMinLength)}
-              className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text text-right focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
-            <SavedBadge show={savedField === 'password_min_length'} />
+              className="text-right" />
           </div>
         </div>
       </div>
 
       {/* SMTP */}
-      <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4">
+      <div className={`${CARD} p-4`}>
         <div className="flex items-center gap-2 mb-1">
-          <h3 className="text-sm font-semibold text-p-text">Email (SMTP)</h3>
-          <SavedBadge show={savedField === 'smtp'} />
+          <h3 className="text-sm font-semibold text-primary">SMTP Email</h3>
+          <SaveState state={stateOf('smtp')} besideButton />
         </div>
-        <p className="text-xs text-p-text-light mb-4">Used for password resets and user invites.</p>
+        <p className="text-xs text-tertiary mb-4">Used for password resets and user invites.</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
           <div>
-            <label className="block text-xs text-p-text-secondary mb-1">SMTP Host</label>
-            <input type="text" value={smtpHost} onChange={e => setSmtpHost(e.target.value)}
-              placeholder="mail.example.com"
-              className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+            <label className="block text-xs text-secondary mb-1">SMTP Host</label>
+            <Input type="text" value={smtpHost} onChange={e => setSmtpHost(e.target.value)}
+              placeholder="mail.example.com" />
           </div>
           <div>
-            <label className="block text-xs text-p-text-secondary mb-1">Port</label>
-            <input type="text" value={smtpPort} onChange={e => setSmtpPort(e.target.value)}
-              className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+            <label className="block text-xs text-secondary mb-1">Port</label>
+            <Input type="text" value={smtpPort} onChange={e => setSmtpPort(e.target.value)} />
           </div>
           <div>
-            <label className="block text-xs text-p-text-secondary mb-1">Username</label>
-            <input type="text" value={smtpUser} onChange={e => setSmtpUser(e.target.value)}
-              placeholder="noreply@example.com"
-              className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+            <label className="block text-xs text-secondary mb-1">Username</label>
+            <Input type="text" value={smtpUser} onChange={e => setSmtpUser(e.target.value)}
+              placeholder="noreply@example.com" />
           </div>
           <div>
-            <label className="block text-xs text-p-text-secondary mb-1">Password {data?.smtp_password_set && <span className="text-green-600">(set)</span>}</label>
-            <input type="password" value={smtpPassword} onChange={e => setSmtpPassword(e.target.value)}
-              placeholder={data?.smtp_password_set ? '••••••••' : 'SMTP password'}
-              className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+            <label className="block text-xs text-secondary mb-1">Password {data?.smtp_password_set && <span className="text-status-success-fg">Set</span>}</label>
+            <Input type="password" value={smtpPassword} onChange={e => setSmtpPassword(e.target.value)}
+              placeholder={data?.smtp_password_set ? '••••••••' : 'SMTP password'} />
           </div>
           <div>
-            <label className="block text-xs text-p-text-secondary mb-1">From Address</label>
-            <input type="text" value={smtpFrom} onChange={e => setSmtpFrom(e.target.value)}
-              placeholder="noreply@example.com"
-              className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+            <label className="block text-xs text-secondary mb-1">From Address</label>
+            <Input type="text" value={smtpFrom} onChange={e => setSmtpFrom(e.target.value)}
+              placeholder="noreply@example.com" />
           </div>
           <div className="flex items-center gap-2 self-end py-2">
-            <label className="text-xs text-p-text-secondary">TLS</label>
-            <button type="button" role="switch" aria-checked={smtpTls}
-              onClick={() => setSmtpTls(!smtpTls)}
-              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${smtpTls ? 'bg-brand' : 'bg-gray-300 dark:bg-gray-600'}`}>
-              <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition ${smtpTls ? 'translate-x-4' : 'translate-x-0'}`} />
-            </button>
+            <span id="smtp-tls-label" className="text-xs text-secondary">TLS</span>
+            <Switch aria-labelledby="smtp-tls-label" checked={smtpTls} onChange={setSmtpTls} />
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <button onClick={saveSmtp} disabled={saveMutation.isPending}
-            className="px-3 py-1.5 text-xs font-medium text-white bg-brand hover:bg-brand-hover rounded-lg disabled:opacity-50">
+          <Button variant="primary" size="xs" onClick={saveSmtp} disabled={saveMutation.isPending}>
             {saveMutation.isPending ? 'Saving...' : 'Save SMTP'}
-          </button>
-          <input type="email" value={testEmail} onChange={e => setTestEmail(e.target.value)}
+          </Button>
+          <Input compact type="email" value={testEmail} onChange={e => setTestEmail(e.target.value)}
             placeholder="test@example.com"
-            className="px-3 py-1.5 text-xs border border-p-border-light rounded-lg bg-p-bg text-p-text w-48" />
-          <button onClick={testSmtp} disabled={testing || !smtpHost}
-            className="px-3 py-1.5 text-xs font-medium border border-p-border-light rounded-lg text-p-text-secondary hover:bg-p-surface-hover disabled:opacity-50">
+            className="max-w-48" />
+          <Button variant="secondary" size="xs" onClick={testSmtp} disabled={testing || !smtpHost}>
             {testing ? 'Testing...' : 'Test Connection'}
-          </button>
+          </Button>
           {testResult && (
-            <span className={`text-xs font-medium ${testResult.success ? 'text-green-600 dark:text-green-400' : 'text-p-accent-red'}`}>
+            <span className={`text-xs font-medium ${testResult.success ? 'text-status-success-fg' : 'text-status-danger-fg'}`}>
               {testResult.message}
             </span>
           )}
@@ -371,50 +364,39 @@ export default function SecurityTab() {
 
       {/* Sharing (SHARING.md): the platform-wide switches for shares to
           agents and departments and for links. */}
-      <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4 space-y-4">
+      <div className={`${CARD} p-4 space-y-4`}>
         <div>
-          <h3 className="text-sm font-semibold text-p-text">Sharing</h3>
-          <p className="text-xs text-p-text-light mt-1">
-            People share apps with colleagues by default. These switches govern shares to whole
-            agents and departments, and links to people outside the platform. Every share and every
-            link is listed under Admin → Shares.
+          <h3 className="text-sm font-semibold text-primary">Sharing</h3>
+          <p className="text-xs text-tertiary mt-1">
+            People share apps with colleagues by default. These switches cover sharing to whole
+            agents and departments. They also cover links for people outside the platform. Every
+            share and every link is listed in Admin, Shares.
           </p>
         </div>
         {([
-          ['sharing_to_agents_enabled', 'Sharing to agents', 'An editor or manager of an agent may place an app of another agent in its Apps panel for every member. Off refuses new ones.'],
-          ['sharing_to_departments_enabled', 'Sharing to departments', 'An admin may place an app in every agent of a department, following the department as it changes. Off refuses new ones.'],
-          ['sharing_external_enabled', 'External links', 'Members may make links that open an app for someone without an account (password-protected by default).'],
-          ['sharing_public_links_enabled', 'Links without a password', 'A link may be made public — anyone holding the URL opens it. Off keeps every link behind a password.'],
-          ['user_directory_visible_to_members', 'User directory when sharing', 'Members pick colleagues and agents from a list. Off means they type an exact username or email, see only their own agents, and the platform never confirms whether a name matched.'],
-        ] as const).map(([key, label, help]) => (
-          <div key={key} className="flex items-center justify-between gap-3">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-p-text">{label}</span>
-                <SavedBadge show={savedField === key} />
-              </div>
-              <p className="text-xs text-p-text-light mt-0.5">{help}</p>
-            </div>
-            <button type="button" role="switch" aria-checked={!!data?.[key]} aria-label={label}
-              onClick={() => save(key, !data?.[key])}
-              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${data?.[key] ? 'bg-brand' : 'bg-gray-300 dark:bg-gray-600'}`}>
-              <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition ${data?.[key] ? 'translate-x-4' : 'translate-x-0'}`} />
-            </button>
-          </div>
+          ['sharing_to_agents_enabled', 'Sharing to agents', 'An agent\'s editor or manager may place another agent\'s app in its Apps panel. Every member sees it. Off refuses new ones.', null],
+          ['sharing_to_departments_enabled', 'Sharing to departments', 'An admin may place an app in every agent of a department. The app follows the department as it changes. Off refuses new ones.', null],
+          ['sharing_external_enabled', 'External links', 'Members may make links that open an app for someone without an account. Links need a password by default.', null],
+          ['sharing_public_links_enabled', 'Links without a password', 'A link may be made public. Off keeps every link behind a password.', 'Anyone with a public link can open it.'],
+          ['user_directory_visible_to_members', 'User directory when sharing', 'Members pick colleagues and agents from a list. Off means they type an exact username or email. They see only their own agents. The platform never says whether a name matched.', null],
+        ] as const).map(([key, label, help, hint]) => (
+          <SettingRow key={key} label={label} description={hint} info={help} save={stateOf(key)}>
+            <Switch aria-label={label} checked={!!data?.[key]} onChange={(on) => save(key, on)} />
+          </SettingRow>
         ))}
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="flex items-center gap-2">
-              <span className="text-sm text-p-text">Longest share expiry</span>
-              <SavedBadge show={savedField === 'sharing_max_expiry_days'} />
+              <span className="text-sm text-primary">Longest share expiry</span>
+              <SaveState state={stateOf('sharing_max_expiry_days')} />
             </div>
-            <p className="text-xs text-p-text-light mt-0.5">In days: caps every share and link. A share left on “Never expires” gets this length. Empty lets a member choose “never”.</p>
+            <p className="text-xs text-tertiary mt-0.5">In days: caps every share and link. A share left on “Never expires” gets this length. Empty lets a member choose “never”.</p>
           </div>
-          <input type="text" inputMode="numeric" defaultValue={data?.sharing_max_expiry_days || ''}
+          <Input type="text" inputMode="numeric" defaultValue={data?.sharing_max_expiry_days || ''}
             key={data?.sharing_max_expiry_days || 'unset'}
-            aria-label="Longest share expiry in days" placeholder="no cap"
+            aria-label="Longest share expiry in days" placeholder="No cap"
             onBlur={(e) => { if (e.target.value !== (data?.sharing_max_expiry_days || '')) save('sharing_max_expiry_days', e.target.value.trim()) }}
-            className="w-24 px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text" />
+            className="max-w-24" />
         </div>
       </div>
 
@@ -423,29 +405,30 @@ export default function SecurityTab() {
           and this card shows only a read-only "managed" badge — never the keys.
           Self-hosters configure their own keys (secret write-only). */}
       {(data?.turnstile_managed || !data?.cloud) && (
-        <div className="border border-p-border-light rounded-xl bg-white dark:bg-p-surface p-4">
-          <h3 className="text-sm font-semibold text-p-text mb-1">Login Security (Cloudflare Turnstile)</h3>
+        <div className={`${CARD} p-4`}>
+          <h3 className="text-sm font-semibold text-primary mb-1">Login Security with Cloudflare Turnstile</h3>
           {data?.turnstile_managed ? (
-            <p className="text-xs text-p-text-secondary">
-              Bot protection managed by OtoDock — <span className="text-green-600 dark:text-green-400 font-medium">Configured</span>.
+            <p className="text-xs text-secondary">
+              Bot protection managed by OtoDock: <span className="text-status-success-fg font-medium">Configured</span>.
             </p>
           ) : (
             <>
-              <p className="text-xs text-p-text-light mb-4">Optional. Protects the login page from automated attacks.</p>
+              <p className="text-xs text-tertiary mb-4">Optional. Protects the login page from automated attacks.</p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs text-p-text-secondary mb-1">Site Key</label>
-                  <input type="text" value={turnstileSiteKey} onChange={e => setTurnstileSiteKey(e.target.value)}
+                  <p className="text-xs text-secondary mb-1"><label>Site Key</label><SaveState state={stateOf('turnstile_site_key')} /></p>
+                  <Input type="text" value={turnstileSiteKey} onChange={e => setTurnstileSiteKey(e.target.value)}
                     onBlur={() => save('turnstile_site_key', turnstileSiteKey)}
-                    placeholder="0x4AAA..."
-                    className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+                    placeholder="0x4AAA..." />
                 </div>
                 <div>
-                  <label className="block text-xs text-p-text-secondary mb-1">Secret Key {data?.turnstile_secret_key_set && <span className="text-green-600">(set)</span>}</label>
-                  <input type="password" value={turnstileSecretKey} onChange={e => setTurnstileSecretKey(e.target.value)}
+                  <p className="text-xs text-secondary mb-1">
+                    <label>Secret Key {data?.turnstile_secret_key_set && <span className="text-status-success-fg">Set</span>}</label>
+                    <SaveState state={stateOf('turnstile_secret_key')} />
+                  </p>
+                  <Input type="password" value={turnstileSecretKey} onChange={e => setTurnstileSecretKey(e.target.value)}
                     onBlur={() => { if (turnstileSecretKey) save('turnstile_secret_key', turnstileSecretKey) }}
-                    placeholder={data?.turnstile_secret_key_set ? '••••••••' : 'Secret key'}
-                    className="w-full px-3 py-2 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30" />
+                    placeholder={data?.turnstile_secret_key_set ? '••••••••' : 'Secret key'} />
                 </div>
               </div>
             </>

@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+from cryptography.fernet import InvalidToken
+
 from storage.pg import get_conn
 
 STATUS_PENDING = "pending"
@@ -318,7 +320,7 @@ def rename_instance_field_keys(mcp_name: str, renames: dict[str, str]) -> dict:
         for r in rows:
             try:
                 values = json.loads(_decrypt(r["field_values_enc"]))
-            except Exception:
+            except (InvalidToken, ValueError):
                 unreadable.append(int(r["id"]))
                 continue
             if not isinstance(values, dict):

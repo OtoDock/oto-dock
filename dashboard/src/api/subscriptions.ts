@@ -8,6 +8,7 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from './auth'
+import { apiJson } from '../lib/http/apiJson'
 import type { WebhookSubscriptionStatus } from '../lib/status/webhookSubscription'
 
 export interface WebhookSubscription {
@@ -134,12 +135,20 @@ export interface WebhookEventCatalogResponse {
   /** EFFECTIVE mode for the queried account: relay (hosted, zero console
    * steps) / auto / manual. */
   registration: {
-    mode: 'relay' | 'auto' | 'manual'
+    mode: 'relay' | 'auto' | 'manual' | 'app'
     manual_instructions_url?: string
   }
   per_subscription_secret: boolean
   /** Prefill for the vendor-target input (slack: the account's team_id). */
   vendor_target_prefill?: string
+  /** What the asked account subscribes to: `installation` for a GitHub App
+   * account (lib/kinds/oauthApp.ts), else ''. */
+  target_kind?: string
+  /** The asked account's recorded scopes; null when they cannot be known
+   * (a token, a GitHub App installation, no account asked). */
+  granted_scopes?: string[] | null
+  /** Each scope a service asks for, with that service's label. */
+  scope_services?: Record<string, string>
 }
 
 export interface CreateSubscriptionRequest {
@@ -181,9 +190,8 @@ export const useSubscriptions = (filters: SubscriptionFilters = {}) =>
       if (filters.account_label !== undefined)
         qs.set('account_label', filters.account_label)
       const url = `/v1/subscriptions${qs.toString() ? `?${qs}` : ''}`
-      const res = await apiFetch(url)
-      if (!res.ok) throw new Error(await res.text())
-      const data = await res.json()
+      const data = await apiJson<{ subscriptions?: WebhookSubscription[] }>(url, {},
+        'Could not load the subscriptions')
       return data.subscriptions ?? []
     },
     refetchInterval: 30_000,
@@ -242,6 +250,12 @@ export const useDeleteSubscription = () => {
  * and the vendor-target input (free_text / static_list dropdowns; remote_list
  * picker is deferred until the matching list endpoint lands).
  */
+/** Every cached event catalog of one MCP (each account, scope and agent):
+ * what an account holds or reaches changes its picker and its scope line,
+ * so a connect, an install, a Refresh or a binding change re-reads them. */
+export const eventCatalogKey = (mcpName: string) => [EVENT_CATALOG_QUERY, mcpName]
+const EVENT_CATALOG_QUERY = 'webhook-event-catalog'
+
 export const useWebhookEventCatalog = (
   mcpName: string | undefined,
   opts: {
@@ -252,7 +266,7 @@ export const useWebhookEventCatalog = (
 ) =>
   useQuery({
     queryKey: [
-      'webhook-event-catalog',
+      EVENT_CATALOG_QUERY,
       mcpName,
       opts.accountLabel,
       opts.scope,
@@ -263,12 +277,12 @@ export const useWebhookEventCatalog = (
       if (opts.accountLabel) qs.set('account_label', opts.accountLabel)
       if (opts.scope) qs.set('scope', opts.scope)
       if (opts.agent) qs.set('agent', opts.agent)
-      const res = await apiFetch(
+      return apiJson<WebhookEventCatalogResponse>(
         `/v1/mcps/${encodeURIComponent(mcpName!)}/webhook-event-catalog` +
           (qs.toString() ? `?${qs}` : ''),
+        {},
+        'Could not load the events',
       )
-      if (!res.ok) throw new Error(await res.text())
-      return res.json()
     },
     enabled: !!mcpName,
     staleTime: 5 * 60_000,
@@ -276,8 +290,7 @@ export const useWebhookEventCatalog = (
 
 /** Reveal a manual-mode subscription's per-subscription signing secret. */
 export const fetchSigningSecret = async (id: string): Promise<string> => {
-  const res = await apiFetch(`/v1/subscriptions/${id}/signing-secret`)
-  if (!res.ok) throw new Error(await res.text())
-  const data = await res.json()
+  const data = await apiJson<{ signing_secret?: string }>(`/v1/subscriptions/${id}/signing-secret`, {},
+    'Could not read the signing secret')
   return data.signing_secret ?? ''
 }

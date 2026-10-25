@@ -20,9 +20,10 @@ from fastapi import HTTPException
 
 import config
 from auth.providers import UserContext
+from configuration import prompts
 from storage.agents import agent_store
-from storage.knowledge import db_knowledge_libraries
 from storage.files import recover_bin_store
+from storage.knowledge import db_knowledge_libraries
 
 SRC = "kl-source"
 CON_A = "kl-con-a"          # collaborative consumer, RO attachment
@@ -514,6 +515,7 @@ class TestProjector:
         """``os.umask`` is process-wide: setting it, even for a moment, can
         hand a file another thread creates meanwhile the wrong bits."""
         import importlib.util
+
         from services.knowledge import library_projector
         calls = []
         monkeypatch.setattr(os, "umask", lambda *a: calls.append(a) or 0o022)
@@ -642,10 +644,12 @@ class TestPathPolicy:
         assert d.allowed is True
 
     def test_ctx_roundtrip_serialization(self, temp_db):
-        from core.session.session_state import (
-            _deserialize_security_ctx, _serialize_security_ctx,
-        )
         import json
+
+        from core.session.session_state import (
+            _deserialize_security_ctx,
+            _serialize_security_ctx,
+        )
         ctx = _ctx(libs=((SRC, "", False), (OTHER, "docs", True)))
         restored = _deserialize_security_ctx(
             json.loads(json.dumps(_serialize_security_ctx(ctx))))
@@ -671,8 +675,9 @@ class TestFilesApiGate:
 
 class TestSandboxMounts:
     def _args(self, **kw):
-        from core.sandbox.sandbox import SandboxBuilder, SandboxConfig
         from pathlib import Path
+
+        from core.sandbox.sandbox import SandboxBuilder, SandboxConfig
         cfg = SandboxConfig(
             role=kw.get("role", "manager"),
             username=kw.get("username", "alice"),
@@ -739,6 +744,7 @@ class TestKnowledgeRwGateCoherence:
 
     def _sandbox_args(self, *, knowledge_rw, libs=()):
         from pathlib import Path
+
         from core.sandbox.sandbox import SandboxBuilder, SandboxConfig
         cfg = SandboxConfig(
             role="manager", username="", agent_name=CON_A,
@@ -767,14 +773,14 @@ class TestKnowledgeRwGateCoherence:
 
     def test_mount_knowledge_rw_bind_no_config(self, kl_env):
         args = self._sandbox_args(knowledge_rw=True)
-        pairs = list(zip(args, args[1:]))
+        pairs = list(zip(args, args[1:], strict=False))
         kdir = str(config.get_agent_dir(CON_A) / "knowledge")
         assert ("--bind", kdir) in pairs           # knowledge RW
         assert "/config" not in " ".join(args)     # config never mounts
 
     def test_mount_default_stays_ro(self, kl_env):
         args = self._sandbox_args(knowledge_rw=False)
-        pairs = list(zip(args, args[1:]))
+        pairs = list(zip(args, args[1:], strict=False))
         kdir = str(config.get_agent_dir(CON_A) / "knowledge")
         assert ("--ro-bind", kdir) in pairs
 
@@ -876,8 +882,10 @@ class TestKnowledgeRwGateCoherence:
 
     def test_ctx_roundtrip_keeps_the_flag(self, temp_db):
         import json
+
         from core.session.session_state import (
-            _deserialize_security_ctx, _serialize_security_ctx,
+            _deserialize_security_ctx,
+            _serialize_security_ctx,
         )
         ctx = self._svc_ctx(knowledge_rw=True, libs=((SRC, "", True),))
         restored = _deserialize_security_ctx(
@@ -922,7 +930,8 @@ def _master_key():
 class TestApiAuthz:
     def _promote(self, user, agent=SRC, enabled=True):
         from api.agents.knowledge_libraries import (
-            LibraryToggleRequest, set_knowledge_library,
+            LibraryToggleRequest,
+            set_knowledge_library,
         )
         return _run(set_knowledge_library(
             agent, LibraryToggleRequest(enabled=enabled, name="Test Library"),
@@ -930,7 +939,8 @@ class TestApiAuthz:
 
     def _attach(self, user, consumer=CON_A, source=SRC, writable=False):
         from api.agents.knowledge_libraries import (
-            AttachRequest, attach_knowledge_library,
+            AttachRequest,
+            attach_knowledge_library,
         )
         return _run(attach_knowledge_library(
             consumer, AttachRequest(source_agent=source, writable=writable),
@@ -1065,7 +1075,8 @@ class TestLibraryDisplayName:
 
     def test_api_requires_a_name_when_sharing(self, kl_env):
         from api.agents.knowledge_libraries import (
-            LibraryToggleRequest, set_knowledge_library,
+            LibraryToggleRequest,
+            set_knowledge_library,
         )
         with pytest.raises(HTTPException) as exc:
             _run(set_knowledge_library(
@@ -1077,7 +1088,8 @@ class TestLibraryDisplayName:
 
     def test_api_rejects_an_overlong_name(self, kl_env):
         from api.agents.knowledge_libraries import (
-            LibraryToggleRequest, set_knowledge_library,
+            LibraryToggleRequest,
+            set_knowledge_library,
         )
         with pytest.raises(HTTPException) as exc:
             _run(set_knowledge_library(
@@ -1087,7 +1099,8 @@ class TestLibraryDisplayName:
 
     def test_unshare_needs_no_name(self, kl_env):
         from api.agents.knowledge_libraries import (
-            LibraryToggleRequest, set_knowledge_library,
+            LibraryToggleRequest,
+            set_knowledge_library,
         )
         db_knowledge_libraries.promote(SRC, created_by=ADMIN_SUB, name="X")
         r = _run(set_knowledge_library(
@@ -1160,7 +1173,8 @@ def kl_subdir_env(temp_db):
 class TestSubdirValidation:
     def _promote(self, subdir, name="Lib", agent=SRC):
         from api.agents.knowledge_libraries import (
-            LibraryToggleRequest, set_knowledge_library,
+            LibraryToggleRequest,
+            set_knowledge_library,
         )
         return _run(set_knowledge_library(
             agent, LibraryToggleRequest(enabled=True, name=name, subdir=subdir),
@@ -1372,6 +1386,7 @@ class TestSubdirLibraries:
     def test_sandbox_mounts_per_library_subtree(self, kl_subdir_env):
         # RO marketing for CON_A → nested ro-bind of the SUBTREE only.
         from pathlib import Path
+
         from core.sandbox.sandbox import SandboxBuilder, SandboxConfig
         cfg = SandboxConfig(
             role="manager", username="alice", agent_name=CON_A,
@@ -1382,7 +1397,7 @@ class TestSubdirLibraries:
             knowledge_libraries=[(SRC, "marketing", False)],
         )
         args = SandboxBuilder(cfg)._workspace_mounts()
-        pairs = list(zip(args, args[1:], args[2:]))
+        pairs = list(zip(args, args[1:], args[2:], strict=False))
         mirror_sub = str(config.get_agent_dir(CON_A) / "knowledge" / "shared"
                          / SRC / "marketing")
         assert ("--ro-bind", mirror_sub,
@@ -1431,27 +1446,27 @@ class TestBulletins:
     def test_injected_for_consumer_and_source(self, kl_subdir_env):
         self._write_bulletin("marketing", "Marketing", "Campaign freeze Friday.")
         # Consumer of the marketing library sees it…
-        section = config._render_library_bulletins(CON_A)
+        section = prompts._render_library_bulletins(CON_A)
         assert section is not None
         assert "# Library Bulletins" in section
         assert "Marketing" in section and "Campaign freeze Friday." in section
         assert f"from the **{SRC}** agent" in section
         # …and the SOURCE agent itself sees its own library's bulletin.
-        own = config._render_library_bulletins(SRC)
+        own = prompts._render_library_bulletins(SRC)
         assert own is not None and "this agent's own library" in own
 
     def test_missing_file_and_unnamed_library_skip(self, kl_env):
         # kl_env's root library has no name and no bulletin file → nothing.
-        assert config._render_library_bulletins(CON_A) is None
+        assert prompts._render_library_bulletins(CON_A) is None
         # Named but still no file → still nothing.
         db_knowledge_libraries.promote(SRC, created_by=ADMIN_SUB, name="Lib")
-        assert config._render_library_bulletins(CON_A) is None
+        assert prompts._render_library_bulletins(CON_A) is None
 
     def test_name_with_space_and_root_library(self, kl_env):
         db_knowledge_libraries.promote(
             SRC, created_by=ADMIN_SUB, name="Brand Guidelines")
         self._write_bulletin("", "Brand Guidelines", "Use the new logo.")
-        section = config._render_library_bulletins(CON_B)
+        section = prompts._render_library_bulletins(CON_B)
         assert section and "Brand Guidelines" in section
         assert "Use the new logo." in section
 
@@ -1460,7 +1475,7 @@ class TestBulletins:
         # 'α' is 2 bytes; an odd byte budget forces a split mid-character.
         text = "α" * 3000  # 6000 bytes > 4096, cut lands mid-α
         self._write_bulletin("", "Lib", text)
-        section = config._render_library_bulletins(CON_A)
+        section = prompts._render_library_bulletins(CON_A)
         assert section is not None
         assert "�" not in section          # no mojibake from the cut
         assert "truncated at 4 KB" in section
@@ -1472,31 +1487,31 @@ class TestBulletins:
         is (auto-loaded runtime broadcast, not memory, 4 KB budget) — the
         old header was a single opaque sentence."""
         self._write_bulletin("marketing", "Marketing", "Note.")
-        section = config._render_library_bulletins(CON_A)
+        section = prompts._render_library_bulletins(CON_A)
         assert "auto-loaded into the context of every agent attached" in section
         assert "NOT a memory" in section
         assert "first 4 KB" in section
 
     def test_rw_attachment_gets_the_write_path_hint(self, kl_subdir_env):
         self._write_bulletin("marketing", "Marketing", "Note.")
-        rw = config._render_library_bulletins(CON_B)   # marketing RW
+        rw = prompts._render_library_bulletins(CON_B)   # marketing RW
         assert ("Writable attachment — publish updates at "
                 f"`/knowledge/shared/{SRC}/marketing/bulletin/Marketing.md`"
                 in rw)
-        ro = config._render_library_bulletins(CON_A)   # marketing RO
+        ro = prompts._render_library_bulletins(CON_A)   # marketing RO
         assert "Writable attachment" not in ro
-        own = config._render_library_bulletins(SRC)
+        own = prompts._render_library_bulletins(SRC)
         assert "File: `/knowledge/marketing/bulletin/Marketing.md`" in own
 
     def test_near_cap_soft_warning(self, kl_env):
         db_knowledge_libraries.promote(SRC, created_by=ADMIN_SUB, name="Lib")
         self._write_bulletin("", "Lib", "x" * 3500)   # >3 KB soft, <4 KB cap
-        section = config._render_library_bulletins(CON_A)
+        section = prompts._render_library_bulletins(CON_A)
         assert "of the 4 KB injected cap" in section
         assert "truncated" not in section
         # Under the soft threshold → no warning line.
         self._write_bulletin("", "Lib", "x" * 1000)
-        section = config._render_library_bulletins(CON_A)
+        section = prompts._render_library_bulletins(CON_A)
         assert "injected cap" not in section
 
     def test_rw_mirror_bulletin_adopted_and_injected(
@@ -1517,7 +1532,7 @@ class TestBulletins:
         assert (_mirror(CON_A) / "marketing" / "bulletin"
                 / "Marketing.md").read_text() == "Written by the attached team."
         # …and injection (source-read) now carries the consumer's text.
-        section = config._render_library_bulletins(CON_A)
+        section = prompts._render_library_bulletins(CON_A)
         assert section and "Written by the attached team." in section
 
     def test_ro_mirror_bulletin_still_refused_and_healed(
@@ -1538,7 +1553,7 @@ class TestBulletins:
         assert not (mir_a / "Marketing.md").exists()
         entries = recover_bin_store.list_for(CON_A, ADMIN_SUB, True, True, True)
         assert any("bulletin/Marketing.md" in e["rel_path"] for e in entries)
-        assert config._render_library_bulletins(CON_B) is None
+        assert prompts._render_library_bulletins(CON_B) is None
 
     def test_rw_mirror_bulletin_delete_deletes_source(
             self, kl_subdir_env, quiet_fanout):
@@ -1552,7 +1567,7 @@ class TestBulletins:
         assert not src_file.exists()
         assert not (_mirror(CON_A) / "marketing" / "bulletin"
                     / "Marketing.md").exists()
-        assert config._render_library_bulletins(CON_A) is None
+        assert prompts._render_library_bulletins(CON_A) is None
 
     def test_reconcile_adopts_rw_bulletin_direct_write(
             self, kl_subdir_env, quiet_fanout):
@@ -1567,7 +1582,7 @@ class TestBulletins:
         src_file = (config.get_agent_dir(SRC) / "knowledge" / "marketing"
                     / "bulletin" / "Marketing.md")
         assert src_file.read_text() == "swept in"
-        section = config._render_library_bulletins(CON_A)
+        section = prompts._render_library_bulletins(CON_A)
         assert section and "swept in" in section
 
     def test_source_bulletin_projects_to_mirrors_readonly_copy(
@@ -1581,7 +1596,8 @@ class TestBulletins:
 
     def _promote(self, name, subdir=""):
         from api.agents.knowledge_libraries import (
-            LibraryToggleRequest, set_knowledge_library,
+            LibraryToggleRequest,
+            set_knowledge_library,
         )
         return _run(set_knowledge_library(
             SRC, LibraryToggleRequest(enabled=True, name=name, subdir=subdir),
@@ -1633,7 +1649,7 @@ class TestBulletins:
             SRC, PERSONAL, writable=False, created_by=ADMIN_SUB,
             subdir="marketing")
         self._write_bulletin("marketing", "Marketing", "For everyone.")
-        section = config._render_library_bulletins(PERSONAL)
+        section = prompts._render_library_bulletins(PERSONAL)
         assert section and "For everyone." in section
 
     def test_get_reports_bulletin_presence(self, kl_subdir_env):

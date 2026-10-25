@@ -16,11 +16,14 @@ import pytest
 
 import config as app_config
 from core.layers.direct import files as direct_files
+from core.sandbox.oto_env import build_oto_env
 from core.sandbox.sandbox import (
-    EXTERNAL_SANDBOX_HOME, SandboxBuilder, SandboxConfig, empty_mount_dir,
+    EXTERNAL_SANDBOX_HOME,
+    SandboxBuilder,
+    SandboxConfig,
+    empty_mount_dir,
 )
 from services import path_roles
-from core.sandbox.oto_env import build_oto_env
 
 
 @pytest.fixture

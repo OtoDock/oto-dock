@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import type { AppSecret, PinnedApp } from '@/api/apps'
@@ -36,6 +36,7 @@ vi.mock('@/api/auth', async (importOriginal) => ({
 }))
 
 import AppSettingsPanel from '@/components/apps/AppSettingsPanel'
+import { answerDialog, renderWithDialogs } from './dialogsHarness'
 
 function mkApp(over: Partial<PinnedApp> = {}): PinnedApp {
   return {
@@ -55,7 +56,7 @@ const SECRETS: AppSecret[] = [
 
 function renderPanel(app = mkApp(), onClose = vi.fn()) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  render(
+  renderWithDialogs(
     <QueryClientProvider client={qc}>
       <AppSettingsPanel app={app} agent="dev" onClose={onClose} />
     </QueryClientProvider>,
@@ -79,19 +80,19 @@ describe('AppSettingsPanel', () => {
     expect(key).toContain('a restricted key')
     // A short description has no fold.
     expect(screen.getByTestId('secret-row-STRIPE_SECRET_KEY').querySelector('[data-testid="secret-description-more"]')).toBeNull()
-    expect(screen.getByTestId('secret-state-STRIPE_SECRET_KEY').textContent).toBe('not set — required')
+    expect(screen.getByTestId('secret-state-STRIPE_SECRET_KEY').textContent).toBe('Not set, required')
     const smtp = screen.getByTestId('secret-row-SMTP_PASSWORD').textContent || ''
     expect(smtp).toContain('read by the server itself')
-    expect(screen.getByTestId('secret-state-SMTP_PASSWORD').textContent).toContain('set by alice')
+    expect(screen.getByTestId('secret-state-SMTP_PASSWORD').textContent).toContain('Set by alice')
     const old = screen.getByTestId('secret-row-OLD_KEY')
-    expect(old.textContent).toContain('no longer declared by the manifest')
+    expect(old.textContent).toContain('The app no longer declares it')
     expect(old.querySelector('input')).toBeNull()
     expect(old.textContent).toContain('Remove')
     // The inputs are password fields with no value; a set one says so.
     const input = screen.getByLabelText('Value of SMTP_PASSWORD') as HTMLInputElement
     expect(input.type).toBe('password')
     expect(input.value).toBe('')
-    expect(input.placeholder).toContain('(set)')
+    expect(input.placeholder).toContain('Already set')
     expect(calls.filter((c) => c.method === 'GET' && c.path.endsWith('/secrets'))).toHaveLength(1)
   })
 
@@ -110,7 +111,7 @@ describe('AppSettingsPanel', () => {
     expect(put?.path).toBe('/v1/apps/app-1/secrets/STRIPE_SECRET_KEY')
     expect(JSON.parse(put!.body)).toEqual({ value: 'sk-test-alpha-beta' })
     expect(input.value).toBe('')
-    await waitFor(() => expect(screen.getByTestId('secret-state-STRIPE_SECRET_KEY').textContent).toContain('set by me'))
+    await waitFor(() => expect(screen.getByTestId('secret-state-STRIPE_SECRET_KEY').textContent).toContain('Set by me'))
     // Enter in the field saves too.
     fireEvent.change(input, { target: { value: 'sk-test-gamma' } })
     fireEvent.keyDown(input, { key: 'Enter' })
@@ -120,16 +121,17 @@ describe('AppSettingsPanel', () => {
   it('removes a value behind a confirm, shows the proxy\'s refusal, and closes on Escape', async () => {
     const onClose = renderPanel()
     await waitFor(() => expect(screen.getByTestId('secret-row-OLD_KEY')).toBeTruthy())
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     fireEvent.click(screen.getByTestId('secret-row-OLD_KEY').querySelector('button') as HTMLButtonElement)
+    await act(async () => { await answerDialog('Cancel', 'Remove the value of OLD_KEY?') })
     expect(calls.filter((c) => c.method === 'DELETE')).toHaveLength(0)
-    confirm.mockReturnValue(true)
+    expect(onClose).not.toHaveBeenCalled()
     fireEvent.click(screen.getByTestId('secret-row-OLD_KEY').querySelector('button') as HTMLButtonElement)
+    await act(async () => { await answerDialog('Remove', 'Remove the value of OLD_KEY?') })
     await waitFor(() => expect(calls.filter((c) => c.method === 'DELETE')).toHaveLength(1))
     expect(calls.find((c) => c.method === 'DELETE')?.path).toBe('/v1/apps/app-1/secrets/OLD_KEY')
     await waitFor(() => expect(screen.queryByTestId('secret-row-OLD_KEY')).toBeNull())
-    confirm.mockRestore()
-    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('alertdialog')).toBeNull()
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' })
     expect(onClose).toHaveBeenCalled()
   })
 
@@ -177,15 +179,14 @@ describe('AppSettingsPanel', () => {
     }))
     await waitFor(() => expect(screen.getByTestId('inbound-row-stripe')).toBeTruthy())
     const stripe = screen.getByTestId('inbound-row-stripe')
-    expect(stripe.textContent).toContain('Stripe-signed events (the Stripe-Signature header)')
+    expect(stripe.textContent).toContain('Stripe-signed events with the Stripe-Signature header')
     expect(stripe.textContent).toContain(`${window.location.origin}/v1/apps/app-1/inbound/stripe`)
     // The secrets' states arrive with the listing.
-    await waitFor(() => expect(stripe.textContent).toContain('verified with the secret STRIPE_WEBHOOK_SECRET (not set — the address is off until it is)'))
-    expect(stripe.textContent).toContain('(not set — the address is off until it is), and wakes payment')
+    await waitFor(() => expect(stripe.textContent).toContain('Verified with the secret STRIPE_WEBHOOK_SECRET and wakes payment. The secret is not set, so the address is off.'))
     expect(screen.getByTestId('inbound-section').textContent).toContain('Paste the address into the vendor’s webhook settings. Its signing secret goes above.')
     const gh = screen.getByTestId('inbound-row-gh')
     expect(gh.textContent).toContain('GitHub-signed events')
-    expect(gh.textContent).toContain('GH_SECRET (set)')
+    expect(gh.textContent).toContain('GH_SECRET and wakes push. The secret is set.')
     fireEvent.click(stripe.querySelector('button') as HTMLButtonElement)
     await waitFor(() => expect(written).toEqual([`${window.location.origin}/v1/apps/app-1/inbound/stripe`]))
     await waitFor(() => expect(stripe.textContent).toContain('Copied'))
@@ -209,7 +210,7 @@ describe('AppSettingsPanel', () => {
     renderPanel(mkApp())
     await waitFor(() => expect(screen.getByTestId('triggers-section')).toBeTruthy())
     const section = screen.getByTestId('triggers-section')
-    expect(section.textContent).toContain('POST to the address with your API key (User Settings → Integrations)')
+    expect(section.textContent).toContain('POST to the address with your API key to wake the app. Your keys are in User Settings, Integrations.')
     const ping = screen.getByTestId('trigger-row-home-ping')
     expect(ping.textContent).toContain('wakes ping')
     expect(ping.textContent).toContain(`${window.location.origin}/v1/webhooks/user/alice/home-ping`)
@@ -217,7 +218,7 @@ describe('AppSettingsPanel', () => {
     await waitFor(() => expect(written).toEqual([`${window.location.origin}/v1/webhooks/user/alice/home-ping`]))
     const mail = screen.getByTestId('trigger-row-home-mail')
     expect(mail.textContent).toContain('paused')
-    expect(mail.textContent).toContain('fed by a vendor subscription')
+    expect(mail.textContent).toContain('Fed by a vendor subscription')
     expect(mail.textContent).toContain('paused: removed from the agent')
     expect(screen.queryByTestId('trigger-row-other')).toBeNull()
   })
@@ -230,6 +231,6 @@ describe('AppSettingsPanel', () => {
     ]
     renderPanel(mkApp({ scope: 'shared', rel_path: 'workspace/apps/board' }))
     await waitFor(() => expect(screen.getByTestId('triggers-section')).toBeTruthy())
-    expect(screen.getByTestId('triggers-section').textContent).toContain('with an agent API key (the Triggers tab)')
+    expect(screen.getByTestId('triggers-section').textContent).toContain('with an agent API key to wake the app. Agent keys are on the agent’s Triggers page.')
   })
 })

@@ -48,6 +48,7 @@ import signal
 import threading
 import time
 from pathlib import Path
+from typing import cast
 
 QUEUE_SIZE = 10_000
 ATEXIT_DRAIN_S = 30.0
@@ -172,7 +173,7 @@ class _Listener(logging.handlers.QueueListener):
     def enqueue_sentinel(self) -> None:
         # Clean path: wait for a slot. The stdlib's put_nowait raises
         # queue.Full whenever the writer is merely busy.
-        self.queue.put(self._sentinel)
+        cast("queue.Queue", self.queue).put(self._sentinel)  # type: ignore[attr-defined]  # QueueListener._sentinel exists at run time; typeshed omits it (library typing gap)
 
     def stop(self) -> None:
         super().stop()
@@ -187,7 +188,7 @@ class _Listener(logging.handlers.QueueListener):
             return True
         deadline = time.monotonic() + timeout_s
         try:
-            self.queue.put(self._sentinel, timeout=timeout_s)
+            cast("queue.Queue", self.queue).put(self._sentinel, timeout=timeout_s)  # type: ignore[attr-defined]  # QueueListener._sentinel exists at run time; typeshed omits it (library typing gap)
         except queue.Full:
             return False
         t.join(max(0.0, deadline - time.monotonic()))
@@ -223,7 +224,7 @@ class LogQueue:
         return self._listener.drain(timeout_s)
 
     def stats(self) -> dict:
-        q = self._handler.queue
+        q = cast("queue.Queue", self._handler.queue)
         return {
             "dropped": self._handler.dropped_total,
             "queued": q.qsize(),

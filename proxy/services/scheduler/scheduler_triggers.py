@@ -91,39 +91,6 @@ def standard_dow_to_apscheduler(field: str) -> str:
     return ",".join(out)
 
 
-def apscheduler_dow_to_standard(field: str) -> str:
-    """Rewrite a day-of-week field from APScheduler numbering (0 = Monday)
-    back to standard cron (0 or 7 = Sunday), preserving the fired days.
-
-    The one-shot startup migration uses this on pre-existing rows: their
-    numeric weekdays were INTERPRETED as APScheduler days, so rewriting them
-    one day forward keeps every schedule firing exactly when it always did
-    (the failure mode to avoid is silently shifting fire days). Numbers map
-    0-6 → 1-7 so ranges never wrap; a lone Sunday emits the conventional 0;
-    ``*/k`` becomes ``1-7/k`` (standard anchors steps at Sunday, APScheduler
-    at Monday). Names and unrecognized tokens pass through untouched.
-    """
-    out: list[str] = []
-    for token in field.split(","):
-        token = token.strip()
-        expr, sep, step_s = token.partition("/")
-        suffix = f"{sep}{step_s}" if sep else ""
-        if expr == "*":
-            out.append(f"1-7{suffix}" if step_s.isdigit() and int(step_s) > 1 else token)
-        elif "-" in expr:
-            lo_s, _, hi_s = expr.partition("-")
-            if lo_s.isdigit() and hi_s.isdigit() and 0 <= int(lo_s) <= int(hi_s) <= 6:
-                out.append(f"{int(lo_s) + 1}-{int(hi_s) + 1}{suffix}")
-            else:
-                out.append(token)
-        elif expr.isdigit() and 0 <= int(expr) <= 6:
-            std = int(expr) + 1
-            out.append(f"{0 if std == 7 else std}{suffix}")
-        else:
-            out.append(token)
-    return ",".join(out)
-
-
 def build_cron_trigger(schedule: str, tz):
     """CronTrigger from a 5-field STANDARD crontab string, interpreted in
     ``tz``. The day-of-week field is remapped to APScheduler numbering (see

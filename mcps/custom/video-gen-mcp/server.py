@@ -26,11 +26,14 @@ import re
 import shutil
 import tempfile
 import uuid
+from pathlib import Path
 
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import TextContent, Tool, ToolAnnotations
+
+from _tool_args import ToolArgs
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -107,7 +110,7 @@ def _api_error_message(provider_label: str, key_name: str, e: httpx.HTTPStatusEr
     status = e.response.status_code
     try:
         detail = json.dumps(e.response.json())[:300]
-    except Exception:
+    except ValueError:
         detail = e.response.text[:300]
     if status in (401, 403):
         # Not always a bad key: Google returns 403 for project-level denials
@@ -133,8 +136,8 @@ def _image_mime(path: str) -> str:
 def _coerce_int(value, name: str) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be an integer, got: {value!r}")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer, got: {value!r}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -142,11 +145,12 @@ def _coerce_int(value, name: str) -> int:
 # ---------------------------------------------------------------------------
 
 server = Server("video-gen")
+TOOL_ARGS = ToolArgs()
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    return TOOL_ARGS.listed([
         Tool(
             name="generate_video",
             description=(
@@ -209,6 +213,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["prompt", "duration_seconds"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
         ),
         Tool(
             name="generate_transition",
@@ -267,6 +272,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["video_a_path", "video_b_path", "duration_seconds"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
         ),
         Tool(
             name="edit_video",
@@ -301,12 +307,16 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["video_path", "prompt"],
             },
+            annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
         ),
-    ]
+    ])
 
 
-@server.call_tool()
+@server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    arguments, refusal = TOOL_ARGS.check(name, arguments)
+    if refusal is not None:
+        return refusal
     if name == "generate_video":
         return await _handle_generate(arguments)
     elif name == "generate_transition":
@@ -336,7 +346,7 @@ async def _hook_post(endpoint: str, payload: dict, *, read_timeout: float = 120.
             )
             resp.raise_for_status()
             return True
-    except Exception as e:
+    except httpx.HTTPError as e:
         logger.warning("Hook %s failed: %s", endpoint, e)
         return False
 
@@ -451,14 +461,14 @@ async def _download_to(url: str, path: str, *, headers: dict | None = None,
         ) as client:
             async with client.stream("GET", url, headers=headers or {}) as resp:
                 resp.raise_for_status()
-                with open(part, "wb") as f:
+                with open(part, "wb") as f:  # noqa: ASYNC230  # a streamed download written one network chunk at a time
                     async for chunk in resp.aiter_bytes():
                         f.write(chunk)
-        if os.path.getsize(part) == 0:
+        if await asyncio.to_thread(os.path.getsize, part) == 0:
             raise RuntimeError("provider returned an empty video file")
         os.replace(part, path)
     finally:
-        if os.path.exists(part):
+        if await asyncio.to_thread(os.path.exists, part):
             os.remove(part)
 
 
@@ -588,8 +598,7 @@ async def _omni_generate(prompt: str, aspect_ratio: str, target_path: str,
 
     video_bytes, uri = _omni_extract_video(data)
     if video_bytes:
-        with open(target_path, "wb") as f:
-            f.write(video_bytes)
+        await asyncio.to_thread(Path(target_path).write_bytes, video_bytes)
         return
     if not uri:
         raise RuntimeError(
@@ -641,7 +650,7 @@ async def _runway_upload(video_path: str) -> str:
     fields = data.get("fields") or {}
     if not upload_url or not runway_uri:
         raise RuntimeError(f"Runway upload initiation returned an unexpected shape: {json.dumps(data)[:200]}")
-    with open(video_path, "rb") as f:
+    with open(video_path, "rb") as f:  # noqa: ASYNC230  # httpx reads the open file as it uploads it
         async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT) as client:
             resp = await client.post(
                 upload_url, data=fields,
@@ -769,10 +778,8 @@ async def _seedance_transition(video_a: str, video_b: str, style: str,
     the assembly cut visibly jump)."""
     last_a = await _extract_frame(video_a, "last")
     first_b = await _extract_frame(video_b, "first")
-    with open(video_a, "rb") as f:
-        bytes_a = f.read()
-    with open(video_b, "rb") as f:
-        bytes_b = f.read()
+    bytes_a = await asyncio.to_thread(Path(video_a).read_bytes)
+    bytes_b = await asyncio.to_thread(Path(video_b).read_bytes)
     url_a = await _fal_upload(bytes_a, os.path.basename(video_a), "video/mp4")
     url_b = await _fal_upload(bytes_b, os.path.basename(video_b), "video/mp4")
     url_last_a = await _fal_upload(last_a, "a_last.png", "image/png")
@@ -842,9 +849,13 @@ async def _run_ffmpeg(args: list[str]) -> int:
     )
     try:
         return await asyncio.wait_for(proc.wait(), timeout=120)
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as exc:
         proc.kill()
-        raise RuntimeError("ffmpeg timed out extracting a frame")
+        raise RuntimeError("ffmpeg timed out extracting a frame") from exc
+
+
+def _nonempty_file(path: str) -> bool:
+    return os.path.isfile(path) and os.path.getsize(path) > 0
 
 
 async def _extract_frame(video_path: str, position: str) -> bytes:
@@ -860,15 +871,14 @@ async def _extract_frame(video_path: str, position: str) -> bytes:
             # the survivor is the last frame. Sub-second clips can yield
             # nothing in the window; fall back to a full decode.
             await _run_ffmpeg(["-sseof", "-0.5", "-i", video_path, "-update", "1", "-y", out])
-            if not os.path.isfile(out) or os.path.getsize(out) == 0:
+            if not await asyncio.to_thread(_nonempty_file, out):
                 await _run_ffmpeg(["-i", video_path, "-update", "1", "-y", out])
-        if not os.path.isfile(out) or os.path.getsize(out) == 0:
+        if not await asyncio.to_thread(_nonempty_file, out):
             raise RuntimeError(
                 f"could not extract the {position} frame of {os.path.basename(video_path)} — "
                 "is it a valid video file?"
             )
-        with open(out, "rb") as f:
-            return f.read()
+        return await asyncio.to_thread(Path(out).read_bytes)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -921,15 +931,14 @@ async def _handle_generate(args: dict) -> list[TextContent]:
             "Error: omni-flash generates 720p only — use veo-3.1 or "
             "veo-3.1-fast for 1080p/4k."
         ))]
-    if image_path and not os.path.isfile(image_path):
+    if image_path and not await asyncio.to_thread(os.path.isfile, image_path):
         return [TextContent(type="text", text=f"Error: file not found: {image_path}")]
     if not GOOGLE_AI_API_KEY:
         return [TextContent(type="text", text=_unavailable_msg("Google AI", "GOOGLE_AI_API_KEY"))]
 
     image = None
     if image_path:
-        with open(image_path, "rb") as f:
-            image = (_image_mime(image_path), f.read())
+        image = (_image_mime(image_path), await asyncio.to_thread(Path(image_path).read_bytes))
     label = MODEL_LABELS[model]
     path = _get_save_path(args.get("save_path"), "video")
     try:
@@ -963,7 +972,7 @@ async def _handle_transition(args: dict) -> list[TextContent]:
     if not video_a or not video_b:
         return [TextContent(type="text", text="Error: video_a_path and video_b_path are required.")]
     for p in (video_a, video_b):
-        if not os.path.isfile(p):
+        if not await asyncio.to_thread(os.path.isfile, p):
             return [TextContent(type="text", text=f"Error: file not found: {p}")]
 
     model = args.get("model", "seedance")
@@ -985,7 +994,8 @@ async def _handle_transition(args: dict) -> list[TextContent]:
         if not FAL_API_KEY:
             return [TextContent(type="text", text=_unavailable_msg(
                 "Seedance premium transitions (fal.ai)", "FAL_API_KEY"))]
-        combined = os.path.getsize(video_a) + os.path.getsize(video_b)
+        combined = (await asyncio.to_thread(os.path.getsize, video_a)
+                    + await asyncio.to_thread(os.path.getsize, video_b))
         if combined > SEEDANCE_MAX_COMBINED_BYTES:
             return [TextContent(type="text", text=(
                 f"Error: seedance accepts at most 50 MB of input video combined "
@@ -1044,11 +1054,11 @@ async def _handle_edit(args: dict) -> list[TextContent]:
     prompt = (args.get("prompt") or "").strip()
     if not video_path or not prompt:
         return [TextContent(type="text", text="Error: video_path and prompt are required.")]
-    if not os.path.isfile(video_path):
+    if not await asyncio.to_thread(os.path.isfile, video_path):
         return [TextContent(type="text", text=f"Error: file not found: {video_path}")]
     if not RUNWAY_API_KEY:
         return [TextContent(type="text", text=_unavailable_msg("Runway", "RUNWAY_API_KEY"))]
-    size = os.path.getsize(video_path)
+    size = await asyncio.to_thread(os.path.getsize, video_path)
     if size > RUNWAY_MAX_UPLOAD_BYTES:
         return [TextContent(type="text", text=(
             f"Error: Runway accepts uploads up to 200 MB (got {size / 1024 / 1024:.0f} MB). "

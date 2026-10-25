@@ -3,6 +3,10 @@ import MarkdownContent from './MarkdownContent'
 import { usePrimaryPointerCoarse } from '../../hooks/usePrimaryPointerCoarse'
 import { usePasteGuard } from '../../hooks/usePasteGuard'
 import { enterAction, insertNewline } from '../../lib/composerKeys'
+import { inputText } from '../../lib/tools/input'
+import { IMPLEMENT_ASK, IMPLEMENT_AUTO, PLAN_ACTIONS_BEFORE_1_9 } from '../../lib/engines/modes'
+import { PLAN_IMPLEMENTED, PLAN_REVISED } from '../../lib/messageBlocks'
+import Button from '../ui/Button'
 
 export default function PlanReviewCard({
   requestId,
@@ -17,7 +21,7 @@ export default function PlanReviewCard({
 }: {
   requestId: string
   plan: string
-  toolInput: any
+  toolInput: unknown
   filename?: string
   resolved?: boolean
   action?: string
@@ -32,7 +36,7 @@ export default function PlanReviewCard({
   const pasteGuard = usePasteGuard()
 
   // Use proxy-provided filename (consistent across edits), fall back to toolInput path
-  const planFilePath = toolInput?.planFilePath || toolInput?.plan_file_path || ''
+  const planFilePath = inputText(toolInput, 'planFilePath') || inputText(toolInput, 'plan_file_path')
   const planFilename = proxyFilename
     || (planFilePath ? (planFilePath.split('/').pop() || planFilePath) : '')
 
@@ -49,21 +53,25 @@ export default function PlanReviewCard({
   }, [requestId])
 
   if (resolved) {
+    const action = PLAN_ACTIONS_BEFORE_1_9[resolvedAction ?? ''] ?? resolvedAction
     const label =
-      resolvedAction === 'implement_accept_edits' ? 'Implementing (Accept Edits)'
-      : resolvedAction === 'implement_default' ? 'Implementing (Default)'
-      : resolvedAction === 'edit' ? 'Editing plan...'
-      : resolvedAction === 'reject' ? 'Plan cancelled'
+      action === IMPLEMENT_AUTO ? 'Implementing in Auto'
+      : action === IMPLEMENT_ASK ? 'Implementing in Ask'
+      : action === 'edit' ? 'Editing plan...'
+      : action === PLAN_REVISED ? 'Plan revised'
+      : action === PLAN_IMPLEMENTED ? 'Plan implemented'
+      : action === 'reject' ? 'Plan cancelled'
       : 'Resolved'
-    const color = resolvedAction === 'edit'
-      ? 'text-brand bg-brand-50 border-brand/20'
+    const edited = resolvedAction === 'edit' || resolvedAction === PLAN_REVISED
+    const color = edited
+      ? 'text-accent-agent-fg bg-accent-agent-bg border-accent-agent-border'
       : resolvedAction === 'reject'
-      ? 'text-p-text-secondary bg-p-surface border-p-border-light'
-      : 'text-green-700 dark:text-green-400 bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800'
-    const icon = resolvedAction === 'edit' ? '\u270F\uFE0F'
+      ? 'text-secondary bg-surface-muted border-subtle'
+      : 'text-status-success-fg bg-status-success-bg border-status-success-border'
+    const icon = edited ? '\u270F\uFE0F'
       : resolvedAction === 'reject' ? '\u2716' : '\u2705'
     return (
-      <div className={`my-2 p-3 rounded-lg border text-sm flex items-center gap-2 ${color}`}>
+      <div className={`my-2 p-3 rounded-card border text-sm flex items-center gap-2 ${color}`}>
         <span>{icon}</span>
         {label}
       </div>
@@ -83,30 +91,30 @@ export default function PlanReviewCard({
   }
 
   return (
-    <div className="my-2 rounded-lg border border-brand/20 bg-brand-50 overflow-hidden">
+    <div className="my-2 rounded-card bg-surface-card shadow-elevation-1 overflow-hidden">
       {/* Header */}
-      <div className="px-3 py-2 border-b border-brand/20">
-        <p className="text-sm font-medium text-brand">
+      <div className="px-3 py-2 border-b border-subtle">
+        <p className="text-sm font-medium text-accent-agent-fg">
           Plan Ready for Review: {displayName}
         </p>
       </div>
 
       {/* Plan content */}
       {plan ? (
-        <div className="px-4 py-3 border-b border-brand/20 bg-white dark:bg-p-surface max-h-96 overflow-y-auto">
-          <MarkdownContent className="prose-headings:text-brand prose-li:text-gray-800 dark:prose-li:text-gray-200">
+        <div className="px-4 py-3 border-b border-subtle max-h-96 overflow-y-auto">
+          <MarkdownContent className="prose-li:text-primary">
             {plan}
           </MarkdownContent>
         </div>
       ) : (
-        <div className="px-4 py-3 border-b border-brand/20 text-sm text-brand/60">
+        <div className="px-4 py-3 border-b border-subtle text-sm text-tertiary">
           No plan content available
         </div>
       )}
 
       {/* Edit feedback input */}
       {editing && (
-        <div className="px-4 py-3 border-b border-brand/20 bg-white dark:bg-p-surface">
+        <div className="px-4 py-3 border-b border-subtle">
           <textarea
             autoFocus
             value={feedback}
@@ -122,26 +130,26 @@ export default function PlanReviewCard({
             onPaste={pasteGuard.onPaste}
             onBlur={pasteGuard.onBlur}
             placeholder="Describe what to change in the plan..."
-            className="w-full px-3 py-2 text-sm border border-brand/30 rounded-lg resize-none
-                       bg-white dark:bg-p-surface text-p-text placeholder:text-p-text-light
-                       focus:outline-hidden focus:ring-1 focus:ring-brand"
+            className="w-full px-3 py-2 text-sm border border-strong rounded-control resize-none
+                       bg-surface-card text-primary placeholder:text-tertiary
+                       focus:outline-hidden focus:ring-1 focus:ring-focus-ring"
             rows={3}
           />
           <div className="flex gap-2 mt-2">
-            <button
+            <Button
+              size="sm" variant="primary"
               onClick={handleSubmitFeedback}
               disabled={!feedback.trim()}
-              title={touchPrimary ? undefined : 'Send Feedback (Shift+Enter)'}
-              className="px-3 py-1 rounded-lg text-sm font-medium text-white bg-brand hover:bg-brand-hover disabled:opacity-50 transition-colors"
+              title={touchPrimary ? undefined : 'Send Feedback: Shift+Enter'}
             >
               Send Feedback
-            </button>
-            <button
+            </Button>
+            <Button
+              size="sm"
               onClick={() => setEditing(false)}
-              className="px-3 py-1 rounded-lg text-sm font-medium text-gray-600 dark:text-gray-300 bg-white dark:bg-p-surface border border-gray-300 dark:border-p-border-light hover:bg-gray-50 dark:hover:bg-p-surface-hover transition-colors"
             >
               Cancel
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -151,34 +159,34 @@ export default function PlanReviewCard({
         <div className="flex flex-wrap gap-2 px-4 py-3">
           {onRespond && (
             <>
-              <button
-                onClick={() => handleImplement('implement_accept_edits')}
-                className="px-3 py-1.5 rounded-lg text-sm font-medium text-white bg-brand hover:bg-brand-hover transition-colors"
+              <Button
+                size="sm" variant="primary"
+                onClick={() => handleImplement(IMPLEMENT_AUTO)}
               >
-                Implement (Accept Edits)
-              </button>
-              <button
-                onClick={() => handleImplement('implement_default')}
-                className="px-3 py-1.5 rounded-lg text-sm font-medium text-brand bg-brand-100 hover:bg-brand-surface transition-colors"
+                Implement in Auto
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => handleImplement(IMPLEMENT_ASK)}
               >
-                Implement (Default)
-              </button>
+                Implement in Ask
+              </Button>
             </>
           )}
           {onRespond && (
             <>
-              <button
+              <Button
+                size="sm"
                 onClick={() => setEditing(true)}
-                className="px-3 py-1.5 rounded-lg text-sm font-medium text-brand bg-white dark:bg-p-surface border border-brand/30 hover:bg-brand-50 transition-colors"
               >
                 Edit Plan
-              </button>
-              <button
+              </Button>
+              <Button
+                size="sm"
                 onClick={() => onRespond(requestId, 'reject')}
-                className="px-3 py-1.5 rounded-lg text-sm font-medium text-gray-600 dark:text-gray-300 bg-white dark:bg-p-surface border border-gray-300 dark:border-p-border-light hover:bg-gray-50 dark:hover:bg-p-surface-hover transition-colors"
               >
                 Cancel
-              </button>
+              </Button>
             </>
           )}
         </div>

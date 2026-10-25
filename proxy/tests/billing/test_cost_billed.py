@@ -7,6 +7,7 @@ behaviour). Recording is not this function's business and never consults it.
 
 from unittest.mock import patch
 
+import psycopg
 import pytest
 
 
@@ -64,7 +65,7 @@ class TestSessionCostBilled:
         try:
             mock_store.get_subscription.return_value = None
             assert sp.session_cost_billed("sess-x") is True
-            mock_store.get_subscription.side_effect = RuntimeError("db down")
+            mock_store.get_subscription.side_effect = psycopg.OperationalError("db down")
             assert sp.session_cost_billed("sess-x") is True
         finally:
             _reset(sp)

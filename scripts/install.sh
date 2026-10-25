@@ -69,6 +69,53 @@ trusted_proxy_hint() {
   for one on another machine, its IP. Then run: docker compose up -d"
 }
 
+# Whether a version (Docker Engine API, Docker Compose) is at least <major>.<minor>.
+at_least() { # at_least <version> <major> <minor>
+    awk -v v="${1#v}" -v M="$2" -v m="$3" 'BEGIN { n = split(v, a, "."); if (n < 2) exit 1
+        exit !((a[1] + 0 > M) || (a[1] + 0 == M && a[2] + 0 >= m)) }'
+}
+
+# The document editor's key is mounted as one file of a volume (a subpath):
+# Docker Engine 26 (API 1.45) and Docker Compose 2.26 or later. An older engine,
+# or a Compose that parses the field but does not pass it on (2.25), mounts the
+# whole volume and the editor runs without its key, every document refused.
+docker_floor() {
+    local api cv
+    api="$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null || true)"
+    if ! at_least "$api" 1 45; then
+        fail "Docker Engine 26 or later is needed (this one speaks API ${api:-unknown}): the
+  document editor's key is mounted as one file of a volume, which older engines
+  cannot do. Update Docker (https://docs.docker.com/engine/install/), then re-run."
+    fi
+    cv="$(docker compose version --short 2>/dev/null || true)"
+    if ! at_least "$cv" 2 26; then
+        fail "Docker Compose 2.26 or later is needed (this one is ${cv:-unknown}): an older
+  Compose mounts the document editor's key wrong. Update Docker, then re-run."
+    fi
+}
+
+# .env's COLLABORA_SSL_TERMINATION set from the scheme of DASHBOARD_PUBLIC_URL
+# (true for https; false, the compose file's default, writes no new line):
+# the editor's image has no shell to derive it at start. Idempotent.
+collabora_scheme_line() {
+    local want have
+    want=false
+    case "$(env_value DASHBOARD_PUBLIC_URL)" in [Hh][Tt][Tt][Pp][Ss]://*) want=true ;; esac
+    have="$(awk '{ line = $0; sub(/^[ \t]*/, "", line); sub(/^export[ \t]+/, "", line)
+        if (match(line, /^COLLABORA_SSL_TERMINATION[ \t]*=/)) { v = substr(line, RLENGTH + 1); f = 1 } }
+        END { if (f) { gsub(/["\047 \t]/, "", v); print v } }' .env)"
+    [ "${have:-false}" != "$want" ] || return 0
+    say "setting COLLABORA_SSL_TERMINATION=$want in .env (the scheme of DASHBOARD_PUBLIC_URL)"
+    awk -v val="$want" '
+        { line = $0; sub(/^[ \t]*/, "", line); sub(/^export[ \t]+/, "", line)
+          if (match(line, /^COLLABORA_SSL_TERMINATION[ \t]*=/)) { print "COLLABORA_SSL_TERMINATION=" val; f = 1; next } }
+        { print }
+        END { if (!f) print "COLLABORA_SSL_TERMINATION=" val }' .env | (umask 077; cat > .env.scheme)
+    # In place: the file keeps its owner and mode.
+    cat .env.scheme > .env
+    rm -f .env.scheme
+}
+
 # Fetch a file atomically: a failed download must not leave a partial file
 # behind (a half-written docker-compose.yml would look like an existing
 # install on the next run).
@@ -150,6 +197,7 @@ if ! docker info >/dev/null 2>&1; then
     fail "cannot talk to the Docker daemon. Is it running, and is your user in the
   'docker' group?  (sudo usermod -aG docker \$USER — then log out and back in.)"
 fi
+docker_floor
 
 # Architecture — the release images publish linux/amd64 + linux/arm64 manifests.
 # Anything else has no matching manifest, and the failure would otherwise surface
@@ -265,6 +313,11 @@ COMPOSE_FILE=${_compose_files}
 # it drives login cookies, OAuth redirects, and links in notifications:
 #DASHBOARD_PUBLIC_URL=http://your-server:8400
 
+# true when DASHBOARD_PUBLIC_URL above is https (the document editor's scheme).
+# This script and upgrade.sh write it; set it yourself when you change the
+# address by hand, then run docker compose up -d:
+#COLLABORA_SSL_TERMINATION=false
+
 # Uncomment to publish the dashboard on a different port:
 #PROXY_PORT=8400
 
@@ -359,9 +412,13 @@ fetch "$_raw/docker-compose.phone.yml" docker-compose.phone.yml
 say "downloading docker-compose.yml (release-pinned)"
 fetch "$_raw/docker-compose.yml" docker-compose.yml
 
+collabora_scheme_line
+
 say "starting OtoDock — the first run pulls the release images, which can take
   a few minutes on a fresh host"
-docker compose up -d
+docker compose up -d || fail "docker compose up failed (the message above). The compose files and .env
+  stay in $(pwd), and install.sh refuses a folder that holds them: fix the
+  cause, then run docker compose up -d in that folder."
 
 # PROXY_PORT moves the published port; the shell environment wins over .env,
 # matching how docker compose itself resolves it.

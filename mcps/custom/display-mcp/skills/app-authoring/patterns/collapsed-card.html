@@ -1,0 +1,39 @@
+<p class="muted">A card that folds. Its whole header is one button. A click, Enter or Space opens and closes it, and a screen reader hears whether it is open. The chevron turns a quarter in 200 ms. Use it for a group a person opens now and then: a day's bookings, a long log, the advanced settings. A control a person must reach stays outside the fold.</p>
+
+<section class="card fold" id="fold-day">
+  <h3 class="fold-header">
+    <button type="button" class="fold-toggle" aria-expanded="true" aria-controls="fold-day-body">
+      <span class="fold-chevron" aria-hidden="true">›</span>
+      <span class="fold-title">Tomorrow</span>
+      <span class="badge">3 bookings</span>
+    </button>
+  </h3>
+  <div class="fold-body" id="fold-day-body">
+    <p>09:00 Alice, 11:00 Bob, 15:30 Chris.</p>
+  </div>
+</section>
+
+<style>
+.fold { padding: 0; }
+.fold-header { margin: 0; font: inherit; }
+.fold-toggle { display: flex; align-items: center; gap: 8px; width: 100%; min-height: var(--p-control-lg); padding: 0 16px; border: 0; border-radius: var(--p-radius); background: transparent; color: var(--p-text); font: 600 var(--p-font-size-sm)/var(--p-line-height-sm) var(--p-font); text-align: left; cursor: pointer; }
+.fold-toggle:hover { background: var(--p-hover); }
+.fold-title { flex: 1; }
+.fold-chevron { display: inline-block; color: var(--p-text-light); transition: transform var(--p-duration-base) var(--p-ease-standard); }
+.fold-toggle[aria-expanded="true"] .fold-chevron { transform: rotate(90deg); }
+.fold-body { padding: 0 16px 16px; }
+.fold-body p { margin: 0; }
+@media (prefers-reduced-motion: reduce) { .fold-chevron { transition: none; } }
+</style>
+
+<script>
+(function () {
+  document.querySelectorAll('.fold-toggle').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var open = btn.getAttribute('aria-expanded') === 'true'
+      btn.setAttribute('aria-expanded', String(!open))
+      document.getElementById(btn.getAttribute('aria-controls')).hidden = open
+    })
+  })
+})()
+</script>

@@ -5,7 +5,7 @@ The platform's skill files follow the agentskills.io format: a folder whose
 carrying at minimum ``name`` and ``description``, followed by the markdown
 instruction body.
 
-Three operations, used at different points of the pipeline:
+Four operations, used at different points of the pipeline:
 
 - ``strip_frontmatter``   — the INLINE path (``loading: always`` skills):
   the body is injected into the system prompt; the frontmatter is index
@@ -18,6 +18,8 @@ Three operations, used at different points of the pipeline:
   unknown keys may acquire CLI-side meaning in future versions.
 - ``parse_frontmatter``   — consistency checks (manifest ``description`` vs
   frontmatter) and installer validation.
+- ``load_frontmatter``    — the VALIDATORS' read (the skill schema,
+  ``mcps/skill.schema.json``): absent, broken and a mapping told apart.
 
 Legacy skill files without a frontmatter fence pass through every helper
 unchanged (all pre-migration bundled skills are stamped ``loading: always``
@@ -81,6 +83,28 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
         logger.warning("SKILL.md frontmatter is not valid YAML: %s", e)
         return {}, body
     return (data, body) if isinstance(data, dict) else ({}, body)
+
+
+class FrontMatterError(ValueError):
+    """A front matter block that is not a YAML mapping."""
+
+
+def load_frontmatter(text: str) -> dict | None:
+    """The front matter's mapping, None when the file has no fence;
+    ``FrontMatterError`` when the block is not valid YAML or not a mapping.
+    The validators' reader (``storage/catalog_schema.py`` checks what it
+    returns): it tells the three apart where ``parse_frontmatter`` falls
+    back to an empty mapping."""
+    fm, _body = split_frontmatter(text)
+    if fm is None:
+        return None
+    try:
+        data = yaml.safe_load(fm)
+    except yaml.YAMLError as exc:
+        raise FrontMatterError(f"not valid YAML ({str(exc).splitlines()[0]})") from exc
+    if not isinstance(data, dict):
+        raise FrontMatterError("not a mapping of keys to values")
+    return data
 
 
 def strip_frontmatter(text: str) -> str:

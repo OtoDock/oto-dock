@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -24,10 +25,9 @@ import config
 from app import app
 from auth.path_policy import SecurityContext
 from auth.providers import UserContext, get_current_user
-from tests.conftest import live_session_token
 from core.session import session_state
 from storage import database as task_store
-from pathlib import Path
+from tests.conftest import live_session_token
 
 client = TestClient(app)
 
@@ -638,9 +638,10 @@ def test_check_rate_min_interval_and_window():
 
 
 def test_pump_artifact_queue_cap_and_abort_clear():
-    from ws.artifact_interactions import QUEUE_CAP
-    from core.events.stream_pump import ChatStreamPump
     import asyncio as _asyncio
+
+    from core.events.artifact_events import QUEUE_CAP
+    from core.events.stream_pump import ChatStreamPump
     loop = _asyncio.new_event_loop()
     try:
         producer = loop.create_task(_asyncio.sleep(3600))
@@ -793,6 +794,7 @@ def test_fd_response_serves_the_checked_inode_with_ranges(agent_tree, tmp_path):
     # The response streams the inode the check saw: a swap of the name after
     # the open changes nothing, and Range / HEAD keep working on it.
     import os
+
     from api.media.media import FdFileResponse
     from services.infra import safe_fs
     clip = agent_tree / "workspace" / "clip.mp3"
@@ -825,6 +827,7 @@ def test_fd_response_serves_the_checked_inode_with_ranges(agent_tree, tmp_path):
 
 def test_serve_media_never_leaks_a_descriptor(agent_tree, monkeypatch):
     import os
+
     from services.media import media_pipeline
     clip = agent_tree / "workspace" / "clip.mp3"
     clip.write_bytes(b"ID3x")
@@ -834,10 +837,18 @@ def test_serve_media_never_leaks_a_descriptor(agent_tree, monkeypatch):
         raise RuntimeError("mime guess failed")
 
     monkeypatch.setattr(media_pipeline, "guess_media_mime", _boom)
-    before = len(os.listdir("/proc/self/fd"))
     with pytest.raises(RuntimeError):
         client.get(f"/v1/media/{token}")
-    assert len(os.listdir("/proc/self/fd")) == before
+    # No descriptor names the clip (a count would also see what the first
+    # request of a process opens: the lane pool's database sockets).
+    target, held = os.path.realpath(clip), []
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            if os.readlink(f"/proc/self/fd/{fd}") == target:
+                held.append(fd)
+        except OSError:
+            pass
+    assert held == []
 
 
 def test_serve_ui_refuses_swapped_symlink(agent_tree, tmp_path):
@@ -851,3 +862,54 @@ def test_serve_ui_refuses_swapped_symlink(agent_tree, tmp_path):
     assert resp.status_code == 404
     assert "JWT_SECRET" not in resp.text
     _assert_sandbox_headers(resp)
+
+
+# ── the wrapper's dark variant, the asset routes' font header ────────────────
+
+
+def test_runtime_declares_the_dark_variant_in_both_document_kinds():
+    from api.media.ui import (
+        DARK_VARIANT_STYLE,
+        UI_RUNTIME,
+        inject_runtime,
+        wrap_fragment,
+    )
+    # Tailwind's browser build reads the style element, so `dark:` follows
+    # the class the runtime toggles, never the device. The kit sheet comes
+    # first, then the variant, then the runtime script, in both kinds.
+    assert UI_RUNTIME.startswith(DARK_VARIANT_STYLE)
+    assert 'type="text/tailwindcss"' in DARK_VARIANT_STYLE
+    assert "@custom-variant dark (&:where(.dark, .dark *));" in DARK_VARIANT_STYLE
+    wrapped = wrap_fragment("<p>x</p>")
+    assert wrapped.index("otodock-tokens.css") < wrapped.index(DARK_VARIANT_STYLE) < wrapped.index("<script>")
+    full = inject_runtime("<!doctype html><html><body><p>x</p></body></html>")
+    assert full.count(DARK_VARIANT_STYLE) == 1
+    assert full.index(DARK_VARIANT_STYLE) < full.index("</body>")
+
+
+def test_client_fonts_carry_the_cors_header_on_both_routes(agent_tree):
+    from api.apps import app_proxy
+    from services.apps import releases
+    # An @font-face fetch from the frame's opaque origin is a CORS request:
+    # a font in client/ needs the header on the dashboard's route and on the
+    # link's twin, which builds its answer with asset_response. Every other
+    # file keeps its headers as they are.
+    row = task_store.upsert_app(AGENT, "alice", "user-viewer", "brand", title="Brand",
+                                rel_path="users/alice/workspace/apps/brand", kind="folder")
+    src = agent_tree / row["rel_path"]
+    (src / "client" / "fonts").mkdir(parents=True)
+    (src / "app.json").write_text("{}")
+    (src / "client" / "index.html").write_text("<p>brand</p>")
+    (src / "client" / "app.js").write_text("console.log('brand')")
+    (src / "client" / "fonts" / "brand.woff2").write_bytes(b"wOF2" + bytes(32))
+    rel, sha, _n = releases.cut_folder_release(row, src)
+    row = task_store.set_app_release(row["id"], rel, sha)
+    base = f"/v1/apps/{row['id']}/client/{sha}"
+    r = client.get(f"{base}/fonts/brand.woff2")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("font/woff2")
+    assert r.headers["access-control-allow-origin"] == "*"
+    assert r.headers["x-content-type-options"] == "nosniff" and "immutable" in r.headers["cache-control"]
+    assert "access-control-allow-origin" not in client.get(f"{base}/app.js").headers
+    twin = app_proxy.asset_response(row, sha, "fonts/brand.woff2")
+    assert twin.media_type == "font/woff2" and twin.headers["access-control-allow-origin"] == "*"
+    assert "access-control-allow-origin" not in app_proxy.asset_response(row, sha, "app.js").headers

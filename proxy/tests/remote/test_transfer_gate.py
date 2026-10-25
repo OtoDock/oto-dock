@@ -55,7 +55,7 @@ async def test_a_slow_machine_never_holds_another_machines_pushes():
             await release.wait()
 
     tasks = [asyncio.create_task(_slow()) for _ in range(2)]
-    while held < 2:
+    while held < 2:  # noqa: ASYNC110  # a fake's held count: the fake has no event
         await asyncio.sleep(0)
     async with asyncio.timeout(1.0):
         async with tg.slot("m-fast", "agent-1", "big.bin", 8 * MB):

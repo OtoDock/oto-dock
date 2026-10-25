@@ -10,11 +10,22 @@ const SCRIPT_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js?onload
 
 let loadPromise: Promise<void> | null = null
 
+interface TurnstileApi {
+  render: (el: HTMLElement, opts: Record<string, unknown>) => string | undefined
+  remove: (id: string) => void
+  reset: (id: string) => void
+}
+
+/** The page's window with the globals the Turnstile script sets and calls. */
+function turnstileWindow(): Window & { turnstile?: TurnstileApi; __otoTurnstileReady?: () => void } {
+  return window
+}
+
 function loadTurnstile(): Promise<void> {
-  if ((window as any).turnstile) return Promise.resolve()
+  if (turnstileWindow().turnstile) return Promise.resolve()
   if (loadPromise) return loadPromise
   loadPromise = new Promise<void>((resolve) => {
-    ;(window as any).__otoTurnstileReady = () => resolve()
+    turnstileWindow().__otoTurnstileReady = () => resolve()
     if (!document.querySelector('script[src^="https://challenges.cloudflare.com/turnstile"]')) {
       const s = document.createElement('script')
       s.src = SCRIPT_SRC
@@ -49,7 +60,7 @@ export function TurnstileWidget({ siteKey, onToken, ref }: TurnstileWidgetProps)
       // cancelled guards the StrictMode mount→cleanup→mount double-invoke;
       // children.length is a backup against rendering twice into one element.
       if (cancelled || !containerRef.current || containerRef.current.children.length) return
-      widgetIdRef.current = (window as any).turnstile.render(containerRef.current, {
+      widgetIdRef.current = turnstileWindow().turnstile?.render(containerRef.current, {
         sitekey: siteKey,
         callback: (token: string) => onTokenRef.current(token),
         'expired-callback': () => onTokenRef.current(''),
@@ -59,7 +70,7 @@ export function TurnstileWidget({ siteKey, onToken, ref }: TurnstileWidgetProps)
     return () => {
       cancelled = true
       if (widgetIdRef.current) {
-        ;(window as any).turnstile?.remove(widgetIdRef.current)
+        turnstileWindow().turnstile?.remove(widgetIdRef.current)
         widgetIdRef.current = undefined
       }
     }
@@ -67,7 +78,7 @@ export function TurnstileWidget({ siteKey, onToken, ref }: TurnstileWidgetProps)
 
   useImperativeHandle(ref, () => ({
     reset: () => {
-      if (widgetIdRef.current) (window as any).turnstile?.reset(widgetIdRef.current)
+      if (widgetIdRef.current) turnstileWindow().turnstile?.reset(widgetIdRef.current)
     },
   }))
 

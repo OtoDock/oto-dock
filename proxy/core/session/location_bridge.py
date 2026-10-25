@@ -9,7 +9,6 @@ functions so existing imports are unchanged.
 
 import asyncio
 
-
 # Location bridge state (mirrors permission bridge for MCP→WS→dashboard→WS→MCP flow)
 _location_events: dict[str, asyncio.Event] = {}  # request_id -> event
 _location_results: dict[str, dict] = {}  # request_id -> {lat, lng, accuracy, ...} or {error}

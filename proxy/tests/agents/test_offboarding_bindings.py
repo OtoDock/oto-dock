@@ -12,14 +12,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from services.agents import offboarding
-from services.agents import offboarding_bindings as bindings
+from services.agents import offboarding, offboarding_bindings as bindings
 from services.agents.offboarding import AgentLoss, OffboardEvent
 from services.webhooks import subscription_manager
 from storage import database as db
 from storage.agents import agent_store
 from storage.automation import webhook_subscription_store
-from storage.identity import credential_store
+from storage.identity import credential_store, oauth_app_kinds
 
 A, B = "sb-a", "sb-b"
 MCP = "github-mcp"
@@ -58,6 +57,15 @@ def _sub(agent, created_by, label="acct"):
     )
 
 
+def _installation_sub(agent, created_by, installation_id, label="acct"):
+    return webhook_subscription_store.create_subscription(
+        scope="service", owner="", agent=agent, mcp_name=MCP, provider_id="github",
+        account_label=label, vendor_target=installation_id, selected_events=["issues"],
+        selected_subevents={}, signing_secret="", created_by=created_by,
+        target_kind=oauth_app_kinds.INSTALLATION_TARGET_KIND,
+    )
+
+
 def _event(w, reason, *losses):
     return OffboardEvent(sub=w.pat, reason=reason, agents=tuple(losses), actor_sub=w.admin,
                          username="pat", email="pat@t.com", display_name="Pat")
@@ -73,7 +81,7 @@ async def test_losing_the_manager_tier_clears_the_binding_and_its_subscriptions(
     db.set_user_agents(w.pat, [A, B], w.admin, agent_roles={A: "editor", B: "manager"})
     await bindings.on_offboard(_event(w, offboarding.DEMOTED, AgentLoss(A, "manager", "editor")))
     assert credential_store.list_service_agent_bindings_for_owner(w.pat) == [
-        {"mcp_name": MCP, "agent_name": B, "account_label": "acct"}]
+        {"mcp_name": MCP, "agent_name": B, "account_label": "acct", "installation_id": ""}]
     assert _rows(A) == [] and [r["id"] for r in _rows(B)] == [w.subs[B]]
     # The vendor delete resolved the token through the lender, not the
     # standing-gated binding lookup.
@@ -113,7 +121,9 @@ async def test_the_admin_delete_route_unregisters_through_the_lender_before_the_
     exists, so the vendor delete runs through the lender; the subscriber's
     sweep then finds nothing left."""
     import asyncio
+
     from fastapi.testclient import TestClient
+
     from app import app
     from auth.providers import UserContext, get_current_user
     w = world
@@ -151,7 +161,9 @@ async def test_a_demotion_through_the_users_route_clears_the_binding_before_it_a
     """The demotion site clears the binding itself: with the offboarding
     chain held back, the route's answer already finds it gone."""
     import asyncio
+
     from fastapi.testclient import TestClient
+
     from auth.providers import get_current_user
     w = world
 
@@ -167,7 +179,7 @@ async def test_a_demotion_through_the_users_route_clears_the_binding_before_it_a
         app.dependency_overrides.pop(get_current_user, None)
     assert resp.status_code == 200, resp.text
     assert credential_store.list_service_agent_bindings_for_owner(w.pat) == [
-        {"mcp_name": MCP, "agent_name": B, "account_label": "acct"}]
+        {"mcp_name": MCP, "agent_name": B, "account_label": "acct", "installation_id": ""}]
     assert _rows(A) == [] and w.deleted == [(A, w.pat)]
 
 
@@ -176,7 +188,9 @@ async def test_a_platform_role_drop_clears_the_bindings_it_takes_away(world, mon
     """An admin lends through admin standing alone; dropping to member
     leaves no manager tier on an agent without a manager row."""
     import asyncio
+
     from fastapi.testclient import TestClient
+
     from auth.providers import get_current_user
     w = world
     boss = db.create_local_user("boss@t.com", "Boss", "Boss", "admin", "x")
@@ -225,7 +239,7 @@ async def test_the_subscriber_waits_for_a_demotion_clear_still_running(world, mo
     await subscriber
     assert calls == [A]
     assert credential_store.list_service_agent_bindings_for_owner(w.pat) == [
-        {"mcp_name": MCP, "agent_name": B, "account_label": "acct"}]
+        {"mcp_name": MCP, "agent_name": B, "account_label": "acct", "installation_id": ""}]
 
 
 @pytest.mark.asyncio
@@ -248,7 +262,7 @@ async def test_a_rebind_while_the_clear_runs_is_kept(world, monkeypatch):
     row = {"mcp_name": MCP, "agent_name": A, "account_label": "acct"}
     await bindings.clear_binding(row, w.pat)
     assert credential_store.list_service_agent_bindings_for_owner(mo) == [
-        {"mcp_name": MCP, "agent_name": A, "account_label": "mos"}]
+        {"mcp_name": MCP, "agent_name": A, "account_label": "mos", "installation_id": ""}]
 
 
 def test_the_conditional_delete_names_the_lender_and_the_account(world):
@@ -261,3 +275,33 @@ def test_the_conditional_delete_names_the_lender_and_the_account(world):
         MCP, A, owner_sub=w.pat, account_label="acct") is True
     assert credential_store.remove_service_agent_binding(MCP, B) is True
     assert credential_store.list_service_agent_bindings_for_owner(w.pat) == []
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_keeps_a_hosted_installation_row_and_drops_an_uncovered_one(world):
+    w = world
+    owned = {"id": 10, "account": "pat", "admin": True, "suspended_at": None}
+    # A: a hosted GitHub-App account bound as itself (hosted sign-in pins no
+    # installation), subscribed to an installation it owns.
+    credential_store.set_account_meta(w.pat, MCP, "acct", {
+        "kind": oauth_app_kinds.KIND_GITHUB_APP, "hosted": True, "installations": [owned]})
+    hosted_row = _installation_sub(A, w.pat, "10")["id"]
+    # B: a self-managed account bound to installation 12, with a row left
+    # on 10 from before the rebind and one on 12.
+    credential_store.set_user_credentials(w.pat, MCP, {"k": "v"}, account_label="self")
+    credential_store.set_account_meta(w.pat, MCP, "self", {
+        "kind": oauth_app_kinds.KIND_GITHUB_APP, "hosted": False,
+        "installations": [owned, {**owned, "id": 12}]})
+    assert credential_store.set_service_agent_binding(
+        MCP, B, account_label="self", owner_sub=w.pat, set_by=w.pat, installation_id="12")
+    stale = _installation_sub(B, w.pat, "10", label="self")["id"]
+    kept = _installation_sub(B, w.pat, "12", label="self")["id"]
+    assert await bindings._sweep_orphans() == 2      # the stale row, and B's old "acct" row
+    ids = {r["id"] for r in _rows(A)} | {r["id"] for r in _rows(B)}
+    assert hosted_row in ids and kept in ids and w.subs[A] in ids
+    assert stale not in ids and w.subs[B] not in ids
+    # The hosted person no longer owns 10: that row alone goes.
+    credential_store.set_account_meta(w.pat, MCP, "acct", {
+        "kind": oauth_app_kinds.KIND_GITHUB_APP, "hosted": True, "installations": []})
+    assert await bindings._sweep_orphans() == 1
+    assert [r["id"] for r in _rows(A)] == [w.subs[A]]

@@ -13,14 +13,14 @@ import re
 import sys
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
 
-from core.credentials import mcp_broker # noqa: E402
-from core.sandbox.sandbox import prepare_mcp_config_for_sandbox  # noqa: E402
-from core.layers.codex.layer import _inject_fetch_tokens_toml  # noqa: E402
-from core.sandbox.interceptor_wrap import wrap_toml_text  # noqa: E402
-
+from core.credentials import mcp_broker
+from core.layers.codex.layer import _inject_fetch_tokens_toml
+from core.sandbox.interceptor_wrap import wrap_toml_text
+from core.sandbox.sandbox import prepare_mcp_config_for_sandbox
 
 # --- local-claude: prepare_mcp_config_for_sandbox ----------------------------
 

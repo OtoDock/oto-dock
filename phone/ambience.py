@@ -54,27 +54,29 @@ def _load_pcm(template: str) -> bytes | None:
                     or w.getnchannels() != config.CHANNELS
                     or w.getsampwidth() != config.SAMPLE_WIDTH):
                 logger.warning(
-                    f"Ambience '{template}': {path} is not "
-                    f"{config.SAMPLE_RATE}Hz/{config.CHANNELS}ch/"
-                    f"{config.SAMPLE_WIDTH * 8}bit — skipping"
+                    "Ambience '%s': %s is not "
+                    "%sHz/%sch/"
+                    "%sbit — skipping",
+                    template, path, config.SAMPLE_RATE, config.CHANNELS, config.SAMPLE_WIDTH * 8
                 )
                 return None
             pcm = w.readframes(w.getnframes())
     except FileNotFoundError:
-        logger.warning(f"Ambience '{template}': asset missing ({path})")
+        logger.warning("Ambience '%s': asset missing (%s)", template, path)
         return None
-    except Exception as e:
-        logger.warning(f"Ambience '{template}': failed to load {path}: {e}")
+    except (wave.Error, EOFError, OSError) as e:
+        logger.warning("Ambience '%s': failed to load %s: %s", template, path, e)
         return None
     # Whole 320-byte frames only, so the loop wraps on a frame boundary.
     usable = len(pcm) - (len(pcm) % config.FRAME_SIZE)
     if usable < config.FRAME_SIZE:
-        logger.warning(f"Ambience '{template}': asset shorter than one frame")
+        logger.warning("Ambience '%s': asset shorter than one frame", template)
         return None
     _pcm_cache[template] = pcm[:usable]
     logger.info(
-        f"Ambience '{template}' loaded: "
-        f"{usable // (config.SAMPLE_RATE * config.SAMPLE_WIDTH)}s loop"
+        "Ambience '%s' loaded: "
+        "%ss loop",
+        template, usable // (config.SAMPLE_RATE * config.SAMPLE_WIDTH)
     )
     return _pcm_cache[template]
 

@@ -11,6 +11,8 @@ The guard refuses any model the chat's execution layer doesn't serve.
 
 from unittest.mock import patch
 
+import psycopg
+
 from ws.dashboard import _model_allowed_for_path
 
 
@@ -45,7 +47,7 @@ def test_unknown_path_passes():
 def test_lookup_failure_fails_open():
     """The guard protects against cross-layer poison; a registry hiccup must
     not block legitimate model changes."""
-    with patch("storage.billing.subscription_store.list_models", side_effect=RuntimeError("db down")):
+    with patch("storage.billing.subscription_store.list_models", side_effect=psycopg.OperationalError("db down")):
         assert _model_allowed_for_path("gpt-5.5", "codex-cli") is True
 
 
@@ -57,6 +59,7 @@ def test_lookup_failure_fails_open():
 
 def test_a_frame_names_a_retired_model_as_its_successor():
     import asyncio
+
     from ws.dashboard_chat_text import live_model
     with patch("storage.billing.subscription_store.custom_model_exists", return_value=False):
         assert asyncio.run(live_model("claude-opus-5")) == "claude-opus-5-5"

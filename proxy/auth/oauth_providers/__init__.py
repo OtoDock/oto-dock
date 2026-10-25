@@ -28,20 +28,20 @@ logger = logging.getLogger("otodock.oauth-providers")
 
 
 # Hardcoded provider singletons. Populated at import time below.
-_HARDCODED: dict[str, "OAuthProvider"] = {}
+_HARDCODED: dict[str, OAuthProvider] = {}
 
 # Lazy cache for manifest-derived GenericOAuthProvider instances. Cleared
 # whenever manifests are rescanned (callable from mcp_registry).
-_MANIFEST_CACHE: dict[str, "OAuthProvider"] = {}
+_MANIFEST_CACHE: dict[str, OAuthProvider] = {}
 
 
 def _register_hardcoded() -> None:
     """Import + register hardcoded provider classes."""
-    from auth.oauth_providers.google import GoogleOAuthProvider
-    from auth.oauth_providers.slack import SlackOAuthProvider
-    from auth.oauth_providers.microsoft import MicrosoftOAuthProvider
-    from auth.oauth_providers.zoom import ZoomOAuthProvider
     from auth.oauth_providers.facebook import FacebookOAuthProvider
+    from auth.oauth_providers.google import GoogleOAuthProvider
+    from auth.oauth_providers.microsoft import MicrosoftOAuthProvider
+    from auth.oauth_providers.slack import SlackOAuthProvider
+    from auth.oauth_providers.zoom import ZoomOAuthProvider
     _HARDCODED["google"] = GoogleOAuthProvider()
     _HARDCODED["slack"] = SlackOAuthProvider()
     _HARDCODED["microsoft"] = MicrosoftOAuthProvider()
@@ -62,7 +62,7 @@ def clear_manifest_cache() -> None:
     _MANIFEST_CACHE.clear()
 
 
-def get_provider(provider_id: str) -> "OAuthProvider":
+def get_provider(provider_id: str) -> OAuthProvider:
     """Resolve a provider by id.
 
     Lookup order: hardcoded singletons → manifest-derived cache → manifest
@@ -113,14 +113,14 @@ def canonical_provider_id(provider_id: str) -> str:
     raise KeyError(provider_id)
 
 
-def _build_from_manifest(provider_id: str) -> "OAuthProvider | None":
+def _build_from_manifest(provider_id: str) -> OAuthProvider | None:
     """Scan loaded manifests for the first one whose oauth.provider_id matches.
 
     Returns a ``GenericOAuthProvider`` built from that manifest's URL fields,
     or None if no manifest declares this provider.
     """
-    from services.mcp import mcp_registry
     from auth.oauth_providers.generic import GenericOAuthProvider
+    from services.mcp import mcp_registry
 
     for manifest in mcp_registry.get_all_manifests().values():
         oauth = manifest.credentials.oauth if manifest.credentials else None

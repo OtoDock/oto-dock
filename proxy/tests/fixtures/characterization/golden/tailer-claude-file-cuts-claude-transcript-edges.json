@@ -1,0 +1,352 @@
+{
+ "offsets": {
+  "sid-char-cf": 28
+ },
+ "pending": [],
+ "rebuilds": [
+  "chat-char-1",
+  "chat-char-1",
+  "chat-char-1"
+ ],
+ "registry": {
+  "completed": [
+   "toolu_edge_task_bg",
+   "toolu_edge_task_denied",
+   "toolu_edge_task_fg"
+  ],
+  "has_pending": false,
+  "spawned": [
+   "toolu_edge_task_bg",
+   "toolu_edge_task_denied",
+   "toolu_edge_task_fg"
+  ]
+ },
+ "results": [
+  {
+   "assistant_chars": 12,
+   "compact_trigger": "",
+   "compacted": false,
+   "from_line": 0,
+   "last_message": "",
+   "last_signal": "tool_use",
+   "last_signal_at": 1792189808.0,
+   "persisted": 3,
+   "question_pending": false,
+   "title_set": true,
+   "to_line": 8,
+   "tool_rows": 0,
+   "turn_complete": false,
+   "usage_rows": 1
+  },
+  {
+   "assistant_chars": 0,
+   "compact_trigger": "",
+   "compacted": false,
+   "from_line": 8,
+   "last_message": "",
+   "last_signal": null,
+   "last_signal_at": null,
+   "persisted": 1,
+   "question_pending": false,
+   "title_set": false,
+   "to_line": 9,
+   "tool_rows": 1,
+   "turn_complete": false,
+   "usage_rows": 0
+  },
+  {
+   "assistant_chars": 51,
+   "compact_trigger": "",
+   "compacted": false,
+   "from_line": 9,
+   "last_message": "",
+   "last_signal": "tool_use",
+   "last_signal_at": 1792189817.0,
+   "persisted": 6,
+   "question_pending": false,
+   "title_set": false,
+   "to_line": 18,
+   "tool_rows": 3,
+   "turn_complete": false,
+   "usage_rows": 1
+  },
+  {
+   "assistant_chars": 10,
+   "compact_trigger": "manual",
+   "compacted": true,
+   "from_line": 18,
+   "last_message": "",
+   "last_signal": "end_turn",
+   "last_signal_at": 1792189824.0,
+   "persisted": 4,
+   "question_pending": false,
+   "title_set": false,
+   "to_line": 28,
+   "tool_rows": 0,
+   "turn_complete": true,
+   "usage_rows": 1
+  },
+  {
+   "assistant_chars": 0,
+   "compact_trigger": "",
+   "compacted": false,
+   "from_line": 28,
+   "last_message": "",
+   "last_signal": null,
+   "last_signal_at": null,
+   "persisted": 0,
+   "question_pending": false,
+   "title_set": false,
+   "to_line": 28,
+   "tool_rows": 0,
+   "turn_complete": false,
+   "usage_rows": 0
+  },
+  {
+   "persisted": 0,
+   "reason": "no_file"
+  }
+ ],
+ "rows": [
+  {
+   "author_sub": "",
+   "content": "[Restored from history]\n\n---\n\nhello there",
+   "role": "user",
+   "sync_search": false
+  },
+  {
+   "event_data": {
+    "content": "Let me look.",
+    "type": "thinking"
+   },
+   "event_type": "thinking",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "Looking now.",
+   "role": "assistant",
+   "sync_search": false
+  },
+  {
+   "event_data": {
+    "active": false,
+    "is_error": false,
+    "name": "Bash",
+    "result_summary": "2 lines",
+    "summary": "List files",
+    "tool_id": "toolu_edge_bash",
+    "tool_input": {
+     "command": "ls -la",
+     "description": "List files"
+    },
+    "tool_result": "total 0\n",
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "description": "Watch the build",
+    "run_in_background": true,
+    "subagent_type": "general-purpose",
+    "tool_input": {
+     "description": "Watch the build",
+     "prompt": "Watch the build.",
+     "run_in_background": true,
+     "subagent_type": "general-purpose"
+    },
+    "tool_use_id": "toolu_edge_task_bg",
+    "type": "task_spawn"
+   },
+   "event_type": "task_spawn",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "description": "Count files",
+    "run_in_background": false,
+    "subagent_type": "general-purpose",
+    "tool_input": {
+     "description": "Count files",
+     "prompt": "Count the files here.",
+     "subagent_type": "general-purpose"
+    },
+    "tool_result": "There are 24 files.",
+    "tool_use_id": "toolu_edge_task_fg",
+    "type": "task_spawn"
+   },
+   "event_type": "task_spawn",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "active": false,
+    "is_error": true,
+    "name": "Read",
+    "result_summary": "1 lines",
+    "summary": "hostname",
+    "tool_id": "toolu_edge_read",
+    "tool_input": {
+     "file_path": "/etc/hostname"
+    },
+    "tool_result": "Error: the path is outside your allowed scope",
+    "type": "tool"
+   },
+   "event_type": "tool",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "action": "enter",
+    "type": "plan_mode"
+   },
+   "event_type": "plan_mode",
+   "role": "event"
+  },
+  {
+   "event_data": {
+    "tool_input": {
+     "questions": [
+      {
+       "header": "Folder",
+       "options": [
+        {
+         "label": "a"
+        },
+        {
+         "label": "b"
+        }
+       ],
+       "question": "Which folder?"
+      }
+     ]
+    },
+    "tool_name": "AskUserQuestion",
+    "type": "question"
+   },
+   "event_type": "question",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "API Error: 429 rate_limit_error: rate limit reached",
+   "role": "assistant",
+   "sync_search": false
+  },
+  {
+   "event_data": {
+    "message": "Conversation compacted (112,000 tokens freed)",
+    "subtype": "context_compressed",
+    "trigger": "manual",
+    "type": "system"
+   },
+   "event_type": "system",
+   "role": "event"
+  },
+  {
+   "author_sub": "",
+   "content": "and now?",
+   "role": "user",
+   "sync_search": false
+  },
+  {
+   "author_sub": "",
+   "content": "Done.",
+   "role": "assistant",
+   "sync_search": false
+  },
+  {
+   "author_sub": "",
+   "content": "Done.",
+   "role": "assistant",
+   "sync_search": false
+  }
+ ],
+ "snapshots": [],
+ "throttles": [
+  "API Error: 429 rate_limit_error: rate limit reached"
+ ],
+ "titles": [
+  [
+   "u-person",
+   "chat-char-1",
+   "[Restored from history] --- hello there",
+   "lite"
+  ]
+ ],
+ "tool_records": [
+  [
+   "Bash",
+   "toolu_edge_bash",
+   false,
+   "tailer",
+   []
+  ],
+  [
+   "Read",
+   "toolu_edge_read",
+   true,
+   "tailer",
+   [
+    "/etc/hostname"
+   ]
+  ]
+ ],
+ "updates": [
+  {
+   "title": "[Restored from history] --- hello there"
+  }
+ ],
+ "usage": [
+  {
+   "agent": "lite",
+   "cache_read": 1000,
+   "cache_write": 100,
+   "cost_usd": 0.00315,
+   "input_tokens": 1200,
+   "message_count": 1,
+   "model": "claude-sonnet-5-5",
+   "output_tokens": 40,
+   "provider": "anthropic",
+   "scope": "user",
+   "source_id": "chat-char-1",
+   "source_key": "default",
+   "source_type": "chat",
+   "user_sub": "u-person"
+  },
+  {
+   "agent": "lite",
+   "cache_read": 4000,
+   "cache_write": 0,
+   "cost_usd": 0.0132,
+   "input_tokens": 5800,
+   "message_count": 1,
+   "model": "claude-sonnet-5-5",
+   "output_tokens": 120,
+   "provider": "anthropic",
+   "scope": "user",
+   "source_id": "chat-char-1",
+   "source_key": "default",
+   "source_type": "chat",
+   "user_sub": "u-person"
+  },
+  {
+   "agent": "lite",
+   "cache_read": 2000,
+   "cache_write": 0,
+   "cost_usd": 0.0073,
+   "input_tokens": 3500,
+   "message_count": 1,
+   "model": "claude-sonnet-5-5",
+   "output_tokens": 10,
+   "provider": "anthropic",
+   "scope": "user",
+   "source_id": "chat-char-1",
+   "source_key": "default",
+   "source_type": "chat",
+   "user_sub": "u-person"
+  }
+ ]
+}

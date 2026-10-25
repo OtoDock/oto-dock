@@ -6,6 +6,7 @@ the offboarding event; other membership changes land within the TTL."""
 import asyncio
 import uuid
 
+import psycopg
 import pytest
 
 import services.notifications.notification_manager as nm
@@ -198,7 +199,7 @@ async def test_a_failed_cold_read_caches_nothing_and_the_getter_is_pinned(temp_d
     nm.reset_audience_cache()
 
     def boom(agent):
-        raise RuntimeError("db down")
+        raise psycopg.OperationalError("db down")
     monkeypatch.setattr(nm.notification_store, "get_agent_user_subs", boom)
     assert await asyncio.to_thread(nm.chat_status_targets, "agent::x", "x") == []
     assert "x" not in nm._audience
@@ -208,7 +209,7 @@ async def test_a_failed_cold_read_caches_nothing_and_the_getter_is_pinned(temp_d
     await _settle()
     entry = nm._audience["x"]
     assert entry.placeholder and entry.stale and not entry.refreshing
-    with pytest.raises(RuntimeError, match="db down"):
+    with pytest.raises(psycopg.OperationalError, match="db down"):
         nm.agent_audience("x")
     assert "x" not in nm._audience
     # A test-style replacement of the getter misses the cache (the entry

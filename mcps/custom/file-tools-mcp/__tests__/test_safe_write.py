@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import shared  # noqa: E402
+import shared
 
 
 async def _ident(p, writing=False, **kw):
@@ -97,7 +97,7 @@ def test_write_docx_xlsx_pptx_never_write_through_a_link(tmp_path, victim, monke
     import powerpoint
     import word
     _bypass(monkeypatch, word, excel, powerpoint)
-    for mod, handler, name in (
+    for _mod, handler, name in (
         (word, word.handle_write_docx, "out.docx"),
         (excel, excel.handle_write_xlsx, "out.xlsx"),
         (powerpoint, powerpoint.handle_write_pptx, "out.pptx"),
@@ -121,9 +121,10 @@ def test_write_docx_xlsx_pptx_never_write_through_a_link(tmp_path, victim, monke
 
 
 def test_edit_image_and_create_chart_never_write_through_a_link(tmp_path, victim, monkeypatch):
+    from PIL import Image
+
     import charts
     import images
-    from PIL import Image
     _bypass(monkeypatch, images, charts)
     src = tmp_path / "in.png"
     Image.new("RGB", (8, 8), "red").save(src)
@@ -149,8 +150,9 @@ def test_edit_image_and_create_chart_never_write_through_a_link(tmp_path, victim
 
 def test_pdf_sinks_never_write_through_a_link(tmp_path, victim, monkeypatch):
     import fitz
-    import pdf as pdf_mod
     from PIL import Image
+
+    import pdf as pdf_mod
     _bypass(monkeypatch, pdf_mod)
     monkeypatch.setattr(pdf_mod, "_to_agents_relative", lambda p: p)
     # write_pdf
@@ -305,22 +307,24 @@ def test_pdf_to_images_default_folder_resolves_as_a_sandbox_write(tmp_path, monk
 
 def test_libreoffice_runs_under_the_pinned_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(shared, "_LO_PROFILE_DIR", str(tmp_path / "lo-profile"))
+    monkeypatch.setattr(shared, "_lo_slot_count", lambda: 1)
     seen = {}
     real_profile = shared._libreoffice_profile
     on_loop = []
 
-    def _profile():
+    def _profile(slot):
         try:
             asyncio.get_running_loop()
             on_loop.append(True)
         except RuntimeError:
             on_loop.append(False)
-        return real_profile()
+        return real_profile(slot)
 
     monkeypatch.setattr(shared, "_libreoffice_profile", _profile)
 
     class _Proc:
         returncode = 0
+        pid = 0
 
         async def communicate(self):
             return b"", b""
@@ -335,13 +339,13 @@ def test_libreoffice_runs_under_the_pinned_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
     (tmp_path / "in.docx").write_bytes(b"x")
     # A profile that drifted (an older pin set, a user's change) is rewritten.
-    xcu_path = tmp_path / "lo-profile" / "user" / "registrymodifications.xcu"
+    xcu_path = tmp_path / "lo-profile" / "slot-0" / "user" / "registrymodifications.xcu"
     xcu_path.parent.mkdir(parents=True)
     xcu_path.write_text(shared._LO_REGISTRY.replace("BlockUntrustedRefererLinks", "Other"))
     out = asyncio.run(shared._libreoffice_convert(str(tmp_path / "in.docx"), "pdf", str(tmp_path)))
     assert out.endswith("in.pdf")
     argv = seen["argv"]
-    assert argv[0] == "libreoffice" and argv[1] == f"-env:UserInstallation=file://{tmp_path / 'lo-profile'}"
+    assert argv[0] == "libreoffice" and argv[1] == f"-env:UserInstallation=file://{tmp_path / 'lo-profile' / 'slot-0'}"
     xcu = xcu_path.read_text()
     for needle in ('name="ODFRecalcMode"', 'name="OOXMLRecalcMode"',
                    'Office.Calc/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>1',
@@ -355,3 +359,202 @@ def test_libreoffice_runs_under_the_pinned_profile(tmp_path, monkeypatch):
     assert on_loop == [False]  # the profile's reads and writes run off the loop
     with contextlib.suppress(OSError):
         os.unlink(tmp_path / "in.pdf")
+
+
+class _FakeLibreOffice:
+    """create_subprocess_exec for LibreOffice: each run records its span, the
+    slot profile it ran under and its output folder, and waits on ``gate``."""
+
+    def __init__(self, gate: asyncio.Event | None = None, hang: bool = False):
+        self.gate, self.hang = gate, hang
+        self.started = asyncio.Event()
+        self.running = 0
+        self.most = 0
+        self.profiles: list[str] = []
+        self.procs: list = []
+
+    async def __call__(self, *argv, **kw):
+        fake = self
+        assert kw.get("start_new_session") is True
+        fake.profiles.append(argv[1])
+
+        class _Proc:
+            pid = 40000 + len(fake.procs)
+            returncode = None
+
+            async def communicate(self):
+                fake.running += 1
+                fake.most = max(fake.most, fake.running)
+                fake.started.set()
+                try:
+                    if fake.hang:
+                        await asyncio.Event().wait()
+                    if fake.gate is not None:
+                        await fake.gate.wait()
+                    await asyncio.sleep(0.01)
+                    out = Path(argv[argv.index("--outdir") + 1]) / (Path(argv[-1]).stem + ".pdf")
+                    out.write_bytes(b"%PDF")
+                    self.returncode = 0
+                    return b"", b""
+                finally:
+                    fake.running -= 1
+
+            async def wait(self):
+                self.returncode = -9
+                return -9
+
+        proc = _Proc()
+        fake.procs.append(proc)
+        return proc
+
+
+@pytest.fixture
+def lo_rig(tmp_path, monkeypatch):
+    """Two slots, profiles under tmp_path, and os.killpg a recorder (a fake
+    pid must never reach a real process group)."""
+    monkeypatch.setattr(shared, "_LO_PROFILE_DIR", str(tmp_path / "lo-profile"))
+    monkeypatch.setattr(shared, "_lo_slot_count", lambda: 2)
+    killed: list = []
+
+    def _killpg(pgid, sig):
+        killed.append((pgid, sig))
+        if sig == 0:
+            raise ProcessLookupError(pgid)
+
+    monkeypatch.setattr(shared.os, "killpg", _killpg)
+    for name in ("a", "b", "c"):
+        (tmp_path / f"{name}.docx").write_bytes(b"x")
+    return tmp_path, killed
+
+
+def _convert(tmp_path, name):
+    out = tmp_path / f"out-{name}-{len(list(tmp_path.glob('out-*')))}"
+    out.mkdir()
+    return shared._libreoffice_convert(str(tmp_path / f"{name}.docx"), "pdf", str(out))
+
+
+def test_two_conversions_run_side_by_side_on_two_slots(lo_rig, monkeypatch):
+    tmp_path, _ = lo_rig
+    fake = _FakeLibreOffice()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
+
+    async def main():
+        return await asyncio.gather(_convert(tmp_path, "a"), _convert(tmp_path, "b"), _convert(tmp_path, "a"))
+
+    outs = asyncio.run(main())
+    assert all(o.endswith(".pdf") for o in outs)
+    assert fake.most == 2  # two at once, the third waited for a free slot
+    assert sorted(set(fake.profiles)) == [f"-env:UserInstallation=file://{tmp_path / 'lo-profile' / f'slot-{n}'}"
+                                          for n in (0, 1)]
+
+
+def test_one_slot_runs_one_conversion_at_a_time(lo_rig, monkeypatch):
+    tmp_path, _ = lo_rig
+    monkeypatch.setattr(shared, "_lo_slot_count", lambda: 1)
+    fake = _FakeLibreOffice()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
+
+    async def main():
+        await asyncio.gather(_convert(tmp_path, "a"), _convert(tmp_path, "b"))
+
+    asyncio.run(main())
+    assert fake.most == 1
+
+
+def test_a_timeout_ends_the_process_group_before_the_slot_is_free(lo_rig, monkeypatch):
+    tmp_path, killed = lo_rig
+    monkeypatch.setattr(shared, "_LO_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _FakeLibreOffice(hang=True))
+
+    async def main():
+        with pytest.raises(RuntimeError, match=r"timed out \(0\.05s\)"):
+            await _convert(tmp_path, "a")
+        return shared._lo_free_slots().qsize()
+
+    assert asyncio.run(main()) == 2
+    assert [sig for _, sig in killed] == [9, 0]
+
+
+def test_a_caller_that_stops_waiting_ends_the_run(lo_rig, monkeypatch):
+    tmp_path, killed = lo_rig
+    fake = _FakeLibreOffice(hang=True)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
+
+    async def main():
+        call = asyncio.ensure_future(_convert(tmp_path, "a"))
+        await fake.started.wait()
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        await _settle()
+        return shared._lo_free_slots().qsize()
+
+    assert asyncio.run(main()) == 2
+    assert killed == [(fake.procs[0].pid, 9), (fake.procs[0].pid, 0)]
+
+
+async def _settle():
+    """Wait for every run and cleanup in flight, the ones they start too. A
+    gather of tasks already done does not yield, and their done callbacks
+    (the set's discard) run on the next turn: sleep(0) gives them it."""
+    while shared._lo_runs:
+        await asyncio.gather(*list(shared._lo_runs), return_exceptions=True)
+        await asyncio.sleep(0)
+
+
+def test_a_stop_while_a_timed_out_group_is_ended_still_frees_the_slot(lo_rig, monkeypatch):
+    """The conversion timed out, its group lingers while it is ended, and
+    the person stops the call then: the slot comes back once the group is
+    gone, and the next conversion runs (on one slot it used to hang)."""
+    tmp_path, _ = lo_rig
+    monkeypatch.setattr(shared, "_lo_slot_count", lambda: 1)
+    monkeypatch.setattr(shared, "_LO_TIMEOUT_S", 0.05)
+    polls = []
+
+    def _killpg(pgid, sig):
+        if sig == 0:
+            polls.append(pgid)
+            if len(polls) > 20:  # the group lingers about a second
+                raise ProcessLookupError(pgid)
+
+    monkeypatch.setattr(shared.os, "killpg", _killpg)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _FakeLibreOffice(hang=True))
+
+    async def main():
+        call = asyncio.ensure_future(_convert(tmp_path, "a"))
+        await asyncio.sleep(0.2)  # timed out at 0.05, the group still being ended
+        assert polls and not call.done()
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        await _settle()
+        freed = shared._lo_free_slots().qsize()
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _FakeLibreOffice())
+        nxt = await asyncio.wait_for(_convert(tmp_path, "b"), 2)
+        return freed, nxt
+
+    freed, nxt = asyncio.run(main())
+    assert freed == 1 and nxt.endswith("b.pdf")
+    assert len(polls) == 21  # the slot came back only after the group was gone
+
+
+def test_a_conversion_that_finds_no_free_slot_says_so(lo_rig, monkeypatch):
+    tmp_path, _ = lo_rig
+    monkeypatch.setattr(shared, "_LO_SLOT_WAIT_S", 0.1)
+
+    async def main():
+        free = shared._lo_free_slots()
+        held = [free.get_nowait() for _ in range(free.qsize())]
+        with pytest.raises(RuntimeError, match=r"busy: no conversion slot came free within 0\.1s"):
+            await _convert(tmp_path, "a")
+        for slot in held:
+            free.put_nowait(slot)
+
+    asyncio.run(main())
+
+
+def test_the_output_folder_is_the_callers():
+    import inspect
+
+    params = inspect.signature(shared._libreoffice_convert).parameters
+    assert params["output_dir"].default is inspect.Parameter.empty

@@ -9,12 +9,13 @@ import sys
 import httpx
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from auth.webhook_providers.base import NormalizedEvent  # noqa: E402
-from services.webhooks import event_enrichment  # noqa: E402
+from auth.webhook_providers.base import NormalizedEvent
+from services.webhooks import event_enrichment
 
 _ROW = {
     "id": "sub-1", "provider_id": "slack", "scope": "user",

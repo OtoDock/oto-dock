@@ -13,9 +13,8 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
-
-from core.config import task_config_builder as tcb
 from core import placement
+from core.config import task_config_builder as tcb
 
 
 def _stub(monkeypatch, *, execution_path: str):
@@ -54,7 +53,7 @@ def _stub(monkeypatch, *, execution_path: str):
         return fn(*a, **k)
     monkeypatch.setattr(tcb.asyncio, "to_thread", _to_thread)
 
-    monkeypatch.setattr(tcb.remote_store, "resolve_execution_target", lambda *a, **k: ("local", None))
+    monkeypatch.setattr(tcb.remote_status, "resolve_execution_target", lambda *a, **k: ("local", None))
     monkeypatch.setattr(tcb.remote_store, "placement_of", lambda *a, **k: placement.LOCAL_PLACEMENT)
 
     def _build_mcp(*a, **k):
@@ -75,7 +74,7 @@ def _stub(monkeypatch, *, execution_path: str):
         return []
     monkeypatch.setattr(tcb.dynamic_context, "get_dynamic_contexts", _no_dyn)
     monkeypatch.setattr(tcb.config, "build_agent_prompt", lambda *a, **k: "PROMPT")
-    monkeypatch.setattr(tcb.config, "get_cli_model", lambda *a, **k: "m")
+    monkeypatch.setattr("configuration.models.get_cli_model", lambda *a, **k: "m")
     monkeypatch.setattr(tcb.config, "get_cli_effort", lambda *a, **k: "")
     monkeypatch.setattr(tcb.subscription_pool, "resolve_subscription_env", lambda *a, **k: ("", {}))
     # oto_env + path_roles are imported INSIDE the function (from core import ...).
@@ -110,3 +109,31 @@ def test_claude_agent_task_uses_claude_dir_and_json(monkeypatch):
     assert calls["claude"] == 1 and calls["codex"] == 0
     assert cfg.sandbox_host_claude_dir.endswith(".claude")
     assert calls["mcp_format"] == "json"
+
+
+_REAL_TO_THREAD = asyncio.to_thread
+
+
+def test_the_prompt_is_built_off_the_loop(monkeypatch):
+    """``build_agent_prompt`` runs in a worker thread (the stub above runs
+    ``to_thread`` inline for the other tests; this one puts the real one
+    back): the loop thread never builds the prompt."""
+    import threading
+    _stub(monkeypatch, execution_path="claude-code-cli")
+    monkeypatch.setattr(tcb.asyncio, "to_thread", _REAL_TO_THREAD)
+    seen: dict = {}
+
+    def recorder(*a, **k):
+        seen["thread"] = threading.get_ident()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            seen["loop"] = None
+        else:
+            seen["loop"] = "running"
+        return "PROMPT"
+
+    monkeypatch.setattr(tcb.config, "build_agent_prompt", recorder)
+    cfg = asyncio.run(tcb.build_task_agent_config("test", _task(), "sess-3"))
+    assert "PROMPT" in cfg.system_prompt
+    assert seen["thread"] != threading.get_ident() and seen["loop"] is None

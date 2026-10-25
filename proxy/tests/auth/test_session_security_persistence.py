@@ -19,14 +19,14 @@ import time
 import pytest
 
 from tests._paths import PROXY_DIR
+
 _proxy_root = str(PROXY_DIR)
 if _proxy_root not in sys.path:
     sys.path.insert(0, _proxy_root)
 
-from auth.path_policy import SecurityContext  # noqa: E402
-from core.session import session_state # noqa: E402
+from auth.path_policy import SecurityContext
 from core import placement
-
+from core.session import session_state
 
 _PLACEMENT = placement.PlacementCapabilities(
     kind=placement.KIND_USER_REMOTE, label="Alice MBP",
@@ -90,16 +90,35 @@ def test_set_persists_and_load_repopulates(iso):
     assert session_state.get_session_security("sess-1") == ctx
 
 
+def test_one_entry_that_cannot_be_written_never_loses_the_others(iso, caplog):
+    """The whole index used to fail on one entry the encoder refused: its
+    neighbours on both sides are written, in their order."""
+    first, last = _ctx(), _ctx(display_name="Last")
+    session_state.set_session_security("sess-first", first)
+    session_state._session_security["sess-bad"] = _ctx(display_name=object())
+    session_state.set_session_security("sess-last", last)
+    with caplog.at_level("WARNING"):
+        session_state._save_session_security()
+    saved = json.loads(session_state._SECURITY_INDEX.read_text())
+    assert list(saved) == ["sess-first", "sess-last"]
+    assert "skipped session sess-bad" in caplog.text
+    session_state._session_security.clear()
+    session_state.load_session_security()
+    assert session_state.get_session_security("sess-first") == first
+    assert session_state.get_session_security("sess-last") == last
+
+
 def test_the_mode_and_the_floor_survive_a_restart(iso, monkeypatch):
     """The index keeps a session's permission mode (a change rewrites it) and
-    its token floor, read back for its re-adoption; a fresh registration of
-    the id replaces what was reloaded."""
+    its token floor, read back for its re-adoption (a word from before 1.9
+    as its current one); a fresh registration of the id replaces what was
+    reloaded."""
     monkeypatch.setattr(session_state, "_session_modes", {})
     monkeypatch.setattr(session_state, "_session_token_floor", {})
     monkeypatch.setattr(session_state, "_reloaded_state", {})
     session_state.register_session_state("sess-1", "default", _ctx(), token_minted_at=1790000000)
     on_disk = json.loads(session_state._SECURITY_INDEX.read_text())["sess-1"]
-    assert (on_disk["_mode"], on_disk["_floor"]) == ("default", 1790000000)
+    assert (on_disk["_mode"], on_disk["_floor"]) == ("ask", 1790000000)
     session_state.set_session_mode("sess-1", "plan")
     assert json.loads(session_state._SECURITY_INDEX.read_text())["sess-1"]["_mode"] == "plan"
     # A restart: memory gone, the index reloaded.

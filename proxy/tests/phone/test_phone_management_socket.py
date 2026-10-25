@@ -52,7 +52,9 @@ class _Socket:
 @pytest.fixture
 def opened(monkeypatch):
     monkeypatch.setattr(phone_management.config, "is_master_key", lambda bearer: bearer == "key")
-    monkeypatch.setattr(phone_management, "assemble_phone_config", lambda: {"version": 7})
+    async def _config():
+        return {"version": 7}
+    monkeypatch.setattr(phone_management, "build_phone_config", _config)
 
 
 def _run(socket, caplog):
@@ -107,10 +109,10 @@ def test_a_lost_connection_in_the_loop_is_no_error(opened, caplog):
 def test_a_real_error_while_opening_is_still_an_error(opened, caplog, monkeypatch):
     """Only the socket's own calls read a failure as the daemon leaving: a
     config that cannot be assembled is logged as the error it is."""
-    def broken():
+    async def broken():
         raise OSError("disk")
 
-    monkeypatch.setattr(phone_management, "assemble_phone_config", broken)
+    monkeypatch.setattr(phone_management, "build_phone_config", broken)
     socket = _Socket()
     errors = _run(socket, caplog)
     assert [r.getMessage() for r in errors] == ["Phone management WebSocket error: disk"]

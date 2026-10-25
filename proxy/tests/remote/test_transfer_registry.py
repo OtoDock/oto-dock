@@ -13,7 +13,6 @@ import pytest
 
 from core.remote import transfer_registry as tr
 
-
 # The genuine resolver, saved before the autouse fixture stubs the module
 # attribute — the scoping test exercises it directly.
 _REAL_RESOLVE = tr._resolve_recipients
@@ -183,8 +182,8 @@ async def test_broadcaster_error_never_raises():
 async def test_recipient_scoping_uses_isolation_predicate(monkeypatch):
     """The real resolver keeps personal paths owner-only (admins included)
     and shares workspace/ with all members, config/ with owner-tier only."""
-    from storage import database as task_store
     from services.notifications import notification_manager
+    from storage import database as task_store
 
     users = {
         "sub-alice": {"role": "creator"},

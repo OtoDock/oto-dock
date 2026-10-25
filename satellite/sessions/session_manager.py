@@ -8,23 +8,24 @@ the session registry and lifecycle.
 
 import asyncio
 import base64
+import contextlib
+import errno
 import json
 import logging
 import os
-import re
 import platform
+import re
 import shutil
 import sys
 import tempfile
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 
-from ..transport import file_sync
-from . import alive_report
-from .cli_session import CLISession, _write_cli_hooks
-from .codex_session import CodexSession, _write_codex_hooks
+from .. import config
+from .._vendored import layout
+from ..background import spawn
 from ..config import atomic_replace, force_rmtree, kill_process_tree
 from ..engines import BY_CREDENTIAL_KIND, ENGINES, engine_for
 from ..host.host_probe import (
@@ -35,6 +36,10 @@ from ..host.host_probe import (
     _machine_resources,
     _recommended_max_sessions,
 )
+from ..transport import file_sync
+from . import alive_report
+from .cli_session import CLISession, _write_cli_hooks
+from .codex_session import CodexSession, _write_codex_hooks
 from .mcp_install_support import (
     _fix_shebangs_after_swap,
     _fix_windows_exe_paths_after_swap,
@@ -44,10 +49,6 @@ from .mcp_install_support import (
     _uv_bin_if_present,
     _warm_one_mcp,
 )
-import contextlib
-from .. import config
-from .._vendored import layout
-
 
 if TYPE_CHECKING:
     from ..config import SatelliteConfig
@@ -62,6 +63,93 @@ logger = logging.getLogger("satellite")
 # Every platform MCP is ``core``; ``custom`` and ``community`` are the
 # operator-installed and catalog trees.
 MCP_CATEGORIES = frozenset({"core", "custom", "community"})
+
+
+# The read errors a resume probe answers as a definite "not resumable": a
+# name nobody can load as a transcript (a planted directory, a dropped
+# permission). The chat takes a fresh session instead of waiting on a file
+# that will never open. Anything else (memory, I/O, a full disk) is the
+# machine's moment and is answered as an error the platform asks again.
+_PROBE_UNREADABLE_ERRNOS = frozenset({
+    errno.EISDIR, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM,
+})
+# The two spellings claude-code has used for a user turn's line.
+_PROBE_USER_MARKS = ('"type":"user"', '"type": "user"')
+_PROBE_READ_BUFFER = 1024 * 1024
+# The engine-home pushes refused so far (``<slug>/<rel>``): each is said
+# once; a platform before 1.9.0 sends them at every merge.
+_engine_home_refusals: set[str] = set()
+
+
+def _probe_session_file(claude_dir: Path, session_id: str) -> tuple[bool, str, int]:
+    """Whether the session JSONL under ``claude_dir`` holds a user message:
+    ``(resumable, reason, lines_read)``. The file is read line by line (one
+    message a line) and the read stops at the first user line, so a
+    transcript of any size costs one line of memory. A missing file is
+    ``(False, "missing", 0)``, one with no user line ``(False, "empty", n)``,
+    one that cannot be loaded for good ``(False, "unreadable", n)``
+    (``_PROBE_UNREADABLE_ERRNOS``); any other ``OSError`` is raised. Runs in
+    a worker thread."""
+    projects_dir = claude_dir / "projects"
+    candidate: Path | None = None
+    try:
+        if projects_dir.is_dir():
+            # The project-hash dir name varies by CWD; search all.
+            for project_dir in projects_dir.iterdir():
+                if project_dir.is_dir() and (project_dir / f"{session_id}.jsonl").exists():
+                    candidate = project_dir / f"{session_id}.jsonl"
+                    break
+    except OSError as e:
+        if e.errno in _PROBE_UNREADABLE_ERRNOS:
+            return False, "unreadable", 0
+        raise
+    if candidate is None:
+        return False, "missing", 0
+    lines = 0
+    try:
+        with open(candidate, encoding="utf-8", errors="replace",
+                  buffering=_PROBE_READ_BUFFER) as fh:
+            for line in fh:
+                lines += 1
+                if any(mark in line for mark in _PROBE_USER_MARKS):
+                    return True, "", lines
+    except OSError as e:
+        if e.errno in _PROBE_UNREADABLE_ERRNOS:
+            return False, "unreadable", lines
+        raise
+    return False, "empty", lines
+
+
+def _under_engine_home(path: str, path_kind: str, agents_dir: Path) -> bool:
+    """Whether a pushed path lands where only a session move may write: under
+    an engine home, beyond the person's own folders that sync. On Windows
+    every segment first loses its trailing dots and spaces (Win32 drops them:
+    ``.claude.`` lands in ``.claude``), a segment left empty dropped. An
+    ``agent_tree`` path is judged with ``.`` and empty segments dropped and
+    the case folded where the filesystem folds it. A ``satellite_host`` path
+    is compared canonical with the agents root (realpath on both sides, the
+    Win32 device prefix dropped: ``_host_real``), as given and resolved, so
+    an alias of the agents folder or a link inside it is caught; the parts
+    after the agents root, the agent slug dropped, are judged the same way."""
+    fold = config.HOST.case_insensitive
+    text = path.replace("\\", "/")
+    if config.HOST.name == config.WINDOWS:
+        # A segment of dots only keeps its spelling (the path rules judge
+        # those); an empty one stays so a root keeps its "/".
+        segs = [(s, s.rstrip(". ") if s.strip(".") else s) for s in text.split("/")]
+        text = "/".join(t for s, t in segs if t or not s)
+    if path_kind != "satellite_host":
+        rel = "/".join(p for p in text.split("/") if p not in ("", "."))
+        return file_sync.is_unsynced_engine_home_path(rel.lower() if fold else rel)
+    root = _host_real(str(agents_dir)).rstrip("/")
+    for spelling in dict.fromkeys((text, _host_real(text))):
+        if not _under(spelling, root, fold=fold):
+            continue
+        parts = [p for p in spelling[len(root):].split("/") if p not in ("", ".")][1:]
+        rel = "/".join(parts)
+        if file_sync.is_unsynced_engine_home_path(rel.lower() if fold else rel):
+            return True
+    return False
 
 
 def _validate_satellite_host_path(raw: str) -> None:
@@ -331,7 +419,7 @@ async def _apply_satellite_host_push(
     try:
         target = Path(abs_path)
         if action == "delete":
-            target.unlink(missing_ok=True)
+            target.unlink(missing_ok=True)  # noqa: ASYNC240  # one push's chunks arrive as separate tasks: written and acked in arrival order
         elif action == "write":
             target.parent.mkdir(parents=True, exist_ok=True)
             content = base64.b64decode(msg.get("content_b64", ""))
@@ -352,14 +440,14 @@ async def _apply_satellite_host_push(
             chunk = base64.b64decode(msg.get("content_b64", ""))
             chunk_idx = msg.get("chunk_index", 0)
             mode = "wb" if chunk_idx == 0 else "ab"
-            with open(partial, mode) as f:
+            with open(partial, mode) as f:  # noqa: ASYNC230  # one push's chunks arrive as separate tasks: written and acked in arrival order
                 f.write(chunk)
             total = msg.get("total_chunks", 0)
             if chunk_idx + 1 >= total:
                 # Last chunk — verify hash and finalize.
                 expected_hash = msg.get("hash", "")
                 if expected_hash:
-                    with open(partial, "rb") as f:
+                    with open(partial, "rb") as f:  # noqa: ASYNC230  # one push's chunks arrive as separate tasks: written and acked in arrival order
                         actual = "sha256:" + hashlib.sha256(f.read()).hexdigest()
                     if actual != expected_hash:
                         partial.unlink(missing_ok=True)
@@ -398,7 +486,7 @@ class SessionManager:
 
     def __init__(self, config: "SatelliteConfig"):
         self.config = config
-        self.sessions: dict[str, Union[CLISession, CodexSession]] = {}
+        self.sessions: dict[str, CLISession | CodexSession] = {}
         # Interactive PTY sessions — a separate lifecycle
         # from the -p `sessions` above (no send_message/stop_turn; driven by
         # pty_input/pty_resize/pty_close from the proxy). session_id -> PtySession.
@@ -429,10 +517,11 @@ class SessionManager:
         # holds the seq/command-tagged event dicts (deque caps memory — a
         # dropped head is reported as `truncated` on replay). forward_paused
         # parks the live forwarder while a replay is enqueued so the wire
-        # order is strictly [begin][replay][live].
+        # order is strictly [begin][replay][live]: the replay's event, set
+        # (and dropped) when the replay ends or the session closes.
         self.turn_buffers: dict[str, deque] = {}
         self.turn_state: dict[str, dict] = {}
-        self.forward_paused: set[str] = set()
+        self.forward_paused: dict[str, asyncio.Event] = {}
 
     def _live_session_count(self, exclude: str = "") -> int:
         """Live agent sessions on this satellite: headless (-p/codex) + interactive
@@ -542,6 +631,10 @@ class SessionManager:
         # ``file_pull_cancel``. The proxy gates the cancel on the flag AND
         # the version.
         caps["paced_transfers"] = True
+        # The session move (0.5.156): a chat's engine session files go on and
+        # off this machine through ``session_move``, the one door into an
+        # engine home. The proxy gates on the flag AND the version.
+        caps["session_move"] = True
         # Per-satellite budget: raw resources + this host's own
         # physical-safety session ceiling. The proxy displays these and may apply
         # a lower admin override (remote_machines.max_sessions) on top.
@@ -567,7 +660,7 @@ class SessionManager:
                 try:
                     pid = int(pid_file.read_text().strip())
                     kill_process_tree(pid, timeout=3.0)
-                    logger.info(f"Killed orphan process tree: pid={pid}")
+                    logger.info("Killed orphan process tree: pid=%s", pid)
                 except (ValueError, ProcessLookupError, PermissionError):
                     pass
                 finally:
@@ -628,13 +721,14 @@ class SessionManager:
             stale = self.sessions.pop(session_id, None)
             if stale is not None:
                 logger.warning(
-                    f"start_session: session {session_id} already live "
-                    f"(pid={stale.pid}) — closing stale process before respawn"
+                    "start_session: session %s already live "
+                    "(pid=%s) — closing stale process before respawn",
+                    session_id, stale.pid
                 )
                 try:
                     await stale.close()
                 except Exception:
-                    logger.exception(f"Failed to close stale session {session_id}")
+                    logger.exception("Failed to close stale session %s", session_id)
 
             session = engine.headless_cls()(session_id, agent_dir, config_payload, self.config)
             session.incarnation = alive_report.next_incarnation()
@@ -642,11 +736,13 @@ class SessionManager:
 
             self.sessions[session_id] = session
 
-            await ws.enqueue_send({
-                "type": "ack",
-                "command_id": command_id,
-                "status": "ok",
-            })
+            ack = {"type": "ack", "command_id": command_id, "status": "ok"}
+            if getattr(session, "resume_refused", False) is True:
+                # The engine refused the session the platform asked to
+                # resume (a Codex thread): the platform reseeds the chat
+                # from its history before the first turn (0.5.156).
+                ack["resume_refused"] = True
+            await ws.enqueue_send(ack)
             await ws.enqueue_send({
                 "type": "session_started",
                 "session_id": session_id,
@@ -670,7 +766,7 @@ class SessionManager:
                 })
 
         except Exception as e:
-            logger.exception(f"Failed to start session {session_id}")
+            logger.exception("Failed to start session %s", session_id)
             await ws.enqueue_send({
                 "type": "ack",
                 "command_id": command_id,
@@ -756,7 +852,7 @@ class SessionManager:
             )
 
         except Exception as e:
-            logger.exception(f"Error streaming session {session_id}")
+            logger.exception("Error streaming session %s", session_id)
             await ws.enqueue_send({
                 "type": "session_event",
                 "session_id": session_id,
@@ -811,7 +907,7 @@ class SessionManager:
                     **change,
                 })
         except Exception:
-            logger.exception(f"Error detecting file changes for {session_id}")
+            logger.exception("Error detecting file changes for %s", session_id)
 
         # A session with a post-turn stdout drainer (the Claude CLI): if the
         # proxy flagged a still-pending backgrounded command on its stop_turn,
@@ -885,7 +981,7 @@ class SessionManager:
         try:
             await session.send_control_request("interrupt")
             logger.info("interrupt_turn: sent graceful interrupt to %s", session_id)
-        except Exception as e:
+        except (OSError, RuntimeError) as e:
             logger.warning(
                 "interrupt_turn: control write failed for %s: %s", session_id, e,
             )
@@ -904,13 +1000,7 @@ class SessionManager:
         if session:
             await session.abort()
         if ws is not None:
-            try:
-                await ws.enqueue_send({"type": "session_aborted", "session_id": session_id})
-            except Exception as e:
-                logger.warning(
-                    "abort: failed to send session_aborted ack for %s: %s",
-                    session_id, e,
-                )
+            await ws.enqueue_send({"type": "session_aborted", "session_id": session_id})
 
     async def close_session(self, msg: dict, ws: "SatelliteWSClient") -> None:
         """Clean shutdown of a session."""
@@ -927,7 +1017,7 @@ class SessionManager:
         # A proxy-commanded close is deliberate — drop the turn retention.
         self.turn_buffers.pop(session_id, None)
         self.turn_state.pop(session_id, None)
-        self.forward_paused.discard(session_id)
+        self._release_forward(session_id)
 
         if session:
             await session.close()
@@ -1072,7 +1162,7 @@ class SessionManager:
                 "pid": session.pid,
             })
         except Exception as e:
-            logger.exception(f"Failed to open PTY session {session_id}")
+            logger.exception("Failed to open PTY session %s", session_id)
             await ws.enqueue_send({
                 "type": "ack",
                 "command_id": command_id,
@@ -1085,7 +1175,7 @@ class SessionManager:
         if session is not None:
             try:
                 session.write(base64.b64decode(msg.get("data_b64", "") or ""))
-            except Exception:
+            except (ValueError, OSError):
                 logger.debug("pty_input decode/write failed", exc_info=True)
 
     async def pty_resize(self, msg: dict) -> None:
@@ -1119,7 +1209,7 @@ class SessionManager:
         conn = self._otodock_conns.pop(sid, None)
         if session is not None:
             await session.close()
-            logger.info(f"PTY session closed: {sid}")
+            logger.info("PTY session closed: %s", sid)
         if conn is not None:
             # Proxy-driven close (e.g. take-over) → tell the local terminal
             # to exit. Idempotent with the _on_exit feed if the child also died.
@@ -1159,19 +1249,16 @@ class SessionManager:
         session.attach_local_relay(conn.feed_output, conn.feed_exit)
         pty = getattr(session, "pty", None)
         if pty is not None:
-            try:
-                # Replay boundary: queries would be auto-answered; a buffered
-                # OSC 52 copy would overwrite the attaching terminal's system
-                # clipboard. Both are replay-only strips (live output passes).
-                sb = strip_clipboard_writes(strip_queries(pty.scrollback()))
-                if sb:
-                    conn.feed_output(sb)
-            except Exception:
-                logger.debug("otodock scrollback replay failed", exc_info=True)
+            # Replay boundary: queries would be auto-answered; a buffered
+            # OSC 52 copy would overwrite the attaching terminal's system
+            # clipboard. Both are replay-only strips (live output passes).
+            sb = strip_clipboard_writes(strip_queries(pty.scrollback()))
+            if sb:
+                conn.feed_output(sb)
         if force_repaint:
             try:
                 session.force_repaint()
-            except Exception:
+            except OSError:
                 logger.debug("otodock force_repaint failed", exc_info=True)
         logger.info(
             "otodock local terminal attached to PTY session %s", session.session_id
@@ -1196,7 +1283,7 @@ class SessionManager:
         if old is not None and old is not conn:
             from ..terminal.otodock_proto import SUPERSEDE_EXIT_CODE
             old.feed_exit(SUPERSEDE_EXIT_CODE, "taken over by another terminal")
-            asyncio.create_task(old.close())
+            spawn(old.close(), name="close_replaced_conn", owner="local_terminal")
         self._otodock_conns[session_id] = conn
         session = self.pty_sessions.get(session_id)
         if session is not None:
@@ -1242,15 +1329,12 @@ class SessionManager:
             conn.feed_exit(SUPERSEDE_EXIT_CODE, reason)
         # Confirm even if conn/session were already gone, so the proxy never gets
         # stuck with otodock_attached=True (→ dashboard gated out forever).
-        try:
-            await ws.send_local_detached(session_id)
-        except Exception:
-            logger.debug("evict_local_conn: confirm send failed", exc_info=True)
+        await ws.send_local_detached(session_id)
 
     async def check_session_resumable(
         self, msg: dict, ws: "SatelliteWSClient",
     ) -> None:
-        """Stat the CLI session JSONL on disk; reply whether ``--resume`` would work.
+        """Read the CLI session JSONL on disk; reply whether ``--resume`` would work.
 
         After an abort the satellite's CLI subprocess exits but the
         ``.claude/projects/<hash>/<session_id>.jsonl`` file claude-code
@@ -1260,55 +1344,70 @@ class SessionManager:
         new subprocess loads conversation history, and (b) creating a
         fresh session (which would drop chat memory entirely).
 
-        Returns ``resumable=True`` iff the JSONL exists AND contains at
-        least one user message — matches the contract in
-        ``proxy/core/layers/cli/layer.py::can_resume_session``.
+        ``resumable: true`` iff the JSONL exists AND contains at least one
+        user message, the contract of
+        ``proxy/core/layers/cli/layer.py::can_resume_session``. A ``false``
+        carries ``reason`` (``missing``, ``empty``, ``unreadable``: a
+        definite answer, the chat takes a fresh session). A read the
+        machine could not finish (memory, I/O) is ``status: error``: the
+        platform asks again instead of taking the fresh branch. The file
+        is read line by line in a worker thread (``_probe_session_file``):
+        a transcript of any size costs one line of memory and never holds
+        the loop that serves every frame.
         """
         command_id = msg.get("command_id", "")
         session_id = msg.get("session_id", "")
         agent_slug = msg.get("agent_slug", "")
         username = msg.get("username", "")
 
-        resumable = False
-        try:
-            if agent_slug and session_id:
-                # Mirror the proxy-side path derivation: per-user agent
-                # dirs win over the shared workspace .claude/ for sessions
-                # that ran under a logged-in user.
-                claude_dir = layout.state_dir(
-                    self.config.agents_dir / agent_slug, username, ".claude",
-                )
-                projects_dir = claude_dir / "projects"
-                if projects_dir.is_dir():
-                    # Project-hash dir name varies by CWD; search all.
-                    for project_dir in projects_dir.iterdir():
-                        if not project_dir.is_dir():
-                            continue
-                        candidate = project_dir / f"{session_id}.jsonl"
-                        if candidate.exists():
-                            try:
-                                content = candidate.read_text(
-                                    encoding="utf-8", errors="replace",
-                                )
-                                resumable = (
-                                    '"type":"user"' in content
-                                    or '"type": "user"' in content
-                                )
-                            except OSError:
-                                resumable = False
-                            break
-        except Exception as e:
-            logger.warning(
-                "check_session_resumable failed for %s: %s",
-                session_id[:8] if session_id else "?", e,
+        resumable, reason, lines = False, "missing", 0
+        from ..host import auth_paths
+        from . import session_move as _mv
+        if not (auth_paths.is_safe_slug(agent_slug) and session_id
+                and _mv.is_safe_username(session_id) and _mv.is_safe_username(username)):
+            # Joined into a path below: a frame naming another place is
+            # answered as a missing session, never looked up.
+            if agent_slug or session_id:
+                logger.warning("check_session_resumable refused an unsafe name (slug=%r)",
+                               agent_slug[:64])
+            agent_slug = session_id = ""
+        if agent_slug and session_id:
+            # Mirror the proxy-side path derivation: per-user agent dirs
+            # win over the shared workspace .claude/ for sessions that ran
+            # under a logged-in user.
+            claude_dir = layout.state_dir(
+                self.config.agents_dir / agent_slug, username, ".claude",
             )
-
-        await ws.enqueue_send({
+            try:
+                resumable, reason, lines = await asyncio.to_thread(
+                    _probe_session_file, claude_dir, session_id,
+                )
+            except OSError as e:
+                logger.warning(
+                    "check_session_resumable could not read for %s: %s",
+                    session_id[:8], e,
+                )
+                await ws.enqueue_send({
+                    "type": "ack",
+                    "command_id": command_id,
+                    "status": "error",
+                    "error": f"{type(e).__name__}: {e}",
+                })
+                return
+        logger.info(
+            "resume probe for %s: %s (%d lines read)",
+            session_id[:8] if session_id else "?",
+            "resumable" if resumable else reason, lines,
+        )
+        ack = {
             "type": "ack",
             "command_id": command_id,
             "status": "ok",
             "resumable": resumable,
-        })
+        }
+        if reason:
+            ack["reason"] = reason
+        await ws.enqueue_send(ack)
 
     async def codex_compact(self, msg: dict, ws: "SatelliteWSClient") -> None:
         """Manual Codex thread compaction RPC (proxy
@@ -1402,9 +1501,16 @@ class SessionManager:
         """Park the live CLI forwarder while a replay is being enqueued so the
         wire order stays strictly [replay][live]. Events keep landing in the
         retention buffer meanwhile (append happens before this wait), so the
-        replay snapshot covers them; the proxy dedupes any overlap by _seq."""
-        while session_id in self.forward_paused:
-            await asyncio.sleep(0.05)
+        replay snapshot covers them; the proxy dedupes any overlap by _seq.
+        A second replay that starts as the first ends parks it again."""
+        while (paused := self.forward_paused.get(session_id)) is not None:
+            await paused.wait()
+
+    def _release_forward(self, session_id: str) -> None:
+        """End a replay's pause: the parked forwarders go on."""
+        paused = self.forward_paused.pop(session_id, None)
+        if paused is not None:
+            paused.set()
 
     def headless_sessions_alive(self) -> list[dict]:
         """Live headless sessions of the engines whose turns a restarted proxy
@@ -1454,7 +1560,7 @@ class SessionManager:
             session.execution_path if session is not None
             else state.get("execution_path", "")
         )
-        self.forward_paused.add(session_id)
+        self.forward_paused.setdefault(session_id, asyncio.Event())
         try:
             events = list(buffer) if buffer is not None else []
             truncated = bool(
@@ -1497,7 +1603,7 @@ class SessionManager:
                 len(events), session_id[:8], truncated, bool(ended_command),
             )
         finally:
-            self.forward_paused.discard(session_id)
+            self._release_forward(session_id)
 
     async def check_session_process(
         self, msg: dict, ws: "SatelliteWSClient",
@@ -1658,8 +1764,32 @@ class SessionManager:
 
         # satellite_host: dispatch to the absolute-path handler and ack
         # there. Agent-tree path falls through to the existing flow.
-        if path_kind == "satellite_host":
+        engine_home = msg.get("action") != "delete" and _under_engine_home(
+            rel_path, path_kind, self.config.agents_dir)
+        if path_kind == "satellite_host" and not engine_home:
             await _apply_satellite_host_push(msg, ws)
+            return
+        if engine_home:
+            # The engine's own files under its home are this machine's: a
+            # platform before 1.9.0 still pushes them (history, the command
+            # wrappers with its sandbox paths) at every merge. Refused, and
+            # said once per path.
+            key = f"{agent_slug}/{rel_path}"
+            if key not in _engine_home_refusals and len(_engine_home_refusals) < 256:
+                _engine_home_refusals.add(key)
+                logger.info(
+                    "file push of %s refused: under an engine home only a person's "
+                    "own folders sync (skills, commands, agents, output styles, "
+                    "prompts); the rest is this machine's", rel_path,
+                )
+            command_id = msg.get("command_id", "")
+            if command_id and ws is not None:
+                await ws.enqueue_send({
+                    "type": "ack",
+                    "command_id": command_id,
+                    "status": "rejected",
+                    "error": "engine home path is host-local",
+                })
             return
 
         agent_dir = self.config.agents_dir / agent_slug
@@ -1678,11 +1808,20 @@ class SessionManager:
             and hasattr(s, "_file_snapshot")
         ]
 
+        committed: dict | None = None
+        stale: file_sync.StalePush | None = None
         try:
-            file_sync.apply_file_push(
+            committed = file_sync.apply_file_push(
                 agent_dir, msg, snapshots=snapshots_to_refresh,
             )
-        except Exception as e:  # pragma: no cover — defensive
+        except file_sync.StalePush as e:
+            stale = e
+            logger.info(
+                "file push of %s not applied: the file %s on this machine", rel_path,
+                "changed since the platform saw it" if e.reason == "changed"
+                else "is being written",
+            )
+        except Exception as e:  # noqa: BLE001  # pragma: no cover, the push acks the error text whatever the write raised
             error_msg = f"{type(e).__name__}: {e}"
 
         # A push of a hooks-settings file (.claude/settings.json /
@@ -1691,17 +1830,25 @@ class SessionManager:
         # re-sync re-pushes push-only .claude/.codex). A live CLI re-reads settings
         # on change, so its PreToolUse gate + Stop hook would then resolve to
         # non-existent /users/<u>/… paths. Re-assert real paths.
-        if not error_msg and msg.get("action", "write") == "write":
+        if not error_msg and stale is None and msg.get("action", "write") == "write":
             self._reapply_hooks_after_push(agent_slug, rel_path)
 
         command_id = msg.get("command_id", "")
         if command_id and ws is not None:
-            await ws.enqueue_send({
+            ack: dict = {
                 "type": "ack",
                 "command_id": command_id,
                 "status": "error" if error_msg else "ok",
                 "error": error_msg,
-            })
+            }
+            if stale is not None:
+                # The copy here, for the platform's mark of its own copy.
+                ack.update(status="stale", reason=stale.reason,
+                           size=stale.size, mtime_ns=stale.mtime_ns)
+            elif committed:
+                # What the platform expects at its next push of the path.
+                ack.update(committed)
+            await ws.enqueue_send(ack)
 
     def _reapply_hooks_after_push(self, agent_slug: str, rel_path: str) -> None:
         """Re-assert REAL-path hook commands for any LIVE session whose hooks-
@@ -1725,7 +1872,7 @@ class SessionManager:
         agent_dir = self.config.agents_dir / agent_slug
         try:
             pushed = (agent_dir / rel_path).resolve()
-        except Exception:
+        except (OSError, RuntimeError):
             return
         for session in (*self.sessions.values(), *self.pty_sessions.values()):
             if getattr(session, "agent_slug", "") != agent_slug:
@@ -1799,6 +1946,99 @@ class SessionManager:
             logger.info("file pull %s cancelled by the platform", request_id[:8])
         if ws is not None and request_id:
             ws.drop_bulk(lambda m: m.get("request_id") == request_id)
+
+    # -- the session move (0.5.156) ----------------------------------------
+
+    def _session_holds(self, refs) -> bool:
+        """Whether a live session, headless or terminal, holds one of
+        ``refs`` as its session id or its thread id."""
+        wanted = set(refs)
+        for s in list(self.sessions.values()) + list(self.pty_sessions.values()):
+            ids = {getattr(s, "session_id", "") or "", getattr(s, "thread_id", "") or "",
+                   getattr(s, "_thread_id", "") or ""}
+            if ids & wanted:
+                return True
+        return False
+
+    async def session_move(self, msg: dict, ws: "SatelliteWSClient") -> None:
+        """``session_move`` ``list`` / ``stat`` / ``commit`` / ``discard`` /
+        ``delete`` (``sessions.session_move``): acked by command id, the
+        result keys beside the status. A refusal is ``rejected`` with its
+        reason. ``stat`` and ``discard`` are answered while a live session
+        holds an id (the move's proof waits on a transcript still growing)."""
+        from . import session_move as mv
+        command_id = msg.get("command_id", "")
+        op = msg.get("op")
+        work = {
+            mv.OP_LIST: ("files", mv.list_files),
+            mv.OP_STAT: ("files", mv.stat_files),
+            mv.OP_COMMIT: ("files", mv.commit),
+            mv.OP_DISCARD: ("", mv.discard),
+            mv.OP_DELETE: ("deleted", mv.delete),
+        }.get(op)  # type: ignore[call-overload]
+        answer: dict = {"type": "ack", "command_id": command_id}
+        try:
+            if work is None:
+                raise mv.MoveRefused("unknown op")
+            scope = mv.parse_scope(msg, need_move=op in (mv.OP_COMMIT, mv.OP_DISCARD))
+            if op not in (mv.OP_DISCARD, mv.OP_STAT) and self._session_holds(scope.refs):
+                raise mv.MoveRefused("busy: a live session holds this session")
+            key, fn = work
+            result = await asyncio.to_thread(fn, self.config.agents_dir, scope)
+            answer["status"] = "ok"
+            if key:
+                answer[key] = result
+        except mv.MoveRefused as e:
+            logger.info("session move %s refused: %s", op, e)
+            answer.update(status="rejected", error=str(e))
+        except (OSError, ValueError) as e:
+            logger.warning("session move %s failed: %s", op, e)
+            answer.update(status="rejected", error=f"{type(e).__name__}: {e}")
+        if command_id:
+            await ws.enqueue_send(answer)
+
+    def session_move_push(self, msg: dict) -> dict:
+        """One pushed chunk of a session file, staged before the caller's
+        next await (the chunks arrive in order and are written in order);
+        returns the ack."""
+        import binascii
+
+        from . import session_move as mv
+        answer: dict = {"type": "ack", "command_id": msg.get("command_id", "")}
+        try:
+            scope = mv.parse_scope(msg, need_move=True)
+            data = base64.b64decode(msg.get("content_b64") or "", validate=True)
+            mv.write_chunk(
+                self.config.agents_dir, scope, msg.get("rel"), data,
+                index=int(msg.get("chunk_index", 0)), total=int(msg.get("total_chunks", 1)),
+                digest=str(msg.get("hash") or ""), max_file=file_sync.max_file_size(),
+            )
+            answer["status"] = "ok"
+        except (mv.MoveRefused, binascii.Error, TypeError) as e:
+            answer.update(status="rejected", error=str(e))
+        except (OSError, ValueError) as e:
+            logger.warning("session move push failed: %s", e)
+            answer.update(status="rejected", error=f"{type(e).__name__}: {e}")
+        return answer
+
+    async def session_move_pull(self, msg: dict, ws: "SatelliteWSClient") -> None:
+        """One session file sent back in ``file_content`` chunks: the scope,
+        the file and the session's idleness checked here, the bytes read by
+        ``file_pull`` (beneath the agents root, no link followed, one link)."""
+        from . import session_move as mv
+        request_id = msg.get("request_id", "")
+        try:
+            scope = mv.parse_scope(msg)
+            path = mv.pull_rel(scope, msg.get("rel"))
+            if self._session_holds(scope.refs):
+                raise mv.MoveRefused("busy: a live session holds this session")
+        except mv.MoveRefused as e:
+            await ws.enqueue_send({"type": "file_content", "request_id": request_id,
+                                   "path": str(msg.get("rel") or ""), "error": f"refused: {e}"})
+            return
+        await self.file_pull({"request_id": request_id, "path_kind": "agent_tree",
+                              "agent_slug": scope.agent_slug, "path": path,
+                              "single_link": True}, ws)
 
     def cancel_pulls(self) -> int:
         """Stop every running pull (the link dropped). Returns how many."""
@@ -1909,6 +2149,17 @@ class SessionManager:
                         "error": f"path not authorized: {type(e).__name__}",
                     })
                     return
+                if msg.get("single_link") and st.st_nlink != 1:
+                    # A session file the move sends must be the file itself,
+                    # never a second name of something else on this machine.
+                    os.close(fd)
+                    await ws.enqueue_send({
+                        "type": "file_content",
+                        "request_id": request_id,
+                        "path": rel_path,
+                        "error": "path not authorized: more than one link",
+                    })
+                    return
                 fh = os.fdopen(fd, "rb")
                 size = st.st_size
             else:
@@ -1923,7 +2174,7 @@ class SessionManager:
                         "error": f"file exceeds {file_sync.max_file_size() // (1024 * 1024)}MB limit",
                     })
                     return
-                fh = open(target, "rb")
+                fh = open(target, "rb")  # noqa: ASYNC230  # a plain open of a local file: a thread would need a cancel-safe close
         except FileNotFoundError:
             await ws.enqueue_send({
                 "type": "file_content",
@@ -2029,8 +2280,7 @@ class SessionManager:
                 # The name's own status beneath the agents root, never
                 # followed: a link answers the error ack, a missing name or
                 # a directory "exists: False".
-                from ..host import auth_paths as _ap
-                from ..host import safe_fs as _sfs
+                from ..host import auth_paths as _ap, safe_fs as _sfs
                 try:
                     st = _sfs.lstat_beneath(
                         self.config.agents_dir, _ap.agent_rel(rel_path, agent_slug))
@@ -2053,6 +2303,73 @@ class SessionManager:
         except OSError:
             pass  # exists stays False — the proxy re-pulls and surfaces it
         await ws.enqueue_send(reply)
+
+    async def session_files_retention(self, msg: dict, ws: "SatelliteWSClient") -> None:
+        """Remove the CLI transcripts under this machine's agent trees that
+        no chat and no live session names (0.5.150, the platform's
+        retention sweep): ``keep`` is every id the platform's rows still
+        reference for this machine, the live ids are this daemon's own
+        sessions (by session id and by a Codex thread), and a file younger
+        than ``min_age_s`` (never less than an hour; seven days when the
+        frame names none) stays. The one irreversible delete on the wire
+        fails closed: a frame whose ``keep`` is not a list, or an empty one
+        outside a dry run (an install with no row has nothing to sweep, and
+        a platform bug that emptied the list must delete nothing), is
+        refused with an error ack. The walk and the deletes run off the
+        loop; ``dry_run`` lists what would go. Answers an ack with the
+        counts (``host/session_retention.py``)."""
+        from ..host import session_retention
+
+        command_id = msg.get("command_id", "")
+
+        async def _refuse(why: str) -> None:
+            logger.warning("session files retention refused: %s", why)
+            await ws.enqueue_send({
+                "type": "ack", "command_id": command_id, "status": "error", "error": why,
+            })
+
+        raw_keep = msg.get("keep")
+        dry_run = bool(msg.get("dry_run"))
+        if not isinstance(raw_keep, list):
+            await _refuse("keep list missing")
+            return
+        keep = {ref for ref in raw_keep if isinstance(ref, str)}
+        if not keep and not dry_run:
+            await _refuse("keep list empty")
+            return
+        raw_age = msg.get("min_age_s")
+        if raw_age is None:
+            min_age_s = session_retention.DEFAULT_MIN_AGE_S
+        else:
+            try:
+                min_age_s = max(float(raw_age), session_retention.MIN_AGE_S)
+            except (TypeError, ValueError):
+                await _refuse("min_age_s is not a number")
+                return
+        live: set[str] = set()
+        for sid, session in list(self.sessions.items()) + list(self.pty_sessions.items()):
+            live.add(sid)
+            thread = getattr(session, "thread_id", None) or getattr(session, "_thread_id", None)
+            if thread:
+                live.add(str(thread))
+        try:
+            stats = await asyncio.to_thread(
+                session_retention.apply, self.config.agents_dir, keep, live, min_age_s, dry_run,
+            )
+        except OSError as e:
+            await ws.enqueue_send({
+                "type": "ack", "command_id": command_id,
+                "status": "error", "error": f"{type(e).__name__}: {e}",
+            })
+            return
+        logger.info(
+            "session files retention%s: %d held (%d bytes), %d %s (%d bytes)",
+            " (dry run)" if dry_run else "", stats["files"], stats["bytes"],
+            stats["deleted"], "would go" if dry_run else "removed", stats["deleted_bytes"],
+        )
+        await ws.enqueue_send({
+            "type": "ack", "command_id": command_id, "status": "ok", "error": "", **stats,
+        })
 
     # ------------------------------------------------------------------
     # MCP lifecycle (install / update / remove)
@@ -2342,7 +2659,7 @@ class SessionManager:
                         marker.unlink()
                     try:
                         old_hash = mcp_installer.compute_version_hash(target_root)
-                    except Exception:
+                    except OSError:
                         old_hash = ""
                     logger.warning(
                         "sync_mcps: update swap for %s blocked (in use) — keeping "
@@ -2478,7 +2795,7 @@ class SessionManager:
                 healthy = not marker.exists()
                 try:
                     vh = mcp_installer.compute_version_hash(mcp_dir)
-                except Exception:
+                except OSError:
                     vh = ""
                     healthy = False
                 out[name] = {"version_hash": vh, "healthy": healthy, "category": cat_dir.name}

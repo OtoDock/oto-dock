@@ -49,7 +49,7 @@ async def _app(scope, receive, send):
     task = asyncio.create_task(flood())
     try:
         if scope["path"] == "/close-when-asked":
-            while not STATE.get("close"):
+            while not STATE.get("close"):  # noqa: ASYNC110  # a fake socket's state: the fake has no event
                 await asyncio.sleep(0.02)
             t0 = time.monotonic()
             await send({"type": "websocket.close"})

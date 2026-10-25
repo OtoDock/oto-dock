@@ -6,7 +6,7 @@ storage cleanup on user_agents revocation, and the migration that
 deletes legacy global rows on first startup.
 """
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -39,8 +39,7 @@ def _make_app(monkeypatch, *, role: str = "creator", agents: dict | None = None,
         "capabilities": "{}",
     }
 
-    from storage import remote_store as _rs
-    from storage import database as _db
+    from storage import database as _db, remote_store as _rs
     monkeypatch.setattr(
         _rs, "get_remote_machine",
         lambda mid: fake_machine if mid == "machine-1" else None,

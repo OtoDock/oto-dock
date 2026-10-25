@@ -1,5 +1,6 @@
 import type { ArtifactWindow } from '@/hooks/useArtifactWindows'
 import type { MessageBlock } from '../types'
+import { GLASS_FILL, GLASS_HOVER } from '../../ui/glass'
 
 /**
  * Minimized interactive-CLI artifact windows (and the minimized document
@@ -28,7 +29,7 @@ interface Props {
 }
 
 function TypeIcon({ type }: { type: MessageBlock['type'] }) {
-  const cls = 'w-5 h-5 text-p-text-secondary'
+  const cls = 'w-5 h-5 text-secondary'
   switch (type) {
     case 'images':
     case 'image_generating':
@@ -82,11 +83,11 @@ function DockChip({ type, title, onRestore, onClose, label }: {
       <button
         onClick={onRestore}
         title={`Open: ${title}`}
-        className="relative flex h-10 w-10 items-center justify-center rounded-xl border border-brand/40 bg-white/80 shadow-xs backdrop-blur-xs transition-all hover:bg-white hover:shadow-md dark:bg-gray-900/80 dark:hover:bg-p-surface"
+        className={`relative flex size-control-md items-center justify-center rounded-xl border border-action/40 ${GLASS_FILL} ${GLASS_HOVER} transition-colors duration-fast`}
       >
-        {label ? <span className="text-xs font-semibold text-p-text-secondary">{label}</span> : <TypeIcon type={type} />}
+        {label ? <span className="text-xs font-semibold text-secondary">{label}</span> : <TypeIcon type={type} />}
         {/* expand badge — signals "click to open" */}
-        <span className="absolute -bottom-0.5 -right-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full border border-brand/40 bg-white text-brand dark:bg-p-surface">
+        <span className="absolute -bottom-0.5 -right-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full border border-action/40 bg-surface-card text-link">
           <svg className="h-2 w-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M4 14v6h6M20 10V4h-6" />
           </svg>
@@ -98,7 +99,7 @@ function DockChip({ type, title, onRestore, onClose, label }: {
         <button
           onClick={onClose}
           title="Close"
-          className="absolute -left-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full border border-p-accent-red bg-p-accent-red text-white shadow-xs hover:brightness-110 md:hidden md:group-hover:flex"
+          className="absolute -left-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full border border-status-danger-solid bg-status-danger-fill text-on-solid shadow-elevation-1 hover:bg-status-danger-fill-hover md:hidden md:group-hover:flex"
         >
           <svg className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />

@@ -20,8 +20,7 @@ from pathlib import Path
 
 import config
 from core import placement
-from services.checks import changed_set as cs
-from services.checks import kinds
+from services.checks import changed_set as cs, kinds
 from services.checks.kinds.schema_kind import last_json_block
 from services.checks.render import Verdict, parse_verdict_json
 from services.scripts import runner
@@ -46,7 +45,7 @@ def _read_script(check) -> tuple[bytes, str]:
             raise runner.ScriptRefused(f"the script {path.name} is missing")
         data = path.read_bytes()
     except OSError as e:
-        raise runner.ScriptRefused(f"the script cannot be read: {e}")
+        raise runner.ScriptRefused(f"the script cannot be read: {e}") from e
     sha = hashlib.sha256(data).hexdigest()
     row = db_checks.get_index(check.agent, check.owner, check.name)
     if row and row.get("script_sha256") and row["script_sha256"] != sha:
@@ -55,8 +54,8 @@ def _read_script(check) -> tuple[bytes, str]:
         raise runner.ScriptRefused("the script is larger than 256 KB")
     try:
         data.decode("utf-8")
-    except UnicodeDecodeError:
-        raise runner.ScriptRefused("the script is not UTF-8 text")
+    except UnicodeDecodeError as exc:
+        raise runner.ScriptRefused("the script is not UTF-8 text") from exc
     return data, sha
 
 

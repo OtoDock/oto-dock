@@ -1,7 +1,7 @@
 // Admin → Platform → Security: the forwarding warnings the proxy records
 // (headers from an untrusted address, a trusted proxy that appends none, an
 // https public URL with no TRUSTED_PROXY in a container) show as a banner
-// naming the address to trust, and a refused save shows the server's reason
+// naming the address to trust, and a refused save toasts the server's reason
 // instead of a generic failure. The container's gateway
 // may be trusted only while the port is published on 127.0.0.1 (direct
 // connections to a published port arrive from it too), TRUSTED_PROXY is a
@@ -11,9 +11,10 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 const h = vi.hoisted(() => ({
-  mutate: vi.fn((_data: unknown, opts?: { onError?: (e: unknown) => void }) => {
-    opts?.onError?.(new Error('Turn on a second factor for your own account first'))
+  mutateAsync: vi.fn(async (_data: unknown): Promise<unknown> => {
+    throw new Error('Turn on a second factor for your own account first')
   }),
+  toast: vi.fn(),
   settings: {
     cloud: false, forced_keys: [], require_2fa: false, passkey_login_mode: 'passwordless',
     password_min_score: '3', password_min_length: '8',
@@ -37,13 +38,14 @@ vi.mock('@/api/auth', () => ({ apiFetch: vi.fn(async () => ({ ok: true, json: as
 vi.mock('@/api/oauth', () => ({
   useBearerAllowlist: () => ({ data: [], isLoading: false }),
   useAddBearerAllowlist: () => ({ mutateAsync: vi.fn() }),
-  useRemoveBearerAllowlist: () => ({ mutate: vi.fn() }),
-  useRestoreBearerAllowlist: () => ({ mutate: vi.fn(), isPending: false }),
+  useRemoveBearerAllowlist: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()) }),
+  useRestoreBearerAllowlist: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false }),
 }))
 vi.mock('@/pages/admin/PlatformPage.hooks', () => ({
   usePlatformSettings: () => ({ data: h.settings, isLoading: false }),
-  useSavePlatformSettings: () => ({ mutate: h.mutate, isPending: false }),
+  useSavePlatformSettings: () => ({ mutate: vi.fn(), mutateAsync: h.mutateAsync, isPending: false }),
 }))
+vi.mock('@/lib/appToasts', () => ({ emitAppToast: h.toast, onAppToast: () => () => {} }))
 
 import SecurityTab from '@/pages/admin/SecurityTab'
 
@@ -53,11 +55,11 @@ describe('SecurityTab forwarding warnings and refused saves', () => {
   it('trusts the gateway only with the port published on 127.0.0.1', () => {
     render(<SecurityTab />)
     expect(screen.getByText(new RegExp(
-      "Forwarding headers arrive from 10\\.200\\.0\\.1, the container's gateway, which is not "
-      + 'a trusted proxy\\. Trust it only with PROXY_BIND_IP=127\\.0\\.0\\.1 \\(the port '
-      + "published on this host's loopback only\\): direct connections to a published port "
-      + 'arrive from the gateway too\\. Then add 10\\.200\\.0\\.1 to TRUSTED_PROXY in \\.env '
-      + '\\(a comma-separated list: that address, never a subnet\\)\\.',
+      "Forwarding headers arrive from 10\\.200\\.0\\.1, the container's gateway\\. It is not "
+      + 'a trusted reverse proxy\\. Trust it only with PROXY_BIND_IP=127\\.0\\.0\\.1, so only '
+      + 'this host can reach the port\\. Direct connections to a published port '
+      + 'also arrive from the gateway\\. With that set, add 10\\.200\\.0\\.1 to TRUSTED_PROXY in \\.env\\. '
+      + 'TRUSTED_PROXY is a comma-separated list: add that address, never a subnet\\.',
     ))).toBeTruthy()
     // Never the unconditional advice, and never "set", which reads as
     // replacing the list.
@@ -68,20 +70,20 @@ describe('SecurityTab forwarding warnings and refused saves', () => {
     render(<SecurityTab />)
     const line = screen.getByText(/arrive from 192\.168\.1\.9/)
     expect(line.textContent).toMatch(
-      /if it is your reverse proxy, add 192\.168\.1\.9 to TRUSTED_PROXY in config\.env/)
-    expect(line.textContent).toMatch(/a comma-separated list: that address, never a subnet/)
+      /If it is your reverse proxy, add 192\.168\.1\.9 to TRUSTED_PROXY in config\.env/)
+    expect(line.textContent).toMatch(/a comma-separated list: add that address, never a subnet/)
     expect(line.textContent).not.toMatch(/PROXY_BIND_IP/)
-    expect(screen.getByText(/192\.168\.1\.5 does not append X-Forwarded-For/)).toBeTruthy()
+    expect(screen.getByText(/192\.168\.1\.5 does not add the X-Forwarded-For header/)).toBeTruthy()
     // The epoch stamp renders as a time, never as a raw number.
     expect(screen.queryByText(/1790568196/)).toBeNull()
   })
 
   it('words the boot check without a request count', () => {
     render(<SecurityTab />)
-    const line = screen.getByText(/public URL is https but no reverse proxy is trusted/)
+    const line = screen.getByText(/public URL is https, but no reverse proxy is trusted/)
     expect(line.textContent).toMatch(/TRUSTED_PROXY is empty, or every entry in it is ignored/)
     expect(line.textContent).toMatch(
-      /publish the port on 127\.0\.0\.1 only \(PROXY_BIND_IP=127\.0\.0\.1\) and add the container's gateway 10\.200\.0\.1 to TRUSTED_PROXY in \.env/)
+      /publish the port on 127\.0\.0\.1 only \(PROXY_BIND_IP=127\.0\.0\.1\)\. Then add the container's gateway 10\.200\.0\.1 to TRUSTED_PROXY in \.env/)
     expect(line.textContent).not.toMatch(/requests?,/)
   })
 
@@ -93,26 +95,35 @@ describe('SecurityTab forwarding warnings and refused saves', () => {
     expect(screen.queryByText(/PROXY_BIND_IP/)).toBeNull()
   })
 
-  it('shows the server reason when a save is refused', async () => {
+  it('toasts the server reason when a save is refused', async () => {
     render(<SecurityTab />)
     fireEvent.click(screen.getAllByRole('switch')[0])
-    await waitFor(() => {
-      expect(screen.getByText('Turn on a second factor for your own account first')).toBeTruthy()
-    })
+    await waitFor(() => expect(h.toast).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'The security setting was not saved',
+      body: 'Turn on a second factor for your own account first',
+    })))
+    // Nothing beside the switch repeats it.
+    expect(screen.queryByText('Turn on a second factor for your own account first')).toBeNull()
   })
 })
 
 describe('SecurityTab sharing switches', () => {
-  it('saves the agent and department switches on their own', () => {
-    h.mutate.mockClear()
+  it('saves the agent and department switches on their own, and says Saved beside the row', async () => {
+    h.mutateAsync.mockClear()
+    h.mutateAsync.mockImplementation(async () => undefined)
     render(<SecurityTab />)
     const agents = screen.getByRole('switch', { name: 'Sharing to agents' })
     expect(agents.getAttribute('aria-checked')).toBe('true')
     fireEvent.click(agents)
-    expect(h.mutate.mock.calls[0][0]).toEqual({ sharing_to_agents_enabled: false })
+    expect(h.mutateAsync.mock.calls[0][0]).toEqual({ sharing_to_agents_enabled: false })
     const depts = screen.getByRole('switch', { name: 'Sharing to departments' })
     expect(depts.getAttribute('aria-checked')).toBe('false')
     fireEvent.click(depts)
-    expect(h.mutate.mock.calls[1][0]).toEqual({ sharing_to_departments_enabled: true })
+    expect(h.mutateAsync.mock.calls[1][0]).toEqual({ sharing_to_departments_enabled: true })
+    // One indication, beside the row saved last.
+    await waitFor(() => expect(screen.getAllByRole('status').filter((r) => r.textContent === 'Saved')).toHaveLength(1))
+    // The row's own status, not its info button's live region.
+    const row = screen.getByText('Sharing to departments').closest('p')!
+    expect([...row.querySelectorAll('[role=status]')].map((r) => r.textContent)).toContain('Saved')
   })
 })

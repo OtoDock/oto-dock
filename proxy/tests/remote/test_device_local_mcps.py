@@ -10,17 +10,18 @@ Covers the three security-critical pieces:
 DB-free by design: everything is monkeypatched, so these run fast and never
 touch the conftest Postgres pool.
 """
-import pytest
 from unittest.mock import AsyncMock
 
-from services.mcp import mcp_registry as reg
-from services.mcp.mcp_registry import McpManifest, ServerConfig, CredentialConfig
-from storage import remote_store
+import pytest
+
 from core import placement
+from services.mcp import mcp_registry as reg
+from services.mcp.mcp_registry import CredentialConfig, McpManifest, ServerConfig
+from storage import remote_store
 
 
 def _mk(name, *, placement="any", requires_display=False, device_capability=None,
-        server_name="", device_high_risk_tools=None):
+        server_name=""):
     return McpManifest(
         name=name, label=name.title(), description=f"{name} does things.",
         version="1.0.0", category="custom",
@@ -29,7 +30,6 @@ def _mk(name, *, placement="any", requires_display=False, device_capability=None
         exclude_from=[], skills=[], server_name=server_name,
         placement=placement, requires_display=requires_display,
         device_capability=device_capability,
-        device_high_risk_tools=device_high_risk_tools or [],
     )
 
 
@@ -174,6 +174,7 @@ def test_placement_of_reads_the_grants(monkeypatch):
 
 def test_validate_device_grants():
     import fastapi
+
     from api.remote import remote_machines
     # de-dup + sort
     assert remote_machines._validate_device_grants(["computer", "computer"]) == ["computer"]
@@ -256,8 +257,9 @@ def _hook_env(monkeypatch, *, grants):
     """Wire up api.hooks.permission for a default-mode dashboard session whose target
     machine grants ``grants``. Returns the configured SecurityContext."""
     import asyncio  # noqa: F401
+
     from api.hooks import permission, routing
-    from auth.path_policy import SecurityContext, PathDecision
+    from auth.path_policy import PathDecision, SecurityContext
     from services import path_policy_v2
 
     manifests = {"computer-control": _mk(
@@ -337,58 +339,42 @@ def test_hook_does_not_auto_approve_nondevice_mcp(monkeypatch):
     assert out["decision"] == "deny"  # non-device MCP still prompts
 
 
-def test_hook_high_risk_device_tool_prompts_even_when_granted(monkeypatch):
+def test_hook_a_device_code_tool_follows_the_grant_like_its_other_tools(monkeypatch):
     import asyncio
-    # A granted device capability auto-approves the connector's normal tools,
-    # but a tool listed in device_high_risk_tools (e.g. execute_blender_code =
-    # RCE inside the app) must STILL prompt.
+    # A granted device capability auto-approves every tool of the connector,
+    # its raw-code tool (Blender's execute_blender_code) included: the
+    # machine's grant is the consent, as for the browser's code tool.
     permission, _ = _hook_env(monkeypatch, grants={"app"})
     reg._manifests["blender-bridge"] = _mk(
         "blender-bridge", placement="satellite_only", device_capability="app",
-        server_name="blender", device_high_risk_tools=["execute_blender_code"],
+        server_name="blender",
     )
-
-    class _Q:
-        async def put(self, _):
-            return None
-    async def _wait(_request_id, _session_id="", timeout=0):
-        return False
-    monkeypatch.setattr(permission, "get_permission_queue", lambda sid: _Q())
-    monkeypatch.setattr(permission, "wait_for_permission", _wait)
-
-    # high-risk tool → prompts (our stub denies), NOT auto-approved
-    hr = permission.HookPermissionRequest(
-        session_id="s1", tool_name="mcp__blender__execute_blender_code",
-        tool_input={"code": "import bpy"},
-    )
-    assert asyncio.run(permission.hook_permission(hr, authorization="Bearer x"))["decision"] == "deny"
-
-    # a non-high-risk tool on the SAME granted connector still auto-approves
-    ok = permission.HookPermissionRequest(
-        session_id="s1", tool_name="mcp__blender__get_scene_info", tool_input={},
-    )
-    assert asyncio.run(permission.hook_permission(ok, authorization="Bearer x")) == {"decision": "allow"}
+    for tool in ("execute_blender_code", "get_scene_info"):
+        req = permission.HookPermissionRequest(
+            session_id="s1", tool_name=f"mcp__blender__{tool}", tool_input={"code": "import bpy"},
+        )
+        assert asyncio.run(permission.hook_permission(req, authorization="Bearer x")) == {"decision": "allow"}
 
 
 # ---------------------------------------------------------------------------
-# High-risk device tools are critical in effect
+# A device MCP's code tool follows the chat's mode
 # ---------------------------------------------------------------------------
 
-def _browser_env(monkeypatch, *, client_type, mode):
+def _browser_env(monkeypatch, *, client_type, mode, grants=frozenset({"browser"})):
     """The hook wired for a session of ``client_type`` in ``mode`` on an
-    admin-paired machine that grants the browser, with browser-control
-    (server key ``local``) pinning ``browser_run_code_unsafe`` high-risk."""
-    permission, _ = _hook_env(monkeypatch, grants={"browser"})
+    admin-paired machine that grants ``grants``, with browser-control
+    (server key ``local``) loaded."""
+    permission, _ = _hook_env(monkeypatch, grants=set(grants))
     reg._manifests["browser-control"] = _mk(
         "browser-control", placement="satellite_only", device_capability="browser",
-        server_name="local", device_high_risk_tools=["browser_run_code_unsafe"],
+        server_name="local",
     )
     from auth.path_policy import SecurityContext
     ctx = SecurityContext(
         role="manager", username="", agent="a", is_admin_agent=False,
         placement=placement.PlacementCapabilities(
             kind=placement.KIND_ADMIN_REMOTE, machine_id="m1deadbeef",
-            device_grants={"browser"}, has_display=True),
+            device_grants=set(grants), has_display=True),
         session_scope="agent",
     )
     monkeypatch.setattr(permission, "get_session_security", lambda sid: ctx)
@@ -406,31 +392,51 @@ def _call(permission, tool_name, tool_input=None):
 
 
 @pytest.mark.parametrize("client_type", ["task", "phone"])
-def test_hook_high_risk_device_tool_refused_unattended(monkeypatch, client_type):
-    """A no-human session in auto mode is refused a high-risk device tool
-    with the unattended reason, and keeps the granted server's other tools."""
+def test_hook_a_device_code_tool_runs_unattended(monkeypatch, client_type):
+    """A no-human session in auto mode runs a device MCP's code tool like
+    the server's other tools (it was refused while code tools were pinned
+    critical, until 1.9.0)."""
     permission = _browser_env(monkeypatch, client_type=client_type, mode="auto")
-    out = _call(permission, "mcp__local__browser_run_code_unsafe", {"code": "async (p) => 1"})
-    assert out["decision"] == "deny" and "unattended" in out["reason"]
-    assert _call(permission, "mcp__local__browser_navigate",
-                 {"url": "https://example.com"}) == {"decision": "allow"}
+    for tool, args in (("browser_run_code_unsafe", {"code": "async (p) => 1"}),
+                       ("browser_navigate", {"url": "https://example.com"})):
+        assert _call(permission, f"mcp__local__{tool}", args) == {"decision": "allow"}
 
 
-def test_hook_high_risk_device_tool_prompts_in_dont_ask(monkeypatch):
-    """A dashboard chat in Don't Ask reaches the prompt for a high-risk
-    device tool (the stub answers no), while its plain tools stay silent."""
-    permission = _browser_env(monkeypatch, client_type="dashboard", mode="dontAsk")
+def _prompts(monkeypatch, permission, answer):
     prompted = []
 
     class _Q:
         async def put(self, item):
             prompted.append(item["tool_name"])
     async def _wait(_request_id, _session_id="", timeout=0):
-        return False
+        return answer
     monkeypatch.setattr(permission, "get_permission_queue", lambda sid: _Q())
     monkeypatch.setattr(permission, "wait_for_permission", _wait)
-    out = _call(permission, "mcp__local__browser_run_code_unsafe", {"code": "async (p) => 1"})
-    assert out["decision"] == "deny" and prompted == ["mcp__local__browser_run_code_unsafe"]
-    assert _call(permission, "mcp__local__browser_navigate",
-                 {"url": "https://example.com"}) == {"decision": "allow"}
+    return prompted
+
+
+def test_hook_a_device_code_tool_runs_in_dont_ask_with_no_card(monkeypatch):
+    """Don't Ask means Don't Ask: no card for the code tool, granted or not."""
+    for grants in ({"browser"}, set()):
+        permission = _browser_env(monkeypatch, client_type="dashboard", mode="dontAsk",
+                                  grants=grants)
+        prompted = _prompts(monkeypatch, permission, False)
+        out = _call(permission, "mcp__local__browser_run_code_unsafe", {"code": "async (p) => 1"})
+        assert out == {"decision": "allow"} and prompted == []
+
+
+def test_hook_a_device_code_tool_without_the_grant_asks_once_in_default(monkeypatch):
+    """With the machine's grant off, Default asks for the code tool, and the
+    Allow covers its later calls in the session like any MCP tool's."""
+    permission = _browser_env(monkeypatch, client_type="dashboard", mode="default",
+                              grants=set())
+    remembered = set()
+    monkeypatch.setattr(permission, "remember_session_tool_allow",
+                        lambda sid, tool: remembered.add(tool))
+    monkeypatch.setattr(permission, "is_session_tool_allowed",
+                        lambda sid, tool: tool in remembered)
+    prompted = _prompts(monkeypatch, permission, True)
+    for _ in range(2):
+        out = _call(permission, "mcp__local__browser_run_code_unsafe", {"code": "async (p) => 1"})
+        assert out == {"decision": "allow"}
     assert prompted == ["mcp__local__browser_run_code_unsafe"]

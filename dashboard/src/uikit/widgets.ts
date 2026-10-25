@@ -10,6 +10,8 @@
 // widget shows that refusal in place). Themed through the token vars only
 // (`--p-*`), so `.dark` and `otodock:theme` need no re-render.
 
+import { WIDGET_TOKENS } from './tokens.generated'
+
 export type Row = Record<string, unknown>
 export type FeedCallback = (rows: Row[], error: string | null) => void
 
@@ -60,36 +62,45 @@ export interface WidgetsApi {
 }
 
 const STYLE_ID = 'otodock-widgets-style'
+// Each colour reads the kit's variable first; the fallback is the token's
+// light value, for a page that has not loaded the kit's tokens.
+const T = WIDGET_TOKENS
 const CSS = `
-.odw{font:13px/1.4 system-ui,sans-serif;color:var(--p-text,#111);}
-.odw h3{margin:0 0 6px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--p-text-secondary,#555)}
+.odw{font:14px/20px var(--p-font,${T.font});color:var(--p-text,${T.text});}
+.odw h3{margin:0 0 8px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--p-text-secondary,${T.textSecondary})}
 .odw ul{list-style:none;margin:0;padding:0}
-.odw li{display:flex;align-items:baseline;gap:8px;padding:6px 0;border-bottom:1px solid var(--p-border-light,#e5e5e5)}
+.odw li{display:flex;align-items:baseline;gap:8px;padding:8px 0;border-bottom:1px solid var(--p-border-light,${T.border})}
 .odw li:last-child{border-bottom:0}
 .odw .odw-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.odw .odw-muted{color:var(--p-text-light,#888);font-size:12px}
-.odw .odw-pill{font-size:11px;padding:1px 6px;border-radius:999px;background:var(--p-primary,#2563eb);color:#fff;opacity:.85}
-.odw .odw-pill[data-s="idle"],.odw .odw-pill[data-s="completed"],.odw .odw-pill[data-s="done"]{opacity:.45}
-.odw .odw-pill[data-s="failed"],.odw .odw-pill[data-s="danger"],.odw .odw-pill[data-s="fail"],.odw .odw-pill[data-s="error"]{background:#dc2626}
-.odw .odw-pill[data-s="warning"]{background:#d97706}
-.odw .odw-pill[data-s="pass"]{background:#16a34a}
-.odw .odw-pill[data-s="skipped"]{opacity:.45}
-.odw button.odw-btn{font:inherit;padding:6px 10px;border-radius:8px;border:1px solid var(--p-border-light,#e5e5e5);background:var(--p-surface,#fff);color:var(--p-text,#111);cursor:pointer}
-.odw button.odw-btn.odw-primary{background:var(--p-primary,#2563eb);color:#fff;border-color:transparent}
-.odw button.odw-btn:disabled{opacity:.5;cursor:default}
+.odw li>.odw-pill,.odw li>.odw-muted{flex:none;white-space:nowrap}
+.odw li>a.odw-row{display:flex;min-width:0}
+.odw .odw-muted{color:var(--p-text-light,${T.textTertiary});font-size:12px}
+.odw .odw-pill{font-size:11px;line-height:16px;padding:2px 8px;border-radius:9999px;background:var(--p-surface,${T.surface});color:var(--p-text-secondary,${T.textSecondary})}
+.odw .odw-pill[data-s="generating"]{background:var(--p-brand-surface,${T.brandSurface});color:var(--p-link,${T.link})}
+.odw .odw-pill[data-s="info"],.odw .odw-pill[data-s="running"],.odw .odw-pill[data-s="pending"]{background:var(--p-status-info-bg,${T.infoBg});color:var(--p-status-info-fg,${T.infoFg})}
+.odw .odw-pill[data-s="failed"],.odw .odw-pill[data-s="danger"],.odw .odw-pill[data-s="fail"],.odw .odw-pill[data-s="error"]{background:var(--p-status-danger-bg,${T.dangerBg});color:var(--p-status-danger-fg,${T.dangerFg})}
+.odw .odw-pill[data-s="warning"],.odw .odw-pill[data-s="awaiting_user"],.odw .odw-pill[data-s="limit_exceeded"]{background:var(--p-status-warning-bg,${T.warningBg});color:var(--p-status-warning-fg,${T.warningFg})}
+.odw .odw-pill[data-s="pass"],.odw .odw-pill[data-s="success"],.odw .odw-pill[data-s="completed"]{background:var(--p-status-success-bg,${T.successBg});color:var(--p-status-success-fg,${T.successFg})}
+.odw button.odw-btn{font:inherit;min-height:32px;padding:4px 12px;margin:0 8px 8px 0;border-radius:var(--p-radius-sm,6px);border:1px solid var(--p-border,${T.borderDefault});background:transparent;color:var(--p-text-secondary,${T.textSecondary});cursor:pointer}
+.odw button.odw-btn:hover{background:var(--p-surface,${T.surface});color:var(--p-text,${T.text})}
+.odw button.odw-btn.odw-primary{background:var(--p-action,${T.action});color:var(--p-action-fg,${T.actionFg});border-color:transparent}
+.odw button.odw-btn.odw-primary:hover{background:var(--p-action-hover,${T.actionHover});color:var(--p-action-fg,${T.actionFg})}
+.odw button.odw-btn:disabled{opacity:.5;cursor:not-allowed}
+.odw a.odw-row:focus-visible,.odw button:focus-visible{outline:2px solid var(--p-focus,${T.focus});outline-offset:2px}
 .odw table{width:100%;border-collapse:collapse}
-.odw th,.odw td{text-align:left;padding:6px 4px;border-bottom:1px solid var(--p-border-light,#e5e5e5);vertical-align:top}
-.odw th{font-weight:600;font-size:12px;color:var(--p-text-secondary,#555)}
+.odw th,.odw td{text-align:left;padding:8px 4px;border-bottom:1px solid var(--p-border-light,${T.border});vertical-align:top}
+.odw th{font-weight:600;font-size:12px;color:var(--p-text-secondary,${T.textSecondary})}
 .odw .odw-scroll{max-width:100%;overflow-x:auto}
 .odw table.odw-tasks{table-layout:auto;min-width:0}
 .odw table.odw-tasks td:first-child .odw-title{white-space:normal;overflow-wrap:anywhere}
 .odw table.odw-tasks td:nth-child(2){white-space:normal;max-width:14em;overflow-wrap:anywhere}
 .odw table.odw-tasks td:nth-child(3){white-space:nowrap;width:1%}
-.odw .odw-next{font-size:11px;opacity:.8}
-.odw .odw-lanes{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
-.odw .odw-card{border:1px solid var(--p-border-light,#e5e5e5);border-radius:10px;padding:10px;background:var(--p-surface,#fff)}
-.odw .odw-card h4{margin:0 0 6px;font-size:12px;color:var(--p-text-secondary,#555)}
-.odw .odw-empty{padding:10px 0;color:var(--p-text-light,#888)}
+.odw .odw-next{font-size:11px}
+@media (max-width:767px){.odw table.odw-tasks thead{display:none}.odw table.odw-tasks tr{display:block;padding:8px 0;border-bottom:1px solid var(--p-border-light,${T.border})}.odw table.odw-tasks tr:last-child{border-bottom:0}.odw table.odw-tasks td:nth-child(n){display:block;max-width:none;width:auto;border:0;padding:2px 0;white-space:normal}}
+.odw .odw-lanes{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.odw .odw-card{border:1px solid var(--p-border-light,${T.border});border-radius:var(--p-radius,8px);padding:12px;background:var(--p-card,${T.card})}
+.odw .odw-card h4{margin:0 0 8px;font-size:12px;color:var(--p-text-secondary,${T.textSecondary})}
+.odw .odw-empty{padding:8px 0;color:var(--p-text-light,${T.textTertiary})}
 .odw a.odw-row{color:inherit;text-decoration:none;cursor:pointer}
 .odw a.odw-row:hover .odw-title{text-decoration:underline}
 `
@@ -112,6 +123,22 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''):
 function str(v: unknown): string {
   return v === null || v === undefined ? '' : String(v)
 }
+
+/** A status as a word: the map's, else the raw value with a capital and
+ * its underscores as spaces. The pill keeps the raw value in `data-s`. */
+function word(raw: unknown, map: Record<string, string>): string {
+  const s = str(raw)
+  if (map[s]) return map[s]
+  const plain = s.replace(/_/g, ' ')
+  return plain ? plain.charAt(0).toUpperCase() + plain.slice(1) : ''
+}
+
+const SESSION_WORDS = { generating: 'Working', awaiting_user: 'Needs you', idle: 'Idle' }
+// The run's tones and words follow the dashboard's status badge.
+const RUN_WORDS = { completed: 'Done', failed: 'Failed', running: 'Running', pending: 'Queued', cancelled: 'Cancelled', limit_exceeded: 'Over the limit' }
+const VERDICT_WORDS = { pass: 'Passed', fail: 'Failed', error: 'Error', skipped: 'Skipped' }
+const SEVERITY_WORDS = { info: 'Note', success: 'Done', warning: 'Warning', danger: 'Problem' }
+const KIND_WORDS = { trigger: 'On trigger', schedule: 'On a schedule', scheduled: 'On a schedule', one_time: 'Once' }
 
 /** A time as "12:04" today, "Mon 12:04" within six days either way (a last
  * run behind, a next run ahead), else the date. */
@@ -155,7 +182,7 @@ export function renderSessions(rows: Row[], limit = 20): HTMLElement {
     const a = rowLink('chat', str(r.id))
     a.appendChild(el('span', 'odw-title', str(r.title) || 'Untitled chat'))
     li.appendChild(a)
-    const pill = el('span', 'odw-pill', str(r.status) || 'idle')
+    const pill = el('span', 'odw-pill', word(str(r.status) || 'idle', SESSION_WORDS))
     pill.dataset.s = str(r.status) || 'idle'
     li.appendChild(pill)
     if (r.updated_at) li.appendChild(el('span', 'odw-muted', when(r.updated_at)))
@@ -173,11 +200,12 @@ export function renderLanes(rows: Row[], limit = 20): HTMLElement {
     if (!groups.has(key)) groups.set(key, [])
     groups.get(key)!.push(r)
   }
-  if (!rows.length) return empty('No lanes right now.')
+  if (!rows.length) return empty('No project work right now.')
   const grid = el('div', 'odw-lanes')
   for (const [project, lanes] of groups) {
     const card = el('div', 'odw-card')
-    card.appendChild(el('h4', '', project ? `Project ${project.slice(0, 8)}` : 'Chats'))
+    // The project's title when the feed carries one; never its id.
+    card.appendChild(el('h4', '', project ? str(lanes[0].project_title) || 'A project' : 'Chats'))
     card.appendChild(renderSessions(lanes, limit))
     grid.appendChild(card)
   }
@@ -187,14 +215,13 @@ export function renderLanes(rows: Row[], limit = 20): HTMLElement {
 export function renderTasks(rows: Row[], limit = 20): HTMLElement {
   const shown = rows.slice(0, limit)
   if (!shown.length) return empty('No tasks.')
-  // On a phone the three columns do not fit a nowrap name: the name wraps,
+  // Under 768 px each row is a block of its cells; above it the name wraps,
   // the schedule wraps inside a bounded column, the last-run column keeps
   // its width, and the table scrolls inside its own box before the page
-  // ever grows wider than the screen (found on the developer dashboard's
-  // Stats tab on a phone, 2026-09-15). The schedule is the feed's words
-  // (`schedule_text`, in the task's zone) with the next run under it; the
-  // raw cron and the type are the fallback for a delta row the snapshot
-  // never carried (an unknown id lands as a partial) and an older proxy.
+  // ever grows wider than the screen. The schedule is the feed's words
+  // (`schedule_text`, in the task's zone) with the next run under it; a row
+  // without them (a delta row the snapshot never carried, an older proxy)
+  // says only what kind of task it is.
   const table = el('table', 'odw-tasks')
   const head = el('thead')
   const hr = el('tr')
@@ -208,24 +235,24 @@ export function renderTasks(rows: Row[], limit = 20): HTMLElement {
     // A task has no page of its own: its name opens the agent's tasks
     // (the host's settings kind, behind its first-use chip).
     const a = rowLink('agent_settings', '', { tab: 'scheduled-tasks' })
-    a.appendChild(el('span', 'odw-title', str(r.name) || str(r.id)))
+    a.appendChild(el('span', 'odw-title', str(r.name) || 'Untitled task'))
     name.appendChild(a)
-    if (r.enabled === false) name.appendChild(el('span', 'odw-muted', ' (paused)'))
+    if (r.enabled === false) name.appendChild(el('span', 'odw-muted', ', paused'))
     tr.appendChild(name)
-    const sched = el('td', 'odw-muted', str(r.schedule_text) || str(r.schedule) || str(r.task_type))
-    if (r.next_run_time) sched.appendChild(el('div', 'odw-next', `next ${when(r.next_run_time)}`))
+    const sched = el('td', 'odw-muted', str(r.schedule_text) || word(str(r.task_type) || 'schedule', KIND_WORDS))
+    if (r.next_run_time) sched.appendChild(el('div', 'odw-next', `Next run ${when(r.next_run_time)}`))
     tr.appendChild(sched)
     const last = (r.last_run || null) as Row | null
     const cell = el('td')
     if (last) {
-      const pill = el('span', 'odw-pill', str(last.status))
+      const pill = el('span', 'odw-pill', word(last.status, RUN_WORDS))
       pill.dataset.s = str(last.status)
       const link = rowLink('run', str(last.id))
       link.appendChild(pill)
       cell.appendChild(link)
       if (last.completed_at) cell.appendChild(el('span', 'odw-muted', ` ${when(last.completed_at)}`))
     } else {
-      cell.appendChild(el('span', 'odw-muted', 'never'))
+      cell.appendChild(el('span', 'odw-muted', 'Not run yet'))
     }
     tr.appendChild(cell)
     body.appendChild(tr)
@@ -241,14 +268,16 @@ export function renderTasks(rows: Row[], limit = 20): HTMLElement {
 export function runsWords(condition: unknown): string {
   const c = (condition && typeof condition === 'object' ? condition : {}) as Record<string, unknown>
   const list = (k: string): string[] => (Array.isArray(c[k]) ? (c[k] as unknown[]).map(str) : [])
-  if (c.always) return 'every turn'
+  if (c.always) return 'Every turn'
   const parts: string[] = []
   if (list('kinds').length) parts.push(`writes ${list('kinds').join(', ')}`)
   if (list('events').length) parts.push(`on ${list('events').map((e) => (e.startsWith('tool:') ? e.slice(5) : e)).join(', ')}`)
   if (list('places').length) parts.push(`writes ${list('places').join(', ')}`)
   if (list('globs').length) parts.push(`under ${list('globs').join(', ')}`)
   if (list('commands').length) parts.push('on matching commands')
-  return parts.length ? parts.join('; ') : 'any change'
+  if (!parts.length) return 'Any change'
+  const text = parts.join(', ')
+  return text.charAt(0).toUpperCase() + text.slice(1)
 }
 
 /** The `checks` feed (CHECKS.md): one row per check the viewer may see —
@@ -267,15 +296,15 @@ export function renderChecks(rows: Row[], limit = 20): HTMLElement {
   for (const r of shown) {
     const tr = el('tr')
     const name = el('td')
-    name.appendChild(el('span', 'odw-title', str(r.name) || str(r.id)))
+    name.appendChild(el('span', 'odw-title', str(r.name) || 'Untitled check'))
     const notes = [r.mandatory ? 'mandatory' : '', r.owner ? 'yours' : '', r.broken ? 'broken' : ''].filter(Boolean)
-    if (notes.length) name.appendChild(el('span', 'odw-muted', ` (${notes.join(', ')})`))
+    if (notes.length) name.appendChild(el('span', 'odw-muted', `, ${notes.join(', ')}`))
     tr.appendChild(name)
     tr.appendChild(el('td', 'odw-muted', runsWords(r.condition)))
     const last = (r.last_verdict || null) as Row | null
     const cell = el('td')
     if (last) {
-      const pill = el('span', 'odw-pill', str(last.status) || 'pass')
+      const pill = el('span', 'odw-pill', word(str(last.status) || 'pass', VERDICT_WORDS))
       pill.dataset.s = str(last.status) || 'pass'
       if (last.chat_id || last.run_id) {
         const link = last.chat_id ? rowLink('chat', str(last.chat_id)) : rowLink('run', str(last.run_id))
@@ -284,10 +313,10 @@ export function renderChecks(rows: Row[], limit = 20): HTMLElement {
       } else {
         cell.appendChild(pill)
       }
-      if (typeof last.score === 'number') cell.appendChild(el('span', 'odw-muted', ` ${last.score.toFixed(2)}`))
+      if (typeof last.score === 'number') cell.appendChild(el('span', 'odw-muted', ` Score ${Math.round(last.score * 100)}%`))
       if (last.created_at) cell.appendChild(el('span', 'odw-muted', ` ${when(last.created_at)}`))
     } else {
-      cell.appendChild(el('span', 'odw-muted', 'never'))
+      cell.appendChild(el('span', 'odw-muted', 'Not run yet'))
     }
     tr.appendChild(cell)
     body.appendChild(tr)
@@ -304,11 +333,11 @@ export function renderNotifications(rows: Row[], limit = 20): HTMLElement {
   const ul = el('ul')
   for (const r of shown) {
     const li = el('li')
-    const pill = el('span', 'odw-pill', str(r.severity) || 'info')
+    const pill = el('span', 'odw-pill', word(str(r.severity) || 'info', SEVERITY_WORDS))
     pill.dataset.s = str(r.severity) || 'info'
     li.appendChild(pill)
     const text = el('span', 'odw-title', str(r.title))
-    if (r.read) text.style.opacity = '.6'
+    if (!r.read) text.style.fontWeight = '600'
     if (r.chat_id) {
       // The inbox spans agents: the chat is the notification's agent's.
       const a = rowLink('chat', str(r.chat_id), r.agent_slug ? { agent: str(r.agent_slug) } : {})
@@ -340,7 +369,7 @@ function feedWidget(el_: HTMLElement, opts: MountOptions, feed: string,
   body.appendChild(empty('Loading…'))
   const otodock = window.otodock
   if (!otodock?.feed) {
-    body.replaceChildren(empty('This widget needs the app runtime (open the page as an app).'))
+    body.replaceChildren(empty('This widget is not ready. Open the page as an app, or wait a moment for it to load.'))
     return { destroy: () => { alive = false } }
   }
   otodock.feed(feed, (rows, error) => {
@@ -374,7 +403,7 @@ function connectWidget(el_: HTMLElement, opts: MountOptions): Handle {
   const otodock = window.otodock
   let alive = true
   if (!otodock?.platform) {
-    body.replaceChildren(empty('This widget needs the app runtime (open the page as an app).'))
+    body.replaceChildren(empty('This widget is not ready. Open the page as an app, or wait a moment for it to load.'))
     return { destroy: () => { alive = false } }
   }
   otodock.platform('integrations.status').then((res) => {
@@ -383,7 +412,7 @@ function connectWidget(el_: HTMLElement, opts: MountOptions): Handle {
     const wanted = opts.provider ? providers.filter((p) => str(p.provider) === opts.provider) : providers
     body.replaceChildren()
     if (!wanted.length) {
-      body.appendChild(empty(opts.provider ? `No MCP of this agent uses ${opts.provider}.` : 'Nothing to connect.'))
+      body.appendChild(empty(opts.provider ? `This agent does not use ${opts.provider}.` : 'Nothing to connect.'))
       return
     }
     for (const p of wanted) {
@@ -398,18 +427,23 @@ function connectWidget(el_: HTMLElement, opts: MountOptions): Handle {
         ? (agents ? `${str(p.provider)}: the agent's account${account ? ` ${account}` : ''}`
           : identity === 'the owner' ? `${str(p.provider)}: the owner's account${account ? ` ${account}` : ''}`
             : `${str(p.provider)} connected${account ? ` as ${account}` : ''}`)
-        : (agents ? `Bind a ${str(p.provider)} account to this agent`
+        : (agents ? `Connect a ${str(p.provider)} account for this agent`
           : identity === 'the owner' ? `${str(p.provider)}: the owner has not connected one`
             : `Connect ${str(p.provider)}`)
-      const btn = el('button', 'odw-btn' + (p.connected ? '' : ' odw-primary'), label)
-      btn.disabled = !!p.connected || identity === 'the owner'
+      // A connected account, or one only the owner can connect, is a line;
+      // a dead button says nothing a line does not.
+      if (p.connected || identity === 'the owner') {
+        body.appendChild(el('div', 'odw-muted', label))
+        continue
+      }
+      const btn = el('button', 'odw-btn odw-primary', label)
       btn.addEventListener('click', () => open(agents
         ? { kind: 'agent_settings', tab: 'mcps' }
         : { kind: 'user_settings', tab: 'integrations', provider: str(p.provider) }))
       body.appendChild(btn)
     }
   }, (err: unknown) => {
-    if (alive) body.replaceChildren(empty(str((err as Error)?.message || err) || 'not available'))
+    if (alive) body.replaceChildren(empty(str((err as Error)?.message || err) || 'Not available right now.'))
   })
   return { destroy: () => { alive = false; el_.replaceChildren() } }
 }
@@ -433,8 +467,10 @@ export function mount(target: HTMLElement, opts: MountOptions): Handle {
 
 // 2: the tasks table prints the feed's `schedule_text` and `next_run_time`
 // (a page on 1 saw the raw cron in that column).
+// 3: every pill says a word, the tables fold into blocks under 768 px, and a
+// connected account is a line rather than a disabled button.
 export const api: WidgetsApi = {
-  version: 2,
+  version: 3,
   mount,
   render: {
     sessions: renderSessions, lanes: renderLanes, tasks: renderTasks, notifications: renderNotifications,

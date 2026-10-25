@@ -1,7 +1,8 @@
 """Tests for execution layer routing with remote targets."""
 
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 
 class TestGetExecutionLayer:
@@ -9,12 +10,12 @@ class TestGetExecutionLayer:
 
     def test_local_agent_returns_cli_layer(self):
         with patch("core.session.session_manager.agent_store") as mock_store, \
-             patch("storage.remote_store.resolve_execution_target", return_value=("local", None)):
+             patch("services.remote.remote_status.resolve_execution_target", return_value=("local", None)):
             mock_store.get_agent.return_value = {
                 "execution_path": "claude-code-cli",
                 "execution_target": "local",
             }
-            from core.session.session_manager import get_execution_layer, _cli_layer
+            from core.session.session_manager import _cli_layer, get_execution_layer
             layer = get_execution_layer("test-agent")
             assert layer is _cli_layer
 
@@ -24,7 +25,7 @@ class TestGetExecutionLayer:
                 "execution_path": "direct-llm",
                 "execution_target": "local",
             }
-            from core.session.session_manager import get_execution_layer, _direct_layer
+            from core.session.session_manager import _direct_layer, get_execution_layer
             layer = get_execution_layer("test-agent")
             assert layer is _direct_layer
 
@@ -35,13 +36,13 @@ class TestGetExecutionLayer:
                 "execution_path": "direct-llm",
                 "execution_target": "machine-123",
             }
-            from core.session.session_manager import get_execution_layer, _direct_layer
+            from core.session.session_manager import _direct_layer, get_execution_layer
             layer = get_execution_layer("test-agent")
             assert layer is _direct_layer
 
     def test_remote_cli_returns_remote_layer(self):
         with patch("core.session.session_manager.agent_store") as mock_store, \
-             patch("storage.remote_store.resolve_execution_target", return_value=("machine-123", None)):
+             patch("services.remote.remote_status.resolve_execution_target", return_value=("machine-123", None)):
             mock_store.get_agent.return_value = {
                 "execution_path": "claude-code-cli",
                 "execution_target": "machine-123",
@@ -52,7 +53,7 @@ class TestGetExecutionLayer:
 
     def test_remote_codex_returns_remote_layer(self):
         with patch("core.session.session_manager.agent_store") as mock_store, \
-             patch("storage.remote_store.resolve_execution_target", return_value=("machine-456", None)):
+             patch("services.remote.remote_status.resolve_execution_target", return_value=("machine-456", None)):
             mock_store.get_agent.return_value = {
                 "execution_path": "codex-cli",
                 "execution_target": "machine-456",
@@ -63,26 +64,26 @@ class TestGetExecutionLayer:
 
     def test_execution_path_override_respected(self):
         with patch("core.session.session_manager.agent_store") as mock_store, \
-             patch("storage.remote_store.resolve_execution_target", return_value=("local", None)):
+             patch("services.remote.remote_status.resolve_execution_target", return_value=("local", None)):
             mock_store.get_agent.return_value = {
                 "execution_path": "claude-code-cli",
                 "execution_target": "local",
             }
-            from core.session.session_manager import get_execution_layer, _codex_layer
+            from core.session.session_manager import _codex_layer, get_execution_layer
             layer = get_execution_layer("test-agent", execution_path="codex-cli")
             assert layer is _codex_layer
 
     def test_unknown_agent_defaults_to_cli(self):
         with patch("core.session.session_manager.agent_store") as mock_store:
             mock_store.get_agent.return_value = None
-            from core.session.session_manager import get_execution_layer, _cli_layer
+            from core.session.session_manager import _cli_layer, get_execution_layer
             layer = get_execution_layer("nonexistent")
             assert layer is _cli_layer
 
     def test_user_override_returns_remote_layer(self):
         """User has a personal machine, agent default is local."""
         with patch("core.session.session_manager.agent_store") as mock_store, \
-             patch("storage.remote_store.resolve_execution_target", return_value=("machine-user-123", None)):
+             patch("services.remote.remote_status.resolve_execution_target", return_value=("machine-user-123", None)):
             mock_store.get_agent.return_value = {
                 "execution_path": "claude-code-cli",
                 "execution_target": "local",
@@ -94,12 +95,12 @@ class TestGetExecutionLayer:
     def test_no_user_sub_uses_agent_default(self):
         """Without user_sub, resolve_execution_target uses agent default."""
         with patch("core.session.session_manager.agent_store") as mock_store, \
-             patch("storage.remote_store.resolve_execution_target", return_value=("local", None)):
+             patch("services.remote.remote_status.resolve_execution_target", return_value=("local", None)):
             mock_store.get_agent.return_value = {
                 "execution_path": "claude-code-cli",
                 "execution_target": "local",
             }
-            from core.session.session_manager import get_execution_layer, _cli_layer
+            from core.session.session_manager import _cli_layer, get_execution_layer
             layer = get_execution_layer("test-agent")
             assert layer is _cli_layer
 
@@ -144,7 +145,7 @@ class TestServiceAccountNeverOnUserMachine:
     def test_user_scope_allowed_on_user_paired(self):
         with patch("core.session.session_manager.agent_store") as mock_store, \
              patch("storage.remote_store.get_remote_machine",
-                   return_value=self._user_paired()), \
+                   return_value={"pairing_scope": "user", "registered_by": "real-sub"}), \
              patch("storage.database.get_platform_setting", return_value="1"):
             mock_store.get_agent.return_value = {
                 "execution_path": "claude-code-cli", "execution_target": "m-user-1",
@@ -154,6 +155,29 @@ class TestServiceAccountNeverOnUserMachine:
                 "test-agent", user_sub="real-sub", execution_target="m-user-1",
             )
             assert type(layer).__name__ == "RemoteExecutionLayer"
+
+    def test_the_spawn_guard_refuses_another_persons_machine_and_a_role_below_owner(self):
+        # The placement guard at the remote spawn: a personal machine runs
+        # only its owner's sessions; an admin machine none below the owner
+        # tier; a run with no person runs on an admin machine.
+        from types import SimpleNamespace
+
+        from core.remote.remote_session_start import placement_refuses
+
+        def cfg(sub, role):
+            return SimpleNamespace(user_sub=sub, security_context=SimpleNamespace(role=role))
+        mine = {"pairing_scope": "user", "registered_by": "real-sub"}
+        admin = {"pairing_scope": "admin", "registered_by": "admin-x"}
+        with patch("storage.remote_store.get_remote_machine", return_value=mine):
+            assert not placement_refuses("m-user-1", cfg("real-sub", "editor"))
+            assert placement_refuses("m-user-1", cfg("other-sub", "admin"))
+            assert placement_refuses("m-user-1", cfg("", "manager"))
+        with patch("storage.remote_store.get_remote_machine", return_value=admin):
+            assert placement_refuses("m-admin-1", cfg("editor-sub", "editor"))
+            assert not placement_refuses("m-admin-1", cfg("mgr-sub", "manager"))
+            assert not placement_refuses("m-admin-1", cfg("", "manager"))
+        with patch("storage.remote_store.get_remote_machine", return_value=None):
+            assert not placement_refuses("m-gone", cfg("x", "viewer"))
 
     def test_agent_scope_allowed_on_admin_shared(self):
         with patch("core.session.session_manager.agent_store") as mock_store, \

@@ -31,7 +31,7 @@ def stores(monkeypatch):
 
 async def _wait_cache(conn, timeout=2.0):
     deadline = time.monotonic() + timeout
-    while conn.max_sessions is None and time.monotonic() < deadline:
+    while conn.max_sessions is None and time.monotonic() < deadline:  # noqa: ASYNC110  # the connection's capacity field: the test polls the real code's write
         await asyncio.sleep(0.02)
 
 

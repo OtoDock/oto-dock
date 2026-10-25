@@ -8,6 +8,8 @@ dashboard/.env
 audio/.env
 phone/.env
 mcps/**/.env
+# Firebase config — project-specific; ships as google-services.json.example (the docs site's Android app page)
+dashboard/android/app/google-services.json
 
 # ── Agent data (user-specific, not shipped) ──
 agents/
@@ -43,6 +45,8 @@ dist/
 # ── Runtime data ──
 proxy/sessions/
 sessions/
+# The MCP tool hints cache the proxy keeps beside its data
+mcp-tool-hints.json
 # …but api/sessions/ is SOURCE (route subpackage), not runtime session data:
 !proxy/api/sessions/
 # …and so is the satellite's session engine (the bare `sessions/` rule above

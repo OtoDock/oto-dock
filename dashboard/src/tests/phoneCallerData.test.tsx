@@ -3,11 +3,12 @@
  * readout, and the confirmed "Forget all caller data now" action.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import * as authApi from '@/api/auth'
 import PhoneServersTab from '@/pages/admin/PhoneServersTab'
+import { answerDialog, renderWithDialogs } from './dialogsHarness'
 
 const fetchSpy = vi.spyOn(authApi, 'apiFetch')
 
@@ -36,7 +37,7 @@ function mockApi() {
 
 function renderTab() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}><PhoneServersTab /></QueryClientProvider>)
+  return renderWithDialogs(<QueryClientProvider client={qc}><PhoneServersTab /></QueryClientProvider>)
 }
 
 async function openCard() {
@@ -45,8 +46,7 @@ async function openCard() {
 }
 
 describe('caller data card', () => {
-  beforeEach(() => { vi.stubGlobal('alert', vi.fn()); vi.stubGlobal('confirm', vi.fn(() => true)) })
-  afterEach(() => { fetchSpy.mockReset(); vi.unstubAllGlobals() })
+  afterEach(() => { fetchSpy.mockReset() })
 
   it('shows the window and what callers left behind', async () => {
     mockApi()
@@ -55,14 +55,14 @@ describe('caller data card', () => {
     expect(within(usage).getByText('3')).toBeInTheDocument()       // callers
     expect(within(usage).getByText('5')).toBeInTheDocument()       // conversations
     expect(within(usage).getByText('7')).toBeInTheDocument()       // call-log rows
-    expect((screen.getByLabelText('Keep caller data for (days)') as HTMLInputElement).value).toBe('90')
+    expect((screen.getByLabelText('Days to keep caller data') as HTMLInputElement).value).toBe('90')
   })
 
   it('saves the window on blur and the toggle on change', async () => {
     mockApi()
     renderTab()
     await openCard()
-    const days = screen.getByLabelText('Keep caller data for (days)')
+    const days = screen.getByLabelText('Days to keep caller data')
     fireEvent.change(days, { target: { value: '30' } })
     fireEvent.blur(days)
     await waitFor(() => {
@@ -83,20 +83,21 @@ describe('caller data card', () => {
     renderTab()
     await openCard()
     fireEvent.click(screen.getByText('Forget all caller data now'))
-    expect(vi.mocked(confirm)).toHaveBeenCalled()
+    await act(async () => { await answerDialog('Forget everything', 'Forget all caller data now?') })
     await waitFor(() => {
       expect(fetchSpy.mock.calls.some(([p, i]) => p === '/v1/admin/phone/external-data/forget' && i?.method === 'POST')).toBe(true)
-      expect(vi.mocked(alert)).toHaveBeenCalledWith(expect.stringContaining('3 callers'))
     })
-    expect(vi.mocked(alert)).toHaveBeenCalledWith(expect.stringContaining('Skipped 1 callers'))
+    const region = screen.getByRole('region', { name: 'Notifications' })
+    await waitFor(() => expect(region.textContent).toContain('3 callers'))
+    expect(region.textContent).toContain('Skipped 1 callers')
   })
 
   it('a declined confirmation forgets nothing', async () => {
     mockApi()
-    vi.stubGlobal('confirm', vi.fn(() => false))
     renderTab()
     await openCard()
     fireEvent.click(screen.getByText('Forget all caller data now'))
+    await act(async () => { await answerDialog('Cancel', 'Forget all caller data now?') })
     expect(fetchSpy.mock.calls.some(([p]) => String(p).includes('/forget'))).toBe(false)
   })
 })

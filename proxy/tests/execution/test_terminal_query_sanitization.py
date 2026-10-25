@@ -28,8 +28,8 @@ import pytest
 # Redundant under pytest (conftest handles it); kept for `python <file>` runs.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from core.terminal_queries import strip_queries, strip_replies  # noqa: E402
-from core.session import interactive_session as I  # noqa: E402
+from core.session import interactive_session as I
+from core.terminal_queries import strip_queries, strip_replies
 
 pytestmark = pytest.mark.asyncio
 
@@ -306,6 +306,30 @@ def test_the_paste_mode_tracker_follows_the_programs_last_toggle():
     t.feed(b"\x1b]52;c;" + b"A" * 100)                 # an OSC body in flight
     t.feed(b"\x07 \x1b[?2004l")
     assert not t.on
+
+
+def test_the_paste_mode_tracker_follows_a_saved_mode():
+    """XTSAVE keeps the mode, XTRESTORE brings it back (nothing saved:
+    unchanged), every toggle of one read counts in order, RIS forgets the
+    save; the cursor save and the scroll region are not the mode's."""
+    from core.terminal_queries import PasteModeTracker
+
+    t = PasteModeTracker()
+    t.feed(b"\x1b[?2004r")                            # nothing saved yet
+    assert not t.on and t.saved is None
+    t.feed(b"\x1b[?2004h\x1b[?2004s\x1b[?2004l")      # on, saved, off: one read
+    assert not t.on and t.saved is True
+    t.feed(b"editor exits \x1b[?2004r")
+    assert t.on
+    t.feed(b"\x1b[?1049;2004s\x1b[?2004l\x1b[?1049;2004r")
+    assert t.on                                       # among other modes
+    t.feed(b"\x1b[s\x1b[1;24r\x1b[?2004l\x1b[u")      # SCOSC, DECSTBM, off
+    assert not t.on and t.saved is True
+    t.feed(b"\x1bc\x1b[?2004r")                       # RIS forgets the save
+    assert not t.on and t.saved is None
+    t.feed(b"\x1b[?2004h\x1b[?20")
+    t.feed(b"04s \x1b[?2004l\x1b[?2004r")             # a save split across reads
+    assert t.on
 
 
 async def test_a_trimmed_remote_ring_replays_the_mode_it_dropped():

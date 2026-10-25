@@ -5,44 +5,54 @@ managing Docker containers, and agent assignments.
 """
 
 import asyncio
+import functools
 import logging
 import stat
-from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
 import config
-from core import host_os
-from auth.providers import UserContext, get_current_user, require_admin, require_user
-from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
-from services.mcp import mcp_manifest_types as _mt
-from services.mcp import mcp_registry
-from storage.mcp import mcp_store
+from api._guards import require_manager
 from auth import roles
+from auth.providers import UserContext, get_current_user, require_admin, require_user
+from core import host_os
+from services.community import community_icons
+from services.infra.path_confinement import PathOutsideRoot, normalize_rel_path
+from services.mcp import docker_manager, mcp_manifest_types as _mt, mcp_registry
+from storage.mcp import mcp_store
 
 logger = logging.getLogger("otodock.mcp-api")
 router = APIRouter(dependencies=[Depends(require_user)])
 
 
-def _require_manage(user: UserContext | None, agent: str | None = None) -> UserContext:
-    if not user:
-        raise HTTPException(403, "Authentication required")
-    if agent:
-        if not user.can_manage_agent(agent):
-            raise HTTPException(403, "Manager access required for this agent")
-    elif not roles.is_creator_or_above(user.role):
-        raise HTTPException(403, "Admin or creator only")
-    return user
+_MANAGER_DETAIL = "Manager access required for this agent"
 
 
-def _icon_flags(manifests) -> dict[str, bool]:
-    """``{name: has icon.png}`` for the rows (a stat per MCP: call off the loop)."""
+def _icon_flags(manifests, *, catalog: bool) -> dict[str, bool]:
+    """``{name: the icon route answers an image}`` for the rows, by what the
+    route reads and the caches alone: the installed folder's valid icon.png,
+    else for a community row the catalog's when the viewer is one the route
+    serves it to (``catalog``) and this process already knows it has one.
+    A file read per MCP: call off the loop."""
     out: dict[str, bool] = {}
     for m in manifests:
-        mcp_dir = getattr(m, "mcp_dir", None)
-        out[m.name] = bool(mcp_dir) and (Path(mcp_dir) / "icon.png").is_file()
+        if not community_icons.valid_name(m.name):
+            out[m.name] = False
+        elif community_icons.installed_icon_path(m.name) is not None:
+            out[m.name] = True
+        else:
+            out[m.name] = (catalog and m.category == "community"
+                           and community_icons.catalog_icon_known(m.name))
     return out
+
+
+def _warm_catalog_icons(manifests, flags: dict[str, bool], *, catalog: bool) -> None:
+    """A community row the list could not give an icon may have one in the
+    catalog once its registry is read: start that read for the next list."""
+    if catalog and any(m.category == "community" and not flags.get(m.name) for m in manifests):
+        community_icons.warm_registry()
 
 
 def _capability_flags(manifests) -> dict[str, bool]:
@@ -56,11 +66,6 @@ def _capability_flags(manifests) -> dict[str, bool]:
 # toggle is a real kill-switch, not just a config hide. Everything else in
 # core is load-bearing plumbing.
 _PLATFORM_DISABLEABLE_CORE = frozenset({"meetings-mcp", "delegation-mcp"})
-
-# This module's registry rescans run in a worker thread, one at a time: two
-# scans never finish out of order, so an older scan never replaces the
-# registry a newer one built.
-_scan_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +95,9 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
         return out
 
     mcp_agents = await asyncio.to_thread(_enabled_agents_by_mcp)
-    icon_flags = await asyncio.to_thread(_icon_flags, manifests.values())
+    icon_flags = await asyncio.to_thread(
+        functools.partial(_icon_flags, manifests.values(), catalog=True))
+    _warm_catalog_icons(manifests.values(), icon_flags, catalog=True)
     capability_flags = await asyncio.to_thread(_capability_flags, manifests.values())
 
     # Docker status (async). Containerized installs: an image-less docker MCP
@@ -110,14 +117,10 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
             docker_unmanaged.add(name)
             continue
         if states.get(name, False):
-            try:
-                from services.mcp import docker_manager
-                status, images = await asyncio.to_thread(docker_manager.container_state, m)
-                docker_statuses[name] = status
-                if status in docker_manager.PRESENT and docker_manager.image_stale(m, images):
-                    docker_stale.add(name)
-            except Exception:
-                docker_statuses[name] = docker_manager.UNKNOWN
+            status, images = await asyncio.to_thread(docker_manager.container_state, m)
+            docker_statuses[name] = status
+            if status in docker_manager.PRESENT and docker_manager.image_stale(m, images):
+                docker_stale.add(name)
 
     result = []
     for name, m in manifests.items():
@@ -125,7 +128,7 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
         cred_type = cred.get("type", "none") if cred else "none"
         cred_label = cred.get("label") if cred and cred_type != "none" else None
 
-        entry = {
+        entry: dict[str, Any] = {
             "name": name,
             "label": m.label,
             "description": m.description,
@@ -219,6 +222,13 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
                 entry["app_credential_fields"] = cred["app_credential_fields"]
                 entry["app_credential_configured"] = bool(stored)
                 entry["app_credential_configured_keys"] = list(stored.keys()) if stored else []
+                if cred.get("app_kinds"):
+                    # The kinds an admin may pick and the one the bundle is in.
+                    from storage.identity import oauth_app_kinds
+                    entry["app_kinds"] = cred["app_kinds"]
+                    entry["app_credential_kind"] = oauth_app_kinds.active_kind(
+                        m.credentials.oauth, stored,
+                    )
 
             # Expose provider_id so the dashboard can render the right
             # callback URL (`/v1/oauth/{provider_id}/callback`) and
@@ -251,7 +261,6 @@ async def list_mcps(user: UserContext = Depends(get_current_user)):
             if name in docker_unmanaged:
                 entry["docker_managed"] = False
             else:
-                from services.mcp import docker_manager
                 entry["docker_status"] = docker_statuses.get(name, docker_manager.NOT_CHECKED)
                 # The container still serves the image an update replaced (its
                 # recreate did not happen): a Restart switches it.
@@ -300,24 +309,14 @@ async def enable_mcp(name: str, user: UserContext = Depends(get_current_user)):
     docker_status: str | None = None
     docker_error: str | None = None
     if m and _mt.is_container(m.server):
-        try:
-            from services.mcp import docker_manager
-            ok = await asyncio.to_thread(docker_manager.start_container, m)
-            docker_status = docker_manager.ENABLE_STARTED if ok else docker_manager.ENABLE_FAILED
-            if not ok:
-                docker_error = (
-                    "docker compose up -d exited non-zero. Likely cause: "
-                    "Docker daemon not running, image build failed, or port "
-                    "conflict. Check proxy logs for the compose output."
-                )
-        except Exception as e:
-            from services.mcp import docker_manager
-            docker_status = docker_manager.ENABLE_FAILED
+        ok = await asyncio.to_thread(docker_manager.start_container, m)
+        docker_status = docker_manager.ENABLE_STARTED if ok else docker_manager.ENABLE_FAILED
+        if not ok:
             docker_error = (
-                f"{type(e).__name__} while starting the container. "
-                "Check proxy logs for the full error."
+                "docker compose up -d exited non-zero. Likely cause: "
+                "Docker daemon not running, image build failed, or port "
+                "conflict. Check proxy logs for the compose output."
             )
-            logger.warning("Failed to auto-start Docker MCP %s: %s", name, e)
 
     return {
         "status": "enabled",
@@ -341,11 +340,7 @@ async def disable_mcp(name: str, user: UserContext = Depends(get_current_user)):
 
     # Stop Docker container if applicable
     if m and _mt.is_container(m.server):
-        try:
-            from services.mcp import docker_manager
-            await asyncio.to_thread(docker_manager.stop_container, m)
-        except Exception as e:
-            logger.warning("Failed to stop Docker MCP %s: %s", name, e)
+        await asyncio.to_thread(docker_manager.stop_container, m)
 
     return {"status": "disabled", "name": name}
 
@@ -388,7 +383,6 @@ async def set_mcp_tool_filter(
         )
 
     regex = (body.regex or "").strip()
-    from services.mcp import docker_manager
     if regex and docker_manager.dotenv_quote(regex) is None:
         raise HTTPException(
             400,
@@ -403,15 +397,7 @@ async def set_mcp_tool_filter(
     # proxy-side restart needed.
     docker_restarted = False
     if _mt.is_container(m.server):
-        try:
-            docker_restarted = await asyncio.to_thread(
-                docker_manager.restart_container, m,
-            )
-        except Exception as e:
-            logger.warning(
-                "tool_filter saved but failed to restart Docker MCP %s: %s",
-                name, e,
-            )
+        docker_restarted = await asyncio.to_thread(docker_manager.restart_container, m)
 
     return {
         "status": "ok",
@@ -526,7 +512,6 @@ async def docker_start(name: str, user: UserContext = Depends(get_current_user))
     m = mcp_registry.get_manifest(name)
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
-    from services.mcp import docker_manager
     ok = await asyncio.to_thread(docker_manager.start_container, m)
     if not ok:
         raise HTTPException(500, "Failed to start container")
@@ -539,7 +524,6 @@ async def docker_stop(name: str, user: UserContext = Depends(get_current_user)):
     m = mcp_registry.get_manifest(name)
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
-    from services.mcp import docker_manager
     ok = await asyncio.to_thread(docker_manager.stop_container, m)
     if not ok:
         raise HTTPException(500, "Failed to stop container")
@@ -552,7 +536,6 @@ async def docker_restart(name: str, user: UserContext = Depends(get_current_user
     m = mcp_registry.get_manifest(name)
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
-    from services.mcp import docker_manager
     status = await asyncio.to_thread(docker_manager.get_container_status, m)
     if status not in docker_manager.PRESENT and status != docker_manager.STOPPED:
         raise HTTPException(409, "There is no container to restart: start it instead.")
@@ -575,7 +558,6 @@ async def docker_status(name: str, user: UserContext = Depends(get_current_user)
     m = mcp_registry.get_manifest(name)
     if not m or not _mt.is_container(m.server):
         raise HTTPException(400, "Not a Docker MCP")
-    from services.mcp import docker_manager
     status = await asyncio.to_thread(docker_manager.get_container_status, m)
     return {"name": name, "status": status}
 
@@ -610,7 +592,7 @@ async def get_agent_mcps(
     unchanged (every default row is implicitly ``authorized: true``); the
     dashboard MCPs tab keeps its exact shape.
     """
-    _require_manage(user, name)
+    require_manager(user, name, detail=_MANAGER_DETAIL)
 
     visible = await asyncio.to_thread(mcp_registry.get_visible_mcps_for_agent, name)
     # Standalone skill packages never surface as MCPs: the Skills tab is
@@ -630,7 +612,11 @@ async def get_agent_mcps(
             )
             if m.category != "skill"
         ]
-    icon_flags = await asyncio.to_thread(_icon_flags, [*visible, *unauthorized])
+    rows = [*visible, *unauthorized]
+    catalog_icons = roles.is_creator_or_above(user.role)
+    icon_flags = await asyncio.to_thread(
+        functools.partial(_icon_flags, rows, catalog=catalog_icons))
+    _warm_catalog_icons(rows, icon_flags, catalog=catalog_icons)
 
     def _row(m, *, authorized: bool) -> dict:
         cred = mcp_registry.get_credential_schema(m.name)
@@ -675,7 +661,7 @@ async def set_agent_mcps(
 
     Auth: any user with manage rights on this agent (admin OR per-agent manager).
     """
-    _require_manage(user, name)
+    require_manager(user, name, detail=_MANAGER_DETAIL)
 
     visible_manifests = await asyncio.to_thread(
         mcp_registry.get_visible_mcps_for_agent, name,
@@ -791,7 +777,7 @@ async def get_agent_ssh_hosts(
     if user and user.is_session and user.agent == name:
         _require_session_editor_tier(user, name)
     else:
-        _require_manage(user, name)
+        require_manager(user, name, detail=_MANAGER_DETAIL)
 
     if mcp_registry.get_manifest("ssh-hosts") is None:
         raise HTTPException(404, "ssh-hosts MCP is not installed")
@@ -845,7 +831,7 @@ async def get_agent_skills(name: str, user: UserContext = Depends(get_current_us
     package). ``standalone`` + ``loading`` drive the tab's source label and
     loading-mode badge.
     """
-    _require_manage(user, name)
+    require_manager(user, name, detail=_MANAGER_DETAIL)
 
     def _job():
         return (
@@ -906,7 +892,7 @@ async def update_agent_skill(
     control surface for skill packages; the MCPs replace-all PUT rejects and
     preserves them). Unknown skill ids 404 instead of writing blind rows.
     """
-    _require_manage(user, name)
+    require_manager(user, name, detail=_MANAGER_DETAIL)
 
     provider = mcp_registry.find_skill_provider(skill_id)
     if provider is None:
@@ -1066,8 +1052,8 @@ async def _retry_install_failed_for_instance(
     Failures are logged and swallowed so the parent instance-save still
     returns 200 — auto-retry is a UX nicety, not a hard contract.
     """
-    from storage.mcp import mcp_request_store
     from services.community import community_installer
+    from storage.mcp import mcp_request_store
 
     failed = await asyncio.to_thread(
         mcp_request_store.list_install_failed_for_mcp, name,
@@ -1111,7 +1097,6 @@ async def _refresh_container_after_instance_change(name: str) -> bool:
     state = await asyncio.to_thread(mcp_store.get_mcp_state, name)
     if not (state and state.get("enabled")):
         return False
-    from services.mcp import docker_manager
     try:
         await asyncio.to_thread(docker_manager._inject_mcp_env, manifest)
         status = await asyncio.to_thread(
@@ -1236,7 +1221,7 @@ async def update_mcp_instance(
             },
         )
     except ValueError as exc:
-        raise HTTPException(409, str(exc))
+        raise HTTPException(409, str(exc)) from exc
     if not updated:
         raise HTTPException(
             404, f"Instance {instance_id} not found for MCP '{name}'",
@@ -1350,7 +1335,6 @@ async def _delete_mcp_locked(name: str) -> dict:
         _mt.is_container(manifest.server)
         and deployment.current_mode() != deployment.EXTERNAL_POOL
     ):
-        from services.mcp import docker_manager
         await asyncio.to_thread(docker_manager.remove_container, manifest)
 
     # Remove folder
@@ -1358,9 +1342,8 @@ async def _delete_mcp_locked(name: str) -> dict:
     if mcp_dir.exists():
         shutil.rmtree(mcp_dir, ignore_errors=True)
 
-    # Re-scan manifests
-    async with _scan_lock:
-        await asyncio.to_thread(mcp_registry.scan_manifests)
+    # Re-scan manifests (a worker thread, under the registry's rescan lock)
+    await mcp_registry.rescan()
 
     return {"status": "deleted", "name": name}
 
@@ -1466,9 +1449,9 @@ async def get_mcp_auto_update_log(user: UserContext = Depends(get_current_user))
     nothing to update, so the status line can show "last run … — up to date".
     """
     require_admin(user)
+    from services.mcp import mcp_autoupdate
     from storage import database as _db
     from storage.mcp import mcp_autoupdate_store
-    from services.mcp import mcp_autoupdate
     runs = await asyncio.to_thread(mcp_autoupdate_store.recent_runs, 50)
     last_run_at = await asyncio.to_thread(
         _db.get_platform_setting, mcp_autoupdate.LAST_RUN_KEY,
@@ -1527,14 +1510,14 @@ async def _extract_upload_zip(file: UploadFile, tmp):
                 try:
                     if name not in ("", "."):
                         normalize_rel_path(name)
-                except PathOutsideRoot:
-                    raise HTTPException(400, f"Invalid path in zip: {info.filename}")
+                except PathOutsideRoot as exc:
+                    raise HTTPException(400, f"Invalid path in zip: {info.filename}") from exc
                 total_uncompressed += info.file_size
                 if total_uncompressed > config.MCP_ZIP_DECOMPRESSED_MAX:
                     raise HTTPException(400, "Zip expands to more than the allowed size")
             zf.extractall(tmp / "extracted")
-    except zipfile.BadZipFile:
-        raise HTTPException(400, "Invalid zip file")
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(400, "Invalid zip file") from exc
     return tmp / "extracted"
 
 
@@ -1565,6 +1548,7 @@ async def install_mcp(
     import shutil
     import tempfile
     from pathlib import Path
+
     from core.credentials import catalog_install_registry
     from services.community import community_installer
 
@@ -1583,7 +1567,7 @@ async def install_mcp(
         # 400, taken under no lock.
         try:
             uploaded_name = json.loads((mcp_root / "manifest.json").read_text()).get("name")
-        except Exception:
+        except (OSError, ValueError, AttributeError):
             uploaded_name = None
         if isinstance(uploaded_name, str) and uploaded_name:
             async with catalog_install_registry.lock_for(uploaded_name):
@@ -1613,6 +1597,7 @@ async def install_skill_zip(
     import shutil
     import tempfile
     from pathlib import Path
+
     from services.community import skills_installer
 
     require_admin(user)

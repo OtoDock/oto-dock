@@ -91,4 +91,4 @@ class TwilioRestClient:
                         )
                     return await resp.json(content_type=None)
         except aiohttp.ClientError as e:
-            raise TwilioRestError(f"Twilio REST unreachable: {e}")
+            raise TwilioRestError(f"Twilio REST unreachable: {e}") from e

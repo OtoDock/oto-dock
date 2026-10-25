@@ -117,14 +117,17 @@ class CapStatus:
     def blocked_message(self, *, no_key: bool = False) -> str:
         """The user-facing reason a spawn was refused (``NoSubscriptionError``)."""
         if self.scope == "user":
-            whose, where, keys = "Your", "User Settings → Usage", "User Settings → AI Engines"
+            whose = "Your"
+            key = "Connect one in User Settings, AI Engines."
+            change = "You can change the cap in User Settings, Usage."
         else:
-            whose, where, keys = "The agent pool's", "Setup → Usage", "Setup → AI Engines"
+            whose = "The agent pool's"
+            key = "An admin can connect one in Setup, AI Engines."
+            change = "An admin can change the cap in Admin, Usage."
         head = f"{whose} {self.account_name} subscription cap is reached: {self.hit_text()}."
         if no_key:
-            return (f"{head} There is no API key to continue on. Connect one in "
-                    f"{keys}, or change the cap in {where}.")
-        return f"{head} It clears as the accounts' windows reset; change the cap in {where}."
+            return f"{head} There is no API key to continue on. {key} {change}"
+        return f"{head} It clears when the accounts' windows reset. {change}"
 
     def short_reason(self) -> str:
         """One line for run records and meeting summaries."""
@@ -177,7 +180,7 @@ def _day_pct_one(sub_id: str, since: str, key: str) -> float | None:
     pcts = [w.pct for row in rows if (w := sw.sample_window(row, key)) is not None]
     if not pcts:
         return None
-    return sum(max(b - a, 0.0) for a, b in zip(pcts, pcts[1:]))
+    return sum(max(b - a, 0.0) for a, b in zip(pcts, pcts[1:], strict=False))
 
 
 def _day_pct(accounts: list[dict], now: datetime, key: str) -> float | None:
@@ -206,7 +209,8 @@ def _evaluate(scope: str, target: str, layer: str, now: datetime) -> CapStatus:
     if cap is not None:
         status.configured = True
         status.caps = {f: cap.get(f) for f in CAP_FIELDS}
-        status.on_reached = cap.get("on_reached") if cap.get("on_reached") in ON_REACHED else "stop"
+        on_reached = cap.get("on_reached")
+        status.on_reached = on_reached if on_reached in ON_REACHED else "stop"
     if layer not in _oauth_layers():
         return status
     accounts = _pool_accounts(scope, target, layer)

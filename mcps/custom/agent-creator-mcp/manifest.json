@@ -9,7 +9,8 @@
     "runtime": "python",
     "transport": "stdio",
     "command": "venv/bin/python",
-    "args": ["server.py"]
+    "args": ["server.py"],
+    "tool_timeout_sec": 600
   },
 
   "credentials": {

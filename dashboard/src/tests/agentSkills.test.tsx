@@ -61,7 +61,7 @@ describe('AgentSkills', () => {
     expect(await screen.findByText('pdf-forms')).toBeInTheDocument()
     expect(screen.getByText('Installed skills')).toBeInTheDocument()
     expect(screen.getByText('PDF Skills')).toBeInTheDocument()
-    expect(screen.getByText('on demand')).toBeInTheDocument()
+    expect(screen.getByText('On demand')).toBeInTheDocument()
     // Bundled section is collapsed: header with count, rows hidden.
     expect(screen.getByText("From this agent's MCPs")).toBeInTheDocument()
     expect(screen.queryByText('memory-usage')).not.toBeInTheDocument()
@@ -70,7 +70,7 @@ describe('AgentSkills', () => {
     fireEvent.click(screen.getByText("From this agent's MCPs"))
     expect(await screen.findByText('memory-usage')).toBeInTheDocument()
     expect(screen.getByText('from Memory')).toBeInTheDocument()
-    expect(screen.getByText('always in context')).toBeInTheDocument()
+    expect(screen.getByText('Always in context')).toBeInTheDocument()
     // Exactly ONE checkbox on the page: the standalone skill's toggle.
     expect(screen.getAllByRole('checkbox')).toHaveLength(1)
   })

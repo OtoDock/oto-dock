@@ -71,7 +71,7 @@ class Relay:
         while self._ls is ls:
             try:
                 client, _ = ls.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 return

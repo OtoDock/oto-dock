@@ -1,79 +1,132 @@
 /**
- * Shared admin UI primitives for the Audio + Phone Servers tabs.
- *
- * Extracted from the old single Voice/Phone tab so AudioTab and
- * PhoneServersTab (and their pills) render identically without duplicating
- * markup. Pure presentational components — no data fetching.
+ * The settings pages' shared pieces: the save indication, the badge, the
+ * collapsible section card and the two row shapes. A row's label stands
+ * alone; `description` is the one visible hint (a cost, a risk, a restart,
+ * who else is affected) and `info` the longer text behind the InfoTip
+ * beside the label. Pure presentational components, no data fetching.
  */
 
-import { useState } from 'react'
+import { useId, useState, type ReactNode } from 'react'
 
-export function SavedBadge({ show }: { show: boolean }) {
-  if (!show) return null
-  return (
-    <span className="text-xs text-green-600 dark:text-green-400 font-medium animate-pulse ml-2">
-      Saved
-    </span>
-  )
-}
+import type { SaveStatus } from '../../hooks/useSaveState'
+import { BADGE_BASE, BADGE_TONE, CARD } from './classes'
+import InfoTip from './InfoTip'
 
-export function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+/** The state `useSaveState` keeps for one field. The region is always
+ *  mounted and empty at rest: a live region that mounts with its text is
+ *  often not announced. Never inside a `<label>`, whose control would take
+ *  the word into its name. `besideButton`: a Save button that says
+ *  Saving… itself, so only Saved shows here. */
+export function SaveState({ state, besideButton = false }: { state: SaveStatus; besideButton?: boolean }) {
+  const saving = state === 'saving' && !besideButton
+  const saved = state === 'saved'
   return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      onClick={() => onChange(!checked)}
-      className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 focus:outline-hidden
-        ${checked ? 'bg-brand' : 'bg-gray-300 dark:bg-gray-600'}`}
+    <span
+      role="status"
+      className={`${saving || saved ? 'ml-2 ' : ''}inline-flex items-center gap-1 text-xs font-medium ${saved ? 'text-status-success-fg' : 'text-secondary'}`}
     >
-      <span
-        className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200
-          ${checked ? 'translate-x-4' : 'translate-x-0'}`}
-      />
-    </button>
+      {saving && 'Saving…'}
+      {saved && (
+        <>
+          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+          </svg>
+          Saved
+        </>
+      )}
+    </span>
   )
 }
 
-export function Badge({ children, variant = 'default' }: { children: React.ReactNode; variant?: 'default' | 'green' | 'amber' | 'blue' | 'red' }) {
-  const colors = {
-    default: 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300',
-    green: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
-    amber: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-    blue: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
-    red: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',
-  }
-  return (
-    <span className={`text-xs font-medium px-2 py-0.5 rounded-full whitespace-nowrap ${colors[variant]}`}>
-      {children}
-    </span>
-  )
+type BadgeTone = keyof typeof BADGE_TONE
+
+export function Badge({ children, variant = 'neutral' }: { children: React.ReactNode; variant?: BadgeTone }) {
+  return <span className={`${BADGE_BASE} ${BADGE_TONE[variant]}`}>{children}</span>
 }
 
 export function SectionCard({ title, children, defaultOpen = true }: { title: string; children: React.ReactNode; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen)
   return (
-    <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light">
+    <div className={CARD}>
       <button
+        type="button"
         onClick={() => setOpen(!open)}
+        aria-expanded={open}
         className="w-full flex items-center justify-between p-4 text-left"
       >
-        <h3 className="text-sm font-semibold text-p-text">{title}</h3>
-        <span className="text-p-text-secondary text-xs">{open ? '−' : '+'}</span>
+        <h3 className="text-sm font-semibold text-primary">{title}</h3>
+        <span className="text-secondary text-xs" aria-hidden="true">{open ? '−' : '+'}</span>
       </button>
       {open && <div className="px-4 pb-4 space-y-4">{children}</div>}
     </div>
   )
 }
 
-export function SettingRow({ label, description, children }: { label: string; description?: string; children: React.ReactNode }) {
+/** Label and hint on the left, the control on the right. */
+export function SettingRow({ label, description, info, save, htmlFor, labelId, children }: {
+  label: string
+  /** The one visible hint, one short sentence. */
+  description?: ReactNode
+  /** The longer text, behind the info button. */
+  info?: ReactNode
+  /** The row's save state (`useSaveState().stateOf(key)`), shown after
+   *  the label and its info button. */
+  save?: SaveStatus
+  htmlFor?: string
+  /** For a Switch's `aria-labelledby`. */
+  labelId?: string
+  children: ReactNode
+}) {
   return (
     <div className="flex items-center justify-between gap-4">
       <div className="flex-1 min-w-0">
-        <label className="block text-sm font-medium text-p-text">{label}</label>
-        {description && <p className="text-xs text-p-text-light">{description}</p>}
+        <p className="text-sm font-medium text-primary">
+          <label id={labelId} htmlFor={htmlFor}>{label}</label>
+          {info && <InfoTip label={label}>{info}</InfoTip>}
+          {save !== undefined && <SaveState state={save} />}
+        </p>
+        {description && <p className="text-xs text-tertiary">{description}</p>}
       </div>
       <div className="flex items-center gap-2 shrink-0">{children}</div>
+    </div>
+  )
+}
+
+/** A checkbox on the left, its label, info button and hint beside it. The
+ *  label is stretched over the row, so a tap anywhere on it toggles the box
+ *  (the hint too); the info button sits above that layer and never does. */
+export function CheckboxRow({ label, description, info, save, checked, onChange, disabled, id }: {
+  label: string
+  description?: ReactNode
+  info?: ReactNode
+  save?: SaveStatus
+  checked: boolean
+  onChange: (next: boolean) => void
+  disabled?: boolean
+  id?: string
+}) {
+  const autoId = useId()
+  const inputId = id ?? autoId
+  const hintId = `${inputId}-hint`
+  return (
+    <div className="relative flex items-start gap-3">
+      <input
+        id={inputId}
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        aria-describedby={description ? hintId : undefined}
+        onChange={(e) => onChange(e.target.checked)}
+        className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-action rounded-control disabled:cursor-not-allowed"
+      />
+      <div className="min-w-0">
+        <p className="text-sm font-medium text-primary">
+          <label htmlFor={inputId} className={`after:absolute after:inset-0 ${disabled ? 'cursor-not-allowed after:cursor-not-allowed' : 'cursor-pointer after:cursor-pointer'}`}>{label}</label>
+          {info && <span className="relative z-10"><InfoTip label={label}>{info}</InfoTip></span>}
+          {save !== undefined && <SaveState state={save} />}
+        </p>
+        {description && <p id={hintId} className="text-xs text-tertiary">{description}</p>}
+      </div>
     </div>
   )
 }

@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
+
+import jsonschema
 
 from core import placement
-from dataclasses import dataclass, field
 from ws import wire_events as wire
 
 logger = logging.getLogger("checks")
@@ -78,10 +80,9 @@ def parse_verdict_json(obj) -> tuple[bool, float | None, list[dict], str] | None
     if not isinstance(obj, dict) or not isinstance(obj.get("pass"), bool):
         return None
     try:
-        import jsonschema
         from services.checks.documents import VERDICT_SCHEMA
         jsonschema.validate(obj, VERDICT_SCHEMA)
-    except Exception:
+    except (ImportError, jsonschema.ValidationError):
         return None
     score = obj.get("score")
     return (bool(obj["pass"]), float(score) if isinstance(score, (int, float)) else None,

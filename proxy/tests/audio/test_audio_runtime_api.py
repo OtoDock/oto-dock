@@ -15,7 +15,6 @@ from auth.providers import UserContext, get_current_user
 from services.media import audio_service
 from storage import database as task_store
 
-
 # --- fakes ----------------------------------------------------------------
 
 class _Caps:
@@ -159,7 +158,7 @@ def test_stt_session_mint(client):
     r = client.post("/v1/audio/stt/session", json={"provider_id": 5})
     assert r.status_code == 200
     body = r.json()
-    assert "ws_token" in body and body["max_seconds"] == 180
+    assert "ws_token" in body and body["max_seconds"] == 300
 
 
 def test_stt_session_blocked_when_disabled(client):
@@ -191,3 +190,32 @@ def test_transcribe(client):
 def test_transcribe_rejects_empty_file(client):
     r = client.post("/v1/audio/transcribe", files={"file": ("a.wav", b"", "audio/wav")})
     assert r.status_code == 400
+
+
+# --- provider errors, one wording ------------------------------------------
+
+def test_provider_error_message_names_a_refused_key_the_same_on_every_path():
+    for raw in (
+        "ElevenLabs speech-to-text auth error: You must be authenticated to use this endpoint.",
+        RuntimeError("ElevenLabs voices error 401: ElevenLabs rejected the API key — check the provider credential in the Audio tab"),
+        "Deepgram: 403 Forbidden", "invalid api_key",
+    ):
+        assert audio_service.provider_error_message(raw, "elevenlabs") == (
+            "Elevenlabs rejected the API key: check the provider credential in Setup, Audio.")
+    assert audio_service.provider_error_message("x" * 400, "deepgram") == "x" * 300
+    assert audio_service.provider_error_message(RuntimeError(""), "deepgram") == "Deepgram failed without a message."
+    assert audio_service.provider_error_message("rate limit", "") == "rate limit"
+
+
+def test_transcribe_reports_a_refused_key_in_the_shared_wording(client, monkeypatch):
+    class RefusingSTT(FakeSTT):
+        async def transcribe_file(self, data, *, language=None):
+            raise RuntimeError("Deepgram auth error: Invalid credentials. (401)")
+
+    def _build(provider_type, *, provider_id=None):
+        return RefusingSTT(), {"id": 1, "provider_name": "deepgram"}
+    monkeypatch.setattr(audio_service, "build_chat_provider", _build)
+    resp = client.post("/v1/audio/transcribe", files={"file": ("a.wav", b"RIFF" * 8, "audio/wav")})
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == (
+        "Transcription failed: Deepgram rejected the API key: check the provider credential in Setup, Audio.")

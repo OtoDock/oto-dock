@@ -140,7 +140,7 @@ class FacebookOAuthProvider(OAuthProvider):
                 client_id=client_id,
                 client_secret=client_secret,
             )
-        except Exception as exc:
+        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
             logger.warning(
                 "Facebook long-lived upgrade failed (shipping the short-lived "
                 "token; the refresh worker will retry): %s", exc,
@@ -211,6 +211,6 @@ class FacebookOAuthProvider(OAuthProvider):
                 return True
             logger.warning("Facebook revoke returned %d", resp.status_code)
             return False
-        except Exception as e:
+        except httpx.HTTPError as e:
             logger.warning("Facebook revoke failed: %s", e)
             return False

@@ -35,6 +35,9 @@ class _Entry:
     exec_path: str
     ts: float
     model: str = ""
+    # The place its page picked for the new chat (the frame's ``target``),
+    # "" for none: a pre-warm made for a pick is no other chat's.
+    place: str = ""
 
 
 _entries: dict[str, _Entry] = {}
@@ -42,7 +45,7 @@ _lock = asyncio.Lock()
 
 
 async def register(session_id: str, *, agent: str, role: str, user_sub: str = "",
-                   exec_path: str = "", model: str = "") -> None:
+                   exec_path: str = "", model: str = "", place: str = "") -> None:
     """Record a freshly pre-warmed (not-yet-claimed) session as reapable.
 
     ``role`` is the per-agent role the session was built with: a claim key
@@ -53,7 +56,7 @@ async def register(session_id: str, *, agent: str, role: str, user_sub: str = ""
     async with _lock:
         _entries[session_id] = _Entry(
             agent=agent, user_sub=user_sub, role=role,
-            exec_path=exec_path, ts=time.monotonic(), model=model,
+            exec_path=exec_path, ts=time.monotonic(), model=model, place=place,
         )
 
 
@@ -66,20 +69,21 @@ async def claim(session_id: str) -> bool:
 
 
 async def claim_by_key(*, user_sub: str, agent: str, model: str,
-                       role: str, exec_path: str) -> tuple[str, float] | None:
+                       role: str, exec_path: str, place: str = "") -> tuple[str, float] | None:
     """Atomically claim a pre-warm by its full match key — the recovery path
     for DETACHED pre-warms (wake-word detection fires an HTTP pre-warm with no
     WS connection to remember the sid on). Returns ``(session_id, age_s)`` or
     None. Model is part of the key because CLI sessions spawn with ``--model``
-    and can't swap; role because the SecurityContext is baked at start. An
-    empty role matches nothing."""
+    and can't swap; role because the SecurityContext is baked at start; the
+    place because another tab's pick is not this chat's. An empty role
+    matches nothing."""
     if not role:
         return None
     async with _lock:
         for sid, e in _entries.items():
             if (e.user_sub == user_sub and e.agent == agent
                     and e.model == model and e.role == role
-                    and e.exec_path == exec_path):
+                    and e.exec_path == exec_path and e.place == place):
                 _entries.pop(sid, None)
                 return sid, time.monotonic() - e.ts
     return None
@@ -121,7 +125,7 @@ async def reap_stale(ttl: float = PREWARM_TTL_S) -> int:
             reaped += 1
             logger.info("prewarm: reaped unused pre-warm %s (agent=%s, idle>%.0fs)",
                         sid[:8], e.agent, ttl)
-        except Exception as ex:  # noqa: BLE001
+        except Exception as ex:  # noqa: BLE001  # one pre-warm's close must not stop the reaping of the others
             logger.warning("prewarm: failed to reap %s: %s", sid[:8], ex)
     return reaped
 
@@ -132,5 +136,5 @@ async def reap_loop(period: float = 30.0) -> None:
         await asyncio.sleep(period)
         try:
             await reap_stale()
-        except Exception as ex:  # noqa: BLE001
+        except Exception as ex:  # noqa: BLE001  # the reap loop's tick: one failed pass must not end the loop
             logger.error("prewarm reap loop error: %s", ex)

@@ -45,15 +45,14 @@ import asyncio
 import logging
 import time
 import uuid
+import zoneinfo
 from datetime import datetime, timezone
 
 import config
-from services.mcp import mcp_installer
-from services.mcp import mcp_manifest_types as _mt
-from services.mcp import mcp_updater
+from core.background import spawn
+from services.mcp import mcp_installer, mcp_manifest_types as _mt, mcp_updater
 from storage import database as task_store
 from storage.mcp import mcp_autoupdate_store as log_store
-from core.background import spawn
 
 logger = logging.getLogger("otodock.mcp-autoupdate")
 
@@ -107,9 +106,8 @@ def _set_last_run(dt: datetime) -> None:
 def _in_window(now_utc: datetime) -> bool:
     """True if `now` (in the platform timezone) is inside the weekly window."""
     try:
-        import zoneinfo
         local = now_utc.astimezone(zoneinfo.ZoneInfo(config.get_platform_timezone()))
-    except Exception:
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
         local = now_utc
     return (
         local.weekday() == RUN_WINDOW_WEEKDAY
@@ -421,7 +419,7 @@ async def _update_and_record(run_id, name, info, manifest, trigger) -> tuple[str
     )
     try:
         result = await mcp_updater.update_one(name, settled_only=True)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  # the weekly sweep's per-mcp update: one failure must not stop the rest
         err = str(e)
         logger.warning("mcp autoupdate: %s failed: %s", name, err)
         _record(run_id, name, runtime, old_version, info.get("latest", ""),

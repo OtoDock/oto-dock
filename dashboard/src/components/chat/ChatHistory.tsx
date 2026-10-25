@@ -1,5 +1,4 @@
-import { useState, useMemo, useEffect, useRef, useCallback, type JSX } from 'react'
-import { createPortal } from 'react-dom'
+import { useState, useMemo, useEffect, useRef, useCallback, type JSX, useLayoutEffect } from 'react'
 import {
   Chat, TaskChat, useDeleteChat, useRenameChat, useRenameTask,
   useSearchChats, useTaskChats,
@@ -7,33 +6,25 @@ import {
 import { useChatSlice } from '../../store/chatStore'
 import { useActiveChats } from '../../hooks/useActiveChats'
 import { pushEscHandler } from '../../lib/escStack'
-import TitleTooltip from '../ui/TitleTooltip'
+import Button from '../ui/Button'
+import Tooltip from '../ui/Tooltip'
+import { POPOVER } from '../ui/classes'
 import { rowAccentClass } from './projectAccents'
 import ActiveChatsPanel from './ActiveChatsPanel'
 import MoveChatConfirm from './MoveChatConfirm'
+import { leavesOffline, MOVE_MEMORY, moveMemoryOf, useChatTargets } from '../../api/remoteMachines'
 import SharePopover, { type ShareTarget } from '../sharing/SharePopover'
 import { SOURCE_TYPE } from '../../lib/session/kind'
 import { isSharedChatOwner } from '../../lib/visibility'
 import { CHAT_PHASE, isLiveChatPhase } from '../../lib/status/chat'
 import { isLiveRunStatus } from '../../lib/status/run'
-
-// Unread-row age steps: a fresh response tints the whole row with the full
-// brand surface; one that has sat unread fades in two steps, so the sidebar
-// separates "just finished" from "waiting since yesterday". A live store flip
-// has no timestamp and counts as fresh (it IS fresh — the turn just ended).
-export function unreadRowClass(lastResponseAt?: string | null): string {
-  const ts = lastResponseAt ? Date.parse(lastResponseAt) : NaN
-  if (Number.isNaN(ts)) return 'bg-brand-surface'
-  const ageHours = (Date.now() - ts) / 3_600_000
-  if (ageHours < 6) return 'bg-brand-surface'
-  if (ageHours < 24) return 'bg-brand-surface/60'
-  return 'bg-brand-surface/35'
-}
+import { unreadRowClass } from '../../lib/chat/unreadRow'
+import AlertDialog from '../ui/AlertDialog'
 
 // Small status indicator next to a chat row title — warm/fail only. The live
 // (generating) and unread states paint the ROW background instead (see
-// ChatRow): pulsing brand surface while generating, static brand surface for
-// a response this viewer hasn't opened.
+// ChatRow): the pulsing action-subtle tint while generating, the static tint
+// for a response this viewer has not opened.
 function ChatStatusDot({ chatId }: { chatId: string }) {
   const slice = useChatSlice(chatId)
   const status = slice?.status
@@ -41,7 +32,7 @@ function ChatStatusDot({ chatId }: { chatId: string }) {
     return (
       <span
         title="Preparing remote environment…"
-        className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse motion-reduce:animate-none mr-1.5 shrink-0"
+        className="inline-block w-1.5 h-1.5 rounded-full bg-status-warning-solid animate-pulse motion-reduce:animate-none mr-1.5 shrink-0"
       />
     )
   }
@@ -49,7 +40,7 @@ function ChatStatusDot({ chatId }: { chatId: string }) {
     return (
       <span
         title="Warmup failed"
-        className="inline-block w-1.5 h-1.5 rounded-full bg-red-500 mr-1.5 shrink-0"
+        className="inline-block w-1.5 h-1.5 rounded-full bg-status-danger-solid mr-1.5 shrink-0"
       />
     )
   }
@@ -99,7 +90,7 @@ function RenameInput({ initial, onCommit, onCancel }: {
   const ref = useRef<HTMLInputElement>(null)
   const doneRef = useRef(false)
   const cancelRef = useRef(onCancel)
-  cancelRef.current = onCancel
+  useLayoutEffect(() => { cancelRef.current = onCancel })
   useEffect(() => {
     ref.current?.focus()
     ref.current?.select()
@@ -129,9 +120,9 @@ function RenameInput({ initial, onCommit, onCancel }: {
           else if (e.key === 'Escape') finish(false)
         }}
         onBlur={() => finish(false)}
-        className="min-w-0 flex-1 text-xs font-medium bg-white dark:bg-p-surface text-p-text
-                   rounded-sm border border-brand/50 px-1.5 py-1
-                   focus:outline-hidden focus:ring-1 focus:ring-brand/40"
+        className="min-w-0 flex-1 text-xs font-medium bg-surface-card text-primary
+                   rounded-sm border border-action px-1.5 py-1
+                   focus:outline-hidden focus:ring-1 focus:ring-focus-ring/40"
       />
       <button
         data-testid="rename-save"
@@ -139,8 +130,8 @@ function RenameInput({ initial, onCommit, onCancel }: {
         title="Save"
         onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); finish(true) }}
         onClick={(e) => { e.stopPropagation(); finish(true) }}
-        className="shrink-0 w-7 h-7 rounded-md bg-brand text-white flex items-center
-                   justify-center hover:bg-brand-hover transition-colors"
+        className="shrink-0 w-7 h-7 rounded-control bg-action text-action-fg flex items-center
+                   justify-center hover:bg-action-hover transition-colors"
       >
         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
@@ -227,7 +218,7 @@ function highlightTitle(title: string, query: string): JSX.Element {
   return (
     <>
       {title.slice(0, idx)}
-      <mark className="bg-brand-100 text-inherit rounded-sm px-0.5">{title.slice(idx, idx + q.length)}</mark>
+      <mark className="bg-action-subtle-hover text-inherit rounded-sm px-0.5">{title.slice(idx, idx + q.length)}</mark>
       {title.slice(idx + q.length)}
     </>
   )
@@ -235,18 +226,18 @@ function highlightTitle(title: string, query: string): JSX.Element {
 
 /** Three-dot menu for chat items with dropdown and delete confirmation. */
 // One sidebar row. Split out of the group map so the per-chat store slice
-// (live/unread state) can drive the ROW styling with a hook. Precedence:
-// active (INVERTED: solid brand fill + brand-surface bars, white text) >
-// generating (pulsing brand surface) > unread (static brand surface,
-// age-faded) > idle (hover only). The active row never renders live/unread
-// paint — viewing it IS reading it, and the composer already shows its
-// streaming state. The inversion is deliberate (operator ask): active and
-// generating both wore the brand-surface tint and read as the same state —
-// the solid fill makes the selection unmistakable at a glance.
-// Generating/unread also carry a 1px inset brand ring: the surface tints
+// (live and unread state) can drive the row's styling with a hook.
+// Precedence: active (inverted: the solid action fill with action-subtle
+// bars, its text on the fill's foreground) > generating (the pulsing
+// action-subtle tint) > unread (the static tint, age-faded) > idle (hover
+// only). The active row never renders live or unread paint: viewing it is
+// reading it, and the composer already shows its streaming state. The
+// inversion keeps the open row apart from a generating one, which wears
+// the same tint.
+// Generating/unread also carry a 1px inset action ring: the surface tints
 // alone blend into the sidebar (especially age-faded unread), and the ring
 // stays constant while the background pulses/fades so the row keeps a crisp
-// edge. Ring, not border — border-l is the project accent rail.
+// edge. A ring, not a border: the left border is the delegation edge.
 function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveChat,
                    onRename, onShare, canDelete, edit }: {
   chat: Chat
@@ -267,22 +258,24 @@ function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveCha
   const slice = useChatSlice(chat.id)
   const streaming = slice?.status === CHAT_PHASE.STREAMING
   const unread = slice?.unread !== undefined ? slice.unread : chat.unread
-  let stateClass = 'text-p-text-secondary hover:bg-p-surface-hover'
+  let stateClass = 'text-secondary hover:bg-surface-hover'
   let stateTitle: string | undefined
   if (active) {
     // Mirrored bars (left + right inset shadows) — the one-sided bar read as
     // a stray accent rail; symmetric they frame the selected row. Colors are
-    // the INVERSE of the tinted states: solid brand fill, brand-surface bars.
-    stateClass = 'bg-brand text-white shadow-[inset_3px_0_0_0_var(--color-brand-surface),inset_-3px_0_0_0_var(--color-brand-surface)]'
+    // the INVERSE of the tinted states: the solid action fill, action-subtle
+    // bars, and every text on the fill's own foreground (a dimmed white
+    // falls under AA there).
+    stateClass = 'bg-action text-action-fg shadow-[inset_3px_0_0_0_var(--color-action-subtle),inset_-3px_0_0_0_var(--color-action-subtle)]'
   } else if (streaming) {
     stateClass =
-      'oto-row-live motion-reduce:animate-none bg-brand-surface ring-1 ring-inset ring-brand/35 text-p-text-secondary'
+      'oto-row-live motion-reduce:animate-none bg-action-subtle ring-1 ring-inset ring-action/40 text-secondary'
     stateTitle = 'Generating response…'
   } else if (unread) {
     // A live flip (slice.unread) means the response just landed → full tint.
-    const tone = slice?.unread ? 'bg-brand-surface' : unreadRowClass(chat.last_response_at)
-    stateClass = `${tone} ring-1 ring-inset ring-brand/30 text-p-text-secondary hover:bg-p-surface-hover`
-    stateTitle = 'New response — not opened yet'
+    const tone = slice?.unread ? 'bg-action-subtle' : unreadRowClass(chat.last_response_at)
+    stateClass = `${tone} ring-1 ring-inset ring-action/30 text-secondary hover:bg-surface-hover`
+    stateTitle = 'New response, not opened yet'
   }
   // Unified live language (matches ActiveChatsPanel): the dot means exactly
   // one thing — "a finished result you haven't opened". Generating rows pulse
@@ -294,8 +287,8 @@ function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveCha
       // aria-label, NOT title: the full-title tooltip owns hover — a native
       // OS tooltip on the row would double up next to it.
       aria-label={stateTitle}
-      className={`group flex items-center justify-between px-3 py-2 rounded-lg text-sm mb-0.5 cursor-pointer transition-colors border-l-2 border-r-2 border-r-transparent ${
-        rowAccentClass(chat, { active }) || 'border-l-transparent'
+      className={`group flex items-center justify-between px-3 py-2 rounded-card text-sm mb-0.5 cursor-pointer transition-colors border-r-2 border-r-transparent ${
+        rowAccentClass(chat, { active })
       } ${stateClass}`}
     >
       <div className="min-w-0 flex-1">
@@ -307,13 +300,13 @@ function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveCha
               <ChatStatusDot chatId={chat.id} />
               {unreadDot && (
                 <span
-                  title="New response — not opened yet"
-                  className="inline-block w-1.5 h-1.5 rounded-full bg-brand mr-1.5 shrink-0"
+                  title="New response, not opened yet"
+                  className="inline-block w-1.5 h-1.5 rounded-full bg-action mr-1.5 shrink-0"
                 />
               )}
-              <TitleTooltip text={plainTitle} className="truncate">{title}</TitleTooltip>
+              <Tooltip text={plainTitle} onlyWhenClipped className="truncate">{title}</Tooltip>
             </p>
-            <p className={`text-[10px] mt-[2px] ${active ? 'text-white/70' : 'text-p-text-light'}`}>{timeAgo(chat.updated_at)}</p>
+            <p className={`text-3xs mt-[2px] ${active ? 'text-action-fg' : 'text-tertiary'}`}>{timeAgo(chat.updated_at)}</p>
           </>
         )}
       </div>
@@ -331,9 +324,9 @@ function ChatRow({ chat, active, title, plainTitle, onClick, onDelete, onMoveCha
 // One TASK-mode row: a task-run chat with its latest run joined. Purple is
 // the task LIVE identity (matches the Active-now strip): purple pulse while
 // generating, solid purple inversion when active. The left accent rail is
-// the SAME role-based rule as chat rows (rowAccentClass): violet only for
-// delegated workers, amber for orchestrators — plain scheduled tasks get
-// none. No unread dot/tint (notifications cover completion). The kebab
+// the SAME role-based rule as chat rows (rowAccentClass): the agent accent
+// at half strength for a delegated worker, the full accent on a wider edge
+// for an orchestrator — plain scheduled tasks get none. No unread dot/tint (notifications cover completion). The kebab
 // renders Rename/Delete from the server-computed can_* flags — the task
 // role matrix lives backend-side; a row with neither right shows no kebab.
 function TaskRow({ chat, active, title, plainTitle, onClick, onDelete,
@@ -354,24 +347,24 @@ function TaskRow({ chat, active, title, plainTitle, onClick, onDelete,
   const streaming = slice
     ? slice.status === CHAT_PHASE.STREAMING
     : isLiveRunStatus(chat.run_status)
-  let stateClass = 'text-p-text-secondary hover:bg-p-surface-hover'
+  let stateClass = 'text-secondary hover:bg-surface-hover'
   let stateTitle: string | undefined
   if (active) {
     // Mirrored edge bars painted with the SIDEBAR BACKGROUND (not a lighter
     // purple) so they read as gaps between the border and the solid fill —
-    // the same look as the chat row's brand-surface bars.
-    stateClass = 'bg-p-accent-purple text-white shadow-[inset_3px_0_0_0_var(--color-p-bg),inset_-3px_0_0_0_var(--color-p-bg)]'
+    // the same look as the chat row's action-subtle bars.
+    stateClass = 'bg-accent-agent-fill text-on-solid shadow-[inset_3px_0_0_0_var(--color-surface-card),inset_-3px_0_0_0_var(--color-surface-card)]'
   } else if (streaming) {
     stateClass =
-      'oto-row-live-purple motion-reduce:animate-none bg-p-accent-purple/10 ring-1 ring-inset ring-p-accent-purple/40 text-p-text-secondary'
+      'oto-row-live-purple motion-reduce:animate-none bg-accent-agent-bg ring-1 ring-inset ring-accent-agent-border text-secondary'
     stateTitle = 'Task running…'
   }
   return (
     <div
       onClick={edit ? undefined : onClick}
       aria-label={stateTitle}
-      className={`group flex items-center justify-between px-3 py-2 rounded-lg text-sm mb-0.5 cursor-pointer transition-colors border-l-2 border-r-2 border-r-transparent ${
-        rowAccentClass(chat, { active }) || 'border-l-transparent'
+      className={`group flex items-center justify-between px-3 py-2 rounded-card text-sm mb-0.5 cursor-pointer transition-colors border-r-2 border-r-transparent ${
+        rowAccentClass(chat, { active })
       } ${stateClass}`}
     >
       <div className="min-w-0 flex-1">
@@ -386,11 +379,11 @@ function TaskRow({ chat, active, title, plainTitle, onClick, onDelete,
         ) : (
           <>
             <p className="text-xs font-medium">
-              <TitleTooltip text={plainTitle} className="block truncate">
+              <Tooltip text={plainTitle} onlyWhenClipped className="block truncate">
                 {chat.task_name || title}
-              </TitleTooltip>
+              </Tooltip>
             </p>
-            <p className={`text-[10px] mt-[2px] truncate ${active ? 'text-white/70' : 'text-p-text-light'}`}>
+            <p className={`text-3xs mt-[2px] truncate ${active ? 'text-on-solid' : 'text-tertiary'}`}>
               {chat.task_name && chat.title ? `${chat.title} · ` : ''}{timeAgo(chat.updated_at)}
             </p>
           </>
@@ -407,8 +400,8 @@ function TaskRow({ chat, active, title, plainTitle, onClick, onDelete,
   )
 }
 
-// `onBrand`: the row behind the trigger is the solid-brand active row — swap
-// the gray trigger colors for white ones so the dots stay visible on blue.
+// `onBrand`: the row behind the trigger is the open row on the action fill:
+// the trigger takes the fill's foreground so the dots stay visible.
 // `isOpen`: this row is the OPEN chat — the move_chat op acts on the
 // connection's open chat, so only then is the target-mismatch row actionable.
 function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
@@ -435,6 +428,16 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
   const [menuOpen, setMenuOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [confirmMove, setConfirmMove] = useState(false)
+  // An item that opens a dialog hands the focus to the kebab first and keeps
+  // it shown (it hides when the row loses hover and focus), so the dialog
+  // gives the focus back to it when it closes; the kebab's own focus clears it.
+  const [holding, setHolding] = useState(false)
+  const kebabRef = useRef<HTMLButtonElement>(null)
+  const handOff = () => {
+    kebabRef.current?.focus()
+    setHolding(true)
+    setMenuOpen(false)
+  }
   const menuRef = useRef<HTMLDivElement>(null)
   // Pin-vs-current target mismatch + live status from the per-chat slice
   // (populated by warmup_ready for chats opened this session; cleared by the
@@ -443,6 +446,13 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
   const slice = useChatSlice(chatId)
   const mismatch = slice?.targetMismatch ?? null
   const moveBusy = isLiveChatPhase(slice?.status)
+  // The OPEN chat's places (the "Runs on" chip's entry, never fetched per
+  // row): a place a person chose is no mismatch to offer a move from.
+  const { data: targets } = useChatTargets(isOpen ? chatId : null)
+  const placeChosen = isOpen && !!targets?.place_chosen
+  // The move confirm goes for good when the move stops being possible (a
+  // turn started, the mismatch cleared): it never comes back on its own.
+  if (confirmMove && (moveBusy || !mismatch || placeChosen)) setConfirmMove(false)
 
   // Close menu on outside click
   useEffect(() => {
@@ -456,23 +466,22 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
     return () => document.removeEventListener('mousedown', handler)
   }, [menuOpen])
 
-  const handleDeleteClick = useCallback((e: React.MouseEvent) => {
+  const handleDeleteClick = (e: React.MouseEvent) => {
     e.stopPropagation()
-    setMenuOpen(false)
+    handOff()
     setConfirmDelete(true)
-  }, [])
+  }
 
-  const handleConfirmDelete = useCallback((e: React.MouseEvent) => {
-    e.stopPropagation()
+  const handleConfirmDelete = useCallback(() => {
     setConfirmDelete(false)
     onDelete(chatId)
   }, [chatId, onDelete])
 
-  const handleMoveClick = useCallback((e: React.MouseEvent) => {
+  const handleMoveClick = (e: React.MouseEvent) => {
     e.stopPropagation()
-    setMenuOpen(false)
+    handOff()
     setConfirmMove(true)
-  }, [])
+  }
 
   const handleConfirmMove = useCallback(() => {
     setConfirmMove(false)
@@ -481,25 +490,31 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
 
   return (
     <>
-      {/* Display-based reveal (not opacity): a hidden wrapper takes no flex
-          slot, so the title gets the FULL row width on desktop until hover —
-          the old opacity reveal reserved the button's width even while
-          invisible. Mobile (no hover) keeps it always visible; an open
-          dropdown pins the wrapper so it can't vanish mid-interaction. */}
+      {/* Width-based reveal: on desktop a zero-width, clipped wrapper gives
+          the title the FULL row width until the row is hovered or focused,
+          and the button stays in the Tab order (display: none would drop it,
+          an opacity reveal would reserve its width). Shown, the wrapper stops
+          clipping so the focus ring is whole. Mobile (no hover) keeps it
+          always visible; an open dropdown pins the wrapper so it can't
+          vanish mid-interaction. */}
       <div
         ref={menuRef}
+        data-testid="chat-row-menu"
         className={`relative ${
-          menuOpen
+          menuOpen || holding
             ? ''
-            : 'hidden group-hover:block group-focus-within:block max-md:block'
+            : 'md:w-0 md:overflow-hidden md:group-hover:w-auto md:group-hover:overflow-visible '
+              + 'md:group-focus-within:w-auto md:group-focus-within:overflow-visible'
         }`}
       >
         <button
+          ref={kebabRef}
           onClick={(e) => { e.stopPropagation(); setMenuOpen(!menuOpen) }}
+          onFocus={() => setHolding(false)}
           className={`p-0.5 rounded-sm transition-colors ml-1 ${
             onBrand
-              ? 'text-white/70 hover:text-white hover:bg-white/20'
-              : 'text-p-text-light hover:text-p-text-secondary hover:bg-p-surface'
+              ? 'text-on-solid hover:bg-action-fg/20'
+              : 'text-tertiary hover:text-secondary hover:bg-surface-hover'
           }`}
           title="Options"
         >
@@ -512,36 +527,37 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
 
         {/* Dropdown menu */}
         {menuOpen && (
-          <div className="absolute right-0 top-full mt-1 z-30 bg-white dark:bg-p-surface rounded-lg border border-p-border-light shadow-lg py-1 min-w-[120px] max-w-[240px]">
+          <div className={`absolute right-0 top-full mt-1 z-30 ${POPOVER} py-1 min-w-[120px] max-w-[240px]`}>
             {/* Mobile full-title header — no hover on touch, so the menu is
                 where a clipped title is guaranteed readable. */}
             {fullTitle && (
-              <div className="md:hidden px-3 py-1.5 text-xs font-medium text-p-text break-words border-b border-p-border-light mb-1">
+              <div className="md:hidden px-3 py-1.5 text-xs font-medium text-primary break-words border-b border-subtle mb-1">
                 {fullTitle}
               </div>
             )}
             {/* Target-mismatch row — the banner's permanent home after
                 dismissal. Actionable only for the OPEN chat (the move op
-                acts on the connection's open chat); other rows just state
+                acts on the connection's open chat) and only while its place
+                was not chosen by a person's move; other rows just state
                 the pin so the fact stays visible. */}
-            {mismatch && (isOpen && onMoveChat ? (
+            {mismatch && (isOpen && onMoveChat && !placeChosen ? (
               <button
                 onClick={handleMoveClick}
                 disabled={moveBusy}
                 title={moveBusy ? 'Finish or stop the current turn first' : undefined}
-                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left text-p-text-secondary hover:bg-p-surface-hover transition-colors disabled:opacity-50 disabled:hover:bg-transparent"
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left text-secondary hover:bg-surface-hover transition-colors disabled:opacity-50 disabled:hover:bg-transparent"
               >
-                Runs on {mismatch.pinnedLabel} — move to {mismatch.resolvedLabel}
+                Runs on {mismatch.pinnedLabel}. Move to {mismatch.resolvedLabel}
               </button>
             ) : (
-              <div className="px-3 py-1.5 text-xs text-p-text-light">
+              <div className="px-3 py-1.5 text-xs text-tertiary">
                 Runs on {mismatch.pinnedLabel}
               </div>
             ))}
             {onRename && (
               <button
                 onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onRename() }}
-                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left text-p-text-secondary hover:bg-p-surface-hover transition-colors"
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left text-secondary hover:bg-surface-hover transition-colors"
               >
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
@@ -551,8 +567,8 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
             )}
             {onShare && (
               <button
-                onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onShare() }}
-                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left text-p-text-secondary hover:bg-p-surface-hover transition-colors"
+                onClick={(e) => { e.stopPropagation(); handOff(); onShare() }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left text-secondary hover:bg-surface-hover transition-colors"
               >
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
@@ -563,7 +579,7 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
             {canDelete && (
               <button
                 onClick={handleDeleteClick}
-                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-p-accent-red hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-status-danger-fg hover:bg-status-danger-bg transition-colors"
               >
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
@@ -575,50 +591,29 @@ function ChatItemMenu({ chatId, onDelete, onBrand = false, isOpen = false,
         )}
       </div>
 
-      {/* Delete confirmation popup — portal to body so it escapes the drawer's stacking context on mobile */}
-      {confirmDelete && createPortal(
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs"
-          onClick={(e) => { e.stopPropagation(); setConfirmDelete(false) }}
+      {confirmDelete && (
+        <AlertDialog
+          title={taskKind ? 'Delete task run' : 'Delete Chat'}
+          confirmLabel="Delete"
+          tone="danger"
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setConfirmDelete(false)}
         >
-          <div
-            className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light shadow-xl p-6 max-w-sm mx-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 className="text-sm font-semibold text-p-text mb-2">
-              {taskKind ? 'Delete task run' : 'Delete Chat'}
-            </h3>
-            <p className="text-sm text-p-text-secondary mb-5">
-              {taskKind
-                ? 'Removes this run from the task history. The scheduled task itself is not deleted. This action cannot be undone.'
-                : 'Are you sure you want to delete this chat? This action cannot be undone.'}
-            </p>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={(e) => { e.stopPropagation(); setConfirmDelete(false) }}
-                className="px-4 py-2 rounded-lg text-sm font-medium text-p-text-secondary
-                           bg-p-surface hover:bg-p-surface-hover transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleConfirmDelete}
-                className="px-4 py-2 rounded-lg text-sm font-medium text-white
-                           bg-p-accent-red hover:bg-red-700 transition-colors"
-              >
-                Delete
-              </button>
-            </div>
-          </div>
-        </div>,
-        document.body,
+          {taskKind
+            ? 'Removes this run from the task history. The scheduled task itself is not deleted. This action cannot be undone.'
+            : 'Are you sure you want to delete this chat? This action cannot be undone.'}
+        </AlertDialog>
       )}
 
-      {/* Move confirmation — shared portal dialog (same one the
-          ChatTargetBanner button opens). */}
+      {/* Move confirmation (the same one the "Runs on" chip opens). */}
       {confirmMove && mismatch && (
         <MoveChatConfirm
+          target={mismatch.resolvedTarget}
           label={mismatch.resolvedLabel}
+          memory={targets ? moveMemoryOf(targets, mismatch.resolvedTarget) : MOVE_MEMORY.FILES}
+          fromTarget={targets?.current.target ?? mismatch.pinnedTarget}
+          fromLabel={targets?.current.label || mismatch.pinnedLabel}
+          fromOffline={targets ? leavesOffline(targets) : false}
           onConfirm={handleConfirmMove}
           onCancel={() => setConfirmMove(false)}
         />
@@ -687,13 +682,19 @@ export default function ChatHistory({
   }, [])
 
   const handleDelete = useCallback((chatId: string) => {
+    // The open chat is left BEFORE the request: the server ends its turn
+    // and closes its terminal as the row goes, and the frames of that end
+    // must meet a view on no chat. A refused delete (the chat still
+    // starting, a run still live) puts the person back on it.
+    const wasOpen = chatId === activeChatId
+    if (wasOpen) onNew()
     deleteChat.mutate(chatId, {
-      // The open chat's terminal is closed by the server before the row goes:
-      // leave the page for a fresh chat rather than stay on a vanished one.
-      onSuccess: () => { if (chatId === activeChatId) onNew() },
-      onError: (e) => surfaceError((e as Error)?.message || 'Failed to delete chat'),
+      onError: (e) => {
+        surfaceError((e as Error)?.message || 'Failed to delete chat')
+        if (wasOpen) onSelect(chatId)
+      },
     })
-  }, [deleteChat, surfaceError, activeChatId, onNew])
+  }, [deleteChat, surfaceError, activeChatId, onNew, onSelect])
 
   const startRename = useCallback((chat: Chat | TaskChat) => {
     const tc = chat as TaskChat
@@ -721,11 +722,13 @@ export default function ChatHistory({
   }, [editing, renameChat, renameTask, surfaceError])
 
   return (
-    <div className="w-full border-r border-p-border-light bg-p-bg flex flex-col h-full">
+    <div className="w-full border-r border-subtle bg-surface-card flex flex-col h-full">
       {/* Header: New Chat + Search (the mode title row sits below the
           Active-now strip, directly above the list it labels) */}
-      <div className="p-3 border-b border-p-border-light space-y-2">
-        <button
+      <div className="p-3 border-b border-subtle space-y-2">
+        <Button
+          variant="primary"
+          className="w-full"
           onClick={() => {
             // Starting a chat FROM the task view exits it — the new-chat
             // page is a chat surface, so the list below follows.
@@ -733,16 +736,14 @@ export default function ChatHistory({
             onNew()
             closeMobileDrawer(onNavigate)
           }}
-          className="w-full px-3 py-1.5 rounded-lg text-sm font-medium text-white
-                     bg-brand hover:bg-brand-hover transition-colors"
         >
           + New Chat
-        </button>
+        </Button>
 
         {/* Search input */}
         <div className="relative">
           <svg
-            className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-p-text-light pointer-events-none"
+            className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-tertiary pointer-events-none"
             fill="none" stroke="currentColor" viewBox="0 0 24 24"
           >
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -753,9 +754,9 @@ export default function ChatHistory({
             value={searchInput}
             onChange={(e) => setSearchInput(e.target.value)}
             placeholder={tasksMode ? 'Search tasks...' : 'Search chats...'}
-            className="w-full pl-8 pr-7 py-1.5 text-xs rounded-lg border border-p-border-light bg-white dark:bg-p-surface
-                       text-p-text placeholder:text-p-text-light
-                       focus:outline-hidden focus:ring-1 focus:ring-brand/40 focus:border-brand/40
+            className="w-full pl-8 pr-7 py-1.5 text-xs rounded-control border border-strong bg-surface-card
+                       text-primary placeholder:text-tertiary
+                       focus:outline-hidden focus:ring-1 focus:ring-focus-ring/40 focus:border-action
                        transition-colors"
           />
           {/* Clear button */}
@@ -763,8 +764,8 @@ export default function ChatHistory({
             <button
               onClick={() => { setSearchInput(''); inputRef.current?.focus() }}
               className="absolute right-2 top-1/2 -translate-y-1/2 w-4 h-4 rounded-full
-                         bg-p-surface hover:bg-p-border flex items-center justify-center
-                         text-p-text-light hover:text-p-text-secondary transition-colors"
+                         bg-surface-muted flex items-center justify-center
+                         text-tertiary hover:text-secondary transition-colors"
             >
               <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
@@ -774,11 +775,11 @@ export default function ChatHistory({
         </div>
 
         {actionError && (
-          <div className="flex items-start gap-2 px-2.5 py-1.5 rounded-sm border border-red-500/40 bg-red-500/10 text-red-600 dark:text-red-400 text-xs">
+          <div className="flex items-start gap-2 px-2.5 py-1.5 rounded-control border border-status-danger-border bg-status-danger-bg text-status-danger-fg text-xs">
             <span className="min-w-0 break-words">{actionError}</span>
             <button
               onClick={() => setActionError(null)}
-              className="ml-auto shrink-0 hover:text-red-700 dark:hover:text-red-300"
+              className="ml-auto shrink-0 hover:text-status-danger-fg"
               aria-label="Dismiss"
             >
               <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -803,7 +804,7 @@ export default function ChatHistory({
           status bar's icon-pill buttons (subtle purple pill off, solid on,
           pulsing while the agent has active tasks and the task view is off). */}
       <div className="flex items-center justify-between px-3 pt-2 pb-1">
-        <p className="text-xs font-semibold text-p-text-secondary">
+        <p className="text-xs font-semibold text-secondary">
           {tasksMode ? 'Task history' : 'Chat history'}
         </p>
         {onTasksModeChange && (
@@ -811,10 +812,10 @@ export default function ChatHistory({
             onClick={() => onTasksModeChange(!tasksMode)}
             title={tasksMode ? 'Show chat history' : 'Show task history'}
             data-testid="tasks-toggle"
-            className={`w-7 h-7 rounded-lg border flex items-center justify-center transition-colors cursor-pointer ${
+            className={`w-7 h-7 rounded-control border flex items-center justify-center transition-colors cursor-pointer ${
               tasksMode
-                ? 'bg-p-accent-purple border-p-accent-purple text-white hover:brightness-110'
-                : `bg-[#673a97]/10 border-[#673a97]/30 text-p-accent-purple hover:brightness-95 ${
+                ? 'bg-accent-agent-fill border-accent-agent-fill text-on-solid hover:brightness-110'
+                : `bg-accent-agent-bg border-accent-agent-border text-accent-agent-fg hover:brightness-95 ${
                     hasActiveTasks ? 'animate-pulse motion-reduce:animate-none' : ''
                   }`
             }`}
@@ -834,19 +835,19 @@ export default function ChatHistory({
         {/* Search loading indicator */}
         {isSearchActive && isSearching && (
           <div className="flex items-center justify-center py-3">
-            <span className="inline-block w-3 h-3 border-2 border-brand border-t-transparent rounded-full animate-spin" />
+            <span className="inline-block w-3 h-3 border-2 border-action border-t-transparent rounded-full animate-spin" />
           </div>
         )}
 
         {/* No results */}
         {isSearchActive && !isSearching && displayChats.length === 0 && (
-          <p className="text-xs text-p-text-light text-center py-4">No matches found</p>
+          <p className="text-xs text-tertiary text-center py-4">No matches found</p>
         )}
 
         {/* Grouped results — same day grouping in both modes */}
         {groups.map((group) => (
           <div key={group.label} className="mb-3">
-            <p className="px-3 py-1 text-[10px] font-semibold text-p-text-light uppercase tracking-wider">
+            <p className="px-3 py-1 text-3xs font-semibold text-tertiary uppercase tracking-wider">
               {group.label}
             </p>
             {group.chats.map((chat) => {
@@ -904,7 +905,7 @@ export default function ChatHistory({
 
         {/* Empty state */}
         {!isSearchActive && modeChats.length === 0 && (
-          <p className="text-xs text-p-text-light text-center py-4">
+          <p className="text-xs text-tertiary text-center py-4">
             {tasksMode ? 'No task runs yet' : 'No chats yet'}
           </p>
         )}

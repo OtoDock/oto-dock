@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import logging
 
+import psycopg
+
 logger = logging.getLogger("otodock.execution_mode")
 
 INTERACTIVE = "interactive"
@@ -56,7 +58,7 @@ def is_interactive_enabled() -> bool:
     from storage import database
     try:
         val = database.get_platform_setting(KILL_SWITCH_KEY)
-    except Exception:
+    except psycopg.Error:
         return True  # fail to the shipped default, same as unset
     return effective_enabled(val)
 

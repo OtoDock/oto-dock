@@ -6,10 +6,11 @@ in-process tools with the CLI's names (persona and skill text ports
 unchanged, the dashboard's tool cards already render them):
 
 - ``Read`` / ``Glob`` — open tier (allowed in every mode)
-- ``Write`` / ``Edit`` — edit tier (prompt in ``default``, silent in
-  ``acceptEdits`` / ``dontAsk`` / ``auto``)
-- ``Delete`` — destructive tier (prompts in ``default`` AND ``acceptEdits``,
-  exactly ``rm``'s treatment; silent only in ``dontAsk`` / ``auto``)
+- ``Write`` / ``Edit`` — edit tier (asked in Ask, silent in Don't Ask and
+  unattended; a held Auto, which Direct LLM does not offer, runs them as
+  Accept Edits did)
+- ``Delete`` — destructive tier (asked in Ask and in a held Auto, exactly
+  ``rm``'s treatment; silent only in Don't Ask and unattended)
 
 Two-pass gate, mirroring ``api.hooks.permission.decide_tool_permission`` for the
 CLI: Pass-1 is ``auth.path_policy.check_tool_access`` with the session's
@@ -26,12 +27,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from core.layers.direct import files as direct_files
 from core.layers.direct.files import FileToolError, Resolved
+from core.permission_modes import (
+    AUTO_REVIEW_MODE,
+    DONT_ASK_MODE,
+    JUDGE_MODE,
+    PLAN_MODE,
+    UNATTENDED_MODE,
+    current_mode,
+)
 
 logger = logging.getLogger("direct-runner")
 
@@ -107,15 +117,16 @@ def call_tool_defs(*, ask_back: bool) -> list[dict]:
 def decide(tier: str, mode: str) -> str:
     """Pass-2: ``"allow"`` | ``"prompt"`` | ``"deny"`` for a builtin tier in a
     session mode — the CLI hook's dashboard branch, tier by tier."""
+    mode = current_mode(mode)
     if tier == TIER_OPEN:
         return "allow"
-    if mode in ("plan", "judge"):
+    if mode in (PLAN_MODE, JUDGE_MODE):
         return "deny"
-    if mode in ("dontAsk", "auto"):
+    if mode in (DONT_ASK_MODE, UNATTENDED_MODE):
         return "allow"
     if tier == TIER_EDIT:
-        return "allow" if mode == "acceptEdits" else "prompt"
-    return "prompt"  # destructive in default / acceptEdits
+        return "allow" if mode == AUTO_REVIEW_MODE else "prompt"
+    return "prompt"  # destructive in Ask / a held Auto
 
 
 def gate(session, tool_call: dict, mode: str) -> tuple[str, str]:
@@ -127,8 +138,8 @@ def gate(session, tool_call: dict, mode: str) -> tuple[str, str]:
         return "deny", f"Unknown tool '{name}'"
     args = tool_call.get("input") or {}
     if builtin.file_path_tool:
-        from core.session.session_state import get_session_security
         from auth.path_policy import check_tool_access
+        from core.session.session_state import get_session_security
         ctx = get_session_security(session.session_id)
         if ctx is None:
             # Fail closed like the hook: a live session always has a context.
@@ -142,6 +153,36 @@ def gate(session, tool_call: dict, mode: str) -> tuple[str, str]:
             return "deny", f"{name} is not available to a judge — a judge reads, it does not write."
         return "deny", f"{name} is not available in plan mode (reads only)."
     return outcome, ""
+
+
+MEETING_ENDED = "The meeting this session belonged to has ended."
+# The permission authority's answer that lets a call run.
+_AUTHORITY_ALLOWS = "allow"
+
+
+async def gate_for_session(session, tool_call: dict, mode: str) -> tuple[str, str]:
+    """``gate`` as the session's place in a meeting decides it. A mapped
+    meeting participant's call goes to the one permission authority
+    (``session_events.pre_tool``), as its MCP tools and every tool of a CLI
+    participant do: the host chat's mode, the turn-end backstop after a
+    routing tool, the ask on the meeting pump's queue with the speaker's
+    badge, the card retired when nobody answers. A session started for a
+    meeting whose mapping is gone (the meeting ended, the agent left) is
+    refused every call. Any other session: ``gate``."""
+    from core.events import tool_roles
+    from core.session import session_events
+    from core.session.session_state import get_meeting_session_info, is_meeting_session
+
+    sid = session.session_id
+    name = tool_call.get("name", "") or ""
+    if get_meeting_session_info(sid) is not None and tool_roles.role_of(name):
+        decision = await session_events.pre_tool(sid, name, tool_call.get("input") or {})
+        if decision.get("decision") == _AUTHORITY_ALLOWS:
+            return "allow", ""
+        return "deny", decision.get("reason") or f"{name} was not allowed in this meeting."
+    if is_meeting_session(sid) and get_meeting_session_info(sid) is None:
+        return "deny", MEETING_ENDED
+    return gate(session, tool_call, mode)
 
 
 async def execute(session, name: str, args: dict) -> str:
@@ -311,7 +352,7 @@ def _load_guide_tools(session, skill_id: str, body: str) -> str:
     try:
         from services.mcp import mcp_registry
         manifest = mcp_registry.find_skill_provider(skill_id)
-    except Exception:
+    except ImportError:
         return ""
     if manifest is None:
         return ""
@@ -382,7 +423,11 @@ def _guides_available(session, guide_ids: list[str]) -> list[str]:
 
 
 async def _tool_search(session, args: dict) -> str:
-    from core.layers.direct.tool_catalog import batch_loads_for, first_sentence, server_of
+    from core.layers.direct.tool_catalog import (
+        batch_loads_for,
+        first_sentence,
+        server_of,
+    )
     catalog = getattr(session, "catalog", None)
     if catalog is None:
         return (

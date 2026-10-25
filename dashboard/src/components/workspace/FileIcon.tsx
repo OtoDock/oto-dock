@@ -15,7 +15,7 @@ export default function FileIcon({ name, size = 16 }: { name: string; size?: num
 
 /** Folder icon, open/closed variants. */
 export function FolderIcon({ open, size = 16 }: { open: boolean; size?: number }) {
-  const baseClass = 'text-amber-500 shrink-0'
+  const baseClass = 'text-secondary shrink-0'
   if (open) {
     return (
       <svg

@@ -7,29 +7,10 @@
 
 import { useEffect, type RefObject } from 'react'
 import { useMyAudioPrefs, useUpdateMyAudioPrefs } from '../../api/userAudio'
-import { AUTO_LANGUAGE, LANGUAGES, baseLang, browserSttLang, isAutoLanguage } from '../../audio/lang'
+import { toastError } from '../../lib/http/apiJson'
 import { pushEscHandler } from '../../lib/escStack'
 import { IconDropdownPanel } from '../ui/IconDropdown'
-
-// The rows: Automatic (the platform engine identifies the language) first,
-// then the languages of the Audio settings tab.
-export const STT_MENU_OPTIONS: { value: string; label: string }[] = [
-  { value: AUTO_LANGUAGE, label: 'Automatic' },
-  ...LANGUAGES.map((l) => ({ value: l.code, label: l.label })),
-]
-
-/** The row to tick: the stored preference, else the browser default the
- *  recognizer really gets — an exact code, else the first row of its base
- *  language (`browserSttLang` yields a base code). An explicit Automatic
- *  pick ticks its own row; a person who never picked keeps the browser's. */
-export function currentSttLanguage(stored: string | null | undefined): string {
-  if (isAutoLanguage(stored)) return AUTO_LANGUAGE
-  const want = stored || browserSttLang()
-  const exact = LANGUAGES.find((l) => l.code === want)
-  if (exact) return exact.code
-  const base = baseLang(want)
-  return LANGUAGES.find((l) => baseLang(l.code) === base)?.code ?? ''
-}
+import { STT_MENU_OPTIONS, currentSttLanguage } from '../../lib/chat/sttLanguages'
 
 interface SttLanguageMenuProps {
   open: boolean
@@ -64,7 +45,7 @@ function Panel({ onClose, anchorRef, duplexActive }: Omit<SttLanguageMenuProps, 
       label="Dictation language"
       value={currentSttLanguage(prefs?.stt_language)}
       options={STT_MENU_OPTIONS}
-      onPick={(code) => { update.mutate({ stt_language: code }); onClose() }}
+      onPick={(code) => { update.mutateAsync({ stt_language: code }).catch(toastError('The dictation language was not saved')); onClose() }}
       footer={duplexActive ? 'Applies to your next conversation' : undefined}
     />
   )

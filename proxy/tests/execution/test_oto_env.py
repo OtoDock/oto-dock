@@ -7,7 +7,6 @@ bwrap mount set per session class.
 
 from core.sandbox.oto_env import OTO_MULTI_VALUE_ENVS, build_oto_env
 
-
 # ---------------------------------------------------------------------------
 # Manager / Admin user-scoped: full mount set
 # ---------------------------------------------------------------------------
@@ -295,8 +294,7 @@ def test_resolve_memory_and_scope_respects_agent_default(temp_db):
 
 def test_resolve_memory_and_scope_master_toggle_off(temp_db):
     from core.sandbox.oto_env import resolve_memory_and_scope
-    from storage.agents import agent_store
-    from storage.agents import memory_store
+    from storage.agents import agent_store, memory_store
     agent_store.create_agent("pa", "PA")
     memory_store.update_settings(user_memory_enabled=False)
     mu, ma, ds = resolve_memory_and_scope("pa", username="alice")

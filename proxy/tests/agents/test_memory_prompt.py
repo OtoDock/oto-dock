@@ -12,11 +12,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 import config as app_config
 from services.memory import memory_file
-from storage.agents import agent_store
-from storage.agents import memory_store
+from storage.agents import agent_store, memory_store
 
 
 def _seed_agent(slug: str, *, default_scope: str = "user") -> Path:
@@ -113,7 +111,8 @@ def test_index_mode_heals_stale_index(temp_db):
     _write_topic(agent_dir, "agent", "big.md",
                  "# Old heading\n" + "x" * 200 + "\n")
     # Hand-edit the topic (simulates dashboard/satellite edit): index stale.
-    import os, time
+    import os
+    import time
     root = memory_file.scope_root(agent_dir, "agent")
     (root / "big.md").write_text("# Hand-edited heading\n" + "y" * 200 + "\n")
     future = time.time() + 5
