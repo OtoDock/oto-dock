@@ -13,6 +13,7 @@ import sys
 import pytest
 
 from tests._paths import PROXY_DIR as _PROXY_DIR
+from tests._timing import bound
 
 if str(_PROXY_DIR) not in sys.path:
     sys.path.insert(0, str(_PROXY_DIR))
@@ -159,7 +160,7 @@ class TestRecursiveDeleteFloor:
         for text in ("rm -rf " * 9400, "rm -rf x " * 7300):
             t0 = time.monotonic()
             pattern.search(text)
-            assert time.monotonic() - t0 < 0.5
+            assert time.monotonic() - t0 < bound(0.5)
 
 
 class TestSshRemoteFloor:
@@ -428,7 +429,7 @@ class TestTheTwoTargetsEndTheHost:
             for pattern in patterns:
                 t0 = time.monotonic()
                 pattern.search(text)
-                assert time.monotonic() - t0 < 0.5
+                assert time.monotonic() - t0 < bound(0.5)
 
 
 class TestRedirectTargets:

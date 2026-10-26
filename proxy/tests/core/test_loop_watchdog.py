@@ -8,6 +8,7 @@ import time
 import pytest
 
 from core import loop_watchdog as wd
+from tests._timing import cpu_share
 
 
 @pytest.fixture(autouse=True)
@@ -196,10 +197,16 @@ async def test_a_call_holding_the_gil_is_a_stall_not_a_freeze(caplog, monkeypatc
     monkeypatch.setattr(wd, "_FROZEN_S", 0.05)
     assert wd.start(threshold_s=0.1, tick_s=0.01, watch_s=0.005)
     await asyncio.sleep(0.1)  # the first tick lands
-    _gil_held_call_for_the_test(4_000_000)   # about 0.3 s on this box, never under 0.15
+    # About 0.3 s on the dev box, never under 0.15.
+    _wall, share = cpu_share(lambda: _gil_held_call_for_the_test(4_000_000))
     await asyncio.sleep(0.3)  # ticks resume: the recovery is seen
     wd.stop()
 
+    if share < 0.75:
+        # The premise is that the process ran all through the call. A host
+        # that packs more workers than cores takes the CPU away from it, and
+        # the watcher then reads a freeze, correctly: nothing to judge here.
+        pytest.skip(f"the host gave this process {share:.0%} of the CPU during the call")
     lines = [r.getMessage() for r in caplog.records]
     assert not any("the process did not run" in m for m in lines), lines
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]

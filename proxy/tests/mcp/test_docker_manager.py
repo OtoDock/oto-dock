@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from services.mcp import docker_manager, mcp_registry
+from tests._timing import bound
 
 
 @pytest.fixture
@@ -821,7 +822,7 @@ def test_a_silent_build_is_ended_at_its_stall_bound(file_tools_manifest):
             file_tools_manifest, ["bash", "-c", "echo Building >&2; sleep 30"],
             timeout=60, stall=1.0,
         )
-    assert _time.monotonic() - started < 10
+    assert _time.monotonic() - started < bound(10)
 
 
 def test_the_whole_group_is_ended(file_tools_manifest, tmp_path):
@@ -848,7 +849,7 @@ def test_a_child_holding_the_pipe_never_blocks_the_reader(file_tools_manifest):
         timeout=60,
     )
     assert rc == 0 and "done" in err
-    assert _time.monotonic() - started < 5
+    assert _time.monotonic() - started < bound(5)
 
 
 def test_shutdown_ends_a_running_build(file_tools_manifest):

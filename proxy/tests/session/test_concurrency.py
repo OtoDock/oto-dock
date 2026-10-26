@@ -27,6 +27,7 @@ import pytest_asyncio
 
 import config
 import core.concurrency as C
+from tests._timing import bound
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -600,7 +601,7 @@ async def test_queued_admit_times_out_with_the_last_denial(monkeypatch):
     t0 = time.monotonic()
     adm = await C.acquire("late", "chat", queue_wait_s=0.3)
     assert not adm and adm.reason == "busy"
-    assert 0.25 <= time.monotonic() - t0 < 2.0
+    assert 0.25 <= time.monotonic() - t0 < bound(2.0)
     assert C._line == [] and "late" not in C._sessions
 
 
@@ -618,7 +619,7 @@ async def test_queue_never_waits_on_host_memory_or_user_cap(env, monkeypatch):
     env["mb"] = 500                                   # non-session pressure
     adm = await C.acquire("other", "chat", queue_wait_s=5)
     assert not adm and adm.reason == "host_memory"
-    assert time.monotonic() - t0 < 1.0 and C._line == []
+    assert time.monotonic() - t0 < bound(1.0) and C._line == []
 
 
 @pytest.mark.asyncio

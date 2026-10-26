@@ -21,6 +21,7 @@ import psycopg
 import pytest
 from fastapi import FastAPI
 
+from tests._timing import bound
 from tests.media.wopi_signing import sign_request_async, signed_client, signing
 
 _REAL_PERSON_HOLDS: dict = {}
@@ -922,7 +923,7 @@ def test_a_save_answers_while_its_fan_out_waits_on_a_stalled_machine(temp_db, tm
         resp = _save(client, file_id, token, b"the person's edit",
                      timestamp=_loaded_time(client, file_id, token))
         assert resp.status_code == 200
-        assert _time.monotonic() - began < 5
+        assert _time.monotonic() - began < bound(5)
         assert target.read_bytes() == b"the person's edit"
         assert started.wait(5)              # the fan-out runs after the answer
         assert workspace_fanout._save_fan_out_tasks

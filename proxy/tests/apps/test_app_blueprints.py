@@ -35,6 +35,7 @@ from services.community import (
 )
 from storage import database as task_store
 from storage.pg import get_conn
+from tests._timing import bound
 
 client = TestClient(app)
 
@@ -326,7 +327,7 @@ def test_a_bundle_of_countless_empty_entries_is_refused_before_it_is_indexed():
     started = time.monotonic()
     with pytest.raises(app_blueprints.BlueprintError, match="500 files"):
         app_blueprints.read_bundle(buf.getvalue())
-    assert time.monotonic() - started < 2
+    assert time.monotonic() - started < bound(2)
 
 
 def test_a_template_ships_apps_that_land_pending_with_their_needs(agent_tree, tmp_path):

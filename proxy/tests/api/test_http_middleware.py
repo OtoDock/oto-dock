@@ -27,6 +27,7 @@ import middleware
 from app import app
 from auth.providers import create_session_jwt
 from storage import pg
+from tests._timing import bound
 from tests.conftest import live_session_token
 
 CHUNK = 64 * 1024
@@ -287,7 +288,7 @@ def test_a_body_that_trickles_past_the_whole_body_limit_is_answered_408(short_bo
     started = time.monotonic()
     status, headers, _, _ = _trickle("/auth/login/local", [0.1] * 40)
     assert status == 408 and headers.get("connection") == "close"
-    assert time.monotonic() - started < 2.0
+    assert time.monotonic() - started < bound(2.0)
 
 
 def test_a_slow_body_with_a_valid_credential_is_not_timed(short_body_deadline):

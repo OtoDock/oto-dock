@@ -4,6 +4,7 @@ call stands for, globs, and the matching rules (CHECKS.md "Conditions")."""
 
 from services.checks import classify
 from services.checks.changed_set import condition_matches
+from tests._timing import bound
 
 
 def test_kinds_by_extension_and_name():
@@ -140,7 +141,7 @@ def test_a_persons_patterns_never_backtrack():
     value, key = "a" * 3000 + "!", "x" * 3000
     answer = f'```json\n{{"id": "{value}", "{key}": 1}}\n```'
     v = asyncio.run(schema_kind.run(check, None, {"result": answer}, round_no=1))
-    assert time.monotonic() - started < 2.0
+    assert time.monotonic() - started < bound(2.0)
     assert v.status == "fail" and len(v.findings) == 2
     ok = asyncio.run(schema_kind.run(check, None, {"result": '```json\n{"id": "aaa", "xxy": 2}\n```'},
                                      round_no=1))

@@ -17,6 +17,7 @@ import uuid
 import pytest
 
 from core import log_queue
+from tests._timing import bound
 
 
 @pytest.fixture
@@ -120,7 +121,7 @@ class TestOverflow:
         t0 = time.monotonic()
         for i in range(20):
             lg.info("overflow %d", i)
-        assert time.monotonic() - t0 < 0.5      # never blocked
+        assert time.monotonic() - t0 < bound(0.5)      # never blocked
         assert handler.dropped_total == 20
         assert lq.stats()["dropped"] == 20 and lq.stats()["queued"] == 8
         assert capsys.readouterr().err == ""    # no handleError traceback
@@ -330,7 +331,7 @@ class TestDrain:
         time.sleep(0.05)
         t0 = time.monotonic()
         assert lq.drain(0.2) is False
-        assert time.monotonic() - t0 < 1.0
+        assert time.monotonic() - t0 < bound(1.0)
         assert lq._listener._thread is not None and lq._listener._thread.is_alive()
         gate.set()
         assert lq.drain(5.0) is True

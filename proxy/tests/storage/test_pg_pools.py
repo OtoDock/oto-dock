@@ -23,6 +23,7 @@ import pytest
 
 import config
 from storage import pg
+from tests._timing import bound
 
 # ---------------------------------------------------------------------------
 # A TCP proxy in front of the test database
@@ -252,7 +253,7 @@ async def test_freeze_aborts_after_the_liveness_probe(loop_pool, proxy_url):
     t = time.monotonic()
     with pytest.raises(pg.DatabaseUnavailable):
         _read()
-    assert time.monotonic() - t < 0.05  # open breaker: no wait at all
+    assert time.monotonic() - t < bound(0.05)  # open breaker: no wait at all
     px.mode = "pass"
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -279,7 +280,7 @@ async def test_freeze_with_the_default_timings(loop_pool, proxy_url):
     t = time.monotonic()
     with pytest.raises(pg.DatabaseUnresponsive):
         _read()
-    assert time.monotonic() - t < 3.8
+    assert time.monotonic() - t < bound(3.8)
 
 
 @pytest.mark.asyncio
@@ -336,7 +337,7 @@ async def test_a_dead_idle_loop_connection_is_replaced_quickly(loop_pool, fresh_
     assert _terminate_backends(config.DATABASE_URL)
     t = time.monotonic()
     assert _read() == 1
-    assert time.monotonic() - t < 1.0
+    assert time.monotonic() - t < bound(1.0)
     assert lp.stats()["trips"] == 0
 
 
@@ -361,12 +362,13 @@ def test_a_broken_shared_connection_drains_the_idle_ones(fresh_pools):
     with contextlib.suppress(psycopg.OperationalError):
         _read()  # at most one caller sees the dead connection
     t = time.monotonic()
+    limit = bound(2.0)
     while True:
         try:
             assert _read() == 1
             break
         except psycopg.OperationalError:
-            assert time.monotonic() - t < 2.0, "the stale connections were not drained"
+            assert time.monotonic() - t < limit, "the stale connections were not drained"
             time.sleep(0.05)
 
 
@@ -387,7 +389,7 @@ async def test_the_fast_lane_is_not_queued_behind_the_bulk_lane(monkeypatch):
         await asyncio.sleep(0.2)
         t = time.monotonic()
         assert await pg.run_db_fast(_read) == 1
-        assert time.monotonic() - t < 1.0
+        assert time.monotonic() - t < bound(1.0)
     finally:
         release.set()
         await asyncio.gather(*held)

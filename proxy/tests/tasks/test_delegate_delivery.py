@@ -28,6 +28,7 @@ from core.execution_layer import ResumeVerdict
 from services.scheduler import delivery, lanes, scheduler
 from services.scheduler.scheduler import TaskDefinition
 from storage import database as task_store
+from tests._timing import bound
 
 
 @contextmanager
@@ -516,7 +517,7 @@ class TestLaneQuiescence:
         import time as _time
         t0 = _time.monotonic()
         asyncio.run(scheduler._await_lane_quiescence("no-such-chat"))
-        assert _time.monotonic() - t0 < 0.5
+        assert _time.monotonic() - t0 < bound(0.5)
 
     def test_waits_for_active_pump_then_settles(self, temp_db):
         from core.events.stream_pump import _active_pumps

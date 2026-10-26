@@ -35,6 +35,7 @@ from core.events.pump_bg_monitors import (
 )
 from core.events.task_producer import task_produce
 from core.session.session_state import get_subagent_registry
+from tests._timing import bound
 
 
 class _FakeLayer:
@@ -766,5 +767,5 @@ async def test_the_wait_counts_from_the_settle_read_start(clean_registries):
     layer = _SettledLayer(turns=[[_bg_cmd_start()]])
     t0 = time.monotonic()
     await _run(layer, sid, bg_cmd_ceiling=0.3)
-    assert time.monotonic() - t0 < 0.25
+    assert time.monotonic() - t0 < bound(0.25)
     assert sid not in cli_settle._run_ceilings

@@ -26,6 +26,7 @@ from core.remote.satellite_http_tunnel import (
     _is_allowed_path,
     _resolve_upstream_url,
 )
+from tests._timing import bound
 
 
 class FakeConnection:
@@ -843,7 +844,7 @@ async def test_hooks_do_not_wait_behind_held_mcp_streams(monkeypatch):
         first = next(f for f in conn.sent
                      if f.get("stream_id") == "hook" and f["type"] == "http_response")
         assert first["status"] == 200 and first.get("error") is None
-        assert time.perf_counter() - t0 < 2.0
+        assert time.perf_counter() - t0 < bound(2.0)
     finally:
         for key in list(disp._streams):
             disp._reap(key)

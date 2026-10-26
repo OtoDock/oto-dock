@@ -15,6 +15,7 @@ import pytest
 import config
 from services.apps import app_deploy, app_lint, releases
 from services.apps.app_lint import Declared, lint_html, lint_tree, strip_comments
+from tests._timing import bound
 
 AGENT = "lint-agent"
 
@@ -236,7 +237,7 @@ def test_a_crafted_page_lints_in_linear_time():
             + ("<meta " * 15_000) + ("on" * 400_000) + (" x.onclose=(" * 20_000))
     started = time.monotonic()
     lint_html(page, "[]")
-    assert time.monotonic() - started < 5
+    assert time.monotonic() - started < bound(5)
 
 
 @pytest.mark.parametrize("snippet,rule", [
@@ -685,7 +686,7 @@ def test_a_crafted_tree_at_the_release_caps_lints_in_bounded_time(tmp_path, side
     assert len(walked) == 17
     started = time.monotonic()
     lint_tree(root, walked, Declared(egress={"api.example.com"}, handlers={"gate"}))
-    assert time.monotonic() - started < 5
+    assert time.monotonic() - started < bound(5)
 
 
 @pytest.mark.parametrize("shape", CRAFTED_SHAPES, ids=[f"shape{n}" for n in range(len(CRAFTED_SHAPES))])
@@ -694,7 +695,7 @@ def test_a_crafted_page_at_the_pin_cap_lints_in_bounded_time(shape):
     page = _crafted(shape, 2 * 1024 * 1024).decode("utf-8", "replace")
     started = time.monotonic()
     lint_html(page, "[]")
-    assert time.monotonic() - started < 1
+    assert time.monotonic() - started < bound(1)
 
 
 # ── a palette the theme never reaches ───────────────────────────────────────
@@ -984,7 +985,7 @@ def test_the_brand_follows_the_cascade_and_the_kit_reader_reads_its_rules(tmp_pa
     import time
     started = time.monotonic()
     brand.lint_brand(";{" * (releases.MAX_RELEASE_FILE_BYTES // 2), 0, "client/brand.css", "")
-    assert time.monotonic() - started < 2
+    assert time.monotonic() - started < bound(2)
 
 
 

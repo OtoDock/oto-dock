@@ -28,6 +28,7 @@ import pytest
 
 from core.remote import satellite_connection as sc
 from core.remote.satellite_connection import SatelliteConnectionManager
+from tests._timing import bound
 
 
 class _FakeWS:
@@ -220,13 +221,13 @@ async def test_pool_exhaustion_keeps_loop_and_reserve_free(monkeypatch):
         # 1. The loop is responsive.
         t0 = time.monotonic()
         await asyncio.sleep(0)
-        assert time.monotonic() - t0 < 0.05
+        assert time.monotonic() - t0 < bound(0.05)
 
         # 2. A residual loop-side caller still gets a connection quickly.
         t0 = time.monotonic()
         with pg.get_conn() as conn:
             conn.execute("SELECT 1")
-        assert time.monotonic() - t0 < 2.0
+        assert time.monotonic() - t0 < bound(2.0)
     finally:
         release.set()
         assert await cm.drain_persists(timeout=15)
